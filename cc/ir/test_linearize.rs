@@ -5910,6 +5910,32 @@ fn test_bitfield_storage_type() {
     assert_eq!(linearizer.bitfield_storage_type(16), types.uint_id);
 }
 
+/// `emit_bitfield_load` extends only for a signed field, and decides that by
+/// asking `is_unsigned`. A `_Bool` field must not be extended: the extension
+/// is `shl 31; sar 31` at one bit wide, which turns the stored 1 into -1.
+///
+/// Asserted at the type table rather than on emitted IR because that is where
+/// the decision is made -- and because the same predicate answers for every
+/// other consumer that picks an extension, an opcode or an ABI class.
+#[test]
+fn test_bool_is_an_unsigned_type_for_bitfield_extension() {
+    let types = TypeTable::new(&Target::host());
+
+    // The signedness that governs code generation.
+    assert!(types.is_unsigned(types.bool_id), "_Bool is unsigned");
+    assert!(types.is_unsigned(types.uchar_id));
+    assert!(!types.is_unsigned(types.schar_id));
+    assert!(!types.is_unsigned(types.int_id));
+
+    // The storage unit a one-byte `_Bool` field is read through is unsigned
+    // either way, so the extension decision rests entirely on the member type.
+    assert_eq!(
+        types.size_bits(types.bool_id),
+        8,
+        "a _Bool bitfield is backed by a one-byte unit"
+    );
+}
+
 // ============================================================================
 // `_Atomic` through ordinary operators (audit #X1)
 // ============================================================================

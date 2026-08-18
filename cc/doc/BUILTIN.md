@@ -122,10 +122,10 @@ Used by `<complex.h>` for `I` and the `CMPLX`/`CMPLXF`/`CMPLXL` macros, which
 exist precisely so `x + y*I` has an exact alternative that cannot corrupt an
 infinite or NaN part.
 
-**Limit:** only in a function body. A complex object with static storage
-duration cannot be initialized at all — neither `double _Complex z = 1.0 +
-2.0*I;` nor `CMPLX(1.0, 2.0)` — where gcc accepts both. See `#C11` in
-`../audit.md`.
+Usable at file scope and in a static initializer as well as in a function
+body: `double _Complex g = 1.0 + 2.0*I;` and `CMPLX(3.0, 4.0)` both work, at
+every precision. (This entry used to record the opposite as a limit; that was
+fixed by `#C11` and the note outlived it.)
 
 ## Object Size and Fortification
 
@@ -181,5 +181,9 @@ system header takes.
 
 | Builtin | Consequence |
 |---------|-------------|
+| `__builtin_classify_type` | Needed by the host's `<tgmath.h>`; c17 bundles its own, built on `_Generic`, so this is not a blocker. `__has_builtin` answers 0, so guarded code is already correct |
+| `__builtin_clear_padding` | Would have to walk a type to find its padding |
+| `__builtin_setjmp`, `__builtin_va_arg_pack` | Not implemented; the ordinary `setjmp`/`longjmp` are |
 
-| `__builtin_classify_type`, `__real__`, `__imag__` | Needed by the host's `<tgmath.h>`; c17 bundles its own, built on `_Generic`, so this is not a blocker |
+`__real__` and `__imag__` used to be listed here and are **implemented** — see
+`#C29` in `../audit.md`.

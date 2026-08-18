@@ -89,13 +89,13 @@ fn test_float_literal() {
 #[test]
 fn test_char_literal() {
     let (expr, _types, _strings, _symbols) = parse_expr("'a'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('a')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(97)));
 }
 
 #[test]
 fn test_char_escape() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\n'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
 #[test]
@@ -114,91 +114,91 @@ fn test_string_literal() {
 #[test]
 fn test_char_escape_newline() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\n'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
 #[test]
 fn test_char_escape_tab() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\t'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\t')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(9)));
 }
 
 #[test]
 fn test_char_escape_carriage_return() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\r'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\r')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(13)));
 }
 
 #[test]
 fn test_char_escape_backslash() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\\\'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\\')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(92)));
 }
 
 #[test]
 fn test_char_escape_single_quote() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\''").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\'')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(39)));
 }
 
 #[test]
 fn test_char_escape_double_quote() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\\"'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('"')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(34)));
 }
 
 #[test]
 fn test_char_escape_bell() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\a'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\x07')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(7)));
 }
 
 #[test]
 fn test_char_escape_backspace() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\b'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\x08')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(8)));
 }
 
 #[test]
 fn test_char_escape_formfeed() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\f'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\x0C')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(12)));
 }
 
 #[test]
 fn test_char_escape_vertical_tab() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\v'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\x0B')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(11)));
 }
 
 #[test]
 fn test_char_escape_null() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\0'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\0')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(0)));
 }
 
 #[test]
 fn test_char_escape_hex() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\x41'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('A')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(65)));
 }
 
 #[test]
 fn test_char_escape_hex_lowercase() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\x0a'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
 #[test]
 fn test_char_escape_octal() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\101'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('A'))); // octal 101 = 65 = 'A'
+    assert!(matches!(expr.kind, ExprKind::CharLit(65))); // octal 101 = 65 = 'A'
 }
 
 #[test]
 fn test_char_escape_octal_012() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\012'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n'))); // octal 012 = 10 = '\n'
+    assert!(matches!(expr.kind, ExprKind::CharLit(10))); // octal 012 = 10 = '\n'
 }
 
 // ========================================================================
@@ -209,28 +209,28 @@ fn test_char_escape_octal_012() {
 fn test_char_escape_ucn_short() {
     // \u00E9 is 'é' (U+00E9)
     let (expr, _types, _strings, _symbols) = parse_expr("'\\u00E9'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('é')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(233)));
 }
 
 #[test]
 fn test_char_escape_ucn_short_lowercase() {
     // \u00e9 is 'é' (U+00E9) - lowercase hex
     let (expr, _types, _strings, _symbols) = parse_expr("'\\u00e9'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('é')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(233)));
 }
 
 #[test]
 fn test_char_escape_ucn_long() {
     // \U00000041 is 'A' (U+0041)
     let (expr, _types, _strings, _symbols) = parse_expr("'\\U00000041'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('A')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(65)));
 }
 
 #[test]
 fn test_char_escape_ucn_long_emoji() {
     // \U0001F600 is '😀' (U+1F600)
     let (expr, _types, _strings, _symbols) = parse_expr("'\\U0001F600'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('😀')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(128512)));
 }
 
 #[test]
@@ -416,6 +416,47 @@ fn test_string_empty() {
         ExprKind::StringLit(s) => assert_eq!(s, ""),
         _ => panic!("Expected StringLit"),
     }
+}
+
+/// C17 6.3.1.8p1 runs the integer promotions on both operands before ranking
+/// them, so no operand narrower than `int` can reach the "either operand is
+/// unsigned" fallback. Without the promotion, `(unsigned char) - (unsigned
+/// char)` was typed `unsigned int` and the arithmetic that followed was done
+/// unsigned.
+#[test]
+fn test_usual_arithmetic_conversions_promote_first() {
+    // Every sub-int pair yields plain signed int, whatever its own signedness.
+    for src in [
+        "(unsigned char)1 - (unsigned char)2",
+        "(unsigned short)1 - (unsigned short)2",
+        "(signed char)1 - (signed char)2",
+        "(char)1 - (char)2",
+        "(_Bool)0 - (_Bool)1",
+        "(unsigned char)1 - (signed char)2",
+        "(unsigned char)1 * (unsigned short)2",
+    ] {
+        let (expr, types, _strings, _symbols) = parse_expr(src).unwrap();
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), TypeKind::Int, "{src} should be int");
+        assert!(!types.is_unsigned(typ), "{src} should be signed");
+    }
+
+    // A genuinely unsigned operand of rank int or above still wins.
+    for (src, kind) in [
+        ("(unsigned char)1 - 2u", TypeKind::Int),
+        ("(unsigned char)1 - (unsigned long)2", TypeKind::Long),
+        ("(_Bool)1 - 2u", TypeKind::Int),
+    ] {
+        let (expr, types, _strings, _symbols) = parse_expr(src).unwrap();
+        let typ = expr.typ.unwrap();
+        assert_eq!(types.kind(typ), kind, "{src}");
+        assert!(types.is_unsigned(typ), "{src} should stay unsigned");
+    }
+
+    // And a signed wider operand still wins.
+    let (expr, types, _strings, _symbols) = parse_expr("(unsigned char)1 - 2L").unwrap();
+    assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Long);
+    assert!(!types.is_unsigned(expr.typ.unwrap()));
 }
 
 #[test]
@@ -1009,7 +1050,75 @@ fn test_sizeof_expr() {
 fn test_sizeof_type() {
     let (expr, types, _strings, _symbols) = parse_expr("sizeof(int)").unwrap();
     match expr.kind {
-        ExprKind::SizeofType(typ) => assert_eq!(types.kind(typ), TypeKind::Int),
+        ExprKind::SizeofType(typ, _) => assert_eq!(types.kind(typ), TypeKind::Int),
+        _ => panic!("Expected SizeofType"),
+    }
+}
+
+/// `sizeof` of a variably-modified type-name carries one size expression per
+/// array level whose extent is absent, outermost-first, because the interned
+/// type cannot hold them: `int[n]`, `int[m]` and `int[]` are one `TypeId`.
+///
+/// `sizeof_type_is_runtime` is what every consumer asks, so the pairing rule
+/// and its refusals are asserted through it rather than by counting the `Vec`.
+#[test]
+fn test_sizeof_variably_modified_type_name_carries_its_dimensions() {
+    use crate::parse::ast::sizeof_type_is_runtime;
+
+    // One absent extent, one expression.
+    let (expr, types, _s, _y) = parse_expr_with_vars("sizeof(int[n])", &["n"]).unwrap();
+    match &expr.kind {
+        ExprKind::SizeofType(typ, dims) => {
+            assert_eq!(dims.len(), 1);
+            assert!(sizeof_type_is_runtime(&types, *typ, dims));
+        }
+        _ => panic!("Expected SizeofType"),
+    }
+
+    // A constant outer level contributes no expression; the inner one does.
+    for src in ["sizeof(int[3][n])", "sizeof(int[n][3])"] {
+        let (expr, types, _s, _y) = parse_expr_with_vars(src, &["n"]).unwrap();
+        match &expr.kind {
+            ExprKind::SizeofType(typ, dims) => {
+                assert_eq!(dims.len(), 1, "{src}");
+                assert!(sizeof_type_is_runtime(&types, *typ, dims), "{src}");
+            }
+            _ => panic!("Expected SizeofType for {src}"),
+        }
+    }
+
+    // Two absent extents, two expressions, in source order.
+    let (expr, types, _s, _y) = parse_expr_with_vars("sizeof(int[n][m])", &["n", "m"]).unwrap();
+    match &expr.kind {
+        ExprKind::SizeofType(typ, dims) => {
+            assert_eq!(dims.len(), 2);
+            assert!(sizeof_type_is_runtime(&types, *typ, dims));
+        }
+        _ => panic!("Expected SizeofType"),
+    }
+
+    // Nothing variably modified: no expressions, and not a run-time size.
+    for src in ["sizeof(int)", "sizeof(int[4])", "sizeof(int[3][4])"] {
+        let (expr, types, _s, _y) = parse_expr(src).unwrap();
+        match &expr.kind {
+            ExprKind::SizeofType(typ, dims) => {
+                assert!(dims.is_empty(), "{src}");
+                assert!(!sizeof_type_is_runtime(&types, *typ, dims), "{src}");
+            }
+            _ => panic!("Expected SizeofType for {src}"),
+        }
+    }
+
+    // A pointer to a variably-modified array is the pointer's size, and its
+    // extent is not evaluated -- gcc agrees.
+    let (expr, types, _s, _y) = parse_expr_with_vars("sizeof(int(*)[n])", &["n"]).unwrap();
+    match &expr.kind {
+        ExprKind::SizeofType(typ, dims) => {
+            assert!(
+                !sizeof_type_is_runtime(&types, *typ, dims),
+                "a pointer to a VLA is not a run-time sizeof"
+            );
+        }
         _ => panic!("Expected SizeofType"),
     }
 }
@@ -1297,7 +1406,7 @@ fn test_cast_int128_non_constant_no_fold() {
 fn test_sizeof_compound_type() {
     let (expr, types, _strings, _symbols) = parse_expr("sizeof(unsigned long long)").unwrap();
     match expr.kind {
-        ExprKind::SizeofType(typ) => {
+        ExprKind::SizeofType(typ, _) => {
             assert_eq!(types.kind(typ), TypeKind::LongLong);
             assert!(types.get(typ).modifiers.contains(TypeModifiers::UNSIGNED));
         }
@@ -1309,7 +1418,7 @@ fn test_sizeof_compound_type() {
 fn test_sizeof_pointer_type() {
     let (expr, types, _strings, _symbols) = parse_expr("sizeof(int*)").unwrap();
     match expr.kind {
-        ExprKind::SizeofType(typ) => {
+        ExprKind::SizeofType(typ, _) => {
             assert_eq!(types.kind(typ), TypeKind::Pointer);
         }
         _ => panic!("Expected SizeofType"),
@@ -1843,6 +1952,59 @@ fn test_simple_program() {
     let (tu, _types, _strings, _symbols) = parse_tu("int main() { return 0; }").unwrap();
     assert_eq!(tu.items.len(), 1);
     assert!(matches!(tu.items[0], ExternalDecl::FunctionDef(_)));
+}
+
+/// C17 6.7.6.2p2 confines a variably modified ordinary identifier to block
+/// scope, and 6.7.6.2p1 requires an array size to be greater than zero.
+///
+/// Both used to fall to `unwrap_or(0)` in the first file-scope declarator's
+/// own dimension loop -- a fourth copy of array-declarator parsing that the
+/// three existing file-scope checks do not guard -- so each was accepted and
+/// silently sized zero.
+#[test]
+fn test_file_scope_array_size_constraints() {
+    for src in [
+        "int n; int bad[n];",
+        "int n; static int bad[n];",
+        "int n; int bad[n][2];",
+        "int n; int bad[2][n];",
+        "int n; int ok[2], bad[n];",
+    ] {
+        match parse_tu(src) {
+            Err(e) => assert!(
+                e.to_string().contains("file scope"),
+                "{src}: wrong message: {e}"
+            ),
+            Ok(_) => panic!("{src} should have been rejected"),
+        }
+    }
+
+    for src in [
+        "int bad[-1];",
+        // Block scope reaches the same check through `parse_declarator`.
+        "int main(void){ int bad[-1]; return 0; }",
+    ] {
+        match parse_tu(src) {
+            Err(e) => assert!(e.to_string().contains("negative"), "{src}: {e}"),
+            Ok(_) => panic!("{src} should have been rejected"),
+        }
+    }
+
+    // The forms that must keep parsing: a constant bound, an incomplete array
+    // (a tentative definition), the GNU zero-length array, and a VLA where it
+    // is legal.
+    for src in [
+        "int ok[3];",
+        "int ok[];",
+        "extern int ok[];",
+        "int ok[0];",
+        "enum { N = 4 }; int ok[N];",
+        "int ok[sizeof(int)];",
+        "int f(int n, int a[n]);",
+        "int main(void){ int n = 4; int ok[n]; return ok[0]; }",
+    ] {
+        assert!(parse_tu(src).is_ok(), "{src} should parse");
+    }
 }
 
 #[test]
@@ -3802,8 +3964,12 @@ fn test_octal_escape_boundary() {
     // \377 is max valid octal for 8-bit char
     let (expr, _types, _strings, _symbols) = parse_expr("'\\377'").unwrap();
     match expr.kind {
+        // The byte the escape denotes. Not `ch` itself: an unprefixed
+        // constant takes plain `char`'s signedness, so this is -1 on a
+        // signed-`char` host and 255 on an unsigned one, and these tests
+        // run on both.
         ExprKind::CharLit(ch) => {
-            assert_eq!(ch as u32, 0o377); // 255 in decimal
+            assert_eq!(ch as u8, 0o377); // 255 in decimal
         }
         _ => panic!("Expected character constant, got {:?}", expr.kind),
     }
@@ -3814,7 +3980,7 @@ fn test_hex_escape_single_digit() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\x0'").unwrap();
     match expr.kind {
         ExprKind::CharLit(ch) => {
-            assert_eq!(ch as u32, 0);
+            assert_eq!(ch as u8, 0);
         }
         _ => panic!("Expected character constant, got {:?}", expr.kind),
     }
@@ -3825,7 +3991,7 @@ fn test_hex_escape_max() {
     let (expr, _types, _strings, _symbols) = parse_expr("'\\xff'").unwrap();
     match expr.kind {
         ExprKind::CharLit(ch) => {
-            assert_eq!(ch as u32, 0xff);
+            assert_eq!(ch as u8, 0xff);
         }
         _ => panic!("Expected character constant, got {:?}", expr.kind),
     }
@@ -3919,7 +4085,7 @@ fn test_sizeof_expression_vs_type() {
     // sizeof applied to type in parentheses
     let (expr2, _types, _strings, _symbols) = parse_expr("sizeof(int)").unwrap();
     match &expr2.kind {
-        ExprKind::SizeofType(_) => {}
+        ExprKind::SizeofType(..) => {}
         _ => panic!("Expected sizeof type"),
     }
 }
@@ -4956,7 +5122,7 @@ fn test_builtin_expect_with_expression() {
 #[test]
 fn test_wide_char_literal() {
     let (expr, types, _, _) = parse_expr("L'A'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('A')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(65)));
     // wchar_t is int on most Unix systems
     assert_eq!(expr.typ, Some(types.int_id));
 }
@@ -4964,7 +5130,7 @@ fn test_wide_char_literal() {
 #[test]
 fn test_wide_char_escape() {
     let (expr, _, _, _) = parse_expr("L'\\n'").unwrap();
-    assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
+    assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
 // ========================================================================

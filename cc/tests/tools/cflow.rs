@@ -145,3 +145,48 @@ fn tools_cflow_mega() {
         assert!(stdout.contains("f:"), "Should contain f");
     }
 }
+
+/// cflow prints the type a declaration *spelled*, not the signedness the
+/// target gives it.
+///
+/// Plain `char` is an unsigned type on aarch64 (AAPCS64), so a type printer
+/// that asks `is_unsigned` renders `char` as `unsigned char` -- and only when
+/// cflow is built for an aarch64 host, which is why nothing caught it here.
+/// Pinned in both directions so the spelling cannot drift either way.
+#[test]
+fn tools_cflow_prints_the_declared_char_spelling() {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("c17_cflow_char_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let src = dir.join("chars.c");
+    let mut f = std::fs::File::create(&src).expect("create");
+    f.write_all(
+        b"char retc(void) { return 0; }\n\
+          signed char rets(void) { return 0; }\n\
+          unsigned char retu(void) { return 0; }\n\
+          int main(void) { return retc() + rets() + retu(); }\n",
+    )
+    .expect("write");
+    drop(f);
+
+    let (stdout, stderr, success) = run_cflow(&[src.to_str().unwrap()]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(success, "cflow failed: {stderr}");
+
+    // The row that would flip on an aarch64 host: a plain `char` return type
+    // must render as `char`, never `unsigned char`.
+    assert!(
+        stdout.contains("retc: char()"),
+        "plain char must print as `char`:\n{stdout}"
+    );
+    // Controls, so the assertion cannot pass by dropping the keyword entirely.
+    assert!(
+        stdout.contains("rets: signed char()"),
+        "signed char keeps its spelling:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("retu: unsigned char()"),
+        "unsigned char keeps its spelling:\n{stdout}"
+    );
+}

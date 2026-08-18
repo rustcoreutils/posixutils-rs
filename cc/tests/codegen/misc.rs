@@ -2165,6 +2165,14 @@ int main(void) {
 }
 
 /// Test: pointer arithmetic with char/short index uses correct sign extension
+///
+/// The negative-index sections say `signed char`, not plain `char`. Plain
+/// `char`'s signedness is implementation-defined (C17 6.2.5p15) and it is
+/// unsigned on aarch64, where `-2` is 254 and the subscript runs off the end
+/// of the array -- cross-gcc fails the plain-`char` form there too. What this
+/// test is about is whether a *signed* narrow index sign-extends, so it now
+/// says so. A plain-`char` index is still covered by the positive sections,
+/// where the two spellings agree.
 #[test]
 fn codegen_ptr_arith_narrow_index() {
     let code = r#"
@@ -2173,7 +2181,7 @@ int arr[10] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90};
 int main(void) {
     int *p = arr;
 
-    // Section 1: char index
+    // Section 1: char index (positive: signedness-independent)
     char ci = 3;
     if (*(p + ci) != 30) return 1;
 
@@ -2181,14 +2189,18 @@ int main(void) {
     short si = 5;
     if (*(p + si) != 50) return 2;
 
-    // Section 3: negative char index from middle of array
+    // Section 3: negative signed char index from middle of array
     int *mid = &arr[5];
-    char neg = -2;
+    signed char neg = -2;
     if (*(mid + neg) != 30) return 3;
 
     // Section 4: negative short index
     short sneg = -3;
     if (*(mid + sneg) != 20) return 4;
+
+    // Section 5: an unsigned narrow index must NOT sign-extend
+    unsigned char uc = 2;
+    if (*(p + uc) != 20) return 5;
 
     return 0;
 }
@@ -2515,6 +2527,86 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("vla_sizeof_mul_type", code, &[]), 0);
+}
+
+/// `sizeof` of a variably-modified *type-name* is computed at run time, and
+/// evaluates its size expressions exactly once (C17 6.5.3.4p2).
+///
+/// The test above covers `sizeof` of a declared VLA *object*, which worked.
+/// The type-name form answered **0** at every shape, because the dimension
+/// expressions are dropped where the type-name is parsed and cannot be
+/// recovered afterwards -- `int[n]`, `int[m]` and `int[]` all intern to one
+/// `TypeId`, and the array arm of `size_bits` reads its absent extent as zero.
+///
+/// Two consequences beyond the wrong number, both covered here: the size
+/// expression was never evaluated at all, so `sizeof(int[f()])` called `f`
+/// zero times; and the bogus 0 was still an integer constant expression, so
+/// `int z[sizeof(int[n])];` silently became a zero-length array.
+#[test]
+fn codegen_sizeof_of_a_variably_modified_type_name() {
+    let code = r#"
+int calls;
+int f(void) { calls++; return 4; }
+
+int main(void) {
+    int n = 4, m = 3;
+
+    /* ===== the value, at every shape (returns 1-9) ===== */
+    if (sizeof(int[n])      != 16) return 1;
+    if (sizeof(int[3][n])   != 48) return 2;
+    if (sizeof(int[n][3])   != 48) return 3;
+    if (sizeof(int[n][m])   != 48) return 4;
+    if (sizeof(int[n+1])    != 20) return 5;
+    if (sizeof(char[n])     != 4)  return 6;
+    if (sizeof(long[n])     != 32) return 7;
+
+    /* ===== controls that already worked (returns 10-19) ===== */
+    int a[n];
+    int b[3][n];
+    if (sizeof a           != 16) return 10;
+    if (sizeof b           != 48) return 11;
+    if (sizeof(int[4])     != 16) return 12;
+    if (sizeof(int[3][4])  != 48) return 13;
+    if (sizeof(int(*)[n])  != sizeof(void*)) return 14;   /* a pointer */
+
+    /* ===== the operand is evaluated, exactly once (returns 20-29) ===== */
+    calls = 0;
+    if (sizeof(int[f()]) != 16) return 20;
+    if (calls != 1) return 21;
+
+    /* once per evaluation of the sizeof, i.e. per iteration */
+    calls = 0;
+    for (int i = 0; i < 3; i++) {
+        if (sizeof(int[f()]) != 16) return 22;
+    }
+    if (calls != 3) return 23;
+
+    /* not evaluated when control never reaches it */
+    calls = 0;
+    if (0 && sizeof(int[f()]) == 16) return 24;
+    if (calls != 0) return 25;
+
+    calls = 0;
+    { int cond = 0; unsigned long z = cond ? sizeof(int[f()]) : 7u; if (z != 7) return 26; }
+    if (calls != 0) return 27;
+
+    /* a pointer-to-VLA type-name does NOT evaluate its extent (gcc agrees) */
+    calls = 0;
+    if (sizeof(int(*)[f()]) != sizeof(void*)) return 28;
+    if (calls != 0) return 29;
+
+    /* ===== the result is not an integer constant expression (30-39) ===== */
+    /* it is a run-time value, so an array declared with it is itself a VLA */
+    { int z[sizeof(int[n])]; if (sizeof z != 64) return 30; }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("sizeof_vm_type_name", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("sizeof_vm_type_name_opt", code),
+        0
+    );
 }
 
 // ============================================================================
@@ -3178,10 +3270,24 @@ int main(void) {
     assert_eq!(compile_and_run("ternary_fptr_return_type", code, &[]), 0);
 }
 
-/// Regression test: character literals >= 0x80 must be sign-extended like GCC.
-/// '\x80' should produce -128 (signed char interpretation), not 128.
-/// This broke CPython's serialization module where enum { PROTO = '\x80' }
-/// didn't match switch cases on signed char values.
+/// A character constant takes its value from plain `char`, whose signedness is
+/// the target's.
+///
+/// C17 6.4.4.4p10: an unprefixed character constant has type `int` and the
+/// value of a `char` object holding the character, converted to `int`. So
+/// `'\x80'` is -128 where plain `char` is signed (x86-64) and **128** where it
+/// is not (aarch64), and `__CHAR_UNSIGNED__` says which. Both are asserted
+/// here rather than one, because the original test hardcoded the x86-64
+/// answers and would fail on aarch64 for a conforming compiler.
+///
+/// The dispatch half is the shape that matters: CPython's serialization module
+/// writes `enum { PROTO = '\x80' }` and switches on a `char` read from a
+/// buffer. Those two must agree, and they did not while the constant's value
+/// was computed signed and the `char` type had become unsigned.
+///
+/// The prefixed forms are covered too. They take the code point in their own
+/// type and never consult plain `char` -- `L'\x80'` is 128 on every target --
+/// which the shared conversion got wrong independently of any of this.
 #[test]
 fn codegen_char_literal_signedness() {
     let code = r#"
@@ -3201,16 +3307,34 @@ int main(void) {
     char none = 'N';
     char stop = '.';
 
+    /* The enumerator and the char read back from memory must agree, whatever
+       the target's plain-char signedness is. */
     if (dispatch(&proto) != 2) return 1;  /* PROTO must match */
     if (dispatch(&none) != 1) return 2;
     if (dispatch(&stop) != 3) return 3;
 
-    /* Verify char literal value */
-    int val = '\x80';
-    if (val != -128) return 4;  /* must be -128, not 128 */
-
+    /* The value itself, per target. */
+    int val  = '\x80';
     int val2 = '\xff';
-    if (val2 != -1) return 5;  /* must be -1, not 255 */
+#ifdef __CHAR_UNSIGNED__
+    if (val  != 128) return 4;
+    if (val2 != 255) return 5;
+    if ((int)proto != 128) return 6;
+#else
+    if (val  != -128) return 4;
+    if (val2 != -1) return 5;
+    if ((int)proto != -128) return 6;
+#endif
+
+    /* An ASCII constant is the same everywhere. */
+    if ('N' != 78 || '.' != 46) return 7;
+
+    /* A prefixed constant is the code point, on every target. */
+    if ((int)L'\x80' != 128) return 10;
+    if ((int)u'\x80' != 128) return 11;
+    if ((int)U'\x80' != 128) return 12;
+    if ((int)L'\xe9' != 233) return 13;
+    if ((int)L'e' != 101) return 14;
 
     return 0;
 }
@@ -8705,9 +8829,13 @@ __attribute__((noinline)) static long lo(i128 v) { return (long)v; }
 __attribute__((noinline)) static long uhi(u128 v) { return (long)(v >> 64); }
 
 int main(void) {
-    /* Signed sources sign-extend into both halves. */
+    /* Signed sources sign-extend into both halves. `signed char`, not plain
+       `char`: plain char's signedness is implementation-defined (C17
+       6.2.5p15) and it is *unsigned* on aarch64, where -3 is 253 and neither
+       half would be negative. This test is about widening, not about which
+       sign plain char happens to have. */
     {
-        char c = -3;
+        signed char c = -3;
         if (lo(c) != -3 || hi(c) != -1) return 1;
     }
     {
@@ -8987,6 +9115,64 @@ int main(void) {
 "#;
     assert_eq!(
         compile_and_run("codegen_attr_alignment_scope", code, &[]),
+        0
+    );
+}
+
+/// A pointer comparison is unsigned, and an enumeration takes the signedness
+/// of the type wide enough to hold it.
+///
+/// Both were asked of a predicate that answers about *integer* types: a
+/// pointer is not one, so `is_unsigned` said false and `a < b` emitted a
+/// signed `setl` where gcc emits `setb` -- C17 6.5.8 compares addresses, and
+/// an address is unsigned. And an enumeration never carried a signedness at
+/// all, so although `enum_underlying_type` correctly picked `unsigned int`
+/// for `enum E { BIG = 0x80000000u }`, an *object* of that type was loaded
+/// and compared as signed: `e` read back -2147483648 and `e < 0` was true,
+/// while the constant `BIG` was right all along.
+#[test]
+fn codegen_pointer_and_enum_signedness() {
+    let code = r#"
+enum Big  { BIG = 0x80000000u };          /* needs unsigned int */
+enum Wide { W = 0x100000000 };            /* needs a 64-bit type */
+enum Neg  { N = -1, P = 2147483647 };     /* stays plain int     */
+
+int main(void) {
+    /* ===== pointer comparison (returns 1-9) ===== */
+    char buf[8];
+    char *lo = buf, *hi = buf + 4;
+    if (!(lo < hi)) return 1;
+    if (hi < lo) return 2;
+    if (!(hi > lo)) return 3;
+    if (!(lo <= lo)) return 4;
+    if (!(hi >= lo)) return 5;
+    if (lo >= hi) return 6;
+
+    /* ===== an unsigned enumeration (returns 10-19) ===== */
+    enum Big e = BIG;
+    if (e < 0) return 10;                      /* the bug: this was true */
+    if ((long long)e != 2147483648LL) return 11;
+    if (sizeof(enum Big) != 4) return 12;
+    if (BIG < 0) return 13;                    /* the constant was always right */
+    if (e != BIG) return 14;
+
+    /* ===== a 64-bit enumeration (returns 20-29) ===== */
+    enum Wide w = W;
+    if ((long long)w != 4294967296LL) return 20;
+    if (sizeof(enum Wide) != 8) return 21;
+
+    /* ===== one holding negatives stays signed (returns 30-39) ===== */
+    enum Neg n = N;
+    if (n != -1) return 30;
+    if (!(n < 0)) return 31;
+    if (sizeof(enum Neg) != 4) return 32;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("ptr_enum_signedness", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("ptr_enum_signedness_opt", code),
         0
     );
 }

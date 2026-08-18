@@ -21,7 +21,7 @@ use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
 use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
-use posixutils_cc::types::{TypeKind, TypeTable};
+use posixutils_cc::types::{TypeKind, TypeModifiers, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -587,13 +587,21 @@ fn declarator_line(lines: &[&str], start_line: u32, name: &str) -> u32 {
 /// Format a type as a string
 fn format_type(typ: posixutils_cc::types::TypeId, types: &TypeTable) -> String {
     let t = types.get(typ);
-    let is_unsigned = types.is_unsigned(typ);
+    // The spelling the declaration used, not the signedness the target gives
+    // it: plain `char` is an unsigned type on aarch64 and is still written
+    // `char`. `is_unsigned` here would print `unsigned char` for a source
+    // that says `char`, and only on aarch64 hosts.
+    let is_unsigned = types.spelled_unsigned(typ);
     match t.kind {
         TypeKind::Void => "void".to_string(),
         TypeKind::Bool => "_Bool".to_string(),
         TypeKind::Char => {
+            // C17 6.2.5p15 makes `char`, `signed char` and `unsigned char`
+            // three distinct types, so all three spellings are reported.
             if is_unsigned {
                 "unsigned char".to_string()
+            } else if t.modifiers.contains(TypeModifiers::SIGNED) {
+                "signed char".to_string()
             } else {
                 "char".to_string()
             }

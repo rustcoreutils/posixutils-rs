@@ -421,32 +421,57 @@ struct F { char c; short :0; char d; };          /* a narrower unit         */
 struct G { int :0; char c; };                    /* first, before anything  */
 struct H { int a:3; int :4; int :0; int b:5; };  /* beside an unnamed field */
 struct P { char c; int :0; char d; } __attribute__((packed));
+struct Z { char c; char :0; char d; };           /* asks for alignment 1    */
+union  U { char c; int :0; };                    /* in a union              */
+union  V { char c; long :0; };
+union  W { char c; int :0; } __attribute__((packed));
 
 int main(void) {
-    if (sizeof(struct A) != 5) return 1;
+    /* The boundary itself is target-independent: every one of these offsets
+       is the same under gcc on both targets. */
     if (offsetof(struct A, c) != 0) return 2;
     if (offsetof(struct A, d) != 4) return 3;
-
-    if (sizeof(struct B) != 8) return 4;
-    if (sizeof(struct C) != 5) return 5;
-    if (sizeof(struct D) != 8) return 6;
-
-    /* The boundary still applies with no member after it. */
-    if (sizeof(struct E) != 4) return 7;
-
-    if (sizeof(struct F) != 3) return 8;
     if (offsetof(struct F, d) != 2) return 9;
-
-    /* Nothing precedes it, so there is no boundary to cross. */
-    if (sizeof(struct G) != 1) return 10;
     if (offsetof(struct G, c) != 0) return 11;
+    if (offsetof(struct P, d) != 4) return 45;
 
-    if (sizeof(struct H) != 8) return 12;
+    /* So are the shapes whose alignment an int bitfield already set. */
+    if (sizeof(struct B) != 8 || _Alignof(struct B) != 4) return 4;
+    if (sizeof(struct D) != 8 || _Alignof(struct D) != 4) return 6;
+    if (sizeof(struct H) != 8 || _Alignof(struct H) != 4) return 12;
+    /* A `char :0` asks for alignment 1, so it changes nothing anywhere. */
+    if (sizeof(struct Z) != 2 || _Alignof(struct Z) != 1) return 46;
 
-    /* packed does not suppress the boundary, and neither raises the
-       struct's own alignment -- A is 5 bytes, not 8. */
-    if (sizeof(struct P) != 5) return 13;
-    if (offsetof(struct P, d) != 4) return 14;
+    /* What the two ABIs disagree about is whether a zero-width bitfield
+       raises the *aggregate's* alignment. C17 6.7.2.1p12 leaves it to them:
+       the x86-64 psABI says no, so A is 5 bytes with alignment 1; AAPCS64
+       says it contributes its declared type's alignment, making A 8 with
+       alignment 4 -- and, unlike an ordinary member's, that survives packing.
+       Every number below is gcc's on the target it is written for. */
+#ifdef __aarch64__
+    if (sizeof(struct A) != 8 || _Alignof(struct A) != 4) return 40;
+    if (sizeof(struct C) != 8 || _Alignof(struct C) != 4) return 41;
+    if (sizeof(struct E) != 4 || _Alignof(struct E) != 4) return 42;
+    if (sizeof(struct F) != 4 || _Alignof(struct F) != 2) return 43;
+    if (sizeof(struct G) != 4 || _Alignof(struct G) != 4) return 10;
+    if (sizeof(struct P) != 8 || _Alignof(struct P) != 4) return 44;
+    /* A union takes the alignment too, and with it the trailing padding. */
+    if (sizeof(union U) != 4 || _Alignof(union U) != 4) return 47;
+    if (sizeof(union V) != 8 || _Alignof(union V) != 8) return 48;
+    if (sizeof(union W) != 4 || _Alignof(union W) != 4) return 49;
+#else
+    if (sizeof(struct A) != 5 || _Alignof(struct A) != 1) return 40;
+    if (sizeof(struct C) != 5 || _Alignof(struct C) != 1) return 41;
+    if (sizeof(struct E) != 4 || _Alignof(struct E) != 1) return 42;
+    if (sizeof(struct F) != 3 || _Alignof(struct F) != 1) return 43;
+    if (sizeof(struct G) != 1 || _Alignof(struct G) != 1) return 10;
+    if (sizeof(struct P) != 5 || _Alignof(struct P) != 1) return 44;
+    /* A zero-width bitfield occupies no storage, so it cannot widen a union:
+       the union is as wide as its widest real member. */
+    if (sizeof(union U) != 1 || _Alignof(union U) != 1) return 47;
+    if (sizeof(union V) != 1 || _Alignof(union V) != 1) return 48;
+    if (sizeof(union W) != 1 || _Alignof(union W) != 1) return 49;
+#endif
 
     /* The surrounding fields still read and write correctly. */
     struct B b;

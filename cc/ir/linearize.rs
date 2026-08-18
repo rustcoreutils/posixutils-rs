@@ -491,26 +491,6 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Apply C99 integer promotions (6.3.1.1)
-    /// Types smaller than int are promoted to int (or unsigned int if int can't hold all values)
-    pub(crate) fn integer_promote(&self, typ_id: TypeId) -> TypeId {
-        // Integer promotions apply to _Bool, char, short (and their unsigned variants)
-        // They are promoted to int if int can represent all values, otherwise unsigned int
-        match self.types.kind(typ_id) {
-            TypeKind::Bool | TypeKind::Char | TypeKind::Short => {
-                // int (32-bit signed) can represent all values of:
-                // - _Bool (0-1)
-                // - char/signed char (-128 to 127)
-                // - unsigned char (0 to 255)
-                // - short/signed short (-32768 to 32767)
-                // - unsigned short (0 to 65535)
-                // So always promote to int
-                self.types.int_id
-            }
-            _ => typ_id,
-        }
-    }
-
     /// Compute the common type for usual arithmetic conversions (C99 6.3.1.8)
     /// Returns the wider type that both operands should be converted to
     pub(crate) fn common_type(&self, left: TypeId, right: TypeId) -> TypeId {
@@ -556,8 +536,8 @@ impl<'a> Linearizer<'a> {
         }
 
         // Apply integer promotions first (C99 6.3.1.1)
-        let left_promoted = self.integer_promote(left);
-        let right_promoted = self.integer_promote(right);
+        let left_promoted = self.types.integer_promote(left);
+        let right_promoted = self.types.integer_promote(right);
 
         let left_size = self.types.size_bits(left_promoted);
         let right_size = self.types.size_bits(right_promoted);
@@ -824,6 +804,11 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
         // Set current position for debug info (function definition location)
         self.current_pos = Some(func.pos);
+
+        // C17 6.8.6.1p1, before anything is lowered: entering the scope of a
+        // variably modified identifier without executing its declaration
+        // leaves the object's size never computed.
+        self.check_jumps_into_variably_modified_scopes(&func.body);
 
         // Reset per-function state
         self.next_pseudo = 0;
@@ -1570,11 +1555,19 @@ impl<'a> Linearizer<'a> {
             // Assignments have side effects
             ExprKind::Assign { .. } => false,
 
-            // Sizeof and _Alignof are always pure (compile-time constant)
-            ExprKind::SizeofType(_)
-            | ExprKind::SizeofExpr(_)
-            | ExprKind::AlignofType(_)
-            | ExprKind::AlignofExpr(_) => true,
+            // `sizeof` of a variable length array type is the one form that
+            // evaluates its operand (6.5.3.4p2), and that operand can call a
+            // function. Reporting it pure lets a conditional expression be
+            // lowered branchlessly, which evaluates *both* arms -- so
+            // `c ? sizeof(int[f()]) : 0` would call `f` even when `c` is
+            // false, against 6.5.15p4.
+            ExprKind::SizeofType(typ, dims) => {
+                !crate::parse::ast::sizeof_type_is_runtime(self.types, *typ, dims)
+                    || dims.iter().all(|d| self.is_pure_expr(d))
+            }
+
+            // The other three never evaluate anything.
+            ExprKind::SizeofExpr(_) | ExprKind::AlignofType(_) | ExprKind::AlignofExpr(_) => true,
 
             // Comma expressions: pure if all sub-expressions are pure
             ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e)),
@@ -3061,7 +3054,7 @@ impl<'a> Linearizer<'a> {
                             TypeKind::Float | TypeKind::Float16 => Some(self.types.double_id),
                             // _Bool, char and short promote to int.
                             _ => {
-                                let promoted = self.integer_promote(arg_type);
+                                let promoted = self.types.integer_promote(arg_type);
                                 (promoted != arg_type).then_some(promoted)
                             }
                         };
@@ -4914,7 +4907,7 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::CharLit(c) => {
                 let typ = self.expr_type(expr);
-                self.emit_const(*c as u8 as i8 as i128, typ)
+                self.emit_const(*c as i128, typ)
             }
 
             ExprKind::StringLit(s) => {
@@ -4976,10 +4969,25 @@ impl<'a> Linearizer<'a> {
                 expr: inner_expr,
             } => self.linearize_cast(inner_expr, *cast_type),
 
-            ExprKind::SizeofType(typ) => {
-                let size = self.types.size_bits(*typ) / 8;
+            ExprKind::SizeofType(typ, dims) => {
                 // sizeof returns size_t, which is unsigned long in our implementation
                 let result_typ = self.types.ulong_id;
+
+                // C17 6.5.3.4p2: for a variable length array type the operand
+                // is evaluated and the size computed at run time.
+                // `record_vm_extents` pairs one size expression with each
+                // absent extent -- the same pairing a declared `int a[n][4][m]`
+                // goes through -- and spills each to a hidden local, so the
+                // expression is linearized exactly once however many times the
+                // product reads it back.
+                if crate::parse::ast::sizeof_type_is_runtime(self.types, *typ, dims) {
+                    let (extents, elem) = self.record_vm_extents(*typ, dims, "sizeof");
+                    if let Some(size) = self.vm_extent_size(&extents, elem) {
+                        return size;
+                    }
+                }
+
+                let size = self.types.size_bits(*typ) / 8;
                 self.emit_const(size as i128, result_typ)
             }
 

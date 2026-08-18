@@ -2716,19 +2716,10 @@ impl X86_64CodeGen {
             _ => Reg::R10, // Use scratch register R10
         };
 
-        // Determine if we need sign or zero extension for small types
-        // is_unsigned() returns true for explicitly unsigned types
-        // For plain char, use target.char_signed to determine signedness
-        let is_unsigned = insn.typ.is_some_and(|t| {
-            if types.is_unsigned(t) {
-                true
-            } else if types.is_plain_char(t) {
-                // Plain char: unsigned if target says char is not signed
-                !self.base.target.char_signed
-            } else {
-                false
-            }
-        });
+        // Sign- or zero-extend by the type's signedness. `is_unsigned`
+        // answers for plain `char` per the target, so there is nothing to
+        // special-case here.
+        let is_unsigned = insn.typ.is_some_and(|t| types.is_unsigned(t));
 
         let addr_loc = self.get_location(addr);
         match addr_loc {
@@ -3862,18 +3853,10 @@ impl X86_64CodeGen {
         // Check if this is long double (uses x87, not XMM)
         let is_longdouble = typ.is_some_and(|t| types.kind(t) == TypeKind::LongDouble);
 
-        // Determine if the type is unsigned (for proper sign/zero extension)
-        // For plain char, use target.char_signed to determine signedness
-        let is_unsigned = typ.is_some_and(|t| {
-            if types.is_unsigned(t) {
-                true
-            } else if types.is_plain_char(t) {
-                // Plain char: unsigned if target says char is not signed
-                !self.base.target.char_signed
-            } else {
-                false
-            }
-        });
+        // Sign- or zero-extend by the type's signedness. `is_unsigned`
+        // answers for plain `char` per the target, so there is nothing to
+        // special-case here.
+        let is_unsigned = typ.is_some_and(|t| types.is_unsigned(t));
 
         if is_fp_copy {
             // Long double uses x87, not XMM
@@ -4991,15 +4974,7 @@ impl X86_64CodeGen {
             return;
         }
 
-        let is_unsigned = insn.typ.is_some_and(|t| {
-            if types.is_unsigned(t) {
-                true
-            } else if types.is_plain_char(t) {
-                !self.base.target.char_signed
-            } else {
-                false
-            }
-        });
+        let is_unsigned = insn.typ.is_some_and(|t| types.is_unsigned(t));
 
         let src_size = OperandSize::from_bits(mem_size);
         if is_unsigned {

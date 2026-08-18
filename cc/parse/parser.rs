@@ -3239,7 +3239,17 @@ impl Parser<'_> {
                 is_complete: true,
             };
 
-            let enum_type = Type::enum_type(composite);
+            let mut enum_type = Type::enum_type(composite);
+            // C17 6.7.2.2p4: the enumerated type shall represent every member.
+            // `enum_underlying_type` picks a type that does, but the enum's own
+            // type carried no signedness, so an *object* of it was loaded and
+            // compared as signed even where the underlying type is unsigned:
+            // `enum E { BIG = 0x80000000u }; enum E e = BIG;` read back
+            // -2147483648 and `e < 0` was true, while the constant `BIG` was
+            // correct all along.
+            if self.types.is_unsigned(underlying) {
+                enum_type.modifiers |= TypeModifiers::UNSIGNED;
+            }
 
             // Register tag if present
             if let Some(tag_name) = tag {
@@ -3736,10 +3746,16 @@ impl Parser<'_> {
                 } else {
                     // It's an expression starting with * (e.g., [*ptr])
                     self.pos = saved_pos;
+                    let size_pos = self.current_pos();
                     let expr = self.parse_assignment_expr()?;
                     match self.eval_const_expr(&expr) {
                         Some(n) if n >= 0 => Some(n as usize),
-                        Some(_) => None,
+                        Some(_) => {
+                            return Err(ParseError::new(
+                                "size of array is negative".to_string(),
+                                size_pos,
+                            ));
+                        }
                         None => {
                             vla_exprs.push(expr);
                             None
@@ -3748,11 +3764,20 @@ impl Parser<'_> {
                 }
             } else {
                 // Parse constant expression for array size (C99 6.7.5.2)
+                let size_pos = self.current_pos();
                 let expr = self.parse_assignment_expr()?;
                 // Evaluate as integer constant expression
                 match self.eval_const_expr(&expr) {
                     Some(n) if n >= 0 => Some(n as usize),
-                    Some(_) => None, // Negative size is invalid
+                    // C17 6.7.6.2p1: the size shall be greater than zero.
+                    // This used to become `None`, i.e. an incomplete array,
+                    // so `int a[-1]` was accepted and silently sized zero.
+                    Some(_) => {
+                        return Err(ParseError::new(
+                            "size of array is negative".to_string(),
+                            size_pos,
+                        ));
+                    }
                     None => {
                         // Non-constant (VLA) - save expression for VLA handling
                         vla_exprs.push(expr);
@@ -4237,6 +4262,20 @@ impl Parser<'_> {
 
             if self.is_special(b',') {
                 self.advance();
+                // C17 6.7.6.3: a parameter-type-list is a comma-separated list
+                // of parameter declarations, optionally followed by `, ...`.
+                // Nothing else may follow the comma. Falling through here let
+                // `parse_type_specifier` supply an implicit `int`, so
+                // `void g(int, );` silently declared `void(int, int)` -- and
+                // once call arity was checked, the *correct* call `g(1)`
+                // became the one rejected. (C23 permits the trailing comma;
+                // this compiler is C17.)
+                if self.is_special(b')') {
+                    return Err(ParseError::new(
+                        "expected a declaration specifier or '...' after ','".to_string(),
+                        self.current_pos(),
+                    ));
+                }
             } else {
                 break;
             }
@@ -4951,20 +4990,47 @@ impl Parser<'_> {
         let mut declarators = Vec::new();
 
         // Handle array - collect dimensions first, build type from right to left
+        //
+        // This is the first declarator of a file-scope declaration, which has
+        // its own dimension loop rather than going through `parse_declarator`.
+        // That is why the three "variable length arrays cannot have file
+        // scope" checks elsewhere in this function never saw a plain
+        // `int bad[n];`: they guard the grouped-declarator, K&R and
+        // second-declarator paths. Here every unusable size folded to
+        // `unwrap_or(0)`, so the declaration was accepted and sized zero.
         let mut var_type_id = typ_id;
         let mut dimensions: Vec<Option<usize>> = Vec::new();
         while self.is_special(b'[') {
             self.advance();
             let size = if self.is_special(b']') {
+                // No size given at all: an incomplete type, which is a
+                // tentative definition at file scope and legal.
                 None
             } else {
                 // Parse constant expression for array size (C99 6.7.5.2)
+                let size_pos = self.current_pos();
                 let arr_expr = self.parse_assignment_expr()?;
                 // Evaluate as integer constant expression
                 match self.eval_const_expr(&arr_expr) {
                     Some(n) if n >= 0 => Some(n as usize),
-                    Some(_) => None, // Negative size is invalid
-                    None => None,    // Non-constant (VLA) or invalid expression
+                    // C17 6.7.6.2p1: the size shall be greater than zero. Zero
+                    // itself is a GNU extension gcc accepts, so only a
+                    // negative size is refused here.
+                    Some(_) => {
+                        return Err(ParseError::new(
+                            "size of array is negative".to_string(),
+                            size_pos,
+                        ));
+                    }
+                    // A size expression that is not a constant makes the type
+                    // variably modified, which 6.7.6.2p2 confines to block
+                    // scope.
+                    None => {
+                        return Err(ParseError::new(
+                            "variable length arrays cannot have file scope".to_string(),
+                            size_pos,
+                        ));
+                    }
                 }
             };
             self.expect_special(b']')?;
@@ -5204,7 +5270,7 @@ impl Parser<'_> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val as i128),
             ExprKind::Int128Lit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i128),
+            ExprKind::CharLit(c) => Some(*c as i128),
             // Float literals are constant, return truncated value
             ExprKind::FloatLit(val) => Some(val.to_f64() as i128),
 
@@ -5287,8 +5353,16 @@ impl Parser<'_> {
                 }
             }
 
-            // sizeof(type) - constant for complete types
-            ExprKind::SizeofType(type_id) => {
+            // sizeof(type) - constant for complete types, but *not* for a
+            // variable length array type, whose size 6.5.3.4p2 computes at run
+            // time. The type table cannot tell `int[n]` from `int[]`, so
+            // answering from it alone gave 0 -- and a 0 that was still an
+            // integer constant expression, so `int z[sizeof(int[n])];`
+            // silently became a zero-length array.
+            ExprKind::SizeofType(type_id, dims) => {
+                if crate::parse::ast::sizeof_type_is_runtime(self.types, *type_id, dims) {
+                    return None;
+                }
                 let size_bits = self.types.size_bits(*type_id);
                 Some((size_bits / 8) as i128)
             }
@@ -5450,8 +5524,10 @@ impl Parser<'_> {
         }
 
         // Warning: one-bit signed bitfield has dubious values
-        // (can only hold -1 or 0 in 2's complement, or 0/-0 in other representations)
-        if width == 1 && !self.types.is_unsigned(typ_id) && kind != TypeKind::Bool {
+        // (can only hold -1 or 0 in 2's complement, or 0/-0 in other representations).
+        // `_Bool` needs no exemption here: it is an unsigned type, which
+        // `is_unsigned` now reports, so `_Bool f:1` is an ordinary flag.
+        if width == 1 && !self.types.is_unsigned(typ_id) {
             diag::warning(
                 self.current_pos(),
                 &gettext("single-bit signed bit-field has dubious values"),

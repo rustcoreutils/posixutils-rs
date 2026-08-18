@@ -172,6 +172,31 @@ pub enum SpecialToken {
     Ellipsis,        // ...
 }
 
+/// Does this universal character name name a character C17 6.4.3p2 forbids?
+///
+/// A UCN "shall not specify a character whose short identifier is less than
+/// 00A0 other than 0024 ($), 0040 (@), or 0060 (`), nor one in the range D800
+/// through DFFF inclusive." The first half keeps a UCN from spelling a
+/// character that already has a spelling -- `\u0041` for `A` -- and the second
+/// excludes the UTF-16 surrogate range, which is not a character at all.
+///
+/// Takes the raw scalar rather than a `char` because a surrogate cannot be
+/// represented as one: `char::from_u32` rejects it, and every caller used to
+/// treat that failure as "not an escape" and carry on with the letter `u`.
+/// Report a universal character name C17 6.4.3p2 forbids, spelled as the
+/// source spells it so the message can be matched against what was written.
+pub(crate) fn report_forbidden_ucn(pos: Position, val: u32) {
+    let (prefix, width) = if val > 0xFFFF { ('U', 8) } else { ('u', 4) };
+    crate::diag::error(
+        pos,
+        &format!("\\{prefix}{val:0width$x} is not a valid universal character"),
+    );
+}
+
+pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
+    (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60) || (0xD800..=0xDFFF).contains(&val)
+}
+
 impl SpecialToken {
     pub const BASE: u32 = 256;
 }
@@ -638,6 +663,14 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             .map(|&b| b as char)
             .collect();
         let val = u32::from_str_radix(&hex_str, 16).ok()?;
+        // C17 6.4.3p2. Diagnosed here rather than folded into the `?` below,
+        // because a forbidden UCN is a constraint violation and not simply
+        // "no UCN here": returning `None` would leave the backslash to be
+        // lexed as some other token and report something unrelated.
+        if ucn_is_forbidden(val) {
+            report_forbidden_ucn(self.pos(), val);
+            return None;
+        }
         let ch = char::from_u32(val)?;
 
         // Calculate bytes consumed from self.offset
@@ -701,6 +734,10 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         }
 
         let val = u32::from_str_radix(&hex, 16).ok()?;
+        if ucn_is_forbidden(val) {
+            report_forbidden_ucn(self.pos(), val);
+            return None;
+        }
         char::from_u32(val)
     }
 
@@ -2034,10 +2071,44 @@ mod tests {
 
     #[test]
     fn test_ucn_long_form() {
-        // Long UCN form: \U00000041 = 'A'
-        let (tokens, idents) = tokenize_str("test\\U00000041bc");
+        // Long UCN form, with a code point it is allowed to name.
+        //
+        // This used to use `\U00000041` and assert the identifier `testAbc`,
+        // which C17 6.4.3p2 forbids: a UCN may not name a character below
+        // 00A0 other than `$`, `@` and `` ` ``, precisely so it cannot spell
+        // an `A` that already has a spelling. gcc rejects that input, and so
+        // does c17 now, so the long form is exercised with `\U000000E9`.
+        let (tokens, idents) = tokenize_str("test\\U000000E9bc");
         assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &idents), "testAbc");
+        assert_eq!(show_token(&tokens[1], &idents), "testébc");
+    }
+
+    #[test]
+    fn test_ucn_forbidden_characters() {
+        // C17 6.4.3p2, in both the short and long forms, and at both ends of
+        // the surrogate range -- a surrogate has no `char`, so it used to fail
+        // `char::from_u32` and be taken for "not an escape" entirely.
+        for src in [
+            "test\\u0041bc",
+            "test\\U00000041bc",
+            "\\u0061bc",
+            "test\\u0020bc",
+            "test\\ud800bc",
+            "test\\udfffbc",
+        ] {
+            assert!(
+                ucn_is_forbidden(match src.split_once("\\u").or(src.split_once("\\U")) {
+                    Some((_, rest)) => u32::from_str_radix(&rest[..4.min(rest.len())], 16)
+                        .unwrap_or_else(|_| u32::from_str_radix(&rest[..8], 16).unwrap()),
+                    None => unreachable!(),
+                }),
+                "{src} should name a forbidden character"
+            );
+        }
+        // The three carve-outs, and everything from 00A0 up.
+        for val in [0x24, 0x40, 0x60, 0xA0, 0xE9, 0xC5, 0x1F600] {
+            assert!(!ucn_is_forbidden(val), "{val:#x} is permitted");
+        }
     }
 
     #[test]

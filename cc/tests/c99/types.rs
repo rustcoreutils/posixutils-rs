@@ -11,7 +11,7 @@
 // Consolidates: longlong, bool, complex tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C99 types (long long, _Bool)
@@ -287,6 +287,91 @@ int main(void)
 }
 "#;
     assert_eq!(compile_and_run("bitfield_sign_extend", src, &[]), 0);
+}
+
+/// A `_Bool` bitfield holds 0 or 1, and reads back as 0 or 1.
+///
+/// C17 6.2.5p6 lists `_Bool` among the standard *unsigned* integer types, and
+/// 6.3.1.2 makes every conversion into it yield exactly 0 or 1. Two separate
+/// defects broke that, in opposite directions, so a test of only one value
+/// would have missed one of them:
+///
+/// ```text
+///   struct S { _Bool f:1; };
+///   struct S a = {1};   read back -1   -- the load sign-extended
+///   struct S b = {2};   read back  0   -- the initializer truncated 2 to
+///                                        one bit without normalizing first
+///   a.f == 1            was false
+/// ```
+///
+/// The load was extended because `_Bool` carries no `unsigned` modifier and the
+/// signedness predicate read that bit; for a one-bit field the extension is
+/// `shl 31; sar 31`, which turns 1 into -1. The initializer converted to the
+/// field's unsigned *storage* type instead of to `_Bool`, so it never reached
+/// the normalization every other conversion into `_Bool` gets.
+#[test]
+fn c99_bool_bitfields_hold_zero_or_one() {
+    let src = r#"
+struct S { _Bool f : 1; };
+struct M { _Bool a : 1; unsigned b : 1; int c : 3; _Bool d : 1; };
+
+__attribute__((noinline)) static int as_int(_Bool v) { return (int)v; }
+
+int main(void)
+{
+    /* Assignment: any non-zero stores as 1 (returns 1-9). */
+    struct S s = {0};
+    s.f = 1;    if ((int)s.f != 1) return 1;
+    s.f = 2;    if ((int)s.f != 1) return 2;
+    s.f = -1;   if ((int)s.f != 1) return 3;
+    s.f = 0;    if ((int)s.f != 0) return 4;
+    s.f = 3;    if ((int)s.f != 1) return 5;
+
+    /* Brace initializers -- the second, independent defect (returns 10-19). */
+    { struct S v = {0};  if ((int)v.f != 0) return 10; }
+    { struct S v = {1};  if ((int)v.f != 1) return 11; }
+    { struct S v = {2};  if ((int)v.f != 1) return 12; }
+    { struct S v = {3};  if ((int)v.f != 1) return 13; }
+    { struct S v = {-1}; if ((int)v.f != 1) return 14; }
+    { struct S v = {.f = 2}; if ((int)v.f != 1) return 15; }
+
+    /* The value must be usable as a value, not merely print as one (20-29). */
+    s.f = 1;
+    if (s.f != 1) return 20;
+    if (!(s.f == 1)) return 21;
+    if (s.f + 0 != 1) return 22;
+    if (s.f * 2 != 2) return 23;
+    if (s.f < 0) return 24;
+    if (!s.f) return 25;
+    if (as_int(s.f) != 1) return 26;
+
+    /* Compound assignment, increment, and struct copy all read the same
+       load, so each would have shown -1 too (returns 30-39). */
+    s.f = 0; s.f |= 1;      if ((int)s.f != 1) return 30;
+    s.f = 0; s.f++;         if ((int)s.f != 1) return 31;
+    s.f = 1; s.f ^= 0;      if ((int)s.f != 1) return 32;
+    { struct S c = s;       if ((int)c.f != 1) return 33; }
+
+    /* Neighbours keep their own signedness -- the control that stops this
+       passing by never extending anything (returns 40-49). */
+    struct M m = {0};
+    m.a = 1; m.b = 1; m.c = -4; m.d = 1;
+    if ((int)m.a != 1) return 40;
+    if ((int)m.b != 1) return 41;
+    if (m.c != -4) return 42;      /* a signed 3-bit field still extends */
+    if ((int)m.d != 1) return 43;
+    m.c = 3;
+    if (m.c != 3) return 44;
+
+    /* Two _Bool fields in one unit add up, rather than cancelling at -1. */
+    m.a = 1; m.d = 1;
+    if (m.a + m.d != 2) return 45;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("bool_bitfield", src, &[]), 0);
+    assert_eq!(compile_and_run_optimized("bool_bitfield_opt", src), 0);
 }
 
 /// Bitfield allocation is a running bit offset from the start of the struct.

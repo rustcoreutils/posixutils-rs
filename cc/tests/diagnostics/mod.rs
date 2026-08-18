@@ -206,6 +206,71 @@ fn diagnostics_plain_vla_is_accepted() {
 }
 
 // ============================================================================
+// #C88 — a variably modified declaration at file scope (C17 6.7.6.2p2)
+// ============================================================================
+
+/// 6.7.6.2p2 confines an ordinary identifier with a variably modified type to
+/// block scope. c17 accepted one at file scope and sized it **zero**: the
+/// first file-scope declarator has its own array-dimension loop, separate from
+/// `parse_declarator`, and it mapped every non-constant dimension to
+/// `unwrap_or(0)` without recording a VLA or saying anything. So `int bad[n];`
+/// compiled, `sizeof bad` was 0, and every access ran off the end.
+///
+/// The three checks that already existed reached only the grouped-declarator,
+/// K&R and second-declarator paths, which is why a plain `int bad[n];` walked
+/// past all of them.
+#[test]
+fn diagnostics_variably_modified_declaration_at_file_scope_is_rejected() {
+    for (name, src) in [
+        ("fs_vla", "int n;\nint bad[n];\n"),
+        ("fs_vla_static", "int n;\nstatic int bad[n];\n"),
+        ("fs_vla_extern", "int n;\nextern int bad[n];\n"),
+        ("fs_vla_2d", "int n;\nint bad[n][2];\n"),
+        ("fs_vla_inner", "int n;\nint bad[2][n];\n"),
+        ("fs_vla_expr", "int n;\nint bad[n + 1];\n"),
+        ("fs_vla_call", "int f(void);\nint bad[f()];\n"),
+        // Second and later declarators were already caught; pinned so the
+        // first-declarator fix does not become the only path that checks.
+        ("fs_vla_second", "int n;\nint ok[2], bad[n];\n"),
+        // Through a `sizeof` of a variably modified type-name, which is not a
+        // constant expression either (#C52).
+        ("fs_vla_sizeof", "int n;\nint bad[sizeof(int[n])];\n"),
+    ] {
+        compile_expect_error(name, src, "file scope");
+    }
+}
+
+/// A size that is a constant but not positive is a different constraint
+/// (6.7.6.2p1: the size shall be greater than zero) and had the same cause --
+/// a negative dimension also fell to `unwrap_or(0)` and was silently accepted.
+#[test]
+fn diagnostics_negative_array_size_is_rejected() {
+    compile_expect_error("neg_array", "int bad[-1];\n", "negative");
+    compile_expect_error(
+        "neg_array_block",
+        "int main(void){ int bad[-1]; return bad[0]; }\n",
+        "negative",
+    );
+}
+
+/// The forms that must keep working: a constant size, an incomplete array at
+/// file scope (a tentative definition, and the `extern` form), a zero-length
+/// array (a GNU extension gcc accepts), and a VLA where it is legal.
+#[test]
+fn diagnostics_ordinary_file_scope_arrays_are_accepted() {
+    compile_expect_ok("fs_const", "int ok[3];\n");
+    compile_expect_ok("fs_incomplete", "int ok[];\n");
+    compile_expect_ok("fs_extern_incomplete", "extern int ok[];\n");
+    compile_expect_ok("fs_zero_len", "int ok[0];\n");
+    compile_expect_ok("fs_enum_size", "enum { N = 4 }; int ok[N];\n");
+    compile_expect_ok("fs_sizeof_size", "int ok[sizeof(int)];\n");
+    compile_expect_ok(
+        "block_vla_still_ok",
+        "int main(void){ int n = 4; int ok[n]; ok[0] = 1; return ok[0] - 1; }\n",
+    );
+}
+
+// ============================================================================
 // #L6 — call argument count (C99 6.5.2.2p2)
 // ============================================================================
 
@@ -1646,4 +1711,372 @@ __attribute__((used)) static int used_var;
 int main(void) { return 0; }
 "#;
     compile_expect_ok("recognised_attributes", src);
+}
+
+// ============================================================================
+// Jumping into the scope of a variably modified type (C17 6.8.6.1p1)
+// ============================================================================
+
+/// Entering the scope of a variably modified identifier without executing its
+/// declaration leaves the object's size never computed -- the array is
+/// whatever the stack held -- so 6.8.6.1p1 forbids the jump outright. c17
+/// accepted every form of it.
+///
+/// The diagnostic names the declaration that would have been skipped, where
+/// gcc names only the kind of type; `Stmt::Goto` carries no position, and the
+/// declaration is the more useful thing to point at anyway.
+#[test]
+fn diagnostics_jump_into_variably_modified_scope_is_rejected() {
+    compile_expect_error(
+        "goto_into_vla",
+        "int main(void){int n=4; goto L; { int a[n]; L: return a[0]; } }\n",
+        "jump into the scope of 'a'",
+    );
+    // The scope runs to the end of the block, so a label after the
+    // declaration is inside it even without braces of its own.
+    compile_expect_error(
+        "goto_past_vla",
+        "int main(void){int n=4; goto L; int a[n]; L: return a[0]; }\n",
+        "variably modified type",
+    );
+    // A pointer to a variably modified array is variably modified too.
+    compile_expect_error(
+        "goto_into_ptr_to_vla",
+        "int main(void){int n=4; goto L; { int (*p)[n]; L: return p != 0; } }\n",
+        "jump into the scope of 'p'",
+    );
+    // A declaration in a for-init scopes over the body.
+    compile_expect_error(
+        "goto_into_for_init_vla",
+        "int main(void){int n=4; goto L; for(int a[n];;){ L: return 0; } }\n",
+        "variably modified type",
+    );
+    // Reaching a `case` transfers control from the `switch`, so the same rule
+    // applies -- and says so.
+    compile_expect_error(
+        "switch_into_vla",
+        "int main(void){int n=4,k=1; switch(k){ int a[n]; case 1: return a[0]; } return 0; }\n",
+        "switch jump into the scope of 'a'",
+    );
+}
+
+/// The jumps that stay legal. Without these the check could pass by rejecting
+/// every `goto` near a VLA, which is the failure mode the whole diagnostics
+/// suite exists to prevent.
+#[test]
+fn diagnostics_legal_jumps_around_variably_modified_scopes_are_accepted() {
+    // Out of the scope, not into it.
+    compile_expect_ok(
+        "goto_out_of_vla",
+        "int main(void){int n=4; L: ; { int a[n]; if(a[0]) goto L; } return 0; }\n",
+    );
+    // Within one scope.
+    compile_expect_ok(
+        "goto_within_vla",
+        "int main(void){int n=4; { int a[n]; L: a[0]=1; if(a[0]) goto L; } return 0; }\n",
+    );
+    // To a label that precedes the declaration.
+    compile_expect_ok(
+        "goto_before_vla",
+        "int main(void){int n=4; goto L; L: ; { int a[n]; return a[0]; } }\n",
+    );
+    // An ordinary array is not variably modified.
+    compile_expect_ok(
+        "goto_into_plain_array",
+        "int main(void){goto L; { int a[4]; L: return a[0]; } }\n",
+    );
+    // The VLA is inside the case, not around it.
+    compile_expect_ok(
+        "switch_case_holds_vla",
+        "int main(void){int n=4,k=1; switch(k){ case 1: { int a[n]; return a[0]; } } return 0; }\n",
+    );
+}
+
+// ============================================================================
+// #C53 — a trailing comma in a parameter list (C17 6.7.6.3)
+// ============================================================================
+
+/// A parameter-type-list is a comma-separated list of parameter declarations,
+/// optionally followed by `, ...`; nothing else may follow a comma. c17 let
+/// the specifier parser supply an implicit `int` for the empty slot, so
+/// `void g(int, );` silently declared `void(int, int)` -- and once call arity
+/// was checked, the *correct* call `g(1)` became the one rejected. C23 allows
+/// the trailing comma; this compiler is C17, and so is gcc here.
+#[test]
+fn diagnostics_trailing_comma_in_parameter_list_is_rejected() {
+    for (name, src) in [
+        ("tc_proto", "void g(int, );\nint main(void){return 0;}\n"),
+        (
+            "tc_defn",
+            "void g(int a, ){(void)a;}\nint main(void){return 0;}\n",
+        ),
+        (
+            "tc_two",
+            "void g(int, char, );\nint main(void){return 0;}\n",
+        ),
+        (
+            "tc_fnptr",
+            "void g(int (*f)(int, ));\nint main(void){return 0;}\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "after ','");
+    }
+}
+
+/// The list forms that must keep working -- including the call the old
+/// behaviour turned into an error.
+#[test]
+fn diagnostics_ordinary_parameter_lists_are_accepted() {
+    compile_expect_ok(
+        "pl_correct_call",
+        "void g(int);\nvoid g(int a){(void)a;}\nint main(void){ g(1); return 0; }\n",
+    );
+    compile_expect_ok(
+        "pl_variadic",
+        "int f(int, ...);\nint main(void){return 0;}\n",
+    );
+    compile_expect_ok("pl_void", "int f(void);\nint main(void){return 0;}\n");
+    compile_expect_ok("pl_two", "int f(int, char);\nint main(void){return 0;}\n");
+    compile_expect_ok("pl_empty", "int f();\nint main(void){return 0;}\n");
+    compile_expect_ok(
+        "pl_knr",
+        "int f(a, b) int a, b; { return a+b; }\nint main(void){ return f(1,2)-3; }\n",
+    );
+}
+
+// ============================================================================
+// Universal character names naming forbidden characters (C17 6.4.3p2)
+// ============================================================================
+
+/// A UCN "shall not specify a character whose short identifier is less than
+/// 00A0 other than 0024 ($), 0040 (@), or 0060 (`), nor one in the range D800
+/// through DFFF inclusive."
+///
+/// Every one was accepted. The surrogate half was the worse of the two: a
+/// surrogate has no `char`, so `char::from_u32` failed and both decoders took
+/// that for "not an escape" and carried on with the letter `u`.
+#[test]
+fn diagnostics_forbidden_universal_character_names_are_rejected() {
+    for (name, src) in [
+        // In an identifier, at the start and in the middle: the lexer has a
+        // separate decoder for each.
+        (
+            "ucn_ident_start",
+            "int \\u0061bc = 3;\nint main(void){return 0;}\n",
+        ),
+        (
+            "ucn_ident_mid",
+            "int a\\u0062c = 3;\nint main(void){return 0;}\n",
+        ),
+        // In a string and in a character constant.
+        (
+            "ucn_string",
+            "int main(void){ const char *s = \"\\u0041\"; return s[0]-65; }\n",
+        ),
+        (
+            "ucn_charconst",
+            "int main(void){ return (int)(char)'\\u0041' - 65; }\n",
+        ),
+        // A control character, and both ends of the surrogate range.
+        (
+            "ucn_space",
+            "int main(void){ const char *s = \"\\u0020\"; return s[0]-32; }\n",
+        ),
+        (
+            "ucn_surrogate_lo",
+            "int main(void){ const char *s = \"\\ud800\"; return s[0]; }\n",
+        ),
+        (
+            "ucn_surrogate_hi",
+            "int main(void){ const char *s = \"\\udfff\"; return s[0]; }\n",
+        ),
+        // The long form is subject to the same rule.
+        (
+            "ucn_long_form",
+            "int main(void){ const char *s = \"\\U00000041\"; return s[0]-65; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "not a valid universal character");
+    }
+}
+
+/// The three carve-outs 6.4.3p2 names, and ordinary UCNs above 00A0.
+#[test]
+fn diagnostics_permitted_universal_character_names_are_accepted() {
+    for (name, src) in [
+        (
+            "ucn_dollar",
+            "int main(void){ const char *s = \"\\u0024\"; return s[0]-36; }\n",
+        ),
+        (
+            "ucn_at",
+            "int main(void){ const char *s = \"\\u0040\"; return s[0]-64; }\n",
+        ),
+        (
+            "ucn_backtick",
+            "int main(void){ const char *s = \"\\u0060\"; return s[0]-96; }\n",
+        ),
+        (
+            "ucn_latin",
+            "int main(void){ const char *s = \"\\u00e9\"; return s[0]!=0?0:1; }\n",
+        ),
+        (
+            "ucn_ident_ok",
+            "int \\u00c5ngstrom = 7;\nint main(void){ return 0; }\n",
+        ),
+        (
+            "ucn_astral",
+            "int main(void){ const char *s = \"\\U0001F600\"; return s[0]!=0?0:1; }\n",
+        ),
+        (
+            "ucn_wide_char",
+            "int main(void){ return (int)L'\\u00e9' - 233; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+// ============================================================================
+// #C90 — sizeof of an incomplete type (C17 6.5.3.4p1)
+// ============================================================================
+
+/// `sizeof` shall not be applied to an incomplete type. An array is the
+/// awkward case: the type table cannot tell `int[n]` from `int[]`, since both
+/// simply have no extent. The size expressions decide it -- a level with an
+/// expression is variably modified and so complete, a level without one is
+/// incomplete -- which is what makes `sizeof(int[][n])`, two absent extents
+/// against one expression, the incomplete array of arrays gcc rejects.
+#[test]
+fn diagnostics_sizeof_of_an_incomplete_type_is_rejected() {
+    for (name, src) in [
+        (
+            "sz_arr_of_vla",
+            "int main(void){ int n = 4; return (int)sizeof(int[][n]); }\n",
+        ),
+        (
+            "sz_incomplete_arr",
+            "int main(void){ return (int)sizeof(int[]); }\n",
+        ),
+        (
+            "sz_arr_of_arr",
+            "int main(void){ return (int)sizeof(int[][3]); }\n",
+        ),
+        (
+            "sz_undef_struct",
+            "struct U;\nint main(void){ return (int)sizeof(struct U); }\n",
+        ),
+        (
+            "sz_undef_union",
+            "union U;\nint main(void){ return (int)sizeof(union U); }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "incomplete type");
+    }
+}
+
+/// Everything `sizeof` must still accept, including the two GNU extensions
+/// gcc allows (`void` and a function type, both 1) and every complete array
+/// shape -- without these the check could pass by refusing every array.
+#[test]
+fn diagnostics_sizeof_of_complete_types_is_accepted() {
+    compile_expect_ok("sz_int", "int main(void){ return (int)sizeof(int) - 4; }\n");
+    compile_expect_ok(
+        "sz_ptr",
+        "int main(void){ return (int)sizeof(int*) - 8; }\n",
+    );
+    compile_expect_ok(
+        "sz_fixed_arr",
+        "int main(void){ return (int)sizeof(int[4]) - 16; }\n",
+    );
+    compile_expect_ok(
+        "sz_vla",
+        "int main(void){ int n = 4; return (int)sizeof(int[n]) - 16; }\n",
+    );
+    compile_expect_ok(
+        "sz_vla_2d",
+        "int main(void){ int n = 4; return (int)sizeof(int[3][n]) - 48; }\n",
+    );
+    compile_expect_ok(
+        "sz_ptr_to_vla",
+        "int main(void){ int n = 4; return (int)sizeof(int(*)[n]) - 8; }\n",
+    );
+    compile_expect_ok(
+        "sz_defined_struct",
+        "struct S { int a; };\nint main(void){ return (int)sizeof(struct S) - 4; }\n",
+    );
+    // GNU extensions gcc accepts, both giving 1.
+    compile_expect_ok(
+        "sz_void",
+        "int main(void){ return (int)sizeof(void) - 1; }\n",
+    );
+}
+
+/// `typeof` yields a bare type, so a VLA's extent does not survive it and the
+/// result is indistinguishable from an incomplete array. `sizeof(typeof(a))`
+/// is legal -- gcc answers with the VLA's size -- so the completeness check
+/// above must not fire on it. It answers 0 rather than 16, which is #C89 and
+/// unfixed; what this pins is that it is not *rejected*, since `typeof`
+/// appears in real system headers.
+#[test]
+fn diagnostics_sizeof_of_a_typeof_is_not_rejected() {
+    compile_expect_ok(
+        "sz_typeof_vla",
+        "int main(void){ int n = 4; int a[n]; return (int)sizeof(typeof(a)) * 0; }\n",
+    );
+    compile_expect_ok(
+        "sz_typeof_fixed",
+        "int main(void){ int b[4]; return (int)sizeof(typeof(b)) - 16; }\n",
+    );
+    compile_expect_ok(
+        "sz_typeof_scalar",
+        "int main(void){ int x = 0; return (int)sizeof(typeof(x)) - 4; }\n",
+    );
+}
+
+// ============================================================================
+// Array compatibility when one side has no extent (C17 6.7.6.2p6)
+// ============================================================================
+
+/// Two array types are compatible if their element types are and *both* have
+/// a constant size, in which case the sizes must agree. A side with no extent
+/// imposes no size requirement.
+///
+/// Requiring the extents to be equal made a legal call diagnosed: a parameter
+/// `int a[n][m]` decays to `int (*)[m]`, whose pointee has no extent, so
+/// passing an ordinary `int m[2][2]` drew "passing argument 3 as 'int[]*'
+/// from 'int[2]*' incompatible pointer type" where gcc is silent under -Wall.
+#[test]
+fn diagnostics_array_of_unspecified_size_is_compatible() {
+    compile_expect_ok(
+        "vla_param_2d",
+        "int f(int n, int m, int a[n][m]) { return a[n-1][m-1]; }\n\
+         int main(void){ int m[2][2] = {{1,2},{3,4}}; return f(2,2,m) - 4; }\n",
+    );
+    compile_expect_ok(
+        "vla_param_mixed",
+        "int f(int n, int a[3][n]) { return a[0][0]; }\n\
+         int main(void){ int m[2][2] = {{1,2},{3,4}}; return f(2,m) - 1; }\n",
+    );
+    compile_expect_ok(
+        "incomplete_array_ptr",
+        "void f(int (*p)[]);\nint main(void){ int a[2][3]; f(a); return 0; }\n",
+    );
+}
+
+/// A genuine element-type mismatch is still diagnosed, and so is a mismatch
+/// between two *constant* extents -- without these the rule above could pass
+/// by treating every array as compatible with every other.
+#[test]
+fn diagnostics_incompatible_array_pointers_are_still_diagnosed() {
+    compile_expect_warning(
+        "arr_elem_mismatch",
+        "void f(int (*p)[3]);\nint main(void){ double m[2][3]; f(m); return 0; }\n",
+        "incompatible pointer type",
+    );
+    compile_expect_warning(
+        "arr_size_mismatch",
+        "void f(int (*p)[3]);\nint main(void){ int m[2][2]; f(m); return 0; }\n",
+        "incompatible pointer type",
+    );
 }

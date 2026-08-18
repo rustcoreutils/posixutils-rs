@@ -50,6 +50,11 @@ pub(crate) enum Escaped {
     /// A code point named by a universal character name, which the execution
     /// character set encodes.
     CodePoint(char),
+    /// A universal character name that names a character C17 6.4.3p2 forbids:
+    /// below 00A0 other than `$`, `@` and `` ` ``, or a UTF-16 surrogate.
+    /// Carries the scalar so the diagnostic can name it -- a surrogate has no
+    /// `char` to carry.
+    ForbiddenUcn(u32),
 }
 
 impl<'a> Parser<'a> {
@@ -822,10 +827,32 @@ impl<'a> Parser<'a> {
             // This is a simplified check - full implementation needs type lookahead
             self.advance(); // consume '('
 
-            // Try to parse as type first
-            if let Some(typ) = self.try_parse_type_name() {
+            // Try to parse as type first. The size expressions of any
+            // variably-modified array level ride on the node: 6.5.3.4p2 says
+            // the operand is evaluated and its size computed at run time, and
+            // the interned type cannot carry either.
+            // `typeof` yields a bare type, so a VLA's extent does not survive
+            // it (see #C89) and the result is indistinguishable from an
+            // incomplete array. `sizeof(typeof(a))` is legal and gcc answers
+            // with the VLA's size, so the completeness check below must not
+            // fire on it -- noted before the type-name is consumed, since
+            // afterwards there is nothing left to tell.
+            let from_typeof = self.get_ident_id(self.current()).is_some_and(|id| {
+                matches!(
+                    id,
+                    crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2
+                )
+            });
+            if let Some((typ, dims)) = self.try_parse_type_name_vm() {
                 self.expect_special(b')')?;
-                return Ok(Expr::typed(ExprKind::SizeofType(typ), size_t, sizeof_pos));
+                if !from_typeof {
+                    self.check_sizeof_operand_is_complete(typ, &dims, sizeof_pos);
+                }
+                return Ok(Expr::typed(
+                    ExprKind::SizeofType(typ, dims),
+                    size_t,
+                    sizeof_pos,
+                ));
             }
 
             // Not a type, parse as expression
@@ -847,6 +874,36 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// C17 6.5.3.4p1: `sizeof` shall not be applied to an incomplete type.
+    ///
+    /// An array is the awkward case, because the type table cannot tell
+    /// `int[n]` from `int[]` -- both simply have no extent. The size
+    /// expressions decide it: a level with an expression is variably modified
+    /// and therefore complete, and a level without one is incomplete. So
+    /// `sizeof(int[][n])`, with two absent extents and one expression, is the
+    /// incomplete `int[]` of arrays and is refused, while `sizeof(int[n])` is
+    /// not.
+    ///
+    /// `void` and function types are deliberately not refused: strict C
+    /// forbids both, gcc accepts them as an extension giving 1, and matching
+    /// gcc is this compiler's policy.
+    fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
+        let incomplete = match self.types.kind(typ) {
+            TypeKind::Array => self.types.unsized_array_levels(typ) > dims.len(),
+            TypeKind::Struct | TypeKind::Union => !self.types.is_composite_complete(typ),
+            _ => false,
+        };
+        if incomplete {
+            crate::diag::error(
+                pos,
+                &format!(
+                    "invalid application of 'sizeof' to incomplete type '{}'",
+                    self.types.format_type(typ, Some(self.idents))
+                ),
+            );
+        }
+    }
+
     /// Parse _Alignof expression (C11)
     fn parse_alignof(&mut self) -> ParseResult<Expr> {
         let alignof_pos = self.current_pos();
@@ -857,7 +914,16 @@ impl<'a> Parser<'a> {
             // Could be _Alignof(type) or _Alignof(expr)
             self.advance(); // consume '('
 
-            // Try to parse as type first
+            // Try to parse as type first.
+            //
+            // Deliberately NOT the variably-modified form that `sizeof` two
+            // functions above uses. C17 6.5.3.4p3 makes the result of
+            // `_Alignof` an integer constant and does not evaluate the
+            // operand, and the alignment of `int[n]` is the alignment of
+            // `int`, which `TypeTable::alignment` already computes without
+            // ever reading an extent. Collecting the expressions here would
+            // either be dead weight in the AST or an evaluation the standard
+            // forbids.
             if let Some(typ) = self.try_parse_type_name() {
                 self.expect_special(b')')?;
                 return Ok(Expr::typed(ExprKind::AlignofType(typ), size_t, alignof_pos));
@@ -959,13 +1025,26 @@ impl<'a> Parser<'a> {
     /// already represents as `StringId::EMPTY`, so there was never a reason
     /// for a second implementation.
     pub(crate) fn try_parse_type_name(&mut self) -> Option<TypeId> {
+        self.try_parse_type_name_vm().map(|(typ, _dims)| typ)
+    }
+
+    /// A type-name together with the size expressions of its variably-modified
+    /// array levels, outermost-first.
+    ///
+    /// Only `sizeof` needs the expressions. C17 6.5.3.4p2 evaluates the
+    /// operand of `sizeof` when the type is a variable length array, and the
+    /// size cannot be recovered afterwards: `int[n]`, `int[m]` and `int[]` all
+    /// intern to one `TypeId`. `parse_declarator` has always computed them
+    /// correctly; they were simply discarded here. Every other caller wants
+    /// the type alone and keeps using [`Self::try_parse_type_name`].
+    pub(crate) fn try_parse_type_name_vm(&mut self) -> Option<(TypeId, Vec<Expr>)> {
         let saved_pos = self.pos;
         let base = self.try_parse_specifier_qualifier_list()?;
 
         match self.parse_declarator(base, DeclaratorName::Optional) {
             // An abstract declarator names nothing. A name here means this was
             // never a type-name, so let the caller try it as an expression.
-            Ok((name, typ, _vla, _params)) if name == StringId::EMPTY => Some(typ),
+            Ok((name, typ, vla, _params)) if name == StringId::EMPTY => Some((typ, vla)),
             _ => {
                 self.pos = saved_pos;
                 None
@@ -1520,7 +1599,18 @@ impl<'a> Parser<'a> {
                         TokenValue::String(s)
                         | TokenValue::WideString(s)
                         | TokenValue::Utf16String(s)
-                        | TokenValue::Utf32String(s) => Self::parse_string_literal(s),
+                        | TokenValue::Utf32String(s) => {
+                            let piece = Self::parse_string_literal(s);
+                            // `parse_string_literal` has no position to report
+                            // from, so the constraint is raised here, where the
+                            // token still does.
+                            for e in &piece {
+                                if let Escaped::ForbiddenUcn(val) = e {
+                                    self.report_forbidden_ucn_at(token.pos, *val);
+                                }
+                            }
+                            piece
+                        }
                         _ => return Err(ParseError::new("invalid string token", token.pos)),
                     }
                 }
@@ -2166,30 +2256,45 @@ impl<'a> Parser<'a> {
             } else {
                 self.types.float16_id
             }
-        } else if left_kind == TypeKind::Int128 || right_kind == TypeKind::Int128 {
-            if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                self.types.uint128_id
-            } else {
-                self.types.int128_id
-            }
-        } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
-            // If either is unsigned long long, result is unsigned long long
-            if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                self.types.ulonglong_id
-            } else {
-                self.types.longlong_id
-            }
-        } else if left_kind == TypeKind::Long || right_kind == TypeKind::Long {
-            // If either is unsigned long, result is unsigned long
-            if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                self.types.ulong_id
-            } else {
-                self.types.long_id
-            }
-        } else if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-            self.types.uint_id
         } else {
-            self.types.int_id
+            // No operand is floating, so the integer promotions apply to both
+            // *before* the ranks below are compared (C17 6.3.1.8p1). Without
+            // this, two sub-`int` operands matched none of the Long/LongLong/
+            // Int128 arms and fell to the final `is_unsigned` fallback, so
+            // `unsigned char` and `unsigned short` arithmetic came out
+            // unsigned -- `(a - b) / 2` divided 0xFFFFFFFF by two. After
+            // promotion no operand narrower than `int` can reach that
+            // fallback at all.
+            let left = self.types.integer_promote(left);
+            let right = self.types.integer_promote(right);
+            let left_kind = self.types.kind(left);
+            let right_kind = self.types.kind(right);
+
+            if left_kind == TypeKind::Int128 || right_kind == TypeKind::Int128 {
+                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                    self.types.uint128_id
+                } else {
+                    self.types.int128_id
+                }
+            } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
+                // If either is unsigned long long, result is unsigned long long
+                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                    self.types.ulonglong_id
+                } else {
+                    self.types.longlong_id
+                }
+            } else if left_kind == TypeKind::Long || right_kind == TypeKind::Long {
+                // If either is unsigned long, result is unsigned long
+                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                    self.types.ulong_id
+                } else {
+                    self.types.long_id
+                }
+            } else if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
+                self.types.uint_id
+            } else {
+                self.types.int_id
+            }
         }
     }
 
@@ -3645,10 +3750,23 @@ impl<'a> Parser<'a> {
                 let token = self.consume();
                 let token_pos = token.pos;
                 if let TokenValue::Char(s) = &token.value {
-                    // Parse character literal - type is int (C promotes char to int)
-                    let c = self.parse_char_literal(s);
+                    // C17 6.4.4.4p10: an unprefixed character constant has
+                    // type `int` and the value of a `char` object holding the
+                    // character, converted to `int` -- so its signedness is
+                    // plain `char`'s, which is the target's. `'\x80'` is -128
+                    // where `char` is signed and 128 where it is not.
+                    let (v, is_code_point) = self.parse_char_literal_value(s);
+                    let value = if is_code_point {
+                        // Not a byte, so plain `char`'s signedness does not
+                        // reach it.
+                        v as i64
+                    } else if self.types.is_unsigned(self.types.char_id) {
+                        v as u8 as i64
+                    } else {
+                        v as u8 as i8 as i64
+                    };
                     Ok(Self::typed_expr(
-                        ExprKind::CharLit(c),
+                        ExprKind::CharLit(value),
                         self.types.int_id,
                         token_pos,
                     ))
@@ -3668,14 +3786,19 @@ impl<'a> Parser<'a> {
                     TokenValue::WideChar(s)
                     | TokenValue::Utf16Char(s)
                     | TokenValue::Utf32Char(s) => {
-                        let c = self.parse_char_literal(s);
-                        let typ = match kind {
+                        // A prefixed constant takes the code point in its own
+                        // type, with no reference to plain `char`'s
+                        // signedness: `L'\x80'` is 128, not -128.
+                        let (code_point, _) = self.parse_char_literal_value(s);
+                        let (typ, value) = match kind {
                             // wchar_t is int on the targets here.
-                            TokenType::WideChar => self.types.int_id,
-                            TokenType::Utf16Char => self.types.ushort_id,
-                            _ => self.types.uint_id,
+                            TokenType::WideChar => (self.types.int_id, code_point as i32 as i64),
+                            TokenType::Utf16Char => {
+                                (self.types.ushort_id, code_point as u16 as i64)
+                            }
+                            _ => (self.types.uint_id, code_point as i64),
                         };
-                        Ok(Self::typed_expr(ExprKind::CharLit(c), typ, token_pos))
+                        Ok(Self::typed_expr(ExprKind::CharLit(value), typ, token_pos))
                     }
                     _ => Err(ParseError::new("invalid character token", token.pos)),
                 }
@@ -4130,7 +4253,9 @@ impl<'a> Parser<'a> {
                 {
                     let hex: String = chars[i + 1..i + 5].iter().collect();
                     let val = u32::from_str_radix(&hex, 16).unwrap_or(0);
-                    if let Some(c) = char::from_u32(val) {
+                    if crate::token::lexer::ucn_is_forbidden(val) {
+                        (Escaped::ForbiddenUcn(val), 5)
+                    } else if let Some(c) = char::from_u32(val) {
                         (Escaped::CodePoint(c), 5)
                     } else {
                         (Escaped::Byte(b'u'), 1) // Invalid code point
@@ -4145,7 +4270,9 @@ impl<'a> Parser<'a> {
                 {
                     let hex: String = chars[i + 1..i + 9].iter().collect();
                     let val = u32::from_str_radix(&hex, 16).unwrap_or(0);
-                    if let Some(c) = char::from_u32(val) {
+                    if crate::token::lexer::ucn_is_forbidden(val) {
+                        (Escaped::ForbiddenUcn(val), 9)
+                    } else if let Some(c) = char::from_u32(val) {
                         (Escaped::CodePoint(c), 9)
                     } else {
                         (Escaped::Byte(b'U'), 1) // Invalid code point
@@ -4176,25 +4303,55 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a character literal string into a char
-    fn parse_char_literal(&self, s: &str) -> char {
+    /// Parse a character literal into its scalar value, and say whether that
+    /// value is a single *byte* or a *code point*.
+    ///
+    /// The distinction decides whether plain `char`'s signedness applies: a
+    /// byte is what a `char` object would hold, so `'\x80'` is subject to it
+    /// (C17 6.4.4.4p10), while a code point is not a byte at all and is
+    /// carried through unchanged.
+    fn parse_char_literal_value(&self, s: &str) -> (u32, bool) {
         if s.is_empty() {
-            return '\0';
+            return (0, false);
         }
 
         let chars: Vec<char> = s.chars().collect();
         if chars[0] == '\\' && chars.len() > 1 {
             match Self::parse_escape_sequence(&chars, 1).0 {
-                Escaped::Byte(b) | Escaped::SourceByte(b) => b as char,
+                Escaped::Byte(b) | Escaped::SourceByte(b) => (b as u32, false),
+                Escaped::ForbiddenUcn(val) => {
+                    self.report_forbidden_ucn(val);
+                    (val, true)
+                }
                 // `'\u00e9'` names a code point. gcc makes it a multi-character
                 // constant of its UTF-8 bytes, with a warning; c17 keeps the
                 // code point, which is the more useful answer for the one place
-                // this is used and costs nothing elsewhere.
-                Escaped::CodePoint(c) => c,
+                // this is used and costs nothing elsewhere. Truncating it to a
+                // byte here would lose that, and would flatten `'\U0001F600'`
+                // to zero.
+                Escaped::CodePoint(c) => (c as u32, true),
             }
         } else {
-            chars[0]
+            // The lexer stores one `char` per source byte, so an ordinary
+            // character is a byte even when the source is UTF-8.
+            (chars[0] as u32, false)
         }
+    }
+
+    /// C17 6.4.3p2: a universal character name may not name a character below
+    /// 00A0 other than `$`, `@` and `` ` ``, nor a UTF-16 surrogate.
+    ///
+    /// The first half stops a UCN spelling a character that already has a
+    /// spelling, which would let `\u0041` smuggle an `A` past anything that
+    /// reads the source as text. Both were accepted silently -- a surrogate
+    /// even degraded to the letter `u`, because `char::from_u32` rejects it
+    /// and the caller took that for "not an escape".
+    fn report_forbidden_ucn(&self, val: u32) {
+        self.report_forbidden_ucn_at(self.current_pos(), val);
+    }
+
+    fn report_forbidden_ucn_at(&self, pos: Position, val: u32) {
+        crate::token::lexer::report_forbidden_ucn(pos, val);
     }
 
     /// Parse a string literal, converting escape sequences to their actual values.
@@ -4228,6 +4385,9 @@ impl<'a> Parser<'a> {
         for e in elements {
             match e {
                 Escaped::Byte(b) | Escaped::SourceByte(b) => out.push(*b as char),
+                // Already diagnosed where the literal was parsed; encoded as
+                // written so the rest of the literal still makes sense.
+                Escaped::ForbiddenUcn(v) => out.push(*v as u8 as char),
                 Escaped::CodePoint(c) => {
                     let mut buf = [0u8; 4];
                     for b in c.encode_utf8(&mut buf).as_bytes() {
@@ -4261,6 +4421,11 @@ impl<'a> Parser<'a> {
                 Escaped::Byte(b) => {
                     flush(&mut run, &mut out);
                     out.push(*b as u32);
+                }
+                // Already diagnosed where the literal was parsed.
+                Escaped::ForbiddenUcn(v) => {
+                    flush(&mut run, &mut out);
+                    out.push(*v);
                 }
                 Escaped::CodePoint(c) => {
                     flush(&mut run, &mut out);

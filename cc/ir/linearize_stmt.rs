@@ -800,7 +800,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);
                                     let storage_type = self.bitfield_storage_type(storage_size);
-                                    let converted = self.emit_convert(val, val_type, storage_type);
+                                    // Convert to the *member's* type first, not
+                                    // straight to the storage unit's. C17 6.7.9p11
+                                    // initializes a member by converting to its own
+                                    // type, and for `_Bool` that conversion is the
+                                    // one that normalizes to 0/1 (6.3.1.2). Going
+                                    // directly to the unsigned storage type skipped
+                                    // it, so `struct { _Bool f:1; } v = {2};` stored
+                                    // 2, truncated it to one bit and read back 0.
+                                    let member_val = self.emit_convert(val, val_type, field_type);
+                                    let converted =
+                                        self.emit_convert(member_val, field_type, storage_type);
                                     self.emit_bitfield_store(
                                         base_sym,
                                         offset as usize,
@@ -1275,6 +1285,54 @@ impl<'a> super::linearize::Linearizer<'a> {
         (case_values, has_default)
     }
 
+    /// C17 6.8.6.1p1: a `goto` shall not jump from outside the scope of an
+    /// identifier having a variably modified type to inside it; 6.8.4.2p... the
+    /// same for a `switch` reaching a `case` inside such a scope.
+    ///
+    /// The rule exists because entering the scope without executing the
+    /// declaration leaves the object's size never computed: the array is
+    /// whatever the stack held. Jumping *out* of the scope, within it, or to a
+    /// label that precedes the declaration are all fine, and all are exercised
+    /// by the accept-side tests.
+    ///
+    /// Reported at the declaration rather than at the jump, which is where gcc
+    /// points: `Stmt::Goto` and `Stmt::Default` carry no position, and naming
+    /// the declaration that cannot be entered says more about the cause than
+    /// the jump does.
+    pub(crate) fn check_jumps_into_variably_modified_scopes(&self, body: &Stmt) {
+        let mut w = VmScopeWalk {
+            open: Vec::new(),
+            declared: Vec::new(),
+            labels: Vec::new(),
+            gotos: Vec::new(),
+            bad_case_ids: Vec::new(),
+        };
+        w.walk(body, None);
+
+        // A `goto` is illegal exactly when its label sits inside a scope the
+        // `goto` itself is not already in.
+        for (name, from) in &w.gotos {
+            let Some((_, to)) = w.labels.iter().find(|(n, _)| n == name) else {
+                continue; // an undefined label is a separate diagnostic
+            };
+            if let Some(id) = to.iter().find(|id| !from.contains(id)) {
+                self.report_vm_jump(&w.declared[*id], "jump");
+            }
+        }
+        for id in w.bad_cases() {
+            self.report_vm_jump(&w.declared[id], "switch jump");
+        }
+    }
+
+    /// Name the declaration a jump would have entered without executing.
+    fn report_vm_jump(&self, decl: &VmDecl, what: &str) {
+        let name = self.strings.get(self.symbols.get(decl.symbol).name);
+        error(
+            decl.pos,
+            &format!("{what} into the scope of '{name}', which has a variably modified type",),
+        );
+    }
+
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
@@ -1475,8 +1533,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             ExprKind::Cast { expr: inner, .. } => self.expr_is_runtime(inner),
 
-            // `sizeof` and `_Alignof` do not evaluate their operand, and
-            // literals are constant. Anything else: not proven either way.
+            // `sizeof` of a variable length array type is the exception: it
+            // does evaluate its operand, and is genuinely not an integer
+            // constant expression. Saying otherwise would send
+            // `case sizeof(int[n]):` to the caller's fallback message, which
+            // blames the compiler for a limitation rather than the program
+            // for a constraint violation.
+            ExprKind::SizeofType(typ, dims) => {
+                crate::parse::ast::sizeof_type_is_runtime(self.types, *typ, dims)
+            }
+
+            // `sizeof` otherwise, and `_Alignof`, do not evaluate their
+            // operand, and literals are constant. Anything else: not proven
+            // either way.
             _ => false,
         }
     }
@@ -1490,7 +1559,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // to f64 here cannot lose a value the result would have kept.
             ExprKind::FloatLit(v) => Some(v.to_f64()),
             ExprKind::IntLit(v) => Some(*v as f64),
-            ExprKind::CharLit(c) => Some(*c as u8 as i8 as f64),
+            ExprKind::CharLit(c) => Some(*c as f64),
             ExprKind::Cast {
                 expr: inner,
                 cast_type,
@@ -1518,7 +1587,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val as i128),
             ExprKind::Int128Lit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as u8 as i8 as i128),
+            ExprKind::CharLit(c) => Some(*c as i128),
 
             ExprKind::Ident(symbol_id) => {
                 // Check if it's an enum constant
@@ -1592,12 +1661,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                     BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                         // Use unsigned comparison when either operand is unsigned.
                         // C promotes both to the common unsigned type for comparison.
-                        let left_unsigned = left.typ.is_some_and(|t| {
-                            self.types.modifiers(t).contains(TypeModifiers::UNSIGNED)
-                        });
-                        let right_unsigned = right.typ.is_some_and(|t| {
-                            self.types.modifiers(t).contains(TypeModifiers::UNSIGNED)
-                        });
+                        // Ask the predicate rather than the modifier bit: the bit is
+                        // silent for the types whose signedness does not live there.
+                        let left_unsigned = left.typ.is_some_and(|t| self.types.is_unsigned(t));
+                        let right_unsigned = right.typ.is_some_and(|t| self.types.is_unsigned(t));
                         let use_unsigned = left_unsigned || right_unsigned;
                         if use_unsigned {
                             let lu = l as u128;
@@ -1687,8 +1754,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            // sizeof(type) - constant for complete types
-            ExprKind::SizeofType(type_id) => {
+            // sizeof(type) - constant for complete types, but a variable
+            // length array type's size is only known at run time (6.5.3.4p2).
+            ExprKind::SizeofType(type_id, dims) => {
+                if crate::parse::ast::sizeof_type_is_runtime(self.types, *type_id, dims) {
+                    return None;
+                }
                 let size_bits = self.types.size_bits(*type_id);
                 Some((size_bits / 8) as i128)
             }
@@ -1830,7 +1901,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Exact: a `u128` mantissa has no more bits than the significand,
             // where `f64` would have rounded anything past the 53rd.
             ExprKind::IntLit(v) => Some(FloatVal::from_i128(*v as i128)),
-            ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i64 as i128)),
+            ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i128)),
 
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_float_expr(operand)?;
@@ -2613,6 +2684,131 @@ impl<'a> super::linearize::Linearizer<'a> {
             let block = self.get_or_create_bb(bb);
             block.label = Some(name.to_string());
             bb
+        }
+    }
+}
+
+/// A declaration whose type is variably modified, and so whose scope may not
+/// be entered by a jump (C17 6.8.6.1p1).
+pub(crate) struct VmDecl {
+    pub(crate) symbol: crate::symbol::SymbolId,
+    pub(crate) pos: crate::diag::Position,
+}
+
+/// Walks a function body recording, for every label and every jump, which
+/// variably modified scopes enclose it.
+///
+/// A scope opens at the declaration and runs to the end of its block, so the
+/// walk is order-sensitive within a block: a label *before* the declaration is
+/// outside the scope and may be jumped to, which is why the scopes are pushed
+/// as the items are visited rather than collected up front.
+struct VmScopeWalk {
+    /// Ids of the scopes currently open, innermost last.
+    open: Vec<usize>,
+    /// Every variably modified declaration seen, indexed by scope id.
+    declared: Vec<VmDecl>,
+    /// Label name, and the scopes enclosing it.
+    labels: Vec<(StringId, Vec<usize>)>,
+    /// Each `goto`, and the scopes enclosing it.
+    gotos: Vec<(StringId, Vec<usize>)>,
+    /// Scope ids a `case`/`default` was found inside but its `switch` was not.
+    bad_case_ids: Vec<usize>,
+}
+
+impl VmScopeWalk {
+    /// The offending scopes, each reported once however many `case` labels
+    /// sit inside it.
+    fn bad_cases(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for id in &self.bad_case_ids {
+            if !out.contains(id) {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
+    /// `switch_scopes` is the scope list in force at the innermost enclosing
+    /// `switch`, against which a `case` label is judged.
+    fn walk(&mut self, stmt: &Stmt, switch_scopes: Option<&[usize]>) {
+        match stmt {
+            Stmt::Block(items) => {
+                let depth = self.open.len();
+                for item in items {
+                    match item {
+                        BlockItem::Declaration(decl) => self.open_scopes(decl),
+                        BlockItem::Statement(s) => self.walk(s, switch_scopes),
+                    }
+                }
+                // Leaving the block closes every scope it opened.
+                self.open.truncate(depth);
+            }
+
+            Stmt::Label { name, stmt } => {
+                self.labels.push((*name, self.open.clone()));
+                self.walk(stmt, switch_scopes);
+            }
+            Stmt::Goto(name) => self.gotos.push((*name, self.open.clone())),
+
+            Stmt::Case(_) | Stmt::Default => {
+                // Reaching a `case` transfers control from the `switch`, so
+                // any scope open here but not there would be entered without
+                // its declaration running.
+                if let Some(outer) = switch_scopes {
+                    for id in &self.open {
+                        if !outer.contains(id) {
+                            self.bad_case_ids.push(*id);
+                        }
+                    }
+                }
+            }
+
+            // A `switch` becomes the reference point for the labels inside it.
+            // Its own scopes are captured before the body is walked.
+            Stmt::Switch { body, .. } => {
+                let outer = self.open.clone();
+                self.walk(body, Some(&outer));
+            }
+
+            Stmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.walk(then_stmt, switch_scopes);
+                if let Some(e) = else_stmt {
+                    self.walk(e, switch_scopes);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => self.walk(body, switch_scopes),
+            Stmt::For { init, body, .. } => {
+                // A declaration in the init clause scopes over the body.
+                let depth = self.open.len();
+                if let Some(ForInit::Declaration(decl)) = init {
+                    self.open_scopes(decl);
+                }
+                self.walk(body, switch_scopes);
+                self.open.truncate(depth);
+            }
+
+            _ => {}
+        }
+    }
+
+    fn open_scopes(&mut self, decl: &Declaration) {
+        for d in &decl.declarators {
+            // A declarator with size expressions is variably modified --
+            // whether it is the array itself or a pointer to one, both of
+            // which C17 6.7.6.2 calls variably modified and gcc refuses to
+            // let a jump enter.
+            if !d.vla_sizes.is_empty() {
+                let id = self.declared.len();
+                self.declared.push(VmDecl {
+                    symbol: d.symbol,
+                    pos: d.pos,
+                });
+                self.open.push(id);
+            }
         }
     }
 }

@@ -489,9 +489,22 @@ impl Type {
             return false;
         }
 
-        // Compare array sizes
-        if self.array_size != other.array_size {
-            return false;
+        // Compare array sizes.
+        //
+        // C17 6.7.6.2p6: two array types are compatible if their element types
+        // are, and *both* have a constant size, in which case the sizes must
+        // agree. A side with no extent -- an incomplete `int[]`, or a variably
+        // modified `int[n]`, which are the same thing to the type table --
+        // imposes no size requirement, so it is compatible with either.
+        //
+        // Requiring equality made a legal call diagnosed: `int a[n][m]` as a
+        // parameter decays to `int (*)[m]`, whose pointee has no extent, and
+        // passing an ordinary `int m[2][2]` gave "passing argument 3 as
+        // 'int[]*' from 'int[2]*' incompatible pointer type" where gcc is
+        // silent even under -Wall.
+        match (self.array_size, other.array_size) {
+            (Some(a), Some(b)) if a != b => return false,
+            _ => {}
         }
 
         // Compare variadic flag
@@ -717,6 +730,14 @@ pub struct TypeTable {
     target_arch: Arch,
     /// Target OS for runtime type size calculations
     target_os: Os,
+    /// Whether plain `char` is signed on the target.
+    ///
+    /// C17 6.2.5p15 leaves this implementation-defined: the x86-64 psABI says
+    /// signed, AAPCS64 says unsigned. Copied from `Target` at construction
+    /// rather than recomputed, because the table cannot reconstruct the
+    /// *requested* target -- `has_float128` rebuilds one with
+    /// `..Target::host()` and would answer for the host instead.
+    char_signed: bool,
 
     // Pre-computed common type IDs for fast access
     pub void_id: TypeId,
@@ -757,6 +778,7 @@ impl TypeTable {
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
+            char_signed: target.char_signed,
             void_id: TypeId::INVALID,
             bool_id: TypeId::INVALID,
             char_id: TypeId::INVALID,
@@ -969,6 +991,47 @@ impl TypeTable {
         self.get(id).array_size
     }
 
+    /// Has this struct or union been defined, as opposed to merely declared?
+    ///
+    /// A forward declaration interns a composite marked incomplete, so a
+    /// `struct U;` never followed by a definition answers false here and its
+    /// size may not be taken. Any other kind answers true: the question is
+    /// only meaningful for a composite.
+    pub fn is_composite_complete(&self, id: TypeId) -> bool {
+        self.get(id)
+            .composite
+            .as_deref()
+            .is_none_or(|c| c.is_complete)
+    }
+
+    /// How many array levels of `id`, outermost-first, have no extent.
+    ///
+    /// The type table cannot tell a variably-modified array from an incomplete
+    /// one: `int[n]`, `int[m]` and `int[]` all intern to the same `TypeId`,
+    /// because the key holds `array_size`, which is `None` for all three. So
+    /// this counts the levels that *need* a size expression supplied from
+    /// outside, which is exactly what `record_vm_extents` consumes one
+    /// expression for -- and therefore also the count that says whether a
+    /// given list of expressions describes the whole type or only part of it.
+    ///
+    /// Stops at the first non-array level, so a pointer to a variably-modified
+    /// array counts zero: its size is the pointer's.
+    pub fn unsized_array_levels(&self, id: TypeId) -> usize {
+        let mut levels = 0;
+        let mut cur = id;
+        while self.kind(cur) == TypeKind::Array {
+            let typ = self.get(cur);
+            if typ.array_size.is_none() {
+                levels += 1;
+            }
+            match typ.base {
+                Some(base) => cur = base,
+                None => break,
+            }
+        }
+        levels
+    }
+
     /// Get function parameters
     #[cfg(test)]
     #[inline]
@@ -1003,7 +1066,10 @@ impl TypeTable {
         if typ.modifiers.contains(TypeModifiers::VOLATILE) {
             result.push_str("volatile ");
         }
-        if typ.modifiers.contains(TypeModifiers::UNSIGNED) {
+        // Spelling, not signedness: a diagnostic must name the type the source
+        // wrote. Plain `char` is an unsigned type on aarch64 and is still
+        // `char` here.
+        if self.spelled_unsigned(id) {
             result.push_str("unsigned ");
         } else if typ.modifiers.contains(TypeModifiers::SIGNED) && typ.kind == TypeKind::Char {
             result.push_str("signed ");
@@ -1343,19 +1409,68 @@ impl TypeTable {
         }
     }
 
-    /// Check if type is unsigned
+    /// Whether `id` is an unsigned integer type.
+    ///
+    /// Not the same question as "was the keyword `unsigned` written" -- see
+    /// [`Self::spelled_unsigned`]. Two integer types carry no `UNSIGNED`
+    /// modifier and are unsigned anyway, which is why answering from the bit
+    /// alone was wrong twice:
+    ///
+    /// - `_Bool`. C17 6.2.5p6 lists it among the standard unsigned integer
+    ///   types and 6.3.1.2 confines its values to 0 and 1. It has no modifier
+    ///   because there is no `signed _Bool` to tell it apart from. Reading the
+    ///   bit sign-extended a `_Bool` bit-field, so `struct { _Bool f:1; }`
+    ///   with `f` set read back -1.
+    /// - Plain `char`, on a target whose `char` is unsigned. 6.2.5p15 leaves
+    ///   that implementation-defined, and it cannot be settled by stamping the
+    ///   modifier on at intern time: `char`, `signed char` and `unsigned char`
+    ///   are three distinct types, and the modifier is what `TypeKey::Basic`
+    ///   deduplicates on, so that would collapse two of them into one.
     #[inline]
     pub fn is_unsigned(&self, id: TypeId) -> bool {
+        let typ = self.get(id);
+        match typ.kind {
+            TypeKind::Bool => true,
+            TypeKind::Char
+                if !typ
+                    .modifiers
+                    .intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED) =>
+            {
+                !self.char_signed
+            }
+            _ => typ.modifiers.contains(TypeModifiers::UNSIGNED),
+        }
+    }
+
+    /// Whether the declaration of `id` spelled the keyword `unsigned`.
+    ///
+    /// A question about source text rather than about values, and the only one
+    /// a caller that *reprints* a type should ask: plain `char` is an unsigned
+    /// type on aarch64 and is still written `char`, and `_Bool` is unsigned
+    /// and is written neither way. Using [`Self::is_unsigned`] here would make
+    /// a type printer say `unsigned char` for a declaration that says `char`.
+    #[inline]
+    pub fn spelled_unsigned(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
     }
 
-    /// Check if type is a plain char (no explicit signed/unsigned)
+    /// Apply the integer promotions (C17 6.3.1.1p2).
+    ///
+    /// `_Bool`, `char` and `short` -- signed or unsigned -- all become `int`,
+    /// which can represent every value of each of them. Every other type is
+    /// returned unchanged.
+    ///
+    /// This lives on the type table rather than on one consumer because the
+    /// promotions are a prerequisite of the usual arithmetic conversions
+    /// (6.3.1.8p1), and both the parser and the linearizer compute those.
+    /// Only the linearizer used to promote, which is why `unsigned char`
+    /// arithmetic came out unsigned.
     #[inline]
-    pub fn is_plain_char(&self, id: TypeId) -> bool {
-        let typ = self.get(id);
-        typ.kind == TypeKind::Char
-            && !typ.modifiers.contains(TypeModifiers::SIGNED)
-            && !typ.modifiers.contains(TypeModifiers::UNSIGNED)
+    pub fn integer_promote(&self, id: TypeId) -> TypeId {
+        match self.kind(id) {
+            TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.int_id,
+            _ => id,
+        }
     }
 
     /// Get the unsigned version of a type
@@ -1679,6 +1794,9 @@ impl TypeTable {
     ) -> (usize, usize) {
         let mut bit_offset = 0usize;
         let mut max_align = 1usize;
+        // Alignment demanded by a zero-width bitfield, on the ABIs where one
+        // demands any. Kept separate because `pack_cap` does not cap it.
+        let mut zero_width_align = 1usize;
         // The furthest byte any access window reaches. Ordinary members never
         // reach past the running offset, but a window is a power-of-two span
         // that can, and the struct has to be large enough to hold it.
@@ -1714,9 +1832,20 @@ impl TypeTable {
             if bit_width == 0 {
                 // C17 6.7.2.1p12: a zero-width bitfield forces the *next*
                 // member to the next boundary of its declared type's storage
-                // unit, and contributes nothing else -- not even alignment.
-                // `struct { char c; int :0; char d; }` is 5 bytes with `d` at
-                // offset 4, packed or not, which is also gcc's answer.
+                // unit. Whether it also raises the enclosing struct's
+                // alignment is the one point the two ABIs disagree on, and
+                // 6.7.2.1p12 leaves it to them.
+                //
+                // The x86-64 psABI says it does not: `struct { char c;
+                // int :0; char d; }` is 5 bytes, alignment 1. AAPCS64 says it
+                // contributes its declared type's alignment, making the same
+                // struct 8 bytes with alignment 4 -- and unlike an ordinary
+                // member's, that contribution survives packing, so it is kept
+                // out of `max_align` (which `pack_cap` caps) and applied
+                // afterwards. Both are gcc's answers on the respective target.
+                if self.target_arch == Arch::Aarch64 {
+                    zero_width_align = zero_width_align.max(self.alignment(member.typ));
+                }
                 bit_offset = bit_offset.next_multiple_of(unit_bits);
                 member.offset = bit_offset / 8;
                 member.bit_offset = None;
@@ -1753,7 +1882,8 @@ impl TypeTable {
         let final_align = match pack_cap {
             Some(cap) => max_align.min(cap as usize),
             None => max_align,
-        };
+        }
+        .max(zero_width_align);
         let size = bit_offset
             .div_ceil(8)
             .max(window_end)
@@ -1779,6 +1909,9 @@ impl TypeTable {
     ) -> (usize, usize) {
         let mut max_size = 0usize;
         let mut max_align = 1usize;
+        // As in a struct: a zero-width bitfield's alignment demand, where the
+        // ABI makes one, is not capped by packing.
+        let mut zero_width_align = 1usize;
 
         for member in members.iter_mut() {
             member.offset = 0;
@@ -1798,6 +1931,23 @@ impl TypeTable {
                 member.bit_offset = None;
                 member.storage_unit_size = None;
             }
+
+            // A zero-width bitfield is not an object: it occupies no storage
+            // and so cannot widen the union. It used to contribute its
+            // declared type's size *and* alignment here, which made
+            // `union { char c; int :0; }` four bytes where gcc gives one.
+            // The boundary it forces in a struct has no meaning in a union,
+            // where every member starts at bit zero.
+            if member.bit_width == Some(0) {
+                // Except on AAPCS64, where it still demands its type's
+                // alignment -- and, as in a struct, packing does not suppress
+                // that. The union's size follows from the rounding.
+                if self.target_arch == Arch::Aarch64 {
+                    zero_width_align = zero_width_align.max(self.alignment(member.typ));
+                }
+                continue;
+            }
+
             max_size = max_size.max(self.size_bytes(member.typ));
             // Use explicit alignment from _Alignas if specified, otherwise natural alignment
             let natural_align = match pack_cap {
@@ -1811,6 +1961,7 @@ impl TypeTable {
             max_align = max_align.max(align);
         }
 
+        let max_align = max_align.max(zero_width_align);
         let size = if max_align > 1 {
             (max_size + max_align - 1) & !(max_align - 1)
         } else {
@@ -1883,6 +2034,192 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         assert!(types.is_unsigned(types.uint_id));
         assert!(!types.is_unsigned(types.int_id));
+    }
+
+    /// Plain `char`'s signedness is the target's (C17 6.2.5p15), and it is a
+    /// different question from how the type is spelled. `signed char` and
+    /// `unsigned char` say what they are on every target; only bare `char`
+    /// moves.
+    #[test]
+    fn test_plain_char_signedness_follows_the_target() {
+        let x86 = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
+        let arm = TypeTable::new(&Target::new(Arch::Aarch64, Os::Linux));
+
+        // The x86-64 psABI makes plain char signed; AAPCS64 makes it unsigned.
+        assert!(!x86.is_unsigned(x86.char_id), "x86-64: char is signed");
+        assert!(arm.is_unsigned(arm.char_id), "aarch64: char is unsigned");
+
+        // The explicit spellings do not move with the target.
+        for t in [&x86, &arm] {
+            assert!(!t.is_unsigned(t.schar_id), "signed char is always signed");
+            assert!(
+                t.is_unsigned(t.uchar_id),
+                "unsigned char is always unsigned"
+            );
+            assert!(t.is_unsigned(t.bool_id), "_Bool is always unsigned");
+            assert!(!t.is_unsigned(t.int_id));
+        }
+
+        // Spelling is target-independent, and is what a type printer asks.
+        // Plain `char` is unsigned on aarch64 and is still written `char`.
+        for t in [&x86, &arm] {
+            assert!(!t.spelled_unsigned(t.char_id));
+            assert!(!t.spelled_unsigned(t.schar_id));
+            assert!(t.spelled_unsigned(t.uchar_id));
+            assert!(!t.spelled_unsigned(t.bool_id));
+        }
+        assert_eq!(arm.format_type(arm.char_id, None), "char");
+        assert_eq!(arm.format_type(arm.uchar_id, None), "unsigned char");
+    }
+
+    /// C17 6.3.1.1p2: everything of lesser rank than `int` becomes `int`,
+    /// including the unsigned spellings -- `int` represents every value of
+    /// `unsigned char` and `unsigned short`, so neither promotes to
+    /// `unsigned int`.
+    #[test]
+    fn test_integer_promote() {
+        let types = TypeTable::new(&Target::host());
+
+        for narrow in [
+            types.bool_id,
+            types.char_id,
+            types.schar_id,
+            types.uchar_id,
+            types.short_id,
+            types.ushort_id,
+        ] {
+            assert_eq!(
+                types.integer_promote(narrow),
+                types.int_id,
+                "{} should promote to int",
+                types.format_type(narrow, None)
+            );
+        }
+
+        // int and everything wider is returned unchanged.
+        for wide in [
+            types.int_id,
+            types.uint_id,
+            types.long_id,
+            types.ulong_id,
+            types.longlong_id,
+            types.double_id,
+        ] {
+            assert_eq!(types.integer_promote(wide), wide);
+        }
+    }
+
+    /// `unsized_array_levels` counts the array levels that need a size
+    /// expression supplied from outside. It is what says whether a list of
+    /// such expressions describes the whole type or only part of it, so
+    /// `int[][n]` (two unsized levels, one expression) can be told from
+    /// `int[n]` (one and one).
+    #[test]
+    fn test_unsized_array_levels() {
+        let mut types = TypeTable::new(&Target::host());
+        let int_id = types.int_id;
+
+        // Not an array at all.
+        assert_eq!(types.unsized_array_levels(int_id), 0);
+
+        // Fully sized arrays need nothing.
+        let a4 = types.intern(Type::array(int_id, 4));
+        assert_eq!(types.unsized_array_levels(a4), 0);
+        let a3x4 = types.intern(Type::array(a4, 3));
+        assert_eq!(types.unsized_array_levels(a3x4), 0);
+
+        // An absent extent counts once, at whichever level it sits. This is
+        // how a variably-modified dimension is represented: the size lives in
+        // a side-channel expression, not in the type.
+        fn unsized_array(types: &mut TypeTable, base: TypeId) -> TypeId {
+            let mut t = Type::array(base, 0);
+            t.array_size = None;
+            types.intern(t)
+        }
+        let an = unsized_array(&mut types, int_id);
+        assert_eq!(types.unsized_array_levels(an), 1);
+
+        // `int[3][n]`: outer sized, inner not.
+        let a3xn = types.intern(Type::array(an, 3));
+        assert_eq!(types.unsized_array_levels(a3xn), 1);
+
+        // `int[n][m]`: both absent.
+        let anxm = unsized_array(&mut types, an);
+        assert_eq!(types.unsized_array_levels(anxm), 2);
+
+        // A pointer to a variably-modified array stops at the pointer: its
+        // size is the pointer's, and nothing about its extent is needed.
+        let ptr = types.intern(Type::pointer(an));
+        assert_eq!(types.unsized_array_levels(ptr), 0);
+    }
+
+    /// A zero-width bit-field forces the next member to a boundary on every
+    /// target, but whether it also raises the *aggregate's* alignment is
+    /// ABI-specific (C17 6.7.2.1p12 leaves it open): the x86-64 psABI says no,
+    /// AAPCS64 says it contributes its declared type's alignment. Both answers
+    /// are gcc's on the respective target.
+    ///
+    /// Asserted here for both targets from one host, which the end-to-end test
+    /// cannot do -- it only ever compiles for the machine it runs on.
+    #[test]
+    fn test_zero_width_bitfield_alignment_is_abi_specific() {
+        fn layout(target: &Target, pack: Option<u32>, union_: bool) -> (usize, usize) {
+            let types = TypeTable::new(target);
+            // { char c; int :0; char d; }
+            let mut members = vec![
+                StructMember {
+                    name: StringId::EMPTY,
+                    typ: types.char_id,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width: None,
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+                StructMember {
+                    name: StringId::EMPTY,
+                    typ: types.int_id,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width: Some(0),
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+                StructMember {
+                    name: StringId::EMPTY,
+                    typ: types.char_id,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width: None,
+                    storage_unit_size: None,
+                    explicit_align: None,
+                },
+            ];
+            if union_ {
+                members.truncate(2);
+                types.compute_union_layout(&mut members, pack)
+            } else {
+                types.compute_struct_layout(&mut members, pack)
+            }
+        }
+
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let arm = Target::new(Arch::Aarch64, Os::Linux);
+
+        // Struct: the boundary applies everywhere, the alignment does not.
+        assert_eq!(layout(&x86, None, false), (5, 1));
+        assert_eq!(layout(&arm, None, false), (8, 4));
+
+        // Packing caps an ordinary member's alignment but not this one.
+        assert_eq!(layout(&x86, Some(1), false), (5, 1));
+        assert_eq!(layout(&arm, Some(1), false), (8, 4));
+
+        // Union: a zero-width bitfield occupies no storage, so it cannot
+        // widen the union -- it used to contribute its type's whole size.
+        assert_eq!(layout(&x86, None, true), (1, 1));
+        assert_eq!(layout(&arm, None, true), (4, 4));
+        assert_eq!(layout(&x86, Some(1), true), (1, 1));
+        assert_eq!(layout(&arm, Some(1), true), (4, 4));
     }
 
     #[test]

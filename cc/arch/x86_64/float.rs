@@ -805,9 +805,9 @@ impl X86_64CodeGen {
         // Convert using cvttss2si/cvttsd2si (truncate toward zero).
         // For unsigned 32-bit targets, use 64-bit conversion to avoid
         // overflow for values >= 2^31 that fit in uint32_t but not int32_t.
-        let is_unsigned = types
-            .modifiers(dst_typ)
-            .contains(crate::types::TypeModifiers::UNSIGNED);
+        // Ask the predicate, not the modifier bit: the bit is silent for the
+        // types whose signedness does not live there.
+        let is_unsigned = types.is_unsigned(dst_typ);
         let int_size = if is_unsigned && dst_size == 32 {
             OperandSize::B64 // cvttsd2siq then truncate
         } else {

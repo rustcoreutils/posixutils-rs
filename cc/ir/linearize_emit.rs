@@ -567,7 +567,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         operand_typ: TypeId,
     ) -> PseudoId {
         let is_float = self.types.is_float(operand_typ);
-        let is_unsigned = self.types.is_unsigned(operand_typ);
+        // A pointer is not an integer type, so `is_unsigned` says false for
+        // one -- but C17 6.5.8 compares pointers by address, and an address is
+        // unsigned. Taking the signed answer emitted `setl` where gcc emits
+        // `setb`, which differs for any pair straddling the sign bit. The
+        // arithmetic opcodes below are unreachable for a pointer operand, so
+        // one predicate serves both.
+        let is_unsigned = self.types.is_unsigned(operand_typ)
+            || self.types.kind(operand_typ) == TypeKind::Pointer;
 
         let result = self.alloc_pseudo();
 

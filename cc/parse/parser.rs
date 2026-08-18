@@ -3348,7 +3348,18 @@ impl Parser<'_> {
             } else if fits(0, u64::MAX as i128) {
                 (self.types.ulong_id, 8)
             } else {
-                unreachable!("a non-negative maximum always fits u64 or overflows i128")
+                // Not unreachable, as this once claimed: nothing clamps an
+                // enumerator to 64 bits and the folder computes in `i128`, so
+                // `enum E { A = 1 << 64 };` reached here and **panicked the
+                // compiler**. gcc warns and carries on, folding the shift to 0
+                // because it truncates to the expression's type -- which c17's
+                // folders do not yet do (see #C115). Until they do, say what is
+                // wrong rather than aborting: a compiler diagnoses.
+                diag::error(
+                    pos,
+                    &gettext("no integer type can represent all values of this enumeration"),
+                );
+                (self.types.ulong_id, 8)
             }
         } else if fits(i32::MIN as i128, i32::MAX as i128) {
             (self.types.int_id, 4)

@@ -3283,3 +3283,70 @@ fn diagnostics_const_objects_do_not_fold_outside_initializers() {
         "constant",
     );
 }
+
+// === #C118 — an out-of-range enumerator must not panic the compiler ===
+
+/// `enum E { A = 1 << 64 };` exited **101** on an `unreachable!` whose premise
+/// ("a non-negative maximum always fits u64 or overflows i128") is false:
+/// nothing clamps an enumerator to 64 bits and the folder computes in `i128`.
+///
+/// gcc warns and carries on, folding the shift to 0 because it truncates to the
+/// expression's type. c17's folders do not truncate -- that is #C115, and until
+/// it lands these are *rejected* rather than folded. Rejecting is a divergence;
+/// panicking is not a behaviour a compiler may have at all, so this closes the
+/// crash first and the value follows with #C115.
+#[test]
+fn diagnostics_out_of_range_enumerator_does_not_panic() {
+    for (name, src) in [
+        (
+            "enum_shift_64",
+            "enum E { A = 1 << 64 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_shift_63x3",
+            "enum E { A = 3 << 63 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_shift_100",
+            "enum E { A = 1 << 100 };\nint main(void){ return 0; }\n",
+        ),
+    ] {
+        // The message is the discriminator: a panic also exits non-zero, so
+        // asserting only on failure would have passed against the crash.
+        compile_expect_error(name, src, "no integer type can represent all values");
+    }
+}
+
+/// Enumerators that do fit are unaffected, at every width the choice of
+/// underlying type turns on.
+#[test]
+fn diagnostics_representable_enumerators_are_accepted() {
+    for (name, src) in [
+        (
+            "enum_int_max",
+            "enum E { A = 2147483647 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_shift_31",
+            "enum E { A = 1 << 31 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_uint_max",
+            "enum E { A = 0xFFFFFFFFU };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_ulong_max",
+            "enum E { A = 0xFFFFFFFFFFFFFFFFULL };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_negative",
+            "enum E { A = -2147483648 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_plain",
+            "enum E { A, B, C };\nint main(void){ return 0; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

@@ -799,7 +799,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);
-                                    let storage_type = self.bitfield_storage_type(storage_size);
+
                                     // Convert to the *member's* type first, not
                                     // straight to the storage unit's. C17 6.7.9p11
                                     // initializes a member by converting to its own
@@ -808,16 +808,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     // directly to the unsigned storage type skipped
                                     // it, so `struct { _Bool f:1; } v = {2};` stored
                                     // 2, truncated it to one bit and read back 0.
+                                    // A *second* conversion, to a type derived from
+                                    // the access span, used to follow. It truncated
+                                    // whenever the span was not 1, 2, 4 or 8 bytes,
+                                    // because `bitfield_storage_type` answers
+                                    // `unsigned int` for everything else -- so a
+                                    // 64-bit field in a sixteen-byte window, or a
+                                    // packed nine-byte span, kept 32 bits of its
+                                    // initializer. `emit_bitfield_store` takes the
+                                    // member-typed value, exactly as the assignment
+                                    // path hands it over through `emit_member_store`.
                                     let member_val = self.emit_convert(val, val_type, field_type);
-                                    let converted =
-                                        self.emit_convert(member_val, field_type, storage_type);
                                     self.emit_bitfield_store(
                                         base_sym,
                                         offset as usize,
                                         bit_off,
                                         bit_w,
                                         storage_size,
-                                        converted,
+                                        member_val,
                                     );
                                 } else {
                                     self.linearize_struct_field_init(

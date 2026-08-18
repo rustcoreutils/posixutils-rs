@@ -1110,3 +1110,80 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("mode_only_its_declarator", code, &[]), 0);
 }
+
+/// A bit-field must read only its own bits, and keep all of them through a
+/// brace initializer (#C119, #C120).
+///
+/// Two defects that meet on the wide bit-field. **The load** walked every byte
+/// of the access span with no "does this byte hold any of the field's bits?"
+/// test -- the skip its *store* sibling has always had -- so a field in a
+/// window wider than itself read the object's **padding**. Every `__int128`
+/// bit-field is such a field: its window is sixteen bytes. The stray bytes were
+/// also shifted by more than the 64-bit carrier's width, which x86-64 masks
+/// (folding padding into the result) and aarch64's assembler rejects outright,
+/// so the same source would not even build there.
+///
+/// **The brace initializer** then converted the value twice: to the member's
+/// type, correctly, and again to a type derived from the *span*, where
+/// `bitfield_storage_type` answers `unsigned int` for anything but 1, 2, 4 or 8
+/// bytes. A 64-bit field in a sixteen-byte window, or in a packed nine-byte
+/// span, kept 32 bits of its initializer. Assignment was unaffected, so
+/// `p.a = ~0ULL` was right and `= {~0ULL}` was not.
+///
+/// The padding is deliberately dirtied; with it zero the load bug is invisible.
+#[test]
+fn c99_wide_bitfields_read_only_their_own_bits() {
+    let code = r#"
+struct A { unsigned __int128 a:64; };
+struct B { unsigned __int128 a:64, b:64; };
+struct C { unsigned __int128 a:32; };
+struct D { unsigned __int128 a:1; };
+struct __attribute__((packed)) P { unsigned c:1; unsigned long long a:64; };
+struct Q { unsigned __int128 a:64; };
+
+int main(void) {
+    /* Reading: the window is wider than the field, so the bytes beyond it must
+       not contribute. */
+    struct A x; __builtin_memset(&x, 0xAA, sizeof x);
+    x.a = 0x1122334455667788ULL;
+    if (x.a != 0x1122334455667788ULL) return 1;
+
+    struct B y; __builtin_memset(&y, 0xAA, sizeof y);
+    y.a = 1; y.b = 2;
+    if (y.a != 1 || y.b != 2) return 2;
+
+    struct C z; __builtin_memset(&z, 0xAA, sizeof z);
+    z.a = 0xDEADBEEFu;
+    if (z.a != 0xDEADBEEFu) return 3;
+
+    struct D w; __builtin_memset(&w, 0xAA, sizeof w);
+    w.a = 1;
+    if (w.a != 1) return 4;
+    w.a = 0;
+    if (w.a != 0) return 5;
+
+    /* Initializing: the value must not be narrowed to a span-derived type. */
+    struct P p = { 0, 0xFFFFFFFFFFFFFFFFULL };
+    if (p.a != 0xFFFFFFFFFFFFFFFFULL) return 6;
+    struct Q q = { 0xFFFFFFFFFFFFFFFFULL };
+    if (q.a != 0xFFFFFFFFFFFFFFFFULL) return 7;
+
+    /* Assignment always worked and must continue to. */
+    p.a = 0x0123456789ABCDEFULL;
+    if (p.a != 0x0123456789ABCDEFULL) return 8;
+
+    /* The narrow and packed spans the same code serves. */
+    struct E { unsigned a:20, b:20; } e = { 0xABCDE, 0x12345 };
+    if (e.a != 0xABCDEu || e.b != 0x12345u) return 9;
+    struct F { char pre; unsigned a:20; char post; } f = { 1, 0xFEDCB, 2 };
+    if (f.pre != 1 || f.a != 0xFEDCBu || f.post != 2) return 10;
+
+    /* `_Bool` still normalises through its own type, not the storage unit. */
+    struct G { _Bool b:1; } g = { 2 };
+    if (g.b != 1) return 11;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("wide_bitfield_own_bits", code, &[]), 0);
+}

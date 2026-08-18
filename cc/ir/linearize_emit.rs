@@ -333,7 +333,19 @@ impl<'a> super::linearize::Linearizer<'a> {
         let byte_type = self.types.uchar_id;
 
         let mut acc: Option<PseudoId> = None;
+        let (field_lo, field_hi) = (bit_offset, bit_offset + bit_width);
         for i in 0..span {
+            // Only the bytes the field's own bits reach. The store path has
+            // always had this test; the load path did not, so a span wider than
+            // the field -- which is every `__int128` bit-field, whose access
+            // window is sixteen bytes -- read the object's *padding* and
+            // shifted it by more than the carrier's width. x86-64 masks such a
+            // shift and folded the padding into the result; aarch64's assembler
+            // rejects the instruction outright.
+            let (byte_lo, byte_hi) = (8 * i, 8 * i + 8);
+            if field_lo.max(byte_lo) >= field_hi.min(byte_hi) {
+                continue;
+            }
             let byte = self.alloc_pseudo();
             self.emit(Instruction::load(
                 byte,

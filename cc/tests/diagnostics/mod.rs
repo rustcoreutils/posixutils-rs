@@ -2190,3 +2190,133 @@ fn diagnostics_non_integer_bitfields_are_rejected() {
         "exceeds type size",
     );
 }
+
+// === #C106 — jump and label statement constraints (C17 6.8.1, 6.8.4.2, 6.8.6) ===
+
+/// Four constraints that were accepted in silence, each producing a broken
+/// program rather than merely a missing message.
+///
+/// A `goto` to a label that does not exist minted a basic block for it and
+/// never terminated it, so control fell out of the function through whatever
+/// happened to follow in layout order: the program built, linked, and
+/// **segfaulted**. Two labels of one name were merged into a single block, so
+/// `L: i++; if (i<2) goto L; L: return i;` **looped forever**. A `break` or
+/// `continue` with nothing to jump out of was silently *deleted* -- the control
+/// flow the program asked for simply did not happen. And a `switch` on a
+/// non-integer compiled and took the wrong branch, comparing the value's bit
+/// pattern.
+#[test]
+fn diagnostics_stray_jumps_and_labels_are_rejected() {
+    compile_expect_error(
+        "goto_undefined",
+        "int f(void){ goto nowhere; return 0; }\n",
+        "label 'nowhere' used but not defined",
+    );
+    compile_expect_error(
+        "label_duplicate",
+        "int f(void){ L: ; L: ; return 0; }\n",
+        "duplicate label 'L'",
+    );
+    compile_expect_error(
+        "break_outside",
+        "int f(void){ break; return 0; }\n",
+        "break statement not within loop or switch",
+    );
+    compile_expect_error(
+        "break_outside_nested_block",
+        "int f(void){ { { break; } } return 0; }\n",
+        "break statement not within loop or switch",
+    );
+    compile_expect_error(
+        "continue_outside",
+        "int f(void){ continue; return 0; }\n",
+        "continue statement not within a loop",
+    );
+    compile_expect_error(
+        "case_outside",
+        "int f(void){ case 1: return 0; }\n",
+        "case label not within a switch statement",
+    );
+    compile_expect_error(
+        "default_outside",
+        "int f(void){ default: return 0; }\n",
+        "'default' label not within a switch statement",
+    );
+    compile_expect_error(
+        "switch_on_double",
+        "int f(double d){ switch(d){ case 1: return 1; } return 0; }\n",
+        "switch quantity is not an integer",
+    );
+    compile_expect_error(
+        "switch_on_struct",
+        "struct S { int a; };\nint f(struct S s){ switch(s){ case 1: return 1; } return 0; }\n",
+        "switch quantity is not an integer",
+    );
+}
+
+/// The accept side, which is where a check of this shape actually goes wrong.
+/// Every row is a construct gcc accepts and an over-eager version of the check
+/// would reject: a *forward* `goto` names a label the walk has not reached yet;
+/// a label is scoped to its function, so the same name in two functions is not
+/// a duplicate; a `switch` supplies a `break` target but not a `continue` one,
+/// so a `continue` inside a switch belongs to the loop around it; a statement
+/// expression is transparent to `break`; and `switch` accepts every integer
+/// type, `enum`, `char`, `_Bool`, a bit-field and `__int128` included.
+#[test]
+fn diagnostics_legal_jumps_and_labels_are_accepted() {
+    for (name, src) in [
+        ("goto_forward", "int f(void){ goto L; L: return 0; }\n"),
+        (
+            "goto_backward",
+            "int f(void){ int i=0; L: i++; if(i<2) goto L; return i; }\n",
+        ),
+        ("goto_out_of_block", "int f(void){ { goto L; } L: return 0; }\n"),
+        (
+            "label_same_name_two_functions",
+            "int f(void){ L: return 0; }\nint g(void){ L: return 1; }\n",
+        ),
+        ("break_in_while", "int f(void){ while(1){ break; } return 0; }\n"),
+        ("break_in_do", "int f(void){ do { break; } while(0); return 0; }\n"),
+        (
+            "break_in_switch",
+            "int f(int x){ switch(x){ case 1: break; } return 0; }\n",
+        ),
+        (
+            "break_nested_loops",
+            "int f(void){ while(1){ while(1){ break; } break; } return 0; }\n",
+        ),
+        (
+            "break_in_statement_expression",
+            "int f(void){ for(;;){ ({ break; }); } return 0; }\n",
+        ),
+        (
+            "continue_in_for",
+            "int f(void){ for(int i=0;i<3;i++){ continue; } return 0; }\n",
+        ),
+        (
+            "continue_through_switch",
+            "int f(void){ for(int i=0;i<3;i++){ switch(i){ case 1: continue; } } return 0; }\n",
+        ),
+        (
+            "switch_on_enum",
+            "enum E { A, B };\nint f(enum E e){ switch(e){ case A: return 1; } return 0; }\n",
+        ),
+        ("switch_on_char", "int f(char c){ switch(c){ case 1: return 1; } return 0; }\n"),
+        ("switch_on_bool", "int f(_Bool b){ switch(b){ case 1: return 1; } return 0; }\n"),
+        (
+            "switch_on_bitfield",
+            "struct S { int b:5; };\nint f(struct S s){ switch(s.b){ case 1: return 1; } return 0; }\n",
+        ),
+        (
+            "switch_on_int128",
+            "int f(__int128 v){ switch(v){ case 1: return 1; } return 0; }\n",
+        ),
+        (
+            "duffs_device",
+            "int f(int n, int *p){ switch(n%4){ case 0: do { (*p)++; case 3: (*p)++; \
+             case 2: (*p)++; case 1: (*p)++; } while((n-=4)>0); } return 0; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}

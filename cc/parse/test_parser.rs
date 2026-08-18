@@ -1691,20 +1691,20 @@ fn test_return_value() {
 #[test]
 fn test_break_stmt() {
     let (stmt, _strings) = parse_stmt("break;").unwrap();
-    assert!(matches!(stmt, Stmt::Break));
+    assert!(matches!(stmt, Stmt::Break(_)));
 }
 
 #[test]
 fn test_continue_stmt() {
     let (stmt, _strings) = parse_stmt("continue;").unwrap();
-    assert!(matches!(stmt, Stmt::Continue));
+    assert!(matches!(stmt, Stmt::Continue(_)));
 }
 
 #[test]
 fn test_goto_stmt() {
     let (stmt, strings) = parse_stmt("goto label;").unwrap();
     match stmt {
-        Stmt::Goto(name) => check_name(&strings, name, "label"),
+        Stmt::Goto { name, .. } => check_name(&strings, name, "label"),
         _ => panic!("Expected Goto"),
     }
 }
@@ -1713,7 +1713,7 @@ fn test_goto_stmt() {
 fn test_labeled_stmt() {
     let (stmt, strings) = parse_stmt("label: x = 1;").unwrap();
     match stmt {
-        Stmt::Label { name, stmt } => {
+        Stmt::Label { name, stmt, .. } => {
             check_name(&strings, name, "label");
             assert!(matches!(*stmt, Stmt::Expr(_)));
         }

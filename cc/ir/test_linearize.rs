@@ -558,7 +558,7 @@ fn test_switch_basic() {
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types))))),
         BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types)))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types))))),
-        BlockItem::Statement(Box::new(Stmt::Default)),
+        BlockItem::Statement(Box::new(Stmt::Default(test_pos()))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
     ]);
 
@@ -627,8 +627,8 @@ fn test_switch_with_break() {
             },
             int_type,
         )))),
-        BlockItem::Statement(Box::new(Stmt::Break)),
-        BlockItem::Statement(Box::new(Stmt::Default)),
+        BlockItem::Statement(Box::new(Stmt::Break(test_pos()))),
+        BlockItem::Statement(Box::new(Stmt::Default(test_pos()))),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
@@ -789,7 +789,7 @@ fn test_do_while_with_break() {
     ));
     let if_break = Stmt::If {
         cond: Expr::var_typed(cond_sym, int_type),
-        then_stmt: Box::new(Stmt::Break),
+        then_stmt: Box::new(Stmt::Break(test_pos())),
         else_stmt: None,
     };
     let body = Stmt::Block(vec![
@@ -862,7 +862,10 @@ fn test_goto_forward() {
 
     // Block: { goto end; x = 1; end: x = 2; return x; }
     let body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Goto(end_id))),
+        BlockItem::Statement(Box::new(Stmt::Goto {
+            name: end_id,
+            pos: test_pos(),
+        })),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
@@ -881,6 +884,7 @@ fn test_goto_forward() {
                 },
                 int_type,
             ))),
+            pos: test_pos(),
         })),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
             x_sym, int_type,
@@ -951,7 +955,10 @@ fn test_goto_backward() {
     );
     let if_goto = Stmt::If {
         cond,
-        then_stmt: Box::new(Stmt::Goto(loop_id)),
+        then_stmt: Box::new(Stmt::Goto {
+            name: loop_id,
+            pos: test_pos(),
+        }),
         else_stmt: None,
     };
 
@@ -959,6 +966,7 @@ fn test_goto_backward() {
         BlockItem::Statement(Box::new(Stmt::Label {
             name: loop_id,
             stmt: Box::new(increment),
+            pos: test_pos(),
         })),
         BlockItem::Statement(Box::new(if_goto)),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
@@ -1019,7 +1027,7 @@ fn test_nested_loop_break() {
     // Inner loop: while(1) { break; }
     let inner_loop = Stmt::While {
         cond: Expr::int(1, &ctx.types),
-        body: Box::new(Stmt::Break),
+        body: Box::new(Stmt::Break(test_pos())),
     };
 
     // x = 1
@@ -1036,7 +1044,7 @@ fn test_nested_loop_break() {
     let outer_body = Stmt::Block(vec![
         BlockItem::Statement(Box::new(inner_loop)),
         BlockItem::Statement(Box::new(assign)),
-        BlockItem::Statement(Box::new(Stmt::Break)),
+        BlockItem::Statement(Box::new(Stmt::Break(test_pos()))),
     ]);
 
     let outer_loop = Stmt::While {
@@ -1098,7 +1106,7 @@ fn test_nested_loop_continue() {
     // Inner loop: while(cond2) { continue; }
     let inner_loop = Stmt::While {
         cond: Expr::var_typed(cond2_sym, int_type),
-        body: Box::new(Stmt::Continue),
+        body: Box::new(Stmt::Continue(test_pos())),
     };
 
     // x = 1
@@ -1774,7 +1782,7 @@ fn test_linearize_while() {
         test_id,
         Stmt::While {
             cond: Expr::int(1, &types),
-            body: Box::new(Stmt::Break),
+            body: Box::new(Stmt::Break(test_pos())),
         },
         &types,
     );

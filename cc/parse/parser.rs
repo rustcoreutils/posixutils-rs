@@ -1552,20 +1552,23 @@ impl Parser<'_> {
                     crate::kw::FOR => return self.parse_for_stmt(),
                     crate::kw::RETURN => return self.parse_return_stmt(),
                     crate::kw::BREAK => {
+                        let pos = self.current_pos();
                         self.advance();
                         self.expect_special(b';')?;
-                        return Ok(Stmt::Break);
+                        return Ok(Stmt::Break(pos));
                     }
                     crate::kw::CONTINUE => {
+                        let pos = self.current_pos();
                         self.advance();
                         self.expect_special(b';')?;
-                        return Ok(Stmt::Continue);
+                        return Ok(Stmt::Continue(pos));
                     }
                     crate::kw::GOTO => {
+                        let pos = self.current_pos();
                         self.advance();
-                        let label = self.expect_identifier()?;
+                        let name = self.expect_identifier()?;
                         self.expect_special(b';')?;
-                        return Ok(Stmt::Goto(label));
+                        return Ok(Stmt::Goto { name, pos });
                     }
                     crate::kw::SWITCH => return self.parse_switch_stmt(),
                     crate::kw::CASE => return self.parse_case_label(),
@@ -1594,6 +1597,7 @@ impl Parser<'_> {
         if self.peek() == TokenType::Ident {
             // Save position for potential backtrack
             let saved_pos = self.pos;
+            let pos = self.current_pos();
             let name = self.expect_identifier()?;
             if self.is_special(b':') {
                 self.advance();
@@ -1601,6 +1605,7 @@ impl Parser<'_> {
                 return Ok(Stmt::Label {
                     name,
                     stmt: Box::new(stmt),
+                    pos,
                 });
             }
             // Not a label, backtrack
@@ -1793,7 +1798,7 @@ impl Parser<'_> {
         let mut items = Vec::new();
         loop {
             let stmt = self.parse_statement()?;
-            let is_label = matches!(stmt, Stmt::Case(_) | Stmt::Default);
+            let is_label = matches!(stmt, Stmt::Case(_) | Stmt::Default(_));
             items.push(BlockItem::Statement(Box::new(stmt)));
             // A label prefixes a statement, so one more must follow it. Anything
             // else ends the body. The `}`/EOF guard keeps a body that is nothing
@@ -1823,9 +1828,10 @@ impl Parser<'_> {
 
     /// Parse a default label
     fn parse_default_label(&mut self) -> ParseResult<Stmt> {
+        let pos = self.current_pos();
         self.advance(); // consume 'default'
         self.expect_special(b':')?;
-        Ok(Stmt::Default)
+        Ok(Stmt::Default(pos))
     }
 
     /// Parse a compound statement (block) with its own scope

@@ -12,7 +12,7 @@ use super::linearize::*;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
 };
-use crate::diag::error;
+use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement,
@@ -145,7 +145,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            Stmt::Break => {
+            Stmt::Break(_) => {
                 if let Some(&target) = self.break_targets.last() {
                     if let Some(current) = self.current_bb {
                         self.emit(Instruction::br(target));
@@ -154,7 +154,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            Stmt::Continue => {
+            Stmt::Continue(_) => {
                 if let Some(&target) = self.continue_targets.last() {
                     if let Some(current) = self.current_bb {
                         self.emit(Instruction::br(target));
@@ -163,7 +163,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            Stmt::Goto(label) => {
+            Stmt::Goto { name: label, .. } => {
                 let label_str = self.str(*label).to_string();
                 let target = self.get_or_create_label(&label_str);
                 if let Some(current) = self.current_bb {
@@ -176,7 +176,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.current_bb = None;
             }
 
-            Stmt::Label { name, stmt } => {
+            Stmt::Label { name, stmt, .. } => {
                 let name_str = self.str(*name).to_string();
                 let label_bb = self.get_or_create_label(&name_str);
 
@@ -196,7 +196,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.linearize_switch(expr, body);
             }
 
-            Stmt::Case(_) | Stmt::Default => {
+            Stmt::Case(_) | Stmt::Default(_) => {
                 // Case/Default labels are handled by linearize_switch
                 // If we encounter them outside a switch, ignore them
             }
@@ -1206,6 +1206,18 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Linearize the switch expression
         let switch_val = self.linearize_expr(expr);
         let expr_type = self.expr_type(expr);
+        // C17 6.8.4.2p1: the controlling expression shall have integer type.
+        // The type was fetched only to size the instruction, so `switch (d)`
+        // on a `double` compiled -- and took the wrong branch, since the
+        // comparison ran on the value's bit pattern.
+        if !self.types.is_integer(expr_type) {
+            let named = self.types.format_type(expr_type, Some(self.strings));
+            crate::diag::error_args(
+                expr.pos,
+                "switch quantity is not an integer: '{0}'",
+                &[&named],
+            );
+        }
         let size = self.types.size_bits(expr_type);
 
         let exit_bb = self.alloc_bb();
@@ -1314,7 +1326,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// by the accept-side tests.
     ///
     /// Reported at the declaration rather than at the jump, which is where gcc
-    /// points: `Stmt::Goto` and `Stmt::Default` carry no position, and naming
+    /// points: `Stmt::Goto` and `Stmt::Default(_)` carry no position, and naming
     /// the declaration that cannot be entered says more about the cause than
     /// the jump does.
     pub(crate) fn check_jumps_into_variably_modified_scopes(&self, body: &Stmt) {
@@ -1324,14 +1336,33 @@ impl<'a> super::linearize::Linearizer<'a> {
             labels: Vec::new(),
             gotos: Vec::new(),
             bad_case_ids: Vec::new(),
+            loop_depth: 0,
+            switch_depth: 0,
+            stray_jumps: Vec::new(),
         };
         w.walk(body, None);
 
+        // 6.8.1p3: a label name is unique within the function it appears in.
+        // Two labels of one name were silently merged into one basic block, so
+        // `L: i++; if (i<2) goto L; L: return i;` looped forever.
+        for (i, (name, _, pos)) in w.labels.iter().enumerate() {
+            if w.labels[..i].iter().any(|(earlier, _, _)| earlier == name) {
+                let spelled = self.strings.get(*name).to_string();
+                crate::diag::error_args(*pos, "duplicate label '{0}'", &[&spelled]);
+            }
+        }
+
         // A `goto` is illegal exactly when its label sits inside a scope the
         // `goto` itself is not already in.
-        for (name, from) in &w.gotos {
-            let Some((_, to)) = w.labels.iter().find(|(n, _)| n == name) else {
-                continue; // an undefined label is a separate diagnostic
+        for (name, from, pos) in &w.gotos {
+            let Some((_, to, _)) = w.labels.iter().find(|(n, _, _)| n == name) else {
+                // 6.8.6.1p1: the label has to exist. Minting a block for it
+                // left that block unterminated, and control fell out of the
+                // function through whatever followed in layout order -- so the
+                // program built, linked, and segfaulted.
+                let spelled = self.strings.get(*name).to_string();
+                crate::diag::error_args(*pos, "label '{0}' used but not defined", &[&spelled]);
+                continue;
             };
             if let Some(id) = to.iter().find(|id| !from.contains(id)) {
                 self.report_vm_jump(&w.declared[*id], "jump");
@@ -1339,6 +1370,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         for id in w.bad_cases() {
             self.report_vm_jump(&w.declared[id], "switch jump");
+        }
+
+        for (pos, what) in &w.stray_jumps {
+            let message = match *what {
+                "break" => "break statement not within loop or switch",
+                "continue" => "continue statement not within a loop",
+                "case" => "case label not within a switch statement",
+                _ => "'default' label not within a switch statement",
+            };
+            error(*pos, &gettextrs::gettext(message));
         }
     }
 
@@ -1390,7 +1431,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                 }
             }
-            Stmt::Default => {
+            Stmt::Default(_) => {
                 // C99 6.8.4.2p3: at most one default label per switch.
                 if *has_default {
                     error(
@@ -2137,7 +2178,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
             }
-            Stmt::Default => {
+            Stmt::Default(_) => {
                 if let Some(def_bb) = default_bb {
                     // Fall through from previous case if not terminated
                     if !self.is_terminated() {
@@ -2349,7 +2390,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.switch_bb(merge_bb);
             }
 
-            Stmt::Label { name, stmt } => {
+            Stmt::Label { name, stmt, .. } => {
                 let name_str = self.str(*name).to_string();
                 let label_bb = self.get_or_create_label(&name_str);
 
@@ -2733,12 +2774,20 @@ struct VmScopeWalk {
     open: Vec<usize>,
     /// Every variably modified declaration seen, indexed by scope id.
     declared: Vec<VmDecl>,
-    /// Label name, and the scopes enclosing it.
-    labels: Vec<(StringId, Vec<usize>)>,
-    /// Each `goto`, and the scopes enclosing it.
-    gotos: Vec<(StringId, Vec<usize>)>,
+    /// Label name, the scopes enclosing it, and where it was written.
+    labels: Vec<(StringId, Vec<usize>, Position)>,
+    /// Each `goto`, the scopes enclosing it, and where it was written.
+    gotos: Vec<(StringId, Vec<usize>, Position)>,
     /// Scope ids a `case`/`default` was found inside but its `switch` was not.
     bad_case_ids: Vec<usize>,
+    /// How many loops enclose the statement being visited. `continue` needs
+    /// one; `break` accepts a `switch` as well.
+    loop_depth: u32,
+    /// How many `switch`es enclose the statement being visited.
+    switch_depth: u32,
+    /// A `break` or `continue` with nothing to jump out of, and a `case` or
+    /// `default` with no `switch`, as (position, keyword).
+    stray_jumps: Vec<(Position, &'static str)>,
 }
 
 impl VmScopeWalk {
@@ -2770,13 +2819,41 @@ impl VmScopeWalk {
                 self.open.truncate(depth);
             }
 
-            Stmt::Label { name, stmt } => {
-                self.labels.push((*name, self.open.clone()));
+            Stmt::Label { name, stmt, pos } => {
+                self.labels.push((*name, self.open.clone(), *pos));
                 self.walk(stmt, switch_scopes);
             }
-            Stmt::Goto(name) => self.gotos.push((*name, self.open.clone())),
+            Stmt::Goto { name, pos } => self.gotos.push((*name, self.open.clone(), *pos)),
 
-            Stmt::Case(_) | Stmt::Default => {
+            // 6.8.6.3p1 and 6.8.6.2p1: a `break` needs an enclosing loop or
+            // switch and a `continue` an enclosing loop. Checked here rather
+            // than in the `linearize_stmt` arms, which look like the obvious
+            // place -- they fail exactly when the target stack is empty -- but
+            // a switch body is lowered by `linearize_switch_stmt`, which
+            // delegates back for nested constructs, so an arm there cannot
+            // tell "outside every construct" from "reached by delegation".
+            Stmt::Break(pos) => {
+                if self.loop_depth == 0 && self.switch_depth == 0 {
+                    self.stray_jumps.push((*pos, "break"));
+                }
+            }
+            Stmt::Continue(pos) => {
+                if self.loop_depth == 0 {
+                    self.stray_jumps.push((*pos, "continue"));
+                }
+            }
+
+            Stmt::Case(_) | Stmt::Default(_) => {
+                // 6.8.1p2: a `case` or `default` belongs to a `switch`.
+                if self.switch_depth == 0 {
+                    let (pos, what) = match stmt {
+                        Stmt::Case(expr) => (expr.pos, "case"),
+                        Stmt::Default(pos) => (*pos, "default"),
+                        _ => unreachable!(),
+                    };
+                    self.stray_jumps.push((pos, what));
+                }
+
                 // Reaching a `case` transfers control from the `switch`, so
                 // any scope open here but not there would be entered without
                 // its declaration running.
@@ -2793,7 +2870,9 @@ impl VmScopeWalk {
             // Its own scopes are captured before the body is walked.
             Stmt::Switch { body, .. } => {
                 let outer = self.open.clone();
+                self.switch_depth += 1;
                 self.walk(body, Some(&outer));
+                self.switch_depth -= 1;
             }
 
             Stmt::If {
@@ -2806,14 +2885,20 @@ impl VmScopeWalk {
                     self.walk(e, switch_scopes);
                 }
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => self.walk(body, switch_scopes),
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                self.loop_depth += 1;
+                self.walk(body, switch_scopes);
+                self.loop_depth -= 1;
+            }
             Stmt::For { init, body, .. } => {
                 // A declaration in the init clause scopes over the body.
                 let depth = self.open.len();
                 if let Some(ForInit::Declaration(decl)) = init {
                     self.open_scopes(decl);
                 }
+                self.loop_depth += 1;
                 self.walk(body, switch_scopes);
+                self.loop_depth -= 1;
                 self.open.truncate(depth);
             }
 

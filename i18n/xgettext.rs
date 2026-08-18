@@ -890,7 +890,7 @@ impl Walker {
             Stmt::Case(expr) => {
                 self.extract_from_c_expr(expr, strings, symbols, streams, path);
             }
-            Stmt::Default => {}
+            Stmt::Default(_) => {}
             Stmt::Return(Some(expr)) => {
                 self.extract_from_c_expr(expr, strings, symbols, streams, path);
             }

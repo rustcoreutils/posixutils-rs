@@ -489,9 +489,22 @@ impl Type {
             return false;
         }
 
-        // Compare array sizes
-        if self.array_size != other.array_size {
-            return false;
+        // Compare array sizes.
+        //
+        // C17 6.7.6.2p6: two array types are compatible if their element types
+        // are, and *both* have a constant size, in which case the sizes must
+        // agree. A side with no extent -- an incomplete `int[]`, or a variably
+        // modified `int[n]`, which are the same thing to the type table --
+        // imposes no size requirement, so it is compatible with either.
+        //
+        // Requiring equality made a legal call diagnosed: `int a[n][m]` as a
+        // parameter decays to `int (*)[m]`, whose pointee has no extent, and
+        // passing an ordinary `int m[2][2]` gave "passing argument 3 as
+        // 'int[]*' from 'int[2]*' incompatible pointer type" where gcc is
+        // silent even under -Wall.
+        match (self.array_size, other.array_size) {
+            (Some(a), Some(b)) if a != b => return false,
+            _ => {}
         }
 
         // Compare variadic flag

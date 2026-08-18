@@ -2033,3 +2033,50 @@ fn diagnostics_sizeof_of_a_typeof_is_not_rejected() {
         "int main(void){ int x = 0; return (int)sizeof(typeof(x)) - 4; }\n",
     );
 }
+
+// ============================================================================
+// Array compatibility when one side has no extent (C17 6.7.6.2p6)
+// ============================================================================
+
+/// Two array types are compatible if their element types are and *both* have
+/// a constant size, in which case the sizes must agree. A side with no extent
+/// imposes no size requirement.
+///
+/// Requiring the extents to be equal made a legal call diagnosed: a parameter
+/// `int a[n][m]` decays to `int (*)[m]`, whose pointee has no extent, so
+/// passing an ordinary `int m[2][2]` drew "passing argument 3 as 'int[]*'
+/// from 'int[2]*' incompatible pointer type" where gcc is silent under -Wall.
+#[test]
+fn diagnostics_array_of_unspecified_size_is_compatible() {
+    compile_expect_ok(
+        "vla_param_2d",
+        "int f(int n, int m, int a[n][m]) { return a[n-1][m-1]; }\n\
+         int main(void){ int m[2][2] = {{1,2},{3,4}}; return f(2,2,m) - 4; }\n",
+    );
+    compile_expect_ok(
+        "vla_param_mixed",
+        "int f(int n, int a[3][n]) { return a[0][0]; }\n\
+         int main(void){ int m[2][2] = {{1,2},{3,4}}; return f(2,m) - 1; }\n",
+    );
+    compile_expect_ok(
+        "incomplete_array_ptr",
+        "void f(int (*p)[]);\nint main(void){ int a[2][3]; f(a); return 0; }\n",
+    );
+}
+
+/// A genuine element-type mismatch is still diagnosed, and so is a mismatch
+/// between two *constant* extents -- without these the rule above could pass
+/// by treating every array as compatible with every other.
+#[test]
+fn diagnostics_incompatible_array_pointers_are_still_diagnosed() {
+    compile_expect_warning(
+        "arr_elem_mismatch",
+        "void f(int (*p)[3]);\nint main(void){ double m[2][3]; f(m); return 0; }\n",
+        "incompatible pointer type",
+    );
+    compile_expect_warning(
+        "arr_size_mismatch",
+        "void f(int (*p)[3]);\nint main(void){ int m[2][2]; f(m); return 0; }\n",
+        "incompatible pointer type",
+    );
+}

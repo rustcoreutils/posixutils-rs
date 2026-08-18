@@ -1325,10 +1325,11 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// label that precedes the declaration are all fine, and all are exercised
     /// by the accept-side tests.
     ///
-    /// Reported at the declaration rather than at the jump, which is where gcc
-    /// points: `Stmt::Goto` and `Stmt::Default(_)` carry no position, and naming
-    /// the declaration that cannot be entered says more about the cause than
-    /// the jump does.
+    /// Reported at the jump, where gcc points, and naming the declaration that
+    /// could not be entered, which gcc does not -- the position says where to
+    /// look and the name says what the problem is. This used to report at the
+    /// declaration for want of anything better: the jump and label statements
+    /// carried no position until #C106 gave them one.
     pub(crate) fn check_jumps_into_variably_modified_scopes(&self, body: &Stmt) {
         let mut w = VmScopeWalk {
             open: Vec::new(),
@@ -1354,22 +1355,22 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // A `goto` is illegal exactly when its label sits inside a scope the
         // `goto` itself is not already in.
-        for (name, from, pos) in &w.gotos {
+        for (name, from, goto_pos) in &w.gotos {
             let Some((_, to, _)) = w.labels.iter().find(|(n, _, _)| n == name) else {
                 // 6.8.6.1p1: the label has to exist. Minting a block for it
                 // left that block unterminated, and control fell out of the
                 // function through whatever followed in layout order -- so the
                 // program built, linked, and segfaulted.
                 let spelled = self.strings.get(*name).to_string();
-                crate::diag::error_args(*pos, "label '{0}' used but not defined", &[&spelled]);
+                crate::diag::error_args(*goto_pos, "label '{0}' used but not defined", &[&spelled]);
                 continue;
             };
             if let Some(id) = to.iter().find(|id| !from.contains(id)) {
-                self.report_vm_jump(&w.declared[*id], "jump");
+                self.report_vm_jump(&w.declared[*id], "jump", *goto_pos);
             }
         }
-        for id in w.bad_cases() {
-            self.report_vm_jump(&w.declared[id], "switch jump");
+        for (id, pos) in w.bad_cases() {
+            self.report_vm_jump(&w.declared[id], "switch jump", pos);
         }
 
         for (pos, what) in &w.stray_jumps {
@@ -1384,10 +1385,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Name the declaration a jump would have entered without executing.
-    fn report_vm_jump(&self, decl: &VmDecl, what: &str) {
+    fn report_vm_jump(&self, decl: &VmDecl, what: &str, pos: Position) {
         let name = self.strings.get(self.symbols.get(decl.symbol).name);
         error(
-            decl.pos,
+            pos,
             &format!("{what} into the scope of '{name}', which has a variably modified type",),
         );
     }
@@ -2759,7 +2760,6 @@ impl<'a> super::linearize::Linearizer<'a> {
 /// be entered by a jump (C17 6.8.6.1p1).
 pub(crate) struct VmDecl {
     pub(crate) symbol: crate::symbol::SymbolId,
-    pub(crate) pos: crate::diag::Position,
 }
 
 /// Walks a function body recording, for every label and every jump, which
@@ -2778,8 +2778,9 @@ struct VmScopeWalk {
     labels: Vec<(StringId, Vec<usize>, Position)>,
     /// Each `goto`, the scopes enclosing it, and where it was written.
     gotos: Vec<(StringId, Vec<usize>, Position)>,
-    /// Scope ids a `case`/`default` was found inside but its `switch` was not.
-    bad_case_ids: Vec<usize>,
+    /// Scope ids a `case`/`default` was found inside but its `switch` was not,
+    /// each with the position of the label that reached it.
+    bad_case_ids: Vec<(usize, Position)>,
     /// How many loops enclose the statement being visited. `continue` needs
     /// one; `break` accepts a `switch` as well.
     loop_depth: u32,
@@ -2793,11 +2794,11 @@ struct VmScopeWalk {
 impl VmScopeWalk {
     /// The offending scopes, each reported once however many `case` labels
     /// sit inside it.
-    fn bad_cases(&self) -> Vec<usize> {
-        let mut out: Vec<usize> = Vec::new();
-        for id in &self.bad_case_ids {
-            if !out.contains(id) {
-                out.push(*id);
+    fn bad_cases(&self) -> Vec<(usize, Position)> {
+        let mut out: Vec<(usize, Position)> = Vec::new();
+        for (id, pos) in &self.bad_case_ids {
+            if !out.iter().any(|(seen, _)| seen == id) {
+                out.push((*id, *pos));
             }
         }
         out
@@ -2858,9 +2859,14 @@ impl VmScopeWalk {
                 // any scope open here but not there would be entered without
                 // its declaration running.
                 if let Some(outer) = switch_scopes {
+                    let label_pos = match stmt {
+                        Stmt::Case(expr) => expr.pos,
+                        Stmt::Default(pos) => *pos,
+                        _ => unreachable!("only a case or default reaches this arm"),
+                    };
                     for id in &self.open {
                         if !outer.contains(id) {
-                            self.bad_case_ids.push(*id);
+                            self.bad_case_ids.push((*id, label_pos));
                         }
                     }
                 }
@@ -2914,10 +2920,7 @@ impl VmScopeWalk {
             // let a jump enter.
             if !d.vla_sizes.is_empty() {
                 let id = self.declared.len();
-                self.declared.push(VmDecl {
-                    symbol: d.symbol,
-                    pos: d.pos,
-                });
+                self.declared.push(VmDecl { symbol: d.symbol });
                 self.open.push(id);
             }
         }

@@ -2835,3 +2835,128 @@ fn diagnostics_complete_objects_and_valid_flexible_arrays_are_accepted() {
         compile_expect_ok(name, src);
     }
 }
+
+// === Review follow-ups to the 2026-08-18 series ===
+
+/// 6.7.9p14 gives a *character* array the narrow string literal, and p15 gives
+/// a wide one an array whose element type is *compatible* with the literal's.
+///
+/// The first version of #C108's check accepted any string literal for any
+/// array, so `int a[] = "hi";` compiled. The distinction p15 draws is finer
+/// than "is it a character type?": `int a[] = L"ab";` is legal where `wchar_t`
+/// is `int`, while `unsigned a[] = L"ab";` is not -- and all three of `char`,
+/// `signed char` and `unsigned char` take the narrow literal, so comparing the
+/// element types for strict compatibility would reject two of them.
+#[test]
+fn diagnostics_string_literal_must_match_the_array_element_type() {
+    for (name, src) in [
+        ("str_into_int_array", "int a[] = \"hi\";\n"),
+        ("str_into_short_array", "short a[] = \"hi\";\n"),
+        ("str_into_double_array", "double a[] = \"hi\";\n"),
+        (
+            "str_into_struct_array",
+            "struct S { int a; };\nstruct S s[] = \"hi\";\n",
+        ),
+        (
+            "str_into_local_int_array",
+            "void f(void){ int a[] = \"hi\"; (void)a; }\n",
+        ),
+        // A wide literal needs its own element type, not merely a wide one.
+        ("wide_into_char_array", "char a[] = L\"ab\";\n"),
+        ("wide_into_unsigned_array", "unsigned a[] = L\"ab\";\n"),
+        ("u16_into_char_array", "char a[] = u\"ab\";\n"),
+        ("u16_into_short_array", "short a[] = u\"ab\";\n"),
+        ("u32_into_int_array", "int a[] = U\"ab\";\n"),
+        // `u8"..."` has type char[], so it is narrow.
+        ("u8_into_int_array", "int a[] = u8\"ab\";\n"),
+    ] {
+        compile_expect_error(name, src, "invalid initializer");
+    }
+}
+
+/// The accept side, which is what rules out the obvious over-strict fix: every
+/// character type takes the narrow literal, a qualifier changes nothing, and
+/// each wide literal has exactly one element type that suits it.
+#[test]
+fn diagnostics_string_literals_matching_their_array_are_accepted() {
+    for (name, src) in [
+        ("str_char", "char a[] = \"hi\";\n"),
+        ("str_signed_char", "signed char a[] = \"hi\";\n"),
+        ("str_unsigned_char", "unsigned char a[] = \"hi\";\n"),
+        ("str_const_char", "const char a[] = \"hi\";\n"),
+        ("str_sized", "char a[5] = \"hi\";\n"),
+        ("str_braced", "char a[] = {\"hi\"};\n"),
+        ("str_u8", "char a[] = u8\"ab\";\n"),
+        ("str_local", "void f(void){ char a[] = \"hi\"; (void)a; }\n"),
+        ("wide_into_int", "int a[] = L\"ab\";\n"),
+        ("wide_into_const_int", "const int a[] = L\"ab\";\n"),
+        ("u16_into_ushort", "unsigned short a[] = u\"ab\";\n"),
+        ("u32_into_uint", "unsigned int a[] = U\"ab\";\n"),
+        ("array_from_braces", "int a[] = {1,2,3};\n"),
+        ("pointer_from_string", "const char *p = \"hi\";\n"),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// A bit-field wider than 64 bits has no carrier here: the value mask is a
+/// `u64` and `bitfield_storage_type` has no arm for a sixteen-byte unit.
+///
+/// `unsigned __int128 a:100` read back a wrong value in a release build and
+/// **panicked the compiler** in a debug one. gcc supports it, so refusing is a
+/// divergence -- but a diagnostic naming the limit beats a panic, and
+/// `__int128` is a GNU extension. Widths up to 64 of such a type still work
+/// and still agree with gcc, so the cap is on the width, not the type.
+#[test]
+fn diagnostics_bitfield_wider_than_its_carrier_is_rejected() {
+    for (name, src) in [
+        ("bf_i128_65", "struct S { unsigned __int128 a:65; };\n"),
+        ("bf_i128_100", "struct S { unsigned __int128 a:100; };\n"),
+        ("bf_i128_128", "struct S { unsigned __int128 a:128; };\n"),
+        ("bf_i128_signed", "struct S { __int128 a:96; };\n"),
+        ("bf_i128_unnamed", "struct S { unsigned __int128 : 96; };\n"),
+    ] {
+        compile_expect_error(name, src, "c17 carries at most 64 bits");
+    }
+}
+
+/// ...and everything at or below the carrier's width still compiles, including
+/// a 64-bit field of a 128-bit type.
+#[test]
+fn diagnostics_bitfields_within_the_carrier_are_accepted() {
+    for (name, src) in [
+        ("bf_i128_64", "struct S { unsigned __int128 a:64; };\n"),
+        ("bf_i128_32", "struct S { unsigned __int128 a:32; };\n"),
+        ("bf_i128_1", "struct S { unsigned __int128 a:1; };\n"),
+        ("bf_ull_64", "struct S { unsigned long long a:64; };\n"),
+        ("bf_int_32", "struct S { int a:32; };\n"),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// A jump into a variably modified scope is reported *at the jump*, where gcc
+/// points, and still names the declaration that could not be entered.
+///
+/// It used to report at the declaration, for want of anything better: the jump
+/// and label statements carried no position until #C106 gave them one, and the
+/// doc comment justifying the choice outlived the reason. The line and column
+/// are asserted here because the position *is* the fix.
+#[test]
+fn diagnostics_variably_modified_jumps_point_at_the_jump() {
+    compile_expect_error(
+        "vm_goto_position",
+        "int main(void){\n  int n = 4;\n  goto L;\n  {\n    int a[n];\n    L: return a[0];\n  }\n}\n",
+        ":3:3: error: jump into the scope of 'a'",
+    );
+    compile_expect_error(
+        "vm_switch_position",
+        "int main(void){\n  int n=4, k=1;\n  switch (k) {\n    int a[n];\n    case 1:\n      return a[0];\n  }\n  return 0;\n}\n",
+        ":5:10: error: switch jump into the scope of 'a'",
+    );
+    compile_expect_error(
+        "undefined_label_position",
+        "int f(void){\n  int x = 1;\n  goto nowhere;\n  return x;\n}\n",
+        ":3:3: error: label 'nowhere' used but not defined",
+    );
+}

@@ -5808,6 +5808,25 @@ impl Parser<'_> {
             ));
         }
 
+        // Nothing here carries more than 64 bits of bit-field: the value mask
+        // is a `u64` and `bitfield_storage_type` has no arm for a 16-byte unit.
+        // An `unsigned __int128 a:100` therefore read back a wrong value in a
+        // release build and *panicked* the compiler in a debug one. gcc handles
+        // it, so this is a divergence -- but a diagnostic naming the limit is
+        // better than either of those, and `__int128` is a GNU extension.
+        // Widths up to 64 of such a type keep working and keep agreeing with
+        // gcc, so the cap is on the width rather than on the declared type.
+        const MAX_BITFIELD_WIDTH: u32 = 64;
+        if width > MAX_BITFIELD_WIDTH {
+            return Err(ParseError::new(
+                format!(
+                    "bit-field width {} is not supported; c17 carries at most {} bits",
+                    width, MAX_BITFIELD_WIDTH
+                ),
+                self.current_pos(),
+            ));
+        }
+
         // Warning: one-bit signed bitfield has dubious values
         // (can only hold -1 or 0 in 2's complement, or 0/-0 in other representations).
         // `_Bool` needs no exemption here: it is an unsigned type, which

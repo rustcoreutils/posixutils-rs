@@ -2125,17 +2125,11 @@ impl<'a> Parser<'a> {
             return;
         };
 
-        // 6.7.9p14: a character array may be initialized by a string literal,
-        // with or without braces. Any other array needs a list.
+        // 6.7.9p14/p15: an array may be initialized by a string literal, with
+        // or without braces, but only one whose element type it matches. Any
+        // other array needs a list.
         if self.types.kind(target) == TypeKind::Array {
-            let from_string = matches!(
-                init.kind,
-                ExprKind::StringLit(_)
-                    | ExprKind::WideStringLit(_)
-                    | ExprKind::Utf16StringLit(_)
-                    | ExprKind::Utf32StringLit(_)
-            );
-            if !from_string {
+            if !self.string_literal_suits_array(target, init) {
                 diag::error(init.pos, &gettext("invalid initializer"));
             }
             return;
@@ -2182,6 +2176,47 @@ impl<'a> Parser<'a> {
                 &[&t_name, &v_name, fault.describe()],
             );
         }
+    }
+
+    /// May this string literal initialize this array (C17 6.7.9p14, p15)?
+    ///
+    /// p14 gives a *character* array the narrow literal -- and "character
+    /// type" is all three of `char`, `signed char` and `unsigned char`, which
+    /// `TypeKind::Char` covers because signedness is a modifier. `u8"..."` is
+    /// narrow too: 6.4.5p6 gives it type `char[]`.
+    ///
+    /// p15 is stricter. A wide literal needs an element type *compatible* with
+    /// its own, so `int a[] = L"ab";` is legal on a target where `wchar_t` is
+    /// `int` while `unsigned a[] = L"ab";` is not -- a distinction gcc makes
+    /// and one that "is it a character type?" cannot. Comparing the kind and
+    /// the signedness gets it exactly, and both are unaffected by a qualifier,
+    /// so `const char a[] = "hi";` still passes.
+    ///
+    /// Returns false for a non-string initializer too: an array has no other
+    /// unbraced form.
+    fn string_literal_suits_array(&mut self, target: TypeId, init: &Expr) -> bool {
+        let narrow = matches!(init.kind, ExprKind::StringLit(_));
+        let wide = matches!(
+            init.kind,
+            ExprKind::WideStringLit(_) | ExprKind::Utf16StringLit(_) | ExprKind::Utf32StringLit(_)
+        );
+        let Some(elem) = self.types.base_type(target) else {
+            return false;
+        };
+
+        if narrow {
+            return self.types.kind(elem) == TypeKind::Char;
+        }
+        if !wide {
+            return false;
+        }
+        // The literal's own element type -- `int` for `L""`, `unsigned short`
+        // for `u""`, `unsigned int` for `U""` -- is already on its type.
+        let Some(lit_elem) = init.typ.and_then(|t| self.types.base_type(t)) else {
+            return false;
+        };
+        self.types.kind(elem) == self.types.kind(lit_elem)
+            && self.types.is_unsigned(elem) == self.types.is_unsigned(lit_elem)
     }
 
     /// Is this expression a null pointer constant (C17 6.3.2.3p3) -- an

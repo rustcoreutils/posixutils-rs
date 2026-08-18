@@ -92,7 +92,6 @@ accepted rather than checked (#C51)._
 | Area | Divergence |
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
-| `__attribute__((packed))` on a struct with bitfields | The bitfields are laid out as if the struct were not packed; only the ordinary members lose their padding. `struct { unsigned a:20, b:20; }` is 5 bytes under gcc and 8 here. Packing a bitfield to the bit lets it straddle its `sizeof(T)` window, and a straddling field has no naturally-aligned span to read or write it through — `emit_bitfield_load` addresses one power-of-two unit. Supporting it means an access path that assembles a field from an arbitrary byte range |
 
 ## Future Features
 

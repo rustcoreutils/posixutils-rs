@@ -915,7 +915,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     kind,
                     bit_offset: member.bit_offset,
                     bit_width: member.bit_width,
-                    storage_unit_size: member.storage_unit_size,
+                    access_bytes: member.access_bytes,
                 });
                 continue;
             }
@@ -927,7 +927,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 typ: field_type,
                 bit_offset,
                 bit_width,
-                storage_unit_size,
+                access_bytes,
             }) = resolved
             else {
                 elem_idx += 1;
@@ -955,7 +955,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 kind: StructFieldVisitKind::Expr(element.value.clone()),
                 bit_offset,
                 bit_width,
-                storage_unit_size,
+                access_bytes,
             });
             elem_idx += 1;
         }
@@ -1186,7 +1186,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut typ = base_type;
         let mut bit_offset = None;
         let mut bit_width = None;
-        let mut storage_unit_size = None;
+        let mut access_bytes = None;
 
         for (idx, designator) in designators.iter().enumerate() {
             match designator {
@@ -1202,11 +1202,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if idx + 1 == designators.len() {
                         bit_offset = member.bit_offset;
                         bit_width = member.bit_width;
-                        storage_unit_size = member.storage_unit_size;
+                        access_bytes = member.access_bytes;
                     } else {
                         bit_offset = None;
                         bit_width = None;
-                        storage_unit_size = None;
+                        access_bytes = None;
                     }
                 }
                 Designator::Index(index) => {
@@ -1219,7 +1219,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     typ = elem_type;
                     bit_offset = None;
                     bit_width = None;
-                    storage_unit_size = None;
+                    access_bytes = None;
                 }
             }
         }
@@ -1229,7 +1229,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             typ,
             bit_offset,
             bit_width,
-            storage_unit_size,
+            access_bytes,
         })
     }
 
@@ -1250,7 +1250,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 typ: member.typ,
                 bit_offset: member.bit_offset,
                 bit_width: member.bit_width,
-                storage_unit_size: member.storage_unit_size,
+                access_bytes: member.access_bytes,
             });
         }
 
@@ -1267,7 +1267,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     typ: member.typ,
                     bit_offset: member.bit_offset,
                     bit_width: member.bit_width,
-                    storage_unit_size: member.storage_unit_size,
+                    access_bytes: member.access_bytes,
                 });
             }
             *current_field_idx += 1;
@@ -1344,7 +1344,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     typ: inner.typ,
                     bit_offset: inner.bit_offset,
                     bit_width: inner.bit_width,
-                    storage_unit_size: inner.storage_unit_size,
+                    access_bytes: inner.access_bytes,
                 });
             }
 

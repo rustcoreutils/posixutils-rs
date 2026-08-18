@@ -440,7 +440,7 @@ mod tests {
             offset: 0,
             bit_width: None,
             bit_offset: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         };
         let m0 = member(d);

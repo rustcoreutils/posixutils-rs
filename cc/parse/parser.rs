@@ -3500,7 +3500,7 @@ impl Parser<'_> {
                         offset: 0,
                         bit_offset: None,
                         bit_width: None,
-                        storage_unit_size: None,
+                        access_bytes: None,
                         explicit_align: None, // anonymous members
                     });
                     self.advance(); // consume ';'
@@ -3524,7 +3524,7 @@ impl Parser<'_> {
                         offset: 0,
                         bit_offset: None,
                         bit_width: Some(width),
-                        storage_unit_size: None,
+                        access_bytes: None,
                         explicit_align: None, // bitfields don't support _Alignas
                     });
 
@@ -3547,7 +3547,7 @@ impl Parser<'_> {
                             offset: 0,
                             bit_offset: None,
                             bit_width: Some(width),
-                            storage_unit_size: None,
+                            access_bytes: None,
                             explicit_align: None, // bitfields don't support _Alignas
                         });
 
@@ -3605,7 +3605,7 @@ impl Parser<'_> {
                         offset: 0, // Computed later
                         bit_offset: None,
                         bit_width,
-                        storage_unit_size: None,
+                        access_bytes: None,
                         explicit_align: member_align,
                     });
 

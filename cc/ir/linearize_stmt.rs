@@ -795,7 +795,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                             }
                             StructFieldVisitKind::Expr(expr) => {
                                 if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
-                                    (visit.bit_offset, visit.bit_width, visit.storage_unit_size)
+                                    (visit.bit_offset, visit.bit_width, visit.access_bytes)
                                 {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);

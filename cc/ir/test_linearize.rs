@@ -2859,7 +2859,7 @@ fn test_incomplete_struct_type_resolution() {
                 offset: 0,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
             StructMember {
@@ -2868,7 +2868,7 @@ fn test_incomplete_struct_type_resolution() {
                 offset: 4, // Second int at offset 4 bytes
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
         ],
@@ -3680,7 +3680,7 @@ fn test_struct_deref_returns_address() {
             offset: 0,
             bit_width: None,
             bit_offset: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         }],
         enum_constants: vec![],
@@ -4317,7 +4317,7 @@ fn test_mixed_designated_positional_struct_init() {
                 offset: 0,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
             StructMember {
@@ -4326,7 +4326,7 @@ fn test_mixed_designated_positional_struct_init() {
                 offset: 4,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
             StructMember {
@@ -4335,7 +4335,7 @@ fn test_mixed_designated_positional_struct_init() {
                 offset: 8,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
             StructMember {
@@ -4344,7 +4344,7 @@ fn test_mixed_designated_positional_struct_init() {
                 offset: 12,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
                 explicit_align: None,
             },
         ],
@@ -4554,7 +4554,7 @@ fn test_designator_chain_nested_struct_init() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -4563,7 +4563,7 @@ fn test_designator_chain_nested_struct_init() {
             offset: 4,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -4585,7 +4585,7 @@ fn test_designator_chain_nested_struct_init() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -4594,7 +4594,7 @@ fn test_designator_chain_nested_struct_init() {
             offset: 8,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -4682,7 +4682,7 @@ fn test_designator_chain_array_member_init() {
         offset: 0,
         bit_offset: None,
         bit_width: None,
-        storage_unit_size: None,
+        access_bytes: None,
         explicit_align: None,
     }];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -4824,7 +4824,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -4833,7 +4833,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             offset: 4,
             bit_offset: Some(0),
             bit_width: Some(8),
-            storage_unit_size: Some(4),
+            access_bytes: Some(4),
             explicit_align: None,
         },
         StructMember {
@@ -4842,7 +4842,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             offset: 8,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -4925,7 +4925,7 @@ fn test_union_first_named_member_positional_init() {
             offset: 0,
             bit_offset: Some(0),
             bit_width: Some(16),
-            storage_unit_size: Some(4),
+            access_bytes: Some(4),
             explicit_align: None,
         },
         StructMember {
@@ -4934,7 +4934,7 @@ fn test_union_first_named_member_positional_init() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -5213,7 +5213,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             offset: 0,
             bit_offset: Some(0),
             bit_width: Some(3),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5222,7 +5222,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             offset: 0,
             bit_offset: Some(3),
             bit_width: Some(1),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5231,7 +5231,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             offset: 0,
             bit_offset: Some(4),
             bit_width: Some(1),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5240,7 +5240,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             offset: 0,
             bit_offset: Some(5),
             bit_width: Some(1),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
     ];
@@ -5371,7 +5371,7 @@ fn test_bitfield_designated_init_local_var() {
             offset: 0,
             bit_offset: Some(0),
             bit_width: Some(4),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5380,7 +5380,7 @@ fn test_bitfield_designated_init_local_var() {
             offset: 0,
             bit_offset: Some(4),
             bit_width: Some(4),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
         StructMember {
@@ -5389,7 +5389,7 @@ fn test_bitfield_designated_init_local_var() {
             offset: 1,
             bit_offset: Some(0),
             bit_width: Some(8),
-            storage_unit_size: Some(1),
+            access_bytes: Some(1),
             explicit_align: None,
         },
     ];
@@ -5515,7 +5515,7 @@ fn test_large_struct_copy_from_array() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -5524,7 +5524,7 @@ fn test_large_struct_copy_from_array() {
             offset: 8,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -5644,7 +5644,7 @@ fn test_compound_literal_zero_init_lvalue() {
             offset: 0,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -5653,7 +5653,7 @@ fn test_compound_literal_zero_init_lvalue() {
             offset: 8,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
         StructMember {
@@ -5662,7 +5662,7 @@ fn test_compound_literal_zero_init_lvalue() {
             offset: 16,
             bit_offset: None,
             bit_width: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         },
     ];
@@ -5802,7 +5802,7 @@ fn test_conditional_short_circuit_arrow() {
         offset: 0,
         bit_offset: None,
         bit_width: None,
-        storage_unit_size: None,
+        access_bytes: None,
         explicit_align: None,
     }];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -6151,7 +6151,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
             offset: 0,
             bit_width: None,
             bit_offset: None,
-            storage_unit_size: None,
+            access_bytes: None,
             explicit_align: None,
         }],
         enum_constants: vec![],

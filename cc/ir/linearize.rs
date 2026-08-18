@@ -80,7 +80,7 @@ pub(crate) struct ResolvedDesignator {
     pub(crate) typ: TypeId,
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
-    pub(crate) storage_unit_size: Option<u32>,
+    pub(crate) access_bytes: Option<u32>,
 }
 
 pub(crate) struct RawFieldInit {
@@ -160,7 +160,7 @@ pub(crate) struct StructFieldVisit {
     pub(crate) kind: StructFieldVisitKind,
     pub(crate) bit_offset: Option<u32>,
     pub(crate) bit_width: Option<u32>,
-    pub(crate) storage_unit_size: Option<u32>,
+    pub(crate) access_bytes: Option<u32>,
 }
 
 pub(crate) enum StructFieldVisitKind {
@@ -1904,7 +1904,7 @@ impl<'a> Linearizer<'a> {
                             typ: self.expr_type(expr),
                             bit_offset: None,
                             bit_width: None,
-                            storage_unit_size: None,
+                            access_bytes: None,
                         });
 
                 if member_info.offset == 0 {
@@ -1945,7 +1945,7 @@ impl<'a> Linearizer<'a> {
                             typ: self.expr_type(expr),
                             bit_offset: None,
                             bit_width: None,
-                            storage_unit_size: None,
+                            access_bytes: None,
                         });
 
                 if member_info.offset == 0 {
@@ -2229,7 +2229,7 @@ impl<'a> Linearizer<'a> {
                 typ: fallback_type,
                 bit_offset: None,
                 bit_width: None,
-                storage_unit_size: None,
+                access_bytes: None,
             });
 
         // If member type is an array, return the address (arrays decay to pointers)
@@ -2252,7 +2252,7 @@ impl<'a> Linearizer<'a> {
         } else if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
             member_info.bit_offset,
             member_info.bit_width,
-            member_info.storage_unit_size,
+            member_info.access_bytes,
         ) {
             // Bitfield read
             self.emit_bitfield_load(

@@ -48,12 +48,23 @@ pub struct StructMember {
     pub typ: TypeId,
     /// Byte offset within struct (0 for unions, offset of storage unit for bitfields)
     pub offset: usize,
-    /// For bitfields: bit offset within storage unit (0 = LSB)
+    /// For a bit-field: bit offset within its access span (0 = LSB)
     pub bit_offset: Option<u32>,
     /// For bitfields: bit width
     pub bit_width: Option<u32>,
-    /// For bitfields: size of storage unit in bytes
-    pub storage_unit_size: Option<u32>,
+    /// For a bit-field: how many bytes of the **access span** beginning at
+    /// `offset` the field is read and written through. The field occupies bits
+    /// `[bit_offset, bit_offset + bit_width)` of that span, and two invariants
+    /// hold: `bit_offset + bit_width <= access_bytes * 8`, and
+    /// `offset + access_bytes <= sizeof(the enclosing aggregate)`.
+    ///
+    /// Unpacked, the span is the naturally-aligned `sizeof(T)` window the field
+    /// provably sits inside and `offset` is that window's base. Packed, it is
+    /// exactly the bytes the field's own bits touch, `offset` is the first of
+    /// them and `bit_offset < 8` -- a span that need not be a power of two, and
+    /// need not be aligned. The name was `storage_unit_size`, which was only
+    /// ever true of the unpacked case.
+    pub access_bytes: Option<u32>,
     /// Explicit alignment from _Alignas specifier (C11 6.7.5)
     /// None means use natural alignment for the type
     pub explicit_align: Option<u32>,
@@ -66,12 +77,14 @@ pub struct MemberInfo {
     pub offset: usize,
     /// Member type (interned TypeId)
     pub typ: TypeId,
-    /// For bitfields: bit offset within storage unit
+    /// For a bit-field: bit offset within the access span
     pub bit_offset: Option<u32>,
-    /// For bitfields: bit width
+    /// For a bit-field: bit width
     pub bit_width: Option<u32>,
-    /// For bitfields: storage unit size in bytes
-    pub storage_unit_size: Option<u32>,
+    /// For a bit-field: the access span in bytes. See [`StructMember`] for the
+    /// contract -- it is not always a storage unit, and not always a power of
+    /// two.
+    pub access_bytes: Option<u32>,
 }
 
 /// An enum constant
@@ -1672,7 +1685,7 @@ impl TypeTable {
                         typ: member.typ,
                         bit_offset: member.bit_offset,
                         bit_width: member.bit_width,
-                        storage_unit_size: member.storage_unit_size,
+                        access_bytes: member.access_bytes,
                     });
                 }
 
@@ -1820,7 +1833,7 @@ impl TypeTable {
                 bit_offset = bit_offset.next_multiple_of(align * 8);
                 member.offset = bit_offset / 8;
                 member.bit_offset = None;
-                member.storage_unit_size = None;
+                member.access_bytes = None;
 
                 bit_offset += self.size_bytes(member.typ) * 8;
                 continue;
@@ -1849,32 +1862,45 @@ impl TypeTable {
                 bit_offset = bit_offset.next_multiple_of(unit_bits);
                 member.offset = bit_offset / 8;
                 member.bit_offset = None;
-                member.storage_unit_size = None;
+                member.access_bytes = None;
                 continue;
             }
 
             max_align = max_align.max(self.alignment(member.typ));
 
-            // Advance only when the field would otherwise straddle a unit
-            // boundary. Bitfields ignore `packed`: packing them to the bit
-            // would let one straddle, and the access window cannot span an
-            // unaligned range (see Known Divergences in cc/doc/TODO.md).
             let bit_width = bit_width as usize;
-            if bit_offset % unit_bits + bit_width > unit_bits {
-                bit_offset = bit_offset.next_multiple_of(unit_bits);
+            if pack_cap.is_some() {
+                // Under a pack cap the unit rule is switched off entirely --
+                // not narrowed to the cap. `#pragma pack(2)` lets a 16-bit
+                // field starting at bit 1 straddle both the 2- and the 4-byte
+                // boundary, which is gcc's answer and the measurement that
+                // rules out the narrowing reading. So the field takes the next
+                // free bit, and its access span is exactly the bytes its own
+                // bits touch: never wider than the object, so `window_end`
+                // takes no contribution here.
+                let byte = bit_offset / 8;
+                let within = bit_offset - byte * 8;
+                member.offset = byte;
+                member.bit_offset = Some(within as u32);
+                member.access_bytes = Some((within + bit_width).div_ceil(8) as u32);
+            } else {
+                // Advance only when the field would otherwise straddle a unit
+                // boundary, then read and write it through the
+                // `sizeof(T)`-aligned window it provably sits inside. That
+                // window is wider than the field needs and can span a
+                // neighbouring member, which costs nothing -- a store is a
+                // read-modify-write, so the neighbour's bits are put back
+                // unchanged -- but it does mean the struct has to be big
+                // enough to contain the window.
+                if bit_offset % unit_bits + bit_width > unit_bits {
+                    bit_offset = bit_offset.next_multiple_of(unit_bits);
+                }
+                let offset = bit_offset / unit_bits * unit_bytes;
+                member.offset = offset;
+                member.bit_offset = Some((bit_offset - offset * 8) as u32);
+                member.access_bytes = Some(unit_bytes as u32);
+                window_end = window_end.max(offset + unit_bytes);
             }
-
-            // The field is read and written through the `sizeof(T)`-aligned
-            // window it now provably sits inside. That window is wider than
-            // the field needs and can span a neighbouring member, which costs
-            // nothing here -- a store is a read-modify-write, so the
-            // neighbour's bits are put back unchanged -- but it does mean the
-            // struct has to be big enough to contain the window.
-            let offset = bit_offset / unit_bits * unit_bytes;
-            member.offset = offset;
-            member.bit_offset = Some((bit_offset - offset * 8) as u32);
-            member.storage_unit_size = Some(unit_bytes as u32);
-            window_end = window_end.max(offset + unit_bytes);
 
             bit_offset += bit_width;
         }
@@ -1924,12 +1950,21 @@ impl TypeTable {
             // and no storage unit, rather than left as it was found: this
             // computes a layout, so every field of it is an output, and
             // `compute_struct_layout` clears the same two for the same reason.
-            if member.bit_width.is_some_and(|w| w > 0) {
+            if let Some(w) = member.bit_width.filter(|w| *w > 0) {
                 member.bit_offset = Some(0);
-                member.storage_unit_size = Some(self.size_bytes(member.typ) as u32);
+                // Packed, the span is the bytes the field's own bits touch, as
+                // in a struct: `packed union { unsigned a:20; char c; }` is 3
+                // bytes under gcc, not 4. Unpacked the two spellings coincide
+                // on both targets, and gating on the cap keeps that output
+                // bit-identical.
+                member.access_bytes = Some(if pack_cap.is_some() {
+                    w.div_ceil(8)
+                } else {
+                    self.size_bytes(member.typ) as u32
+                });
             } else {
                 member.bit_offset = None;
-                member.storage_unit_size = None;
+                member.access_bytes = None;
             }
 
             // A zero-width bitfield is not an object: it occupies no storage
@@ -1948,7 +1983,14 @@ impl TypeTable {
                 continue;
             }
 
-            max_size = max_size.max(self.size_bytes(member.typ));
+            // A packed bit-field contributes only the bytes it occupies, which
+            // is what makes `packed union { unsigned a:20; char c; }` three
+            // bytes rather than four.
+            let member_size = match (pack_cap, member.bit_width) {
+                (Some(_), Some(w)) if w > 0 => w.div_ceil(8) as usize,
+                _ => self.size_bytes(member.typ),
+            };
+            max_size = max_size.max(member_size);
             // Use explicit alignment from _Alignas if specified, otherwise natural alignment
             let natural_align = match pack_cap {
                 Some(cap) => self.alignment(member.typ).min(cap as usize),
@@ -2173,7 +2215,7 @@ mod tests {
                     offset: 0,
                     bit_offset: None,
                     bit_width: None,
-                    storage_unit_size: None,
+                    access_bytes: None,
                     explicit_align: None,
                 },
                 StructMember {
@@ -2182,7 +2224,7 @@ mod tests {
                     offset: 0,
                     bit_offset: None,
                     bit_width: Some(0),
-                    storage_unit_size: None,
+                    access_bytes: None,
                     explicit_align: None,
                 },
                 StructMember {
@@ -2191,7 +2233,7 @@ mod tests {
                     offset: 0,
                     bit_offset: None,
                     bit_width: None,
-                    storage_unit_size: None,
+                    access_bytes: None,
                     explicit_align: None,
                 },
             ];

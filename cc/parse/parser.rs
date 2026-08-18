@@ -560,6 +560,11 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// The machine mode named by `__attribute__((mode(M)))` on the declaration
+    /// being parsed, and where it was written. Held like `pending_alignas`
+    /// because the attribute is seen while the declarator is being consumed and
+    /// can only be applied once the type is final.
+    pending_mode: Option<(String, Position)>,
     /// File-scope object definitions whose type was incomplete when parsed.
     /// Judged at end of translation unit -- see
     /// [`Self::check_deferred_incomplete_definitions`].
@@ -656,6 +661,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_mode: None,
             tentative_definitions: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
@@ -1068,18 +1074,11 @@ impl<'a> Parser<'a> {
                     "'{0}' attribute is not implemented, and ignoring it would change the type",
                     &[&name],
                 );
-            } else if name.trim_matches('_') == "mode"
-                && diag::warning_group_enabled(ATTRIBUTE_WARNING)
-            {
-                // Also changes the type -- `register_t` is declared with
-                // `__mode__(__word__)` -- but glibc puts it in `sys/types.h`
-                // and `floatn.h`, so refusing would reject every program that
-                // includes them. Said out loud instead of silently dropped.
-                diag::warning_args(
-                    pos,
-                    "'{0}' attribute is not implemented; the declared type is used unchanged",
-                    &[&name],
-                );
+            } else if name.trim_matches('_') == "mode" {
+                // Applied below, once the argument is parsed: a mode replaces
+                // the declared type, and getting it wrong is not cosmetic --
+                // glibc declares `register_t` with `__mode__(__word__)`, which
+                // c17 sized 4 bytes against gcc's 8 while this was a warning.
             } else if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
                 diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
             }
@@ -1106,6 +1105,11 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
 
+            if name.trim_matches('_') == "mode" {
+                if let Some(AttributeArg::Ident(m)) = args.first() {
+                    self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
+                }
+            }
             Some(Attribute::with_args(name, args))
         } else {
             Some(Attribute::new(name))
@@ -1505,6 +1509,77 @@ impl<'a> Parser<'a> {
         }
         if found.visibility.is_some() {
             self.pending_symbol_attrs.visibility = found.visibility;
+        }
+    }
+
+    /// Apply `__attribute__((mode(M)))` to a declared type.
+    ///
+    /// A machine mode names a width, and the attribute replaces the declared
+    /// type with the one of that width in the same family -- keeping the
+    /// declared signedness, so `typedef unsigned u8 __attribute__((mode(QI)));`
+    /// is unsigned and the `int` spelling is signed. glibc's `register_t` is
+    /// `__mode__(__word__)`, which is why leaving this unimplemented sized it
+    /// 4 bytes against gcc's 8.
+    ///
+    /// An unrecognised mode -- `V4SF` and the other vector modes, which need
+    /// vector types -- keeps the warning, because ignoring it would silently
+    /// change what the program computes.
+    fn apply_pending_mode(&mut self, typ: TypeId) -> TypeId {
+        let Some((mode, pos)) = self.pending_mode.take() else {
+            return typ;
+        };
+        let unsigned = self.types.is_unsigned(typ);
+        let t = &self.types;
+        let mapped = match mode.as_str() {
+            // Integer modes, named for their width in bytes.
+            "QI" => Some(if unsigned { t.uchar_id } else { t.schar_id }),
+            "HI" => Some(if unsigned { t.ushort_id } else { t.short_id }),
+            "SI" => Some(if unsigned { t.uint_id } else { t.int_id }),
+            "DI" | "word" | "pointer" => Some(if unsigned { t.ulong_id } else { t.long_id }),
+            "TI" => Some(if unsigned { t.uint128_id } else { t.int128_id }),
+            // Floating modes. `XF` is the x87 extended format and `TF` IEEE
+            // binary128 -- both sixteen bytes on this target and *not*
+            // interchangeable, so they map to their own types rather than to a
+            // width.
+            "HF" => Some(t.float16_id),
+            "SF" => Some(t.float_id),
+            "DF" => Some(t.double_id),
+            "XF" => Some(t.longdouble_id),
+            "TF" => Some(t.float128_id),
+            // Complex modes, named for the format of each half. glibc's
+            // <bits/floatn.h> declares `__cfloat128` with `mode(TC)`, which was
+            // 285 of the warnings a CPython build produced.
+            "HC" => Some(t.complex_float16_id),
+            "SC" => Some(t.complex_float_id),
+            "DC" => Some(t.complex_double_id),
+            "XC" => Some(t.complex_longdouble_id),
+            "TC" => Some(t.complex_float128_id),
+            _ => None,
+        };
+        match mapped {
+            Some(m) => {
+                // The declared type's qualifiers survive; only its width and
+                // family change.
+                let quals = self.types.modifiers(typ)
+                    & (TypeModifiers::CONST | TypeModifiers::VOLATILE | TypeModifiers::ATOMIC);
+                if quals.is_empty() {
+                    m
+                } else {
+                    let mut q = self.types.get(m).clone();
+                    q.modifiers |= quals;
+                    self.types.intern(q)
+                }
+            }
+            None => {
+                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+                    diag::warning_args(
+                        pos,
+                        "'mode({0})' is not implemented; the declared type is used unchanged",
+                        &[&mode],
+                    );
+                }
+                typ
+            }
         }
     }
 
@@ -2468,6 +2543,9 @@ impl Parser<'_> {
                             decl_pos,
                         ));
                     }
+                    // A mode replaces the type; alignment then attaches to
+                    // whatever the type ended up being.
+                    typ = self.apply_pending_mode(typ);
                     // Apply __attribute__((aligned(N))) to typedef type
                     if let Some(align) = self.pending_alignas {
                         let mut aligned_type = self.types.get(typ).clone();
@@ -4793,6 +4871,9 @@ impl Parser<'_> {
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same variable at file scope
                 let symbol_id = if is_typedef {
+                    // A mode replaces the type; alignment then attaches to
+                    // whatever the type ended up being.
+                    typ = self.apply_pending_mode(typ);
                     // Apply __attribute__((aligned(N))) to typedef type
                     if let Some(align) = self.pending_alignas {
                         let mut aligned_type = self.types.get(typ).clone();
@@ -5393,6 +5474,7 @@ impl Parser<'_> {
 
         // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
         if is_typedef {
+            var_type_id = self.apply_pending_mode(var_type_id);
             // Apply __attribute__((aligned(N))) to typedef type
             if let Some(align) = self.pending_alignas {
                 let mut aligned_type = self.types.get(var_type_id).clone();

@@ -1663,12 +1663,48 @@ fn diagnostics_unimplemented_attributes_are_reported() {
         "typedef int T __attribute__((totally_made_up));\nint main(void){ return 0; }\n",
         "attribute directive ignored",
     );
-    // `mode` changes the type too, but glibc declares `register_t` with it in
-    // <sys/types.h>, so refusing would reject every program that includes it.
+    // A *vector* mode still needs vector types, so it keeps the warning; the
+    // scalar modes are implemented (#C85) and must not warn.
     compile_expect_warning(
-        "mode_warns_rather_than_refusing",
-        "typedef int W __attribute__((__mode__(__word__)));\nint main(void){ return 0; }\n",
-        "'__mode__' attribute is not implemented",
+        "vector_mode_warns",
+        "typedef float V __attribute__((__mode__(V4SF)));\nint main(void){ return 0; }\n",
+        "'mode(V4SF)' is not implemented",
+    );
+}
+
+/// `__attribute__((mode(M)))` replaces the declared type with the one of that
+/// width in the same family, keeping the declared signedness (#C85).
+///
+/// Leaving it unimplemented was not the cosmetic problem the warning implied:
+/// glibc declares `register_t` with `__mode__(__word__)`, so c17 sized it 4
+/// bytes where gcc sizes it 8. The widths are checked by
+/// `c99_mode_attribute_selects_the_type`; this pins that the ones c17 now
+/// implements are silent, since 567 warnings per CPython build was the other
+/// half of the complaint.
+#[test]
+fn diagnostics_implemented_modes_are_silent() {
+    compile_expect_ok(
+        "modes_silent",
+        r#"
+typedef int qi __attribute__((__mode__(__QI__)));
+typedef int hi __attribute__((__mode__(__HI__)));
+typedef int si __attribute__((__mode__(__SI__)));
+typedef int di __attribute__((__mode__(__DI__)));
+typedef int ti __attribute__((__mode__(__TI__)));
+typedef int wd __attribute__((__mode__(__word__)));
+typedef int pt __attribute__((__mode__(__pointer__)));
+typedef float hf __attribute__((__mode__(__HF__)));
+typedef float sf __attribute__((__mode__(__SF__)));
+typedef float df __attribute__((__mode__(__DF__)));
+typedef float xf __attribute__((__mode__(__XF__)));
+typedef float tf __attribute__((__mode__(__TF__)));
+typedef _Complex float hc __attribute__((__mode__(HC)));
+typedef _Complex float sc __attribute__((__mode__(SC)));
+typedef _Complex float dc __attribute__((__mode__(DC)));
+typedef _Complex float xc __attribute__((__mode__(XC)));
+typedef _Complex float tc __attribute__((__mode__(TC)));
+int main(void){ return 0; }
+"#,
     );
 }
 

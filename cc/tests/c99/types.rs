@@ -953,3 +953,78 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("packed_bitfields", code, &[]), 0);
 }
+
+/// `__attribute__((mode(M)))` selects the type of a machine mode (#C85).
+///
+/// It was unimplemented and warned, which read as cosmetic and was not:
+/// glibc declares `register_t` with `__mode__(__word__)`, so c17 sized it 4
+/// bytes where gcc sizes it 8 -- a wrong type, silently, in a header any
+/// program can include.
+///
+/// The signedness comes from the *declared* type, not the mode, and `XF` and
+/// `TF` are both sixteen bytes but not interchangeable -- one is the x87
+/// extended format and the other IEEE binary128 -- so the arithmetic check at
+/// the end distinguishes them rather than trusting the size.
+#[test]
+fn c99_mode_attribute_selects_the_type() {
+    let code = r#"
+typedef int qi  __attribute__((__mode__(__QI__)));
+typedef int hi  __attribute__((__mode__(__HI__)));
+typedef int si  __attribute__((__mode__(__SI__)));
+typedef int di  __attribute__((__mode__(__DI__)));
+typedef int ti  __attribute__((__mode__(__TI__)));
+typedef int wd  __attribute__((__mode__(__word__)));
+typedef int pt  __attribute__((__mode__(__pointer__)));
+typedef unsigned uqi __attribute__((__mode__(__QI__)));
+typedef unsigned udi __attribute__((__mode__(__DI__)));
+typedef float hf __attribute__((__mode__(__HF__)));
+typedef float sf __attribute__((__mode__(__SF__)));
+typedef float df __attribute__((__mode__(__DF__)));
+typedef float tf __attribute__((__mode__(__TF__)));
+typedef _Complex float hc __attribute__((__mode__(HC)));
+typedef _Complex float sc __attribute__((__mode__(SC)));
+typedef _Complex float dc __attribute__((__mode__(DC)));
+typedef _Complex float tc __attribute__((__mode__(TC)));
+
+int main(void) {
+    if (sizeof(qi) != 1)  return 1;
+    if (sizeof(hi) != 2)  return 2;
+    if (sizeof(si) != 4)  return 3;
+    if (sizeof(di) != 8)  return 4;
+    if (sizeof(ti) != 16) return 5;
+    if (sizeof(wd) != sizeof(void *)) return 6;
+    if (sizeof(pt) != sizeof(void *)) return 7;
+
+    /* Signedness follows the declared type, not the mode. */
+    if (!((qi)-1 < 0))  return 8;
+    if ((uqi)-1 < 0)    return 9;
+    if (!((di)-1 < 0))  return 10;
+    if ((udi)-1 < 0)    return 11;
+
+    if (sizeof(hf) != 2) return 12;
+    if (sizeof(sf) != 4) return 13;
+    if (sizeof(df) != 8) return 14;
+
+    /* A mode is a type, not merely a width: binary128 divides to more
+       precision than double, which a size check alone would not show. */
+    tf third = (tf)1 / 3;
+    if ((int)(third * 3 * 1000000) != 1000000) return 15;
+
+    /* Complex modes name the format of each half. glibc's <bits/floatn.h>
+       declares `__cfloat128` with `mode(TC)`, which was 285 of the warnings a
+       CPython build used to produce. */
+    if (sizeof(hc) != 2 * sizeof(hf)) return 17;
+    if (sizeof(sc) != 2 * sizeof(sf)) return 18;
+    if (sizeof(dc) != 2 * sizeof(df)) return 19;
+    if (sizeof(tc) != 2 * sizeof(tf)) return 20;
+
+    /* And the narrow integer modes really do wrap at their own width. */
+    qi small = 127;
+    small = (qi)(small + 1);
+    if (small != -128) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("mode_attribute", code, &[]), 0);
+}

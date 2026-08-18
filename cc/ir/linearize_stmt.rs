@@ -1694,6 +1694,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// Does either operand of a comparison have floating type?
+    ///
+    /// Asked of the operands rather than the node, because a comparison's own
+    /// type is `int` whatever it compares.
+    fn operand_is_floating(&self, left: &Expr, right: &Expr) -> bool {
+        [left, right]
+            .iter()
+            .any(|e| e.typ.is_some_and(|t| self.types.is_float(t)))
+    }
+
     /// Evaluate an integer constant expression under C's own rule: an
     /// enumeration constant is the only identifier that has a value here.
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
@@ -1746,6 +1756,28 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             ExprKind::Binary { op, left, right } => {
+                // A comparison of *floating* operands has an integer result, so
+                // it is an integer constant expression even though neither
+                // operand is one -- `_Static_assert(1.5 > 1.0, "")` is legal
+                // and so is `int a[1.5 > 1.0 ? 4 : 8];`. Nothing here evaluated
+                // it: the integer folder has no floating arm, so it answered
+                // `None` and every caller degraded differently -- the assert
+                // reported "failed", an enumerator took 0, and a ternary chose
+                // the other branch.
+                if op.is_comparison() && self.operand_is_floating(left, right) {
+                    let l = self.eval_const_float_expr_scoped(scope, left)?;
+                    let r = self.eval_const_float_expr_scoped(scope, right)?;
+                    let (l, r) = (l.to_f64(), r.to_f64());
+                    let yes = match op {
+                        BinaryOp::Lt => l < r,
+                        BinaryOp::Le => l <= r,
+                        BinaryOp::Gt => l > r,
+                        BinaryOp::Ge => l >= r,
+                        BinaryOp::Eq => l == r,
+                        _ => l != r,
+                    };
+                    return Some(if yes { 1 } else { 0 });
+                }
                 let l = self.eval_const_expr_scoped(scope, left)?;
                 let r = self.eval_const_expr_scoped(scope, right)?;
                 match op {

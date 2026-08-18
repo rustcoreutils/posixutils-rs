@@ -5619,6 +5619,55 @@ impl Parser<'_> {
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
     }
 
+    /// Does either operand of a comparison have floating type?
+    ///
+    /// Asked of the operands, because a comparison's own type is `int`
+    /// whatever it compares.
+    fn comparison_has_float_operand(&self, left: &Expr, right: &Expr) -> bool {
+        [left, right]
+            .iter()
+            .any(|e| e.typ.is_some_and(|t| self.types.is_float(t)))
+    }
+
+    /// The `f64` value of a constant floating subexpression.
+    ///
+    /// Only reached from a comparison, whose result is an integer -- the
+    /// arithmetic itself is folded at full width by the linearizer's
+    /// `eval_const_float_expr` for anything that survives to code generation.
+    /// `f64` is enough to decide an ordering that `i128` truncation was
+    /// getting wrong.
+    fn eval_const_f64(&self, expr: &Expr) -> Option<f64> {
+        match &expr.kind {
+            ExprKind::FloatLit(v) => Some(v.to_f64()),
+            ExprKind::IntLit(v) => Some(*v as f64),
+            ExprKind::CharLit(c) => Some(*c as u32 as f64),
+            ExprKind::Cast { expr: inner, .. } => {
+                let v = self.eval_const_f64(inner)?;
+                // A cast to an integer type truncates before the comparison.
+                match expr.typ {
+                    Some(t) if self.types.is_integer(t) => Some(v.trunc()),
+                    _ => Some(v),
+                }
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => Some(-self.eval_const_f64(operand)?),
+            ExprKind::Binary { op, left, right } => {
+                let l = self.eval_const_f64(left)?;
+                let r = self.eval_const_f64(right)?;
+                match op {
+                    BinaryOp::Add => Some(l + r),
+                    BinaryOp::Sub => Some(l - r),
+                    BinaryOp::Mul => Some(l * r),
+                    BinaryOp::Div if r != 0.0 => Some(l / r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate a constant expression (for array sizes, enum values, case labels, static initializers)
     ///
     /// C99 6.6 defines integer constant expressions as:
@@ -5654,8 +5703,49 @@ impl Parser<'_> {
             }
 
             ExprKind::Binary { op, left, right } => {
+                // A comparison of *floating* operands has an integer result,
+                // so it is an integer constant expression even though neither
+                // operand is one. Truncating each side to `i128` first -- which
+                // the `FloatLit` arm above does, and which is right for a cast
+                // -- made `1.5 > 1.0` into `1 > 1`, so `enum E { X = 1.5 > 1.0 }`
+                // was 0 and `int a[1.5 > 1.0 ? 4 : 8]` took the wrong branch.
+                if op.is_comparison() && self.comparison_has_float_operand(left, right) {
+                    let l = self.eval_const_f64(left)?;
+                    let r = self.eval_const_f64(right)?;
+                    let yes = match op {
+                        BinaryOp::Lt => l < r,
+                        BinaryOp::Le => l <= r,
+                        BinaryOp::Gt => l > r,
+                        BinaryOp::Ge => l >= r,
+                        BinaryOp::Eq => l == r,
+                        _ => l != r,
+                    };
+                    return Some(if yes { 1 } else { 0 });
+                }
                 let lval = self.eval_const_expr(left)?;
                 let rval = self.eval_const_expr(right)?;
+                // C promotes both operands to the common type before comparing,
+                // so an unsigned operand makes the comparison unsigned. Doing
+                // it signed made `(unsigned)-1 > 0` false, in an enumerator and
+                // in an array size alike.
+                if op.is_comparison() {
+                    let unsigned = [left, right].iter().any(|e| {
+                        e.typ
+                            .is_some_and(|t| self.types.is_integer(t) && self.types.is_unsigned(t))
+                    });
+                    if unsigned {
+                        let (l, r) = (lval as u128, rval as u128);
+                        let yes = match op {
+                            BinaryOp::Lt => l < r,
+                            BinaryOp::Le => l <= r,
+                            BinaryOp::Gt => l > r,
+                            BinaryOp::Ge => l >= r,
+                            BinaryOp::Eq => l == r,
+                            _ => l != r,
+                        };
+                        return Some(if yes { 1 } else { 0 });
+                    }
+                }
                 match op {
                     BinaryOp::Add => Some(lval.wrapping_add(rval)),
                     BinaryOp::Sub => Some(lval.wrapping_sub(rval)),
@@ -5741,6 +5831,15 @@ impl Parser<'_> {
 
             // Cast to integer type - evaluate inner and truncate/extend as needed
             ExprKind::Cast { expr: inner, .. } => {
+                // A cast *from* a floating operand truncates the floating
+                // value, so the arithmetic below it has to be done in floating
+                // point: evaluating `1.5 + 1.5` through the integer folder made
+                // it `1 + 1`, and `(int)(1.5 + 1.5)` came out 2 rather than 3.
+                if inner.typ.is_some_and(|t| self.types.is_float(t)) {
+                    if let Some(v) = self.eval_const_f64(inner) {
+                        return Some(v.trunc() as i128);
+                    }
+                }
                 // For integer constant expressions, we can evaluate the inner expression
                 self.eval_const_expr(inner)
             }

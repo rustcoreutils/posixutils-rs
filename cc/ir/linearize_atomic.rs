@@ -113,7 +113,8 @@ impl Linearizer<'_> {
             // wants an address while initialization wants a value, so a single
             // representation is wrong for one of them. Until that is settled, a
             // warning is honest where the previous silence was not, and it does
-            // not risk a subtly wrong implementation. Recorded in doc/TODO.md.
+            // not risk a subtly wrong implementation. Recorded at #C116 in
+            // cc/audit.md and under C11 Atomics in cc/doc/TODO.md.
             diag::warning_args(
                 expr.pos,
                 "access to '{0}' ({1} bytes) is not atomic: c17 provides \

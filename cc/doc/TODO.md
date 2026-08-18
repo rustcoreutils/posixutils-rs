@@ -107,7 +107,18 @@ The type system, parser, IR, linearizer, both code generators, `<stdatomic.h>`,
 and access through ordinary operators are all done. `_Atomic` on an array or
 function type is rejected.
 
-**Remaining:** nothing on the semantic-validation list. The member-access
+**Remaining:** an `_Atomic` aggregate of lock-free size is not accessed
+atomically (#C116). `_Atomic struct S { int a; }` read as a whole object warns
+and falls through to a non-atomic struct copy, where gcc emits a plain 4-byte
+load. Scalars of 1, 2, 4 and 8 bytes are lock-free; an aggregate of the same
+size gets nothing, and anything larger is refused outright -- which is
+deliberate, since gcc's `__atomic_*` calls need `-latomic` and c17 links through
+the host `cc` without it (#X1). Doing it properly means operating on the
+aggregate's bits as an integer, which needs the value-versus-address convention
+for small aggregates settled first: assignment wants an address where
+initialization wants a value, so one representation is wrong for one of them.
+
+Nothing else on the semantic-validation list. The member-access
 warning that stood here is #C113, closed 2026-08-18; C11 6.5.2.3p5 makes it
 undefined behaviour rather than a constraint violation, so it is a warning
 rather than the rejection an earlier version of this list called for.

@@ -2601,12 +2601,22 @@ impl<'a> Parser<'a> {
                 self.usual_arithmetic_conversions(left_type, right_type)
             }
 
-            // Bitwise and shift operators use integer promotions
-            BinaryOp::BitAnd
-            | BinaryOp::BitOr
-            | BinaryOp::BitXor
-            | BinaryOp::Shl
-            | BinaryOp::Shr => self.usual_arithmetic_conversions(left_type, right_type),
+            // The bitwise operators take the usual arithmetic conversions.
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                self.usual_arithmetic_conversions(left_type, right_type)
+            }
+
+            // A shift does not. C17 6.5.7p3: the integer promotions are
+            // performed on *each* operand and "the type of the result is that
+            // of the promoted left operand" -- the right operand's type never
+            // reaches the result. Taking the usual arithmetic conversions here
+            // let it through, so `1 << 1L` came out `long` and
+            // `sizeof(1 << 1L)` answered 8 where gcc answers 4.
+            BinaryOp::Shl | BinaryOp::Shr => {
+                let promoted = self.types.integer_promote(left_type);
+                self.check_shift_count(op, promoted, &right);
+                promoted
+            }
         };
 
         let pos = left.pos;
@@ -2619,6 +2629,40 @@ impl<'a> Parser<'a> {
             result_type,
             pos,
         )
+    }
+
+    /// Warn when a shift's constant count cannot name a bit of the value
+    /// being shifted (#C125).
+    ///
+    /// C17 6.5.7p3 makes a count that is negative, or not less than the width
+    /// of the promoted left operand, undefined. c17 folds such a shift by
+    /// masking the count the way the hardware does, and keeps the run-time
+    /// path in agreement -- so the *value* is as defensible as gcc's, which is
+    /// not even self-consistent (`1 << 64` folds to 0 while `-1 >> 64` stays
+    /// -1). The gap was the silence.
+    ///
+    /// This sits with the type check rather than in the constant folder
+    /// because the folder is called speculatively -- by `__builtin_constant_p`
+    /// merely asking whether an expression folds, and by the backtracking
+    /// type-name parse -- and would report on expressions that are never
+    /// evaluated, sometimes twice. A shift's type is computed exactly once.
+    ///
+    /// Only the *count* need be constant, as in gcc: `x << 64` warns.
+    fn check_shift_count(&mut self, op: BinaryOp, promoted_left: TypeId, right: &Expr) {
+        let Some(count) = self.eval_const_expr(right) else {
+            return;
+        };
+        let width = self.types.size_bits(promoted_left) as i128;
+        let side = if op == BinaryOp::Shl { "left" } else { "right" };
+
+        // gcc spells these as two groups, and so does `-Wno-`.
+        if count < 0 {
+            if crate::diag::warning_group_enabled("shift-count-negative") {
+                crate::diag::warning(right.pos, &format!("{} shift count is negative", side));
+            }
+        } else if count >= width && crate::diag::warning_group_enabled("shift-count-overflow") {
+            crate::diag::warning(right.pos, &format!("{} shift count >= width of type", side));
+        }
     }
 
     /// Compute usual arithmetic conversions (C99 6.3.1.8)

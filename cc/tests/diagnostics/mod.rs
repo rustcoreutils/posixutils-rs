@@ -4083,3 +4083,137 @@ fn diagnostics_type_name_backtracking_still_works() {
         "struct S { int a; };\nint main(void){ return ((struct S){0}).a; }\n",
     );
 }
+
+/// #C125: a shift whose constant count cannot name a bit of the value being
+/// shifted draws a diagnostic, as gcc's does.
+///
+/// C17 6.5.7p3 makes such a shift undefined, and c17's answer -- the count
+/// masked the way the hardware masks it -- is as defensible as gcc's, which is
+/// not even self-consistent (`1 << 64` folds to 0 while `-1 >> 64` stays -1).
+/// The gap was never the value; it was the silence.
+///
+/// The width is the *promoted left* operand's, so `(char)1 << 40` warns (char
+/// promotes to int) and `1L << 63` does not. Only the count need be constant:
+/// `x << 64` warns. Every row here was taken from `gcc -std=c17`.
+#[test]
+fn diagnostics_shift_count_out_of_range_warns() {
+    for (name, src, expected) in [
+        (
+            "shift_left_64",
+            "int main(void){ return 1 << 64; }\n",
+            "left shift count >= width of type",
+        ),
+        (
+            "shift_left_32",
+            "int main(void){ return 1 << 32; }\n",
+            "left shift count >= width of type",
+        ),
+        (
+            "shift_right_64",
+            "int main(void){ return 1 >> 64; }\n",
+            "right shift count >= width of type",
+        ),
+        (
+            "shift_long_64",
+            "int main(void){ return (int)(1L << 64); }\n",
+            "left shift count >= width of type",
+        ),
+        (
+            "shift_char_40",
+            "int main(void){ return (char)1 << 40; }\n",
+            "left shift count >= width of type",
+        ),
+        (
+            "shift_var_left",
+            "int x = 1;\nint main(void){ return x << 64; }\n",
+            "left shift count >= width of type",
+        ),
+        (
+            "shift_negative",
+            "int main(void){ return 1 << -1; }\n",
+            "left shift count is negative",
+        ),
+    ] {
+        compile_expect_warning(name, src, expected);
+    }
+}
+
+/// The accept side, which is what keeps the check from being "warn on every
+/// shift": a count inside the promoted left operand's width is silent, and so
+/// is a count that is not a constant at all.
+#[test]
+fn diagnostics_shift_count_in_range_is_silent() {
+    for (name, src) in [
+        (
+            "shift_left_31_ok",
+            "int main(void){ return (1 << 31) != 0; }\n",
+        ),
+        (
+            "shift_long_63_ok",
+            "int main(void){ return (int)((1L << 63) != 0); }\n",
+        ),
+        ("shift_zero_ok", "int main(void){ return 1 << 0; }\n"),
+        (
+            "shift_var_count_ok",
+            "int n = 3;\nint main(void){ return (1 << n) - 8; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// `-Wno-shift-count-overflow` and `-Wno-shift-count-negative` turn the two
+/// groups off separately, as gcc spells them.
+#[test]
+fn diagnostics_shift_count_warnings_can_be_turned_off() {
+    for (name, src, flag) in [
+        (
+            "shift_off_overflow",
+            "int main(void){ return 1 << 64; }\n",
+            "-Wno-shift-count-overflow",
+        ),
+        (
+            "shift_off_negative",
+            "int main(void){ return 1 << -1; }\n",
+            "-Wno-shift-count-negative",
+        ),
+    ] {
+        let c = create_c_file(name, src);
+        let path = c.path().to_string_lossy().to_string();
+        let run = run_c17(&[flag, "-S", "-o", "/dev/null", &path]);
+        assert!(run.success, "{} should still compile: {}", name, run.stderr);
+        assert!(
+            !run.stderr.contains("shift count"),
+            "{} did not silence the warning:\n{}",
+            flag,
+            run.stderr
+        );
+    }
+}
+
+/// C17 6.5.7p3: "the type of the result is that of the promoted left operand".
+/// The right operand's type never reaches the result, and c17 took the usual
+/// arithmetic conversions instead -- so `1 << 1L` came out `long` and
+/// `sizeof(1 << 1L)` answered 8 where gcc answers 4. That width is also what
+/// the warning above measures against, so the two had to be fixed together.
+#[test]
+fn diagnostics_shift_result_type_is_the_promoted_left_operand() {
+    // Run it: compiling proves nothing here, since the wrong type compiles
+    // just as cleanly as the right one.
+    assert_eq!(
+        compile_and_run(
+            "shift_result_type",
+            r#"
+int main(void) {
+    if (sizeof(1 << 1L) != sizeof(int)) return 1;
+    if (sizeof(1L << 1) != sizeof(long)) return 2;
+    if (sizeof((char)1 << 1) != sizeof(int)) return 3;
+    if (sizeof(1U << 1L) != sizeof(unsigned int)) return 4;
+    return 0;
+}
+"#,
+            &[]
+        ),
+        0
+    );
+}

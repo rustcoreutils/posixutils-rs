@@ -33,4 +33,5 @@ pub mod strings;
 pub mod symbol;
 pub mod target;
 pub mod token;
+pub mod tools;
 pub mod types;

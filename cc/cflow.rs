@@ -21,7 +21,7 @@ use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
 use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
-use posixutils_cc::types::{TypeKind, TypeModifiers, TypeTable};
+use posixutils_cc::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -584,96 +584,6 @@ fn declarator_line(lines: &[&str], start_line: u32, name: &str) -> u32 {
     start_line
 }
 
-/// Format a type as a string
-fn format_type(typ: posixutils_cc::types::TypeId, types: &TypeTable) -> String {
-    let t = types.get(typ);
-    // The spelling the declaration used, not the signedness the target gives
-    // it: plain `char` is an unsigned type on aarch64 and is still written
-    // `char`. `is_unsigned` here would print `unsigned char` for a source
-    // that says `char`, and only on aarch64 hosts.
-    let is_unsigned = types.spelled_unsigned(typ);
-    match t.kind {
-        TypeKind::Void => "void".to_string(),
-        TypeKind::Bool => "_Bool".to_string(),
-        TypeKind::Char => {
-            // C17 6.2.5p15 makes `char`, `signed char` and `unsigned char`
-            // three distinct types, so all three spellings are reported.
-            if is_unsigned {
-                "unsigned char".to_string()
-            } else if t.modifiers.contains(TypeModifiers::SIGNED) {
-                "signed char".to_string()
-            } else {
-                "char".to_string()
-            }
-        }
-        TypeKind::Short => {
-            if is_unsigned {
-                "unsigned short".to_string()
-            } else {
-                "short".to_string()
-            }
-        }
-        TypeKind::Int => {
-            if is_unsigned {
-                "unsigned int".to_string()
-            } else {
-                "int".to_string()
-            }
-        }
-        TypeKind::Long => {
-            if is_unsigned {
-                "unsigned long".to_string()
-            } else {
-                "long".to_string()
-            }
-        }
-        TypeKind::LongLong => {
-            if is_unsigned {
-                "unsigned long long".to_string()
-            } else {
-                "long long".to_string()
-            }
-        }
-        TypeKind::Int128 => {
-            if is_unsigned {
-                "__uint128_t".to_string()
-            } else {
-                "__int128".to_string()
-            }
-        }
-        TypeKind::Float => "float".to_string(),
-        TypeKind::Double => "double".to_string(),
-        TypeKind::LongDouble => "long double".to_string(),
-        TypeKind::Float16 => "_Float16".to_string(),
-        TypeKind::Float128 => "__float128".to_string(),
-        TypeKind::Pointer => {
-            if let Some(base) = t.base {
-                format!("{} *", format_type(base, types))
-            } else {
-                "void *".to_string()
-            }
-        }
-        TypeKind::Array => {
-            if let Some(base) = t.base {
-                format!("{}[]", format_type(base, types))
-            } else {
-                "[]".to_string()
-            }
-        }
-        TypeKind::Function => {
-            if let Some(ret) = t.base {
-                format!("{}()", format_type(ret, types))
-            } else {
-                "()".to_string()
-            }
-        }
-        TypeKind::Struct => "struct".to_string(),
-        TypeKind::Union => "union".to_string(),
-        TypeKind::Enum => "enum".to_string(),
-        TypeKind::VaList => "__builtin_va_list".to_string(),
-    }
-}
-
 // ============================================================================
 // lex / yacc Input
 // ============================================================================
@@ -1022,7 +932,7 @@ fn process_file(
                     name.clone(),
                     FunctionInfo::from_source(
                         name,
-                        &format_type(d.typ, &types),
+                        &types.format_type(d.typ, Some(&strings)),
                         display,
                         line,
                         Vec::new(),
@@ -1037,7 +947,7 @@ fn process_file(
     for item in &ast.items {
         if let ExternalDecl::FunctionDef(func) = item {
             let name = strings.get(func.name).to_string();
-            let return_type = format_type(func.return_type, &types);
+            let return_type = types.format_type(func.return_type, Some(&strings));
             let line = declarator_line(&lines, func.pos.line, &name);
 
             let mut calls = Vec::new();
@@ -1292,17 +1202,5 @@ fn main() -> ExitCode {
         }
     }
 
-    exit_code()
-}
-
-/// Combine this utility's own diagnostics with any emitted by the C front end
-/// (undeclared identifiers and friends are reported by `posixutils_cc::diag`,
-/// which keeps its own counter). POSIX requires a non-zero status when either
-/// has fired.
-fn exit_code() -> ExitCode {
-    if plib::diag::has_errors() || posixutils_cc::diag::has_error() != 0 {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
+    posixutils_cc::tools::exit_code()
 }

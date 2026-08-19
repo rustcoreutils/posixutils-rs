@@ -4398,23 +4398,6 @@ impl Parser<'_> {
         })
     }
 
-    /// Count the array levels of `typ` whose extent is not a compile-time
-    /// constant, i.e. how many run-time dimension expressions the type needs.
-    fn variable_array_levels(&self, typ: TypeId) -> usize {
-        let mut levels = 0;
-        let mut cur = Some(typ);
-        while let Some(t) = cur {
-            if self.types.kind(t) != TypeKind::Array {
-                break;
-            }
-            if self.types.get(t).array_size.is_none() {
-                levels += 1;
-            }
-            cur = self.types.get(t).base;
-        }
-        levels
-    }
-
     /// Parse a parameter list, returning raw parameter info (name and type)
     /// Parameters are declared in a temporary scope during parsing so that
     /// VLA sizes like `arr[n]` can reference earlier parameters like `n`.
@@ -4542,7 +4525,7 @@ impl Parser<'_> {
             let elem_typ = self.types.get(typ_id).base;
             let vm_dims = match elem_typ {
                 Some(elem) => {
-                    let want = self.variable_array_levels(elem);
+                    let want = self.types.unsized_array_levels(elem);
                     let skip = vla_sizes.len().saturating_sub(want);
                     vla_sizes[skip..].to_vec()
                 }

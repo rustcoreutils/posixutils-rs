@@ -1062,10 +1062,11 @@ impl TypeTable {
         levels
     }
 
-    /// Get function parameters
     // The two below are read by `parse::test_parser` and by nothing in the
     // compiler, which reaches a signature through `Type::func_params` and
     // `Type::variadic` directly. They stay gated so that stays visible.
+
+    /// Get function parameters
     #[cfg(test)]
     #[inline]
     pub fn params(&self, id: TypeId) -> Option<&Vec<TypeId>> {
@@ -1110,24 +1111,45 @@ impl TypeTable {
 
         match typ.kind {
             TypeKind::Pointer => {
-                if let Some(base) = typ.base {
-                    result.push_str(&self.format_type(base, idents));
-                    result.push('*');
-                } else {
-                    result.push('*');
+                // `char *` and `char **`, the way gcc and the source write
+                // them: a space before the first star and none between stars.
+                match typ.base {
+                    Some(base) => {
+                        let pointee = self.format_type(base, idents);
+                        let joined = pointee.ends_with('*');
+                        result.push_str(&pointee);
+                        if !joined {
+                            result.push(' ');
+                        }
+                        result.push('*');
+                    }
+                    None => result.push('*'),
                 }
             }
             TypeKind::Array => {
-                if let Some(base) = typ.base {
-                    result.push_str(&self.format_type(base, idents));
-                    if let Some(size) = typ.array_size {
-                        result.push_str(&format!("[{}]", size));
-                    } else {
-                        result.push_str("[]");
+                // Outermost extent first, as the declaration writes it.
+                // Recursing element-first and appending printed `int[4][8]`
+                // as `int[8][4]`, in a diagnostic and in `cflow` alike.
+                let mut extents = String::new();
+                let mut cur = id;
+                let element = loop {
+                    let t = self.get(cur);
+                    if t.kind != TypeKind::Array {
+                        break Some(cur);
                     }
-                } else {
-                    result.push_str("[]");
+                    match t.array_size {
+                        Some(size) => extents.push_str(&format!("[{}]", size)),
+                        None => extents.push_str("[]"),
+                    }
+                    match t.base {
+                        Some(base) => cur = base,
+                        None => break None,
+                    }
+                };
+                if let Some(element) = element {
+                    result.push_str(&self.format_type(element, idents));
                 }
+                result.push_str(&extents);
             }
             TypeKind::Function => {
                 if let Some(ret) = typ.base {

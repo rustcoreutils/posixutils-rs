@@ -708,15 +708,5 @@ fn main() -> ExitCode {
         print_xref(&xref, args.width, args.silent, &mut *output_file);
     }
 
-    exit_code()
-}
-
-/// Combine this utility's own diagnostics with any emitted by the C front end.
-/// POSIX requires a non-zero status when either has fired.
-fn exit_code() -> ExitCode {
-    if plib::diag::has_errors() || posixutils_cc::diag::has_error() != 0 {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
+    posixutils_cc::tools::exit_code()
 }

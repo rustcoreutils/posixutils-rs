@@ -190,3 +190,58 @@ fn tools_cflow_prints_the_declared_char_spelling() {
         "unsigned char keeps its spelling:\n{stdout}"
     );
 }
+
+/// The type cflow prints is the one the declaration wrote.
+///
+/// cflow had its own `format_type`, a partial copy of `TypeTable::format_type`
+/// that dropped everything below the top level: an array printed `int[]`
+/// whatever its extent, a function printed `int()` whatever its parameters,
+/// and a tagged struct printed bare `struct`. It calls the shared formatter
+/// now. Recorded at #C131.
+#[test]
+fn tools_cflow_prints_the_whole_type() {
+    let dir = tempfile::Builder::new()
+        .prefix("cflow_types_")
+        .tempdir()
+        .unwrap();
+    let src = dir.path().join("t.c");
+    std::fs::write(
+        &src,
+        "struct point { int x; int y; };\n\
+         int table[10];\n\
+         char *name;\n\
+         char **argv_copy;\n\
+         struct point origin;\n\
+         int matrix[4][8];\n\
+         int use(void) { return table[0] + *name + **argv_copy + origin.x + matrix[0][0]; }\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, ok) = run_cflow(&["-i", "x", &src.to_string_lossy()]);
+    assert!(ok, "cflow failed: {}", stderr);
+
+    for (symbol, expected) in [
+        // The extent, which the copy dropped.
+        ("table", "int[10]"),
+        // Both dimensions, innermost last.
+        ("matrix", "int[4][8]"),
+        // A space before the first star and none between stars, as gcc and
+        // the source write them.
+        ("name", "char *"),
+        ("argv_copy", "char **"),
+        // The tag, without which one struct reads like any other.
+        ("origin", "struct point"),
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(&format!("{}: ", symbol)))
+            .unwrap_or_else(|| panic!("no line for {} in:\n{}", symbol, stdout));
+        assert!(
+            line.contains(expected),
+            "expected {} to be typed {:?}, got: {}",
+            symbol,
+            expected,
+            line
+        );
+    }
+}

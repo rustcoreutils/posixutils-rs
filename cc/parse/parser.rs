@@ -1524,6 +1524,40 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `transparent_union` is a union attribute. gcc warns and ignores it
+    /// anywhere else rather than rejecting, and so does c17 -- dropping it in
+    /// silence would leave the program believing a rule was in force that was
+    /// not.
+    ///
+    /// Shared by the two routes that can reach the mistake: on the
+    /// struct-or-union specifier, and trailing after the declarator.
+    fn warn_transparent_union_ignored(&self, pos: Position) {
+        if crate::diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+            diag::warning(
+                pos,
+                &gettext("'transparent_union' attribute ignored on a non-union type"),
+            );
+        }
+    }
+
+    /// Apply every type attribute held over from the declarator: the machine
+    /// mode named by `mode(M)`, then `transparent_union`.
+    ///
+    /// Both are seen mid-declarator and can only land once the type is final,
+    /// so every path that finishes a declarator calls this rather than
+    /// remembering which attributes exist.
+    fn apply_pending_type_attrs(&mut self, typ: TypeId) -> TypeId {
+        let typ = self.apply_pending_mode(typ);
+        if let Some(pos) = self.pending_transparent_union.take() {
+            if self.types.kind(typ) == TypeKind::Union {
+                self.types.set_transparent_union(typ);
+            } else {
+                self.warn_transparent_union_ignored(pos);
+            }
+        }
+        typ
+    }
+
     /// Apply `__attribute__((mode(M)))` to a declared type.
     ///
     /// A machine mode names a width, and the attribute replaces the declared
@@ -1536,27 +1570,6 @@ impl<'a> Parser<'a> {
     /// An unrecognised mode -- `V4SF` and the other vector modes, which need
     /// vector types -- keeps the warning, because ignoring it would silently
     /// change what the program computes.
-    /// Apply every type attribute held over from the declarator: the machine
-    /// mode named by `mode(M)`, then `transparent_union`.
-    ///
-    /// Both are seen mid-declarator and can only land once the type is final,
-    /// so every path that finishes a declarator calls this rather than
-    /// remembering which attributes exist.
-    fn apply_pending_type_attrs(&mut self, typ: TypeId) -> TypeId {
-        let typ = self.apply_pending_mode(typ);
-        if let Some(pos) = self.pending_transparent_union.take() {
-            if self.types.kind(typ) == TypeKind::Union {
-                self.types.set_transparent_union(typ);
-            } else if crate::diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-                diag::warning(
-                    pos,
-                    &gettext("'transparent_union' attribute ignored on a non-union type"),
-                );
-            }
-        }
-        typ
-    }
-
     fn apply_pending_mode(&mut self, typ: TypeId) -> TypeId {
         let Some((mode, pos)) = self.pending_mode.take() else {
             return typ;
@@ -3825,6 +3838,10 @@ impl Parser<'_> {
                     ),
                     specifier_pos,
                 ));
+            }
+
+            if is_transparent && !is_union {
+                self.warn_transparent_union_ignored(specifier_pos);
             }
 
             let composite = CompositeType {

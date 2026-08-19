@@ -1394,15 +1394,57 @@ void f(void){ int *p = 0; (void)g(p); }
 /// `transparent_union` is a union attribute. gcc ignores it elsewhere with a
 /// warning rather than rejecting, and so must c17 -- silently dropping it
 /// would leave the program believing a rule was in force that was not.
+///
+/// Every position that can carry it is covered, because they reach the check
+/// by two different routes: the three specifier positions land on the
+/// `CompositeType` as it is built, while the trailing-on-a-typedef spelling --
+/// glibc's own -- is held over and applied once the declarator finishes. The
+/// specifier ones were silently dropped when this landed; only the typedef
+/// route warned.
 #[test]
 fn diagnostics_transparent_union_on_a_non_union_warns() {
-    compile_expect_warning(
-        "transparent_union_on_struct",
-        "typedef struct { int a; } SA __attribute__((transparent_union));
-SA x;
-",
-        "'transparent_union' attribute ignored on a non-union type",
-    );
+    for (name, src) in [
+        (
+            "transparent_union_after_struct_body",
+            "struct S { int a; } __attribute__((transparent_union));\nstruct S x;\n",
+        ),
+        (
+            "transparent_union_before_struct_tag",
+            "struct __attribute__((transparent_union)) T { int a; };\nstruct T y;\n",
+        ),
+        (
+            "transparent_union_after_struct_tag",
+            "struct U __attribute__((transparent_union)) { int a; };\nstruct U w;\n",
+        ),
+        (
+            "transparent_union_on_struct_typedef",
+            "typedef struct { int a; } SA __attribute__((transparent_union));\nSA z;\n",
+        ),
+    ] {
+        compile_expect_warning(
+            name,
+            src,
+            "'transparent_union' attribute ignored on a non-union type",
+        );
+    }
+}
+
+/// ...and it belongs to the `attributes` group, like every other
+/// unimplemented-or-ignored attribute diagnostic.
+#[test]
+fn diagnostics_transparent_union_warning_can_be_silenced() {
+    let src = "struct S { int a; } __attribute__((transparent_union));\nstruct S x;\n";
+    let c = create_c_file("transparent_union_silence", src);
+    let path = c.path().to_string_lossy().to_string();
+    for silencer in ["-w", "-Wno-attributes"] {
+        let run = run_c17(&["-S", "-o", "/dev/null", silencer, &path]);
+        assert!(run.success, "{silencer} should be accepted: {}", run.stderr);
+        assert!(
+            !run.stderr.contains("transparent_union"),
+            "{silencer} should silence it, got:\n{}",
+            run.stderr
+        );
+    }
 }
 
 // ==== void operands and subscripts (C17 6.5.6p2, 6.5.15p3, 6.5.2.1p1) ====

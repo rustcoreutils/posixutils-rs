@@ -1298,3 +1298,123 @@ int main(void) {
         "the same, once the allocator is under real pressure"
     );
 }
+
+// ============================================================================
+// A floating constant as an inline-asm operand
+//
+// `loc_to_asm_string` used to `panic!("Float immediate not supported in inline
+// asm operand")` on both targets. The linearizer does no type filtering on a
+// non-memory asm input, so a floating constant stays an FVal pseudo, and
+// regalloc maps every FVal to `Loc::FImm` -- an FP *constant* is never given a
+// register. `__asm__ ("" :: "r"(1.0))` therefore aborted the compiler at -O0.
+//
+// There was no float-operand test here at all, which is why it survived.
+// ============================================================================
+
+/// A general-register constraint gets the constant's bit pattern, which is
+/// what gcc materializes. 1.5 is 0x3FF8000000000000.
+#[test]
+fn codegen_inline_asm_float_constant_in_general_register() {
+    #[cfg(target_arch = "x86_64")]
+    let code = r#"
+int main(void) {
+    unsigned long bits = 0;
+    __asm__ ("movq %1, %0" : "=r"(bits) : "r"(1.5));
+    return bits == 0x3FF8000000000000UL ? 0 : 1;
+}
+"#;
+    #[cfg(target_arch = "aarch64")]
+    let code = r#"
+int main(void) {
+    unsigned long bits = 0;
+    __asm__ ("mov %0, %1" : "=r"(bits) : "r"(1.5));
+    return bits == 0x3FF8000000000000UL ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("asm_fp_const_gp", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_fp_const_gp_opt", code), 0);
+}
+
+/// An immediate-class constraint substitutes the same bit pattern literally,
+/// with no register spent on it.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_float_constant_as_immediate() {
+    let code = r#"
+int main(void) {
+    unsigned long bits = 0;
+    __asm__ ("movq %1, %0" : "=r"(bits) : "i"(3.5));
+    return bits == 0x400C000000000000UL ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("asm_fp_const_imm", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_fp_const_imm_opt", code), 0);
+}
+
+/// An SSE-class constraint takes the reserved scratch register, loaded with
+/// the constant. The clobber is declared because the operand *is* the scratch.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_float_constant_in_sse_register() {
+    let code = r#"
+int main(void) {
+    double x = 0;
+    __asm__ ("movsd %%xmm15, %0" : "=m"(x) : "x"(2.25) : "xmm15");
+    return x == 2.25 ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("asm_fp_const_sse", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_fp_const_sse_opt", code), 0);
+}
+
+/// The zero constant has its own materialization path (`xorps`), so it is
+/// worth its own case -- and a negative zero must not come back as positive.
+#[test]
+fn codegen_inline_asm_float_constant_zero_and_negative() {
+    #[cfg(target_arch = "x86_64")]
+    let code = r#"
+int main(void) {
+    unsigned long z = 1, nz = 0;
+    __asm__ ("movq %1, %0" : "=r"(z) : "r"(0.0));
+    __asm__ ("movq %1, %0" : "=r"(nz) : "r"(-0.0));
+    if (z != 0UL) return 1;
+    if (nz != 0x8000000000000000UL) return 2;
+    return 0;
+}
+"#;
+    #[cfg(target_arch = "aarch64")]
+    let code = r#"
+int main(void) {
+    unsigned long z = 1, nz = 0;
+    __asm__ ("mov %0, %1" : "=r"(z) : "r"(0.0));
+    __asm__ ("mov %0, %1" : "=r"(nz) : "r"(-0.0));
+    if (z != 0UL) return 1;
+    if (nz != 0x8000000000000000UL) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_fp_const_zero", code, &[]), 0);
+}
+
+/// A `float` constant is narrowed to its own width, not handed over as the
+/// `double` bit pattern: 1.5f is 0x3FC00000, not 0x3FF8000000000000.
+#[test]
+fn codegen_inline_asm_float_constant_uses_its_own_width() {
+    #[cfg(target_arch = "x86_64")]
+    let code = r#"
+int main(void) {
+    unsigned int bits = 0;
+    __asm__ ("movl %1, %0" : "=r"(bits) : "r"(1.5f));
+    return bits == 0x3FC00000U ? 0 : 1;
+}
+"#;
+    #[cfg(target_arch = "aarch64")]
+    let code = r#"
+int main(void) {
+    unsigned int bits = 0;
+    __asm__ ("mov %w0, %w1" : "=r"(bits) : "r"(1.5f));
+    return bits == 0x3FC00000U ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("asm_fp_const_float_width", code, &[]), 0);
+}

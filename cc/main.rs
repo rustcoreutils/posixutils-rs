@@ -760,6 +760,19 @@ fn process_file(
         arch::codegen::create_codegen(target.clone(), emit_unwind_tables, pic_mode, shared_mode);
     let asm = codegen.generate(&module, &types);
 
+    // Codegen can diagnose too. Inline asm is the case that reaches here: a
+    // constraint's register class is only confronted with the operand's actual
+    // location once registers are allocated, so "memory input 0 is not
+    // directly addressable" cannot be raised any earlier. Without this
+    // checkpoint the error would be printed and the broken object written
+    // anyway.
+    if diag::has_error() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compilation failed",
+        ));
+    }
+
     // Determine output file names
     // For stdin ("-"), use "stdin" as the default stem
     let stem = if path == "-" {

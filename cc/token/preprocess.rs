@@ -2662,8 +2662,10 @@ impl<'a> Preprocessor<'a> {
         self.include_stack.insert(canonical.clone());
         self.include_depth += 1;
 
-        // Create a new stream for this file
-        let stream_id = diag::init_stream(&self.current_file);
+        // Create a new stream for this file, remembering which `#include`
+        // brought it in: that is what lets a diagnostic inside a header name
+        // the chain that reached it.
+        let stream_id = diag::init_included_stream(&self.current_file, hash_token.pos);
 
         // Tokenize the included file using the same shared string table
         // Since we use the same StringTable, all StringIds are consistent
@@ -2721,8 +2723,9 @@ impl<'a> Preprocessor<'a> {
 
         self.include_depth += 1;
 
-        // Create a stream for this builtin header
-        let stream_id = diag::init_stream(&self.current_file);
+        // Create a stream for this builtin header, with the `#include` that
+        // asked for it; see `include_file`.
+        let stream_id = diag::init_included_stream(&self.current_file, hash_token.pos);
 
         // Tokenize the builtin content
         let tokens = {

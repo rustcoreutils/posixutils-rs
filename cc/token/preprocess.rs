@@ -3066,8 +3066,17 @@ impl<'a> Preprocessor<'a> {
                 }
                 TokenValue::Number(n) => result.push_str(n),
                 TokenValue::String(s) => result.push_str(s),
-                TokenValue::Special(code) if *code < 256 => {
+                TokenValue::Special(code) if *code < SpecialToken::BASE => {
                     result.push(*code as u8 as char);
+                }
+                // A punctuator of more than one character has a spelling too.
+                // Dropping it turned `a >> b` into `a  b`, in `#x` (6.10.3.2p2
+                // asks for "the spelling of the preprocessing token") and in
+                // the text a `_Pragma` is rebuilt from alike.
+                TokenValue::Special(code) => {
+                    if let Some(punct) = SpecialToken::from_code(*code) {
+                        result.push_str(punct.spelling());
+                    }
                 }
                 _ => {}
             }
@@ -3136,8 +3145,17 @@ impl<'a> Preprocessor<'a> {
                     }
                     result.push('\'');
                 }
-                TokenValue::Special(code) if *code < 256 => {
+                TokenValue::Special(code) if *code < SpecialToken::BASE => {
                     result.push(*code as u8 as char);
+                }
+                // A punctuator of more than one character has a spelling too.
+                // Dropping it turned `a >> b` into `a  b`, in `#x` (6.10.3.2p2
+                // asks for "the spelling of the preprocessing token") and in
+                // the text a `_Pragma` is rebuilt from alike.
+                TokenValue::Special(code) => {
+                    if let Some(punct) = SpecialToken::from_code(*code) {
+                        result.push_str(punct.spelling());
+                    }
                 }
                 _ => {}
             }

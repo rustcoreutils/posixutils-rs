@@ -648,3 +648,52 @@ int main(void) {
         0
     );
 }
+
+/// 6.10.3.2p2 asks for "the spelling of the preprocessing token", and a
+/// punctuator of more than one character has one.
+///
+/// `SpecialToken` codes at or above 256 fell through the stringifier's
+/// catch-all, so every multi-character operator vanished: `#x` turned
+/// `a >> b` into `"a  b"`, and an assertion or logging macro printed something
+/// that was not the expression it was given. Each expected string below is
+/// gcc's. Recorded at #C128.
+#[test]
+fn preprocessor_stringify_keeps_multi_character_punctuators() {
+    assert_eq!(
+        compile_and_run(
+            "stringify_multi_character_punctuators",
+            "#include <string.h>\n\
+             #define S(x) #x\n\
+             int main(void) {\n\
+             if (strcmp(S(a += b), \"a += b\")) return 1;\n\
+             if (strcmp(S(a ++), \"a ++\")) return 2;\n\
+             if (strcmp(S(a -= b), \"a -= b\")) return 3;\n\
+             if (strcmp(S(a --), \"a --\")) return 4;\n\
+             if (strcmp(S(p -> m), \"p -> m\")) return 5;\n\
+             if (strcmp(S(a *= b), \"a *= b\")) return 6;\n\
+             if (strcmp(S(a /= b), \"a /= b\")) return 7;\n\
+             if (strcmp(S(a %= b), \"a %= b\")) return 8;\n\
+             if (strcmp(S(a <= b), \"a <= b\")) return 9;\n\
+             if (strcmp(S(a >= b), \"a >= b\")) return 10;\n\
+             if (strcmp(S(a == b), \"a == b\")) return 11;\n\
+             if (strcmp(S(a != b), \"a != b\")) return 12;\n\
+             if (strcmp(S(a && b), \"a && b\")) return 13;\n\
+             if (strcmp(S(a &= b), \"a &= b\")) return 14;\n\
+             if (strcmp(S(a || b), \"a || b\")) return 15;\n\
+             if (strcmp(S(a |= b), \"a |= b\")) return 16;\n\
+             if (strcmp(S(a ^= b), \"a ^= b\")) return 17;\n\
+             if (strcmp(S(a << b), \"a << b\")) return 18;\n\
+             if (strcmp(S(a >> b), \"a >> b\")) return 19;\n\
+             if (strcmp(S(a <<= b), \"a <<= b\")) return 20;\n\
+             if (strcmp(S(a >>= b), \"a >>= b\")) return 21;\n\
+             if (strcmp(S(f(...)), \"f(...)\")) return 22;\n\
+             /* single-character punctuators were never the problem */\n\
+             if (strcmp(S(x[i] ? y : z), \"x[i] ? y : z\")) return 23;\n\
+             if (strcmp(S(a > b), \"a > b\")) return 24;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+}

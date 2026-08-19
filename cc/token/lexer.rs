@@ -199,6 +199,74 @@ pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
 
 impl SpecialToken {
     pub const BASE: u32 = 256;
+
+    /// The punctuator this code stands for, or `None` for a single-character
+    /// one, which is its own ASCII code and has no variant here.
+    pub fn from_code(code: u32) -> Option<Self> {
+        use SpecialToken::*;
+        Some(match code {
+            c if c == AddAssign as u32 => AddAssign,
+            c if c == Increment as u32 => Increment,
+            c if c == SubAssign as u32 => SubAssign,
+            c if c == Decrement as u32 => Decrement,
+            c if c == Arrow as u32 => Arrow,
+            c if c == MulAssign as u32 => MulAssign,
+            c if c == DivAssign as u32 => DivAssign,
+            c if c == ModAssign as u32 => ModAssign,
+            c if c == Lte as u32 => Lte,
+            c if c == Gte as u32 => Gte,
+            c if c == Equal as u32 => Equal,
+            c if c == NotEqual as u32 => NotEqual,
+            c if c == LogicalAnd as u32 => LogicalAnd,
+            c if c == AndAssign as u32 => AndAssign,
+            c if c == LogicalOr as u32 => LogicalOr,
+            c if c == OrAssign as u32 => OrAssign,
+            c if c == XorAssign as u32 => XorAssign,
+            c if c == HashHash as u32 => HashHash,
+            c if c == LeftShift as u32 => LeftShift,
+            c if c == RightShift as u32 => RightShift,
+            c if c == DotDot as u32 => DotDot,
+            c if c == ShlAssign as u32 => ShlAssign,
+            c if c == ShrAssign as u32 => ShrAssign,
+            c if c == Ellipsis as u32 => Ellipsis,
+            _ => return None,
+        })
+    }
+
+    /// How this punctuator is written in source.
+    ///
+    /// `#` stringification needs it (6.10.3.2p2: "the spelling of the
+    /// preprocessing token"). Without one, `#x` dropped every operator of more
+    /// than one character, so `S(a >> b)` came out `"a  b"`.
+    pub fn spelling(self) -> &'static str {
+        use SpecialToken::*;
+        match self {
+            AddAssign => "+=",
+            Increment => "++",
+            SubAssign => "-=",
+            Decrement => "--",
+            Arrow => "->",
+            MulAssign => "*=",
+            DivAssign => "/=",
+            ModAssign => "%=",
+            Lte => "<=",
+            Gte => ">=",
+            Equal => "==",
+            NotEqual => "!=",
+            LogicalAnd => "&&",
+            AndAssign => "&=",
+            LogicalOr => "||",
+            OrAssign => "|=",
+            XorAssign => "^=",
+            HashHash => "##",
+            LeftShift => "<<",
+            RightShift => ">>",
+            DotDot => "..",
+            ShlAssign => "<<=",
+            ShrAssign => ">>=",
+            Ellipsis => "...",
+        }
+    }
 }
 
 // Position is imported from crate::diag

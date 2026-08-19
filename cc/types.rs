@@ -1689,6 +1689,28 @@ impl TypeTable {
         if let Some(explicit) = typ.explicit_align {
             return explicit as usize;
         }
+        // C17 6.2.5p27 lets an atomic type have a different alignment from its
+        // unqualified version, and it must: the hardware's atomic access at
+        // width N requires N-byte alignment. `_Atomic struct S8 { int a, b; }`
+        // took the struct's natural 4, so aarch64 raised SIGBUS on the 8-byte
+        // access #C116 introduced, and x86-64 quietly performed one that was
+        // not atomic across a cache line.
+        //
+        // gcc's rule, measured on both targets: a power-of-two size up to 16
+        // aligns to its own size, anything else keeps its natural alignment.
+        // The odd sizes are the ones with no lock-free access to align for.
+        if typ.modifiers.contains(TypeModifiers::ATOMIC) {
+            let size = self.size_bits(id) as usize / 8;
+            if size.is_power_of_two() && size <= 16 {
+                return size.max(self.natural_alignment(id));
+            }
+        }
+        self.natural_alignment(id)
+    }
+
+    /// The alignment the type would have without `_Atomic`.
+    fn natural_alignment(&self, id: TypeId) -> usize {
+        let typ = self.get(id);
         match typ.kind {
             TypeKind::Void => 1,
             TypeKind::Bool | TypeKind::Char => 1,

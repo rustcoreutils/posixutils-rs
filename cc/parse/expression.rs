@@ -1076,13 +1076,25 @@ impl<'a> Parser<'a> {
 
     /// Apply trailing qualifiers to a type and return the qualified type id
     /// Used for patterns like "struct foo const *" where const comes after the struct
-    fn apply_trailing_qualifiers(&mut self, base_type: TypeId) -> TypeId {
-        let trailing_mods = self.consume_type_qualifiers();
-        if trailing_mods.is_empty() {
+    /// Apply the qualifiers written after a tag reference, plus `leading` --
+    /// the ones already collected before it.
+    ///
+    /// Both halves matter and only the trailing half used to be applied, so
+    /// `_Atomic struct S;` for an already-declared tag quietly produced the
+    /// unqualified struct. That is invisible for `const` and `volatile`, which
+    /// the back end does not act on, and load-bearing for `_Atomic`, which
+    /// decides both the access and the alignment.
+    fn apply_trailing_qualifiers_with(
+        &mut self,
+        base_type: TypeId,
+        leading: TypeModifiers,
+    ) -> TypeId {
+        let mods = leading | self.consume_type_qualifiers();
+        if mods.is_empty() {
             base_type
         } else {
             let mut qualified_type = self.types.get(base_type).clone();
-            qualified_type.modifiers |= trailing_mods;
+            qualified_type.modifiers |= mods;
             self.types.intern(qualified_type)
         }
     }
@@ -1394,7 +1406,7 @@ impl<'a> Parser<'a> {
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                                 return Some((
-                                    self.apply_trailing_qualifiers(existing.typ),
+                                    self.apply_trailing_qualifiers_with(existing.typ, modifiers),
                                     Vec::new(),
                                 ));
                             }
@@ -1427,7 +1439,7 @@ impl<'a> Parser<'a> {
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                                 return Some((
-                                    self.apply_trailing_qualifiers(existing.typ),
+                                    self.apply_trailing_qualifiers_with(existing.typ, modifiers),
                                     Vec::new(),
                                 ));
                             }

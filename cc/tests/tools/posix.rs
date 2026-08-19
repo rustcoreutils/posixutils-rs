@@ -53,6 +53,18 @@ fn run_env(bin: &str, args: &[&str], env: &[(&str, &str)]) -> (String, String, i
     )
 }
 
+/// `PATH` with `bindir` first, so `cflow` finds the `lex` and `yacc` this
+/// workspace builds rather than whatever the host happens to offer.
+///
+/// A missing or empty `PATH` is not an error worth panicking over: the build
+/// directory alone is exactly what these tests need on it.
+fn path_with_bindir(bindir: &std::path::Path) -> String {
+    match std::env::var("PATH") {
+        Ok(p) if !p.is_empty() => format!("{}:{}", bindir.display(), p),
+        _ => bindir.display().to_string(),
+    }
+}
+
 /// Write `content` into a fresh temp dir and return (dir, path-as-string).
 fn src(dir: &TempDir, name: &str, content: &str) -> String {
     let p = dir.path().join(name);
@@ -819,7 +831,7 @@ fn cflow_processes_lex_input() {
     // Success path, when lex was built alongside these binaries.
     let bindir = std::path::Path::new(exe_for("cflow")).parent().unwrap();
     if bindir.join("lex").exists() {
-        let path = format!("{}:{}", bindir.display(), std::env::var("PATH").unwrap());
+        let path = path_with_bindir(bindir);
         let (stdout, stderr, code) = run_env("cflow", &[&l], &[("PATH", &path)]);
         assert_eq!(code, 0, "lex input should analyze cleanly: {}", stderr);
         assert!(
@@ -930,7 +942,7 @@ fn cflow_processes_yacc_input() {
         eprintln!("skipping cflow_processes_yacc_input: yacc was not built alongside cflow");
         return;
     }
-    let env_path = format!("{}:{}", bindir.display(), std::env::var("PATH").unwrap());
+    let env_path = path_with_bindir(bindir);
     let dir = TempDir::new().unwrap();
     let grammar = src(
         &dir,

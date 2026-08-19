@@ -332,7 +332,9 @@ fn output_ends_with_newline() {
 /// are the host's, and differ between a 32- and 64-bit machine.
 #[test]
 fn posix_v8_programming_environments_match_v7() {
-    let names = [
+    // The flag lists: compiler and linker flags are the same strings whichever
+    // issue asked for them.
+    let flag_names = [
         "ILP32_OFF32_CFLAGS",
         "ILP32_OFF32_LDFLAGS",
         "ILP32_OFF32_LIBS",
@@ -345,15 +347,56 @@ fn posix_v8_programming_environments_match_v7() {
         "LPBIG_OFFBIG_CFLAGS",
         "LPBIG_OFFBIG_LDFLAGS",
         "LPBIG_OFFBIG_LIBS",
-        "WIDTH_RESTRICTED_ENVS",
     ];
 
-    for suffix in names {
+    for suffix in flag_names {
         let v8 = getconf_output(&format!("POSIX_V8_{suffix}"));
         let v7 = getconf_output(&format!("POSIX_V7_{suffix}"));
         assert_eq!(
             v8, v7,
             "POSIX_V8_{suffix} must resolve, and to the same environment as V7"
+        );
+    }
+}
+
+/// `WIDTH_RESTRICTED_ENVS` is the one that answers with environment *names*
+/// rather than flags, and 88129-88132 wants them "suitable for use with the
+/// getconf -v option". glibc has no V8 confstr, so the V8 query aliases the V7
+/// one and the host replies `POSIX_V7_LP64_OFF64` -- a V7 name in reply to a V8
+/// question. The names denote the same environments either way (Austin Group
+/// Defect 1330 renamed them only), so the answer is restated in the issue that
+/// was asked about.
+#[test]
+fn posix_width_restricted_envs_answer_in_the_issue_asked_about() {
+    let v8 = getconf_output("POSIX_V8_WIDTH_RESTRICTED_ENVS");
+    let v7 = getconf_output("POSIX_V7_WIDTH_RESTRICTED_ENVS");
+
+    assert!(
+        !v8.trim().is_empty(),
+        "POSIX_V8_WIDTH_RESTRICTED_ENVS must name at least one environment"
+    );
+    assert!(
+        !v8.contains("POSIX_V7_"),
+        "a V8 query must not answer with V7 names, got: {v8}"
+    );
+    assert_eq!(
+        v8,
+        v7.replace("POSIX_V7_", "POSIX_V8_"),
+        "the V8 answer must be the V7 one restated, not a different list"
+    );
+
+    // The names have to round-trip: each is meant to be handed straight back
+    // to `getconf -v`.
+    for name in v8.split_whitespace() {
+        run_getconf_test(
+            vec!["-v", name, "POSIX_V8_LP64_OFF64_CFLAGS"],
+            0,
+            |_, output| {
+                assert!(
+                    output.status.success(),
+                    "getconf -v rejected a name it had just printed"
+                );
+            },
         );
     }
 }

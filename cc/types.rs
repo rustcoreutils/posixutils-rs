@@ -802,6 +802,17 @@ pub struct TypeTable {
     pub char_ptr_id: TypeId,
 }
 
+/// Parenthesize a declarator that has reached a `*` before an array or
+/// function suffix is appended, because a pointer binds looser than either.
+/// `int (*)[8]` is a pointer to an array; `int *[8]` is an array of pointers.
+fn parenthesize_if_pointer(decl: String) -> String {
+    if decl.contains('*') {
+        format!("({})", decl)
+    } else {
+        decl
+    }
+}
+
 impl TypeTable {
     /// Create a new type table with common types pre-interned
     pub fn new(target: &Target) -> Self {
@@ -1146,53 +1157,57 @@ impl TypeTable {
     /// Used by diagnostics that have to name the types they are complaining
     /// about -- an assignment constraint violation is unreadable without them.
     pub fn format_type(&self, id: TypeId, idents: Option<&IdentTable>) -> String {
-        let typ = self.get(id);
-        let mut result = String::new();
+        self.format_declarator(id, String::new(), idents)
+    }
 
-        // Print modifiers
-        if typ.modifiers.contains(TypeModifiers::CONST) {
-            result.push_str("const ");
-        }
-        if typ.modifiers.contains(TypeModifiers::VOLATILE) {
-            result.push_str("volatile ");
-        }
-        // Spelling, not signedness: a diagnostic must name the type the source
-        // wrote. Plain `char` is an unsigned type on aarch64 and is still
-        // `char` here.
-        if self.spelled_unsigned(id) {
-            result.push_str("unsigned ");
-        } else if typ.modifiers.contains(TypeModifiers::SIGNED) && typ.kind == TypeKind::Char {
-            result.push_str("signed ");
-        }
+    /// Spell `id` in declarator form, wrapping `decl` -- the declarator built
+    /// so far, read outward from where the name would stand.
+    ///
+    /// A C type reads inside-out, and building it left to right prints the
+    /// wrong type: `int *p = m;` for `int m[4][8]` used to report the pointee
+    /// as `int[8] *`, which reads as "array of pointers" -- the other type
+    /// entirely. gcc says `int (*)[8]` (#C132). #C131 fixed the *order* of an
+    /// array's extents; this is their composition with pointers and functions.
+    ///
+    /// The rule is the language's own: a pointer binds looser than an array or
+    /// function suffix, so a declarator that has reached a `*` is parenthesized
+    /// before a suffix is appended to it.
+    fn format_declarator(&self, id: TypeId, decl: String, idents: Option<&IdentTable>) -> String {
+        let typ = self.get(id);
 
         match typ.kind {
             TypeKind::Pointer => {
-                // `char *` and `char **`, the way gcc and the source write
-                // them: a space before the first star and none between stars.
-                match typ.base {
-                    Some(base) => {
-                        let pointee = self.format_type(base, idents);
-                        let joined = pointee.ends_with('*');
-                        result.push_str(&pointee);
-                        if !joined {
-                            result.push(' ');
-                        }
-                        result.push('*');
+                // Qualifiers on the pointer belong after the star -- the
+                // `const` in `char *const` qualifies the pointer, not the char.
+                let mut inner = String::from("*");
+                if typ.modifiers.contains(TypeModifiers::CONST) {
+                    inner.push_str(" const");
+                }
+                if typ.modifiers.contains(TypeModifiers::VOLATILE) {
+                    inner.push_str(" volatile");
+                }
+                if !decl.is_empty() {
+                    // `**`, never `* *`; but `*const p` needs its space.
+                    if !inner.ends_with('*') {
+                        inner.push(' ');
                     }
-                    None => result.push('*'),
+                    inner.push_str(&decl);
+                }
+                match typ.base {
+                    Some(base) => self.format_declarator(base, inner, idents),
+                    None => inner,
                 }
             }
+
             TypeKind::Array => {
-                // Outermost extent first, as the declaration writes it.
-                // Recursing element-first and appending printed `int[4][8]`
-                // as `int[8][4]`, in a diagnostic and in `cflow` alike.
-                let mut extents = String::new();
+                let mut extents = parenthesize_if_pointer(decl);
                 let mut cur = id;
                 let element = loop {
                     let t = self.get(cur);
                     if t.kind != TypeKind::Array {
                         break Some(cur);
                     }
+                    // Outermost extent first, as the declaration writes it.
                     match t.array_size {
                         Some(size) => extents.push_str(&format!("[{}]", size)),
                         None => extents.push_str("[]"),
@@ -1202,51 +1217,93 @@ impl TypeTable {
                         None => break None,
                     }
                 };
-                if let Some(element) = element {
-                    result.push_str(&self.format_type(element, idents));
+                match element {
+                    Some(element) => self.format_declarator(element, extents, idents),
+                    None => extents,
                 }
-                result.push_str(&extents);
             }
+
             TypeKind::Function => {
-                if let Some(ret) = typ.base {
-                    result.push_str(&self.format_type(ret, idents));
-                    result.push('(');
-                    if let Some(params) = &typ.params {
+                let mut sig = parenthesize_if_pointer(decl);
+                sig.push('(');
+                match &typ.params {
+                    // 6.7.6.3p14 puts the line at "prototype or not", not at
+                    // "zero parameters": `(void)` says there are none, an empty
+                    // identifier list says nothing at all. They are distinct
+                    // types (#C45), so a diagnostic must spell them apart.
+                    Some(params) if params.is_empty() && !typ.variadic => {
+                        sig.push_str("void");
+                    }
+                    Some(params) => {
                         for (i, &param) in params.iter().enumerate() {
                             if i > 0 {
-                                result.push_str(", ");
+                                sig.push_str(", ");
                             }
-                            result.push_str(&self.format_type(param, idents));
+                            sig.push_str(&self.format_type(param, idents));
                         }
                         if typ.variadic {
                             if !params.is_empty() {
-                                result.push_str(", ");
+                                sig.push_str(", ");
                             }
-                            result.push_str("...");
+                            sig.push_str("...");
                         }
                     }
-                    result.push(')');
-                } else {
-                    result.push_str("()");
+                    None => {}
+                }
+                sig.push(')');
+                match typ.base {
+                    Some(ret) => self.format_declarator(ret, sig, idents),
+                    None => sig,
                 }
             }
-            TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
-                result.push_str(&typ.kind.to_string());
-                // The tag is what tells one struct from another, and an
-                // assignment diagnostic naming neither is unreadable.
-                if let (Some(comp), Some(idents)) = (typ.composite.as_deref(), idents) {
-                    if let Some(tag) = comp.tag {
-                        result.push(' ');
-                        result.push_str(idents.get(tag));
-                    }
-                }
-            }
+
             _ => {
-                result.push_str(&typ.kind.to_string());
+                let mut result = String::new();
+                if typ.modifiers.contains(TypeModifiers::CONST) {
+                    result.push_str("const ");
+                }
+                if typ.modifiers.contains(TypeModifiers::VOLATILE) {
+                    result.push_str("volatile ");
+                }
+                // Spelling, not signedness: a diagnostic must name the type the
+                // source wrote. Plain `char` is an unsigned type on aarch64 and
+                // is still `char` here.
+                if self.spelled_unsigned(id) {
+                    result.push_str("unsigned ");
+                } else if typ.modifiers.contains(TypeModifiers::SIGNED)
+                    && typ.kind == TypeKind::Char
+                {
+                    result.push_str("signed ");
+                }
+
+                match typ.kind {
+                    TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
+                        result.push_str(&typ.kind.to_string());
+                        // The tag is what tells one struct from another, and an
+                        // assignment diagnostic naming neither is unreadable.
+                        if let (Some(comp), Some(idents)) = (typ.composite.as_deref(), idents) {
+                            if let Some(tag) = comp.tag {
+                                result.push(' ');
+                                result.push_str(idents.get(tag));
+                            }
+                        }
+                    }
+                    _ => result.push_str(&typ.kind.to_string()),
+                }
+
+                if !decl.is_empty() {
+                    // A space only where a pointer is involved: gcc writes
+                    // `int *`, `int (*)[8]` and `int (*)(void)` with one, and
+                    // `int[4][8]` and `int()` without. The latter is also what
+                    // cflow's worked EXAMPLE in POSIX prints.
+                    if decl.contains('*') {
+                        result.push(' ');
+                    }
+                    result.push_str(&decl);
+                }
+                result
             }
         }
-
-        result
     }
 
     // =========================================================================
@@ -2467,6 +2524,62 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         assert_eq!(types.format_type(types.int_id, None), "int");
         assert_eq!(types.format_type(types.uint_id, None), "unsigned int");
+    }
+
+    /// A C type reads inside-out, and building the spelling left to right
+    /// prints a *different* type: `int (*)[8]` came out `int[8] *`, which
+    /// reads as "array of pointers" (#C132). Every row here was taken from
+    /// `gcc -std=c17`'s own diagnostics.
+    #[test]
+    fn format_type_spells_a_declarator_not_a_suffix_chain() {
+        let mut t = TypeTable::new(&Target::host());
+
+        let arr8 = t.intern(Type::array(t.int_id, 8));
+        let ptr_to_arr = t.intern(Type::pointer(arr8));
+        assert_eq!(t.format_type(ptr_to_arr, None), "int (*)[8]");
+
+        let int_ptr = t.intern(Type::pointer(t.int_id));
+        let arr_of_ptr = t.intern(Type::array(int_ptr, 8));
+        assert_eq!(t.format_type(arr_of_ptr, None), "int *[8]");
+
+        // The two are different types and must not share a spelling.
+        assert_ne!(
+            t.format_type(ptr_to_arr, None),
+            t.format_type(arr_of_ptr, None)
+        );
+
+        // #C131's fix, still holding: outermost extent first.
+        let arr48 = t.intern(Type::array(arr8, 4));
+        assert_eq!(t.format_type(arr48, None), "int[4][8]");
+        let ptr_to_arr48 = t.intern(Type::pointer(arr48));
+        assert_eq!(t.format_type(ptr_to_arr48, None), "int (*)[4][8]");
+
+        // Pointers chain without spaces between the stars.
+        let ptr_ptr = t.intern(Type::pointer(int_ptr));
+        assert_eq!(t.format_type(ptr_ptr, None), "int **");
+
+        // A function, and a pointer to one.
+        let f_void = t.intern(Type::function(t.int_id, vec![], false, false));
+        assert_eq!(t.format_type(f_void, None), "int(void)");
+        let ptr_to_f = t.intern(Type::pointer(f_void));
+        assert_eq!(t.format_type(ptr_to_f, None), "int (*)(void)");
+
+        // 6.7.6.3p14: no prototype is not the same type as `(void)`, so the
+        // two must not print the same either (#C45).
+        let f_noproto = t.intern(Type::function_no_prototype(t.int_id, false));
+        assert_eq!(t.format_type(f_noproto, None), "int()");
+        assert_ne!(t.format_type(f_void, None), t.format_type(f_noproto, None));
+
+        // An array of pointers to functions -- both suffixes and a pointer.
+        let arr_of_fptr = t.intern(Type::array(ptr_to_f, 4));
+        assert_eq!(t.format_type(arr_of_fptr, None), "int (*[4])(void)");
+
+        // A qualifier on the pointer goes after the star, where the
+        // declaration writes it.
+        let mut cptr = Type::pointer(t.char_id);
+        cptr.modifiers |= TypeModifiers::CONST;
+        let const_ptr = t.intern(cptr);
+        assert_eq!(t.format_type(const_ptr, None), "char * const");
     }
 
     #[test]

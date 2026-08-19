@@ -4217,3 +4217,46 @@ int main(void) {
         0
     );
 }
+
+/// #C132: a diagnostic must name the type the source could have written.
+///
+/// `int m[4][8]; int *p = m;` reported the pointee as `int[8] *`, which reads
+/// as "array of pointers" -- the other type entirely. `format_type` built the
+/// spelling left to right and had no notion of a declarator's inside-out
+/// reading, so it could not parenthesize. gcc says `int (*)[8]`.
+#[test]
+fn diagnostics_pointer_to_array_is_spelled_as_a_declarator() {
+    let c = create_c_file("spell_ptr_to_array", "int m[4][8];\nint *p = m;\n");
+    let path = c.path().to_string_lossy().to_string();
+    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+
+    assert!(
+        run.stderr.contains("int (*)[8]"),
+        "expected the declarator spelling gcc uses, got:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("int[8] *"),
+        "the suffix spelling names a different type:\n{}",
+        run.stderr
+    );
+}
+
+/// The composition, through a diagnostic rather than the type table directly:
+/// a pointer to a function and an array of pointers must not collapse into
+/// each other's spelling.
+#[test]
+fn diagnostics_function_pointer_is_spelled_as_a_declarator() {
+    let c = create_c_file(
+        "spell_fn_ptr",
+        "int f(void);\nint (*fp)(void) = f;\nint bad = fp;\n",
+    );
+    let path = c.path().to_string_lossy().to_string();
+    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+
+    assert!(
+        run.stderr.contains("int (*)(void)"),
+        "expected `int (*)(void)`, got:\n{}",
+        run.stderr
+    );
+}

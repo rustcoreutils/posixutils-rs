@@ -3546,3 +3546,142 @@ fn diagnostics_shared_constant_folder_answers_alike() {
         0
     );
 }
+
+/// Every operation is evaluated *in* a type, and its result narrowed to that
+/// type before the next one sees it.
+///
+/// The folder carried a full-width `i128` instead, so `-1u / 3u` was 0 rather
+/// than 1431655765 -- the negative was still negative when the division saw
+/// it -- `(unsigned)-1 % 7u` was 4294967295 rather than 3, and a cast did not
+/// convert at all: `(unsigned char)-1` was -1, `(short)70000` was 70000. Each
+/// value below is gcc's. Recorded at #C126.
+#[test]
+fn diagnostics_constants_fold_at_their_own_width() {
+    assert_eq!(
+        compile_and_run(
+            "constants_fold_at_their_own_width",
+            "typedef unsigned __int128 u128;\n\
+             int main(void) {\n\
+             /* division and remainder see an unsigned operand as unsigned */\n\
+             if (-1u / 3u != 1431655765u) return 1;\n\
+             if ((unsigned)-1 % 7u != 3u) return 2;\n\
+             if ((0u - 1u) / 2u != 2147483647u) return 3;\n\
+             if (-1ull / 3ull != 6148914691236517205ull) return 4;\n\
+             /* a right shift of an unsigned value is logical */\n\
+             if ((-1u >> 1) != 2147483647u) return 5;\n\
+             if ((-1ull >> 1) != 9223372036854775807ull) return 6;\n\
+             if ((~0u >> 28) != 15u) return 7;\n\
+             /* 128 bits, where narrowing cannot help and signedness must */\n\
+             u128 thirds = ((u128)6148914691236517205ull << 64) | 6148914691236517205ull;\n\
+             if ((u128)-1 / 3 != thirds) return 8;\n\
+             if ((long long)((u128)-1 >> 1) != -1) return 9;\n\
+             /* a cast converts */\n\
+             if ((int)(unsigned char)-1 != 255) return 10;\n\
+             if ((int)(unsigned char)300 != 44) return 11;\n\
+             if ((int)(short)70000 != 4464) return 12;\n\
+             if ((int)(signed char)200 != -56) return 13;\n\
+             if ((int)(unsigned short)-1 != 65535) return 14;\n\
+             /* ... and a conversion to _Bool gives 0 or 1, not the low byte */\n\
+             if ((int)(_Bool)2 != 1) return 15;\n\
+             if ((int)(_Bool)256 != 1) return 16;\n\
+             /* integer promotion still widens: these are int arithmetic */\n\
+             if ((char)100 + (char)100 != 200) return 17;\n\
+             if ((short)30000 + (short)30000 != 60000) return 18;\n\
+             if ((unsigned char)200 + (unsigned char)200 != 400) return 19;\n\
+             /* and signed arithmetic wraps at its own width */\n\
+             if (4294967295u + 1u != 0u) return 20;\n\
+             if ((unsigned)(1u << 31) != 2147483648u) return 21;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+
+    // The same expressions as *constant* contexts, where only the folder can
+    // answer: a run-time path that happened to be right would hide the bug.
+    assert_eq!(
+        compile_and_run(
+            "constant_contexts_fold_alike",
+            "enum E {\n\
+             A = -1u / 3u,\n\
+             B = (unsigned)-1 % 7u,\n\
+             C = (int)(unsigned char)300,\n\
+             D = (int)(short)70000,\n\
+             F = (int)(_Bool)2,\n\
+             G = (int)(-1u >> 1)\n\
+             };\n\
+             static unsigned s_div = -1u / 3u;\n\
+             static int s_cast = (int)(unsigned char)300;\n\
+             int main(void) {\n\
+             int a[(int)(unsigned char)300];\n\
+             if (A != 1431655765) return 1;\n\
+             if (B != 3) return 2;\n\
+             if (C != 44) return 3;\n\
+             if (D != 4464) return 4;\n\
+             if (F != 1) return 5;\n\
+             if (G != 2147483647) return 6;\n\
+             if (s_div != 1431655765u) return 7;\n\
+             if (s_cast != 44) return 8;\n\
+             if (sizeof a != 44 * sizeof(int)) return 9;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+}
+
+/// 6.4.4.1p5 picks the first type that can represent the value, for a
+/// `u`-suffixed constant as much as an unsuffixed one.
+///
+/// Every `u` suffix took `unsigned int` regardless of magnitude, so
+/// `0xaaaaaaaaaaaaaaabu` had a four-byte type. That was survivable while
+/// constants were carried at full width and only `sizeof` was wrong; once they
+/// folded at their own width it truncated the value, and CPython's
+/// `math.comb(5, 2)` returned 85899345930. Recorded at #C127.
+#[test]
+fn diagnostics_unsigned_suffix_widens_by_magnitude() {
+    assert_eq!(
+        compile_and_run(
+            "unsigned_suffix_widens_by_magnitude",
+            "int main(void) {\n\
+             if (sizeof 1u != 4) return 1;\n\
+             if (sizeof 0xFFFFFFFFu != 4) return 2;\n\
+             if (sizeof 0x100000000u != 8) return 3;\n\
+             if (sizeof 4294967296u != 8) return 4;\n\
+             if (sizeof 0xaaaaaaaaaaaaaaabu != 8) return 5;\n\
+             if (sizeof 18446744073709551615u != 8) return 6;\n\
+             if (0xaaaaaaaaaaaaaaabu != 12297829382473034411ULL) return 7;\n\
+             if (0x100000000u != 4294967296ULL) return 8;\n\
+             /* the value that made math.comb wrong: a 64-bit product whose\n\
+                left operand had been truncated to 32 bits */\n\
+             if (0xfu * 0xaaaaaaaaaaaaaaabu != 5) return 9;\n\
+             /* unsuffixed and l-suffixed spellings were already right */\n\
+             if (sizeof 0xaaaaaaaaaaaaaaab != 8) return 10;\n\
+             if (sizeof 1ul != 8) return 11;\n\
+             if (sizeof 1ull != 8) return 12;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+
+    // Through a static table, which is how CPython hit it: the initializer is
+    // emitted from the folded value, so a truncated literal reaches .rodata.
+    assert_eq!(
+        compile_and_run(
+            "wide_unsigned_literal_in_a_static_table",
+            "static const unsigned long t[] = { 0xfu, 0xaaaaaaaaaaaaaaabu };\n\
+             int main(void) {\n\
+             unsigned long a = t[0], b = t[1];\n\
+             if (b != 12297829382473034411UL) return 1;\n\
+             if (a * b != 5) return 2;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+}

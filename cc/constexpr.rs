@@ -59,6 +59,42 @@ pub(crate) trait ConstEnv {
     fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64>;
 }
 
+/// Reduce a value to what its type can hold.
+///
+/// C evaluates every operation *in* a type, and the result of one is an
+/// operand of the next. Carrying a full-width `i128` through instead answered
+/// `-1u / 3u` with 0 rather than 1431655765, `(unsigned)-1 % 7u` with
+/// 4294967295 rather than 3, and `(unsigned char)-1` with -1 rather than 255:
+/// the negative was still negative when the division saw it. Applied at every
+/// node, this is also what makes a cast convert, since a cast node's type is
+/// the type cast to.
+///
+/// A type wider than the `i128` the walk carries -- `unsigned __int128` --
+/// is left alone: there is nothing to reduce it to. The unsigned arms of
+/// [`eval_binary`] handle that case directly instead.
+fn normalize(env: &impl ConstEnv, typ: Option<TypeId>, value: i128) -> i128 {
+    let Some(t) = typ else { return value };
+    let types = env.types();
+    if !types.is_integer(t) {
+        return value;
+    }
+    // A conversion to `_Bool` yields 0 or 1 (6.3.1.2), not the low byte:
+    // `(_Bool)2` is 1, where masking to eight bits left it 2.
+    if types.kind(t) == crate::types::TypeKind::Bool {
+        return (value != 0) as i128;
+    }
+    let bits = types.size_bits(t);
+    if bits == 0 || bits >= 128 {
+        return value;
+    }
+    let shift = 128 - bits;
+    if types.is_unsigned(t) {
+        (((value as u128) << shift) >> shift) as i128
+    } else {
+        (value << shift) >> shift
+    }
+}
+
 /// Does either operand of a comparison have floating type?
 ///
 /// Asked of the operands rather than the node, because a comparison's own type
@@ -70,7 +106,19 @@ fn has_float_operand(env: &impl ConstEnv, left: &Expr, right: &Expr) -> bool {
 }
 
 /// Evaluate an integer constant expression, or `None` if it is not one.
+///
+/// The answer is reduced to what the expression's own type can hold, which is
+/// what makes arithmetic wrap where C wraps and a cast convert where C
+/// converts. See [`normalize`].
 pub(crate) fn eval(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Option<i128> {
+    Some(normalize(
+        env,
+        expr.typ,
+        eval_unnormalized(env, scope, expr)?,
+    ))
+}
+
+fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Option<i128> {
     // Note the absence of a `FloatLit` arm: a floating literal is deliberately
     // *not* an integer constant expression. 6.6p6 admits one only as the
     // immediate operand of a cast, which the `Cast` arm below handles. Folding
@@ -218,10 +266,25 @@ fn eval_binary(
         return Some(compare(op, l.cmp(&r)) as i128);
     }
 
+    // Division, remainder and right shift are the three operations whose
+    // answer depends on the operands' signedness. `normalize` has already made
+    // an unsigned operand non-negative for every width it can represent, so
+    // this matters only at 128 bits -- where it matters absolutely, since
+    // `(unsigned __int128)-1` is a negative `i128`.
+    let unsigned = left
+        .typ
+        .is_some_and(|t| env.types().is_integer(t) && env.types().is_unsigned(t));
+
     match op {
         BinaryOp::Add => Some(l.wrapping_add(r)),
         BinaryOp::Sub => Some(l.wrapping_sub(r)),
         BinaryOp::Mul => Some(l.wrapping_mul(r)),
+        BinaryOp::Div if unsigned => {
+            (r != 0).then(|| ((l as u128).wrapping_div(r as u128)) as i128)
+        }
+        BinaryOp::Mod if unsigned => {
+            (r != 0).then(|| ((l as u128).wrapping_rem(r as u128)) as i128)
+        }
         BinaryOp::Div => (r != 0).then(|| l.wrapping_div(r)),
         BinaryOp::Mod => (r != 0).then(|| l.wrapping_rem(r)),
         BinaryOp::BitAnd => Some(l & r),
@@ -252,9 +315,13 @@ fn eval_binary(
                 31
             };
             let amount = (r & mask) as u32;
-            Some(match op {
-                BinaryOp::Shl => l.wrapping_shl(amount),
-                _ => l.wrapping_shr(amount),
+            Some(match (op, unsigned) {
+                (BinaryOp::Shl, _) => l.wrapping_shl(amount),
+                // A logical shift, not an arithmetic one. Below 128 bits
+                // `normalize` has already cleared the sign bit; at 128 the
+                // value really is negative as an `i128`.
+                (_, true) => ((l as u128).wrapping_shr(amount)) as i128,
+                (_, false) => l.wrapping_shr(amount),
             })
         }
         BinaryOp::LogAnd => Some((l != 0 && r != 0) as i128),

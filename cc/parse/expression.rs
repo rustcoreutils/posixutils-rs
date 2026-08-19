@@ -4421,11 +4421,16 @@ impl<'a> Parser<'a> {
             // The type is the first in the list that can represent the value.
             let is_octal = !is_hex && num_str.starts_with('0') && num_str.len() > 1;
             let typ = if is_unsigned {
-                // Explicit U suffix
+                // Explicit U suffix. 6.4.4.1p5 still picks the *first* of
+                // `unsigned int`, `unsigned long`, `unsigned long long` that
+                // can represent the value; taking `unsigned int` regardless of
+                // magnitude gave `0xaaaaaaaaaaaaaaabu` a four-byte type, and
+                // once constants folded at their own width that truncated it.
                 match (is_longlong, is_long) {
                     (true, _) => self.types.ulonglong_id,
                     (false, true) => self.types.ulong_id,
-                    (false, false) => self.types.uint_id,
+                    (false, false) if value_u64 <= u32::MAX as u64 => self.types.uint_id,
+                    (false, false) => self.types.ulong_id,
                 }
             } else if is_hex || is_octal {
                 // Hex/octal without U suffix - use first type that fits (C99 6.4.4.1)

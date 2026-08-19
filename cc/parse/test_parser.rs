@@ -1763,8 +1763,16 @@ fn parse_decl(input: &str) -> ParseResult<(Declaration, TypeTable, StringTable, 
     let mut types = TypeTable::new(&Target::host());
     let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     parser.skip_stream_tokens();
-    let decl = parser.parse_declaration()?;
-    Ok((decl, types, strings, symbols))
+    // The production entry point, not a copy of it: `parse_declaration` and
+    // `parse_function_def` were `#[cfg(test)]` duplicates of this and had
+    // drifted from it, so these tests were checking a parser that no
+    // translation unit ever ran through (#C133).
+    match parser.parse_external_decl()? {
+        ExternalDecl::Declaration(decl) => Ok((decl, types, strings, symbols)),
+        ExternalDecl::FunctionDef(_) => {
+            panic!("expected a declaration, parsed a function definition: {input}")
+        }
+    }
 }
 
 #[test]
@@ -1891,8 +1899,13 @@ fn parse_func(input: &str) -> ParseResult<(FunctionDef, TypeTable, StringTable, 
     let mut types = TypeTable::new(&Target::host());
     let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     parser.skip_stream_tokens();
-    let func = parser.parse_function_def()?;
-    Ok((func, types, strings, symbols))
+    // See `parse_decl`: the production entry point.
+    match parser.parse_external_decl()? {
+        ExternalDecl::FunctionDef(func) => Ok((func, types, strings, symbols)),
+        ExternalDecl::Declaration(_) => {
+            panic!("expected a function definition, parsed a declaration: {input}")
+        }
+    }
 }
 
 #[test]

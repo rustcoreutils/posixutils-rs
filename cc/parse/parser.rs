@@ -2071,78 +2071,6 @@ impl Parser<'_> {
         }
     }
 
-    /// Parse a declaration and bind to symbol table
-    ///
-    /// Used for testing declarations in isolation.
-    #[cfg(test)]
-    pub(crate) fn parse_declaration(&mut self) -> ParseResult<Declaration> {
-        // Parse type specifiers
-        let base_type = self.parse_type_specifier()?;
-        // Skip __attribute__ between type and declarator (GCC extension)
-        self.skip_extensions();
-        let base_type_id = self.types.intern(base_type);
-
-        // Parse declarators
-        let mut declarators = Vec::new();
-
-        // Check for struct/union/enum-only declaration (no declarators)
-        // e.g., "struct point { int x; int y; };"
-        if !self.is_special(b';') {
-            loop {
-                let decl_pos = self.current_pos();
-                let (name, mut typ, vla_sizes, _func_params) =
-                    self.parse_declarator(base_type_id, DeclaratorName::Required)?;
-                // Skip GCC extensions like __asm("...") or __attribute__((...))
-                self.skip_extensions();
-                let init = if self.is_special(b'=') {
-                    self.advance();
-                    Some(self.parse_initializer()?)
-                } else {
-                    None
-                };
-
-                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-                typ = self.apply_pending_mode(typ);
-                let validated_align = self.validated_explicit_align(typ)?;
-
-                // Declare symbol in symbol table
-                let symbol = self
-                    .symbols
-                    .declare(
-                        crate::symbol::Symbol::variable(name, typ, self.symbols.depth())
-                            .with_align(validated_align),
-                    )
-                    .expect("symbol declaration failed in test");
-
-                declarators.push(InitDeclarator {
-                    symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                    symbol,
-                    typ,
-                    storage_class: TypeModifiers::empty(),
-                    init,
-                    vla_sizes,
-                    explicit_align: validated_align,
-                    pos: decl_pos,
-                });
-
-                if self.is_special(b',') {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Clear pending alignment after declaration
-        self.pending_alignas = None;
-        // A mode that no declarator consumed belongs to no later declaration:
-        // leaving it set applied it to whatever came next.
-        self.pending_mode = None;
-        self.expect_special(b';')?;
-
-        Ok(Declaration { declarators })
-    }
-
     /// Parse a declaration and bind variables to symbol table
     ///
     /// Binds each declared variable to the symbol table immediately during
@@ -4313,91 +4241,6 @@ impl Parser<'_> {
         }
     }
 
-    /// Parse a function definition
-    ///
-    /// Binds the function to the symbol table at global scope, then enters
-    /// a new scope for the function body and binds all parameters in that
-    /// scope.
-    #[cfg(test)]
-    pub(crate) fn parse_function_def(&mut self) -> ParseResult<FunctionDef> {
-        let func_pos = self.current_pos();
-        // Parse return type
-        let return_type = self.parse_type_specifier()?;
-        let mut ret_type_id = self.types.intern(return_type);
-
-        // Handle pointer in return type with qualifiers
-        while self.is_special(b'*') {
-            self.advance();
-            let mut ptr_modifiers = TypeModifiers::empty();
-
-            ptr_modifiers |= self.parse_pointer_qualifiers();
-
-            let ptr_type = Type {
-                kind: TypeKind::Pointer,
-                modifiers: ptr_modifiers,
-                base: Some(ret_type_id),
-                ..Default::default()
-            };
-            ret_type_id = self.types.intern(ptr_type);
-        }
-
-        // Parse function name
-        let name = self.expect_declarator_name()?;
-
-        // Parse parameter list
-        self.expect_special(b'(')?;
-        let param_list = self.parse_parameter_list()?;
-        let raw_params = param_list.params;
-        self.expect_special(b')')?;
-
-        // Build the function type
-        let param_types: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
-        let func_type = FuncSignature {
-            param_types,
-            variadic: param_list.variadic,
-            prototyped: param_list.prototyped,
-        }
-        .into_type(ret_type_id);
-        let func_type_id = self.types.intern(func_type);
-
-        // Bind function to symbol table at current (global) scope
-        self.check_redeclaration(name, func_type_id, self.current_pos());
-        let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
-        let _ = self.symbols.declare(func_sym); // Ignore redefinition errors for now
-
-        // Enter function scope for parameters and body
-        self.symbols.enter_scope();
-
-        // Bind parameters in function scope and create Parameter structs
-        let mut params = Vec::with_capacity(raw_params.len());
-        for raw in &raw_params {
-            let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
-            params.push(Parameter {
-                symbol: symbol_id,
-                typ: raw.typ,
-                vm_dims: raw.vm_dims.clone(),
-            });
-        }
-
-        // Parse function body (block handles its own scope for locals)
-        let body = self.parse_block_stmt_no_scope()?;
-
-        // Leave function scope
-        self.symbols.leave_scope();
-
-        Ok(FunctionDef {
-            attrs: Default::default(),
-            return_type: ret_type_id,
-            name,
-            params,
-            body,
-            pos: func_pos,
-            is_static: false, // Test function, storage class not parsed
-            is_inline: false,
-            calling_conv: crate::abi::CallingConv::default(),
-        })
-    }
-
     /// Parse a parameter list, returning raw parameter info (name and type)
     /// Parameters are declared in a temporary scope during parsing so that
     /// VLA sizes like `arr[n]` can reference earlier parameters like `n`.
@@ -4744,7 +4587,7 @@ impl Parser<'_> {
     }
 
     /// Parse an external declaration (function definition or declaration)
-    fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+    pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
         // Clear pending alignment from previous declaration
         self.pending_alignas = None;
         // A mode that no declarator consumed belongs to no later declaration:

@@ -190,12 +190,26 @@ fn diagnostics_matching_returns_are_accepted() {
 // #L5 — typedef of a variably modified type
 // ============================================================================
 
+/// C17 6.7.7p3 admits a typedef of a variably modified type at block scope,
+/// and c17 used to reject one outright. The rejection was a limitation, not a
+/// rule -- see `cc/tests/c99/types.rs` for the semantics it now implements.
+///
+/// What 6.7.7p3 does forbid is such a typedef at *file* scope, where there is
+/// no order of execution to evaluate the extent in.
 #[test]
-fn diagnostics_typedef_of_vla_is_rejected() {
-    compile_expect_error(
-        "typedef_vla",
+fn diagnostics_vm_typedef_is_block_scope_only() {
+    compile_expect_ok(
+        "typedef_vla_block_scope",
         "int main(void){int n=4; typedef int arr_t[n]; arr_t x; x[0]=1; return x[0]-1;}\n",
-        "variable-length array",
+    );
+    // The file-scope spelling is refused by the declarator, before the
+    // typedef branch is reached -- the same message gcc's "variably modified
+    // 'T' at file scope" carries, and the same one a plain `int a[n];` at file
+    // scope gets (#C88).
+    compile_expect_error(
+        "typedef_vla_file_scope",
+        "int n = 4;\ntypedef int arr_t[n];\nint main(void){ return 0; }\n",
+        "cannot have file scope",
     );
 }
 
@@ -427,7 +441,7 @@ fn diagnostics_variably_modified_aggregates_cannot_be_formed() {
     compile_expect_error(
         "vm_member_via_typedef",
         "void f(int n){ typedef int A[n]; struct S { A x; } s; (void)s; }\n",
-        "typedef of a variable-length array type",
+        "a member of a structure or union cannot have a variably modified type",
     );
     // So the _Atomic spelling fails on the type, never reaching the qualifier.
     compile_expect_error(

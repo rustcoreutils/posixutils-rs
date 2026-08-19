@@ -1233,6 +1233,9 @@ impl<'a> Parser<'a> {
         // Track typedef type separately - we continue parsing after a typedef
         // to collect trailing qualifiers like "z_word_t const"
         let mut typedef_base: Option<TypeId> = None;
+        // The extents of a variably modified typedef, when the name resolves
+        // to one. Kept beside the type because they cannot live in it.
+        let mut typedef_dims: Option<Vec<Expr>> = None;
 
         loop {
             if self.peek() != TokenType::Ident {
@@ -1523,8 +1526,16 @@ impl<'a> Parser<'a> {
                     // Check if it's a typedef name
                     // Only consume if we haven't already seen a base type or typedef
                     if base_kind.is_none() && typedef_base.is_none() {
-                        if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
+                        if let Some((sym, typedef_type_id)) =
+                            self.symbols.lookup_typedef_symbol(name_id)
+                        {
                             self.advance();
+                            // A variably modified typedef's extents cannot be
+                            // recovered from its `TypeId`, so `sizeof(T)` is
+                            // handed the ones its declaration evaluated -- the
+                            // same channel a type-name's own `[n]` levels use
+                            // (C17 6.7.7p3).
+                            typedef_dims = self.vm_typedef_extents(sym);
                             // Save the typedef type and continue looping to collect trailing
                             // qualifiers (e.g., "z_word_t const" where const comes after typedef)
                             typedef_base = Some(typedef_type_id);
@@ -1566,7 +1577,7 @@ impl<'a> Parser<'a> {
             self.types.intern(typ)
         };
 
-        Some((result_id, Vec::new()))
+        Some((result_id, typedef_dims.unwrap_or_default()))
     }
 
     /// Parse postfix expression: x++, x--, x[i], x.member, x->member, x(args)

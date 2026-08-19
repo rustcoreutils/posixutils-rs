@@ -24,7 +24,7 @@ use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
 };
 use gettextrs::gettext;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
@@ -649,6 +649,23 @@ pub struct Parser<'a> {
     /// The alignment cap currently in force, and the `push`ed stack of caps.
     pack_current: Option<u32>,
     pack_stack: Vec<Option<u32>>,
+    /// Typedef names that specify a variably modified type, and how many
+    /// run-time extents each carries (C17 6.7.7).
+    ///
+    /// A use of such a name has to name the typedef's *already evaluated*
+    /// extents rather than repeat its size expressions, since 6.7.7p3
+    /// evaluates them at the typedef and not at each use.
+    ///
+    /// A `HashMap` rather than a `BTreeMap`: this is pure lookup, never
+    /// iterated, so no iteration order can reach the output. See the container
+    /// selection rule in `cc/CLAUDE.md`.
+    vm_typedefs: HashMap<SymbolId, u32>,
+    /// The extents of the variably modified typedef named by the declaration
+    /// specifiers just parsed, awaiting the declarators they apply to.
+    ///
+    /// Held like `pending_alignas`: the specifier list is parsed before the
+    /// declarator list, and every declarator in the declaration shares it.
+    pending_vm_typedef_dims: Option<Vec<Expr>>,
 }
 
 impl<'a> Parser<'a> {
@@ -686,6 +703,8 @@ impl<'a> Parser<'a> {
             saw_explicit_type: true,
             pack_directives,
             pack_cursor: 0,
+            vm_typedefs: HashMap::new(),
+            pending_vm_typedef_dims: None,
             pack_current: None,
             pack_stack: Vec::new(),
         }
@@ -2486,8 +2505,16 @@ impl Parser<'_> {
         if !self.is_special(b';') {
             loop {
                 let decl_pos = self.current_pos();
-                let (name, mut typ, vla_sizes, _func_params) =
+                let (name, mut typ, mut vla_sizes, _func_params) =
                     self.parse_declarator(base_type_id, DeclaratorName::Required)?;
+                // A variably modified typedef supplies the extents of the
+                // levels it contributed. The declarator's own `[n]` levels, if
+                // it wrote any, are innermost-of-the-outer and come first --
+                // the same ordering `try_parse_type_name_vm` applies to a
+                // type-name's declarator and specifier levels.
+                if let Some(dims) = &self.pending_vm_typedef_dims {
+                    vla_sizes.extend(dims.iter().cloned());
+                }
                 // Skip GCC extensions like __asm("...") or __attribute__((...))
                 self.skip_extensions_after_declarator();
 
@@ -2571,20 +2598,12 @@ impl Parser<'_> {
                 // Bind typedef to symbol table (after parsing initializer, which
                 // is forbidden for typedefs anyway)
                 if has_name && is_typedef {
-                    // A typedef of a variably modified type keeps a side-channel
-                    // `vla_sizes` that only the ordinary declarator paths carry
-                    // forward, so the typedef became indistinguishable from an
-                    // incomplete array `int a[]`. Worse, the local-declaration
-                    // linearizer checks `STATIC` and `vla_sizes.is_empty()` but
-                    // never `TYPEDEF`, so a block-scope `typedef int A[n];` was
-                    // lowered as a runtime VLA allocation. File scope already
-                    // rejects this; reject it here too rather than miscompile.
-                    if !vla_sizes.is_empty() {
-                        return Err(ParseError::new(
-                            "typedef of a variable-length array type is not supported",
-                            decl_pos,
-                        ));
-                    }
+                    // C17 6.7.7p3 admits a typedef of a variably modified type
+                    // only at block scope, and this path is only ever reached
+                    // from one -- `parse_block_items` and a `for`-init are its
+                    // sole callers. The file-scope spelling is refused by the
+                    // declarator itself, with "variable length arrays cannot
+                    // have file scope", before it could arrive here.
                     // A mode replaces the type; alignment then attaches to
                     // whatever the type ended up being.
                     typ = self.apply_pending_type_attrs(typ);
@@ -2599,6 +2618,13 @@ impl Parser<'_> {
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     if let Ok(id) = self.symbols.declare(sym) {
                         symbol_id = Some(id);
+                        // Remember how many extents this name carries, so a
+                        // use can name each of them. They cannot be recovered
+                        // from the type: `int[n]`, `int[m]` and `int[]` all
+                        // intern to one `TypeId`.
+                        if !vla_sizes.is_empty() {
+                            self.vm_typedefs.insert(id, vla_sizes.len() as u32);
+                        }
                     }
                 }
 
@@ -2635,6 +2661,9 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        // Belongs to the declaration whose specifiers named the typedef, and
+        // to no later one.
+        self.pending_vm_typedef_dims = None;
         // A mode that no declarator consumed belongs to no later declaration:
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;
@@ -3043,8 +3072,15 @@ impl Parser<'_> {
                     // Check if it's a typedef name
                     // Only consume the typedef if we haven't already seen a base type or typedef
                     if base_kind.is_none() && typedef_base.is_none() {
-                        if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
+                        if let Some((sym, typedef_type_id)) =
+                            self.symbols.lookup_typedef_symbol(name_id)
+                        {
                             self.advance();
+                            // A variably modified typedef carries extents the
+                            // `TypeId` cannot: hand the declarator list the
+                            // names of the ones this typedef already evaluated
+                            // (C17 6.7.7p3), not its size expressions.
+                            self.pending_vm_typedef_dims = self.vm_typedef_extents(sym);
                             // Save the typedef type and continue looping to collect trailing
                             // qualifiers (e.g., "z_word_t const" where const comes after typedef)
                             typedef_base = Some(typedef_type_id);
@@ -3076,6 +3112,23 @@ impl Parser<'_> {
 
         let kind = base_kind.unwrap_or(TypeKind::Int);
         Ok((Type::with_modifiers(kind, modifiers), explicit))
+    }
+
+    /// The extents of the variably modified typedef `sym`, as expressions that
+    /// name what its declaration already evaluated.
+    ///
+    /// None for an ordinary typedef, which is nearly all of them.
+    pub(crate) fn vm_typedef_extents(&self, sym: SymbolId) -> Option<Vec<Expr>> {
+        let levels = *self.vm_typedefs.get(&sym)?;
+        Some(
+            (0..levels)
+                .map(|level| Expr {
+                    kind: ExprKind::VmTypedefExtent(sym, level),
+                    typ: Some(self.types.ulong_id),
+                    pos: self.current_pos(),
+                })
+                .collect(),
+        )
     }
 
     /// Parse a type specifier and record whether one was present.
@@ -3730,6 +3783,20 @@ impl Parser<'_> {
                     if !vla_sizes.is_empty() {
                         return Err(ParseError::new(
                             "variable length arrays cannot be structure or union members"
+                                .to_string(),
+                            self.current_pos(),
+                        ));
+                    }
+
+                    // 6.7.2.1p9 says the same of a member that reached its
+                    // variably modified type through a typedef, which is the
+                    // only other way in -- the declarator wrote no `[n]`, so
+                    // the check above sees nothing. Without this the member
+                    // looked like a flexible array (its extent is absent) and
+                    // drew a diagnostic about that instead. gcc's wording.
+                    if self.pending_vm_typedef_dims.is_some() {
+                        return Err(ParseError::new(
+                            "a member of a structure or union cannot have a variably modified type"
                                 .to_string(),
                             self.current_pos(),
                         ));
@@ -5605,6 +5672,9 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        // Belongs to the declaration whose specifiers named the typedef, and
+        // to no later one.
+        self.pending_vm_typedef_dims = None;
         // A mode that no declarator consumed belongs to no later declaration:
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;

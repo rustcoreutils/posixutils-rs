@@ -200,6 +200,16 @@ pub struct Linearizer<'a> {
     /// Local variables (use Load/Store, converted to SSA later)
     /// Keyed by SymbolId for proper scope handling
     pub(crate) locals: HashMap<SymbolId, LocalVarInfo>,
+    /// The evaluated extents of each variably modified `typedef` in scope,
+    /// keyed by the typedef's symbol.
+    ///
+    /// C17 6.7.7p3 evaluates them "each time the declaration of the typedef
+    /// name is reached", once per execution of the typedef and not once per
+    /// use, so they are recorded when the typedef is linearized and read back
+    /// by every `ExprKind::VmTypedefExtent` that names it. Re-entering the
+    /// declaration -- a typedef inside a loop -- overwrites the entry, which
+    /// is exactly what "each time it is reached" asks for.
+    pub(crate) vm_typedef_dims: HashMap<SymbolId, Vec<VmDim>>,
     /// Label -> basic block mapping
     pub(crate) label_map: HashMap<String, BasicBlockId>,
     /// Break target stack (for loops)
@@ -262,6 +272,7 @@ impl<'a> Linearizer<'a> {
             next_bb: 0,
             var_map: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
             locals: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
+            vm_typedef_dims: HashMap::new(),
             label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             break_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
             continue_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
@@ -1480,6 +1491,9 @@ impl<'a> Linearizer<'a> {
         match &expr.kind {
             // Writes through its third argument.
             ExprKind::CheckedArith { .. } => false,
+            // Reads a hidden local the typedef already stored: no side
+            // effect, and re-reading it is what makes the extent stable.
+            ExprKind::VmTypedefExtent(..) => true,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -4812,6 +4826,33 @@ impl<'a> Linearizer<'a> {
         }
 
         match &expr.kind {
+            // One extent of a variably modified `typedef`, evaluated when the
+            // typedef's declaration was reached and stored in a hidden local
+            // since (C17 6.7.7p3). Reading it back here is what keeps
+            // `typedef int T[n]; n = 100; T a;` giving `a` the extent `n` had
+            // at the typedef.
+            ExprKind::VmTypedefExtent(symbol_id, level) => {
+                let ulong = self.types.ulong_id;
+                let dim = self
+                    .vm_typedef_dims
+                    .get(symbol_id)
+                    .and_then(|dims| dims.get(*level as usize))
+                    .copied();
+                match dim {
+                    Some(VmDim::Const(n)) => self.emit_const(n as i128, ulong),
+                    Some(VmDim::Sym(sym)) => {
+                        let loaded = self.alloc_pseudo();
+                        self.emit(Instruction::load(loaded, sym, 0, ulong, 64));
+                        loaded
+                    }
+                    // The typedef's own declaration is always linearized
+                    // before any use of it can be: a use is in its scope, and
+                    // scope begins at the declarator. Nothing measurable is
+                    // left to do if that ever fails to hold.
+                    None => self.emit_const(0, ulong),
+                }
+            }
+
             // `__builtin_add_overflow(a, b, res)` and its siblings.
             //
             // Computed in 128 bits, which holds every exact sum, difference

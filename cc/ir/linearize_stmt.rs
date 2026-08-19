@@ -219,6 +219,26 @@ impl<'a> super::linearize::Linearizer<'a> {
         for declarator in &decl.declarators {
             let typ = declarator.typ;
 
+            // A typedef declares a name, not an object, so nothing is
+            // allocated for it. It used to fall through and take a local slot
+            // for the type name -- harmless while nothing read it, and not
+            // harmless once a typedef can be variably modified, since the VLA
+            // arm below tests only `vla_sizes` and would have allocated the
+            // array itself.
+            if declarator.storage_class.contains(TypeModifiers::TYPEDEF) {
+                // C17 6.7.7p3: a variably modified typedef's size expressions
+                // are evaluated "each time the declaration of the typedef name
+                // is reached in the order of execution" -- here, once, however
+                // many objects the name goes on to declare. Each is spilled to
+                // a hidden local that `ExprKind::VmTypedefExtent` reads back.
+                if !declarator.vla_sizes.is_empty() && self.types.kind(typ) == TypeKind::Array {
+                    let name = self.symbol_name(declarator.symbol);
+                    let (dims, _elem) = self.record_vm_extents(typ, &declarator.vla_sizes, &name);
+                    self.vm_typedef_dims.insert(declarator.symbol, dims);
+                }
+                continue;
+            }
+
             // Check if this is a static local variable
             if declarator.storage_class.contains(TypeModifiers::STATIC) {
                 // Static local: create a global with unique name

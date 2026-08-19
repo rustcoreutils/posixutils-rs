@@ -911,16 +911,28 @@ fn listed_names(bin: &str, args: &[&str], locale: &str) -> Vec<String> {
 
 /// `cflow` accepts a `.y` operand: it runs yacc and analyzes the generated C.
 /// Object-file and `.l` operands were covered; `.y` never was.
+///
+/// Run against the `yacc` this workspace builds, reached by putting the build
+/// directory first on `PATH` -- exactly what `cflow_processes_lex_input` does
+/// for `lex`, and for a sharper reason. This used to inherit the ambient
+/// `PATH` and take whatever `yacc` the host offered. On macOS that is an
+/// Xcode shim which serves `lex`, `flex` and `bison` but refuses `yacc`
+/// outright, so the test failed on a stock install against a generator that
+/// was never the one under test.
+///
+/// The guard it replaced could not have caught that: `output().is_err()` is
+/// true only when the binary cannot be *spawned*, and the shim spawns
+/// perfectly well before failing.
 #[test]
 fn cflow_processes_yacc_input() {
-    if Command::new("yacc").arg("--version").output().is_err()
-        && Command::new("bison").arg("--version").output().is_err()
-    {
-        eprintln!("skipping cflow_processes_yacc_input: no yacc/bison on this host");
+    let bindir = std::path::Path::new(exe_for("cflow")).parent().unwrap();
+    if !bindir.join("yacc").exists() {
+        eprintln!("skipping cflow_processes_yacc_input: yacc was not built alongside cflow");
         return;
     }
+    let env_path = format!("{}:{}", bindir.display(), std::env::var("PATH").unwrap());
     let dir = TempDir::new().unwrap();
-    let path = src(
+    let grammar = src(
         &dir,
         "g.y",
         "%{\n#include <stdio.h>\nint yylex(void);\nvoid yyerror(const char *);\n%}\n\
@@ -928,7 +940,7 @@ fn cflow_processes_yacc_input() {
          int yylex(void) { return 0; }\nvoid yyerror(const char *s) { (void)s; }\n",
     );
 
-    let (stdout, stderr, code) = run("cflow", &[&path]);
+    let (stdout, stderr, code) = run_env("cflow", &[&grammar], &[("PATH", &env_path)]);
     assert_eq!(code, 0, "cflow on a .y operand failed: {}", stderr);
     assert!(
         stdout.contains("yyparse") || stdout.contains("yylex"),

@@ -1629,3 +1629,56 @@ fn cross_abi_zero_width_bitfield_does_not_change_argument_class() {
         );
     }
 }
+
+/// `__attribute__((transparent_union))` passes the union exactly as its
+/// **first member** would be passed, not as the class its members merge to.
+///
+/// The merge is what makes this observable: SysV's `RegClass::merge` rule (d)
+/// says one INTEGER makes the whole eightbyte INTEGER, so
+/// `union { float f; int i; }` classifies as INTEGER, and AAPCS64 reaches the
+/// same answer through its own overlap rule. gcc, under the attribute, hands
+/// it over in an SSE/V register because `float` is the first member. Reversing
+/// the two members must reverse the answer -- that is the whole rule, and a
+/// test on one order alone would pass against a compiler that simply ignored
+/// the attribute.
+#[test]
+fn codegen_transparent_union_is_passed_as_its_first_member() {
+    let src = r#"
+        union FirstFloat { float f; int i; } __attribute__((transparent_union));
+        union FirstInt   { int i; float f; } __attribute__((transparent_union));
+        union Plain      { float f; int i; };
+        extern void sink_ff(union FirstFloat);
+        extern void sink_fi(union FirstInt);
+        extern void sink_pl(union Plain);
+        void fwd_ff(union FirstFloat u) { sink_ff(u); }
+        void fwd_fi(union FirstInt u)   { sink_fi(u); }
+        void fwd_pl(union Plain u)      { sink_pl(u); }
+    "#;
+
+    for (triple, fp, gp) in [(X86_64_LINUX, "xmm0", "%edi"), (AARCH64_LINUX, "s0", "w0")] {
+        let asm = asm_for("transparent_union_first_member", triple, src);
+
+        let ff = body_of(&asm, "fwd_ff");
+        assert!(
+            ff.contains(fp),
+            "{triple}: a transparent union whose first member is `float` must \
+             travel in {fp}:\n{ff}"
+        );
+
+        // The reverse order, and the same union without the attribute, both
+        // go in a general-purpose register. If either mentioned the FP one,
+        // the substitution is firing on the wrong types.
+        for name in ["fwd_fi", "fwd_pl"] {
+            let body = body_of(&asm, name);
+            assert!(
+                body.contains(gp),
+                "{triple}: {name} must travel in {gp}:\n{body}"
+            );
+            assert!(
+                !body.contains(fp),
+                "{triple}: {name} must not reach {fp} -- only a transparent \
+                 union whose *first* member is floating point does:\n{body}"
+            );
+        }
+    }
+}

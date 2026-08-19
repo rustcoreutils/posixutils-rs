@@ -115,6 +115,11 @@ pub struct CompositeType {
     pub align: usize,
     /// False for forward declarations
     pub is_complete: bool,
+    /// `__attribute__((transparent_union))`: an argument matching **any**
+    /// member's type may be passed to a parameter of this union, and the
+    /// union is passed as its first member would be. Unions only; gcc's
+    /// attribute governs calls, so assignment and `return` stay strict.
+    pub transparent: bool,
 }
 
 impl CompositeType {
@@ -127,6 +132,7 @@ impl CompositeType {
             size: 0,
             align: 1,
             is_complete: false,
+            transparent: false,
         }
     }
 
@@ -1097,6 +1103,42 @@ impl TypeTable {
     /// Get composite type data (for struct/union/enum)
     pub fn composite(&self, id: TypeId) -> Option<&CompositeType> {
         self.get(id).composite.as_deref()
+    }
+
+    /// Mark a union `__attribute__((transparent_union))`.
+    ///
+    /// In place, like `complete_struct`: glibc spells the attribute on a
+    /// typedef of an *anonymous* union, so re-interning a clone would hand
+    /// back a fresh `TypeId` that every existing reference would then have to
+    /// match structurally. Composites are never deduplicated, so the identity
+    /// this preserves is the one the rest of the compiler already relies on.
+    pub fn set_transparent_union(&mut self, id: TypeId) {
+        if let Some(c) = self.types[id.0 as usize].composite.as_deref_mut() {
+            c.transparent = true;
+        }
+    }
+
+    /// The type an argument to a `transparent_union` parameter is really
+    /// passed as: its **first declared member**.
+    ///
+    /// `None` for anything that is not a transparent union, which is what
+    /// makes this usable as the guard at every call site.
+    ///
+    /// Unnamed zero-width bit-fields are skipped. They are not declared
+    /// members in the sense gcc's rule means, and `CompositeType::members` is
+    /// unfiltered, so one would otherwise decide the whole ABI of the union.
+    pub fn transparent_union_first_member(&self, id: TypeId) -> Option<TypeId> {
+        if self.kind(id) != TypeKind::Union {
+            return None;
+        }
+        let comp = self.composite(id)?;
+        if !comp.transparent {
+            return None;
+        }
+        comp.members
+            .iter()
+            .find(|m| m.bit_width != Some(0))
+            .map(|m| m.typ)
     }
 
     /// Format a type for display (with recursive base type printing).
@@ -2107,6 +2149,61 @@ mod tests {
         assert!(types.is_arithmetic(types.int_id));
         assert!(types.is_scalar(types.int_id));
         assert!(!types.is_float(types.int_id));
+    }
+
+    /// `transparent_union_first_member` is the guard every #C51 call site
+    /// uses, so it has to answer `None` for everything that is not a
+    /// transparent union -- an ordinary union most of all, since that is the
+    /// case the old blanket accommodation got wrong.
+    #[test]
+    fn test_transparent_union_first_member() {
+        let mut types = TypeTable::new(&Target::host());
+        let int_ptr = types.intern(Type::pointer(types.int_id));
+        let char_ptr = types.intern(Type::pointer(types.char_id));
+        let member = |typ, bit_width| StructMember {
+            name: StringId::EMPTY,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width,
+            access_bytes: None,
+            explicit_align: None,
+        };
+        let composite = |members| CompositeType {
+            tag: None,
+            members,
+            enum_constants: Vec::new(),
+            size: 8,
+            align: 8,
+            is_complete: true,
+            transparent: false,
+        };
+
+        // An ordinary union answers None even though it has members.
+        let plain = types.intern(Type::union_type(composite(vec![
+            member(int_ptr, None),
+            member(char_ptr, None),
+        ])));
+        assert_eq!(types.transparent_union_first_member(plain), None);
+
+        // Marked, it answers its first member.
+        types.set_transparent_union(plain);
+        assert_eq!(types.transparent_union_first_member(plain), Some(int_ptr));
+
+        // A struct is never transparent, whatever the flag says.
+        let st = types.intern(Type::struct_type(composite(vec![member(int_ptr, None)])));
+        types.set_transparent_union(st);
+        assert_eq!(types.transparent_union_first_member(st), None);
+
+        // A zero-width bit-field is not a declared member for this purpose.
+        // `members` is unfiltered, so one sitting first would otherwise decide
+        // the whole ABI of the union.
+        let zw = types.intern(Type::union_type(composite(vec![
+            member(types.int_id, Some(0)),
+            member(char_ptr, None),
+        ])));
+        types.set_transparent_union(zw);
+        assert_eq!(types.transparent_union_first_member(zw), Some(char_ptr));
     }
 
     #[test]

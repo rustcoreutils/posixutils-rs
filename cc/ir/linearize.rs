@@ -3073,6 +3073,20 @@ impl<'a> Linearizer<'a> {
         // Compute ABI classification for parameters and return value.
         // This provides rich metadata for the backend to generate correct calling code.
         // Use the current function's calling convention (which may be overridden via attributes)
+        // A `transparent_union` argument travels as its first member, so that
+        // is the type the backends have to be told. They do not consult the
+        // ABI classification alone: aarch64's `is_fp` asks `types.is_float`,
+        // and a union is not a float however it is classified, so the value
+        // went out in a general-purpose register while the callee read it
+        // from a V register. Substituted here, once, after the argument
+        // values have been materialized and after the front end has checked
+        // the call against the union's members.
+        for t in arg_types_vec.iter_mut() {
+            if let Some(first) = self.types.transparent_union_first_member(*t) {
+                *t = first;
+            }
+        }
+
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
         let param_classes: Vec<_> = arg_types_vec
             .iter()

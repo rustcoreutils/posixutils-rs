@@ -2876,6 +2876,7 @@ fn test_incomplete_struct_type_resolution() {
         size: 8,  // 2 ints = 8 bytes
         align: 4, // int alignment
         is_complete: true,
+        transparent: false,
     };
     let complete_struct_type = ctx.types.intern(Type::struct_type(complete_composite));
 
@@ -3687,6 +3688,7 @@ fn test_struct_deref_returns_address() {
         size: 4,
         align: 4,
         is_complete: true,
+        transparent: false,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let struct_ptr_type_id = ctx.types.intern(Type::pointer(struct_type_id));
@@ -4352,6 +4354,7 @@ fn test_mixed_designated_positional_struct_init() {
         size: 16,
         align: 4,
         is_complete: true,
+        transparent: false,
     };
     let struct_type = ctx.types.intern(Type::struct_type(struct_composite));
     let s_sym = ctx.var("s", struct_type);
@@ -4574,6 +4577,7 @@ fn test_designator_chain_nested_struct_init() {
         size: 8,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
 
     let pt_id = ctx.str("pt");
@@ -4605,6 +4609,7 @@ fn test_designator_chain_nested_struct_init() {
         size: 12,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let outer_sym = ctx.var("s", outer_type);
 
@@ -4692,6 +4697,7 @@ fn test_designator_chain_array_member_init() {
         size: 12,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -4853,6 +4859,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         size: 12,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -4945,6 +4952,7 @@ fn test_union_first_named_member_positional_init() {
         size: 4,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let u_sym = ctx.var("u", union_type);
 
@@ -5255,6 +5263,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             size: 1,
             align: 1,
             is_complete: true,
+            transparent: false,
         })),
         ..Default::default()
     });
@@ -5401,6 +5410,7 @@ fn test_bitfield_designated_init_local_var() {
         size: 2,
         align: 1,
         is_complete: true,
+        transparent: false,
     }));
 
     let s_sym = ctx.var("s", struct_type);
@@ -5538,6 +5548,7 @@ fn test_large_struct_copy_from_array() {
             size: 16,
             align: 8,
             is_complete: true,
+            transparent: false,
         })),
         ..Default::default()
     });
@@ -5676,6 +5687,7 @@ fn test_compound_literal_zero_init_lvalue() {
             size: 24,
             align: 8,
             is_complete: true,
+            transparent: false,
         })),
         ..Default::default()
     });
@@ -5812,6 +5824,7 @@ fn test_conditional_short_circuit_arrow() {
         size: 4,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let struct_ptr_type = ctx.types.intern(Type::pointer(struct_type));
 
@@ -6158,6 +6171,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         size: 16,
         align: 8,
         is_complete: true,
+        transparent: false,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let s_sym = ctx.var("s", struct_type_id);

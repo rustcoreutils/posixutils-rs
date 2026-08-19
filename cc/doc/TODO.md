@@ -85,9 +85,9 @@ _Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
 `gcc -std=c17` on every row; see #C45-#C49 in `cc/audit.md`. Two divergences are
 deliberate and remain: `return` with a value in a `void` function, and a bare
 `return` in a non-`void` one, are errors here and warnings in gcc, both being
-genuine 6.8.6.4 violations. And `__attribute__((transparent_union))` is
-unimplemented, so an argument matching any member of a union parameter is
-accepted rather than checked (#C51)._
+genuine 6.8.6.4 violations. `__attribute__((transparent_union))` used to sit
+here too -- an argument matching any member of *any* union parameter was
+accepted rather than checked -- and is closed, see #C51 in `cc/audit.md`._
 
 _The packed-bit-field layout used to be a row in the table below:
 `struct __attribute__((packed)) { unsigned a:20, b:20; }` was 8 bytes here and

@@ -232,6 +232,16 @@ impl Abi for Aapcs64Abi {
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
 
+        // `__attribute__((transparent_union))` passes the union exactly as its
+        // first member would be passed. Substituted here rather than on the
+        // declared type, so the front end still sees a union and can check an
+        // argument against every member. Without this, `RegClass::merge` folds
+        // the members together and rule (d) makes `union { float f; int i; }`
+        // INTEGER where gcc hands it over in SSE.
+        if let Some(first) = types.transparent_union_first_member(ty) {
+            return self.classify_param(first, types);
+        }
+
         // Void type - ignore
         if kind == TypeKind::Void {
             return ArgClass::Ignore;
@@ -452,6 +462,7 @@ mod tests {
             size: 8,
             align: 8,
             is_complete: true,
+            transparent: false,
         }));
         assert!(
             matches!(
@@ -473,6 +484,7 @@ mod tests {
             size: 16,
             align: 8,
             is_complete: true,
+            transparent: false,
         }));
         assert!(
             matches!(

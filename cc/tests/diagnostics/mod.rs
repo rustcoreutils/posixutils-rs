@@ -1332,17 +1332,15 @@ fn diagnostics_function_pointer_warning_can_be_silenced() {
 
 /// glibc declares the socket calls with a union parameter carrying
 /// `__attribute__((transparent_union))`, so a caller may hand them any one of
-/// its member types. c17 does not record that attribute, and the first cut of
-/// the argument check rejected `sendto(..., SAS2SA(&addr), ...)` -- two lines
-/// of CPython's socketmodule.c, and with them every socket program on the
+/// its member types -- `sendto(..., SAS2SA(&addr), ...)` is two lines of
+/// CPython's socketmodule.c, and with them every socket program on the
 /// platform.
 ///
-/// An argument matching some member of a union parameter is therefore
-/// accepted. This pins both the real header call and the synthetic shape
-/// behind it, so that implementing the attribute properly has something to
-/// tighten against.
+/// The attribute is now recorded, so this is a rule about *transparent*
+/// unions rather than about unions. The real header call and a synthetic twin
+/// carrying the attribute are accepted; the ordinary union below is not.
 #[test]
-fn diagnostics_union_parameter_accepts_a_member_type() {
+fn diagnostics_transparent_union_parameter_accepts_a_member_type() {
     compile_expect_ok(
         "transparent_union_socket_call",
         r#"
@@ -1355,12 +1353,55 @@ int f(int fd) {
 }
 "#,
     );
+    // The attribute on the union specifier...
     compile_expect_ok(
-        "union_parameter_member_type",
+        "transparent_union_on_specifier",
+        "union U { int *ip; char *cp; } __attribute__((transparent_union));
+int g(union U);
+void f(void){ int *p = 0; (void)g(p); }
+",
+    );
+    // ...and glibc's own spelling, trailing on a typedef of an anonymous
+    // union, in the underscored form its headers use.
+    compile_expect_ok(
+        "transparent_union_on_typedef",
+        "typedef union { int *ip; char *cp; } UA __attribute__((__transparent_union__));
+int g(UA);
+void f(void){ int *p = 0; (void)g(p); }
+",
+    );
+}
+
+/// The accommodation that stood in for the attribute waved through *every*
+/// union parameter, which under-diagnosed the ordinary case: 6.5.2.2p2 gives
+/// an argument the constraints of simple assignment, and a member's type is
+/// not the union's.
+///
+/// This is the half of the old `diagnostics_union_parameter_accepts_a_member_type`
+/// whose premise inverted when the attribute became real.
+#[test]
+fn diagnostics_ordinary_union_parameter_rejects_a_member_type() {
+    compile_expect_error(
+        "ordinary_union_parameter_member_type",
         "union U { int *ip; char *cp; };
 int g(union U);
 void f(void){ int *p = 0; (void)g(p); }
 ",
+        "incompatible type for argument 1",
+    );
+}
+
+/// `transparent_union` is a union attribute. gcc ignores it elsewhere with a
+/// warning rather than rejecting, and so must c17 -- silently dropping it
+/// would leave the program believing a rule was in force that was not.
+#[test]
+fn diagnostics_transparent_union_on_a_non_union_warns() {
+    compile_expect_warning(
+        "transparent_union_on_struct",
+        "typedef struct { int a; } SA __attribute__((transparent_union));
+SA x;
+",
+        "'transparent_union' attribute ignored on a non-union type",
     );
 }
 

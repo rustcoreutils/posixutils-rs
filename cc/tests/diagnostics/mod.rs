@@ -20,6 +20,7 @@
 
 use crate::common::{
     compile_and_run, compile_expect_error, compile_expect_ok, compile_expect_warning,
+    create_c_file, run_c17,
 };
 
 // ============================================================================
@@ -1226,6 +1227,107 @@ void f(void) {
 }
 "#;
     compile_expect_ok("permitted_assignments", src);
+}
+
+// ============================================================================
+// #C56 — `void *` against a function pointer
+// ============================================================================
+
+/// 6.5.16.1p1 offers the `void *` carve-out for a pointer to an **object**
+/// type, so a function pointer on the other side is a constraint violation.
+/// It is a warning rather than a rejection: gcc accepts it in silence and
+/// only `-pedantic` objects, and POSIX requires the line it appears in to
+/// work -- `dlsym` returns `void *` and every caller assigns it to a function
+/// pointer.
+///
+/// All four contexts, because 6.5.16.1's constraints reach `return` and
+/// argument passing through "as if by assignment" and the three live in
+/// different files.
+#[test]
+fn diagnostics_function_pointer_and_void_pointer_warn() {
+    let cases = [
+        (
+            "fnptr_init",
+            "typedef int (*FP)(void);\nFP f(void *v) { FP p = v; return p; }\n",
+            "ISO C forbids initialization between function pointer and 'void *'",
+        ),
+        (
+            "fnptr_assign",
+            "int fn(void);\nvoid f(void **out) { *out = fn; }\n",
+            "ISO C forbids assignment between function pointer and 'void *'",
+        ),
+        (
+            "fnptr_return",
+            "int fn(void);\nvoid *f(void) { return fn; }\n",
+            "ISO C forbids return between function pointer and 'void *'",
+        ),
+        (
+            "fnptr_argument",
+            "int fn(void);\nvoid take(void *);\nvoid f(void) { take(fn); }\n",
+            "ISO C forbids passing argument 1 between function pointer and 'void *'",
+        ),
+    ];
+    for (name, src, expected) in cases {
+        compile_expect_warning(name, src, expected);
+    }
+}
+
+/// The warning must not reach an ordinary object pointer, and must not reach
+/// a function designator converting to its own pointer type -- both are
+/// conversions the standard permits outright, and a check written from
+/// "pointer meets pointer" would catch them.
+///
+/// `compile_expect_ok` asserts only that the program builds, which a
+/// spuriously warning compiler still does; this asserts the silence.
+#[test]
+fn diagnostics_function_pointer_warning_does_not_over_fire() {
+    let src = r#"
+typedef int (*FP)(void);
+int fn(void);
+FP ret_fn(void) { return fn; }
+void f(void) {
+    void *v; int *p; char *cp; _Bool b;
+    p = v;  v = p;  cp = v;  v = cp;
+    b = v;  v = 0;
+    FP g = fn;  (void)g;  (void)b;
+}
+"#;
+    let c = create_c_file("fnptr_no_over_fire", src);
+    let path = c.path().to_string_lossy().to_string();
+    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+    assert!(run.success, "should compile: {}", run.stderr);
+    assert!(
+        !run.stderr.contains("ISO C forbids"),
+        "no permitted conversion may draw the #C56 warning, got:\n{}",
+        run.stderr
+    );
+}
+
+/// Diagnosing this at all is stricter than gcc's default, so it has to be
+/// silenceable by name -- otherwise every `dlsym` caller pays for it.
+#[test]
+fn diagnostics_function_pointer_warning_can_be_silenced() {
+    let src = "int fn(void);\nvoid *f(void) { return fn; }\n";
+    let c = create_c_file("fnptr_silence", src);
+    let path = c.path().to_string_lossy().to_string();
+
+    for silencer in ["-w", "-Wno-function-pointer-conv"] {
+        let run = run_c17(&["-S", "-o", "/dev/null", silencer, &path]);
+        assert!(run.success, "{silencer} should be accepted: {}", run.stderr);
+        assert!(
+            !run.stderr.contains("ISO C forbids"),
+            "{silencer} should silence the conversion warning, got:\n{}",
+            run.stderr
+        );
+    }
+
+    // An unrelated -Wno- must not silence it, or the flag name means nothing.
+    let run = run_c17(&["-S", "-o", "/dev/null", "-Wno-unused", &path]);
+    assert!(
+        run.stderr.contains("ISO C forbids"),
+        "-Wno-unused should leave it alone, got:\n{}",
+        run.stderr
+    );
 }
 
 /// glibc declares the socket calls with a union parameter carrying

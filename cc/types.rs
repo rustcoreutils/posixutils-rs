@@ -695,7 +695,20 @@ pub enum AssignFault {
     PointerMismatch,
     /// The target's referenced type drops a qualifier the source's had.
     QualifierDiscard,
+    /// A function pointer against `void *`. The 6.5.16.1p1 carve-out is for a
+    /// pointer to an *object* type, so this is a constraint violation -- but
+    /// one POSIX requires to work, since `dlsym` returns `void *` and every
+    /// caller assigns it to a function pointer.
+    FunctionPointerVoid,
 }
+
+/// The `-Wno-<name>` group the function-pointer/`void *` warnings belong to.
+///
+/// Named rather than fatal because gcc accepts the conversion in silence and
+/// only `-pedantic` objects; diagnosing it at all is stricter than the
+/// compiler c17 matches by policy, so it has to be silenceable by anyone who
+/// calls `dlsym` in a loop.
+pub const FUNCTION_POINTER_CONV: &str = "function-pointer-conv";
 
 impl AssignFault {
     /// Whether this fault is fatal. Only a missing conversion is.
@@ -711,6 +724,7 @@ impl AssignFault {
             AssignFault::PointerFromInteger => "makes pointer from integer without a cast",
             AssignFault::PointerMismatch => "incompatible pointer type",
             AssignFault::QualifierDiscard => "discards a qualifier from the pointer target type",
+            AssignFault::FunctionPointerVoid => "converts between a function pointer and 'void *'",
         }
     }
 }
@@ -1353,7 +1367,24 @@ impl TypeTable {
                 return None;
             };
             // `void *` converts to and from any object pointer (6.5.16.1p1).
-            if self.kind(t_pointee) == TypeKind::Void || self.kind(v_pointee) == TypeKind::Void {
+            //
+            // "Object" is the whole of it: the carve-out does not reach a
+            // function pointer, which is why `FP fp = dlsym(h, "x");` is a
+            // constraint violation. It stays a warning because POSIX requires
+            // that exact line to work (XSH `dlsym`) and gcc accepts it in
+            // silence, objecting only under `-pedantic`.
+            let (t_void, v_void) = (
+                self.kind(t_pointee) == TypeKind::Void,
+                self.kind(v_pointee) == TypeKind::Void,
+            );
+            let (t_fn, v_fn) = (
+                self.kind(t_pointee) == TypeKind::Function,
+                self.kind(v_pointee) == TypeKind::Function,
+            );
+            if (t_void && v_fn) || (v_void && t_fn) {
+                return Some(AssignFault::FunctionPointerVoid);
+            }
+            if t_void || v_void {
                 return None;
             }
             if !self.types_compatible(t_pointee, v_pointee) {

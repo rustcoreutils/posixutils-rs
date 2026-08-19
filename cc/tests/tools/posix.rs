@@ -1169,3 +1169,62 @@ fn ctags_append_keeps_the_whole_file_sorted() {
     let after = fs::read_to_string(&tags).unwrap().lines().count();
     assert_eq!(before, after, "re-appending the same file duplicated tags");
 }
+
+/// A diagnostic naming a failed system call must read the way every other
+/// utility on the system reads it: `No such file or directory`, not Rust's
+/// `No such file or directory (os error 2)`.
+///
+/// The text now comes from `strerror`, so it is the *locale's* — which is the
+/// `LC_MESSAGES` obligation that formatting Rust's `io::Error` can never meet,
+/// its table being English whatever the locale says. All four binaries in this
+/// crate leaked the parenthetical (audit #U7).
+#[test]
+fn tools_io_errors_carry_no_rust_os_error_suffix() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir
+        .path()
+        .join("no_such_source.c")
+        .to_string_lossy()
+        .into_owned();
+    let a_directory = dir.path().to_string_lossy().into_owned();
+
+    for bin in ["cflow", "ctags", "cxref"] {
+        for operand in [&missing, &a_directory] {
+            let (_, stderr, _) = run(bin, &[operand]);
+            assert!(
+                !stderr.contains("os error"),
+                "{} leaked Rust's os-error suffix on {}:\n{}",
+                bin,
+                operand,
+                stderr
+            );
+        }
+        // The missing-file case must still say *something*, or the assertion
+        // above would pass against a utility that had gone silent.
+        let (_, stderr, code) = run(bin, &[&missing]);
+        assert_ne!(code, 0, "{} must fail on a missing operand", bin);
+        assert!(
+            stderr.contains("No such file"),
+            "{} lost the strerror text entirely:\n{}",
+            bin,
+            stderr
+        );
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_c17"))
+        .arg(&missing)
+        .output()
+        .expect("failed to run c17");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "c17 must fail on a missing operand");
+    assert!(
+        !stderr.contains("os error"),
+        "c17 leaked Rust's os-error suffix:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("No such file"),
+        "c17 lost the strerror text entirely:\n{}",
+        stderr
+    );
+}

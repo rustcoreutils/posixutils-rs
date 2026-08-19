@@ -369,7 +369,10 @@ fn show_include_chain(stream_id: u16) -> Option<String> {
         if chain.is_empty() {
             None
         } else {
-            Some(format!(" (through {})", chain.join(", ")))
+            // The one piece of user-visible text in this function, so it
+            // gets the same treatment as the "note"/"in included file" labels
+            // just below rather than being the lone English fragment.
+            Some(format!(" ({} {})", gettext("through"), chain.join(", ")))
         }
     })
 }

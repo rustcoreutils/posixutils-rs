@@ -796,7 +796,7 @@ fn process_file(
             let mut file = File::create(&asm_file)?;
             file.write_all(asm.as_bytes())?;
             if args.verbose {
-                eprintln!("Wrote assembly to {}", asm_file);
+                eprintln!("{}: {}", gettext("wrote assembly to"), asm_file);
             }
         }
         return Ok(Compiled::Nothing);
@@ -832,7 +832,7 @@ fn process_file(
     }
 
     if args.verbose && !temporary {
-        eprintln!("Wrote object file to {}", obj_file);
+        eprintln!("{}: {}", gettext("wrote object file to"), obj_file);
     }
 
     Ok(Compiled::Object {
@@ -953,7 +953,7 @@ fn link_objects(
     }
 
     if args.verbose {
-        eprintln!("Linked to {}", exe_file);
+        eprintln!("{}: {}", gettext("linked to"), exe_file);
     }
     Ok(())
 }
@@ -1613,7 +1613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Some(obj)) => operand_objects[idx] = Some(obj),
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("c17: {}: {}", op.path, e);
+                        eprintln!("c17: {}: {}", op.path, plib::diag::io_error_text(&e));
                         failed = true;
                     }
                 }
@@ -1640,7 +1640,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("c17: {}: {}", op.path, e);
+                        eprintln!("c17: {}: {}", op.path, plib::diag::io_error_text(&e));
                         failed = true;
                     }
                 }
@@ -1665,7 +1665,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !failed && link_phase && has_object {
         let exe_file = args.output.clone().unwrap_or_else(|| "a.out".to_string());
         if let Err(e) = link_objects(&link_line, &exe_file, &args, &target) {
-            eprintln!("c17: {}", e);
+            eprintln!("c17: {}", plib::diag::io_error_text(&e));
             failed = true;
         }
     }

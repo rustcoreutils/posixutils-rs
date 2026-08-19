@@ -374,7 +374,7 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(e) => {
-                    plib::diag::error(&format!("{}: {}", file, e));
+                    plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)));
                 }
             },
             "f" => {

@@ -985,7 +985,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Check if we're at end of input
-    fn is_eof(&self) -> bool {
+    pub(crate) fn is_eof(&self) -> bool {
         matches!(self.peek(), TokenType::StreamEnd)
     }
 
@@ -4103,8 +4103,15 @@ impl Parser<'_> {
                     // This used to become `None`, i.e. an incomplete array,
                     // so `int a[-1]` was accepted and silently sized zero.
                     Some(_) => {
+                        // gcc distinguishes the two, and the abstract case is
+                        // the one a type-name reaches: `sizeof(char[-1])`
+                        // says "unnamed", `char a[-1];` names `a`.
                         return Err(ParseError::new(
-                            "size of array is negative".to_string(),
+                            if name == StringId::EMPTY {
+                                "size of unnamed array is negative".to_string()
+                            } else {
+                                format!("size of array '{}' is negative", self.idents.get(name))
+                            },
                             size_pos,
                         ));
                     }
@@ -5282,8 +5289,15 @@ impl Parser<'_> {
                     // itself is a GNU extension gcc accepts, so only a
                     // negative size is refused here.
                     Some(_) => {
+                        // gcc distinguishes the two, and the abstract case is
+                        // the one a type-name reaches: `sizeof(char[-1])`
+                        // says "unnamed", `char a[-1];` names `a`.
                         return Err(ParseError::new(
-                            "size of array is negative".to_string(),
+                            if name == StringId::EMPTY {
+                                "size of unnamed array is negative".to_string()
+                            } else {
+                                format!("size of array '{}' is negative", self.idents.get(name))
+                            },
                             size_pos,
                         ));
                     }

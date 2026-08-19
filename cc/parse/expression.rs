@@ -1152,10 +1152,58 @@ impl<'a> Parser<'a> {
                 dims.extend(spec_dims);
                 Some((typ, dims))
             }
-            _ => {
+            // A *named* declarator means this was never a type-name -- `(x)`
+            // in a cast position, say. Rewind and let the caller read it as
+            // an expression.
+            Ok(_) => {
                 self.pos = saved_pos;
                 None
             }
+            // The specifier-qualifier list parsed, so this *is* a type-name
+            // and the declarator after it is simply invalid. Report the
+            // declarator's own error instead of rewinding (#C123).
+            //
+            // Rewinding here discarded the real diagnostic and let the caller
+            // re-read the tokens as an expression, which produced two about
+            // neither problem: `sizeof(char[-1])` said "undeclared identifier
+            // 'char'" and "subscripted value is neither array nor pointer"
+            // where gcc says "size of unnamed array is negative". Every
+            // constraint an abstract declarator can violate was reported that
+            // way, not just these two.
+            Err(e) => {
+                crate::diag::error(e.pos, &e.message);
+                self.resync_to_enclosing_paren();
+                Some((self.types.int_id, Vec::new()))
+            }
+        }
+    }
+
+    /// After a committed type-name error, skip to the `)` that closes the
+    /// construct the caller opened, so one bad declarator draws one
+    /// diagnostic rather than cascading into "expected ')'".
+    ///
+    /// Every caller of `try_parse_type_name_vm` is positioned just inside a
+    /// `(` -- `sizeof(`, `_Alignof(`, `_Atomic(`, `typeof(`, a cast, a
+    /// compound literal -- so the token that ends the construct is the first
+    /// `)` not nested inside a bracket or paren opened after this point.
+    ///
+    /// The cursor usually sits *inside* an unclosed `[` when this is called,
+    /// the array bound being where the declarator failed, so a closer with no
+    /// opener is one of the caller's and must not drive the depth negative.
+    fn resync_to_enclosing_paren(&mut self) {
+        let mut depth = 0i32;
+        while !self.is_eof() {
+            if self.is_special(b'(') || self.is_special(b'[') {
+                depth += 1;
+            } else if self.is_special(b']') {
+                depth = (depth - 1).max(0);
+            } else if self.is_special(b')') {
+                if depth == 0 {
+                    return;
+                }
+                depth -= 1;
+            }
+            self.advance();
         }
     }
 

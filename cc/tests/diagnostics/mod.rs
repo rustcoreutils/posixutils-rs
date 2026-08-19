@@ -3990,3 +3990,96 @@ int main(void) { __asm__ ("nop" :: "x"(1.0), "x"(2.0)); return 0; }
 "#;
     compile_expect_error("asm_two_float_const_sse", src, "only one floating constant");
 }
+
+/// #C123: a constraint violation inside an abstract declarator must be
+/// reported as itself, not discarded.
+///
+/// `try_parse_type_name_vm` backtracks by restoring the token cursor, and its
+/// fallback arm collapsed two situations: "the declarator produced a name, so
+/// this was never a type-name" and "this *is* a type-name and its declarator
+/// is invalid". The second rewound too, so the real error was dropped and the
+/// caller re-read `char[-1]` as a subscript expression -- producing
+/// "undeclared identifier 'char'" and "subscripted value is neither array nor
+/// pointer", two diagnostics about neither problem.
+///
+/// Every constraint an abstract declarator can violate was reported that way.
+/// The wording is gcc's, including the named/unnamed distinction.
+#[test]
+fn diagnostics_abstract_declarator_reports_its_own_error() {
+    for (name, src) in [
+        (
+            "abstract_neg_array_sizeof",
+            "int main(void){ return sizeof(char[-1]); }\n",
+        ),
+        (
+            "abstract_neg_array_alignof",
+            "int main(void){ return _Alignof(char[-1]); }\n",
+        ),
+        (
+            "abstract_neg_array_cast",
+            "int main(void){ return (int)(char(*)[-1])0; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "size of unnamed array is negative");
+    }
+
+    // A declarator that *has* a name keeps naming it, as gcc does.
+    compile_expect_error(
+        "named_neg_array",
+        "int main(void){ char a[-1]; return 0; }\n",
+        "size of array 'a' is negative",
+    );
+}
+
+/// The discarded diagnostic is only half the defect: the fallback's two
+/// *spurious* messages were the visible half, and they must be gone.
+#[test]
+fn diagnostics_abstract_declarator_does_not_cascade() {
+    let c = create_c_file(
+        "abstract_no_cascade",
+        "int main(void){ return sizeof(char[-1]); }\n",
+    );
+    let path = c.path().to_string_lossy().to_string();
+    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+
+    assert!(!run.success, "the program must still be rejected");
+    for spurious in ["undeclared identifier", "subscripted value", "expected ')'"] {
+        assert!(
+            !run.stderr.contains(spurious),
+            "the fallback parse still leaks {:?}:\n{}",
+            spurious,
+            run.stderr
+        );
+    }
+    assert_eq!(
+        run.stderr.matches("error:").count(),
+        1,
+        "one bad declarator must draw exactly one error:\n{}",
+        run.stderr
+    );
+}
+
+/// Committing to the type-name reading must not swallow the *expression*
+/// reading, which is what the rewind is legitimately for: `(x)` in a cast
+/// position is a parenthesized identifier, and `sizeof(x)` is sizeof an
+/// object. Without these the test above would pass against a parser that had
+/// simply stopped backtracking.
+#[test]
+fn diagnostics_type_name_backtracking_still_works() {
+    compile_expect_ok(
+        "backtrack_paren_expr",
+        "int main(void){ int x = 3; return (x) - 3; }\n",
+    );
+    compile_expect_ok(
+        "backtrack_sizeof_object",
+        "int main(void){ int x = 0; (void)x; return sizeof(x) - sizeof(int); }\n",
+    );
+    compile_expect_ok(
+        "backtrack_cast_to_ptr_to_array",
+        "int a[3]; int main(void){ int (*p)[3] = (int(*)[3])&a; return (*p)[0]; }\n",
+    );
+    compile_expect_ok(
+        "backtrack_compound_literal",
+        "struct S { int a; };\nint main(void){ return ((struct S){0}).a; }\n",
+    );
+}

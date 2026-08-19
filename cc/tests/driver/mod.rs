@@ -270,6 +270,108 @@ fn driver_early_exit_modes_do_not_link() {
     );
 }
 
+/// `-E` used to accept `-o` and then discard it: the preprocessed text went to
+/// stdout, no file appeared, and the exit status was 0. POSIX leaves the
+/// combination unspecified (88941-88942), but silently ignoring an option is
+/// not one of the available readings, and every build system running
+/// `cc -E -o foo.i foo.c` assumes the gcc/clang behavior.
+#[test]
+fn driver_preprocess_honors_dash_o() {
+    let w = WorkDir::new("eout");
+    let src = w.write("pp.c", "#define N 7\nint frag(void){return N;}\n");
+    let out = w.join("pp.i");
+
+    let r = run_c17(&["-E", &s(&src), "-o", &s(&out)]);
+    assert!(r.success, "-E -o failed: {}{}", r.stdout, r.stderr);
+    assert!(out.exists(), "-E -o produced no file");
+    assert!(
+        r.stdout.is_empty(),
+        "-E -o must not also write to stdout:\n{}",
+        r.stdout
+    );
+
+    let body = std::fs::read_to_string(&out).unwrap();
+    assert!(body.contains("frag"), "no preprocessed text in the file");
+    assert!(body.contains("7"), "the macro was not expanded");
+    // STDOUT 88032-88038: the mandated line marker must survive the rerouting.
+    assert!(
+        body.contains("# 1 \""),
+        "no line marker in the file:\n{}",
+        body
+    );
+}
+
+/// `-o -` is stdout, matching the spelling `-S` already used.
+#[test]
+fn driver_preprocess_dash_o_dash_is_stdout() {
+    let w = WorkDir::new("edash");
+    let src = w.write("pp.c", "int frag(void){return 1;}\n");
+
+    let r = run_c17(&["-E", &s(&src), "-o", "-"]);
+    assert!(r.success, "-E -o - failed: {}", r.stderr);
+    assert!(r.stdout.contains("frag"), "-E -o - produced no output");
+    assert!(
+        !w.join("-").exists(),
+        "-o - must not create a file named '-'"
+    );
+}
+
+/// Several sources share one `-E` sink, so they concatenate rather than each
+/// truncating the last — the same thing they already did on stdout.
+#[test]
+fn driver_preprocess_dash_o_collects_every_source() {
+    let w = WorkDir::new("emulti");
+    let a = w.write("p1.c", "int one(void){return 1;}\n");
+    let b = w.write("p2.c", "int two(void){return 2;}\n");
+    let out = w.join("both.i");
+
+    let r = run_c17(&["-E", &s(&a), &s(&b), "-o", &s(&out)]);
+    assert!(r.success, "-E of two sources failed: {}", r.stderr);
+    assert!(
+        r.stderr.contains("warning") && r.stderr.contains("-o"),
+        "expected a warning about -o with several sources, got:\n{}",
+        r.stderr
+    );
+
+    let body = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        body.contains("one") && body.contains("two"),
+        "one source overwrote the other:\n{}",
+        body
+    );
+}
+
+/// 87883-87885: with `-E`, "no compilation shall be performed". An assembler
+/// operand was dispatched to `as` regardless of the mode, so `c17 -E foo.s`
+/// assembled it and left a foo.o behind.
+#[test]
+fn driver_preprocess_does_not_assemble() {
+    let w = WorkDir::new("easm");
+    let asm = w.write("bare.s", ".text\n.globl bare\nbare: ret\n");
+
+    let r = run_c17(&["-E", &s(&asm)]);
+    assert!(r.success, "-E of an .s operand failed: {}", r.stderr);
+    assert!(
+        !w.join("bare.o").exists(),
+        "-E must not assemble an .s operand"
+    );
+}
+
+/// `-o` belongs to the compile or link output in every other mode. `-E` is the
+/// only one that may open it, and opening it eagerly would truncate the
+/// executable a normal compile is about to write.
+#[test]
+fn driver_dash_o_is_untouched_without_dash_e() {
+    let w = WorkDir::new("noeout");
+    let a = w.write("m1.c", CALLER);
+    let b = w.write("m2.c", HELPER_7);
+    let exe = w.join("prog");
+
+    let r = run_c17(&[&s(&a), &s(&b), "-o", &s(&exe)]);
+    assert!(r.success, "link failed: {}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 7, "the executable was clobbered");
+}
+
 // ============================================================================
 // #U3 — -L/-l order relative to the operands is significant
 // ============================================================================

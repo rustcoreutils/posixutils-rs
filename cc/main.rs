@@ -36,7 +36,7 @@ use gettextrs::{
     bind_textdomain_codeset, gettext, gettext_args, setlocale, textdomain, LocaleCategory,
 };
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::process::Command;
 
@@ -403,12 +403,45 @@ enum Compiled {
     Object { path: String, temporary: bool },
 }
 
+/// Where `-E` writes.
+///
+/// `-o` is honored here, as gcc and clang do and as every build system that
+/// runs `cc -E -o foo.i foo.c` assumes. POSIX leaves `-o` with `-E`
+/// unspecified (88941-88942) and its own EXAMPLE redirects with `>` instead,
+/// so this is a compatibility choice rather than a conformance one — but
+/// accepting the option and then discarding it, which is what c17 did, is not
+/// one of the readings on offer.
+///
+/// One sink serves the whole run: with several source operands the
+/// preprocessed forms concatenate, exactly as they already did on stdout.
+fn preprocess_sink(args: &Args) -> io::Result<Box<dyn Write>> {
+    // Only `-E` may open `args.output`. Every other mode names its own output
+    // downstream, and creating the file here would truncate the executable or
+    // object a normal compile is about to write.
+    match args.output.as_deref() {
+        Some(path) if args.preprocess_only && path != "-" => {
+            Ok(Box::new(BufWriter::new(File::create(path)?)))
+        }
+        _ => Ok(Box::new(BufWriter::new(io::stdout()))),
+    }
+}
+
+/// Where one source operand's product goes.
+///
+/// The two travel together because the mode picks exactly one of them: an
+/// early-exit `-E` writes to `preprocessed` and produces no object, and every
+/// other mode fills `object` and never touches the stream.
+struct Outputs<'a> {
+    object: &'a ObjectName,
+    preprocessed: &'a mut dyn Write,
+}
+
 fn process_file(
     path: &str,
     streams: &mut StreamTable,
     args: &Args,
     target: &Target,
-    obj_name: &ObjectName,
+    out: &mut Outputs,
     scratch: &Path,
     operand_id: usize,
 ) -> io::Result<Compiled> {
@@ -507,7 +540,7 @@ fn process_file(
         // state on the preprocessor and is never recorded in the stream
         // registry, so `effective_position` cannot see it either — the same
         // pre-existing gap that keeps parser diagnostics on physical lines.
-        println!("# 1 \"{}\"", display_path);
+        writeln!(out.preprocessed, "# 1 \"{}\"", display_path)?;
         let mut emitted_marker_for: Vec<u16> = vec![stream_id];
         let mut current_stream: Option<u16> = Some(stream_id);
         let mut at_line_start = true;
@@ -515,13 +548,14 @@ fn process_file(
         let mut iter = preprocessed.iter().peekable();
         while let Some(token) = iter.next() {
             if args.verbose {
-                println!(
+                writeln!(
+                    out.preprocessed,
                     "{:>4}:{:<3} {:12} {}",
                     token.pos.line,
                     token.pos.col,
                     token_type_name(token.typ),
                     show_token(token, &strings)
-                );
+                )?;
             } else {
                 let text = show_token(token, &strings);
                 // Skip stream markers (e.g., <STREAM_BEGIN>, <STREAM_END>)
@@ -540,18 +574,24 @@ fn process_file(
                         emitted_marker_for.push(token.pos.stream);
                     }
                     if !at_line_start {
-                        println!();
+                        writeln!(out.preprocessed)?;
                     }
-                    println!("# {} \"{}\" {}", line, name, if returning { 2 } else { 1 });
+                    writeln!(
+                        out.preprocessed,
+                        "# {} \"{}\" {}",
+                        line,
+                        name,
+                        if returning { 2 } else { 1 }
+                    )?;
                     current_stream = Some(token.pos.stream);
                 }
 
-                print!("{}", text);
+                write!(out.preprocessed, "{}", text)?;
                 at_line_start = false;
                 // Check next token to determine separator
                 if let Some(next) = iter.peek() {
                     if next.pos.newline {
-                        println!();
+                        writeln!(out.preprocessed)?;
                         at_line_start = true;
                     } else {
                         // Need a space if:
@@ -568,15 +608,17 @@ fn process_file(
                                     .next()
                                     .is_some_and(|c| c.is_alphanumeric() || c == '_'));
                         if needs_space {
-                            print!(" ");
+                            write!(out.preprocessed, " ")?;
                         }
                     }
                 }
             }
         }
         if !args.verbose {
-            println!();
+            writeln!(out.preprocessed)?;
         }
+        // The sink may be a file, and a BufWriter's Drop discards errors.
+        out.preprocessed.flush()?;
         // Check for preprocessor errors (e.g., #error directive)
         if diag::has_error() != 0 {
             return Err(io::Error::new(
@@ -759,7 +801,7 @@ fn process_file(
     // Assemble. The caller decided where the object goes; this function no
     // longer links, so that one link can cover every operand — POSIX EXAMPLE 1
     // and EXAMPLE 3 both combine sources with objects and libraries.
-    let (obj_file, temporary) = match obj_name {
+    let (obj_file, temporary) = match out.object {
         ObjectName::Keep(p) => (p.clone(), false),
         ObjectName::Temp(p) => (p.clone(), true),
     };
@@ -1505,6 +1547,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    // -E is the other unspecified combination, and it resolves the other way:
+    // the operands share one output stream, so they concatenate rather than
+    // overwrite. Still worth saying, since a makefile expecting one .i per
+    // source gets one file holding all of them.
+    if args.preprocess_only && args.output.is_some() && source_count > 1 {
+        driver_warning(&format!(
+            "{} ({})",
+            gettext("-o collects every source operand into one file with -E"),
+            source_count
+        ));
+    }
+
     if let Some(mode) = args.binding.as_deref() {
         if mode != "dynamic" && mode != "static" {
             eprintln!(
@@ -1522,6 +1576,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scratch = tempfile::Builder::new().prefix("c17-").tempdir()?;
 
     let mut streams = StreamTable::new();
+    // Opened once, before the loop, so several source operands concatenate
+    // into one `-E` output rather than each truncating the last.
+    let mut pp_out = preprocess_sink(&args)?;
     // The object each operand contributes to the link, by operand index.
     // `None` means the operand contributes nothing (`-c`, an early-exit mode,
     // or an unrecognized file).
@@ -1534,6 +1591,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match op.kind {
             OperandKind::Unknown => {}
             OperandKind::Object => operand_objects[idx] = Some(op.path.clone()),
+            // 87883-87885: with -E "no compilation shall be performed". An
+            // assembler operand was being handed to `as` regardless, so
+            // `c17 -E foo.s` assembled it and wrote foo.o.
+            OperandKind::Asm if args.preprocess_only => {}
             OperandKind::Asm => {
                 match assemble_operand(&op.path, &args, &target, scratch.path(), idx) {
                     Ok(Some(obj)) => operand_objects[idx] = Some(obj),
@@ -1546,12 +1607,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             OperandKind::Source => {
                 let obj_name = source_object_name(&op.path, &args, scratch.path(), idx);
+                let mut outputs = Outputs {
+                    object: &obj_name,
+                    preprocessed: &mut pp_out,
+                };
                 match process_file(
                     &op.path,
                     &mut streams,
                     &args,
                     &target,
-                    &obj_name,
+                    &mut outputs,
                     scratch.path(),
                     idx,
                 ) {

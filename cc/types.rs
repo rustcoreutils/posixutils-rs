@@ -995,7 +995,7 @@ impl TypeTable {
     }
 
     // =========================================================================
-    // Test-only methods (used by tests but not production code)
+    // Type-shape accessors
     // =========================================================================
 
     /// Get array size
@@ -1063,6 +1063,9 @@ impl TypeTable {
     }
 
     /// Get function parameters
+    // The two below are read by `parse::test_parser` and by nothing in the
+    // compiler, which reaches a signature through `Type::func_params` and
+    // `Type::variadic` directly. They stay gated so that stays visible.
     #[cfg(test)]
     #[inline]
     pub fn params(&self, id: TypeId) -> Option<&Vec<TypeId>> {

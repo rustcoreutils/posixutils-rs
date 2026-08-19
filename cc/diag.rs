@@ -205,7 +205,10 @@ pub fn effective_position(pos: Position) -> (String, u32, u16) {
     STREAMS.with(|s| s.borrow().effective_position(pos))
 }
 
-/// Get stream name by ID (for tests)
+/// The name registered for a stream.
+///
+/// Read only by this module's own tests; production formats a name through
+/// `effective_position`, which also follows `#line`.
 #[cfg(test)]
 pub fn stream_name(id: u16) -> String {
     STREAMS.with(|s| {

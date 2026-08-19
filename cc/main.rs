@@ -841,15 +841,35 @@ fn link_objects(
 
     // Emit the recovered link line in argument order: a library is searched
     // where its name was encountered, not after every object.
+    //
+    // `-L` directories accumulate as we go, because a standard library is
+    // resolved against the paths that precede its `-l` and no others
+    // (88925-88929).
+    let mut lib_paths_so_far: Vec<String> = Vec::new();
     for item in link_line {
         match item {
             LinkItem::Object(p) => {
                 link_cmd.arg(p);
             }
             LinkItem::LibPath(d) => {
+                lib_paths_so_far.push(d.clone());
                 link_cmd.arg(format!("-L{}", d));
             }
             LinkItem::Library(l) => {
+                // One of the seven POSIX standard libraries that this host
+                // does not ship is satisfied by libc, which the host driver
+                // links anyway -- so the name is dropped rather than passed on
+                // to fail. Every other name goes through untouched.
+                if linkargs::drop_standard_library(l, &lib_paths_so_far) {
+                    if args.verbose {
+                        eprintln!(
+                            "c17: {}: -l {}",
+                            gettext("standard library provided by the C library"),
+                            l
+                        );
+                    }
+                    continue;
+                }
                 link_cmd.arg(format!("-l{}", l));
             }
             LinkItem::RunPath(d) => {

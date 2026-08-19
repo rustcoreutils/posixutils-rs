@@ -313,3 +313,74 @@ int main(void) {
         0
     );
 }
+
+/// `__builtin_*_overflow` asks whether the *mathematical* result fits, and a
+/// 128-bit destination is no exception (#C62).
+///
+/// The ordinary lowering computes in a type twice the destination's width and
+/// asks whether narrowing lost anything; nothing here is wider than 128 bits,
+/// so at that width it compared a value to itself. The fallback examined the
+/// result directly, on operands already converted to the destination -- which
+/// is not value-preserving for a negative operand with an unsigned
+/// destination, so `__builtin_add_overflow(-1, 5u, &u128)` reported overflow
+/// where the answer is 4.
+///
+/// When both operands are narrower than 128 bits the exact computation still
+/// fits (a sum needs 65 bits, a product 128), so only the *check* changes:
+/// from "did narrowing lose anything" to "is the exact value representable".
+#[test]
+fn builtins_checked_arith_128bit_mixed_signedness() {
+    let code = r#"
+int main(void) {
+    unsigned __int128 u;
+    __int128 s;
+
+    /* A negative operand whose mathematical result is representable. */
+    if (__builtin_add_overflow(-1, 5u, &u)) return 1;
+    if (u != 4) return 2;
+    if (__builtin_add_overflow(-10, 20, &u)) return 3;
+    if (u != 10) return 4;
+    if (__builtin_add_overflow(-5, 5, &u)) return 5;
+    if (u != 0) return 6;
+
+    /* ...and ones where it is not. */
+    if (!__builtin_add_overflow(-1, -1, &u)) return 7;
+    if (!__builtin_sub_overflow(3, 5, &u)) return 8;
+    if (!__builtin_mul_overflow(-2, 3, &u)) return 9;
+    /* ...while `-1 * -1` is 1, which is representable, so it does not. */
+    if (__builtin_mul_overflow(-1, -1, &u)) return 10;
+    if (u != 1) return 23;
+
+    /* The exact computation must itself fit the width it is done in:
+       `(u64)-1 * (u64)-1` is just under 2^128, which an unsigned 128-bit
+       destination holds and a signed one does not. */
+    unsigned long long um = 0xFFFFFFFFFFFFFFFFULL;
+    if (__builtin_mul_overflow(um, um, &u)) return 24;
+    if (!__builtin_mul_overflow(um, um, &s)) return 25;
+
+    /* Unsigned operands at full width still fit a 128-bit destination. */
+    if (__builtin_mul_overflow(0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, &u)) return 11;
+    if (__builtin_add_overflow(0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, &u)) return 12;
+
+    /* A signed 128-bit destination holds anything two 64-bit operands make. */
+    if (__builtin_add_overflow(9223372036854775807LL, 9223372036854775807LL, &s)) return 13;
+    if (__builtin_mul_overflow(-9223372036854775807LL - 1, -9223372036854775807LL - 1, &s)) return 14;
+    if (__builtin_sub_overflow(-9223372036854775807LL - 1, 9223372036854775807LL, &s)) return 15;
+    if (__builtin_add_overflow(-1, -1, &s)) return 16;
+    if (s != -2) return 17;
+
+    /* Narrow destinations are untouched by any of this. */
+    int i;
+    if (!__builtin_add_overflow(2147483647, 1, &i)) return 18;
+    if (!__builtin_mul_overflow(65536, 65536, &i)) return 19;
+    unsigned un;
+    if (!__builtin_sub_overflow(0, 1, &un)) return 20;
+    unsigned long long ull;
+    if (__builtin_add_overflow(-1, 5u, &ull)) return 21;
+    if (ull != 4) return 22;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("checked_arith_128_mixed", code, &[]), 0);
+}

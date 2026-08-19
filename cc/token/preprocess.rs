@@ -2662,8 +2662,10 @@ impl<'a> Preprocessor<'a> {
         self.include_stack.insert(canonical.clone());
         self.include_depth += 1;
 
-        // Create a new stream for this file
-        let stream_id = diag::init_stream(&self.current_file);
+        // Create a new stream for this file, remembering which `#include`
+        // brought it in: that is what lets a diagnostic inside a header name
+        // the chain that reached it.
+        let stream_id = diag::init_included_stream(&self.current_file, hash_token.pos);
 
         // Tokenize the included file using the same shared string table
         // Since we use the same StringTable, all StringIds are consistent
@@ -2721,8 +2723,9 @@ impl<'a> Preprocessor<'a> {
 
         self.include_depth += 1;
 
-        // Create a stream for this builtin header
-        let stream_id = diag::init_stream(&self.current_file);
+        // Create a stream for this builtin header, with the `#include` that
+        // asked for it; see `include_file`.
+        let stream_id = diag::init_included_stream(&self.current_file, hash_token.pos);
 
         // Tokenize the builtin content
         let tokens = {
@@ -3066,8 +3069,17 @@ impl<'a> Preprocessor<'a> {
                 }
                 TokenValue::Number(n) => result.push_str(n),
                 TokenValue::String(s) => result.push_str(s),
-                TokenValue::Special(code) if *code < 256 => {
+                TokenValue::Special(code) if *code < SpecialToken::BASE => {
                     result.push(*code as u8 as char);
+                }
+                // A punctuator of more than one character has a spelling too.
+                // Dropping it turned `a >> b` into `a  b`, in `#x` (6.10.3.2p2
+                // asks for "the spelling of the preprocessing token") and in
+                // the text a `_Pragma` is rebuilt from alike.
+                TokenValue::Special(code) => {
+                    if let Some(punct) = SpecialToken::from_code(*code) {
+                        result.push_str(punct.spelling());
+                    }
                 }
                 _ => {}
             }
@@ -3136,8 +3148,17 @@ impl<'a> Preprocessor<'a> {
                     }
                     result.push('\'');
                 }
-                TokenValue::Special(code) if *code < 256 => {
+                TokenValue::Special(code) if *code < SpecialToken::BASE => {
                     result.push(*code as u8 as char);
+                }
+                // A punctuator of more than one character has a spelling too.
+                // Dropping it turned `a >> b` into `a  b`, in `#x` (6.10.3.2p2
+                // asks for "the spelling of the preprocessing token") and in
+                // the text a `_Pragma` is rebuilt from alike.
+                TokenValue::Special(code) => {
+                    if let Some(punct) = SpecialToken::from_code(*code) {
+                        result.push_str(punct.spelling());
+                    }
                 }
                 _ => {}
             }

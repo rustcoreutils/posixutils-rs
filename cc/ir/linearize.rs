@@ -1605,10 +1605,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountll { arg }
             | ExprKind::Fabs { arg }
             | ExprKind::Fabsf { arg }
-            | ExprKind::Fabsl { arg }
             | ExprKind::Signbit { arg }
             | ExprKind::Signbitf { arg }
-            | ExprKind::Signbitl { arg }
             | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
 
             // Pure iff everything it reads is: the class codes are ordinary
@@ -4400,20 +4398,6 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Fabsl { arg } => {
-                // Long double fabs - treat as 64-bit for now
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Fabs64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(128) // long double is 128-bit on our targets
-                    .with_type(self.types.longdouble_id);
-                self.emit(insn);
-                result
-            }
-
             ExprKind::Signbit { arg } => {
                 let arg_val = self.linearize_expr(arg);
                 let result = self.alloc_pseudo();
@@ -4435,20 +4419,6 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(arg_val)
                     .with_size(32)
-                    .with_type(self.types.int_id);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::Signbitl { arg } => {
-                // Long double signbit - use 64-bit version
-                let arg_val = self.linearize_expr(arg);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Signbit64)
-                    .with_target(result)
-                    .with_src(arg_val)
-                    .with_size(128) // long double is 128-bit on our targets
                     .with_type(self.types.int_id);
                 self.emit(insn);
                 result
@@ -4875,6 +4845,63 @@ impl<'a> Linearizer<'a> {
                 // a value against itself and always answered "no overflow".
                 // At that width the result has to be examined directly.
                 if self.types.size_bits(dst_typ) >= 128 {
+                    // ...unless both operands are *narrower* than 128 bits, in
+                    // which case the computation in `wide` is still exact: a
+                    // sum or difference of two 64-bit values needs 65 bits and
+                    // a product 128, both of which fit. Only the *check* has to
+                    // change, from "did narrowing lose anything" to "is the
+                    // exact value representable at all" -- and the two differ
+                    // exactly where #C62 was wrong, a negative operand with an
+                    // unsigned destination. `__builtin_add_overflow(-1, 5u,
+                    // &u128)` is 4 and does not overflow; converting the
+                    // operands to the destination first made it 2^128-1 + 5 and
+                    // reported that it did.
+                    // "Narrower than the destination" is not enough on its
+                    // own: `(u64)-1 * (u64)-1` is just under 2^128, which fits
+                    // `unsigned __int128` but *not* `__int128`, so the exact
+                    // computation would itself wrap and the check would pass a
+                    // value it never saw. Count magnitude bits instead -- `w`
+                    // for an unsigned operand, `w-1` for a signed one -- and
+                    // require the result to fit `wide`.
+                    let magnitude_bits = |t: TypeId| {
+                        let w = self.types.size_bits(t);
+                        if self.types.is_unsigned(t) {
+                            w
+                        } else {
+                            w - 1
+                        }
+                    };
+                    let (ma, mb) = (magnitude_bits(a_typ), magnitude_bits(b_typ));
+                    let room = if self.types.is_unsigned(wide) {
+                        128
+                    } else {
+                        127
+                    };
+                    let exact_fits = match op {
+                        crate::parse::ast::CheckedOp::Mul => ma + mb <= room,
+                        // A sum or difference needs one bit more than the wider
+                        // operand, i.e. `ma.max(mb) + 1 <= room`.
+                        _ => ma.max(mb) < room,
+                    };
+                    if self.types.size_bits(a_typ) < 128
+                        && self.types.size_bits(b_typ) < 128
+                        && exact_fits
+                    {
+                        let exact = self.emit_binary(bin, aw, bw, wide, wide);
+                        let dst_size = self.types.size_bits(dst_typ);
+                        let narrowed = self.emit_convert(exact, wide, dst_typ);
+                        self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+                        // `wide` is unsigned only when the destination is too,
+                        // so the two agree except when a signed exact value has
+                        // to land in an unsigned destination -- where the
+                        // negatives are precisely the unrepresentable ones.
+                        return if wide == dst_typ {
+                            self.emit_const(0, self.types.int_id)
+                        } else {
+                            let zero = self.emit_const(0, wide);
+                            self.emit_binary(BinaryOp::Lt, exact, zero, self.types.int_id, wide)
+                        };
+                    }
                     let a128 = self.emit_convert(av, a_typ, dst_typ);
                     let b128 = self.emit_convert(bv, b_typ, dst_typ);
                     return self.linearize_checked_arith_wide(*op, a128, b128, addr, dst_typ);
@@ -5091,10 +5118,8 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Memmove { .. }
             | ExprKind::Fabs { .. }
             | ExprKind::Fabsf { .. }
-            | ExprKind::Fabsl { .. }
             | ExprKind::Signbit { .. }
             | ExprKind::Signbitf { .. }
-            | ExprKind::Signbitl { .. }
             | ExprKind::FpTest { .. }
             | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable

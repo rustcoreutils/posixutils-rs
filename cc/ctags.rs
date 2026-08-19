@@ -480,7 +480,7 @@ fn main() -> ExitCode {
         }
     }
 
-    exit_code()
+    posixutils_cc::tools::exit_code()
 }
 
 /// Undo the byte-per-`char` decoding used when the source was read.
@@ -490,14 +490,4 @@ fn main() -> ExitCode {
 /// again.
 fn bytes_from_latin1(s: &str) -> Vec<u8> {
     s.chars().map(|c| c as u32 as u8).collect()
-}
-
-/// Combine this utility's own diagnostics with any emitted by the C front end.
-/// POSIX requires a non-zero status when either has fired.
-fn exit_code() -> ExitCode {
-    if plib::diag::has_errors() || posixutils_cc::diag::has_error() != 0 {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
 }

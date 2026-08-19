@@ -995,7 +995,7 @@ impl TypeTable {
     }
 
     // =========================================================================
-    // Test-only methods (used by tests but not production code)
+    // Type-shape accessors
     // =========================================================================
 
     /// Get array size
@@ -1062,6 +1062,10 @@ impl TypeTable {
         levels
     }
 
+    // The two below are read by `parse::test_parser` and by nothing in the
+    // compiler, which reaches a signature through `Type::func_params` and
+    // `Type::variadic` directly. They stay gated so that stays visible.
+
     /// Get function parameters
     #[cfg(test)]
     #[inline]
@@ -1107,24 +1111,45 @@ impl TypeTable {
 
         match typ.kind {
             TypeKind::Pointer => {
-                if let Some(base) = typ.base {
-                    result.push_str(&self.format_type(base, idents));
-                    result.push('*');
-                } else {
-                    result.push('*');
+                // `char *` and `char **`, the way gcc and the source write
+                // them: a space before the first star and none between stars.
+                match typ.base {
+                    Some(base) => {
+                        let pointee = self.format_type(base, idents);
+                        let joined = pointee.ends_with('*');
+                        result.push_str(&pointee);
+                        if !joined {
+                            result.push(' ');
+                        }
+                        result.push('*');
+                    }
+                    None => result.push('*'),
                 }
             }
             TypeKind::Array => {
-                if let Some(base) = typ.base {
-                    result.push_str(&self.format_type(base, idents));
-                    if let Some(size) = typ.array_size {
-                        result.push_str(&format!("[{}]", size));
-                    } else {
-                        result.push_str("[]");
+                // Outermost extent first, as the declaration writes it.
+                // Recursing element-first and appending printed `int[4][8]`
+                // as `int[8][4]`, in a diagnostic and in `cflow` alike.
+                let mut extents = String::new();
+                let mut cur = id;
+                let element = loop {
+                    let t = self.get(cur);
+                    if t.kind != TypeKind::Array {
+                        break Some(cur);
                     }
-                } else {
-                    result.push_str("[]");
+                    match t.array_size {
+                        Some(size) => extents.push_str(&format!("[{}]", size)),
+                        None => extents.push_str("[]"),
+                    }
+                    match t.base {
+                        Some(base) => cur = base,
+                        None => break None,
+                    }
+                };
+                if let Some(element) = element {
+                    result.push_str(&self.format_type(element, idents));
                 }
+                result.push_str(&extents);
             }
             TypeKind::Function => {
                 if let Some(ret) = typ.base {
@@ -1543,17 +1568,15 @@ impl TypeTable {
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0) as u64;
                 let count = typ.array_size.unwrap_or(0) as u64;
-                let total = elem_size.saturating_mul(count);
-                if total > u32::MAX as u64 {
-                    // Array too large for u32 size_bits; cap at u32::MAX
-                    // (size_bytes via size_bits/8 still works for reasonable sizes)
-                    u32::MAX
-                } else {
-                    total as u32
-                }
+                // The parser refuses an extent whose product exceeds
+                // `MAX_OBJECT_BYTES`, so the saturation below is unreachable
+                // for a type that came from source. It stays as a floor
+                // rather than an overflow.
+                elem_size.saturating_mul(count).min(u32::MAX as u64) as u32
             }
             TypeKind::Struct | TypeKind::Union => {
-                (typ.composite.as_ref().map(|c| c.size).unwrap_or(0) * 8) as u32
+                let bytes = typ.composite.as_ref().map(|c| c.size).unwrap_or(0) as u64;
+                bytes.saturating_mul(8).min(u32::MAX as u64) as u32
             }
             TypeKind::Function => 0,
             // An enumeration is as wide as the integer type it was found to
@@ -1563,6 +1586,14 @@ impl TypeTable {
             TypeKind::VaList => self.va_list_size_bits(),
         }
     }
+
+    /// The largest object c17 can describe, in bytes.
+    ///
+    /// `size_bits` answers in a `u32`, so nothing wider than `u32::MAX` bits
+    /// has a representable size. Exceeding it used to saturate in silence and
+    /// give `sizeof` a wrong answer for the whole type; the parser diagnoses
+    /// it now, and this is the bound it enforces.
+    pub const MAX_OBJECT_BYTES: usize = (u32::MAX / 8) as usize;
 
     /// Get the size of a type in bytes
     pub fn size_bytes(&self, id: TypeId) -> usize {

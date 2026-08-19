@@ -733,3 +733,84 @@ fn c17_nested_stringification_preserves_spelling() {
     // trailing are deleted.
     assert_has(&r.stdout, "spaced \"1 + 2\"", "interior space collapses");
 }
+
+/// A diagnostic inside a header names the `#include` chain that reached it.
+///
+/// The machinery was all there -- `Stream::include_pos`, `show_include_chain`,
+/// the "(through ...)" note -- but the only three functions that ever set
+/// `include_pos` were `#[cfg(test)]`, and production registered every file
+/// with `init_stream`, which leaves it `None`. So the chain was live in test
+/// builds only, and a full CPython build produced zero "through" lines across
+/// 552 diagnostics. Recorded at #C54.
+#[test]
+fn preprocessor_diagnostic_in_a_header_names_the_include_chain() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_chain_")
+        .tempdir()
+        .unwrap();
+    let inc = dir.path().join("inc");
+    std::fs::create_dir_all(&inc).unwrap();
+    // Two levels deep, so the order of the chain is observable.
+    std::fs::write(
+        inc.join("inner.h"),
+        "int bad(void) { return undeclared_thing; }\n",
+    )
+    .unwrap();
+    std::fs::write(inc.join("outer.h"), "#include \"inner.h\"\n").unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "#include \"outer.h\"\nint main(void) { return 0; }\n").unwrap();
+
+    let r = run_c17(&[
+        "-S",
+        "-o",
+        "/dev/null",
+        &format!("-I{}", inc.to_string_lossy()),
+        &src.to_string_lossy(),
+    ]);
+    assert!(!r.success, "the program should not compile:\n{}", r.stderr);
+    assert!(
+        r.stderr.contains("inner.h"),
+        "the diagnostic must name the file it is in:\n{}",
+        r.stderr
+    );
+    let chain = r
+        .stderr
+        .lines()
+        .find(|l| l.contains("through"))
+        .unwrap_or_else(|| panic!("no include chain in:\n{}", r.stderr));
+    // The line opens by naming the primary source, so read only the list.
+    let list = chain
+        .split_once("through ")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("no chain list in: {}", chain));
+    // Innermost first: the file that included inner.h, then the one that
+    // included that.
+    let outer_at = list
+        .find("outer.h")
+        .expect("outer.h missing from the chain");
+    let main_at = list.find("m.c").expect("m.c missing from the chain");
+    assert!(
+        outer_at < main_at,
+        "the chain must read outwards, got: {}",
+        chain
+    );
+}
+
+/// A diagnostic in the primary source has no chain to name.
+#[test]
+fn preprocessor_diagnostic_outside_a_header_has_no_include_chain() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_nochain_")
+        .tempdir()
+        .unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "int bad(void) { return undeclared_thing; }\n").unwrap();
+
+    let r = run_c17(&["-S", "-o", "/dev/null", &src.to_string_lossy()]);
+    assert!(!r.success, "the program should not compile:\n{}", r.stderr);
+    assert!(
+        !r.stderr.contains("through"),
+        "nothing included m.c, so there is no chain:\n{}",
+        r.stderr
+    );
+}

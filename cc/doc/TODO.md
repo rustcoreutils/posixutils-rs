@@ -76,9 +76,9 @@ does or claims.
 _The `__int128` and `long double` argument-passing bugs, the universal-character-name
 encoding, and the silently-dropped attributes used to belong here; all are closed, see
 #C42, #C43, #C57, #C58 and #C59 in `cc/audit.md`. What remains of that family: `used` is
-satisfied only because nothing is pruned, `vector_size` and `mode` are unimplemented (the
-first refused, the second warned), and #C38 -- an inlined stacked float HFA on aarch64 --
-now has a reproducer and a diagnosis but not a fix._
+satisfied only because nothing is pruned, `vector_size` is unimplemented and refused,
+while `mode` is implemented as of #C85 except for the vector modes, which warn, and #C38 -- an inlined stacked float HFA on aarch64 --
+is fixed, this note having outlived it (re-probed 2026-08-18 at -O0 and -O2 under qemu)._
 
 _Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
 -- 21 constraint violations and 14 accept-side controls -- agrees with
@@ -107,11 +107,21 @@ The type system, parser, IR, linearizer, both code generators, `<stdatomic.h>`,
 and access through ordinary operators are all done. `_Atomic` on an array or
 function type is rejected.
 
-**Remaining:**
-- Warn on member access of an atomic struct or union, as gcc does
-  ("accessing a member of an atomic structure"). C11 6.5.2.3p5 makes it
-  undefined behaviour rather than a constraint violation, so this is a
-  warning, not the rejection an earlier version of this list called for.
+**Remaining:** an `_Atomic` aggregate of lock-free size is not accessed
+atomically (#C116). `_Atomic struct S { int a; }` read as a whole object warns
+and falls through to a non-atomic struct copy, where gcc emits a plain 4-byte
+load. Scalars of 1, 2, 4 and 8 bytes are lock-free; an aggregate of the same
+size gets nothing, and anything larger is refused outright -- which is
+deliberate, since gcc's `__atomic_*` calls need `-latomic` and c17 links through
+the host `cc` without it (#X1). Doing it properly means operating on the
+aggregate's bits as an integer, which needs the value-versus-address convention
+for small aggregates settled first: assignment wants an address where
+initialization wants a value, so one representation is wrong for one of them.
+
+Nothing else on the semantic-validation list. The member-access
+warning that stood here is #C113, closed 2026-08-18; C11 6.5.2.3p5 makes it
+undefined behaviour rather than a constraint violation, so it is a warning
+rather than the rejection an earlier version of this list called for.
 
 Two entries that used to sit here were removed after being probed rather than
 implemented. Rejecting `_Atomic` on a struct or union with a VLA member is

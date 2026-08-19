@@ -879,6 +879,7 @@ impl<'a> Parser<'a> {
             // carry. Routing it to `SizeofExpr` reaches that record.
             if let Some(inner) = self.try_parse_sizeof_typeof_operand()? {
                 self.expect_special(b')')?;
+                self.check_sizeof_expr_operand(&inner, sizeof_pos);
                 return Ok(Expr::typed(
                     ExprKind::SizeofExpr(Box::new(inner)),
                     size_t,
@@ -905,6 +906,7 @@ impl<'a> Parser<'a> {
             // Not a type, parse as expression
             let expr = self.parse_expression()?;
             self.expect_special(b')')?;
+            self.check_sizeof_expr_operand(&expr, sizeof_pos);
             Ok(Expr::typed(
                 ExprKind::SizeofExpr(Box::new(expr)),
                 size_t,
@@ -913,6 +915,7 @@ impl<'a> Parser<'a> {
         } else {
             // sizeof without parens - must be expression
             let expr = self.parse_unary_expr()?;
+            self.check_sizeof_expr_operand(&expr, sizeof_pos);
             Ok(Expr::typed(
                 ExprKind::SizeofExpr(Box::new(expr)),
                 size_t,
@@ -934,6 +937,41 @@ impl<'a> Parser<'a> {
     /// `void` and function types are deliberately not refused: strict C
     /// forbids both, gcc accepts them as an extension giving 1, and matching
     /// gcc is this compiler's policy.
+    /// 6.5.3.4p1 for the *expression* form of `sizeof`.
+    ///
+    /// `check_sizeof_operand_is_complete` answers for a type-name, where the
+    /// extents ride on the node. An expression has only its type, and the type
+    /// cannot tell an incomplete array from a variably modified one -- `int[]`,
+    /// `int[n]` and `int[m]` all intern to one `TypeId`. So the question is put
+    /// to the *declaration*: `Symbol::array_is_variably_modified` records
+    /// whether the declarator carried size expressions. Without it `extern int
+    /// a[]; sizeof a` answered 0 where gcc rejects it, while a local VLA's
+    /// `sizeof` had to keep working.
+    ///
+    /// Only an identifier is examined. A subscript or a member reaches an
+    /// element whose type is complete by construction, and a call cannot
+    /// return an array.
+    fn check_sizeof_expr_operand(&self, expr: &Expr, pos: Position) {
+        let ExprKind::Ident(symbol_id) = expr.kind else {
+            return;
+        };
+        let Some(typ) = expr.typ else {
+            return;
+        };
+        if self.types.kind(typ) != TypeKind::Array
+            || self.types.unsized_array_levels(typ) == 0
+            || self.symbols.get(symbol_id).array_is_variably_modified
+        {
+            return;
+        }
+        let named = self.types.format_type(typ, Some(self.idents));
+        diag::error_args(
+            pos,
+            "invalid application of 'sizeof' to incomplete type '{0}'",
+            &[&named],
+        );
+    }
+
     fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
         let incomplete = match self.types.kind(typ) {
             TypeKind::Array => self.types.unsized_array_levels(typ) > dims.len(),
@@ -1541,6 +1579,9 @@ impl<'a> Parser<'a> {
                 } else {
                     self.types.int_id
                 };
+                if let Some(t) = expr.typ {
+                    self.warn_atomic_member_access(t, member, dot_pos);
+                }
                 expr = Self::typed_expr(
                     ExprKind::Member {
                         expr: Box::new(expr),
@@ -1584,6 +1625,11 @@ impl<'a> Parser<'a> {
                 } else {
                     self.types.int_id
                 };
+                // `p->m` names the object `*p`, so the atomicity that matters
+                // is the pointee's.
+                if let Some(pointee) = expr.typ.and_then(|t| self.types.base_type(t)) {
+                    self.warn_atomic_member_access(pointee, member, arrow_pos);
+                }
                 expr = Self::typed_expr(
                     ExprKind::Arrow {
                         expr: Box::new(expr),
@@ -2176,6 +2222,40 @@ impl<'a> Parser<'a> {
                 &[&t_name, &v_name, fault.describe()],
             );
         }
+    }
+
+    /// C11 6.5.2.3p5: naming a member of an atomic structure or union is
+    /// undefined behaviour -- the access reads or writes part of an object
+    /// whose atomicity covers the whole of it, so the lock the type promises
+    /// is not taken.
+    ///
+    /// A warning rather than a rejection, because the standard makes it
+    /// undefined rather than a constraint violation, and gcc warns. c17 said
+    /// nothing at all, so the one operation `_Atomic` exists to prevent was
+    /// the one it did not mention.
+    ///
+    /// The atomicity of the *object* is what counts, not the member's:
+    /// `struct { _Atomic int a; } s; s.a` is an ordinary access to an atomic
+    /// member and is silent, while `_Atomic struct S s; s.a` is not.
+    fn warn_atomic_member_access(&self, object: TypeId, member: StringId, pos: Position) {
+        if !self.types.modifiers(object).contains(TypeModifiers::ATOMIC) {
+            return;
+        }
+        let what = match self.types.kind(self.resolve_struct_type(object)) {
+            TypeKind::Struct => "structure",
+            TypeKind::Union => "union",
+            _ => return,
+        };
+        let name = self
+            .idents
+            .get_opt(member)
+            .unwrap_or("<unknown>")
+            .to_string();
+        diag::warning_args(
+            pos,
+            "accessing a member '{0}' of an atomic {1}",
+            &[&name, what],
+        );
     }
 
     /// May this string literal initialize this array (C17 6.7.9p14, p15)?
@@ -3214,11 +3294,15 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Fabsl { arg: Box::new(arg) },
-                    self.types.longdouble_id,
-                    token_pos,
-                ))
+                // Lowered as an ordinary call to `fabsl`, not as an opcode.
+                // The opcode it used to build was `Fabs64`, whose emitter moves
+                // its argument as a `double` and calls `fabs` -- so on x86-64 it
+                // read the low eight bytes of an 80-bit x87 value, its mantissa,
+                // and `__builtin_fabsl(-3.5L)` returned 2.5e-4932. A real call
+                // gets the long-double ABI from the call path, which already
+                // carries one for `__mulxc3`.
+                let ld = self.types.longdouble_id;
+                Ok(self.libm_call("fabsl", ld, &[ld], arg, token_pos))
             })()),
             // Signbit builtins - test sign bit of floats
             crate::kw::BUILTIN_ISNAN
@@ -3275,31 +3359,35 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
+                let raw = Self::typed_expr(
                     ExprKind::Signbit { arg: Box::new(arg) },
                     self.types.int_id,
                     token_pos,
-                ))
+                );
+                Ok(self.normalise_predicate(raw, token_pos))
             })()),
             crate::kw::BUILTIN_SIGNBITF => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
+                let raw = Self::typed_expr(
                     ExprKind::Signbitf { arg: Box::new(arg) },
                     self.types.int_id,
                     token_pos,
-                ))
+                );
+                Ok(self.normalise_predicate(raw, token_pos))
             })()),
             crate::kw::BUILTIN_SIGNBITL => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Signbitl { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
+                // Same reason as `__builtin_fabsl`: the `Signbit64` emitter
+                // calls `__signbit`, which takes a `double`, so it tested bit 63
+                // of an x87 mantissa -- the explicit integer bit, set for every
+                // normal value -- and answered "negative" for positive numbers.
+                let ld = self.types.longdouble_id;
+                let raw = self.libm_call("__signbitl", self.types.int_id, &[ld], arg, token_pos);
+                Ok(self.normalise_predicate(raw, token_pos))
             })()),
             crate::kw::BUILTIN_COMPLEX => Some((|| {
                 // __builtin_complex(real, imag) - construct complex value
@@ -3338,8 +3426,13 @@ impl<'a> Parser<'a> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                // Check if the argument is a constant expression
-                let is_constant = self.eval_const_expr(&arg).is_some();
+                // Constant-ness, not integer-ness: `__builtin_constant_p(3.14)`
+                // is 1 in gcc. The integer folder deliberately refuses a
+                // floating literal, since 6.6 makes one an integer constant
+                // expression only as the operand of a cast, so the floating
+                // fold has to be asked as well.
+                let is_constant =
+                    self.eval_const_expr(&arg).is_some() || self.eval_const_f64(&arg).is_some();
                 Ok(Self::typed_expr(
                     ExprKind::IntLit(if is_constant { 1 } else { 0 }),
                     self.types.int_id,
@@ -4328,11 +4421,16 @@ impl<'a> Parser<'a> {
             // The type is the first in the list that can represent the value.
             let is_octal = !is_hex && num_str.starts_with('0') && num_str.len() > 1;
             let typ = if is_unsigned {
-                // Explicit U suffix
+                // Explicit U suffix. 6.4.4.1p5 still picks the *first* of
+                // `unsigned int`, `unsigned long`, `unsigned long long` that
+                // can represent the value; taking `unsigned int` regardless of
+                // magnitude gave `0xaaaaaaaaaaaaaaabu` a four-byte type, and
+                // once constants folded at their own width that truncated it.
                 match (is_longlong, is_long) {
                     (true, _) => self.types.ulonglong_id,
                     (false, true) => self.types.ulong_id,
-                    (false, false) => self.types.uint_id,
+                    (false, false) if value_u64 <= u32::MAX as u64 => self.types.uint_id,
+                    (false, false) => self.types.ulong_id,
                 }
             } else if is_hex || is_octal {
                 // Hex/octal without U suffix - use first type that fits (C99 6.4.4.1)
@@ -4879,6 +4977,83 @@ impl<'a> Parser<'a> {
     /// registers, so declaring these as variadic-from-argument-zero -- which
     /// is what an empty parameter list means -- put `__snprintf_chk`'s buffer,
     /// length, flag and size on the stack, where it does not look for them.
+    /// Reduce a predicate to 0 or 1.
+    ///
+    /// C17 7.12.3.6 lets `signbit` answer with *any* nonzero value, and the
+    /// library entry points take it literally -- `__signbitf` returns 8,
+    /// `__signbit` 128 and `__signbitl` 512, each being the sign bit still in
+    /// place. All conforming, none matching gcc's 0/1, and the three did not
+    /// even agree with one another. Comparing against zero costs one
+    /// instruction and removes a gratuitous difference.
+    fn normalise_predicate(&mut self, raw: Expr, pos: Position) -> Expr {
+        let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
+        Self::typed_expr(
+            ExprKind::Binary {
+                op: BinaryOp::Ne,
+                left: Box::new(raw),
+                right: Box::new(zero),
+            },
+            self.types.int_id,
+            pos,
+        )
+    }
+
+    /// Lower a one-argument math builtin to an ordinary call to the library
+    /// function that implements it, declaring that function if the translation
+    /// unit has not.
+    ///
+    /// Unlike `declare_chk_builtin`, the parameter types are *modelled*: that
+    /// one spells every parameter `unsigned long` because a pointer, a size and
+    /// a flag all classify the same way, which is false the moment an argument
+    /// is a `long double`.
+    ///
+    /// Falls back to the argument unchanged if the name cannot be interned,
+    /// which would mean `kw.rs` and this list had drifted apart.
+    fn libm_call(
+        &mut self,
+        name: &str,
+        ret_type: TypeId,
+        params: &[TypeId],
+        arg: Expr,
+        pos: Position,
+    ) -> Expr {
+        let Some(symbol_id) = self.declare_libm_function(name, ret_type, params) else {
+            return arg;
+        };
+        let func_type = self.symbols.get(symbol_id).typ;
+        let func_expr = Self::typed_expr(ExprKind::Ident(symbol_id), func_type, pos);
+        Self::typed_expr(
+            ExprKind::Call {
+                func: Box::new(func_expr),
+                args: vec![arg],
+            },
+            ret_type,
+            pos,
+        )
+    }
+
+    /// Declare `name` with a real prototype, reusing any existing declaration.
+    fn declare_libm_function(
+        &mut self,
+        name: &str,
+        ret_type: TypeId,
+        params: &[TypeId],
+    ) -> Option<SymbolId> {
+        let name_id = self.idents.lookup(name)?;
+        if let Some(existing) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
+            return Some(existing);
+        }
+        let func_type = self.types.intern(Type {
+            kind: TypeKind::Function,
+            base: Some(ret_type),
+            params: Some(params.to_vec()),
+            variadic: false,
+            ..Default::default()
+        });
+        let sym = Symbol::function(name_id, func_type, 0);
+        self.symbols.declare(sym).ok()
+    }
+
     fn declare_chk_builtin(&mut self, name: &str, ret_type: TypeId) -> Option<SymbolId> {
         // Pre-interned in `cc/kw.rs`; the identifier table is read-only here.
         let name_id = self.idents.lookup(name)?;

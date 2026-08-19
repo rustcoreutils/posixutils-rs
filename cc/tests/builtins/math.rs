@@ -155,9 +155,9 @@ int main(void) {
 ///
 /// `__builtin_isnan` and friends are lowered as comparisons rather than bit
 /// tests, which keeps them exact for `long double` and needs no backend work.
-/// They are deliberately not expressed with `fabs`: `__builtin_fabsl` still
-/// narrows a `long double` to a double, so a magnitude test through it would
-/// answer the wrong question at exactly the width that matters most.
+/// They were also deliberately not expressed with `fabs`, because
+/// `__builtin_fabsl` used to narrow a `long double` to a double -- that is
+/// #C121 and is fixed, but a comparison is still the cheaper lowering.
 ///
 /// Checked against gcc on the same source at -O0 and -O2.
 #[test]
@@ -281,4 +281,60 @@ int main(void)
 }
 "#;
     assert_eq!(compile_and_run("builtins_isnan_is_one", code, &[]), 0);
+}
+
+/// `__builtin_fabsl` and `__builtin_signbitl` operate on a `long double`, not
+/// on its low eight bytes (#C121).
+///
+/// Both lowered to the *`double`* opcode, whose emitter moves the argument as a
+/// `double` and calls `fabs` / `__signbit`. On x86-64 a `long double` is the
+/// 80-bit x87 format, so that read its mantissa:
+/// `__builtin_fabsl(-3.5L)` returned **2.5e-4932**. They are ordinary calls to
+/// `fabsl` and `__signbitl` now, which gets the long-double ABI from the call
+/// path that already carries one for `__mulxc3`.
+///
+/// The `signbit` family is also normalised to 0/1. C17 7.12.3.6 permits any
+/// nonzero value and the library entry points return the sign bit in place --
+/// 8, 128 and 512 for the three widths, which did not even agree with each
+/// other. gcc is no more consistent: on x86-64 it answers 512 for a runtime
+/// `long double` and 1 for a constant one, and on aarch64 it answers 1 for
+/// both. Everything here is conforming; 0/1 is merely predictable.
+#[test]
+fn builtins_long_double_magnitude_and_sign() {
+    let code = r#"
+int main(void) {
+    /* Through an array so the value is not folded at compile time -- the
+       constant form was always right, which is what hid this. */
+    long double v[] = { -3.5L, 3.5L, -0.0L, 0.0L };
+
+    if (__builtin_fabsl(v[0]) != 3.5L) return 1;
+    if (__builtin_fabsl(v[1]) != 3.5L) return 2;
+    if (__builtin_fabsl(v[2]) != 0.0L) return 3;
+
+    if (__builtin_signbitl(v[0]) != 1) return 4;
+    if (__builtin_signbitl(v[1]) != 0) return 5;
+    if (__builtin_signbitl(v[2]) != 1) return 6;      /* -0.0 is negative */
+    if (__builtin_signbitl(v[3]) != 0) return 7;
+
+    /* fabsl clears the sign, so the result is never negative. */
+    if (__builtin_signbitl(__builtin_fabsl(v[0])) != 0) return 8;
+    if (__builtin_signbitl(__builtin_fabsl(v[2])) != 0) return 9;
+
+    /* The narrower widths, which were already right, and their 0/1 answers. */
+    double d[] = { -2.5, 2.5 };
+    float  f[] = { -1.5f, 1.5f };
+    if (__builtin_fabs(d[0]) != 2.5) return 10;
+    if (__builtin_fabsf(f[0]) != 1.5f) return 11;
+    if (__builtin_signbit(d[0]) != 1) return 12;
+    if (__builtin_signbit(d[1]) != 0) return 13;
+    if (__builtin_signbitf(f[0]) != 1) return 14;
+    if (__builtin_signbitf(f[1]) != 0) return 15;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("long_double_magnitude", code, &["-lm".to_string()]),
+        0
+    );
 }

@@ -404,3 +404,68 @@ int main(void)
         0
     );
 }
+
+/// Constant folding of floating comparisons and unsigned comparisons (#C114).
+///
+/// Two wrong answers from one place: the parser's constant folder, which
+/// evaluates array sizes, enumerators, `case` labels and `_Static_assert`.
+///
+/// It truncated a floating literal to `i128` before folding, so `1.5 > 1.0`
+/// became `1 > 1` and was **false** -- `enum E { X = 1.5 > 1.0 }` was 0 and
+/// `int a[1.5 > 1.0 ? 4 : 8]` took the wrong branch. And it compared signed
+/// whatever the operand types, so `(unsigned)-1 > 0` was **false** too.
+/// Neither is exotic; both silently produce a different program.
+///
+/// The runtime rows are the control: the same expressions were always right
+/// when they reached code generation, which is what made the folder's
+/// disagreement invisible.
+#[test]
+fn c99_constant_folding_of_float_and_unsigned_comparisons() {
+    let code = r#"
+/* Floating comparisons, in every context the parser folds. */
+enum FloatCmp { GT = 1.5 > 1.0, LT = 1.0 < 1.5, EQ = 2.0 == 2.0,
+                NE = 2.0 != 3.0, GE = 1.0 >= 1.0, LE = 2.0 <= 1.0,
+                MIXED = 1 < 1.5, LD = 1.5L > 1.0L, DIVCMP = 1.0/4.0 < 0.5 };
+int chosen[1.5 > 1.0 ? 4 : 8];
+
+/* A cast from floating arithmetic truncates the floating value, so the
+   arithmetic under it has to be done in floating point. */
+enum FloatCast { SUM = (int)(1.5 + 1.5), DIV = (int)(7.0/2.0),
+                 NEG = (int)(-3.7), LIT = (int)3.9 };
+int scaled[(int)(2.5 * 2)];
+
+/* Unsigned comparisons; C promotes to the common type before comparing. */
+enum UnsignedCmp { UMAX = (unsigned)-1 > 0, ULMAX = 0xFFFFFFFFFFFFFFFFULL > 1,
+                   UEQ = 1u == 1, SNEG = -1 > 0, SLE = -1 <= 0 };
+int usized[((unsigned)-1 > 0) ? 4 : 8];
+
+_Static_assert(1.5 > 1.0, "floating comparison folds");
+_Static_assert(1.5 + 1.5 == 3.0, "floating arithmetic folds");
+_Static_assert((unsigned)-1 > 0, "unsigned comparison folds");
+
+int main(void) {
+    if (GT != 1 || LT != 1 || EQ != 1 || NE != 1) return 1;
+    if (GE != 1 || LE != 0) return 2;
+    if (MIXED != 1 || LD != 1 || DIVCMP != 1) return 3;
+    if (sizeof chosen / sizeof chosen[0] != 4) return 4;
+
+    if (SUM != 3 || DIV != 3 || NEG != -3 || LIT != 3) return 5;
+    if (sizeof scaled / sizeof scaled[0] != 5) return 6;
+
+    if (UMAX != 1 || ULMAX != 1 || UEQ != 1) return 7;
+    if (SNEG != 0 || SLE != 1) return 8;
+    if (sizeof usized / sizeof usized[0] != 4) return 9;
+
+    /* The control: at run time these were always right, which is why the
+       folder disagreeing with them went unnoticed. */
+    double a = 1.5, b = 1.0;
+    unsigned u = (unsigned)-1;
+    if (!(a > b)) return 10;
+    if (!(u > 0)) return 11;
+    if ((int)(a + a) != 3) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("const_fold_float_unsigned", code, &[]), 0);
+}

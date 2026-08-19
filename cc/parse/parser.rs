@@ -12,9 +12,9 @@
 
 use super::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, InitDeclarator, InitElement, OffsetOfPath, Parameter, Stmt,
-    TranslationUnit, UnaryOp,
+    ForInit, FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, TranslationUnit, UnaryOp,
 };
+use crate::constexpr::ConstScope;
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind, SymbolTable};
@@ -560,6 +560,11 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pending_alignas: Option<u32>,
+    /// The machine mode named by `__attribute__((mode(M)))` on the declaration
+    /// being parsed, and where it was written. Held like `pending_alignas`
+    /// because the attribute is seen while the declarator is being consumed and
+    /// can only be applied once the type is final.
+    pending_mode: Option<(String, Position)>,
     /// File-scope object definitions whose type was incomplete when parsed.
     /// Judged at end of translation unit -- see
     /// [`Self::check_deferred_incomplete_definitions`].
@@ -656,6 +661,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_mode: None,
             tentative_definitions: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
@@ -1068,18 +1074,11 @@ impl<'a> Parser<'a> {
                     "'{0}' attribute is not implemented, and ignoring it would change the type",
                     &[&name],
                 );
-            } else if name.trim_matches('_') == "mode"
-                && diag::warning_group_enabled(ATTRIBUTE_WARNING)
-            {
-                // Also changes the type -- `register_t` is declared with
-                // `__mode__(__word__)` -- but glibc puts it in `sys/types.h`
-                // and `floatn.h`, so refusing would reject every program that
-                // includes them. Said out loud instead of silently dropped.
-                diag::warning_args(
-                    pos,
-                    "'{0}' attribute is not implemented; the declared type is used unchanged",
-                    &[&name],
-                );
+            } else if name.trim_matches('_') == "mode" {
+                // Applied below, once the argument is parsed: a mode replaces
+                // the declared type, and getting it wrong is not cosmetic --
+                // glibc declares `register_t` with `__mode__(__word__)`, which
+                // c17 sized 4 bytes against gcc's 8 while this was a warning.
             } else if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
                 diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
             }
@@ -1106,6 +1105,11 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
 
+            if name.trim_matches('_') == "mode" {
+                if let Some(AttributeArg::Ident(m)) = args.first() {
+                    self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
+                }
+            }
             Some(Attribute::with_args(name, args))
         } else {
             Some(Attribute::new(name))
@@ -1505,6 +1509,86 @@ impl<'a> Parser<'a> {
         }
         if found.visibility.is_some() {
             self.pending_symbol_attrs.visibility = found.visibility;
+        }
+    }
+
+    /// Apply `__attribute__((mode(M)))` to a declared type.
+    ///
+    /// A machine mode names a width, and the attribute replaces the declared
+    /// type with the one of that width in the same family -- keeping the
+    /// declared signedness, so `typedef unsigned u8 __attribute__((mode(QI)));`
+    /// is unsigned and the `int` spelling is signed. glibc's `register_t` is
+    /// `__mode__(__word__)`, which is why leaving this unimplemented sized it
+    /// 4 bytes against gcc's 8.
+    ///
+    /// An unrecognised mode -- `V4SF` and the other vector modes, which need
+    /// vector types -- keeps the warning, because ignoring it would silently
+    /// change what the program computes.
+    fn apply_pending_mode(&mut self, typ: TypeId) -> TypeId {
+        let Some((mode, pos)) = self.pending_mode.take() else {
+            return typ;
+        };
+        let unsigned = self.types.is_unsigned(typ);
+        let t = &self.types;
+        let mapped = match mode.as_str() {
+            // Integer modes, named for their width in bytes.
+            "QI" => Some(if unsigned { t.uchar_id } else { t.schar_id }),
+            "HI" => Some(if unsigned { t.ushort_id } else { t.short_id }),
+            "SI" => Some(if unsigned { t.uint_id } else { t.int_id }),
+            "DI" | "word" | "pointer" => Some(if unsigned { t.ulong_id } else { t.long_id }),
+            "TI" => Some(if unsigned { t.uint128_id } else { t.int128_id }),
+            // Floating modes. `XF` is the x87 extended format and `TF` IEEE
+            // binary128 -- both sixteen bytes on x86-64 and *not*
+            // interchangeable, so they map to their own types rather than to a
+            // width.
+            //
+            // The binary128 modes are offered only where the type is. c17 does
+            // not support `_Float128` on macOS and deliberately predefines no
+            // `__FLT128_*` family there, so that `<float.h>` cannot advertise a
+            // type whose every operation fails to link. Handing the same type
+            // back through a mode attribute defeated that: `mode(TF)` on Apple
+            // arm64 produced a type needing `__divtf3` and `__multf3`, which
+            // that platform has no equivalent of. `has_float128` is the one
+            // condition both places ask.
+            "HF" => Some(t.float16_id),
+            "SF" => Some(t.float_id),
+            "DF" => Some(t.double_id),
+            "XF" => Some(t.longdouble_id),
+            "TF" if t.has_float128() => Some(t.float128_id),
+            // Complex modes, named for the format of each half. glibc's
+            // <bits/floatn.h> declares `__cfloat128` with `mode(TC)`, which was
+            // 285 of the warnings a CPython build produced.
+            "HC" => Some(t.complex_float16_id),
+            "SC" => Some(t.complex_float_id),
+            "DC" => Some(t.complex_double_id),
+            "XC" => Some(t.complex_longdouble_id),
+            "TC" if t.has_float128() => Some(t.complex_float128_id),
+            _ => None,
+        };
+        match mapped {
+            Some(m) => {
+                // The declared type's qualifiers survive; only its width and
+                // family change.
+                let quals = self.types.modifiers(typ)
+                    & (TypeModifiers::CONST | TypeModifiers::VOLATILE | TypeModifiers::ATOMIC);
+                if quals.is_empty() {
+                    m
+                } else {
+                    let mut q = self.types.get(m).clone();
+                    q.modifiers |= quals;
+                    self.types.intern(q)
+                }
+            }
+            None => {
+                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+                    diag::warning_args(
+                        pos,
+                        "'mode({0})' is not implemented; the declared type is used unchanged",
+                        &[&mode],
+                    );
+                }
+                typ
+            }
         }
     }
 
@@ -1987,74 +2071,6 @@ impl Parser<'_> {
         }
     }
 
-    /// Parse a declaration and bind to symbol table
-    ///
-    /// Used for testing declarations in isolation.
-    #[cfg(test)]
-    pub(crate) fn parse_declaration(&mut self) -> ParseResult<Declaration> {
-        // Parse type specifiers
-        let base_type = self.parse_type_specifier()?;
-        // Skip __attribute__ between type and declarator (GCC extension)
-        self.skip_extensions();
-        let base_type_id = self.types.intern(base_type);
-
-        // Parse declarators
-        let mut declarators = Vec::new();
-
-        // Check for struct/union/enum-only declaration (no declarators)
-        // e.g., "struct point { int x; int y; };"
-        if !self.is_special(b';') {
-            loop {
-                let decl_pos = self.current_pos();
-                let (name, typ, vla_sizes, _func_params) =
-                    self.parse_declarator(base_type_id, DeclaratorName::Required)?;
-                // Skip GCC extensions like __asm("...") or __attribute__((...))
-                self.skip_extensions();
-                let init = if self.is_special(b'=') {
-                    self.advance();
-                    Some(self.parse_initializer()?)
-                } else {
-                    None
-                };
-
-                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-                let validated_align = self.validated_explicit_align(typ)?;
-
-                // Declare symbol in symbol table
-                let symbol = self
-                    .symbols
-                    .declare(
-                        crate::symbol::Symbol::variable(name, typ, self.symbols.depth())
-                            .with_align(validated_align),
-                    )
-                    .expect("symbol declaration failed in test");
-
-                declarators.push(InitDeclarator {
-                    symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                    symbol,
-                    typ,
-                    storage_class: TypeModifiers::empty(),
-                    init,
-                    vla_sizes,
-                    explicit_align: validated_align,
-                    pos: decl_pos,
-                });
-
-                if self.is_special(b',') {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Clear pending alignment after declaration
-        self.pending_alignas = None;
-        self.expect_special(b';')?;
-
-        Ok(Declaration { declarators })
-    }
-
     /// Parse a declaration and bind variables to symbol table
     ///
     /// Binds each declared variable to the symbol table immediately during
@@ -2232,6 +2248,57 @@ impl Parser<'_> {
     /// fields (C17 6.7.9p20) -- so `int a[][2] = {1,2,3,4}` names two rows,
     /// not four. Counting list elements instead sized the object at twice
     /// what the linearizer then filled.
+    /// C17 6.7.6.2p1: an array's size expression shall have integer type.
+    ///
+    /// Without this the non-constant fallback took over and `int a[1.5];`
+    /// became a variable length array at block scope -- accepted, and sized
+    /// from a `double` -- where gcc says *"size of array has non-integer
+    /// type"*. At file scope it read as a VLA rejection, which is a different
+    /// reason and the wrong one.
+    fn check_array_size_type(&self, expr: &Expr, pos: Position) -> ParseResult<()> {
+        match expr.typ {
+            Some(t) if !self.types.is_integer(t) => Err(ParseError::new(
+                "size of array has non-integer type".to_string(),
+                pos,
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Derive an array type, refusing an extent the compiler cannot describe.
+    ///
+    /// `TypeTable::size_bits` answers in a `u32`, so an object wider than
+    /// `u32::MAX` bits has no representable size. That used to saturate in
+    /// silence: `char big[5000000000];` reported `sizeof` 536870911 with no
+    /// diagnostic anywhere. The bound is enforced here, where the element
+    /// type is known, so the outer dimension of a multi-dimensional array is
+    /// measured against an inner one that is already within it.
+    fn derive_array_type(
+        &mut self,
+        elem: TypeId,
+        size: Option<usize>,
+        pos: Position,
+    ) -> Result<TypeId, ParseError> {
+        if let Some(count) = size {
+            let total = (count as u128) * (self.types.size_bytes(elem) as u128);
+            if total > TypeTable::MAX_OBJECT_BYTES as u128 {
+                return Err(ParseError::new(
+                    format!(
+                        "size of array exceeds the maximum object size of {} bytes",
+                        TypeTable::MAX_OBJECT_BYTES
+                    ),
+                    pos,
+                ));
+            }
+        }
+        Ok(self.types.intern(Type {
+            kind: TypeKind::Array,
+            base: Some(elem),
+            array_size: size,
+            ..Default::default()
+        }))
+    }
+
     pub(crate) fn array_size_from_elements(
         &self,
         elements: &[InitElement],
@@ -2379,6 +2446,7 @@ impl Parser<'_> {
                 let has_name = !self.str(name).is_empty();
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                typ = self.apply_pending_mode(typ);
                 let validated_align = self.validated_explicit_align(typ)?;
 
                 // Bind variable to symbol table BEFORE parsing initializer.
@@ -2389,7 +2457,8 @@ impl Parser<'_> {
                 if has_name && !is_typedef {
                     self.check_redeclaration(name, typ, decl_pos);
                     let sym = Symbol::variable(name, typ, self.symbols.depth())
-                        .with_align(validated_align);
+                        .with_align(validated_align)
+                        .with_variably_modified_array(!vla_sizes.is_empty());
                     if let Ok(id) = self.symbols.declare(sym) {
                         symbol_id = Some(id);
                     }
@@ -2467,6 +2536,9 @@ impl Parser<'_> {
                             decl_pos,
                         ));
                     }
+                    // A mode replaces the type; alignment then attaches to
+                    // whatever the type ended up being.
+                    typ = self.apply_pending_mode(typ);
                     // Apply __attribute__((aligned(N))) to typedef type
                     if let Some(align) = self.pending_alignas {
                         let mut aligned_type = self.types.get(typ).clone();
@@ -2514,6 +2586,9 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
         self.expect_special(b';')?;
 
         Ok(Declaration { declarators })
@@ -3252,7 +3327,18 @@ impl Parser<'_> {
             } else if fits(0, u64::MAX as i128) {
                 (self.types.ulong_id, 8)
             } else {
-                unreachable!("a non-negative maximum always fits u64 or overflows i128")
+                // Not unreachable, as this once claimed: nothing clamps an
+                // enumerator to 64 bits and the folder computes in `i128`, so
+                // `enum E { A = 1 << 64 };` reached here and **panicked the
+                // compiler**. gcc warns and carries on, folding the shift to 0
+                // because it truncates to the expression's type -- which c17's
+                // folders do not yet do (see #C115). Until they do, say what is
+                // wrong rather than aborting: a compiler diagnoses.
+                diag::error(
+                    pos,
+                    &gettext("no integer type can represent all values of this enumeration"),
+                );
+                (self.types.ulong_id, 8)
             }
         } else if fits(i32::MIN as i128, i32::MAX as i128) {
             (self.types.int_id, 4)
@@ -3440,6 +3526,7 @@ impl Parser<'_> {
     /// struct-or-union-specifier: ('struct'|'union') identifier? '{' struct-declaration-list? '}'
     ///                          | ('struct'|'union') identifier
     pub(crate) fn parse_struct_or_union_specifier(&mut self, is_union: bool) -> ParseResult<Type> {
+        let specifier_pos = self.current_pos();
         self.advance(); // consume 'struct' or 'union'
 
         // Parse __attribute__ between 'struct' keyword and tag name
@@ -3683,6 +3770,19 @@ impl Parser<'_> {
                 size
             };
 
+            // The same bound `derive_array_type` enforces: a member list can
+            // reach it even when no single member does.
+            if size > TypeTable::MAX_OBJECT_BYTES {
+                return Err(ParseError::new(
+                    format!(
+                        "size of {} exceeds the maximum object size of {} bytes",
+                        if is_union { "union" } else { "struct" },
+                        TypeTable::MAX_OBJECT_BYTES
+                    ),
+                    specifier_pos,
+                ));
+            }
+
             let composite = CompositeType {
                 tag,
                 members,
@@ -3871,9 +3971,10 @@ impl Parser<'_> {
 
         // Handle array declarators - collect all dimensions first
         // Also track VLA expressions (non-constant size) for each dimension
-        let mut dimensions: Vec<Option<usize>> = Vec::new();
+        let mut dimensions: Vec<(Option<usize>, Position)> = Vec::new();
         let mut vla_exprs: Vec<Expr> = Vec::new();
         while self.is_special(b'[') {
+            let dim_pos = self.current_pos();
             self.advance();
 
             // Parse optional qualifiers and static (C99 6.7.5.3)
@@ -3923,6 +4024,7 @@ impl Parser<'_> {
                             ));
                         }
                         None => {
+                            self.check_array_size_type(&expr, size_pos)?;
                             vla_exprs.push(expr);
                             None
                         }
@@ -3946,13 +4048,14 @@ impl Parser<'_> {
                     }
                     None => {
                         // Non-constant (VLA) - save expression for VLA handling
+                        self.check_array_size_type(&expr, size_pos)?;
                         vla_exprs.push(expr);
                         None
                     }
                 }
             };
             self.expect_special(b']')?;
-            dimensions.push(size);
+            dimensions.push((size, dim_pos));
         }
 
         // Handle function declarators: void (*fp)(int, char)
@@ -4009,14 +4112,8 @@ impl Parser<'_> {
 
             // Apply array dimensions to result type
             // For int *(*q)[3]: result is Pointer(int) -> Array(3, Pointer(int))
-            for size in dimensions.into_iter().rev() {
-                let arr_type = Type {
-                    kind: TypeKind::Array,
-                    base: Some(result_type_id),
-                    array_size: size,
-                    ..Default::default()
-                };
-                result_type_id = self.types.intern(arr_type);
+            for (size, pos) in dimensions.into_iter().rev() {
+                result_type_id = self.derive_array_type(result_type_id, size, pos)?;
             }
 
             // Substitute into inner declarator
@@ -4044,14 +4141,8 @@ impl Parser<'_> {
 
             // Then apply array dimensions
             // For char *arr[3]: result_type is char*, suffix [3] -> Array(3, char*)
-            for size in dimensions.into_iter().rev() {
-                let arr_type = Type {
-                    kind: TypeKind::Array,
-                    base: Some(result_type_id),
-                    array_size: size,
-                    ..Default::default()
-                };
-                result_type_id = self.types.intern(arr_type);
+            for (size, pos) in dimensions.into_iter().rev() {
+                result_type_id = self.derive_array_type(result_type_id, size, pos)?;
             }
 
             // Apply function parameters if present (for function declarators)
@@ -4148,108 +4239,6 @@ impl Parser<'_> {
             }
             _ => decl_type_id, // Other types don't need substitution
         }
-    }
-
-    /// Parse a function definition
-    ///
-    /// Binds the function to the symbol table at global scope, then enters
-    /// a new scope for the function body and binds all parameters in that
-    /// scope.
-    #[cfg(test)]
-    pub(crate) fn parse_function_def(&mut self) -> ParseResult<FunctionDef> {
-        let func_pos = self.current_pos();
-        // Parse return type
-        let return_type = self.parse_type_specifier()?;
-        let mut ret_type_id = self.types.intern(return_type);
-
-        // Handle pointer in return type with qualifiers
-        while self.is_special(b'*') {
-            self.advance();
-            let mut ptr_modifiers = TypeModifiers::empty();
-
-            ptr_modifiers |= self.parse_pointer_qualifiers();
-
-            let ptr_type = Type {
-                kind: TypeKind::Pointer,
-                modifiers: ptr_modifiers,
-                base: Some(ret_type_id),
-                ..Default::default()
-            };
-            ret_type_id = self.types.intern(ptr_type);
-        }
-
-        // Parse function name
-        let name = self.expect_declarator_name()?;
-
-        // Parse parameter list
-        self.expect_special(b'(')?;
-        let param_list = self.parse_parameter_list()?;
-        let raw_params = param_list.params;
-        self.expect_special(b')')?;
-
-        // Build the function type
-        let param_types: Vec<TypeId> = raw_params.iter().map(|p| p.typ).collect();
-        let func_type = FuncSignature {
-            param_types,
-            variadic: param_list.variadic,
-            prototyped: param_list.prototyped,
-        }
-        .into_type(ret_type_id);
-        let func_type_id = self.types.intern(func_type);
-
-        // Bind function to symbol table at current (global) scope
-        self.check_redeclaration(name, func_type_id, self.current_pos());
-        let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
-        let _ = self.symbols.declare(func_sym); // Ignore redefinition errors for now
-
-        // Enter function scope for parameters and body
-        self.symbols.enter_scope();
-
-        // Bind parameters in function scope and create Parameter structs
-        let mut params = Vec::with_capacity(raw_params.len());
-        for raw in &raw_params {
-            let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
-            params.push(Parameter {
-                symbol: symbol_id,
-                typ: raw.typ,
-                vm_dims: raw.vm_dims.clone(),
-            });
-        }
-
-        // Parse function body (block handles its own scope for locals)
-        let body = self.parse_block_stmt_no_scope()?;
-
-        // Leave function scope
-        self.symbols.leave_scope();
-
-        Ok(FunctionDef {
-            attrs: Default::default(),
-            return_type: ret_type_id,
-            name,
-            params,
-            body,
-            pos: func_pos,
-            is_static: false, // Test function, storage class not parsed
-            is_inline: false,
-            calling_conv: crate::abi::CallingConv::default(),
-        })
-    }
-
-    /// Count the array levels of `typ` whose extent is not a compile-time
-    /// constant, i.e. how many run-time dimension expressions the type needs.
-    fn variable_array_levels(&self, typ: TypeId) -> usize {
-        let mut levels = 0;
-        let mut cur = Some(typ);
-        while let Some(t) = cur {
-            if self.types.kind(t) != TypeKind::Array {
-                break;
-            }
-            if self.types.get(t).array_size.is_none() {
-                levels += 1;
-            }
-            cur = self.types.get(t).base;
-        }
-        levels
     }
 
     /// Parse a parameter list, returning raw parameter info (name and type)
@@ -4379,7 +4368,7 @@ impl Parser<'_> {
             let elem_typ = self.types.get(typ_id).base;
             let vm_dims = match elem_typ {
                 Some(elem) => {
-                    let want = self.variable_array_levels(elem);
+                    let want = self.types.unsized_array_levels(elem);
                     let skip = vla_sizes.len().saturating_sub(want);
                     vla_sizes[skip..].to_vec()
                 }
@@ -4418,7 +4407,8 @@ impl Parser<'_> {
             // Declare parameter in temporary scope so later params can reference it
             // (C99 6.9.1p9: parameters are in scope for VLA sizes)
             if let Some(name) = name_opt {
-                let sym = Symbol::parameter(name, typ_id, self.symbols.depth());
+                let sym = Symbol::parameter(name, typ_id, self.symbols.depth())
+                    .with_variably_modified_array(!vla_sizes.is_empty());
                 // 6.9.1p5: no two parameters may share a name. `declare`
                 // reports it and the `Err` was dropped, leaving the second
                 // parameter with no symbol at all -- so the function compiled
@@ -4597,9 +4587,12 @@ impl Parser<'_> {
     }
 
     /// Parse an external declaration (function definition or declaration)
-    fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+    pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
         // Clear pending alignment from previous declaration
         self.pending_alignas = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
         self.pending_fn_attrs = Default::default();
         // And any asm label the previous declaration left behind.
         //
@@ -4786,11 +4779,15 @@ impl Parser<'_> {
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                typ = self.apply_pending_mode(typ);
                 let validated_align = self.validated_explicit_align(typ)?;
 
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same variable at file scope
                 let symbol_id = if is_typedef {
+                    // A mode replaces the type; alignment then attaches to
+                    // whatever the type ended up being.
+                    typ = self.apply_pending_mode(typ);
                     // Apply __attribute__((aligned(N))) to typedef type
                     if let Some(align) = self.pending_alignas {
                         let mut aligned_type = self.types.get(typ).clone();
@@ -4883,7 +4880,7 @@ impl Parser<'_> {
             if self.is_grouped_declarator() {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
-                let (name, full_typ, vla_sizes, decl_func_params) =
+                let (name, mut full_typ, vla_sizes, decl_func_params) =
                     self.parse_declarator(typ_id, DeclaratorName::Required)?;
 
                 // C99 6.7.5.2: VLAs must have block scope
@@ -4980,6 +4977,7 @@ impl Parser<'_> {
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+                full_typ = self.apply_pending_mode(full_typ);
                 let validated_align = self.validated_explicit_align(full_typ)?;
 
                 // Add to symbol table and capture SymbolId
@@ -5202,8 +5200,9 @@ impl Parser<'_> {
         // second-declarator paths. Here every unusable size folded to
         // `unwrap_or(0)`, so the declaration was accepted and sized zero.
         let mut var_type_id = typ_id;
-        let mut dimensions: Vec<Option<usize>> = Vec::new();
+        let mut dimensions: Vec<(Option<usize>, Position)> = Vec::new();
         while self.is_special(b'[') {
+            let dim_pos = self.current_pos();
             self.advance();
             let size = if self.is_special(b']') {
                 // No size given at all: an incomplete type, which is a
@@ -5229,6 +5228,7 @@ impl Parser<'_> {
                     // variably modified, which 6.7.6.2p2 confines to block
                     // scope.
                     None => {
+                        self.check_array_size_type(&arr_expr, size_pos)?;
                         return Err(ParseError::new(
                             "variable length arrays cannot have file scope".to_string(),
                             size_pos,
@@ -5237,12 +5237,17 @@ impl Parser<'_> {
                 }
             };
             self.expect_special(b']')?;
-            dimensions.push(size);
+            dimensions.push((size, dim_pos));
         }
-        // Build type from right to left (innermost dimension first)
-        for size in dimensions.into_iter().rev() {
-            let arr_type = Type::array(var_type_id, size.unwrap_or(0));
-            var_type_id = self.types.intern(arr_type);
+        // Build type from right to left (innermost dimension first).
+        //
+        // An absent extent stays `None`, as `parse_declarator` records it.
+        // Collapsing it to `Some(0)` here made `int a[];` indistinguishable
+        // from the GNU zero-length `int a[0];`, so the two declarator paths
+        // disagreed about what "incomplete" looks like and `sizeof a` could
+        // not tell them apart.
+        for (size, pos) in dimensions.into_iter().rev() {
+            var_type_id = self.derive_array_type(var_type_id, size, pos)?;
         }
 
         // Propagate storage class modifiers from base type to derived array type
@@ -5270,6 +5275,7 @@ impl Parser<'_> {
         self.skip_extensions_after_declarator();
 
         // Validate explicit alignment (C11 6.7.5: >= natural alignment)
+        var_type_id = self.apply_pending_mode(var_type_id);
         let validated_align = self.validated_explicit_align(var_type_id)?;
 
         // 6.7p7 for a file-scope *definition*. Judged at end of translation
@@ -5317,9 +5323,24 @@ impl Parser<'_> {
                 Ok(id) => id,
                 Err(_) => {
                     // Extern declaration of existing variable - reuse existing symbol
-                    self.symbols
+                    let existing = self
+                        .symbols
                         .lookup_id(name, Namespace::Ordinary)
-                        .expect("redeclaration should find existing symbol")
+                        .expect("redeclaration should find existing symbol");
+                    // 6.2.7p4: the composite of two compatible array types has
+                    // whichever extent is known, so a later declaration
+                    // completes an earlier `extern int a[];`. Keeping the first
+                    // type left the object incomplete for good, and `sizeof a`
+                    // after `int a[4];` was refused.
+                    if self
+                        .types
+                        .unsized_array_levels(self.symbols.get(existing).typ)
+                        > 0
+                        && self.types.unsized_array_levels(var_type_id) == 0
+                    {
+                        self.symbols.get_mut(existing).typ = var_type_id;
+                    }
+                    existing
                 }
             })
         };
@@ -5365,6 +5386,7 @@ impl Parser<'_> {
 
         // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
         if is_typedef {
+            var_type_id = self.apply_pending_mode(var_type_id);
             // Apply __attribute__((aligned(N))) to typedef type
             if let Some(align) = self.pending_alignas {
                 let mut aligned_type = self.types.get(var_type_id).clone();
@@ -5419,6 +5441,7 @@ impl Parser<'_> {
             }
 
             // Validate explicit alignment for this declarator's type (C11 6.7.5)
+            decl_type = self.apply_pending_mode(decl_type);
             let decl_validated_align = self.validated_explicit_align(decl_type)?;
 
             // Bind variable to symbol table BEFORE parsing initializer (C99 6.2.1p7)
@@ -5505,214 +5528,61 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
 
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
     }
 
-    /// Evaluate a constant expression (for array sizes, enum values, case labels, static initializers)
+    /// The `f64` value of a constant floating subexpression.
     ///
-    /// C99 6.6 defines integer constant expressions as:
-    /// - Integer/character literals
-    /// - Enum constants
-    /// - sizeof expressions
-    /// - Casts to integer types
-    /// - Unary/binary operators with constant operands
-    /// - Conditional expressions with constant operands
-    pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
+    /// Only reached from a comparison, whose result is an integer -- the
+    /// arithmetic itself is folded at full width by the linearizer's
+    /// `eval_const_float_expr` for anything that survives to code generation.
+    /// `f64` is enough to decide an ordering that `i128` truncation was
+    /// getting wrong.
+    pub(crate) fn eval_const_f64(&self, expr: &Expr) -> Option<f64> {
         match &expr.kind {
-            ExprKind::IntLit(val) => Some(*val as i128),
-            ExprKind::Int128Lit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as i128),
-            // Float literals are constant, return truncated value
-            ExprKind::FloatLit(val) => Some(val.to_f64() as i128),
-
-            // The address of a member of a pointer constant is an integer
-            // constant; see `eval_pointer_constant`.
+            ExprKind::FloatLit(v) => Some(v.to_f64()),
+            ExprKind::IntLit(v) => Some(*v as f64),
+            ExprKind::CharLit(c) => Some(*c as u32 as f64),
+            ExprKind::Cast { expr: inner, .. } => {
+                let v = self.eval_const_f64(inner)?;
+                // A cast to an integer type truncates before the comparison.
+                match expr.typ {
+                    Some(t) if self.types.is_integer(t) => Some(v.trunc()),
+                    _ => Some(v),
+                }
+            }
             ExprKind::Unary {
-                op: UnaryOp::AddrOf,
+                op: UnaryOp::Neg,
                 operand,
-            } => self.eval_pointer_constant(operand),
-
-            ExprKind::Unary { op, operand } => {
-                let val = self.eval_const_expr(operand)?;
+            } => Some(-self.eval_const_f64(operand)?),
+            ExprKind::Binary { op, left, right } => {
+                let l = self.eval_const_f64(left)?;
+                let r = self.eval_const_f64(right)?;
                 match op {
-                    UnaryOp::Neg => Some(val.wrapping_neg()),
-                    UnaryOp::Not => Some(if val == 0 { 1 } else { 0 }),
-                    UnaryOp::BitNot => Some(!val),
+                    BinaryOp::Add => Some(l + r),
+                    BinaryOp::Sub => Some(l - r),
+                    BinaryOp::Mul => Some(l * r),
+                    BinaryOp::Div if r != 0.0 => Some(l / r),
                     _ => None,
                 }
             }
-
-            ExprKind::Binary { op, left, right } => {
-                let lval = self.eval_const_expr(left)?;
-                let rval = self.eval_const_expr(right)?;
-                match op {
-                    BinaryOp::Add => Some(lval.wrapping_add(rval)),
-                    BinaryOp::Sub => Some(lval.wrapping_sub(rval)),
-                    BinaryOp::Mul => Some(lval.wrapping_mul(rval)),
-                    BinaryOp::Div => {
-                        if rval != 0 {
-                            Some(lval / rval)
-                        } else {
-                            None
-                        }
-                    }
-                    BinaryOp::Mod => {
-                        if rval != 0 {
-                            Some(lval % rval)
-                        } else {
-                            None
-                        }
-                    }
-                    BinaryOp::BitAnd => Some(lval & rval),
-                    BinaryOp::BitOr => Some(lval | rval),
-                    BinaryOp::BitXor => Some(lval ^ rval),
-                    BinaryOp::Shl => Some(lval.wrapping_shl(rval as u32)),
-                    BinaryOp::Shr => Some(lval.wrapping_shr(rval as u32)),
-                    BinaryOp::Lt => Some(if lval < rval { 1 } else { 0 }),
-                    BinaryOp::Le => Some(if lval <= rval { 1 } else { 0 }),
-                    BinaryOp::Gt => Some(if lval > rval { 1 } else { 0 }),
-                    BinaryOp::Ge => Some(if lval >= rval { 1 } else { 0 }),
-                    BinaryOp::Eq => Some(if lval == rval { 1 } else { 0 }),
-                    BinaryOp::Ne => Some(if lval != rval { 1 } else { 0 }),
-                    BinaryOp::LogAnd => Some(if lval != 0 && rval != 0 { 1 } else { 0 }),
-                    BinaryOp::LogOr => Some(if lval != 0 || rval != 0 { 1 } else { 0 }),
-                }
-            }
-
-            ExprKind::Ident(symbol_id) => {
-                // Check for enum constant
-                let sym = self.symbols.get(*symbol_id);
-                if sym.is_enum_constant() {
-                    sym.enum_value
-                } else {
-                    None
-                }
-            }
-
-            ExprKind::FuncName => None,
-
-            ExprKind::Conditional {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                let cond_val = self.eval_const_expr(cond)?;
-                if cond_val != 0 {
-                    self.eval_const_expr(then_expr)
-                } else {
-                    self.eval_const_expr(else_expr)
-                }
-            }
-
-            // sizeof(type) - constant for complete types, but *not* for a
-            // variable length array type, whose size 6.5.3.4p2 computes at run
-            // time. The type table cannot tell `int[n]` from `int[]`, so
-            // answering from it alone gave 0 -- and a 0 that was still an
-            // integer constant expression, so `int z[sizeof(int[n])];`
-            // silently became a zero-length array.
-            ExprKind::SizeofType(type_id, dims) => {
-                if crate::parse::ast::sizeof_type_is_runtime(self.types, *type_id, dims) {
-                    return None;
-                }
-                let size_bits = self.types.size_bits(*type_id);
-                Some((size_bits / 8) as i128)
-            }
-
-            // sizeof(expr) - constant if expr type is complete
-            ExprKind::SizeofExpr(inner_expr) => {
-                if let Some(typ) = inner_expr.typ {
-                    let size_bits = self.types.size_bits(typ);
-                    Some((size_bits / 8) as i128)
-                } else {
-                    None
-                }
-            }
-
-            // Cast to integer type - evaluate inner and truncate/extend as needed
-            ExprKind::Cast { expr: inner, .. } => {
-                // For integer constant expressions, we can evaluate the inner expression
-                self.eval_const_expr(inner)
-            }
-
-            // __builtin_offsetof(type, member-designator) - compile-time constant
-            ExprKind::OffsetOf { type_id, path } => {
-                let mut offset: i128 = 0;
-                let mut current_type = *type_id;
-
-                for element in path {
-                    match element {
-                        OffsetOfPath::Field(field_id) => {
-                            // None if the field is not found
-                            let member_info = self.types.find_member(current_type, *field_id)?;
-                            offset += member_info.offset as i128;
-                            current_type = member_info.typ;
-                        }
-                        OffsetOfPath::Index(index) => {
-                            // None if this is not an array type
-                            let elem_type = self.types.base_type(current_type)?;
-                            let elem_size = self.types.size_bytes(elem_type);
-                            offset += *index as i128 * (elem_size as i128);
-                            current_type = elem_type;
-                        }
-                    }
-                }
-
-                Some(offset)
-            }
-
             _ => None,
         }
     }
 
-    /// The address of `expr`, when it is an integer constant rather than a
-    /// symbol's address.
+    /// Evaluate an integer constant expression: array bounds, enumerators,
+    /// `case` labels, bit-field widths, `_Static_assert`.
     ///
-    /// `(size_t)&((struct S *)0)->member` is how offsetof was spelled before
-    /// <stddef.h> was relied on to provide it. Nothing is dereferenced -- the
-    /// address of a member of a null pointer is arithmetic on the null pointer
-    /// -- so the result is a plain integer, usable anywhere an integer
-    /// constant expression is: an array bound, a case label, a bitfield width.
-    ///
-    /// The recursion bottoms out only at an integer constant, so the address
-    /// of a real object is not folded here: that one needs a relocation, which
-    /// no integer constant expression can carry.
-    fn eval_pointer_constant(&self, expr: &Expr) -> Option<i128> {
-        match &expr.kind {
-            ExprKind::IntLit(v) => Some(*v as i128),
-            ExprKind::Int128Lit(v) => Some(*v),
-
-            ExprKind::Cast { expr: inner, .. } => self.eval_pointer_constant(inner),
-
-            ExprKind::Unary {
-                op: UnaryOp::AddrOf,
-                operand,
-            } => self.eval_pointer_constant(operand),
-
-            ExprKind::Member { expr: base, member } => {
-                let base_offset = self.eval_pointer_constant(base)?;
-                let struct_type = self.resolve_struct_type(base.typ?);
-                let member_info = self.types.find_member(struct_type, *member)?;
-                Some(base_offset + member_info.offset as i128)
-            }
-
-            ExprKind::Arrow { expr: base, member } => {
-                let base_offset = self.eval_pointer_constant(base)?;
-                let pointee_type = self.types.base_type(base.typ?)?;
-                let struct_type = self.resolve_struct_type(pointee_type);
-                let member_info = self.types.find_member(struct_type, *member)?;
-                Some(base_offset + member_info.offset as i128)
-            }
-
-            ExprKind::Index { array, index } => {
-                let base_offset = self.eval_pointer_constant(array)?;
-                let idx = self.eval_const_expr(index)?;
-                let elem_type = self.types.base_type(array.typ?)?;
-                Some(base_offset + idx * self.types.size_bytes(elem_type) as i128)
-            }
-
-            _ => None,
-        }
+    /// The walk itself lives in [`crate::constexpr`], shared with the
+    /// linearizer's static-initializer folding. The parser answers only
+    /// [`ConstScope::Standard`]: it has no emitted globals to read a `const`
+    /// object's value out of, and no context here would accept one anyway.
+    pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
+        crate::constexpr::eval(self, ConstScope::Standard, expr)
     }
 
     /// Parse a bitfield width (constant expression after ':')
@@ -5883,5 +5753,31 @@ impl Parser<'_> {
                 Ok(Some(explicit))
             }
         }
+    }
+}
+
+/// The parser's half of the shared C17 6.6 walk.
+///
+/// [`crate::constexpr`] owns the walk; what differs between the two hosts is
+/// only what an identifier means and how a floating subexpression folds.
+impl crate::constexpr::ConstEnv for Parser<'_> {
+    fn types(&self) -> &TypeTable {
+        self.types
+    }
+
+    /// An enumeration constant is the only identifier with a value in the
+    /// parser: a `const` object's value lives in an emitted global, which does
+    /// not exist yet here, and no parse-time context would accept one.
+    fn ident_value(&self, sym: crate::symbol::SymbolId, _scope: ConstScope) -> Option<i128> {
+        let symbol = self.symbols.get(sym);
+        symbol.is_enum_constant().then_some(symbol.enum_value)?
+    }
+
+    fn struct_of(&self, typ: TypeId) -> TypeId {
+        self.resolve_struct_type(typ)
+    }
+
+    fn float_value(&self, _scope: ConstScope, expr: &Expr) -> Option<f64> {
+        self.eval_const_f64(expr)
     }
 }

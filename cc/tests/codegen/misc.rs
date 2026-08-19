@@ -9268,3 +9268,92 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("sizeof_through_typeof", code, &[]), 0);
 }
+
+/// The sizes that #C112's check must not disturb, and the one it repaired.
+///
+/// The two declarator paths disagreed about how an absent extent is spelled --
+/// `parse_declarator` recorded `None`, the file-scope loop collapsed it to
+/// `Some(0)` -- which made `int a[];` indistinguishable from the GNU
+/// zero-length `int a[0];`. Both are exercised here, along with the composite
+/// type 6.2.7p4 forms when a later declaration completes an earlier one.
+#[test]
+fn codegen_sizeof_of_array_objects() {
+    let code = r#"
+int inferred[] = {1, 2, 3};
+int zero_length[0];
+char from_string[] = "hi";
+int two_d[2][3];
+extern int completed[];
+int completed[4];
+
+int main(void) {
+    if (sizeof inferred != 3 * sizeof(int)) return 1;
+    if (sizeof zero_length != 0) return 2;
+    if (sizeof from_string != 3) return 3;
+    if (sizeof two_d != 6 * sizeof(int)) return 4;
+    if (sizeof completed != 4 * sizeof(int)) return 5;
+
+    int n = 5;
+    int vla[n];
+    if (sizeof vla != 5 * sizeof(int)) return 6;
+    int vla2[n][3];
+    if (sizeof vla2 != 15 * sizeof(int)) return 7;
+
+    /* A different extent gives a different answer, so nothing is folding to a
+       constant behind the test's back. */
+    n = 7;
+    int vla3[n];
+    if (sizeof vla3 != 7 * sizeof(int)) return 8;
+
+    int fixed[4];
+    if (sizeof fixed != 4 * sizeof(int)) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("sizeof_of_array_objects", code, &[]), 0);
+}
+
+/// The values a folded `const` object contributes to a static initializer
+/// (#C102).
+///
+/// Acceptance alone is not the check: before the fix `int w = c;` was accepted
+/// and happened to be right while `int w = c + 1;` was rejected, so the
+/// arithmetic is what distinguishes a real fold from an accident.
+#[test]
+fn codegen_const_objects_fold_in_static_initializers() {
+    let code = r#"
+const int   c = 5;
+static const int s = 9;
+const long  l = 3;
+const double d = 2.5;
+const float  f = 1.5f;
+const char   ch = 'A';
+int arr[10];
+
+int    w_plain   = c;
+int    w_arith   = c * 2 + 1;
+int    w_negate  = -c;
+int    w_cond    = c ? 11 : 22;
+int    w_static  = s;
+long   w_shift   = l << 4;
+double w_double  = d * 2;
+float  w_float   = f + 1.0f;
+int    w_char    = ch + 1;
+int   *w_address = &arr[c - 3];
+
+int main(void) {
+    if (w_plain  != 5)  return 1;
+    if (w_arith  != 11) return 2;
+    if (w_negate != -5) return 3;
+    if (w_cond   != 11) return 4;
+    if (w_static != 9)  return 5;
+    if (w_shift  != 48) return 6;
+    if (w_double != 5.0) return 7;
+    if (w_float  != 2.5f) return 8;
+    if (w_char   != 'A' + 1) return 9;
+    if (w_address != &arr[2]) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("const_fold_static_init", code, &[]), 0);
+}

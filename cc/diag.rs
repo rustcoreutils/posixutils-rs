@@ -51,24 +51,6 @@ impl Position {
             noexpand: false,
         }
     }
-
-    /// Create a "bad" position for error tokens
-    #[cfg(test)]
-    pub fn bad() -> Self {
-        Self {
-            stream: u16::MAX,
-            line: 0,
-            col: 0,
-            newline: false,
-            whitespace: false,
-            noexpand: false,
-        }
-    }
-
-    /// Check if this is a bad/invalid position
-    pub fn is_bad(&self) -> bool {
-        self.stream == u16::MAX && self.line == 0
-    }
 }
 
 impl fmt::Display for Position {
@@ -117,7 +99,6 @@ impl Stream {
     }
 
     /// Create a stream for an included file
-    #[cfg(test)]
     pub fn included(name: String, include_pos: Position) -> Self {
         Self {
             name,
@@ -151,7 +132,6 @@ impl StreamRegistry {
     }
 
     /// Add a stream for an included file
-    #[cfg(test)]
     pub fn add_included(&mut self, name: String, include_pos: Position) -> u16 {
         let id = self.streams.len() as u16;
         self.streams.push(Stream::included(name, include_pos));
@@ -212,7 +192,6 @@ pub fn init_stream(name: &str) -> u16 {
 }
 
 /// Initialize a stream for an included file
-#[cfg(test)]
 pub fn init_included_stream(name: &str, include_pos: Position) -> u16 {
     STREAMS.with(|s| s.borrow_mut().add_included(name.to_string(), include_pos))
 }
@@ -226,7 +205,10 @@ pub fn effective_position(pos: Position) -> (String, u32, u16) {
     STREAMS.with(|s| s.borrow().effective_position(pos))
 }
 
-/// Get stream name by ID (for tests)
+/// The name registered for a stream.
+///
+/// Read only by this module's own tests; production formats a name through
+/// `effective_position`, which also follows `#line`.
 #[cfg(test)]
 pub fn stream_name(id: u16) -> String {
     STREAMS.with(|s| {
@@ -401,11 +383,6 @@ fn prettify_path(path: &str) -> String {
 
 /// Output a diagnostic message
 fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
-    // Don't output if position is bad
-    if pos.is_bad() {
-        return;
-    }
-
     // Track errors/warnings
     match level {
         DiagLevel::Error => {
@@ -536,10 +513,27 @@ mod tests {
         assert_eq!(s, "test.c:42");
     }
 
+    /// The chain names every file between the diagnostic and the top, in
+    /// order. `init_included_stream` is what records it, and it had been
+    /// `#[cfg(test)]` while production registered every file with
+    /// `init_stream`, whose `include_pos` is `None` -- so `show_include_chain`
+    /// was live only in test builds and a full CPython build produced zero
+    /// "through" lines across 552 diagnostics.
     #[test]
-    fn test_bad_position() {
-        let pos = Position::bad();
-        assert!(pos.is_bad());
+    fn test_include_chain_is_recorded() {
+        clear_streams();
+        let main = init_stream("main.c");
+        let outer = init_included_stream("outer.h", Position::new(main, 1, 1));
+        let inner = init_included_stream("inner.h", Position::new(outer, 1, 1));
+
+        assert_eq!(stream_prev(inner), Some(outer));
+        assert_eq!(stream_prev(outer), Some(main));
+        assert_eq!(stream_prev(main), None);
+        assert_eq!(
+            show_include_chain(inner),
+            Some(" (through outer.h, main.c)".to_string())
+        );
+        assert_eq!(show_include_chain(main), None);
     }
 
     #[test]

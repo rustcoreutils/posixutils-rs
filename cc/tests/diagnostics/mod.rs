@@ -18,7 +18,9 @@
 // everything.
 //
 
-use crate::common::{compile_expect_error, compile_expect_ok, compile_expect_warning};
+use crate::common::{
+    compile_and_run, compile_expect_error, compile_expect_ok, compile_expect_warning,
+};
 
 // ============================================================================
 // #L1 — implicit int (C99 6.7.2p2)
@@ -1663,12 +1665,48 @@ fn diagnostics_unimplemented_attributes_are_reported() {
         "typedef int T __attribute__((totally_made_up));\nint main(void){ return 0; }\n",
         "attribute directive ignored",
     );
-    // `mode` changes the type too, but glibc declares `register_t` with it in
-    // <sys/types.h>, so refusing would reject every program that includes it.
+    // A *vector* mode still needs vector types, so it keeps the warning; the
+    // scalar modes are implemented (#C85) and must not warn.
     compile_expect_warning(
-        "mode_warns_rather_than_refusing",
-        "typedef int W __attribute__((__mode__(__word__)));\nint main(void){ return 0; }\n",
-        "'__mode__' attribute is not implemented",
+        "vector_mode_warns",
+        "typedef float V __attribute__((__mode__(V4SF)));\nint main(void){ return 0; }\n",
+        "'mode(V4SF)' is not implemented",
+    );
+}
+
+/// `__attribute__((mode(M)))` replaces the declared type with the one of that
+/// width in the same family, keeping the declared signedness (#C85).
+///
+/// Leaving it unimplemented was not the cosmetic problem the warning implied:
+/// glibc declares `register_t` with `__mode__(__word__)`, so c17 sized it 4
+/// bytes where gcc sizes it 8. The widths are checked by
+/// `c99_mode_attribute_selects_the_type`; this pins that the ones c17 now
+/// implements are silent, since 567 warnings per CPython build was the other
+/// half of the complaint.
+#[test]
+fn diagnostics_implemented_modes_are_silent() {
+    compile_expect_ok(
+        "modes_silent",
+        r#"
+typedef int qi __attribute__((__mode__(__QI__)));
+typedef int hi __attribute__((__mode__(__HI__)));
+typedef int si __attribute__((__mode__(__SI__)));
+typedef int di __attribute__((__mode__(__DI__)));
+typedef int ti __attribute__((__mode__(__TI__)));
+typedef int wd __attribute__((__mode__(__word__)));
+typedef int pt __attribute__((__mode__(__pointer__)));
+typedef float hf __attribute__((__mode__(__HF__)));
+typedef float sf __attribute__((__mode__(__SF__)));
+typedef float df __attribute__((__mode__(__DF__)));
+typedef float xf __attribute__((__mode__(__XF__)));
+typedef float tf __attribute__((__mode__(__TF__)));
+typedef _Complex float hc __attribute__((__mode__(HC)));
+typedef _Complex float sc __attribute__((__mode__(SC)));
+typedef _Complex float dc __attribute__((__mode__(DC)));
+typedef _Complex float xc __attribute__((__mode__(XC)));
+typedef _Complex float tc __attribute__((__mode__(TC)));
+int main(void){ return 0; }
+"#,
     );
 }
 
@@ -2958,5 +2996,692 @@ fn diagnostics_variably_modified_jumps_point_at_the_jump() {
         "undefined_label_position",
         "int f(void){\n  int x = 1;\n  goto nowhere;\n  return x;\n}\n",
         ":3:3: error: label 'nowhere' used but not defined",
+    );
+}
+
+// === #C112 — `sizeof` of an incomplete array expression (C17 6.5.3.4p1) ===
+
+/// #C90 closed the type-name form and left this one: `extern int a[]; sizeof a`
+/// compiled and answered **0**.
+///
+/// Neither the type nor the completeness helpers can settle it, because
+/// `int[]`, `int[n]` and `int[m]` all intern to one `TypeId` -- the extent
+/// lives on the declarator. `Symbol::array_is_variably_modified` records
+/// whether one was given, so a VLA's `sizeof` keeps working while an
+/// incomplete array's is refused.
+#[test]
+fn diagnostics_sizeof_of_an_incomplete_array_expression_is_rejected() {
+    for (name, src) in [
+        (
+            "szx_extern_file",
+            "extern int a[];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_extern_parens",
+            "extern int a[];\nunsigned long f(void){ return sizeof(a); }\n",
+        ),
+        (
+            "szx_extern_block",
+            "unsigned long f(void){ extern int a[]; return sizeof a; }\n",
+        ),
+        (
+            "szx_tentative",
+            "int a[];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "incomplete type");
+    }
+}
+
+/// The accept side. A VLA is measured at run time, a GNU zero-length array has
+/// an extent that happens to be zero, and a later declaration completes an
+/// earlier `extern int a[];` (6.2.7p4) -- all of which an over-eager check
+/// would refuse.
+#[test]
+fn diagnostics_sizeof_of_complete_array_expressions_is_accepted() {
+    for (name, src) in [
+        (
+            "szx_vla",
+            "unsigned long f(int n){ int a[n]; return sizeof a; }\n",
+        ),
+        (
+            "szx_vla_2d",
+            "unsigned long f(int n){ int a[n][3]; return sizeof a; }\n",
+        ),
+        (
+            "szx_zero_length",
+            "int a[0];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_sized",
+            "int a[4];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_inferred",
+            "int a[] = {1,2,3};\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_string",
+            "char a[] = \"hi\";\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_completed_later",
+            "extern int a[];\nint a[4];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_completed_by_init",
+            "extern int a[];\nint a[] = {1,2,3};\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+        (
+            "szx_local_fixed",
+            "unsigned long f(void){ int a[4]; return sizeof a; }\n",
+        ),
+        (
+            "szx_param_decayed",
+            "unsigned long f(int a[]){ return sizeof a; }\n",
+        ),
+        (
+            "szx_2d_file",
+            "int a[2][3];\nunsigned long f(void){ return sizeof a; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+// === C11 6.5.2.3p5 — naming a member of an atomic structure or union ===
+
+/// Reading or writing one member of an `_Atomic` aggregate touches part of an
+/// object whose atomicity covers all of it, so the lock the type promises is
+/// not taken. C11 makes it undefined behaviour rather than a constraint
+/// violation, so gcc warns and so does c17 now -- it used to say nothing at
+/// all, which meant the one operation `_Atomic` exists to prevent was the one
+/// it did not mention.
+#[test]
+fn diagnostics_member_of_an_atomic_aggregate_warns() {
+    for (name, src, expected) in [
+        (
+            "atomic_member_read",
+            "struct S { int a; };\n_Atomic struct S s;\nint f(void){ return s.a; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+        (
+            "atomic_member_write",
+            "struct S { int a; };\n_Atomic struct S s;\nvoid f(void){ s.a = 1; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+        (
+            "atomic_member_arrow",
+            "struct S { int a; };\nvoid f(_Atomic struct S *p){ (void)p->a; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+        (
+            "atomic_member_address",
+            "struct S { int a; };\n_Atomic struct S s;\nint *f(void){ return &s.a; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+        (
+            "atomic_union_member",
+            "union U { int a; };\n_Atomic union U u;\nint f(void){ return u.a; }\n",
+            "accessing a member 'a' of an atomic union",
+        ),
+        (
+            // gcc names the outer member, not the inner one.
+            "atomic_nested_member",
+            "struct I { int q; };\nstruct S { struct I i; };\n_Atomic struct S s;\n\
+             int f(void){ return s.i.q; }\n",
+            "accessing a member 'i' of an atomic structure",
+        ),
+        (
+            "atomic_through_typedef",
+            "struct S { int a; };\ntypedef _Atomic struct S AS;\nAS s;\nint f(void){ return s.a; }\n",
+            "accessing a member 'a' of an atomic structure",
+        ),
+    ] {
+        compile_expect_warning(name, src, expected);
+    }
+}
+
+/// It is the *object's* atomicity that matters, not the member's:
+/// `struct { _Atomic int a; } s; s.a` is an ordinary access to an atomic
+/// member and must stay silent, as must every access to a non-atomic
+/// aggregate.
+#[test]
+fn diagnostics_ordinary_member_access_stays_silent() {
+    for (name, src) in [
+        (
+            "plain_struct_member",
+            "struct S { int a; };\nstruct S s;\nint f(void){ return s.a; }\n",
+        ),
+        (
+            "atomic_scalar_member",
+            "struct S { _Atomic int a; };\nstruct S s;\nint f(void){ return s.a; }\n",
+        ),
+        (
+            "atomic_scalar_member_arrow",
+            "struct S { _Atomic int a; };\nvoid f(struct S *p){ (void)p->a; }\n",
+        ),
+        (
+            "plain_arrow",
+            "struct S { int a; };\nvoid f(struct S *p){ (void)p->a; }\n",
+        ),
+        (
+            "atomic_scalar_object",
+            "_Atomic int x;\nint f(void){ return x; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+// === #C102 — reading an object in a static initializer (C17 6.7.9p4) ===
+
+/// One missing mechanism behind three symptoms, and the middle one is why the
+/// first attempt at this was reverted.
+///
+/// `int v; int w = v;` was accepted and silently yielded **zero**. `const int
+/// c = 5; int w = c;` was accepted and right, but only because nothing folded
+/// it. And `int w = c + 1;` one step along was **rejected**, valid code that
+/// gcc compiles. Fixing any one of them alone leaves the others wrong.
+///
+/// The folding is scoped to the initializer by a `ConstScope` parameter rather
+/// than a flag: C makes a `const` object no kind of constant expression, so it
+/// must not reach an array size or a `case` label.
+#[test]
+fn diagnostics_non_constant_static_initializers_are_rejected() {
+    for (name, src) in [
+        ("si_read_object", "int v = 5;\nint w = v;\n"),
+        ("si_read_in_arithmetic", "int v = 5;\nint w = v + 1;\n"),
+        ("si_const_no_initializer", "const int c;\nint w = c;\n"),
+        ("si_extern_const", "extern const int c;\nint w = c;\n"),
+        ("si_function_call", "int f(void);\nint w = f();\n"),
+        (
+            "si_static_local",
+            "int v;\nvoid f(void){ static int w = v; (void)w; }\n",
+        ),
+        ("si_float_object", "double v;\ndouble w = v * 2;\n"),
+    ] {
+        compile_expect_error(name, src, "constant expression");
+    }
+}
+
+/// A `const` object with a visible initializer folds, in arbitrary arithmetic
+/// and at every arithmetic type -- which is what gcc does, silently and even
+/// under `-pedantic`.
+#[test]
+fn diagnostics_const_objects_fold_in_static_initializers() {
+    for (name, src) in [
+        ("si_const_int", "const int c = 5;\nint w = c;\n"),
+        (
+            "si_const_arithmetic",
+            "const int c = 5;\nint w = c * 2 + 1;\n",
+        ),
+        ("si_const_negate", "const int c = 5;\nint w = -c;\n"),
+        (
+            "si_const_conditional",
+            "const int c = 5;\nint w = c ? 1 : 2;\n",
+        ),
+        ("si_const_shift", "const long c = 5;\nlong w = c << 2;\n"),
+        (
+            "si_const_double",
+            "const double d = 2.5;\ndouble x = d * 2;\n",
+        ),
+        (
+            "si_const_float",
+            "const float f = 1.5f;\nfloat y = f + 1.0f;\n",
+        ),
+        ("si_static_const", "static const int c = 7;\nint w = c;\n"),
+        (
+            "si_const_in_address",
+            "const int c = 5;\nint a[10];\nint *p = &a[c - 3];\n",
+        ),
+        ("si_enum_constant", "enum { N = 7 };\nint w = N;\n"),
+        (
+            "si_const_array_element",
+            "const int a[2] = {1,2};\nint w = a[0];\n",
+        ),
+        (
+            "si_const_struct_member",
+            "struct S { int a; };\nconst struct S s = {5};\nint w = s.a;\n",
+        ),
+        (
+            "si_block_scope_auto",
+            "int v;\nvoid f(void){ int w = v; (void)w; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// The boundary. C makes a `const` object no kind of constant expression, so
+/// the folding must reach the initializer and nowhere else -- `int a[c];` is a
+/// VLA and `case c:` an error, in gcc as here. Without these the fix would
+/// silently turn five other contexts lax.
+#[test]
+fn diagnostics_const_objects_do_not_fold_outside_initializers() {
+    compile_expect_error(
+        "si_boundary_array_size",
+        "const int c = 5;\nint a[c];\n",
+        "file scope",
+    );
+    compile_expect_error(
+        "si_boundary_case_label",
+        "const int c = 5;\nvoid f(int x){ switch(x){ case c: break; } }\n",
+        "constant",
+    );
+    compile_expect_error(
+        "si_boundary_static_assert",
+        "const int c = 5;\n_Static_assert(c == 5, \"x\");\n",
+        "constant",
+    );
+    compile_expect_error(
+        "si_boundary_enumerator",
+        "const int c = 5;\nenum E { X = c };\n",
+        "constant",
+    );
+    compile_expect_error(
+        "si_boundary_bitfield_width",
+        "const int c = 5;\nstruct S { int b : c; };\n",
+        "constant",
+    );
+}
+
+// === #C118 — an out-of-range enumerator must not panic the compiler ===
+
+/// An enumeration with no possible underlying type is diagnosed, not a panic.
+///
+/// `enum_underlying_type` reached an `unreachable!` whose premise -- that a
+/// non-negative maximum always fits `u64` -- nothing enforced, so the compiler
+/// exited 101. gcc accepts these by giving the enumeration a `__int128`
+/// underlying type, which c17 does not offer; refusing them is a deliberate
+/// divergence, and the point of the test is that it is a *diagnostic*.
+#[test]
+fn diagnostics_unrepresentable_enumeration_does_not_panic() {
+    for (name, src) in [
+        (
+            "wide_positive_and_negative",
+            "enum E { A = (__int128)1 << 100, B = -1 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "wide_positive_alone",
+            "enum E { A = (__int128)1 << 100 };\nint main(void){ return 0; }\n",
+        ),
+    ] {
+        // The message is the discriminator: a panic also exits non-zero, so
+        // asserting only on failure would have passed against the crash.
+        compile_expect_error(name, src, "no integer type can represent all values");
+    }
+}
+
+/// A folded shift agrees with the same shift computed at run time.
+///
+/// The count is masked to the operand width, as the hardware does. 6.5.7p3
+/// makes a count outside `[0, width)` undefined and gcc has no single answer
+/// for it either -- it folds `1 << 64` to 0 but leaves `-1 >> 64` at -1 -- so
+/// what this pins is c17's *self*-consistency: an enumerator, an array bound
+/// and a run-time expression must not disagree. Recorded at #C125, which is
+/// the warning gcc has and c17 does not.
+#[test]
+fn diagnostics_folded_shift_agrees_with_the_runtime_one() {
+    assert_eq!(
+        compile_and_run(
+            "folded_shift_matches_runtime",
+            "enum E { A = 1 << 64, B = 1 >> 64, C = (char)1 << 20, D = 1LL << 40 };\n\
+             int main(void) {\n\
+             volatile int one = 1, sixty_four = 64;\n\
+             if (A != (one << sixty_four)) return 1;\n\
+             if (B != (one >> sixty_four)) return 2;\n\
+             if (C != 1048576) return 3;\n\
+             if (D != 1099511627776LL) return 4;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+}
+
+/// Enumerators that do fit are unaffected, at every width the choice of
+/// underlying type turns on.
+#[test]
+fn diagnostics_representable_enumerators_are_accepted() {
+    for (name, src) in [
+        (
+            "enum_int_max",
+            "enum E { A = 2147483647 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_shift_31",
+            "enum E { A = 1 << 31 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_uint_max",
+            "enum E { A = 0xFFFFFFFFU };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_ulong_max",
+            "enum E { A = 0xFFFFFFFFFFFFFFFFULL };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_negative",
+            "enum E { A = -2147483648 };\nint main(void){ return 0; }\n",
+        ),
+        (
+            "enum_plain",
+            "enum E { A, B, C };\nint main(void){ return 0; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// An object too large for the compiler to describe is diagnosed, not capped.
+///
+/// `TypeTable::size_bits` answers in a `u32`, and an extent past that used to
+/// saturate in silence: `char big[5000000000];` compiled and reported `sizeof`
+/// 536870911. gcc accepts these — its own limit is far higher — so this is an
+/// implementation limit rather than a constraint violation, and the message
+/// says so. Recorded at #C122.
+#[test]
+fn diagnostics_object_larger_than_the_compiler_can_describe() {
+    for (name, src) in [
+        (
+            "array_five_billion",
+            "char big[5000000000L];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_just_over",
+            "char big[536870912];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_of_int",
+            "int big[2000000000L];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_two_dimensions",
+            "char big[16385][32768];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_block_scope",
+            "int main(void){ static char big[5000000000L]; return big[0]; }\n",
+        ),
+        (
+            "array_typedef",
+            "typedef char T[5000000000L];\nint main(void){ return 0; }\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "exceeds the maximum object size");
+    }
+
+    // A member list can reach the bound even when no single member does.
+    compile_expect_error(
+        "struct_sum_of_members",
+        "struct S { char a[400000000]; char b[400000000]; } s;\nint main(void){ return 0; }\n",
+        "size of struct exceeds the maximum object size",
+    );
+}
+
+/// The largest object that *is* describable keeps working, and `sizeof` agrees
+/// with gcc for it — the bound has to be a diagnostic at the edge, not a cap
+/// that moved.
+#[test]
+fn diagnostics_largest_describable_object_is_accepted() {
+    for (name, src) in [
+        (
+            "array_at_the_bound",
+            "char big[536870911];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_of_int_at_the_bound",
+            "int big[134217727];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_two_dimensions",
+            "char big[16384][16384];\nint main(void){ return 0; }\n",
+        ),
+        (
+            "struct_under_the_bound",
+            "struct S { char a[100000000]; char b[100000000]; } s;\nint main(void){ return 0; }\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+
+    // And the sizes are the ones gcc reports. These all sit under the bound,
+    // so they were right before the diagnostic existed too; the assertion is
+    // here so that moving the bound cannot quietly move an answer with it.
+    assert_eq!(
+        compile_and_run(
+            "object_sizes_are_exact",
+            "char a[536870911];\n\
+             struct S { char x[100000000]; char y[100000000]; } s;\n\
+             int main(void) {\n\
+             if (sizeof a != 536870911UL) return 1;\n\
+             if (sizeof s != 200000000UL) return 2;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+}
+
+/// A floating literal is not an integer constant expression.
+///
+/// 6.6p6 admits one only as the immediate operand of a cast. The parser's
+/// folder had a `FloatLit` arm that truncated it instead, so four constraint
+/// violations compiled: an array bound, an enumerator, a bit-field width and
+/// a `_Static_assert`. At block scope the array case was worse than accepted
+/// -- it became a variable length array sized from a `double`. Recorded at
+/// #C124.
+#[test]
+fn diagnostics_floating_literal_is_not_an_integer_constant() {
+    for (name, src, message) in [
+        (
+            "array_bound_file_scope",
+            "int a[1.5];\nint main(void){ return 0; }\n",
+            "size of array has non-integer type",
+        ),
+        (
+            "array_bound_block_scope",
+            "int main(void){ int a[1.5]; return sizeof a; }\n",
+            "size of array has non-integer type",
+        ),
+        (
+            "enumerator",
+            "enum E { X = 1.5 };\nint main(void){ return 0; }\n",
+            "constant",
+        ),
+        (
+            "bitfield_width",
+            "struct S { int b : 1.5; };\nint main(void){ return 0; }\n",
+            "constant",
+        ),
+        (
+            "static_assert",
+            "_Static_assert(1.5, \"\");\nint main(void){ return 0; }\n",
+            "constant",
+        ),
+    ] {
+        compile_expect_error(name, src, message);
+    }
+}
+
+/// What 6.6 *does* let a floating constant do, and what the two folders had to
+/// agree on before they became one.
+#[test]
+fn diagnostics_shared_constant_folder_answers_alike() {
+    assert_eq!(
+        compile_and_run(
+            "shared_constant_folder",
+            "struct S { int x; int y; };\n\
+             const int c = 5;\n\
+             int arr[10];\n\
+             int *p = &arr[c - 3];\n\
+             int w = c + 1;\n\
+             enum E { A = 3 };\n\
+             int main(void) {\n\
+             /* a cast of a floating constant, folded in floating point */\n\
+             int cast_fold[(int)(1.5 + 1.5)];\n\
+             /* a comparison of floating operands is an integer constant */\n\
+             int cmp[1.5 > 1.0 ? 4 : 8];\n\
+             /* _Alignof, which only one of the two folders used to know */\n\
+             int aligned[_Alignof(double)];\n\
+             /* the pre-<stddef.h> offsetof idiom */\n\
+             int off[(int)(unsigned long)&((struct S *)0)->y];\n\
+             _Static_assert(1.5 > 1.0, \"\");\n\
+             _Static_assert((unsigned)-1 > 0, \"\");\n\
+             if (sizeof cast_fold != 12) return 1;\n\
+             if (sizeof cmp != 16) return 2;\n\
+             if (sizeof aligned != 32) return 3;\n\
+             if (sizeof off != 16) return 4;\n\
+             if (w != 6) return 5;\n\
+             if (p != &arr[2]) return 6;\n\
+             if (A != 3) return 7;\n\
+             if (!__builtin_constant_p(3.14)) return 8;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+}
+
+/// Every operation is evaluated *in* a type, and its result narrowed to that
+/// type before the next one sees it.
+///
+/// The folder carried a full-width `i128` instead, so `-1u / 3u` was 0 rather
+/// than 1431655765 -- the negative was still negative when the division saw
+/// it -- `(unsigned)-1 % 7u` was 4294967295 rather than 3, and a cast did not
+/// convert at all: `(unsigned char)-1` was -1, `(short)70000` was 70000. Each
+/// value below is gcc's. Recorded at #C126.
+#[test]
+fn diagnostics_constants_fold_at_their_own_width() {
+    assert_eq!(
+        compile_and_run(
+            "constants_fold_at_their_own_width",
+            "typedef unsigned __int128 u128;\n\
+             int main(void) {\n\
+             /* division and remainder see an unsigned operand as unsigned */\n\
+             if (-1u / 3u != 1431655765u) return 1;\n\
+             if ((unsigned)-1 % 7u != 3u) return 2;\n\
+             if ((0u - 1u) / 2u != 2147483647u) return 3;\n\
+             if (-1ull / 3ull != 6148914691236517205ull) return 4;\n\
+             /* a right shift of an unsigned value is logical */\n\
+             if ((-1u >> 1) != 2147483647u) return 5;\n\
+             if ((-1ull >> 1) != 9223372036854775807ull) return 6;\n\
+             if ((~0u >> 28) != 15u) return 7;\n\
+             /* 128 bits, where narrowing cannot help and signedness must */\n\
+             u128 thirds = ((u128)6148914691236517205ull << 64) | 6148914691236517205ull;\n\
+             if ((u128)-1 / 3 != thirds) return 8;\n\
+             if ((long long)((u128)-1 >> 1) != -1) return 9;\n\
+             /* a cast converts */\n\
+             if ((int)(unsigned char)-1 != 255) return 10;\n\
+             if ((int)(unsigned char)300 != 44) return 11;\n\
+             if ((int)(short)70000 != 4464) return 12;\n\
+             if ((int)(signed char)200 != -56) return 13;\n\
+             if ((int)(unsigned short)-1 != 65535) return 14;\n\
+             /* ... and a conversion to _Bool gives 0 or 1, not the low byte */\n\
+             if ((int)(_Bool)2 != 1) return 15;\n\
+             if ((int)(_Bool)256 != 1) return 16;\n\
+             /* integer promotion still widens: these are int arithmetic */\n\
+             if ((char)100 + (char)100 != 200) return 17;\n\
+             if ((short)30000 + (short)30000 != 60000) return 18;\n\
+             if ((unsigned char)200 + (unsigned char)200 != 400) return 19;\n\
+             /* and signed arithmetic wraps at its own width */\n\
+             if (4294967295u + 1u != 0u) return 20;\n\
+             if ((unsigned)(1u << 31) != 2147483648u) return 21;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+
+    // The same expressions as *constant* contexts, where only the folder can
+    // answer: a run-time path that happened to be right would hide the bug.
+    assert_eq!(
+        compile_and_run(
+            "constant_contexts_fold_alike",
+            "enum E {\n\
+             A = -1u / 3u,\n\
+             B = (unsigned)-1 % 7u,\n\
+             C = (int)(unsigned char)300,\n\
+             D = (int)(short)70000,\n\
+             F = (int)(_Bool)2,\n\
+             G = (int)(-1u >> 1)\n\
+             };\n\
+             static unsigned s_div = -1u / 3u;\n\
+             static int s_cast = (int)(unsigned char)300;\n\
+             int main(void) {\n\
+             int a[(int)(unsigned char)300];\n\
+             if (A != 1431655765) return 1;\n\
+             if (B != 3) return 2;\n\
+             if (C != 44) return 3;\n\
+             if (D != 4464) return 4;\n\
+             if (F != 1) return 5;\n\
+             if (G != 2147483647) return 6;\n\
+             if (s_div != 1431655765u) return 7;\n\
+             if (s_cast != 44) return 8;\n\
+             if (sizeof a != 44 * sizeof(int)) return 9;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+}
+
+/// 6.4.4.1p5 picks the first type that can represent the value, for a
+/// `u`-suffixed constant as much as an unsuffixed one.
+///
+/// Every `u` suffix took `unsigned int` regardless of magnitude, so
+/// `0xaaaaaaaaaaaaaaabu` had a four-byte type. That was survivable while
+/// constants were carried at full width and only `sizeof` was wrong; once they
+/// folded at their own width it truncated the value, and CPython's
+/// `math.comb(5, 2)` returned 85899345930. Recorded at #C127.
+#[test]
+fn diagnostics_unsigned_suffix_widens_by_magnitude() {
+    assert_eq!(
+        compile_and_run(
+            "unsigned_suffix_widens_by_magnitude",
+            "int main(void) {\n\
+             if (sizeof 1u != 4) return 1;\n\
+             if (sizeof 0xFFFFFFFFu != 4) return 2;\n\
+             if (sizeof 0x100000000u != 8) return 3;\n\
+             if (sizeof 4294967296u != 8) return 4;\n\
+             if (sizeof 0xaaaaaaaaaaaaaaabu != 8) return 5;\n\
+             if (sizeof 18446744073709551615u != 8) return 6;\n\
+             if (0xaaaaaaaaaaaaaaabu != 12297829382473034411ULL) return 7;\n\
+             if (0x100000000u != 4294967296ULL) return 8;\n\
+             /* the value that made math.comb wrong: a 64-bit product whose\n\
+                left operand had been truncated to 32 bits */\n\
+             if (0xfu * 0xaaaaaaaaaaaaaaabu != 5) return 9;\n\
+             /* unsuffixed and l-suffixed spellings were already right */\n\
+             if (sizeof 0xaaaaaaaaaaaaaaab != 8) return 10;\n\
+             if (sizeof 1ul != 8) return 11;\n\
+             if (sizeof 1ull != 8) return 12;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
+    );
+
+    // Through a static table, which is how CPython hit it: the initializer is
+    // emitted from the folded value, so a truncated literal reaches .rodata.
+    assert_eq!(
+        compile_and_run(
+            "wide_unsigned_literal_in_a_static_table",
+            "static const unsigned long t[] = { 0xfu, 0xaaaaaaaaaaaaaaabu };\n\
+             int main(void) {\n\
+             unsigned long a = t[0], b = t[1];\n\
+             if (b != 12297829382473034411UL) return 1;\n\
+             if (a * b != 5) return 2;\n\
+             return 0;\n\
+             }\n",
+            &[],
+        ),
+        0
     );
 }

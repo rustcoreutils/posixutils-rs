@@ -15,6 +15,7 @@ mod abi;
 mod arch;
 mod builtin_headers;
 mod builtins;
+mod constexpr;
 mod diag;
 mod float;
 mod ir;

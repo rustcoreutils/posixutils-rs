@@ -953,3 +953,237 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("packed_bitfields", code, &[]), 0);
 }
+
+/// `__attribute__((mode(M)))` selects the type of a machine mode (#C85).
+///
+/// It was unimplemented and warned, which read as cosmetic and was not:
+/// glibc declares `register_t` with `__mode__(__word__)`, so c17 sized it 4
+/// bytes where gcc sizes it 8 -- a wrong type, silently, in a header any
+/// program can include.
+///
+/// The signedness comes from the *declared* type, not the mode, and `XF` and
+/// `TF` are both sixteen bytes but not interchangeable -- one is the x87
+/// extended format and the other IEEE binary128 -- so the arithmetic check at
+/// the end distinguishes them rather than trusting the size.
+#[test]
+fn c99_mode_attribute_selects_the_type() {
+    let code = r#"
+typedef int qi  __attribute__((__mode__(__QI__)));
+typedef int hi  __attribute__((__mode__(__HI__)));
+typedef int si  __attribute__((__mode__(__SI__)));
+typedef int di  __attribute__((__mode__(__DI__)));
+typedef int ti  __attribute__((__mode__(__TI__)));
+typedef int wd  __attribute__((__mode__(__word__)));
+typedef int pt  __attribute__((__mode__(__pointer__)));
+typedef unsigned uqi __attribute__((__mode__(__QI__)));
+typedef unsigned udi __attribute__((__mode__(__DI__)));
+typedef float hf __attribute__((__mode__(__HF__)));
+typedef float sf __attribute__((__mode__(__SF__)));
+typedef float df __attribute__((__mode__(__DF__)));
+typedef _Complex float hc __attribute__((__mode__(HC)));
+typedef _Complex float sc __attribute__((__mode__(SC)));
+typedef _Complex float dc __attribute__((__mode__(DC)));
+/* The binary128 modes exist only where the type does; c17 refuses them on a
+   target with no `__FLT128_*` family rather than handing back a type whose
+   arithmetic cannot link. */
+#ifdef __FLT128_MANT_DIG__
+typedef float tf __attribute__((__mode__(__TF__)));
+typedef _Complex float tc __attribute__((__mode__(TC)));
+#endif
+
+int main(void) {
+    if (sizeof(qi) != 1)  return 1;
+    if (sizeof(hi) != 2)  return 2;
+    if (sizeof(si) != 4)  return 3;
+    if (sizeof(di) != 8)  return 4;
+    if (sizeof(ti) != 16) return 5;
+    if (sizeof(wd) != sizeof(void *)) return 6;
+    if (sizeof(pt) != sizeof(void *)) return 7;
+
+    /* Signedness follows the declared type, not the mode. */
+    if (!((qi)-1 < 0))  return 8;
+    if ((uqi)-1 < 0)    return 9;
+    if (!((di)-1 < 0))  return 10;
+    if ((udi)-1 < 0)    return 11;
+
+    if (sizeof(hf) != 2) return 12;
+    if (sizeof(sf) != 4) return 13;
+    if (sizeof(df) != 8) return 14;
+
+    /* A mode is a type, not merely a width: binary128 divides to more
+       precision than double, which a size check alone would not show.
+       Guarded because c17 offers `_Float128` only where the runtime can
+       support it -- there are no `__FLT128_*` predefines on Apple targets,
+       and `mode(TF)` is refused there rather than handing back a type whose
+       every operation would fail to link. Same guard as
+       `c99_float128_is_a_first_class_type`. */
+#ifdef __FLT128_MANT_DIG__
+    tf third = (tf)1 / 3;
+    if ((int)(third * 3 * 1000000) != 1000000) return 15;
+#endif
+
+    /* Complex modes name the format of each half. glibc's <bits/floatn.h>
+       declares `__cfloat128` with `mode(TC)`, which was 285 of the warnings a
+       CPython build used to produce. */
+    if (sizeof(hc) != 2 * sizeof(hf)) return 17;
+    if (sizeof(sc) != 2 * sizeof(sf)) return 18;
+    if (sizeof(dc) != 2 * sizeof(df)) return 19;
+#ifdef __FLT128_MANT_DIG__
+    if (sizeof(tf) != 16) return 20;
+    if (sizeof(tc) != 2 * sizeof(tf)) return 21;
+#endif
+
+    /* And the narrow integer modes really do wrap at their own width. */
+    qi small = 127;
+    small = (qi)(small + 1);
+    if (small != -128) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("mode_attribute", code, &[]), 0);
+}
+
+/// A `mode` applies to the declarator it was written on, and to nothing else
+/// (#C117).
+///
+/// `apply_pending_mode` was called only at the three *typedef* sites, but
+/// `pending_mode` is set for any declarator and -- unlike `pending_alignas`,
+/// which is cleared at four declaration boundaries -- was never cleared. So a
+/// mode on a non-typedef was silently dropped **and** survived to be applied to
+/// whatever was declared next:
+///
+/// ```c
+/// int a __attribute__((__mode__(__QI__)));   /* was 4 bytes, gcc gives 1 */
+/// typedef int T;                              /* became 1 byte  */
+/// ```
+///
+/// Both halves are checked here: the mode reaching its own declarator, and the
+/// declaration after it being untouched.
+#[test]
+fn c99_mode_attribute_applies_only_to_its_own_declarator() {
+    let code = r#"
+int a __attribute__((__mode__(__QI__)));
+int after_a;                                   /* must stay 4 */
+
+int b, c __attribute__((__mode__(__HI__)));    /* only c is moded */
+int after_c;
+
+static int d __attribute__((__mode__(__DI__)));
+typedef int AfterD;                            /* must stay 4 */
+
+extern int e __attribute__((__mode__(__QI__)));
+struct S { int m; } s;                         /* member must stay 4 */
+
+unsigned int u __attribute__((__mode__(__QI__)));
+int after_u;
+
+typedef int T __attribute__((__mode__(__HI__)));
+typedef int AfterT;                            /* must stay 4 */
+
+int main(void) {
+    if (sizeof a != 1) return 1;
+    if (sizeof after_a != 4) return 2;
+
+    if (sizeof b != 4) return 3;
+    if (sizeof c != 2) return 4;
+    if (sizeof after_c != 4) return 5;
+
+    if (sizeof d != 8) return 6;
+    if (sizeof(AfterD) != 4) return 7;
+
+    if (sizeof s.m != 4) return 8;
+
+    if (sizeof u != 1) return 9;
+    /* Still unsigned, and narrow: -1 wraps to 255 rather than sign-extending.
+       Tested by the stored value, not by `u - 1 < 0`, which the integer
+       promotions make an `int` comparison whatever `u` is. */
+    u = (unsigned)-1;
+    if (u != 255) return 10;
+    if (sizeof after_u != 4) return 11;
+
+    if (sizeof(T) != 2) return 12;
+    if (sizeof(AfterT) != 4) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("mode_only_its_declarator", code, &[]), 0);
+}
+
+/// A bit-field must read only its own bits, and keep all of them through a
+/// brace initializer (#C119, #C120).
+///
+/// Two defects that meet on the wide bit-field. **The load** walked every byte
+/// of the access span with no "does this byte hold any of the field's bits?"
+/// test -- the skip its *store* sibling has always had -- so a field in a
+/// window wider than itself read the object's **padding**. Every `__int128`
+/// bit-field is such a field: its window is sixteen bytes. The stray bytes were
+/// also shifted by more than the 64-bit carrier's width, which x86-64 masks
+/// (folding padding into the result) and aarch64's assembler rejects outright,
+/// so the same source would not even build there.
+///
+/// **The brace initializer** then converted the value twice: to the member's
+/// type, correctly, and again to a type derived from the *span*, where
+/// `bitfield_storage_type` answers `unsigned int` for anything but 1, 2, 4 or 8
+/// bytes. A 64-bit field in a sixteen-byte window, or in a packed nine-byte
+/// span, kept 32 bits of its initializer. Assignment was unaffected, so
+/// `p.a = ~0ULL` was right and `= {~0ULL}` was not.
+///
+/// The padding is deliberately dirtied; with it zero the load bug is invisible.
+#[test]
+fn c99_wide_bitfields_read_only_their_own_bits() {
+    let code = r#"
+struct A { unsigned __int128 a:64; };
+struct B { unsigned __int128 a:64, b:64; };
+struct C { unsigned __int128 a:32; };
+struct D { unsigned __int128 a:1; };
+struct __attribute__((packed)) P { unsigned c:1; unsigned long long a:64; };
+struct Q { unsigned __int128 a:64; };
+
+int main(void) {
+    /* Reading: the window is wider than the field, so the bytes beyond it must
+       not contribute. */
+    struct A x; __builtin_memset(&x, 0xAA, sizeof x);
+    x.a = 0x1122334455667788ULL;
+    if (x.a != 0x1122334455667788ULL) return 1;
+
+    struct B y; __builtin_memset(&y, 0xAA, sizeof y);
+    y.a = 1; y.b = 2;
+    if (y.a != 1 || y.b != 2) return 2;
+
+    struct C z; __builtin_memset(&z, 0xAA, sizeof z);
+    z.a = 0xDEADBEEFu;
+    if (z.a != 0xDEADBEEFu) return 3;
+
+    struct D w; __builtin_memset(&w, 0xAA, sizeof w);
+    w.a = 1;
+    if (w.a != 1) return 4;
+    w.a = 0;
+    if (w.a != 0) return 5;
+
+    /* Initializing: the value must not be narrowed to a span-derived type. */
+    struct P p = { 0, 0xFFFFFFFFFFFFFFFFULL };
+    if (p.a != 0xFFFFFFFFFFFFFFFFULL) return 6;
+    struct Q q = { 0xFFFFFFFFFFFFFFFFULL };
+    if (q.a != 0xFFFFFFFFFFFFFFFFULL) return 7;
+
+    /* Assignment always worked and must continue to. */
+    p.a = 0x0123456789ABCDEFULL;
+    if (p.a != 0x0123456789ABCDEFULL) return 8;
+
+    /* The narrow and packed spans the same code serves. */
+    struct E { unsigned a:20, b:20; } e = { 0xABCDE, 0x12345 };
+    if (e.a != 0xABCDEu || e.b != 0x12345u) return 9;
+    struct F { char pre; unsigned a:20; char post; } f = { 1, 0xFEDCB, 2 };
+    if (f.pre != 1 || f.a != 0xFEDCBu || f.post != 2) return 10;
+
+    /* `_Bool` still normalises through its own type, not the storage unit. */
+    struct G { _Bool b:1; } g = { 2 };
+    if (g.b != 1) return 11;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("wide_bitfield_own_bits", code, &[]), 0);
+}

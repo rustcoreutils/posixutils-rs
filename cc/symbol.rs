@@ -104,6 +104,16 @@ pub struct Symbol {
     /// headers, so ignoring it makes those headers fail to link.
     pub asm_label: Option<String>,
 
+    /// Whether this symbol's array type was declared with size *expressions*
+    /// -- that is, whether it is variably modified rather than incomplete.
+    ///
+    /// The type cannot answer it: `int[]`, `int[n]` and `int[m]` all intern to
+    /// one `TypeId`, the key holding an `array_size` that is `None` for all
+    /// three. The distinction lives on the declarator, and `sizeof a` needs it
+    /// -- gcc measures a VLA at run time and rejects an incomplete array
+    /// (6.5.3.4p1), and without this both answered 0.
+    pub array_is_variably_modified: bool,
+
     /// Whether *any* file-scope declaration of this name carried `extern`.
     ///
     /// C99 6.7.4p6 makes an `inline` definition an external definition only if
@@ -139,6 +149,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
         }
@@ -156,6 +167,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
         }
@@ -173,6 +185,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
         }
@@ -190,6 +203,7 @@ impl Symbol {
             enum_value: Some(value),
             explicit_align: None,
             asm_label: None,
+            array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
         }
@@ -207,6 +221,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
         }
@@ -224,6 +239,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
         }
@@ -232,6 +248,14 @@ impl Symbol {
     /// Set explicit alignment from _Alignas specifier (C11 6.7.5)
     pub fn with_align(mut self, align: Option<u32>) -> Self {
         self.explicit_align = align;
+        self
+    }
+
+    /// Record that this array was declared with size expressions, which is
+    /// what separates a variably modified array from an incomplete one --
+    /// see [`Symbol::array_is_variably_modified`].
+    pub fn with_variably_modified_array(mut self, yes: bool) -> Self {
+        self.array_is_variably_modified = yes;
         self
     }
 

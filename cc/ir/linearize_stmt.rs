@@ -12,13 +12,15 @@ use super::linearize::*;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
 };
+use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{
-    AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement,
-    OffsetOfPath, Stmt, UnaryOp,
+    AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Stmt,
+    UnaryOp,
 };
 use crate::strings::StringId;
+use crate::types::TypeTable;
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
 impl<'a> super::linearize::Linearizer<'a> {
@@ -799,7 +801,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);
-                                    let storage_type = self.bitfield_storage_type(storage_size);
+
                                     // Convert to the *member's* type first, not
                                     // straight to the storage unit's. C17 6.7.9p11
                                     // initializes a member by converting to its own
@@ -808,16 +810,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     // directly to the unsigned storage type skipped
                                     // it, so `struct { _Bool f:1; } v = {2};` stored
                                     // 2, truncated it to one bit and read back 0.
+                                    // A *second* conversion, to a type derived from
+                                    // the access span, used to follow. It truncated
+                                    // whenever the span was not 1, 2, 4 or 8 bytes,
+                                    // because `bitfield_storage_type` answers
+                                    // `unsigned int` for everything else -- so a
+                                    // 64-bit field in a sixteen-byte window, or a
+                                    // packed nine-byte span, kept 32 bits of its
+                                    // initializer. `emit_bitfield_store` takes the
+                                    // member-typed value, exactly as the assignment
+                                    // path hands it over through `emit_member_store`.
                                     let member_val = self.emit_convert(val, val_type, field_type);
-                                    let converted =
-                                        self.emit_convert(member_val, field_type, storage_type);
                                     self.emit_bitfield_store(
                                         base_sym,
                                         offset as usize,
                                         bit_off,
                                         bit_w,
                                         storage_size,
-                                        converted,
+                                        member_val,
                                     );
                                 } else {
                                     self.linearize_struct_field_init(
@@ -1610,341 +1620,76 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Fold a floating constant expression, for the arithmetic C permits
-    /// inside one. Only reachable through a cast to an integer type — the
-    /// value of a `case` label is still an integer.
-    fn eval_const_float(&self, expr: &Expr) -> Option<f64> {
-        match &expr.kind {
-            // Only reachable through a cast to an integer type, so narrowing
-            // to f64 here cannot lose a value the result would have kept.
-            ExprKind::FloatLit(v) => Some(v.to_f64()),
-            ExprKind::IntLit(v) => Some(*v as f64),
-            ExprKind::CharLit(c) => Some(*c as f64),
-            ExprKind::Cast {
-                expr: inner,
-                cast_type,
-            } if self.types.is_float(*cast_type) => self.eval_const_float(inner),
-            ExprKind::Unary {
-                op: UnaryOp::Neg,
-                operand,
-            } => self.eval_const_float(operand).map(|v| -v),
-            ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float(left)?;
-                let r = self.eval_const_float(right)?;
-                match op {
-                    BinaryOp::Add => Some(l + r),
-                    BinaryOp::Sub => Some(l - r),
-                    BinaryOp::Mul => Some(l * r),
-                    BinaryOp::Div if r != 0.0 => Some(l / r),
-                    _ => None,
-                }
-            }
+    /// The value of a `const`-qualified object whose own initializer already
+    /// folded to a constant, if this identifier names one.
+    ///
+    /// C makes no such object a constant expression -- that is a C++ rule --
+    /// but gcc folds it in a static initializer, silently and even under
+    /// `-pedantic`, so `const int c = 5; int w = c;` compiles everywhere. The
+    /// qualifier alone is not enough: `const int c;` and `extern const int c;`
+    /// have no visible value and gcc rejects both, which returning `None` here
+    /// leaves to the caller's diagnostic.
+    ///
+    /// The already-emitted global is the record consulted, so this answers only
+    /// for an object defined earlier in the translation unit -- which is what
+    /// "visible value" means.
+    fn const_object_value(&self, symbol_id: crate::symbol::SymbolId) -> Option<i128> {
+        let name = self.symbol_name(symbol_id);
+        let key = format!("{}.{}", self.current_func_name, name);
+        let global_name = match self.static_locals.get(&key) {
+            Some(info) => info.global_name.as_str(),
+            None => name.as_str(),
+        };
+        let global = self
+            .module
+            .globals
+            .iter()
+            .find(|g| g.name == global_name && g.is_const)?;
+        match &global.init {
+            crate::ir::Initializer::Int(v) => Some(*v),
             _ => None,
         }
     }
 
+    /// [`Self::const_object_value`] for a floating `const` object.
+    fn const_object_float_value(&self, symbol_id: crate::symbol::SymbolId) -> Option<FloatVal> {
+        let name = self.symbol_name(symbol_id);
+        let key = format!("{}.{}", self.current_func_name, name);
+        let global_name = match self.static_locals.get(&key) {
+            Some(info) => info.global_name.as_str(),
+            None => name.as_str(),
+        };
+        let global = self
+            .module
+            .globals
+            .iter()
+            .find(|g| g.name == global_name && g.is_const)?;
+        match &global.init {
+            crate::ir::Initializer::Float(v) => Some(*v),
+            crate::ir::Initializer::Int(v) => Some(FloatVal::from_i128(*v)),
+            _ => None,
+        }
+    }
+
+    /// Evaluate an integer constant expression under C's own rule: an
+    /// enumeration constant is the only identifier that has a value here.
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
-        match &expr.kind {
-            ExprKind::IntLit(val) => Some(*val as i128),
-            ExprKind::Int128Lit(val) => Some(*val),
-            ExprKind::CharLit(c) => Some(*c as i128),
-
-            ExprKind::Ident(symbol_id) => {
-                // Check if it's an enum constant
-                let sym = self.symbols.get(*symbol_id);
-                if sym.is_enum_constant() {
-                    sym.enum_value
-                } else {
-                    None
-                }
-            }
-
-            // The address of a member of a pointer constant is itself an
-            // integer constant; see `eval_pointer_constant`.
-            ExprKind::Unary {
-                op: UnaryOp::AddrOf,
-                operand,
-            } => self.eval_pointer_constant(operand),
-
-            ExprKind::Unary { op, operand } => {
-                let val = self.eval_const_expr(operand)?;
-                match op {
-                    UnaryOp::Neg => Some(val.wrapping_neg()),
-                    UnaryOp::Not => Some(if val == 0 { 1 } else { 0 }),
-                    UnaryOp::BitNot => Some(!val),
-                    _ => None,
-                }
-            }
-
-            ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_expr(left)?;
-                let r = self.eval_const_expr(right)?;
-                match op {
-                    BinaryOp::Add => Some(l.wrapping_add(r)),
-                    BinaryOp::Sub => Some(l.wrapping_sub(r)),
-                    BinaryOp::Mul => Some(l.wrapping_mul(r)),
-                    BinaryOp::Div => {
-                        if r != 0 {
-                            Some(l / r)
-                        } else {
-                            None
-                        }
-                    }
-                    BinaryOp::Mod => {
-                        if r != 0 {
-                            Some(l % r)
-                        } else {
-                            None
-                        }
-                    }
-                    BinaryOp::BitAnd => Some(l & r),
-                    BinaryOp::BitOr => Some(l | r),
-                    BinaryOp::BitXor => Some(l ^ r),
-                    BinaryOp::Shl | BinaryOp::Shr => {
-                        // Mask shift amount to match C semantics and target hardware behavior.
-                        // 8/16/32-bit: mask 31, 64-bit: mask 63, 128-bit: mask 127.
-                        let size_bits = left.typ.map(|t| self.types.size_bits(t)).unwrap_or(32);
-                        let mask: i128 = if size_bits > 64 {
-                            127
-                        } else if size_bits > 32 {
-                            63
-                        } else {
-                            31
-                        };
-                        let shift_amt = (r & mask) as u32;
-                        match op {
-                            BinaryOp::Shl => Some(l << shift_amt),
-                            BinaryOp::Shr => Some(l >> shift_amt),
-                            _ => unreachable!(),
-                        }
-                    }
-                    BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-                        // Use unsigned comparison when either operand is unsigned.
-                        // C promotes both to the common unsigned type for comparison.
-                        // Ask the predicate rather than the modifier bit: the bit is
-                        // silent for the types whose signedness does not live there.
-                        let left_unsigned = left.typ.is_some_and(|t| self.types.is_unsigned(t));
-                        let right_unsigned = right.typ.is_some_and(|t| self.types.is_unsigned(t));
-                        let use_unsigned = left_unsigned || right_unsigned;
-                        if use_unsigned {
-                            let lu = l as u128;
-                            let ru = r as u128;
-                            Some(match op {
-                                BinaryOp::Lt => {
-                                    if lu < ru {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                BinaryOp::Le => {
-                                    if lu <= ru {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                BinaryOp::Gt => {
-                                    if lu > ru {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                BinaryOp::Ge => {
-                                    if lu >= ru {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                _ => unreachable!(),
-                            })
-                        } else {
-                            Some(match op {
-                                BinaryOp::Lt => {
-                                    if l < r {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                BinaryOp::Le => {
-                                    if l <= r {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                BinaryOp::Gt => {
-                                    if l > r {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                BinaryOp::Ge => {
-                                    if l >= r {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                _ => unreachable!(),
-                            })
-                        }
-                    }
-                    BinaryOp::Eq => Some(if l == r { 1 } else { 0 }),
-                    BinaryOp::Ne => Some(if l != r { 1 } else { 0 }),
-                    BinaryOp::LogAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
-                    BinaryOp::LogOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
-                }
-            }
-
-            ExprKind::Conditional {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                let cond_val = self.eval_const_expr(cond)?;
-                if cond_val != 0 {
-                    self.eval_const_expr(then_expr)
-                } else {
-                    self.eval_const_expr(else_expr)
-                }
-            }
-
-            // sizeof(type) - constant for complete types, but a variable
-            // length array type's size is only known at run time (6.5.3.4p2).
-            ExprKind::SizeofType(type_id, dims) => {
-                if crate::parse::ast::sizeof_type_is_runtime(self.types, *type_id, dims) {
-                    return None;
-                }
-                let size_bits = self.types.size_bits(*type_id);
-                Some((size_bits / 8) as i128)
-            }
-
-            // sizeof(expr) - constant if expr type is complete
-            ExprKind::SizeofExpr(inner_expr) => {
-                if let Some(typ) = inner_expr.typ {
-                    let size_bits = self.types.size_bits(typ);
-                    Some((size_bits / 8) as i128)
-                } else {
-                    None
-                }
-            }
-
-            // _Alignof(type) - constant for complete types
-            ExprKind::AlignofType(type_id) => {
-                let align = self.types.alignment(*type_id);
-                Some(align as i128)
-            }
-
-            // _Alignof(expr) - constant if expr type is complete
-            ExprKind::AlignofExpr(inner_expr) => {
-                if let Some(typ) = inner_expr.typ {
-                    let align = self.types.alignment(typ);
-                    Some(align as i128)
-                } else {
-                    None
-                }
-            }
-
-            // Cast to integer type - evaluate inner expression
-            ExprKind::Cast {
-                expr: inner,
-                cast_type,
-            } => self.eval_const_expr(inner).or_else(|| {
-                // `(int)2.0` is an integer constant expression (6.6p6: a cast
-                // of a floating constant is allowed as long as it is the
-                // immediate operand of a cast). Without this the fold failed
-                // and a valid case label was rejected as non-constant.
-                if self.types.is_integer(*cast_type) {
-                    self.eval_const_float(inner).map(|f| f as i128)
-                } else {
-                    None
-                }
-            }),
-
-            // __builtin_offsetof(type, member-designator) - compile-time constant
-            ExprKind::OffsetOf { type_id, path } => {
-                let mut offset: u64 = 0;
-                let mut current_type = *type_id;
-
-                for element in path {
-                    match element {
-                        OffsetOfPath::Field(field_id) => {
-                            let struct_type = self.resolve_struct_type(current_type);
-                            // None if the field is not found
-                            let member_info = self.types.find_member(struct_type, *field_id)?;
-                            offset += member_info.offset as u64;
-                            current_type = member_info.typ;
-                        }
-                        OffsetOfPath::Index(index) => {
-                            // None if this is not an array type
-                            let elem_type = self.types.base_type(current_type)?;
-                            let elem_size = self.types.size_bytes(elem_type);
-                            offset += (*index as u64) * (elem_size as u64);
-                            current_type = elem_type;
-                        }
-                    }
-                }
-
-                Some(offset as i128)
-            }
-
-            _ => None,
-        }
+        self.eval_const_expr_scoped(ConstScope::Standard, expr)
     }
 
-    /// The address of `expr`, when it is an integer constant rather than a
-    /// symbol's address.
+    /// `eval_const_expr`, plus the `const`-object folding gcc performs in a
+    /// *static initializer* and nowhere else.
     ///
-    /// `(size_t)&((struct S *)0)->member` is how offsetof was spelled before
-    /// <stddef.h> was relied on to provide it, and it is still what a good
-    /// many headers expand to. Nothing is dereferenced -- the address of a
-    /// member of a null pointer is arithmetic on the null pointer -- so there
-    /// is no symbol to relocate against and the result is a plain integer.
-    ///
-    /// The recursion bottoms out only at an integer constant, so `&global.f`
-    /// is not folded here: that one *does* need a symbol, and
-    /// `eval_static_address` is what computes it.
-    fn eval_pointer_constant(&self, expr: &Expr) -> Option<i128> {
-        match &expr.kind {
-            ExprKind::IntLit(v) => Some(*v as i128),
-            ExprKind::Int128Lit(v) => Some(*v),
+    /// `const int c = 5; int w = c + 1;` compiles everywhere and was rejected
+    /// here. The folding must not reach `eval_const_expr`'s other callers: C
+    /// makes a `const` object no kind of constant expression, so `int a[c];`
+    /// is a VLA and `case c:` an error, in gcc as here.
+    pub(crate) fn eval_const_init_expr(&self, expr: &Expr) -> Option<i128> {
+        self.eval_const_expr_scoped(ConstScope::StaticInitializer, expr)
+    }
 
-            ExprKind::Cast { expr: inner, .. } => self.eval_pointer_constant(inner),
-
-            ExprKind::Unary {
-                op: UnaryOp::AddrOf,
-                operand,
-            } => self.eval_pointer_constant(operand),
-
-            ExprKind::Member { expr: base, member } => {
-                let base_offset = self.eval_pointer_constant(base)?;
-                let struct_type = self.resolve_struct_type(base.typ?);
-                let member_info = self.types.find_member(struct_type, *member)?;
-                Some(base_offset + member_info.offset as i128)
-            }
-
-            ExprKind::Arrow { expr: base, member } => {
-                let base_offset = self.eval_pointer_constant(base)?;
-                let pointee_type = self.types.base_type(base.typ?)?;
-                let struct_type = self.resolve_struct_type(pointee_type);
-                let member_info = self.types.find_member(struct_type, *member)?;
-                Some(base_offset + member_info.offset as i128)
-            }
-
-            ExprKind::Index { array, index } => {
-                let base_offset = self.eval_pointer_constant(array)?;
-                let idx = self.eval_const_expr(index)?;
-                let elem_type = self.types.base_type(array.typ?)?;
-                Some(base_offset + idx * self.types.size_bytes(elem_type) as i128)
-            }
-
-            _ => None,
-        }
+    fn eval_const_expr_scoped(&self, scope: ConstScope, expr: &Expr) -> Option<i128> {
+        crate::constexpr::eval(self, scope, expr)
     }
 
     /// Fold a constant floating expression for a static initializer.
@@ -1955,7 +1700,20 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `__float128` sixty, so `static __float128 c = 1.0q/3.0q;` disagreed with
     /// the *same initializer written for a local*, which is computed at run
     /// time and was right.
-    pub(crate) fn eval_const_float_expr(&self, expr: &Expr) -> Option<FloatVal> {
+    /// Fold a floating constant expression for a static initializer, with the
+    /// `const`-object folding [`Self::eval_const_init_expr`] describes.
+    ///
+    /// There is no `Standard` entry point beside this one because no strict
+    /// context reaches the floating evaluator: an array size, a `case` label
+    /// and `_Static_assert` all take an *integer* constant expression, and a
+    /// floating one is refused before it gets here. The scope is still a
+    /// parameter rather than a constant so that adding such a caller is a
+    /// one-line change and cannot silently inherit the lax rule.
+    pub(crate) fn eval_const_float_init_expr(&self, expr: &Expr) -> Option<FloatVal> {
+        self.eval_const_float_expr_scoped(ConstScope::StaticInitializer, expr)
+    }
+
+    fn eval_const_float_expr_scoped(&self, scope: ConstScope, expr: &Expr) -> Option<FloatVal> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(*v),
             // Exact: a `u128` mantissa has no more bits than the significand,
@@ -1963,8 +1721,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             ExprKind::IntLit(v) => Some(FloatVal::from_i128(*v as i128)),
             ExprKind::CharLit(c) => Some(FloatVal::from_i128(*c as i128)),
 
+            // A `const double` folds in a static initializer exactly as a
+            // `const int` does; without this `const double d = 2.5; double x =
+            // d * 2;` was rejected while the integer spelling compiled.
+            ExprKind::Ident(symbol_id) if scope == ConstScope::StaticInitializer => {
+                self.const_object_float_value(*symbol_id)
+            }
+
             ExprKind::Unary { op, operand } => {
-                let val = self.eval_const_float_expr(operand)?;
+                let val = self.eval_const_float_expr_scoped(scope, operand)?;
                 match op {
                     UnaryOp::Neg => Some(val.negated()),
                     _ => None,
@@ -1975,8 +1740,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             // which is the type the usual arithmetic conversions already gave
             // this node -- not in whatever width the operands were written at.
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_float_expr(left)?;
-                let r = self.eval_const_float_expr(right)?;
+                let l = self.eval_const_float_expr_scoped(scope, left)?;
+                let r = self.eval_const_float_expr_scoped(scope, right)?;
                 let fmt = expr.typ.and_then(|t| self.types.fp_format(t))?;
                 Some(match op {
                     BinaryOp::Add => l.add(r, fmt),
@@ -1994,7 +1759,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 expr: inner,
                 cast_type,
             } => {
-                let val = self.eval_const_float_expr(inner)?;
+                let val = self.eval_const_float_expr_scoped(scope, inner)?;
                 Some(match self.types.fp_format(*cast_type) {
                     Some(fmt) => val.round_to_format(fmt),
                     None => val,
@@ -2006,6 +1771,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Evaluate a static address expression (for initializers like `&symbol.field`)
+    ///
+    /// Reached only from the initializer path, so a subscript folds with
+    /// [`Self::eval_const_init_expr`]: `const int c = 5; int *p = &a[c-3];`
+    /// is an ordinary static initializer and gcc accepts it.
     ///
     /// Returns Some((symbol_name, offset)) if the expression is a valid static address,
     /// or None if it can't be computed at compile time.
@@ -2054,7 +1823,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let (name, base_offset) = self.eval_static_address(array)?;
 
                 // Get the index as a constant
-                let idx = self.eval_const_expr(index)?;
+                let idx = self.eval_const_init_expr(index)?;
 
                 // Get the element size
                 let array_type = array.typ?;
@@ -2094,7 +1863,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 };
 
                 let (name, base_offset) = self.eval_static_address(ptr_expr)?;
-                let int_val = self.eval_const_expr(int_expr)?;
+                let int_val = self.eval_const_init_expr(int_expr)?;
 
                 // Scale by pointee size for pointer arithmetic
                 let pointee_size = ptr_expr
@@ -2924,5 +2693,40 @@ impl VmScopeWalk {
                 self.open.push(id);
             }
         }
+    }
+}
+
+/// The linearizer's half of the shared C17 6.6 walk.
+///
+/// [`crate::constexpr`] owns the walk; what differs from the parser's half is
+/// the `const`-object folding gcc performs in a static initializer, and that a
+/// floating subexpression folds in its own format rather than through `f64`.
+impl crate::constexpr::ConstEnv for Linearizer<'_> {
+    fn types(&self) -> &TypeTable {
+        self.types
+    }
+
+    fn ident_value(&self, sym: crate::symbol::SymbolId, scope: ConstScope) -> Option<i128> {
+        let symbol = self.symbols.get(sym);
+        if symbol.is_enum_constant() {
+            return symbol.enum_value;
+        }
+        match scope {
+            ConstScope::Standard => None,
+            ConstScope::StaticInitializer => self.const_object_value(sym),
+        }
+    }
+
+    fn struct_of(&self, typ: TypeId) -> TypeId {
+        self.resolve_struct_type(typ)
+    }
+
+    /// Folded at the expression's own precision and narrowed once, rather than
+    /// computed in `f64`: the two arms that ask for this -- an ordering and a
+    /// truncating cast -- are both decided correctly by the `f64` result, and
+    /// the exactness matters underneath it.
+    fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
+        self.eval_const_float_expr_scoped(scope, expr)
+            .map(|v| v.to_f64())
     }
 }

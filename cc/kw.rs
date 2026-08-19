@@ -411,6 +411,11 @@ define_keywords! {
     (_,                 "sqrt",                 0),
     (_,                 "copysign",             0),
     (_,                 "abort",                0),
+    // The long-double magnitude and sign builtins lower to these rather than
+    // to `fabs`/`__signbit`, which take a `double` and so read only the low
+    // eight bytes of an x87 value. See #C121.
+    (_,                 "fabsl",                0),
+    (_,                 "__signbitl",           0),
 
     // ---- Supported attribute names (SUPPORTED_ATTR) ----
     // Plain forms

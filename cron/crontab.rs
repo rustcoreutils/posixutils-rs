@@ -75,7 +75,10 @@ fn install_crontab(target: &str, content: &str) -> ! {
         exit(1);
     }
 
-    if let Err(e) = plib::io::write_atomic(Path::new(target), content.as_bytes()) {
+    // 0600 outright rather than the 0666 & ~umask XCU 1.1.1.4 gives a created
+    // file: this is the spool copy, and a crontab is readable only by its
+    // owner and the daemon.
+    if let Err(e) = plib::io::write_atomic_mode(Path::new(target), content.as_bytes(), 0o600) {
         diag_error(&format!("{}: {}", gettext("cannot install crontab"), e));
         exit(1);
     }

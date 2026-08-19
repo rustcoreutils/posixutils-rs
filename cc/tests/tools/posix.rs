@@ -1034,6 +1034,46 @@ fn ctags_default_output_file_is_tags() {
     );
 }
 
+/// XCU 1.1.1.4: a file a utility creates gets `S_IRUSR|S_IWUSR|S_IRGRP|
+/// S_IWGRP|S_IROTH|S_IWOTH` with the umask cleared. `ctags.md` states no
+/// override, so a fresh tags file is `0o666 & ~umask` — not the `0o600` it
+/// used to inherit from `write_atomic`'s temporary.
+///
+/// The umask is only *read* here, and nothing in this test binary sets one,
+/// so no serialization is needed; `plib/tests/write_atomic_umask.rs` is where
+/// the mask is varied.
+#[test]
+fn ctags_creates_the_tags_file_with_the_mandated_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = src(&dir, "m.c", "int moded(void){return 0;}\n");
+
+    let cwd = TempDir::new().unwrap();
+    let out = Command::new(exe_for("ctags"))
+        .arg(&path)
+        .current_dir(cwd.path())
+        .output()
+        .expect("failed to run ctags");
+    assert!(out.status.success());
+
+    // The reference is a file created the ordinary way: `File::create` opens
+    // with mode 0o666 and lets the kernel apply the umask, which is exactly
+    // what XCU 1.1.1.4 describes. Comparing against it keeps this test from
+    // restating plib's own arithmetic, and needs no libc dependency here.
+    let reference = cwd.path().join("reference");
+    fs::File::create(&reference).unwrap();
+    let want = fs::metadata(&reference).unwrap().permissions().mode() & 0o7777;
+
+    let tags = cwd.path().join("tags");
+    let got = fs::metadata(&tags).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        got, want,
+        "tags file is {:04o}, an ordinarily-created file is {:04o}",
+        got, want
+    );
+}
+
 /// `/` and `\` inside a search pattern must be escaped, or the pattern ends
 /// early and the editor jumps nowhere. The behavior was right; nothing pinned it.
 #[test]

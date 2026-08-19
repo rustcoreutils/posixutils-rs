@@ -189,6 +189,33 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
     Ok(ChmodMode::Symbolic(symbolic))
 }
 
+/// The process file mode creation mask.
+///
+/// There is no `getumask(2)`: the only portable way to read the mask is to set
+/// it and put back what was there. That makes this a read-modify-write on
+/// process-global state.
+///
+/// WARNING:
+/// Potential umask race-condition. A test that *sets* the umask must not run in
+/// parallel with one that reads or depends on it, so such tests live in a test
+/// binary of their own — `tree/tests/tree-tests-umask.rs` and
+/// `plib/tests/write_atomic_umask.rs`.
+pub fn umask() -> u32 {
+    let m = unsafe { libc::umask(0) };
+    unsafe { libc::umask(m) }; // Immediately revert
+    m as u32 // Cast for macOS
+}
+
+/// The mode a utility must give a file it creates, per XCU 1.1.1.4 "File Read,
+/// Write, and Creation": `S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH`,
+/// with the bits in the process's file mode creation mask cleared.
+///
+/// Utilities whose spec overrides this say so — `c17` creates an executable
+/// `S_IRWXU|S_IRWXG|S_IRWXO & ~umask` — and those pass their own mode instead.
+pub fn default_create_mode() -> u32 {
+    0o666 & !umask()
+}
+
 // apply symbolic mutations to the given file at path
 #[allow(clippy::unnecessary_cast)] // casts needed for macOS where libc constants are u16
 pub fn mutate(init_mode: u32, is_dir: bool, symbolic: &ChmodSymbolic) -> u32 {
@@ -203,14 +230,9 @@ pub fn mutate(init_mode: u32, is_dir: bool, symbolic: &ChmodSymbolic) -> u32 {
         match cached_umask {
             Some(m) => m,
             None => {
-                // WARNING:
-                // Potential umask race-condition. Tests that exercise this code path must be
-                // located in tree/tree-tests-umask.rs so that they would not be run in parallel.
-
-                let m = unsafe { libc::umask(0) };
-                unsafe { libc::umask(m) }; // Immediately revert
-
-                let mask = m as u32; // Cast for macOS
+                // Read once per `mutate` call: each read is a umask(2)
+                // round-trip on process-global state.
+                let mask = umask();
                 cached_umask = Some(mask);
                 mask
             }

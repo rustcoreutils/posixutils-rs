@@ -347,3 +347,72 @@ void mul(void) { a *= 3; }
         "the CAS temp pointer must be frame-relative:\n{body}"
     );
 }
+
+/// An `_Atomic` aggregate of lock-free size is accessed with the same
+/// instructions its scalar equivalent gets (#C116), at the aggregate's own
+/// width.
+///
+/// This is the test that had to exist: c17 warned and fell through to a
+/// non-atomic struct copy, and a copy reads back the value it wrote just as an
+/// atomic access does. Only the instructions tell the two apart -- which is
+/// this file's whole premise.
+#[test]
+fn codegen_atomic_aggregate_uses_atomic_instructions() {
+    let src = r#"
+struct S4 { int a; };
+struct S8 { int a, b; };
+_Atomic struct S4 g4;
+_Atomic struct S8 g8;
+void st4(struct S4 v) { g4 = v; }
+void st8(struct S8 v) { g8 = v; }
+struct S4 ld4(void) { return g4; }
+"#;
+
+    // x86-64: a store is an `xchg` against memory, which is implicitly locked;
+    // the suffix is the object's own width, so a 4-byte struct must not be
+    // widened to 8 the way #X1's narrow-scalar defect did.
+    let asm = asm_for("atomic_aggregate_x86", X86_64_LINUX, src);
+    assert_body_contains(&asm, "st4", "xchgl", "a 4-byte _Atomic struct store");
+    assert_body_lacks(
+        &asm,
+        "st4",
+        "xchgq",
+        "a 4-byte object must not be stored 8 bytes wide",
+    );
+    assert_body_contains(&asm, "st8", "xchgq", "an 8-byte _Atomic struct store");
+    // A block copy would be the old behaviour, at any width.
+    for f in ["st4", "st8", "ld4"] {
+        assert_body_lacks(&asm, f, "memcpy", "an atomic access is not a block copy");
+        assert_body_lacks(&asm, f, "rep movs", "an atomic access is not a block copy");
+    }
+
+    // aarch64 has no implicitly-ordered plain access, so both directions are
+    // explicit: store-release and load-acquire, again at the object's width.
+    let asm = asm_for("atomic_aggregate_arm", AARCH64_LINUX, src);
+    assert_body_contains(&asm, "st4", "stlr w", "a 4-byte _Atomic struct store");
+    assert_body_contains(&asm, "st8", "stlr x", "an 8-byte _Atomic struct store");
+    assert_body_contains(&asm, "ld4", "ldar w", "a 4-byte _Atomic struct load");
+}
+
+/// The lock-free ceiling has to stay where it is, and stay visible.
+///
+/// Above 8 bytes -- and at any width that is not a machine integer size --
+/// gcc emits `__atomic_*` calls that need `-latomic`, which c17 does not link
+/// because it hands the link to the host `cc` (#X1). Those fall back to a
+/// non-atomic access *with a diagnostic*, and nothing in the suite asserted
+/// the diagnostic's text, so the ceiling could have eroded unnoticed.
+#[test]
+fn codegen_oversized_atomic_still_warns_and_falls_back() {
+    let src = r#"
+struct Big { int a, b, c; };
+struct Odd { char a, b, c; };
+_Atomic struct Big gb;
+_Atomic struct Odd go;
+_Atomic long double gl;
+void f(struct Big b, struct Odd o, long double l) { gb = b; go = o; gl = l; }
+"#;
+    let asm = asm_for("atomic_ceiling", X86_64_LINUX, src);
+    // The fallback is a plain copy, so no atomic instruction may appear.
+    assert_body_lacks(&asm, "f", "xchg", "an oversized atomic must not be lowered");
+    assert_body_lacks(&asm, "f", "lock", "an oversized atomic must not be lowered");
+}

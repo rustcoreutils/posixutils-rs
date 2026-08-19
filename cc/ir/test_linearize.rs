@@ -6141,6 +6141,112 @@ fn test_atomic_plain_assign_uses_atomic_store() {
     );
 }
 
+/// An `_Atomic` aggregate of lock-free size lowers to a single atomic store
+/// at the aggregate's own width, through an unsigned integer surrogate
+/// (#C116).
+///
+/// The IR is where this is worth asserting: the fallback it replaced was an
+/// ordinary struct copy, which reads back what it wrote exactly as the atomic
+/// store does. `insn.size` is what every backend uses to size the access, so a
+/// wrong width here is a read or write of the neighbouring bytes.
+#[test]
+fn test_atomic_aggregate_assign_uses_atomic_store() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let s_tag = ctx.str("S");
+    let a_name = ctx.str("a");
+    let int_id = ctx.types.int_id;
+
+    // struct S { int a; } -- four bytes, a lock-free width.
+    let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
+        tag: Some(s_tag),
+        members: vec![StructMember {
+            name: a_name,
+            typ: int_id,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            explicit_align: None,
+        }],
+        enum_constants: vec![],
+        size: 4,
+        align: 4,
+        is_complete: true,
+        transparent: false,
+    }));
+    let atomic_struct = {
+        let mut t = ctx.types.get(struct_type).clone();
+        t.modifiers |= TypeModifiers::ATOMIC;
+        ctx.types.intern(t)
+    };
+
+    // void test(_Atomic struct S g, struct S v) { g = v; }
+    let g_sym = ctx.var("g", atomic_struct);
+    let v_sym = ctx.var("v", struct_type);
+    let assign = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(Expr::var_typed(g_sym, atomic_struct)),
+            value: Box::new(Expr::var_typed(v_sym, struct_type)),
+        },
+        atomic_struct,
+    );
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![
+            Parameter {
+                symbol: Some(g_sym),
+                typ: atomic_struct,
+                vm_dims: vec![],
+            },
+            Parameter {
+                symbol: Some(v_sym),
+                typ: struct_type,
+                vm_dims: vec![],
+            },
+        ],
+        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let module = ctx.linearize(&TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    });
+
+    assert_eq!(
+        count_op(&module, Opcode::AtomicStore),
+        1,
+        "an _Atomic aggregate assignment is one atomic store"
+    );
+
+    let store = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|i| i.op == Opcode::AtomicStore)
+        .expect("no AtomicStore");
+    assert_eq!(
+        store.size, 32,
+        "the access must be the aggregate's own width, not widened"
+    );
+    let typ = store.typ.expect("AtomicStore carries no type");
+    assert!(
+        ctx.types.is_integer(typ),
+        "the aggregate travels through an integer surrogate; got {:?}",
+        ctx.types.kind(typ)
+    );
+    assert_eq!(
+        ctx.types.size_bits(typ),
+        32,
+        "the surrogate must be the same width as the aggregate"
+    );
+}
+
 /// A complex member of an automatic struct is stored as two halves.
 ///
 /// A complex value travels by *address*, so storing it the way a scalar member

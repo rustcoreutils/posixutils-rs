@@ -47,9 +47,15 @@ impl Linearizer<'_> {
     /// True when an atomic object of this type can be operated on with a
     /// single hardware instruction.
     ///
-    /// Anything else -- a struct, a complex value, `long double`, `__int128`,
-    /// or any width that is not a machine integer size -- would need the
-    /// lock-based fallbacks in libatomic, which this compiler does not link.
+    /// Anything else -- a complex value, `long double`, `__int128`, or any
+    /// width that is not a machine integer size -- would need the lock-based
+    /// fallbacks in libatomic, which this compiler does not link.
+    ///
+    /// An aggregate of a machine width qualifies (#C116). Its members are
+    /// irrelevant: what the hardware needs is a width and an address, and gcc
+    /// lowers `_Atomic struct S { int a; }` to a plain 4-byte access for the
+    /// same reason. The instruction operates on the bits through the integer
+    /// surrogate `atomic_access_type` picks.
     fn is_lock_free(&self, typ: TypeId) -> bool {
         let kind = self.types.kind(typ);
         let is_scalar = matches!(
@@ -66,7 +72,24 @@ impl Linearizer<'_> {
                 | TypeKind::Double
         ) && !self.types.is_complex(typ);
 
-        is_scalar && matches!(self.types.size_bits(typ), 8 | 16 | 32 | 64)
+        let is_aggregate = matches!(kind, TypeKind::Struct | TypeKind::Union);
+
+        (is_scalar || is_aggregate) && matches!(self.types.size_bits(typ), 8 | 16 | 32 | 64)
+    }
+
+    /// The type the atomic instruction actually operates through.
+    ///
+    /// A scalar is its own surrogate. An aggregate has no arithmetic and no
+    /// register class of its own, so it travels as an unsigned integer of the
+    /// same width -- the same mapping bit-fields already use for their storage
+    /// unit. `elem_typ` is what every backend reads to size the access, so
+    /// substituting here is enough; nothing downstream has to know.
+    fn atomic_access_type(&self, typ: TypeId) -> TypeId {
+        if matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union) {
+            self.bitfield_storage_type((self.types.size_bits(typ) / 8).max(1))
+        } else {
+            typ
+        }
     }
 
     /// Recognize an `_Atomic` lvalue and produce its address.
@@ -107,18 +130,14 @@ impl Linearizer<'_> {
             // libatomic reference, so code that built with gcc -- and with c17
             // before the atomic operators landed -- stopped compiling.
             //
-            // Doing it properly means operating on the aggregate's bits as an
-            // integer, which needs the linearizer's value-versus-address
-            // conventions for small aggregates to agree first: assignment
-            // wants an address while initialization wants a value, so a single
-            // representation is wrong for one of them. Until that is settled, a
-            // warning is honest where the previous silence was not, and it does
-            // not risk a subtly wrong implementation. Recorded at #C116 in
-            // cc/audit.md and under C11 Atomics in cc/doc/TODO.md.
+            // What is left here is what libatomic exists for: `long double`,
+            // `__int128`, complex, and any width that is not a machine integer
+            // size. gcc calls `__atomic_*` for those and c17 links through the
+            // host `cc` without `-latomic` (#X1), so the warning stands.
             diag::warning_args(
                 expr.pos,
                 "access to '{0}' ({1} bytes) is not atomic: c17 provides \
-                 lock-free atomics only for 1, 2, 4 and 8-byte scalars",
+                 lock-free atomics only at 1, 2, 4 and 8 bytes",
                 &[
                     &self.types.get(typ).to_string(),
                     &self.types.size_bytes(typ).to_string(),
@@ -131,7 +150,7 @@ impl Linearizer<'_> {
         let addr = self.linearize_lvalue(expr);
         Some(AtomicLvalue {
             addr,
-            elem_typ: typ,
+            elem_typ: self.atomic_access_type(typ),
             size_bits,
         })
     }

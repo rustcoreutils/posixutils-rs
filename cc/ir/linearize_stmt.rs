@@ -603,6 +603,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         let Some(fault) = self.types.assignment_fault(declared, value, null_constant) else {
             return;
         };
+        if fault == crate::types::AssignFault::FunctionPointerVoid {
+            if crate::diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
+                crate::diag::warning(
+                    expr.pos,
+                    &gettextrs::gettext(
+                        "ISO C forbids return between function pointer and 'void *'",
+                    ),
+                );
+            }
+            return;
+        }
         let (d_name, v_name) = (
             self.types.format_type(declared, Some(self.strings)),
             self.types.format_type(value, Some(self.strings)),

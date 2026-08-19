@@ -1187,3 +1187,62 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("wide_bitfield_own_bits", code, &[]), 0);
 }
+
+/// `__attribute__((transparent_union))` (#C51): a caller may pass any member
+/// type to the parameter, and the union is passed as its **first member**
+/// would be.
+///
+/// The attribute exists because glibc declares every socket call with it, so
+/// the front-end half is what keeps `sendto` compiling. The ABI half is the
+/// half that can be silently wrong, and only a run catches it: a union whose
+/// members classify differently -- `float` against `int` -- goes in a
+/// different register file depending on which member comes first, and reading
+/// the wrong file yields a plausible number rather than a crash.
+///
+/// Both spellings are exercised, because they take different paths through the
+/// parser: on the union specifier, and trailing on a typedef of an anonymous
+/// union, which is glibc's own.
+#[test]
+fn c99_transparent_union_passes_as_its_first_member() {
+    let code = r#"
+union FirstFloat { float f; int i; } __attribute__((transparent_union));
+union FirstInt   { int i; float f; } __attribute__((transparent_union));
+typedef union { int *ip; char *cp; } PtrArg __attribute__((__transparent_union__));
+
+static float take_f(union FirstFloat u) { return u.f; }
+static int   take_i(union FirstInt u)   { return u.i; }
+static long  take_p(PtrArg u)           { return *u.ip; }
+
+/* Forwarding matters as much as receiving: the caller classifies the
+   argument's declared type, which here is the union itself. */
+static float fwd_f(union FirstFloat u) { return take_f(u); }
+
+int main(void) {
+    int n = 1234;
+
+    /* A member type may be passed directly -- no cast, no brace. */
+    if (take_f(2.5f) != 2.5f) return 1;
+    if (take_i(7) != 7)       return 2;
+    if (take_p(&n) != 1234)   return 3;
+
+    /* Same two members, opposite order: the first one decides, so these
+       travel in different register files and must both survive. */
+    if (take_f(-0.75f) != -0.75f) return 4;
+    if (take_i(-9) != -9)         return 5;
+
+    /* And a union value forwarded on as a whole. */
+    if (fwd_f(3.25f) != 3.25f) return 6;
+
+    /* The union is still a union: naming a member works, and its size is the
+       widest member's, not the first member's. */
+    union FirstFloat u;
+    u.i = 0;
+    u.f = 8.5f;
+    if (u.f != 8.5f) return 7;
+    if (sizeof(PtrArg) != sizeof(char *)) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("transparent_union_abi", code, &[]), 0);
+}

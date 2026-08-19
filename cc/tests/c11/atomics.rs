@@ -687,30 +687,102 @@ int main(void) {
     assert_eq!(compile_and_run_optimized("c11_atomic_bool_opt", code), 0);
 }
 
-/// An `_Atomic` type c17 cannot operate on lock-free must still *compile*.
+/// An `_Atomic` aggregate of lock-free size **is** accessed atomically
+/// (#C116). What the hardware needs is a width and an address, and members
+/// are irrelevant to both; gcc lowers `_Atomic struct S { int a; }` to a plain
+/// 4-byte access for exactly that reason.
 ///
-/// Rejecting it outright was a source-compatibility regression: gcc lowers an
-/// 8-byte `_Atomic struct` to a single lock-free cmpxchg with no libatomic
-/// reference, so code that built with gcc -- and with c17 before the atomic
-/// operators landed -- stopped compiling. It now warns and falls back to the
-/// ordinary access, which is honest where the previous silence was not.
+/// c17 used to warn and fall through to a non-atomic struct copy -- the one
+/// operation `_Atomic` exists to prevent, done silently under a type that
+/// promised otherwise. Every lock-free width is exercised here, and a union
+/// alongside the structs, since the rule is about size rather than shape.
 #[test]
-fn c11_atomic_aggregate_still_compiles() {
+fn c11_atomic_aggregate_is_atomic() {
     let code = r#"
 #include <stdatomic.h>
 
-struct P { int a, b; };
-_Atomic struct P g;
+struct S1 { char a; };
+struct S2 { short a; };
+struct S4 { int a; };
+struct S8 { int a, b; };
+union  U4 { int i; float f; };
+
+_Atomic struct S1 g1;
+_Atomic struct S2 g2;
+_Atomic struct S4 g4;
+_Atomic struct S8 g8;
+_Atomic union  U4 gu;
+
+int main(void) {
+    struct S1 v1 = { 1 };   g1 = v1;  struct S1 r1 = g1;
+    struct S2 v2 = { 2 };   g2 = v2;  struct S2 r2 = g2;
+    struct S4 v4 = { 44 };  g4 = v4;  struct S4 r4 = g4;
+    struct S8 v8 = { 3, 4 }; g8 = v8; struct S8 r8 = g8;
+    union  U4 vu; vu.i = 99; gu = vu; union U4 ru = gu;
+
+    if (r1.a != 1)              return 1;
+    if (r2.a != 2)              return 2;
+    if (r4.a != 44)             return 3;
+    if (r8.a != 3 || r8.b != 4) return 4;
+    if (ru.i != 99)             return 5;
+
+    /* A local `_Atomic` aggregate, and a second round trip through the same
+       object, so this is not passing on a single store that happened to land. */
+    _Atomic struct S8 l8;
+    l8 = (struct S8){ 5, 6 };
+    struct S8 lr = l8;
+    if (lr.a != 5 || lr.b != 6) return 6;
+
+    g8 = (struct S8){ 7, 8 };
+    r8 = g8;
+    if (r8.a != 7 || r8.b != 8) return 7;
+
+    /* The aggregate is still an aggregate: sizeof is unchanged by _Atomic. */
+    if (sizeof(g8) != sizeof(struct S8)) return 8;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomic_aggregate", code, &[]), 0);
+}
+
+/// An `_Atomic` type c17 *cannot* operate on lock-free must still compile.
+///
+/// Rejecting it outright was a source-compatibility regression: code that
+/// built with gcc -- and with c17 before the atomic operators landed --
+/// stopped compiling. It warns and falls back to the ordinary access, which is
+/// honest where the previous silence was not.
+///
+/// What is left here after #C116 is what libatomic exists for: `long double`,
+/// and any width that is not a machine integer size. gcc calls `__atomic_*`
+/// for those, which needs `-latomic`, and c17 links through the host `cc`
+/// without it (#X1). A 3-byte struct is the interesting case -- under the
+/// lock-free ceiling but not *at* a machine width.
+#[test]
+fn c11_atomic_non_lock_free_still_compiles() {
+    let code = r#"
+#include <stdatomic.h>
+
+struct Big { int a, b, c; };   /* 12 bytes: over the ceiling */
+struct Odd { char a, b, c; };  /*  3 bytes: under it, but not a machine width */
+
+_Atomic struct Big gb;
+_Atomic struct Odd go;
 _Atomic long double ld;
 
 int main(void) {
-    struct P v = { 3, 4 };
-    g = v;
-    struct P r = g;
-    if (r.a != 3 || r.b != 4) return 1;
+    struct Big vb = { 1, 2, 3 };
+    gb = vb;
+    struct Big rb = gb;
+    if (rb.a != 1 || rb.b != 2 || rb.c != 3) return 1;
+
+    struct Odd vo = { 4, 5, 6 };
+    go = vo;
+    struct Odd ro = go;
+    if (ro.a != 4 || ro.b != 5 || ro.c != 6) return 2;
 
     ld = 2.5L;
-    if ((double)ld != 2.5) return 2;
+    if ((double)ld != 2.5) return 3;
 
     /* `_Atomic double _Complex` is deliberately absent: assigning to a
        complex *global* segfaults with or without _Atomic, on this branch and
@@ -721,7 +793,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("c11_atomic_aggregate", code, &[]), 0);
+    assert_eq!(compile_and_run("c11_atomic_non_lock_free", code, &[]), 0);
 }
 
 /// C17 6.7.6.1: `_Atomic` is a type qualifier, so it may appear in the

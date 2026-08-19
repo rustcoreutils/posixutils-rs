@@ -435,6 +435,11 @@ impl AttributeList {
         self.has_attr("always_inline")
     }
 
+    /// `__attribute__((transparent_union))`, in either spelling.
+    fn has_transparent_union(&self) -> bool {
+        self.has_attr("transparent_union")
+    }
+
     /// Whether an attribute is present, in either spelling.
     fn has_attr(&self, name: &str) -> bool {
         let underscored = format!("__{name}__");
@@ -565,6 +570,12 @@ pub struct Parser<'a> {
     /// because the attribute is seen while the declarator is being consumed and
     /// can only be applied once the type is final.
     pending_mode: Option<(String, Position)>,
+    /// `__attribute__((transparent_union))` written *after* the declarator,
+    /// which is how glibc spells it -- `typedef union { ... } __SOCKADDR_ARG
+    /// __attribute__((__transparent_union__));`. Held for the same reason as
+    /// `pending_mode`: the attribute is consumed while the declarator is, and
+    /// only the finished type can carry it.
+    pending_transparent_union: Option<Position>,
     /// File-scope object definitions whose type was incomplete when parsed.
     /// Judged at end of translation unit -- see
     /// [`Self::check_deferred_incomplete_definitions`].
@@ -662,6 +673,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             pending_alignas: None,
             pending_mode: None,
+            pending_transparent_union: None,
             tentative_definitions: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
@@ -1512,6 +1524,40 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `transparent_union` is a union attribute. gcc warns and ignores it
+    /// anywhere else rather than rejecting, and so does c17 -- dropping it in
+    /// silence would leave the program believing a rule was in force that was
+    /// not.
+    ///
+    /// Shared by the two routes that can reach the mistake: on the
+    /// struct-or-union specifier, and trailing after the declarator.
+    fn warn_transparent_union_ignored(&self, pos: Position) {
+        if crate::diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+            diag::warning(
+                pos,
+                &gettext("'transparent_union' attribute ignored on a non-union type"),
+            );
+        }
+    }
+
+    /// Apply every type attribute held over from the declarator: the machine
+    /// mode named by `mode(M)`, then `transparent_union`.
+    ///
+    /// Both are seen mid-declarator and can only land once the type is final,
+    /// so every path that finishes a declarator calls this rather than
+    /// remembering which attributes exist.
+    fn apply_pending_type_attrs(&mut self, typ: TypeId) -> TypeId {
+        let typ = self.apply_pending_mode(typ);
+        if let Some(pos) = self.pending_transparent_union.take() {
+            if self.types.kind(typ) == TypeKind::Union {
+                self.types.set_transparent_union(typ);
+            } else {
+                self.warn_transparent_union_ignored(pos);
+            }
+        }
+        typ
+    }
+
     /// Apply `__attribute__((mode(M)))` to a declared type.
     ///
     /// A machine mode names a width, and the attribute replaces the declared
@@ -1633,6 +1679,9 @@ impl<'a> Parser<'a> {
                     }
                 } else {
                     self.apply_attribute_alignment(&attrs);
+                }
+                if attrs.has_transparent_union() {
+                    self.pending_transparent_union = Some(self.current_pos());
                 }
                 self.merge_symbol_attrs(&attrs);
                 let fn_attrs = attrs.function_attrs();
@@ -2446,7 +2495,7 @@ impl Parser<'_> {
                 let has_name = !self.str(name).is_empty();
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-                typ = self.apply_pending_mode(typ);
+                typ = self.apply_pending_type_attrs(typ);
                 let validated_align = self.validated_explicit_align(typ)?;
 
                 // Bind variable to symbol table BEFORE parsing initializer.
@@ -2538,7 +2587,7 @@ impl Parser<'_> {
                     }
                     // A mode replaces the type; alignment then attaches to
                     // whatever the type ended up being.
-                    typ = self.apply_pending_mode(typ);
+                    typ = self.apply_pending_type_attrs(typ);
                     // Apply __attribute__((aligned(N))) to typedef type
                     if let Some(align) = self.pending_alignas {
                         let mut aligned_type = self.types.get(typ).clone();
@@ -2589,6 +2638,7 @@ impl Parser<'_> {
         // A mode that no declarator consumed belongs to no later declaration:
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;
+        self.pending_transparent_union = None;
         self.expect_special(b';')?;
 
         Ok(Declaration { declarators })
@@ -3481,6 +3531,7 @@ impl Parser<'_> {
                 size,
                 align: size,
                 is_complete: true,
+                transparent: false,
             };
 
             let mut enum_type = Type::enum_type(composite);
@@ -3536,6 +3587,9 @@ impl Parser<'_> {
             .attrs
             .iter()
             .any(|a| a.name == "packed" || a.name == "__packed__");
+        // `transparent_union` is collected at the same four positions as
+        // `packed`, for the same reason: gcc accepts it at any of them.
+        let mut is_transparent = early_attrs.has_transparent_union();
         // Track struct-level aligned attribute (max across all positions)
         let mut struct_align: Option<u32> = early_attrs.get_alignment();
 
@@ -3550,6 +3604,7 @@ impl Parser<'_> {
                         .attrs
                         .iter()
                         .any(|a| a.name == "packed" || a.name == "__packed__");
+                is_transparent = is_transparent || mid_attrs.has_transparent_union();
                 if let Some(a) = mid_attrs.get_alignment() {
                     struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
                 }
@@ -3570,6 +3625,7 @@ impl Parser<'_> {
                 .attrs
                 .iter()
                 .any(|a| a.name == "packed" || a.name == "__packed__");
+        is_transparent = is_transparent || pre_attrs.has_transparent_union();
         if let Some(a) = pre_attrs.get_alignment() {
             struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
         }
@@ -3735,6 +3791,7 @@ impl Parser<'_> {
                     .attrs
                     .iter()
                     .any(|a| a.name == "packed" || a.name == "__packed__");
+            is_transparent = is_transparent || attrs.has_transparent_union();
             if let Some(a) = attrs.get_alignment() {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
@@ -3783,6 +3840,10 @@ impl Parser<'_> {
                 ));
             }
 
+            if is_transparent && !is_union {
+                self.warn_transparent_union_ignored(specifier_pos);
+            }
+
             let composite = CompositeType {
                 tag,
                 members,
@@ -3790,6 +3851,7 @@ impl Parser<'_> {
                 size,
                 align,
                 is_complete: true,
+                transparent: is_transparent && is_union,
             };
 
             // Check if there's an existing forward declaration that we should complete
@@ -4593,6 +4655,7 @@ impl Parser<'_> {
         // A mode that no declarator consumed belongs to no later declaration:
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;
+        self.pending_transparent_union = None;
         self.pending_fn_attrs = Default::default();
         // And any asm label the previous declaration left behind.
         //
@@ -4779,7 +4842,7 @@ impl Parser<'_> {
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-                typ = self.apply_pending_mode(typ);
+                typ = self.apply_pending_type_attrs(typ);
                 let validated_align = self.validated_explicit_align(typ)?;
 
                 // Add to symbol table and capture SymbolId
@@ -4787,7 +4850,7 @@ impl Parser<'_> {
                 let symbol_id = if is_typedef {
                     // A mode replaces the type; alignment then attaches to
                     // whatever the type ended up being.
-                    typ = self.apply_pending_mode(typ);
+                    typ = self.apply_pending_type_attrs(typ);
                     // Apply __attribute__((aligned(N))) to typedef type
                     if let Some(align) = self.pending_alignas {
                         let mut aligned_type = self.types.get(typ).clone();
@@ -4977,7 +5040,7 @@ impl Parser<'_> {
                 self.expect_special(b';')?;
 
                 // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-                full_typ = self.apply_pending_mode(full_typ);
+                full_typ = self.apply_pending_type_attrs(full_typ);
                 let validated_align = self.validated_explicit_align(full_typ)?;
 
                 // Add to symbol table and capture SymbolId
@@ -5275,7 +5338,7 @@ impl Parser<'_> {
         self.skip_extensions_after_declarator();
 
         // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-        var_type_id = self.apply_pending_mode(var_type_id);
+        var_type_id = self.apply_pending_type_attrs(var_type_id);
         let validated_align = self.validated_explicit_align(var_type_id)?;
 
         // 6.7p7 for a file-scope *definition*. Judged at end of translation
@@ -5386,7 +5449,7 @@ impl Parser<'_> {
 
         // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
         if is_typedef {
-            var_type_id = self.apply_pending_mode(var_type_id);
+            var_type_id = self.apply_pending_type_attrs(var_type_id);
             // Apply __attribute__((aligned(N))) to typedef type
             if let Some(align) = self.pending_alignas {
                 let mut aligned_type = self.types.get(var_type_id).clone();
@@ -5441,7 +5504,7 @@ impl Parser<'_> {
             }
 
             // Validate explicit alignment for this declarator's type (C11 6.7.5)
-            decl_type = self.apply_pending_mode(decl_type);
+            decl_type = self.apply_pending_type_attrs(decl_type);
             let decl_validated_align = self.validated_explicit_align(decl_type)?;
 
             // Bind variable to symbol table BEFORE parsing initializer (C99 6.2.1p7)
@@ -5531,6 +5594,7 @@ impl Parser<'_> {
         // A mode that no declarator consumed belongs to no later declaration:
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;
+        self.pending_transparent_union = None;
 
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
     }

@@ -2876,6 +2876,7 @@ fn test_incomplete_struct_type_resolution() {
         size: 8,  // 2 ints = 8 bytes
         align: 4, // int alignment
         is_complete: true,
+        transparent: false,
     };
     let complete_struct_type = ctx.types.intern(Type::struct_type(complete_composite));
 
@@ -3687,6 +3688,7 @@ fn test_struct_deref_returns_address() {
         size: 4,
         align: 4,
         is_complete: true,
+        transparent: false,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let struct_ptr_type_id = ctx.types.intern(Type::pointer(struct_type_id));
@@ -4352,6 +4354,7 @@ fn test_mixed_designated_positional_struct_init() {
         size: 16,
         align: 4,
         is_complete: true,
+        transparent: false,
     };
     let struct_type = ctx.types.intern(Type::struct_type(struct_composite));
     let s_sym = ctx.var("s", struct_type);
@@ -4574,6 +4577,7 @@ fn test_designator_chain_nested_struct_init() {
         size: 8,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
 
     let pt_id = ctx.str("pt");
@@ -4605,6 +4609,7 @@ fn test_designator_chain_nested_struct_init() {
         size: 12,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let outer_sym = ctx.var("s", outer_type);
 
@@ -4692,6 +4697,7 @@ fn test_designator_chain_array_member_init() {
         size: 12,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -4853,6 +4859,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         size: 12,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -4945,6 +4952,7 @@ fn test_union_first_named_member_positional_init() {
         size: 4,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let u_sym = ctx.var("u", union_type);
 
@@ -5255,6 +5263,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             size: 1,
             align: 1,
             is_complete: true,
+            transparent: false,
         })),
         ..Default::default()
     });
@@ -5401,6 +5410,7 @@ fn test_bitfield_designated_init_local_var() {
         size: 2,
         align: 1,
         is_complete: true,
+        transparent: false,
     }));
 
     let s_sym = ctx.var("s", struct_type);
@@ -5538,6 +5548,7 @@ fn test_large_struct_copy_from_array() {
             size: 16,
             align: 8,
             is_complete: true,
+            transparent: false,
         })),
         ..Default::default()
     });
@@ -5676,6 +5687,7 @@ fn test_compound_literal_zero_init_lvalue() {
             size: 24,
             align: 8,
             is_complete: true,
+            transparent: false,
         })),
         ..Default::default()
     });
@@ -5812,6 +5824,7 @@ fn test_conditional_short_circuit_arrow() {
         size: 4,
         align: 4,
         is_complete: true,
+        transparent: false,
     }));
     let struct_ptr_type = ctx.types.intern(Type::pointer(struct_type));
 
@@ -6128,6 +6141,112 @@ fn test_atomic_plain_assign_uses_atomic_store() {
     );
 }
 
+/// An `_Atomic` aggregate of lock-free size lowers to a single atomic store
+/// at the aggregate's own width, through an unsigned integer surrogate
+/// (#C116).
+///
+/// The IR is where this is worth asserting: the fallback it replaced was an
+/// ordinary struct copy, which reads back what it wrote exactly as the atomic
+/// store does. `insn.size` is what every backend uses to size the access, so a
+/// wrong width here is a read or write of the neighbouring bytes.
+#[test]
+fn test_atomic_aggregate_assign_uses_atomic_store() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let s_tag = ctx.str("S");
+    let a_name = ctx.str("a");
+    let int_id = ctx.types.int_id;
+
+    // struct S { int a; } -- four bytes, a lock-free width.
+    let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
+        tag: Some(s_tag),
+        members: vec![StructMember {
+            name: a_name,
+            typ: int_id,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            explicit_align: None,
+        }],
+        enum_constants: vec![],
+        size: 4,
+        align: 4,
+        is_complete: true,
+        transparent: false,
+    }));
+    let atomic_struct = {
+        let mut t = ctx.types.get(struct_type).clone();
+        t.modifiers |= TypeModifiers::ATOMIC;
+        ctx.types.intern(t)
+    };
+
+    // void test(_Atomic struct S g, struct S v) { g = v; }
+    let g_sym = ctx.var("g", atomic_struct);
+    let v_sym = ctx.var("v", struct_type);
+    let assign = Expr::typed_unpositioned(
+        ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(Expr::var_typed(g_sym, atomic_struct)),
+            value: Box::new(Expr::var_typed(v_sym, struct_type)),
+        },
+        atomic_struct,
+    );
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: ctx.types.void_id,
+        name: test_id,
+        params: vec![
+            Parameter {
+                symbol: Some(g_sym),
+                typ: atomic_struct,
+                vm_dims: vec![],
+            },
+            Parameter {
+                symbol: Some(v_sym),
+                typ: struct_type,
+                vm_dims: vec![],
+            },
+        ],
+        body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let module = ctx.linearize(&TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    });
+
+    assert_eq!(
+        count_op(&module, Opcode::AtomicStore),
+        1,
+        "an _Atomic aggregate assignment is one atomic store"
+    );
+
+    let store = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .find(|i| i.op == Opcode::AtomicStore)
+        .expect("no AtomicStore");
+    assert_eq!(
+        store.size, 32,
+        "the access must be the aggregate's own width, not widened"
+    );
+    let typ = store.typ.expect("AtomicStore carries no type");
+    assert!(
+        ctx.types.is_integer(typ),
+        "the aggregate travels through an integer surrogate; got {:?}",
+        ctx.types.kind(typ)
+    );
+    assert_eq!(
+        ctx.types.size_bits(typ),
+        32,
+        "the surrogate must be the same width as the aggregate"
+    );
+}
+
 /// A complex member of an automatic struct is stored as two halves.
 ///
 /// A complex value travels by *address*, so storing it the way a scalar member
@@ -6158,6 +6277,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         size: 16,
         align: 8,
         is_complete: true,
+        transparent: false,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let s_sym = ctx.var("s", struct_type_id);

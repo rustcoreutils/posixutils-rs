@@ -85,9 +85,9 @@ _Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
 `gcc -std=c17` on every row; see #C45-#C49 in `cc/audit.md`. Two divergences are
 deliberate and remain: `return` with a value in a `void` function, and a bare
 `return` in a non-`void` one, are errors here and warnings in gcc, both being
-genuine 6.8.6.4 violations. And `__attribute__((transparent_union))` is
-unimplemented, so an argument matching any member of a union parameter is
-accepted rather than checked (#C51)._
+genuine 6.8.6.4 violations. `__attribute__((transparent_union))` used to sit
+here too -- an argument matching any member of *any* union parameter was
+accepted rather than checked -- and is closed, see #C51 in `cc/audit.md`._
 
 _The packed-bit-field layout used to be a row in the table below:
 `struct __attribute__((packed)) { unsigned a:20, b:20; }` was 8 bytes here and
@@ -107,18 +107,19 @@ The type system, parser, IR, linearizer, both code generators, `<stdatomic.h>`,
 and access through ordinary operators are all done. `_Atomic` on an array or
 function type is rejected.
 
-**Remaining:** an `_Atomic` aggregate of lock-free size is not accessed
-atomically (#C116). `_Atomic struct S { int a; }` read as a whole object warns
-and falls through to a non-atomic struct copy, where gcc emits a plain 4-byte
-load. Scalars of 1, 2, 4 and 8 bytes are lock-free; an aggregate of the same
-size gets nothing, and anything larger is refused outright -- which is
-deliberate, since gcc's `__atomic_*` calls need `-latomic` and c17 links through
-the host `cc` without it (#X1). Doing it properly means operating on the
-aggregate's bits as an integer, which needs the value-versus-address convention
-for small aggregates settled first: assignment wants an address where
-initialization wants a value, so one representation is wrong for one of them.
+**Nothing remaining.** An `_Atomic` aggregate of lock-free size used to fall
+through to a non-atomic struct copy; closed by #C116, which admits a struct or
+union *at* a machine width and operates on its bits through an unsigned integer
+surrogate. Anything else -- `long double`, `__int128`, complex, and any width
+that is not a machine integer size, a 3-byte struct included -- still warns and
+falls back to an ordinary access. That ceiling is deliberate and unchanged:
+gcc's `__atomic_*` calls need `-latomic` and c17 links through the host `cc`
+without it (#X1).
 
-Nothing else on the semantic-validation list. The member-access
+The deferral this section used to record was justified by the
+value-versus-address convention for small aggregates needing to be settled
+first. That turned out not to be a blocker, and not to be one convention --
+see #C116 in `cc/audit.md` for what the three sites actually decide. The member-access
 warning that stood here is #C113, closed 2026-08-18; C11 6.5.2.3p5 makes it
 undefined behaviour rather than a constraint violation, so it is a warning
 rather than the rejection an earlier version of this list called for.

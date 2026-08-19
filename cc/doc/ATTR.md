@@ -43,6 +43,7 @@ Attributes fall into three categories based on implementation depth:
 | Attribute | Applies to | Effect |
 |-----------|-----------|--------|
 | `noreturn` | Functions | Emits trap after call; enables DCE |
+| `transparent_union` | Unions | An argument matching **any** member's type may be passed to a parameter of this union, and the union is passed as its **first** member would be -- an unnamed zero-width bit-field is not a member for this purpose. glibc declares every socket call this way. Calls only: assignment and `return` stay strict, as in gcc. Ignored with a warning anywhere but a union |
 | `packed` | Structs/unions | Removes padding from layout. Shares one alignment-cap rule with `#pragma pack`, which caps at `n` rather than 1; where both apply the tighter wins |
 | `aligned` | Types, variables | Raises alignment; `.align` on a variable, layout and `_Alignof` on a type. Verified to match gcc |
 | `sysv_abi` | Functions | Forces System V AMD64 calling convention |

@@ -19,7 +19,7 @@ use crate::float::FloatVal;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{AssignFault, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
@@ -1906,22 +1906,29 @@ impl<'a> Parser<'a> {
             // glibc declares the socket calls with a union parameter carrying
             // __attribute__((transparent_union)), which lets a caller pass any
             // one of its member types -- `sendto(..., SAS2SA(&addr), ...)`
-            // hands a `struct sockaddr *` to a `__CONST_SOCKADDR_ARG`. c17
-            // does not record that attribute, so it cannot tell a transparent
-            // union from an ordinary one, and rejecting the call would refuse
-            // every socket program on the platform. Accepting an argument that
-            // matches some member is the safe direction: it under-diagnoses an
-            // ordinary union parameter, which is rare, rather than rejecting
-            // valid code, which is not. Assignment and `return` stay strict --
-            // the attribute governs calls only.
+            // hands a `struct sockaddr *` to a `__CONST_SOCKADDR_ARG`.
+            //
+            // The attribute is now recorded, so this asks about the union in
+            // hand rather than waving every union parameter through. Assignment
+            // and `return` stay strict: the attribute governs calls only.
             if self.argument_matches_union_member(param, a) {
+                continue;
+            }
+            let n = (i + 1).to_string();
+            if fault == AssignFault::FunctionPointerVoid {
+                if diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
+                    diag::warning_args(
+                        arg.pos,
+                        "ISO C forbids passing argument {0} between function pointer and 'void *'",
+                        &[&n],
+                    );
+                }
                 continue;
             }
             let (p_name, a_name) = (
                 self.types.format_type(param, Some(self.idents)),
                 self.types.format_type(a, Some(self.idents)),
             );
-            let n = (i + 1).to_string();
             if fault.is_error() {
                 diag::error_args(
                     arg.pos,
@@ -2037,12 +2044,14 @@ impl<'a> Parser<'a> {
         is_void
     }
 
-    /// Does this argument's type match some member of a union parameter?
+    /// Does this argument's type match some member of a
+    /// `__attribute__((transparent_union))` parameter?
     ///
-    /// Stands in for `__attribute__((transparent_union))`, which c17 does not
-    /// record. See the call site for why the approximation is the safe one.
+    /// C17 has no such rule; the attribute is a gcc extension that glibc's
+    /// socket declarations depend on. An ordinary union parameter is checked
+    /// like any other aggregate, which is what 6.5.2.2p2 requires.
     fn argument_matches_union_member(&self, param: TypeId, arg: TypeId) -> bool {
-        if self.types.kind(param) != TypeKind::Union {
+        if self.types.transparent_union_first_member(param).is_none() {
             return false;
         }
         let Some(comp) = self.types.composite(param) else {
@@ -2120,6 +2129,15 @@ impl<'a> Parser<'a> {
         else {
             return;
         };
+        if fault == AssignFault::FunctionPointerVoid {
+            if diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
+                diag::warning(
+                    pos,
+                    &gettext("ISO C forbids assignment between function pointer and 'void *'"),
+                );
+            }
+            return;
+        }
         let (t_name, v_name) = (
             self.types.format_type(t, Some(self.idents)),
             self.types.format_type(v, Some(self.idents)),
@@ -2195,6 +2213,16 @@ impl<'a> Parser<'a> {
         // and the wording is the useful part, being what a user searches for.
         if fault.is_error() && matches!(self.types.kind(t), TypeKind::Struct | TypeKind::Union) {
             diag::error(init.pos, &gettext("invalid initializer"));
+            return;
+        }
+
+        if fault == AssignFault::FunctionPointerVoid {
+            if diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
+                diag::warning(
+                    init.pos,
+                    &gettext("ISO C forbids initialization between function pointer and 'void *'"),
+                );
+            }
             return;
         }
 

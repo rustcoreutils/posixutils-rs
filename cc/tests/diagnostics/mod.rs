@@ -20,6 +20,7 @@
 
 use crate::common::{
     compile_and_run, compile_expect_error, compile_expect_ok, compile_expect_warning,
+    create_c_file, run_c17,
 };
 
 // ============================================================================
@@ -1228,19 +1229,118 @@ void f(void) {
     compile_expect_ok("permitted_assignments", src);
 }
 
+// ============================================================================
+// #C56 — `void *` against a function pointer
+// ============================================================================
+
+/// 6.5.16.1p1 offers the `void *` carve-out for a pointer to an **object**
+/// type, so a function pointer on the other side is a constraint violation.
+/// It is a warning rather than a rejection: gcc accepts it in silence and
+/// only `-pedantic` objects, and POSIX requires the line it appears in to
+/// work -- `dlsym` returns `void *` and every caller assigns it to a function
+/// pointer.
+///
+/// All four contexts, because 6.5.16.1's constraints reach `return` and
+/// argument passing through "as if by assignment" and the three live in
+/// different files.
+#[test]
+fn diagnostics_function_pointer_and_void_pointer_warn() {
+    let cases = [
+        (
+            "fnptr_init",
+            "typedef int (*FP)(void);\nFP f(void *v) { FP p = v; return p; }\n",
+            "ISO C forbids initialization between function pointer and 'void *'",
+        ),
+        (
+            "fnptr_assign",
+            "int fn(void);\nvoid f(void **out) { *out = fn; }\n",
+            "ISO C forbids assignment between function pointer and 'void *'",
+        ),
+        (
+            "fnptr_return",
+            "int fn(void);\nvoid *f(void) { return fn; }\n",
+            "ISO C forbids return between function pointer and 'void *'",
+        ),
+        (
+            "fnptr_argument",
+            "int fn(void);\nvoid take(void *);\nvoid f(void) { take(fn); }\n",
+            "ISO C forbids passing argument 1 between function pointer and 'void *'",
+        ),
+    ];
+    for (name, src, expected) in cases {
+        compile_expect_warning(name, src, expected);
+    }
+}
+
+/// The warning must not reach an ordinary object pointer, and must not reach
+/// a function designator converting to its own pointer type -- both are
+/// conversions the standard permits outright, and a check written from
+/// "pointer meets pointer" would catch them.
+///
+/// `compile_expect_ok` asserts only that the program builds, which a
+/// spuriously warning compiler still does; this asserts the silence.
+#[test]
+fn diagnostics_function_pointer_warning_does_not_over_fire() {
+    let src = r#"
+typedef int (*FP)(void);
+int fn(void);
+FP ret_fn(void) { return fn; }
+void f(void) {
+    void *v; int *p; char *cp; _Bool b;
+    p = v;  v = p;  cp = v;  v = cp;
+    b = v;  v = 0;
+    FP g = fn;  (void)g;  (void)b;
+}
+"#;
+    let c = create_c_file("fnptr_no_over_fire", src);
+    let path = c.path().to_string_lossy().to_string();
+    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+    assert!(run.success, "should compile: {}", run.stderr);
+    assert!(
+        !run.stderr.contains("ISO C forbids"),
+        "no permitted conversion may draw the #C56 warning, got:\n{}",
+        run.stderr
+    );
+}
+
+/// Diagnosing this at all is stricter than gcc's default, so it has to be
+/// silenceable by name -- otherwise every `dlsym` caller pays for it.
+#[test]
+fn diagnostics_function_pointer_warning_can_be_silenced() {
+    let src = "int fn(void);\nvoid *f(void) { return fn; }\n";
+    let c = create_c_file("fnptr_silence", src);
+    let path = c.path().to_string_lossy().to_string();
+
+    for silencer in ["-w", "-Wno-function-pointer-conv"] {
+        let run = run_c17(&["-S", "-o", "/dev/null", silencer, &path]);
+        assert!(run.success, "{silencer} should be accepted: {}", run.stderr);
+        assert!(
+            !run.stderr.contains("ISO C forbids"),
+            "{silencer} should silence the conversion warning, got:\n{}",
+            run.stderr
+        );
+    }
+
+    // An unrelated -Wno- must not silence it, or the flag name means nothing.
+    let run = run_c17(&["-S", "-o", "/dev/null", "-Wno-unused", &path]);
+    assert!(
+        run.stderr.contains("ISO C forbids"),
+        "-Wno-unused should leave it alone, got:\n{}",
+        run.stderr
+    );
+}
+
 /// glibc declares the socket calls with a union parameter carrying
 /// `__attribute__((transparent_union))`, so a caller may hand them any one of
-/// its member types. c17 does not record that attribute, and the first cut of
-/// the argument check rejected `sendto(..., SAS2SA(&addr), ...)` -- two lines
-/// of CPython's socketmodule.c, and with them every socket program on the
+/// its member types -- `sendto(..., SAS2SA(&addr), ...)` is two lines of
+/// CPython's socketmodule.c, and with them every socket program on the
 /// platform.
 ///
-/// An argument matching some member of a union parameter is therefore
-/// accepted. This pins both the real header call and the synthetic shape
-/// behind it, so that implementing the attribute properly has something to
-/// tighten against.
+/// The attribute is now recorded, so this is a rule about *transparent*
+/// unions rather than about unions. The real header call and a synthetic twin
+/// carrying the attribute are accepted; the ordinary union below is not.
 #[test]
-fn diagnostics_union_parameter_accepts_a_member_type() {
+fn diagnostics_transparent_union_parameter_accepts_a_member_type() {
     compile_expect_ok(
         "transparent_union_socket_call",
         r#"
@@ -1253,13 +1353,98 @@ int f(int fd) {
 }
 "#,
     );
+    // The attribute on the union specifier...
     compile_expect_ok(
-        "union_parameter_member_type",
-        "union U { int *ip; char *cp; };
+        "transparent_union_on_specifier",
+        "union U { int *ip; char *cp; } __attribute__((transparent_union));
 int g(union U);
 void f(void){ int *p = 0; (void)g(p); }
 ",
     );
+    // ...and glibc's own spelling, trailing on a typedef of an anonymous
+    // union, in the underscored form its headers use.
+    compile_expect_ok(
+        "transparent_union_on_typedef",
+        "typedef union { int *ip; char *cp; } UA __attribute__((__transparent_union__));
+int g(UA);
+void f(void){ int *p = 0; (void)g(p); }
+",
+    );
+}
+
+/// The accommodation that stood in for the attribute waved through *every*
+/// union parameter, which under-diagnosed the ordinary case: 6.5.2.2p2 gives
+/// an argument the constraints of simple assignment, and a member's type is
+/// not the union's.
+///
+/// This is the half of the old `diagnostics_union_parameter_accepts_a_member_type`
+/// whose premise inverted when the attribute became real.
+#[test]
+fn diagnostics_ordinary_union_parameter_rejects_a_member_type() {
+    compile_expect_error(
+        "ordinary_union_parameter_member_type",
+        "union U { int *ip; char *cp; };
+int g(union U);
+void f(void){ int *p = 0; (void)g(p); }
+",
+        "incompatible type for argument 1",
+    );
+}
+
+/// `transparent_union` is a union attribute. gcc ignores it elsewhere with a
+/// warning rather than rejecting, and so must c17 -- silently dropping it
+/// would leave the program believing a rule was in force that was not.
+///
+/// Every position that can carry it is covered, because they reach the check
+/// by two different routes: the three specifier positions land on the
+/// `CompositeType` as it is built, while the trailing-on-a-typedef spelling --
+/// glibc's own -- is held over and applied once the declarator finishes. The
+/// specifier ones were silently dropped when this landed; only the typedef
+/// route warned.
+#[test]
+fn diagnostics_transparent_union_on_a_non_union_warns() {
+    for (name, src) in [
+        (
+            "transparent_union_after_struct_body",
+            "struct S { int a; } __attribute__((transparent_union));\nstruct S x;\n",
+        ),
+        (
+            "transparent_union_before_struct_tag",
+            "struct __attribute__((transparent_union)) T { int a; };\nstruct T y;\n",
+        ),
+        (
+            "transparent_union_after_struct_tag",
+            "struct U __attribute__((transparent_union)) { int a; };\nstruct U w;\n",
+        ),
+        (
+            "transparent_union_on_struct_typedef",
+            "typedef struct { int a; } SA __attribute__((transparent_union));\nSA z;\n",
+        ),
+    ] {
+        compile_expect_warning(
+            name,
+            src,
+            "'transparent_union' attribute ignored on a non-union type",
+        );
+    }
+}
+
+/// ...and it belongs to the `attributes` group, like every other
+/// unimplemented-or-ignored attribute diagnostic.
+#[test]
+fn diagnostics_transparent_union_warning_can_be_silenced() {
+    let src = "struct S { int a; } __attribute__((transparent_union));\nstruct S x;\n";
+    let c = create_c_file("transparent_union_silence", src);
+    let path = c.path().to_string_lossy().to_string();
+    for silencer in ["-w", "-Wno-attributes"] {
+        let run = run_c17(&["-S", "-o", "/dev/null", silencer, &path]);
+        assert!(run.success, "{silencer} should be accepted: {}", run.stderr);
+        assert!(
+            !run.stderr.contains("transparent_union"),
+            "{silencer} should silence it, got:\n{}",
+            run.stderr
+        );
+    }
 }
 
 // ==== void operands and subscripts (C17 6.5.6p2, 6.5.15p3, 6.5.2.1p1) ====
@@ -3683,5 +3868,73 @@ fn diagnostics_unsigned_suffix_widens_by_magnitude() {
             &[],
         ),
         0
+    );
+}
+
+// ============================================================================
+// #C116 — the lock-free atomic ceiling
+// ============================================================================
+
+/// An `_Atomic` object c17 cannot access lock-free falls back to an ordinary,
+/// non-atomic access, and must say so.
+///
+/// Nothing in the suite asserted this text, so the ceiling could have moved --
+/// in either direction -- without a test noticing. It is load-bearing: gcc
+/// emits `__atomic_*` calls above it, which need `-latomic`, and c17 hands the
+/// link to the host `cc` without it (#X1).
+///
+/// The 3-byte struct is the case worth naming. It is *under* eight bytes and
+/// still not lock-free, because the hardware has no 3-byte atomic -- so the
+/// rule is "at a machine width", not "small enough".
+#[test]
+fn diagnostics_non_lock_free_atomic_warns() {
+    for (name, src) in [
+        (
+            "atomic_oversized_struct",
+            "struct Big { int a, b, c; };\n_Atomic struct Big g;\nvoid f(struct Big v) { g = v; }\n",
+        ),
+        (
+            "atomic_odd_width_struct",
+            "struct Odd { char a, b, c; };\n_Atomic struct Odd g;\nvoid f(struct Odd v) { g = v; }\n",
+        ),
+        (
+            "atomic_long_double",
+            "_Atomic long double g;\nvoid f(long double v) { g = v; }\n",
+        ),
+    ] {
+        compile_expect_warning(name, src, "is not atomic");
+    }
+}
+
+/// The other side of the same rule: an aggregate *at* a lock-free width must
+/// draw no diagnostic at all, because it is now genuinely atomic (#C116).
+///
+/// Without this, the test above passes just as well against a compiler that
+/// warns on every `_Atomic` aggregate -- which is what c17 used to do.
+#[test]
+fn diagnostics_lock_free_atomic_aggregate_is_silent() {
+    let src = r#"
+struct S1 { char a; };
+struct S2 { short a; };
+struct S4 { int a; };
+struct S8 { int a, b; };
+union  U4 { int i; float f; };
+_Atomic struct S1 g1;
+_Atomic struct S2 g2;
+_Atomic struct S4 g4;
+_Atomic struct S8 g8;
+_Atomic union  U4 gu;
+void f(struct S1 a, struct S2 b, struct S4 c, struct S8 d, union U4 e) {
+    g1 = a; g2 = b; g4 = c; g8 = d; gu = e;
+}
+"#;
+    let c = create_c_file("atomic_lock_free_aggregate_silent", src);
+    let path = c.path().to_string_lossy().to_string();
+    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+    assert!(run.success, "should compile: {}", run.stderr);
+    assert!(
+        !run.stderr.contains("is not atomic"),
+        "an aggregate at a lock-free width must not warn, got:\n{}",
+        run.stderr
     );
 }

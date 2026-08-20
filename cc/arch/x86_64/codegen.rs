@@ -4036,15 +4036,21 @@ impl X86_64CodeGen {
         // SSE outputs to copy back once the template has run:
         // (scratch register, destination, operand size in bits).
         let mut sse_output_moves: Vec<(XmmReg, Loc, u32)> = Vec::new();
-        // x87 operands, which live on the FP stack rather than in a register.
-        // Loaded with `fldt` before the template and popped back with `fstpt`
-        // after it; the template names them `%st`. Only one is supported --
-        // keeping a second in step with the stack's own discipline is what
-        // makes an x87 asm easy to get subtly wrong, and a wrong answer here
-        // is worse than a diagnostic.
-        let mut x87_load: Option<Loc> = None;
-        let mut x87_store: Option<Loc> = None;
-        let mut x87_taken = false;
+        // x87 operands live on the FP stack rather than in a register, so they
+        // are not given one: each is pushed with `fldt` before the template and
+        // the result popped back with `fstpt` after, and the template names
+        // them `%st` and `%st(1)`.
+        //
+        // `t` is st(0) and `u` is st(1), so `u` has to be pushed first for `t`
+        // to end up on top. `x87_pushes` is collected in operand order and
+        // reversed at emit time. A pure `"=t"` output is *not* pushed -- the
+        // template supplies the value, as `fldz` does -- and `x87_store` is set
+        // only when there is an output to write back to, so a template that
+        // consumes its operand (`fistpl` on a `"t"` input) leaves nothing to
+        // store.
+        let mut x87_pushes: Vec<(crate::ir::PseudoId, u32)> = Vec::new();
+        let mut x87_store: Option<(crate::ir::PseudoId, u32)> = None;
+        let mut x87_slots = 0usize;
 
         // SSE read-write (`"+x"`) operands whose current value must reach the
         // scratch before the template runs: (scratch, source pseudo, size).
@@ -4105,29 +4111,33 @@ impl X86_64CodeGen {
                     // The operand is rendered as text rather than a register
                     // slot because `AsmOperandSlot` carries only a general
                     // register; `XmmReg::name()` already includes the `%`.
-                    // An x87-class output. The value is popped off the FP
-                    // stack into the operand's own storage after the template.
-                    // A read-write `"+t"` is also loaded before it.
+                    // An x87-class output. Written back off the FP stack once
+                    // the template has run; a read-write `"+t"` is also pushed
+                    // before it, while a pure `"=t"` takes its value from the
+                    // template.
                     _ if Self::constraint_requires_x87(&output.constraint) => {
-                        if x87_taken {
+                        let name = Self::x87_slot_name(x87_slots);
+                        x87_slots += 1;
+                        // The result is written back through the operand's
+                        // own stack slot. A pseudo the allocator gave no slot
+                        // -- which is what a bare `"=t"` local gets, since
+                        // nothing else in the function forces one -- is
+                        // refused rather than guessed at: addressing it
+                        // through an uninitialised register is how this
+                        // segfaulted while being developed.
+                        if matches!(loc, Loc::Stack(_)) {
+                            if output.constraint.contains('+') {
+                                x87_pushes.push((output.pseudo, op_size));
+                            }
+                            x87_store = Some((output.pseudo, op_size));
+                        } else {
                             crate::diag::error(
                                 insn.pos.unwrap_or_default(),
-                                "only one x87 register constraint is supported in one \
-                                 asm statement",
+                                "an x87 asm output must be an object with storage; \
+                                 c17 cannot give a write-only x87 operand a home",
                             );
                         }
-                        x87_taken = true;
-                        if !matches!(loc, Loc::Stack(_)) {
-                            crate::diag::error(
-                                insn.pos.unwrap_or_default(),
-                                "an x87 asm operand must live in memory",
-                            );
-                        }
-                        if output.constraint.contains('+') {
-                            x87_load = Some(loc.clone());
-                        }
-                        x87_store = Some(loc.clone());
-                        slots.push(mk(None, Some("%st".to_string())));
+                        slots.push(mk(None, Some(name)));
                     }
                     _ if Self::constraint_requires_sse(&output.constraint) => {
                         match sse_scratch.pop() {
@@ -4275,6 +4285,18 @@ impl X86_64CodeGen {
                         // memory-class constraint cannot be satisfied. gcc
                         // says the same thing and stops; c17 used to reach
                         // `loc_to_asm_string` and panic.
+                        // An x87-class input: pushed onto the FP stack before the
+                        // template, which then names it `%st`/`%st(1)`. Without
+                        // this arm an x87 input fell through to the general path
+                        // and the template ran on whatever happened to be on the
+                        // stack -- `__asm__("fmulp" : "+t"(a) : "u"(b))` answered
+                        // -nan.
+                        _ if Self::constraint_requires_x87(constraint_for_reg) => {
+                            let name = Self::x87_slot_name(x87_slots);
+                            x87_slots += 1;
+                            x87_pushes.push((input.pseudo, input.size));
+                            slots.push(mk(None, Some(name)));
+                        }
                         Loc::FImm(..) if requires_mem => {
                             crate::diag::error(
                                 insn.pos.unwrap_or_default(),
@@ -4379,10 +4401,18 @@ impl X86_64CodeGen {
             self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
         }
 
-        // Push an x87 operand onto the FP stack, where `%st` names it.
-        if let Some(Loc::Stack(off)) = &x87_load {
-            let addr = self.stack_mem(*off).format(&self.base.target);
-            self.push_lir(X86Inst::Directive(Directive::Raw(format!("fldt {addr}"))));
+        // Push the x87 operands. Reversed, so that the first declared ends on
+        // top of the stack where `%st` names it and the second at `%st(1)`.
+        for (pseudo, size) in x87_pushes.clone().into_iter().rev() {
+            let addr = self.get_x87_mem_addr(pseudo).format(&self.base.target);
+            let mnemonic = match size {
+                32 => "flds",
+                64 => "fldl",
+                _ => "fldt",
+            };
+            self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                "{mnemonic} {addr}"
+            ))));
         }
 
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
@@ -4409,10 +4439,19 @@ impl X86_64CodeGen {
             }
         }
 
-        // Pop the x87 result back into the operand's own storage.
-        if let Some(Loc::Stack(off)) = &x87_store {
-            let addr = self.stack_mem(*off).format(&self.base.target);
-            self.push_lir(X86Inst::Directive(Directive::Raw(format!("fstpt {addr}"))));
+        // Pop the x87 result back into the operand's own storage. Only an
+        // output has somewhere to go; a template that consumed its input --
+        // `fistpl` on a `"t"` operand -- leaves nothing here.
+        if let Some((pseudo, size)) = x87_store {
+            let addr = self.get_x87_mem_addr(pseudo).format(&self.base.target);
+            let mnemonic = match size {
+                32 => "fstps",
+                64 => "fstpl",
+                _ => "fstpt",
+            };
+            self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                "{mnemonic} {addr}"
+            ))));
         }
 
         // Copy SSE outputs out of the scratch register into where the
@@ -4736,6 +4775,18 @@ impl X86_64CodeGen {
     /// c17 keeps a long double in memory and reaches it with `fldt`/`fstpt`,
     /// so an x87 operand is loaded onto the stack before the template and
     /// popped back afterwards rather than being given a register.
+    /// How the template names the `n`th x87 operand.
+    ///
+    /// `t` is the top of the stack and `u` the one below it, and operands are
+    /// pushed so that the first declared ends on top.
+    fn x87_slot_name(n: usize) -> String {
+        if n == 0 {
+            "%st".to_string()
+        } else {
+            format!("%st({n})")
+        }
+    }
+
     fn constraint_requires_x87(constraint: &str) -> bool {
         constraint.chars().any(|c| matches!(c, 'f' | 't' | 'u'))
     }

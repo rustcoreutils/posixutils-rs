@@ -1418,3 +1418,40 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("asm_fp_const_float_width", code, &[]), 0);
 }
+
+/// An FP *value* — not a constant — under a general-register constraint.
+///
+/// On aarch64 nothing moved it out of the vector register it was computed in,
+/// and the operand rendered as the vector register's name, so `mov %0, %1`
+/// assembled as `mov x0, d0` and the assembler read `d0` as an undefined
+/// symbol. Pre-existing and independent of any floating constant: it is
+/// reachable from any FP variable passed as `"r"`. x86-64 was never affected,
+/// spilling the value to a stack slot the register path then loads from.
+///
+/// It is also why `-0.0` needed its own case above — that arrives as `fneg` of
+/// zero, a computed value in a vector register, rather than as an immediate.
+#[test]
+fn codegen_inline_asm_fp_value_in_general_register() {
+    #[cfg(target_arch = "x86_64")]
+    let code = r#"
+double src = 2.5;
+int main(void) {
+    unsigned long bits = 0;
+    double d = src * 2.0;                 /* computed, so it lives in an FP reg */
+    __asm__ ("movq %1, %0" : "=r"(bits) : "r"(d));
+    return bits == 0x4014000000000000UL ? 0 : 1;   /* 5.0 */
+}
+"#;
+    #[cfg(target_arch = "aarch64")]
+    let code = r#"
+double src = 2.5;
+int main(void) {
+    unsigned long bits = 0;
+    double d = src * 2.0;
+    __asm__ ("mov %0, %1" : "=r"(bits) : "r"(d));
+    return bits == 0x4014000000000000UL ? 0 : 1;   /* 5.0 */
+}
+"#;
+    assert_eq!(compile_and_run("asm_fp_value_gp", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_fp_value_gp_opt", code), 0);
+}

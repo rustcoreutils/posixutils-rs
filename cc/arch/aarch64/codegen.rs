@@ -3679,6 +3679,27 @@ impl Aarch64CodeGen {
                         slots.push(mk(None, Some(asm_reg_name_64(scratch).to_string())));
                     }
                 }
+                // An FP *value* under a general-register constraint. Nothing
+                // put it in a general register, and rendering the vector
+                // register's name gave `mov x0, d0` -- the assembler reads
+                // `d0` as an undefined symbol. Pre-existing, and reachable
+                // from any FP variable passed as `"r"`, not just a constant:
+                // `-0.0` arrives here rather than as an `FImm` because it is
+                // computed as `fneg` of zero.
+                Loc::VReg(v) if !Self::constraint_requires_vector(&input.constraint) => {
+                    let (scratch, _, _) = Reg::scratch_regs();
+                    let fp_size = match op_size {
+                        16 => FpSize::Half,
+                        32 => FpSize::Single,
+                        _ => FpSize::Double,
+                    };
+                    self.push_lir(Aarch64Inst::FmovToGp {
+                        size: fp_size,
+                        src: v,
+                        dst: scratch,
+                    });
+                    slots.push(mk(Some(scratch), None));
+                }
                 _ => {
                     // Memory or other location
                     let mem_str = self.loc_to_asm_string(&loc, op_size);

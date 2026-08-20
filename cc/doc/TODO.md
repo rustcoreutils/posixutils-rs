@@ -126,28 +126,68 @@ byte, as gcc does on both targets._
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
 
-## GNU extensions not implemented
+## GNU extensions: what c17 will and will not grow
 
-Ranked by how often each appears in real source, counted over the trees in
-`~/tmp/repo` (2026-08-20). A project fails to build if *any* file it compiles
-uses one, so even a small count blocks.
+This is a **decision table, not a backlog**. Frequency in real source is the
+tie-breaker, never the justification — "the kernel uses it 116 times" argues
+that the kernel is GCC-specific, not that c17 should be. Each row had to clear
+the project's own filter before earning a verdict:
 
-| Extension | linux | mesa | cpython | abc | Note |
-|-----------|------:|-----:|--------:|----:|------|
-| SIMD intrinsic headers (`immintrin.h` …) | 2 | 18 | 2 | 1 | Not bundled; needs vector arithmetic underneath |
-| `__sync_*` builtins | 116 | 8 | — | 1 | The older atomic spelling |
-| `__atomic_*` builtins | 53 | 5 | 3 | 1 | C11 `<stdatomic.h>` is complete; these are the GCC spellings |
-| `__auto_type` | 5 | 1 | — | — | |
-| nested functions / `__label__` | 17 | — | — | — | |
+1. Is there a POSIX or C17 basis? (None of these have one — GNU extensions
+   start at a disadvantage, they do not start neutral.)
+2. Does refusing it actually block a real build, or does the guarded code
+   already have a portable path c17 can take?
+3. Is it an *alternate spelling* of machinery c17 already has, or genuinely
+   new subsystems?
+4. Is it a de-facto standard both GCC and Clang accept, or a GCC quirk?
 
-Vector *arithmetic* belongs here too. `vector_size` gives a type a vector's
-storage, which is what makes glibc's `<link.h>` compile, but element-wise `+`
-and friends need a vector type in the IR and in both backends.
+| Extension | Verdict | Why |
+|-----------|---------|-----|
+| SIMD intrinsic headers | **No — fix the predefines** | See below; the blocking is self-inflicted |
+| `__atomic_*` / `__sync_*` | **Yes, when it blocks** | Alternate spellings of complete C11 atomics |
+| `__auto_type` | **No** | 6 files across four trees; fails minimalism on its own numbers |
+| nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines |
+
+### SIMD headers — the blocking is ours
+
+c17 predefines `__SSE__`, `__SSE2__` and `__MMX__`, matching GCC's x86-64
+baseline. But GCC defines those *and* ships `<emmintrin.h>`; c17 defines them
+and does not. So a project's `#ifdef __SSE2__` guard opens the door to a header
+that isn't there, when the same file's `#else` branch would have compiled:
+
+```c
+#ifdef __SSE2__
+#include <emmintrin.h>      /* c17: 'emmintrin.h': file not found */
+#else
+... portable fallback ...   /* builds clean; -U__SSE2__ proves it */
+#endif
+```
+
+The choice is to bundle the intrinsic headers — thousands of functions, plus
+element-wise vector arithmetic in the IR and both backends — or to stop
+claiming the capability. The second is a few lines in the predefines and costs
+those projects only the speed of their own fallback path. Advertising what we
+cannot deliver is the actual defect here; adding SIMD to make the advertisement
+true would be the tail wagging the dog.
+
+Vector *arithmetic* is the related non-goal. `vector_size` gives a type a
+vector's storage, which is what makes glibc's `<link.h>` compile, and that is
+deliberately where it stops.
+
+### Atomics — spelling, not substance
+
+`__atomic_*` and `__sync_*` are the only rows that survive on merit. c17's C11
+atomics are complete — type system, parser, IR, linearizer, both backends,
+`<stdatomic.h>` — so these builtins map onto machinery that already exists
+rather than adding a subsystem, and they inherit the same lock-free width
+ceiling (#X1). They earn their place by being cheap, not by being frequent.
 
 Implemented since this list was first measured: case ranges, designated
-initializer ranges, and computed goto — the three that led it. CPython's
-configure now detects computed gotos, so it builds its indirect-branch
-interpreter rather than the switch fallback.
+initializer ranges, and computed goto. Those three passed the same filter for a
+reason worth recording — each is a *syntax* over control flow and initializers
+c17 already had, none added a subsystem, and all three block outright with no
+fallback path. CPython's configure now detects computed gotos, so it builds its
+indirect-branch interpreter rather than the switch fallback.
 
 ## Future Features
 

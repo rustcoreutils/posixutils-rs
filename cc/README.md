@@ -129,18 +129,23 @@ Supported:
   give `--target` the target's headers. `as` and `cc` are still the host's, so
   assembling and linking for another target is not supported
 
-Not yet implemented (features we want to add):
+Not yet implemented:
 - assembly peephole optimizations
-- vector *arithmetic*. `vector_size` gives a type a vector's storage — the size
-  and alignment GCC gives it, which is what glibc's `<link.h>` needs — but
-  element-wise `+`, `*` and the rest need a vector type in the IR and in both
-  backends, so they are diagnosed rather than silently computed on one element
 - the GCC atomic builtins `__sync_*` and `__atomic_*`. C11 `<stdatomic.h>` is
-  complete; these are the older spellings, and projects use them directly
-- SIMD intrinsic headers (`immintrin.h` and friends) are not bundled
-- `__auto_type`, nested functions, and `__label__`
+  complete; these are the older spellings of machinery c17 already has, which
+  is why they are on this list rather than the one below
 
 Will not implement:
+- vector *arithmetic*. `vector_size` gives a type a vector's storage — the size
+  and alignment GCC gives it, which is what glibc's `<link.h>` needs — and that
+  is deliberately where it stops. Element-wise `+`, `*` and the rest need a
+  vector type in the IR and in both backends, so they are diagnosed rather than
+  silently computed on one element
+- SIMD intrinsic headers (`immintrin.h` and friends). c17 predefines `__SSE2__`
+  and friends without shipping the headers those guards then reach for; the fix
+  is to stop advertising the capability, not to grow one. See `doc/TODO.md`
+- `__auto_type`; nested functions and `__label__`. Clang refuses nested
+  functions too, and they need executable-stack trampolines
 - `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,
   as this line used to claim. Neither gcc nor clang implements them: gcc
   rejects `_Imaginary double x;` outright and leaves `_Imaginary_I` undefined,

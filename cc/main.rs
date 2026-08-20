@@ -47,7 +47,7 @@ use target::Os;
 use target::{classify_std, StdRequest, Target};
 use token::{
     preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
-    AsmPreprocessConfig, PreprocessConfig, StreamTable, Tokenizer,
+    AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType, Tokenizer,
 };
 
 // ============================================================================
@@ -598,15 +598,38 @@ fn process_file(
                     show_token(token, &strings)
                 )?;
             } else {
-                let text = show_token(token, &strings);
-                // Skip stream markers (e.g., <STREAM_BEGIN>, <STREAM_END>)
-                // but NOT the '<' operator or '<=', etc.
-                if text.starts_with("<STREAM")
-                    || text.starts_with("<ident")
-                    || text.starts_with("<special")
-                {
-                    continue;
-                }
+                // A `#pragma pack` travels to the parser as a marker token
+                // carrying an internal payload, and `show_token` spells that
+                // payload `<PRAGMA pack:set:1>` -- a debug form, not C. It was
+                // reaching the output, so `c17 -E` on any source using the
+                // pragma produced a file that neither c17 nor gcc would
+                // compile. Write the directive that produced it instead;
+                // dropping it would lose the packing, which is the one thing
+                // the marker exists to carry.
+                let pragma = if token.typ == TokenType::Pragma {
+                    match token::preprocess::PackAction::from_token(token) {
+                        Some(action) => Some(action.to_pragma_text()),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
+
+                let text = match &pragma {
+                    Some(directive) => directive.clone(),
+                    None => {
+                        let text = show_token(token, &strings);
+                        // Skip stream markers (e.g., <STREAM_BEGIN>,
+                        // <STREAM_END>) but NOT the '<' operator or '<=', etc.
+                        if text.starts_with("<STREAM")
+                            || text.starts_with("<ident")
+                            || text.starts_with("<special")
+                        {
+                            continue;
+                        }
+                        text
+                    }
+                };
 
                 if current_stream != Some(token.pos.stream) {
                     let (name, line, _) = diag::effective_position(token.pos);
@@ -625,6 +648,18 @@ fn process_file(
                         if returning { 2 } else { 1 }
                     )?;
                     current_stream = Some(token.pos.stream);
+                    at_line_start = true;
+                }
+
+                // A directive owns its line: it has to start one, and the text
+                // after it has to start another.
+                if pragma.is_some() {
+                    if !at_line_start {
+                        writeln!(out.preprocessed)?;
+                    }
+                    writeln!(out.preprocessed, "{}", text)?;
+                    at_line_start = true;
+                    continue;
                 }
 
                 write!(out.preprocessed, "{}", text)?;

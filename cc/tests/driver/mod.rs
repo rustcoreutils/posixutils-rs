@@ -889,3 +889,135 @@ fn driver_dot_c_is_still_preprocessed() {
     assert!(r.success, "{}{}", r.stdout, r.stderr);
     assert_eq!(run_exe(&exe), 0);
 }
+
+// ============================================================================
+// #C141 — `-E` output must be C, not the internal pragma marker
+// ============================================================================
+
+/// A `#pragma pack` must survive `-E` as a directive.
+///
+/// It reaches the parser as a marker token carrying an internal payload, and
+/// `show_token` spells that payload `<PRAGMA pack:set:1>` -- a debug form, not
+/// C. The `-E` writer filtered the other internal markers but not this one, so
+/// `c17 -E` on any source using the pragma produced a file that neither c17
+/// nor gcc would compile. POSIX 87981 makes that output a `.i` operand, so
+/// this made the whole `.i` form unreachable for such a source.
+#[test]
+fn driver_preprocess_writes_pragma_pack_as_a_directive() {
+    let w = WorkDir::new("pp_pragma");
+    let src = w.write(
+        "q.c",
+        "#pragma pack(1)\nstruct S{char c;int i;};\n\
+         int main(void){return sizeof(struct S)==5?0:1;}\n",
+    );
+    let i = w.join("q.i");
+    let r = run_c17(&["-E", &s(&src), "-o", &s(&i)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+
+    let body = std::fs::read_to_string(&i).unwrap();
+    assert!(
+        !body.contains("<PRAGMA"),
+        "the internal marker reached the output:\n{body}"
+    );
+    assert!(
+        body.contains("#pragma pack(1)"),
+        "the pragma was dropped instead of written back:\n{body}"
+    );
+
+    // And the round trip has to keep the packing, not merely parse.
+    let exe = w.join("q");
+    let r = run_c17(&[&s(&i), "-o", &s(&exe)]);
+    assert!(
+        r.success,
+        "-E output did not compile: {}{}",
+        r.stdout, r.stderr
+    );
+    assert_eq!(run_exe(&exe), 0, "the packing was lost across -E");
+}
+
+/// Every `#pragma pack` form round-trips, not just the one with a number.
+#[test]
+fn driver_preprocess_writes_every_pragma_pack_form() {
+    let w = WorkDir::new("pp_pragma_forms");
+    let src = w.write(
+        "f.c",
+        "#pragma pack(push, 1)\nstruct A{char c;int i;};\n\
+         #pragma pack(pop)\nstruct B{char c;int i;};\n\
+         #pragma pack()\nstruct C{char c;int i;};\n\
+         int main(void){return sizeof(struct A)==5 && sizeof(struct B)==8 ? 0 : 1;}\n",
+    );
+    let i = w.join("f.i");
+    let r = run_c17(&["-E", &s(&src), "-o", &s(&i)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+
+    let body = std::fs::read_to_string(&i).unwrap();
+    assert!(!body.contains("<PRAGMA"), "internal marker leaked:\n{body}");
+    for want in [
+        "#pragma pack(push, 1)",
+        "#pragma pack(pop)",
+        "#pragma pack()",
+    ] {
+        assert!(body.contains(want), "missing {want}:\n{body}");
+    }
+
+    let exe = w.join("f");
+    let r = run_c17(&[&s(&i), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 0, "push/pop did not survive -E");
+}
+
+/// Preprocessing an already-preprocessed file stays stable and correct.
+///
+/// The second pass must attribute the text to the file the linemarkers name,
+/// not to the `.i` it is reading, and the result must still compile and run.
+#[test]
+fn driver_preprocess_of_a_dot_i_is_stable() {
+    let w = WorkDir::new("pp_idem");
+    let src = w.write(
+        "q.c",
+        "#pragma pack(1)\nstruct S{char c;int i;};\n\
+         int main(void){return sizeof(struct S)==5?0:1;}\n",
+    );
+    let one = w.join("q1.i");
+    let two = w.join("q2.i");
+    let three = w.join("q3.i");
+    assert!(run_c17(&["-E", &s(&src), "-o", &s(&one)]).success);
+    assert!(run_c17(&["-E", &s(&one), "-o", &s(&two)]).success);
+    assert!(run_c17(&["-E", &s(&two), "-o", &s(&three)]).success);
+
+    // The first line names the file being read, so it differs by construction;
+    // everything after it has converged.
+    let skip_first = |p: &Path| {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        skip_first(&two),
+        skip_first(&three),
+        "re-preprocessing keeps changing the output"
+    );
+
+    // The second-generation file names the original source, not the `.i`.
+    let body = std::fs::read_to_string(&two).unwrap();
+    assert!(
+        body.contains("q.c\""),
+        "lost the original file name:\n{body}"
+    );
+
+    for f in [&one, &two, &three] {
+        let exe = w.join("out");
+        let r = run_c17(&[&s(f), "-o", &s(&exe)]);
+        assert!(
+            r.success,
+            "{} did not compile: {}{}",
+            s(f),
+            r.stdout,
+            r.stderr
+        );
+        assert_eq!(run_exe(&exe), 0, "{} lost the packing", s(f));
+    }
+}

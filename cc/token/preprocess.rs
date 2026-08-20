@@ -476,6 +476,29 @@ impl PackAction {
         }
     }
 
+    /// Spell the action back as the directive that produced it.
+    ///
+    /// `-E` output is a `.i` operand (POSIX 87981), so what it writes for a
+    /// pragma has to be C that the compiler -- ours or anyone's -- will read
+    /// back. `encode` is an internal payload and was reaching the output.
+    pub fn to_pragma_text(self) -> String {
+        match self {
+            PackAction::Set(None) => "#pragma pack()".to_string(),
+            PackAction::Set(Some(n)) => format!("#pragma pack({n})"),
+            PackAction::Push(None) => "#pragma pack(push)".to_string(),
+            PackAction::Push(Some(n)) => format!("#pragma pack(push, {n})"),
+            PackAction::Pop => "#pragma pack(pop)".to_string(),
+        }
+    }
+
+    /// Recover the action from a `TokenType::Pragma` marker's payload.
+    pub fn from_token(token: &Token) -> Option<PackAction> {
+        match &token.value {
+            TokenValue::String(s) => PackAction::decode(s),
+            _ => None,
+        }
+    }
+
     fn decode(s: &str) -> Option<PackAction> {
         let mut parts = s.split(':');
         if parts.next()? != "pack" {
@@ -3045,7 +3068,11 @@ impl<'a> Preprocessor<'a> {
                             // reach it. It travels as a marker in the stream
                             // because that is the only ordering that survives
                             // include splicing.
-                            let mut marker = Token::new(TokenType::Pragma, pos);
+                            // A directive handler pulls its own tokens, so
+                            // they never pass the remap in the main loop; the
+                            // marker has to be attributed here or a `.i`
+                            // reports the pragma against the preprocessed file.
+                            let mut marker = Token::new(TokenType::Pragma, self.remap_pos(pos));
                             marker.value = TokenValue::String(action.encode());
                             output.push(marker);
                         }
@@ -3156,7 +3183,7 @@ impl<'a> Preprocessor<'a> {
         }
         if let TokenValue::String(body) = &token.value {
             if let Some(action) = parse_pragma_text(body, token.pos) {
-                let mut marker = Token::new(TokenType::Pragma, token.pos);
+                let mut marker = Token::new(TokenType::Pragma, self.remap_pos(token.pos));
                 marker.value = TokenValue::String(action.encode());
                 output.push(marker);
             }

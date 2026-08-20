@@ -173,7 +173,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // 6.5.3.2: the operand of a computed goto is an address.
                 // Anything else -- `goto *3;` -- would branch to a number.
                 let target_typ = self.expr_type(target);
-                if !self.types.is_scalar(target_typ) || self.types.is_float(target_typ) {
+                // GCC: "computed goto must be pointer type". An integer is
+                // scalar, so testing scalarity accepted `goto *3;` -- and the
+                // 64-bit store of a 32-bit value then branched through a
+                // half-initialised address.
+                if self.types.kind(target_typ) != crate::types::TypeKind::Pointer {
                     let named = self.types.format_type(target_typ, Some(self.strings));
                     crate::diag::error_args(
                         *pos,
@@ -210,6 +214,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             Stmt::Label { name, stmt, .. } => {
                 let name_str = self.str(*name).to_string();
+                self.defined_labels.insert(name_str.clone());
                 let label_bb = self.get_or_create_label(&name_str);
 
                 // If current block is not terminated, branch to label
@@ -1318,7 +1323,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.break_targets.push(exit_bb);
 
         // Collect case labels and create basic blocks for each
-        let (case_values, has_default) = self.collect_switch_cases(body);
+        let switch_unsigned = self.types.is_unsigned(expr_type);
+        let (case_values, has_default) = self.collect_switch_cases(body, switch_unsigned);
         let case_bbs: Vec<BasicBlockId> = case_values.iter().map(|_| self.alloc_bb()).collect();
         let default_bb = if has_default {
             Some(self.alloc_bb())
@@ -1389,7 +1395,11 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// only `Stmt::Block` here collected no cases from it -- so the switch was
     /// emitted with an empty table and every value took the default edge.
     /// A non-compound body is one statement, so it is walked as one.
-    pub(crate) fn collect_switch_cases(&self, body: &Stmt) -> (Vec<(i64, i64)>, bool) {
+    pub(crate) fn collect_switch_cases(
+        &self,
+        body: &Stmt,
+        unsigned: bool,
+    ) -> (Vec<(i64, i64)>, bool) {
         let mut case_values = Vec::new();
         let mut has_default = false;
 
@@ -1397,31 +1407,23 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Block(items) => {
                 for item in items {
                     if let BlockItem::Statement(stmt) = item {
-                        self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default);
+                        self.collect_cases_from_stmt(
+                            stmt,
+                            &mut case_values,
+                            &mut has_default,
+                            unsigned,
+                        );
                     }
                 }
             }
-            stmt => self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default),
+            stmt => {
+                self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default, unsigned)
+            }
         }
 
         (case_values, has_default)
     }
 
-    /// C17 6.8.6.1p1: a `goto` shall not jump from outside the scope of an
-    /// identifier having a variably modified type to inside it; 6.8.4.2p... the
-    /// same for a `switch` reaching a `case` inside such a scope.
-    ///
-    /// The rule exists because entering the scope without executing the
-    /// declaration leaves the object's size never computed: the array is
-    /// whatever the stack held. Jumping *out* of the scope, within it, or to a
-    /// label that precedes the declaration are all fine, and all are exercised
-    /// by the accept-side tests.
-    ///
-    /// Reported at the jump, where gcc points, and naming the declaration that
-    /// could not be entered, which gcc does not -- the position says where to
-    /// look and the name says what the problem is. This used to report at the
-    /// declaration for want of anything better: the jump and label statements
-    /// carried no position until #C106 gave them one.
     /// The block every computed `goto` in this function branches through,
     /// creating it on first use along with the hidden local that carries the
     /// target address to it.
@@ -1458,7 +1460,24 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Called once the function body is walked, because `&&label` may appear
     /// after the `goto *` that can reach it.
     pub(crate) fn finish_indirect_dispatch(&mut self) {
+        // `&&label` naming a label the function never defines. The block
+        // `get_or_create_label` minted stays empty and unterminated, so
+        // branching to it ran off the end of the function -- the program hung.
+        // Checked here because a forward reference is legal.
+        for (name, pos) in std::mem::take(&mut self.label_addr_refs) {
+            if !self.defined_labels.contains(&name) {
+                crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
+            }
+        }
+
         let Some((dispatch_bb, _)) = self.indirect_dispatch else {
+            // The address was taken but this function never branches on it --
+            // it was stored for someone else, or only compared. The blocks
+            // still have to survive DCE, or the symbol the address refers to
+            // is never emitted and the link fails on an undefined `.L` label.
+            for bb in self.addr_taken_labels.clone() {
+                self.get_or_create_bb(bb).addr_taken = true;
+            }
             return;
         };
         for bb in self.addr_taken_labels.clone() {
@@ -1466,6 +1485,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// C17 6.8.6.1p1: a `goto` shall not jump from outside the scope of an
+    /// identifier having a variably modified type to inside it; 6.8.4.2p... the
+    /// same for a `switch` reaching a `case` inside such a scope.
+    ///
+    /// The rule exists because entering the scope without executing the
+    /// declaration leaves the object's size never computed: the array is
+    /// whatever the stack held. Jumping *out* of the scope, within it, or to a
+    /// label that precedes the declaration are all fine, and all are exercised
+    /// by the accept-side tests.
+    ///
+    /// Reported at the jump, where gcc points, and naming the declaration that
+    /// could not be entered, which gcc does not -- the position says where to
+    /// look and the name says what the problem is. This used to report at the
+    /// declaration for want of anything better: the jump and label statements
+    /// carried no position until #C106 gave them one.
     pub(crate) fn check_jumps_into_variably_modified_scopes(&self, body: &Stmt) {
         let mut w = VmScopeWalk {
             open: Vec::new(),
@@ -1550,6 +1584,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         stmt: &Stmt,
         case_values: &mut Vec<(i64, i64)>,
         has_default: &mut bool,
+        unsigned: bool,
     ) {
         match stmt {
             Stmt::Case(expr, high) => {
@@ -1576,7 +1611,19 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // extends that to overlapping ranges -- an overlap would
                     // otherwise make one arm silently unreachable, since the
                     // body walk resolves a label by finding the first match.
-                    if hi < val {
+                    // Order by the switch type's own signedness. The endpoints
+                    // are carried as `i64`, so an unsigned 64-bit bound above
+                    // `i64::MAX` looks negative: `case 0ul ... ULONG_MAX:` read
+                    // as an empty range and never matched.
+                    let below = |a: i64, b: i64| {
+                        if unsigned {
+                            (a as u64) < (b as u64)
+                        } else {
+                            a < b
+                        }
+                    };
+                    let at_most = |a: i64, b: i64| !below(b, a);
+                    if below(hi, val) {
                         // GCC accepts an empty range, warns, and never matches
                         // it. Nothing is recorded, so nothing can overlap it.
                         crate::diag::warning(expr.pos, "empty range specified");
@@ -1584,7 +1631,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                     if let Some((lo2, hi2)) = case_values
                         .iter()
-                        .find(|(lo2, hi2)| val <= *hi2 && *lo2 <= hi)
+                        .find(|(lo2, hi2)| at_most(val, *hi2) && at_most(*lo2, hi))
                         .copied()
                     {
                         let what = if val == hi && lo2 == hi2 {
@@ -1627,28 +1674,28 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             // Recursively check labeled statements
             Stmt::Label { stmt, .. } => {
-                self.collect_cases_from_stmt(stmt, case_values, has_default);
+                self.collect_cases_from_stmt(stmt, case_values, has_default, unsigned);
             }
             // Recurse into nested statements for Duff's device pattern
             // (case labels inside loops/blocks within a switch)
             Stmt::Block(items) => {
                 for item in items {
                     if let BlockItem::Statement(s) = item {
-                        self.collect_cases_from_stmt(s, case_values, has_default);
+                        self.collect_cases_from_stmt(s, case_values, has_default, unsigned);
                     }
                 }
             }
             Stmt::DoWhile { body, .. } | Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                self.collect_cases_from_stmt(body, case_values, has_default);
+                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
             }
             Stmt::If {
                 then_stmt,
                 else_stmt,
                 ..
             } => {
-                self.collect_cases_from_stmt(then_stmt, case_values, has_default);
+                self.collect_cases_from_stmt(then_stmt, case_values, has_default, unsigned);
                 if let Some(e) = else_stmt {
-                    self.collect_cases_from_stmt(e, case_values, has_default);
+                    self.collect_cases_from_stmt(e, case_values, has_default, unsigned);
                 }
             }
             // Stop at inner switch — its case labels belong to it

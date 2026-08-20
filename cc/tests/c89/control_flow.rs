@@ -921,3 +921,67 @@ int main(void)
         0
     );
 }
+
+/// An unsigned switch range whose bound exceeds `i64::MAX`.
+///
+/// Case endpoints are carried as `i64`, so `ULONG_MAX` read as -1 and the
+/// range looked empty: it warned "empty range specified" and never matched.
+/// The ordering has to follow the switch type's own signedness.
+#[test]
+fn c89_case_range_unsigned_bounds() {
+    let code = r#"
+static int whole(unsigned long x)
+{
+    switch (x) { case 0ul ... 18446744073709551615ul: return 1; default: return 0; }
+}
+
+static int upper(unsigned long x)
+{
+    switch (x) {
+    case 9223372036854775808ul ... 18446744073709551615ul: return 1;
+    default: return 0;
+    }
+}
+
+int main(void)
+{
+    if (!whole(0) || !whole(1) || !whole(18446744073709551615ul)) return 1;
+    if (!upper(9223372036854775808ul) || !upper(18446744073709551615ul)) return 2;
+    if (upper(0) || upper(9223372036854775807ul)) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("case_range_unsigned", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("case_range_unsigned_opt", code),
+        0
+    );
+}
+
+/// A label whose address is taken but never branched on must still be emitted.
+///
+/// The blocks were linked to the dispatch block, and a function with no
+/// computed goto has none — so DCE deleted the block and the link failed on an
+/// undefined `.L` symbol. Storing a label address for later use is legal.
+#[test]
+fn c89_label_address_without_a_computed_goto() {
+    let code = r#"
+void *slot;
+
+static void take(int x)
+{
+    slot = &&L;
+    if (x) return;
+    return;
+L:  slot = 0;
+}
+
+int main(void)
+{
+    take(1);
+    return slot != 0 ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("label_addr_no_goto", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("label_addr_no_goto_opt", code), 0);
+}

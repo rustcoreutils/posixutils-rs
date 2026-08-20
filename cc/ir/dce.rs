@@ -278,6 +278,14 @@ fn compute_reachable(func: &Function) -> HashSet<BasicBlockId> {
     let mut worklist = VecDeque::with_capacity(DEFAULT_REACHABLE_CAPACITY);
 
     worklist.push_back(func.entry);
+    // A block whose address is taken is reachable through that address, which
+    // no edge records. Seeding it here keeps the label -- and so the symbol
+    // the address refers to -- from being deleted.
+    for block in &func.blocks {
+        if block.addr_taken {
+            worklist.push_back(block.id);
+        }
+    }
 
     while let Some(bb_id) = worklist.pop_front() {
         if !reachable.insert(bb_id) {

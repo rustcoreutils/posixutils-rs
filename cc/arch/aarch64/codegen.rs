@@ -3674,9 +3674,16 @@ impl Aarch64CodeGen {
                             src: scratch,
                             dst: VReg::V16,
                         });
+                        // A vector operand has to be pre-rendered: the slot
+                        // carries only a general register, and `%w`-style
+                        // width modifiers do not apply to one of these.
                         slots.push(mk(None, Some(name.to_string())));
                     } else {
-                        slots.push(mk(None, Some(asm_reg_name_64(scratch).to_string())));
+                        // A *register* slot, not a pre-rendered name: the
+                        // template decides the width it wants, and `%w1`
+                        // against a hard-coded `x9` assembled as
+                        // `mov w0, x9`.
+                        slots.push(mk(Some(scratch), None));
                     }
                 }
                 // An FP *value* under a general-register constraint. Nothing

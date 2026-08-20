@@ -1455,3 +1455,23 @@ int main(void) {
     assert_eq!(compile_and_run("asm_fp_value_gp", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("asm_fp_value_gp_opt", code), 0);
 }
+
+/// The template chooses the width it wants, so a materialized constant has to
+/// be handed over as a *register* rather than a pre-rendered name: `%w1`
+/// against a hard-coded `x9` assembled as `mov w0, x9`.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn codegen_inline_asm_width_modifier_applies_to_a_materialized_constant() {
+    let code = r#"
+int main(void) {
+    unsigned int lo = 0;
+    unsigned long full = 0;
+    __asm__ ("mov %w0, %w1" : "=r"(lo) : "r"(1.5f));
+    __asm__ ("mov %0, %1"   : "=r"(full) : "r"(1.5));
+    if (lo != 0x3FC00000U) return 1;
+    if (full != 0x3FF8000000000000UL) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_width_modifier_const", code, &[]), 0);
+}

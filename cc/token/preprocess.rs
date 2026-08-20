@@ -439,8 +439,8 @@ pub struct Preprocessor<'a> {
 /// consulting a side table at diagnostic time: `Position` already carries a
 /// stream and a line, so a rewritten token needs no further interpretation --
 /// `effective_position`, the include-chain note and the `-E` marker writer all
-/// keep working unchanged, and re-running `-E` over a `.i` reproduces its
-/// markers.
+/// keep working unchanged, and re-running `-E` over a `.i` re-emits markers
+/// naming the original source rather than the `.i` it is reading.
 #[derive(Debug, Clone, Copy)]
 struct LineMarker {
     /// Only tokens from this stream are remapped. Text spliced in from an

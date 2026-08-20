@@ -688,13 +688,15 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     fn peek_ucn(&self) -> Option<(char, usize)> {
         let mut offset = self.offset;
 
-        // Skip any line splices to find the actual backslash
+        // Skip any line splices to find the actual backslash. With phase 2
+        // off -- a `.i` operand -- there are none to skip, and a backslash
+        // before a newline is text rather than a joint.
         loop {
             if offset >= self.buffer.len() {
                 return None;
             }
             let c = self.buffer[offset];
-            if c == b'\\' && offset + 1 < self.buffer.len() {
+            if self.splice && c == b'\\' && offset + 1 < self.buffer.len() {
                 let next = self.buffer[offset + 1];
                 if next == b'\n' {
                     offset += 2;

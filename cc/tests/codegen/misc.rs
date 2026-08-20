@@ -5377,13 +5377,26 @@ int main(void) {
     _Float16 from_double = (_Float16)d;
     if ((float)from_double < 3.49f || (float)from_double > 3.51f) return 23;
 
-    /* Float16 <-> int via float intermediary (avoids __fixhfsi) */
-    float fa = (float)a;
-    int i = (int)fa;
+    /* Float16 <-> int, directly. These used to be written through a float
+       intermediary by hand, to avoid __fixhfsi and the seven siblings libgcc
+       does not define; the compiler goes through float itself now. */
+    int i = (int)a;
     if (i != 3) return 30;
 
-    _Float16 from_int = (_Float16)(float)42;
+    _Float16 from_int = (_Float16)42;
     if ((float)from_int < 41.9f || (float)from_int > 42.1f) return 31;
+
+    unsigned u = (unsigned)a;
+    if (u != 3u) return 32;
+
+    long l = (long)a;
+    if (l != 3L) return 33;
+
+    _Float16 neg = -3.5f16;
+    if ((int)neg != -3) return 34;
+
+    _Float16 from_long = (_Float16)1234L;
+    if ((float)from_long < 1233.0f || (float)from_long > 1235.0f) return 35;
 
     /* Compound assignment */
     _Float16 ca = 10.0f16;

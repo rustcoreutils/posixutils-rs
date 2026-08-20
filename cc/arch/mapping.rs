@@ -1265,6 +1265,91 @@ pub(crate) fn expand_float16_arith(
     insns
 }
 
+/// Expand a `_Float16` <-> integer conversion by going through `float`.
+///
+/// libgcc implements no half<->integer helper at all: `__fixhfsi`,
+/// `__fixhfdi`, `__fixunshfsi`, `__fixunshfdi`, `__floatsihf`, `__floatdihf`,
+/// `__floatunsihf` and `__floatundihf` are every one of them undefined, so
+/// emitting a direct call made valid C fail to link. gcc converts via `float`,
+/// which needs only `__extendhfsf2` / `__truncsfhf2` -- the two that do exist,
+/// and the two the arithmetic expansion beside this one already uses.
+///
+/// A 128-bit integer on the other side builds its own libcall here rather than
+/// emitting a conversion for a later pass to lower: `map_function` pushes a
+/// replacement verbatim and does **not** re-map it, so a `float` -> `__int128`
+/// left in the stream would reach codegen with nothing to lower it. The four
+/// symbols that step needs -- `__fixsfti`, `__fixunssfti`, `__floattisf`,
+/// `__floatuntisf` -- are all present in libgcc.
+pub(crate) fn expand_float16_int_convert(
+    insn: &Instruction,
+    func: &mut Function,
+    types: &TypeTable,
+    target: &Target,
+) -> Vec<Instruction> {
+    let float_type = types.float_id;
+    let float_size = types.size_bits(float_type);
+    let pos = insn.pos;
+    let src = insn.src[0];
+    let result = insn.target.expect("conversion must have target");
+    let mut insns = Vec::new();
+
+    match insn.op {
+        // half -> integer
+        Opcode::FCvtS | Opcode::FCvtU => {
+            let dst_typ = insn.typ.expect("conversion must have type");
+            let dst_size = types.size_bits(dst_typ);
+
+            let as_float = func.create_reg_pseudo();
+            insns.push(build_f16_extend_call(as_float, src, pos, types, target));
+
+            let mut step = Instruction::unop(insn.op, result, as_float, dst_typ, dst_size);
+            step.src_typ = Some(float_type);
+            step.src_size = float_size;
+            step.pos = pos;
+
+            if types.kind(dst_typ) == TypeKind::Int128 {
+                let name = if insn.op == Opcode::FCvtU {
+                    "__fixunssfti"
+                } else {
+                    "__fixsfti"
+                };
+                insns.push(build_convert_rtlib_call(&step, name, types, target));
+            } else {
+                insns.push(step);
+            }
+        }
+        // integer -> half
+        Opcode::SCvtF | Opcode::UCvtF => {
+            let src_typ = insn.src_typ.expect("conversion must have src_typ");
+            let src_size = types.size_bits(src_typ);
+
+            let as_float = func.create_reg_pseudo();
+            let mut step = Instruction::unop(insn.op, as_float, src, float_type, float_size);
+            step.src_typ = Some(src_typ);
+            step.src_size = src_size;
+            step.pos = pos;
+
+            if types.kind(src_typ) == TypeKind::Int128 {
+                let name = if insn.op == Opcode::UCvtF {
+                    "__floatuntisf"
+                } else {
+                    "__floattisf"
+                };
+                insns.push(build_convert_rtlib_call(&step, name, types, target));
+            } else {
+                insns.push(step);
+            }
+
+            insns.push(build_f16_truncate_call(
+                result, as_float, pos, types, target,
+            ));
+        }
+        _ => {}
+    }
+
+    insns
+}
+
 /// Expand Float16 negation (promote-negate-truncate).
 pub(crate) fn expand_float16_neg(
     insn: &Instruction,

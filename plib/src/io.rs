@@ -87,7 +87,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             use std::os::unix::fs::PermissionsExt;
             meta.permissions().mode()
         }
-        Err(_) => crate::modestr::default_create_mode(),
+        // Only "there is no file here" means a file is being created. Every
+        // other stat failure is reported rather than read as absence: an
+        // `Err(_)` arm would take, say, EACCES on a path component or ENOTDIR
+        // on a parent as "missing" and go on to pick a mode for a file it
+        // could not have looked at.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => crate::modestr::default_create_mode(),
+        Err(e) => return Err(e),
     };
     write_atomic_mode(path, bytes, mode)
 }

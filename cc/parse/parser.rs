@@ -5690,13 +5690,16 @@ impl Parser<'_> {
     /// `eval_const_float_expr` for anything that survives to code generation.
     /// `f64` is enough to decide an ordering that `i128` truncation was
     /// getting wrong.
-    pub(crate) fn eval_const_f64(&self, expr: &Expr) -> Option<f64> {
+    pub(crate) fn eval_const_f64(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(v.to_f64()),
             ExprKind::IntLit(v) => Some(*v as f64),
-            ExprKind::CharLit(c) => Some(*c as u32 as f64),
+            // `CharLit` is an `i64` whose signedness the lexer has already
+            // resolved, so `'\x80'` is -128 where `char` is signed. Rounding
+            // it through `u32` made that 4294967168.0.
+            ExprKind::CharLit(c) => Some(*c as f64),
             ExprKind::Cast { expr: inner, .. } => {
-                let v = self.eval_const_f64(inner)?;
+                let v = self.eval_const_f64(scope, inner)?;
                 // A cast to an integer type truncates before the comparison.
                 match expr.typ {
                     Some(t) if self.types.is_integer(t) => Some(v.trunc()),
@@ -5706,10 +5709,10 @@ impl Parser<'_> {
             ExprKind::Unary {
                 op: UnaryOp::Neg,
                 operand,
-            } => Some(-self.eval_const_f64(operand)?),
+            } => Some(-self.eval_const_f64(scope, operand)?),
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_f64(left)?;
-                let r = self.eval_const_f64(right)?;
+                let l = self.eval_const_f64(scope, left)?;
+                let r = self.eval_const_f64(scope, right)?;
                 match op {
                     BinaryOp::Add => Some(l + r),
                     BinaryOp::Sub => Some(l - r),
@@ -5718,7 +5721,12 @@ impl Parser<'_> {
                     _ => None,
                 }
             }
-            _ => None,
+            // Anything else that is an integer constant expression converts to
+            // one. `sizeof`, `_Alignof`, an enumerator and a conditional all
+            // reach here, and each was answered "not a constant expression"
+            // for want of an arm -- so `_Static_assert(sizeof(int) < 4.5, "")`
+            // was rejected although both operands are perfectly constant.
+            _ => crate::constexpr::eval(self, scope, expr).map(|v| v as f64),
         }
     }
 
@@ -5925,7 +5933,7 @@ impl crate::constexpr::ConstEnv for Parser<'_> {
         self.resolve_struct_type(typ)
     }
 
-    fn float_value(&self, _scope: ConstScope, expr: &Expr) -> Option<f64> {
-        self.eval_const_f64(expr)
+    fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
+        self.eval_const_f64(scope, expr)
     }
 }

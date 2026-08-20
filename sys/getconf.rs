@@ -153,15 +153,25 @@ fn handle_confstr(
 /// accepts either; re-stating them in the queried issue is the honest answer
 /// rather than a behavioral change.
 ///
+/// Every earlier spelling is restated, not just V7: which one comes back
+/// depends on the constant the host has. glibc answers a V8 query from its V7
+/// confstr, while macOS has neither and answers from its V6 one, so a V8 query
+/// could come back `POSIX_V6_LP64_OFF64`.
+///
 /// Only the names are rewritten. A `_CFLAGS` / `_LDFLAGS` / `_LIBS` value is
-/// compiler flags, not environment names, and is passed through untouched.
+/// compiler flags, not environment names, and is passed through untouched; so
+/// is a reply that names no environment at all, such as `undefined`.
 fn restate_environment_names(var: &str, value: &str) -> String {
     if !var.contains("POSIX_V8_") || !var.ends_with("WIDTH_RESTRICTED_ENVS") {
         return value.to_string();
     }
     value
         .lines()
-        .map(|name| name.replace("POSIX_V7_", "POSIX_V8_"))
+        .map(|name| {
+            name.replace("POSIX_V5_", "POSIX_V8_")
+                .replace("POSIX_V6_", "POSIX_V8_")
+                .replace("POSIX_V7_", "POSIX_V8_")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

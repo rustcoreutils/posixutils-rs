@@ -361,33 +361,51 @@ fn posix_v8_programming_environments_match_v7() {
 
 /// `WIDTH_RESTRICTED_ENVS` is the one that answers with environment *names*
 /// rather than flags, and 88129-88132 wants them "suitable for use with the
-/// getconf -v option". glibc has no V8 confstr, so the V8 query aliases the V7
-/// one and the host replies `POSIX_V7_LP64_OFF64` -- a V7 name in reply to a V8
-/// question. The names denote the same environments either way (Austin Group
-/// Defect 1330 renamed them only), so the answer is restated in the issue that
-/// was asked about.
+/// getconf -v option".
+///
+/// No host has a V8 confstr: glibc answers a V8 query from its V7 constant and
+/// macOS from its V6 one, so the reply comes back in an earlier issue's
+/// spelling. Austin Group Defect 1330 renamed the names without changing the
+/// environments behind them, so the answer is restated in the issue that was
+/// asked about.
+///
+/// What is *not* asserted is the content of the host's list. POSIX does not
+/// promise that any environment meets the width restriction, and `getconf`
+/// prints `undefined` for a variable that is valid but has no value — which is
+/// how this first failed on macOS, where the round-trip below tried to feed
+/// `undefined` back to `getconf -v`.
 #[test]
 fn posix_width_restricted_envs_answer_in_the_issue_asked_about() {
     let v8 = getconf_output("POSIX_V8_WIDTH_RESTRICTED_ENVS");
     let v7 = getconf_output("POSIX_V7_WIDTH_RESTRICTED_ENVS");
 
-    assert!(
-        !v8.trim().is_empty(),
-        "POSIX_V8_WIDTH_RESTRICTED_ENVS must name at least one environment"
-    );
-    assert!(
-        !v8.contains("POSIX_V7_"),
-        "a V8 query must not answer with V7 names, got: {v8}"
-    );
+    // The rule: a V8 query never answers in an earlier issue's spelling.
+    for stale in ["POSIX_V5_", "POSIX_V6_", "POSIX_V7_"] {
+        assert!(
+            !v8.contains(stale),
+            "a V8 query answered with a {stale} name: {v8:?}"
+        );
+    }
+
+    // The two queries name the same environments, differing only in the issue
+    // they are stated in. Compared with the prefix stripped from both, so this
+    // does not just restate the implementation's own rewrite.
+    let strip = |s: &str| {
+        s.split_whitespace()
+            .map(|n| n.rsplit_once('_').map_or(n, |(_, rest)| rest).to_string())
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        v8,
-        v7.replace("POSIX_V7_", "POSIX_V8_"),
-        "the V8 answer must be the V7 one restated, not a different list"
+        strip(&v8),
+        strip(&v7),
+        "the V8 and V7 answers name different environments: {v8:?} vs {v7:?}"
     );
 
-    // The names have to round-trip: each is meant to be handed straight back
-    // to `getconf -v`.
-    for name in v8.split_whitespace() {
+    // Each name the host does offer must round-trip: being usable with
+    // `getconf -v` is the whole point of the variable. A reply that names no
+    // environment — `undefined`, or an empty list — is a conforming answer and
+    // has nothing to round-trip.
+    for name in v8.split_whitespace().filter(|n| n.starts_with("POSIX_V")) {
         run_getconf_test(
             vec!["-v", name, "POSIX_V8_LP64_OFF64_CFLAGS"],
             0,

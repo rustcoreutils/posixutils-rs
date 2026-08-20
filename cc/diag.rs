@@ -86,6 +86,11 @@ pub struct Stream {
     /// Line number offset from #line directive
     /// If Some((new_line, new_file)), positions should be adjusted
     pub line_directive: Option<(u32, Option<String>)>,
+    /// Named by a `# N "file" 3` linemarker, i.e. a system header. Warnings
+    /// from such a stream are suppressed, as they are in GCC: a preprocessed
+    /// file carries the whole of glibc with it, and its warnings are not the
+    /// user's to act on.
+    pub is_system: bool,
 }
 
 impl Stream {
@@ -95,6 +100,7 @@ impl Stream {
             name,
             include_pos: None,
             line_directive: None,
+            is_system: false,
         }
     }
 
@@ -104,6 +110,7 @@ impl Stream {
             name,
             include_pos: Some(include_pos),
             line_directive: None,
+            is_system: false,
         }
     }
 }
@@ -129,6 +136,31 @@ impl StreamRegistry {
         let id = self.streams.len() as u16;
         self.streams.push(Stream::new(name));
         id
+    }
+
+    /// Find the stream already registered under `name`, or add one.
+    ///
+    /// A preprocessed file re-enters the same file many times -- every
+    /// `# N "foo.h" 2` returns to one already seen -- and each name must map
+    /// to one stream, or the include-chain note and the `-E` marker writer
+    /// both see a file they have never met before.
+    pub fn find_or_add(&mut self, name: &str) -> u16 {
+        match self.streams.iter().position(|s| s.name == name) {
+            Some(i) => i as u16,
+            None => self.add(name.to_string()),
+        }
+    }
+
+    /// Mark a stream as a system header (linemarker flag 3).
+    pub fn set_system(&mut self, id: u16, is_system: bool) {
+        if let Some(stream) = self.streams.get_mut(id as usize) {
+            stream.is_system = is_system;
+        }
+    }
+
+    /// Whether warnings from this stream are suppressed.
+    pub fn is_system(&self, id: u16) -> bool {
+        self.streams.get(id as usize).is_some_and(|s| s.is_system)
     }
 
     /// Add a stream for an included file
@@ -189,6 +221,16 @@ thread_local! {
 /// Initialize a new stream, returning its ID
 pub fn init_stream(name: &str) -> u16 {
     STREAMS.with(|s| s.borrow_mut().add(name.to_string()))
+}
+
+/// Resolve `name` to its stream, registering one if this is the first sighting.
+pub fn find_or_add_stream(name: &str) -> u16 {
+    STREAMS.with(|s| s.borrow_mut().find_or_add(name))
+}
+
+/// Mark a stream as a system header, silencing its warnings.
+pub fn set_stream_system(id: u16, is_system: bool) {
+    STREAMS.with(|s| s.borrow_mut().set_system(id, is_system));
 }
 
 /// Initialize a stream for an included file
@@ -395,6 +437,9 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
         DiagLevel::Warning => {
             WARNING_COUNT.fetch_add(1, Ordering::Relaxed);
             if warnings_suppressed() {
+                return;
+            }
+            if STREAMS.with(|s| s.borrow().is_system(pos.stream)) {
                 return;
             }
         }

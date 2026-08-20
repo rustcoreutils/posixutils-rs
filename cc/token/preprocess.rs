@@ -410,6 +410,41 @@ pub struct Preprocessor<'a> {
 
     /// File name override from #line directive
     line_file_override: Option<String>,
+
+    /// Attribution established by the most recent `# N "file" flags`
+    /// linemarker, if any. See [`LineMarker`].
+    linemarker: Option<LineMarker>,
+
+    /// Position of the token currently being dispatched, before [`LineMarker`]
+    /// remapping. A linemarker's delta is measured from the physical line and
+    /// binds to the physical stream, so both have to survive the remap that is
+    /// applied to its own `#` token.
+    physical_line: u32,
+    physical_stream: u16,
+}
+
+/// Where a linemarker says the text after it really came from.
+///
+/// `c17 -E` writes `# N "file" flags` at every file transition, and POSIX
+/// 87981 makes that output a `.i` operand. Compiling one has to attribute
+/// diagnostics to the original file and line rather than to the position in
+/// the preprocessed text, which is what GCC does and what c17 did not.
+///
+/// The mapping is applied by rewriting token positions rather than by
+/// consulting a side table at diagnostic time: `Position` already carries a
+/// stream and a line, so a rewritten token needs no further interpretation --
+/// `effective_position`, the include-chain note and the `-E` marker writer all
+/// keep working unchanged, and re-running `-E` over a `.i` reproduces its
+/// markers.
+#[derive(Debug, Clone, Copy)]
+struct LineMarker {
+    /// Only tokens from this stream are remapped. Text spliced in from an
+    /// `#include` carries its own attribution and must not be touched.
+    origin: u16,
+    /// The stream the marker named.
+    target: u16,
+    /// Added to a physical line number to get the reported one.
+    delta: i64,
 }
 
 /// What a `#pragma pack` directive does to the packing state.
@@ -695,6 +730,9 @@ impl<'a> Preprocessor<'a> {
             lexer_mode: LexerMode::C,
             line_offset: 0,
             line_file_override: None,
+            linemarker: None,
+            physical_line: 0,
+            physical_stream: 0,
         };
 
         // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
@@ -1001,7 +1039,15 @@ impl<'a> Preprocessor<'a> {
         let mut output = Vec::new();
         let mut iter = tokens.into_iter().peekable();
 
-        while let Some(token) = iter.next() {
+        while let Some(mut token) = iter.next() {
+            // Attribute the token before anything looks at it, so that macro
+            // expansion, diagnostics and the `-E` marker writer all inherit
+            // the position a linemarker established. The physical position is
+            // kept because the next linemarker's delta is measured from it.
+            self.physical_line = token.pos.line;
+            self.physical_stream = token.pos.stream;
+            token.pos = self.remap_pos(token.pos);
+
             match token.typ {
                 TokenType::StreamBegin | TokenType::StreamEnd => {
                     // Pass through stream markers
@@ -1193,6 +1239,16 @@ impl<'a> Preprocessor<'a> {
         let directive_id = match directive_id {
             Some(id) => id,
             None => {
+                // A number where a directive name belongs is the GCC
+                // linemarker `# N "file" flags` -- the form `c17 -E` writes
+                // and POSIX 87981 makes a `.i` operand. It used to be
+                // swallowed whole, which is why every diagnostic about a
+                // preprocessed file cited the position in the preprocessed
+                // text rather than the original.
+                if directive_token.typ == TokenType::Number && !self.is_skipping() {
+                    self.handle_linemarker(iter, &directive_token);
+                    return;
+                }
                 // Consume rest of line
                 self.skip_to_eol(iter);
                 return;
@@ -1227,6 +1283,80 @@ impl<'a> Preprocessor<'a> {
                 self.skip_to_eol(iter);
             }
         }
+    }
+
+    /// Apply the active [`LineMarker`] to a position.
+    fn remap_pos(&self, pos: Position) -> Position {
+        match self.linemarker {
+            Some(lm) if lm.origin == pos.stream => Position {
+                stream: lm.target,
+                line: (pos.line as i64 + lm.delta).max(1) as u32,
+                ..pos
+            },
+            _ => pos,
+        }
+    }
+
+    /// Consume a `# N ["file" [flags]]` linemarker and record the attribution
+    /// it establishes for the text that follows.
+    ///
+    /// `number` is the directive-name token, which the caller has already
+    /// taken from the iterator and found to be a number rather than an
+    /// identifier. C17 has no such directive; this is the GCC form that
+    /// `c17 -E` itself writes, and `#line` is deliberately *not* routed here
+    /// (GCC honors only this form in a preprocessed file, and so does c17).
+    fn handle_linemarker<I>(&mut self, iter: &mut std::iter::Peekable<I>, number: &Token)
+    where
+        I: Iterator<Item = Token>,
+    {
+        let origin = self.physical_stream;
+        let TokenValue::Number(ref text) = number.value else {
+            self.skip_to_eol(iter);
+            return;
+        };
+        let Ok(line) = text.parse::<u32>() else {
+            self.skip_to_eol(iter);
+            return;
+        };
+
+        // An optional filename follows; without one the marker renumbers the
+        // current file rather than renaming it.
+        let mut target = self.linemarker.map_or(origin, |lm| lm.target);
+        if let Some(tok) = iter.peek() {
+            if !tok.pos.newline && tok.typ == TokenType::String {
+                if let TokenValue::String(name) = &tok.value {
+                    let name = name.clone();
+                    target = diag::find_or_add_stream(&name);
+                }
+                iter.next();
+            }
+        }
+
+        // Flags 1 (entering) and 2 (returning) are attribution the stream
+        // registry already derives; 4 (extern "C") means nothing here. Only 3
+        // carries a decision: it marks a system header, whose warnings are
+        // not the user's to act on.
+        let mut is_system = false;
+        while let Some(tok) = iter.peek() {
+            if tok.pos.newline {
+                break;
+            }
+            if let TokenValue::Number(flag) = &tok.value {
+                if flag == "3" {
+                    is_system = true;
+                }
+            }
+            iter.next();
+        }
+        diag::set_stream_system(target, is_system);
+
+        // The marker names the line of the text *after* it, so the delta is
+        // measured against the next physical line.
+        self.linemarker = Some(LineMarker {
+            origin,
+            target,
+            delta: line as i64 - (self.physical_line as i64 + 1),
+        });
     }
 
     /// Skip tokens until end of line

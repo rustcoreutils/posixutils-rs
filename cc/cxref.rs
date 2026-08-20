@@ -335,6 +335,11 @@ fn extract_refs_from_stmt(
             extract_refs_from_expr(expr, strings, symbols, xref);
             extract_refs_from_stmt(body, strings, symbols, xref);
         }
+        // A computed goto's target references identifiers like any other
+        // expression.
+        Stmt::GotoIndirect { target, .. } => {
+            extract_refs_from_expr(target, strings, symbols, xref);
+        }
         Stmt::Case(expr, high) => {
             extract_refs_from_expr(expr, strings, symbols, xref);
             // Both endpoints of a range label can reference identifiers.

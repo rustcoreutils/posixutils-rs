@@ -276,6 +276,17 @@ impl<'a> Parser<'a> {
                         ));
                     }
                 }
+                // A range that follows a field designator -- `.m[0 ... 3] = v`
+                // -- resolves through `resolve_designator_chain`, which yields
+                // one offset where a range names many. It used to be dropped
+                // there in silence, initializing nothing. The nested spelling
+                // `.m = {[0 ... 3] = v}` does the same job and works.
+                if high.is_some() && !designators.is_empty() {
+                    return Err(ParseError::new(
+                        "an index range is not supported after a field designator;                          write '.field = { [lo ... hi] = value }'",
+                        self.current_pos(),
+                    ));
+                }
                 designators.push(match high {
                     None => Designator::Index(index),
                     Some(high) => Designator::IndexRange(index, high),

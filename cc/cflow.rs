@@ -389,6 +389,10 @@ fn extract_calls_from_stmt(
             extract_calls_from_expr(expr, strings, symbols, calls);
             extract_calls_from_stmt(body, strings, symbols, calls);
         }
+        // A computed goto's target is an ordinary expression and can call.
+        Stmt::GotoIndirect { target, .. } => {
+            extract_calls_from_expr(target, strings, symbols, calls);
+        }
         Stmt::Case(expr, high) => {
             extract_calls_from_expr(expr, strings, symbols, calls);
             // A range label has a second endpoint, and a call can appear in

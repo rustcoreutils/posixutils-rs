@@ -4451,3 +4451,72 @@ fn diagnostics_designator_range_is_well_formed() {
         "int a[4] = {[1 ... 1] = 5};\nint main(void){ return a[1] == 5 ? 0 : 1; }\n",
     );
 }
+
+/// `&&label` naming a label the function never defines is an error.
+///
+/// The block minted for the reference stayed empty and unterminated, so
+/// branching to it ran off the end of the function and the program hung.
+/// Checked at the end of the function, because a forward reference is legal.
+#[test]
+fn diagnostics_label_address_must_name_a_label() {
+    compile_expect_error(
+        "label_addr_undefined",
+        "int main(void){ void *p = &&nowhere; goto *p; return 1; }\n",
+        "used but not defined",
+    );
+    // A forward reference is fine.
+    compile_expect_ok(
+        "label_addr_forward",
+        "int main(void){ void *p = &&L; goto *p; return 1; L: return 0; }\n",
+    );
+}
+
+/// `&&label` outside any function is an error, not a compiler crash.
+#[test]
+fn diagnostics_label_address_outside_a_function() {
+    compile_expect_error(
+        "label_addr_file_scope",
+        "void *g = &&L;\nint main(void){ L: return 0; }\n",
+        "outside of any function",
+    );
+}
+
+/// The operand of a computed goto must be a pointer.
+///
+/// An integer is scalar, so testing scalarity accepted `goto *3;` — and the
+/// 64-bit store of a 32-bit value then branched through a half-initialised
+/// address.
+#[test]
+fn diagnostics_computed_goto_requires_a_pointer() {
+    compile_expect_error(
+        "computed_goto_int",
+        "int main(void){ int n = 3; goto *n; return 1; }\n",
+        "must be a pointer",
+    );
+    compile_expect_error(
+        "computed_goto_double",
+        "int main(void){ double d = 1.0; goto *d; return 1; }\n",
+        "must be a pointer",
+    );
+}
+
+/// An index range after a field designator is refused, not silently dropped.
+///
+/// `.m[0 ... 3] = v` resolves through the designator chain, which yields one
+/// offset where a range names many, so it initialized nothing at all and said
+/// nothing about it. The nested spelling does the same job.
+#[test]
+fn diagnostics_index_range_after_field_designator() {
+    compile_expect_error(
+        "range_after_field",
+        "struct S { int m[4]; int t; };\nstruct S s = { .m[0 ... 3] = 7, .t = 9 };\n\
+         int main(void){ return s.m[0]; }\n",
+        "index range is not supported after a field designator",
+    );
+    // The nested form works and is what the diagnostic points at.
+    compile_expect_ok(
+        "range_nested_in_field",
+        "struct S { int m[4]; int t; };\nstruct S s = { .m = { [0 ... 3] = 7 }, .t = 9 };\n\
+         int main(void){ return (s.m[3] == 7 && s.t == 9) ? 0 : 1; }\n",
+    );
+}

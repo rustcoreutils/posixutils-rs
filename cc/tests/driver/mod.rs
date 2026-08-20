@@ -1021,3 +1021,87 @@ fn driver_preprocess_of_a_dot_i_is_stable() {
         assert_eq!(run_exe(&exe), 0, "{} lost the packing", s(f));
     }
 }
+
+/// A search-path option must not be mistaken for a pathname operand.
+///
+/// `VALUE_OPTIONS` tells the link-order scan which options swallow the word
+/// after them. `-isystem` and `-idirafter` were listed under their single-dash
+/// gcc spellings, but `preprocess_args_from` rewrites those to double-dash
+/// before clap sees them and the scan runs on the rewritten vector -- so the
+/// entries never matched, the directory was read as a pathname operand, and
+/// `ordering_recovered` went false. The link line then silently fell back to
+/// its unordered shape, which is the one thing the table exists to prevent:
+/// `-l foo` written *before* the operand that needs it must not resolve.
+#[test]
+fn driver_isystem_does_not_disturb_library_ordering() {
+    let w = WorkDir::new("isystem_order");
+    std::fs::create_dir_all(w.join("libdir")).unwrap();
+    std::fs::create_dir_all(w.join("inc")).unwrap();
+
+    let helper = w.write("helper.c", HELPER_7);
+    let obj = w.join("helper.o");
+    assert!(run_c17(&["-c", &s(&helper), "-o", &s(&obj)]).success);
+    let archive = w.join("libdir/libhelper.a");
+    assert!(Command::new("ar")
+        .args(["rcs", &s(&archive), &s(&obj)])
+        .status()
+        .expect("ar")
+        .success());
+
+    let main = w.write("main.c", CALLER);
+    let libdir = s(&w.join("libdir"));
+    let incdir = s(&w.join("inc"));
+
+    // The baseline: an archive named before the operand that needs it does
+    // not resolve.
+    let before = run_c17(&[
+        "-L",
+        &libdir,
+        "-l",
+        "helper",
+        &s(&main),
+        "-o",
+        &s(&w.join("a")),
+    ]);
+    assert!(
+        !before.success,
+        "an archive named before its user must not resolve: {}{}",
+        before.stdout, before.stderr
+    );
+
+    // Adding a search-path option must not change that.
+    for opt in ["-isystem", "-idirafter"] {
+        let r = run_c17(&[
+            opt,
+            &incdir,
+            "-L",
+            &libdir,
+            "-l",
+            "helper",
+            &s(&main),
+            "-o",
+            &s(&w.join("b")),
+        ]);
+        assert!(
+            !r.success,
+            "{opt} made link ordering fall back to its unordered shape: {}{}",
+            r.stdout, r.stderr
+        );
+    }
+
+    // And the correct order still links and runs, with the option present.
+    let exe = w.join("ok");
+    let r = run_c17(&[
+        "-isystem",
+        &incdir,
+        &s(&main),
+        "-L",
+        &libdir,
+        "-l",
+        "helper",
+        "-o",
+        &s(&exe),
+    ]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 7);
+}

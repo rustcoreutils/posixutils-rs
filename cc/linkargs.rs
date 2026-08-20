@@ -69,8 +69,17 @@ const VALUE_OPTIONS: &[&str] = &[
     "--c17-linker-flag",
     "--c17-unsupported-mflag",
     "--sysroot",
+    // Both spellings. `preprocess_args_from` rewrites the single-dash gcc
+    // forms to double-dash before clap sees them, and `scan` runs on the
+    // rewritten vector -- so the single-dash entries never matched anything,
+    // the directory after `-isystem` was read as a pathname operand, and
+    // `ordering_recovered` went false. The link line then fell back to its
+    // unordered shape, silently: `c17 -isystem inc -L A -l foo t.c` linked a
+    // program that `c17 -L A -l foo t.c` correctly refuses.
     "-isystem",
+    "--isystem",
     "-idirafter",
+    "--idirafter",
 ];
 
 /// The libraries `-l` is required to find, c17.md 88057-88093.

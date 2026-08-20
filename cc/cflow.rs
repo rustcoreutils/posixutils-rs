@@ -880,6 +880,7 @@ fn process_file(
                 no_std_inc: false,
                 no_builtin_inc: false,
                 trigraphs: false,
+                preprocessed: false,
             },
         )
     };

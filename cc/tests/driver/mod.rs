@@ -701,3 +701,191 @@ fn driver_source_does_not_clobber_a_like_named_object_operand() {
     );
     assert_eq!(run_exe(&exe), 7);
 }
+
+// ============================================================================
+// #C140 — a `.i` operand is not preprocessed a second time
+//
+// POSIX 87981-87983: a `.i` is "a text file containing the output of c17 -E",
+// and "the processing already performed by c17 -E when the file was produced
+// shall not be repeated when the file is compiled."
+//
+// That is not a wholesale skip of translation phase 4. GCC keeps a five-entry
+// allowlist -- `#define`, `#undef`, `#pragma`, `#ident`, `#sccs` -- plus the
+// null `#` and linemarkers; everything else leaves a stray `#`. These pin both
+// halves, because dropping the allowlist would silently lose `#pragma pack`.
+// ============================================================================
+
+/// Compile `body` as a `.i` and return (success, combined output).
+fn compile_dot_i(name: &str, body: &str, extra: &[&str]) -> (bool, String) {
+    let w = WorkDir::new(name);
+    let src = w.write("t.i", body);
+    let obj = w.join("t.o");
+    let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    args.extend(["-c".to_string(), s(&src), "-o".to_string(), s(&obj)]);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let r = run_c17(&argv);
+    (r.success, format!("{}{}", r.stdout, r.stderr))
+}
+
+/// A macro defined in a `.i` is recorded but never substituted.
+///
+/// This is the headline case: c17 re-ran phase 4 and expanded `X`, so the
+/// program returned 1 where gcc rejects the source outright.
+#[test]
+fn driver_dot_i_does_not_expand_macros() {
+    let (ok, out) = compile_dot_i("i_nomacro", "#define X 1\nint main(void){return X;}\n", &[]);
+    assert!(
+        !ok,
+        "a `.i` was preprocessed again -- `X` must stay undeclared:\n{out}"
+    );
+    assert!(out.contains("X"), "expected a diagnostic naming X:\n{out}");
+}
+
+/// `-D` on the command line is phase-4 processing and does not reach a `.i`.
+#[test]
+fn driver_dot_i_ignores_command_line_defines() {
+    let (ok, out) = compile_dot_i("i_nodef", "int main(void){return X;}\n", &["-D", "X=0"]);
+    assert!(!ok, "-D reached a `.i` operand:\n{out}");
+}
+
+/// Predefined macros are spent too -- `c17 -E` already replaced them.
+#[test]
+fn driver_dot_i_does_not_expand_predefined_macros() {
+    for m in ["__LINE__", "__STDC__", "__FILE__"] {
+        let (ok, out) = compile_dot_i(
+            "i_nopredef",
+            &format!("int f(void){{return sizeof {m};}}\n"),
+            &[],
+        );
+        assert!(!ok, "{m} was expanded inside a `.i`:\n{out}");
+    }
+}
+
+/// The allowlist: these directives still run in a `.i`.
+#[test]
+fn driver_dot_i_keeps_the_allowlisted_directives() {
+    for (what, body) in [
+        ("#define", "#define X 1\nint main(void){return 0;}\n"),
+        ("#undef", "#undef NOPE\nint main(void){return 0;}\n"),
+        (
+            "#pragma",
+            "#pragma GCC unknown_to_everyone\nint main(void){return 0;}\n",
+        ),
+        ("#ident", "#ident \"x\"\nint main(void){return 0;}\n"),
+        ("null #", "#\nint main(void){return 0;}\n"),
+    ] {
+        let (ok, out) = compile_dot_i("i_allow", body, &[]);
+        assert!(ok, "{what} must survive in a `.i`:\n{out}");
+    }
+}
+
+/// Everything outside the allowlist leaves a stray `#`.
+///
+/// `#if 0` is the one that matters most: its body must be *kept*, because the
+/// conditional was already resolved when the `.i` was produced.
+#[test]
+fn driver_dot_i_rejects_directives_outside_the_allowlist() {
+    for (what, body) in [
+        (
+            "#include",
+            "#include <stdio.h>\nint main(void){return 0;}\n",
+        ),
+        ("#if", "#if 0\n#endif\nint main(void){return 0;}\n"),
+        ("#ifdef", "#ifdef NOPE\n#endif\nint main(void){return 0;}\n"),
+        ("#error", "#error boom\nint main(void){return 0;}\n"),
+        ("#line", "#line 100 \"fake.c\"\nint main(void){return 0;}\n"),
+    ] {
+        let (ok, out) = compile_dot_i("i_reject", body, &[]);
+        assert!(!ok, "{what} was processed inside a `.i`:\n{out}");
+        assert!(
+            out.contains("stray '#'"),
+            "{what} should leave a stray `#`:\n{out}"
+        );
+    }
+}
+
+/// `#pragma pack` must still take effect, or a preprocessed file silently
+/// loses its layout -- the reason the allowlist exists rather than a blanket
+/// skip of every `#` line.
+#[test]
+fn driver_dot_i_still_honors_pragma_pack() {
+    let w = WorkDir::new("i_pack");
+    let src = w.write(
+        "t.i",
+        "#pragma pack(1)\nstruct S{char c;int i;};\n\
+         int main(void){return sizeof(struct S)==5?0:1;}\n",
+    );
+    let exe = w.join("t");
+    let r = run_c17(&[&s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 0, "#pragma pack was dropped inside a `.i`");
+}
+
+/// `_Pragma` is a phase-4 operator, and `c17 -E` has already lowered it.
+#[test]
+fn driver_dot_i_does_not_process_the_pragma_operator() {
+    let w = WorkDir::new("i_pragma_op");
+    let src = w.write(
+        "t.i",
+        "_Pragma(\"pack(1)\")\nstruct S{char c;int i;};\n\
+         int main(void){return sizeof(struct S)==5?0:1;}\n",
+    );
+    let r = run_c17(&[&s(&src), "-o", &s(&w.join("t"))]);
+    assert!(!r.success, "_Pragma was executed inside a `.i`");
+}
+
+/// Phases 1 and 2 do not run again either.
+#[test]
+fn driver_dot_i_skips_trigraphs_and_line_splicing() {
+    // Phase 1: a trigraph stays three characters even with --trigraphs.
+    let (ok, out) = compile_dot_i(
+        "i_trigraph",
+        "int main(void){return sizeof(\"??=\")==4?0:1;}\n",
+        &["--trigraphs"],
+    );
+    assert!(ok, "{out}");
+    let w = WorkDir::new("i_trigraph_run");
+    let src = w.write("t.i", "int main(void){return sizeof(\"??=\")==4?0:1;}\n");
+    let exe = w.join("t");
+    let r = run_c17(&["--trigraphs", &s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 0, "a trigraph was folded inside a `.i`");
+
+    // Phase 2: a backslash-newline is text, not a splice.
+    let (ok, out) = compile_dot_i(
+        "i_splice",
+        "int a\\\nb = 0;\nint main(void){return 0;}\n",
+        &[],
+    );
+    assert!(!ok, "a `.i` was line-spliced again:\n{out}");
+}
+
+/// Phases 5 and 6 are the compiler's, not the preprocessor's, and still run.
+#[test]
+fn driver_dot_i_still_runs_the_later_phases() {
+    let w = WorkDir::new("i_late");
+    let src = w.write(
+        "t.i",
+        "int main(void){return sizeof(\"a\" \"b\")==3 && sizeof(\"\\x41\\101\")==3 ? 0 : 1;}\n",
+    );
+    let exe = w.join("t");
+    let r = run_c17(&[&s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(
+        run_exe(&exe),
+        0,
+        "string concatenation or escapes stopped working"
+    );
+}
+
+/// A `.c` holding the same text is still fully preprocessed -- the gate is the
+/// suffix, and nothing about the normal path changed.
+#[test]
+fn driver_dot_c_is_still_preprocessed() {
+    let w = WorkDir::new("i_control");
+    let src = w.write("t.c", "#define X 0\nint main(void){return X;}\n");
+    let exe = w.join("t");
+    let r = run_c17(&[&s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 0);
+}

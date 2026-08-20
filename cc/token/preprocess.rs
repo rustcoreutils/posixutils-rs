@@ -411,6 +411,11 @@ pub struct Preprocessor<'a> {
     /// File name override from #line directive
     line_file_override: Option<String>,
 
+    /// The input is already the output of `c17 -E`, so translation phases 1
+    /// through 4 must not run again (POSIX 87982-87983). See the allowlist in
+    /// `handle_directive`.
+    preprocessed: bool,
+
     /// Attribution established by the most recent `# N "file" flags`
     /// linemarker, if any. See [`LineMarker`].
     linemarker: Option<LineMarker>,
@@ -730,6 +735,7 @@ impl<'a> Preprocessor<'a> {
             lexer_mode: LexerMode::C,
             line_offset: 0,
             line_file_override: None,
+            preprocessed: false,
             linemarker: None,
             physical_line: 0,
             physical_stream: 0,
@@ -1071,6 +1077,17 @@ impl<'a> Preprocessor<'a> {
                     if self.is_skipping() {
                         continue;
                     }
+                    // In an already-preprocessed file every macro has already
+                    // been expanded, so nothing here is a macro name: not a
+                    // `#define` recorded above (GCC records them for debug
+                    // info but never substitutes), not a `-D` from the command
+                    // line, and not a predefined `__LINE__` or `__STDC__`.
+                    // `_Pragma` is a phase-4 operator and is likewise spent --
+                    // `c17 -E` has already lowered it to a `#pragma` line.
+                    if self.preprocessed {
+                        output.push(token);
+                        continue;
+                    }
                     // Check for macro expansion
                     if let TokenValue::Ident(id) = &token.value {
                         if let Some(name) = idents.get_opt(*id) {
@@ -1254,6 +1271,44 @@ impl<'a> Preprocessor<'a> {
                 return;
             }
         };
+
+        // POSIX 87982-87983: the processing `c17 -E` already performed shall
+        // not be repeated. That is not a wholesale skip of translation phase
+        // 4 -- GCC keeps a five-directive allowlist (libcpp's `IN_I` set), and
+        // `#pragma pack` in particular has to keep working or a preprocessed
+        // file silently loses its layout. Everything outside the allowlist
+        // leaves the `#` as a stray token, which is what GCC diagnoses.
+        if self.preprocessed
+            && !matches!(
+                directive_id,
+                crate::kw::DEFINE
+                    | crate::kw::UNDEF
+                    | crate::kw::PRAGMA
+                    | crate::kw::PP_IDENT
+                    | crate::kw::SCCS
+            )
+            && matches!(
+                directive_id,
+                crate::kw::IFDEF
+                    | crate::kw::IFNDEF
+                    | crate::kw::IF
+                    | crate::kw::ELIF
+                    | crate::kw::ELSE
+                    | crate::kw::ENDIF
+                    | crate::kw::INCLUDE
+                    | crate::kw::INCLUDE_NEXT
+                    | crate::kw::PP_ERROR
+                    | crate::kw::WARNING
+                    | crate::kw::LINE
+            )
+        {
+            // One diagnostic naming the cause, rather than GCC's cascade of
+            // follow-on parse errors from feeding the rest of the line to the
+            // parser.
+            diag::error(hash_token.pos, "stray '#' in program");
+            self.skip_to_eol(iter);
+            return;
+        }
 
         match directive_id {
             crate::kw::DEFINE => self.handle_define(iter, idents),
@@ -4644,6 +4699,9 @@ pub struct PreprocessConfig<'a> {
     pub no_builtin_inc: bool,
     /// If true, apply translation phase 1 trigraph replacement (--trigraphs).
     pub trigraphs: bool,
+    /// If true, the input is a `.i` operand -- already the output of `c17 -E`
+    /// -- and the processing that produced it must not be repeated.
+    pub preprocessed: bool,
 }
 
 /// Preprocess tokens with command-line defines and undefines
@@ -4678,6 +4736,7 @@ pub fn preprocess_with_defines(
         pp.use_builtin_headers = false;
     }
     pp.trigraphs = config.trigraphs;
+    pp.preprocessed = config.preprocessed;
 
     // Add -I include paths
     for path in config.include_paths {

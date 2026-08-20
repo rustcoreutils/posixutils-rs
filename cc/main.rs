@@ -486,8 +486,14 @@ fn process_file(
         path
     };
 
+    // POSIX 87981-87983: a `.i` operand is the output of `c17 -E`, and the
+    // processing that produced it "shall not be repeated when the file is
+    // compiled". Phases 1 and 2 are part of that processing, so neither runs
+    // here; phase 4 is narrowed to GCC's allowlist inside the preprocessor.
+    let preprocessed = is_preprocessed_file(path);
+
     // Translation phase 1, before anything else looks at the bytes.
-    let buffer = if args.trigraphs {
+    let buffer = if args.trigraphs && !preprocessed {
         replace_trigraphs(&buffer).into_owned()
     } else {
         buffer
@@ -502,6 +508,10 @@ fn process_file(
     // Tokenize
     let tokens = {
         let mut tokenizer = Tokenizer::new(&buffer, stream_id, &mut strings);
+        // Translation phase 2 likewise already ran.
+        if preprocessed {
+            tokenizer = tokenizer.without_splicing();
+        }
         tokenizer.tokenize()
     };
 
@@ -548,6 +558,7 @@ fn process_file(
             no_std_inc: args.no_std_inc,
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
+            preprocessed,
         },
     );
 
@@ -1259,6 +1270,14 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
 /// Check if a file is a C source file (by extension)
 fn is_source_file(path: &str) -> bool {
     path.ends_with(".c") || path.ends_with(".i") || path == "-"
+}
+
+/// A `.i` operand is already the output of `c17 -E` (POSIX 87981).
+///
+/// Standard input is not one of these: like GCC, c17 reads `-` as ordinary
+/// C source, there being no suffix to say otherwise.
+fn is_preprocessed_file(path: &str) -> bool {
+    path.ends_with(".i")
 }
 
 /// Check if a file is an assembly file (by extension)

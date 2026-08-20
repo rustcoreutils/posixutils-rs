@@ -2,21 +2,25 @@
 
 ## Table of Contents
 
-- [Deferred indefinitely](#deferred-indefinitely)
+- [Settled — do not re-open](#settled--do-not-re-open)
 - [Technical Debt](#technical-debt)
 - [Known Divergences](#known-divergences)
+- [GNU extensions not implemented](#gnu-extensions-not-implemented)
 - [Future Features](#future-features)
 - [Optimization Passes](#optimization-passes)
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
 - [External Test Suites](#external-test-suites)
 
-## Deferred indefinitely
+## Settled — do not re-open
 
-These are open by maintainer decision (2026-08-19), not by oversight. Neither
-is scheduled; both are recorded so a future reader knows the reasoning rather
-than rediscovering it.
+Recorded so a future reader knows the reasoning rather than rediscovering it,
+and so neither is raised again as a question.
 
 ### `_FORTIFY_SOURCE` compiles but checks nothing
+
+Not a conformance item. `_FORTIFY_SOURCE`, `__builtin_object_size` and the
+`_chk` family appear nowhere in POSIX.1-2024 — this is a security-hardening
+gap in a glibc extension, deferred by decision rather than scheduled.
 
 Peeling this apart one layer at a time has been the only way to see it: each
 fix exposes the next blocker, and three of the layers are invisible until the
@@ -48,15 +52,18 @@ implemented and reverted three times, most recently after measuring the
 duplicate-symbol failure that turned out to be layer 5. `__OPTIMIZE__` and
 layer 6 must land together.
 
-### Trigraphs are off by default
+### Trigraphs are off by default — decided, not deferred
+
+**Settled. Not a to-do, not an open conformance item, not awaiting a
+decision.** It is recorded here only so it stops being rediscovered.
 
 POSIX APPLICATION USAGE 88224 says outright that a compiler doing this is "not
-conforming to POSIX.1-2024". `--trigraphs` implements translation phase 1
+conforming to POSIX.1-2024", which is why it keeps reading like an open item to
+anyone coming to the spec fresh. `--trigraphs` implements translation phase 1
 exactly. The default is off because replacement reaches inside string
 literals — `"What??!"` becomes `"What|"` — and `??` is far likelier to appear
-by accident than by intent; gcc and clang default them off for the same
-reason. Flipping the default and offering an opt-out is the whole fix, and is
-a decision rather than a piece of work. See #C55 in `cc/audit.md`.
+by accident than by intent; gcc and clang default them off for the same reason.
+See #C55 in `cc/audit.md`.
 
 ## Technical Debt
 
@@ -93,9 +100,12 @@ does or claims.
 _The `__int128` and `long double` argument-passing bugs, the universal-character-name
 encoding, and the silently-dropped attributes used to belong here; all are closed, see
 #C42, #C43, #C57, #C58 and #C59 in `cc/audit.md`. What remains of that family: `used` is
-satisfied only because nothing is pruned, `vector_size` is unimplemented and refused,
-while `mode` is implemented as of #C85 except for the vector modes, which warn, and #C38 -- an inlined stacked float HFA on aarch64 --
-is fixed, this note having outlived it (re-probed 2026-08-18 at -O0 and -O2 under qemu)._
+satisfied only because nothing is pruned -- re-probed 2026-08-20, an unreferenced static
+survives `-O2` whether or not it is marked. `vector_size` is implemented as storage and
+`mode` as of #C85, the latter also binding to a struct member's and a parameter's
+declarator as of #C149; only the vector modes still warn. #C38 -- an inlined stacked
+float HFA on aarch64 -- is fixed, this note having outlived it (re-probed 2026-08-18 at
+-O0 and -O2 under qemu)._
 
 _Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
 -- 21 constraint violations and 14 accept-side controls -- agrees with
@@ -115,6 +125,29 @@ byte, as gcc does on both targets._
 | Area | Divergence |
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
+
+## GNU extensions not implemented
+
+Ranked by how often each appears in real source, counted over the trees in
+`~/tmp/repo` (2026-08-20). A project fails to build if *any* file it compiles
+uses one, so even a small count blocks.
+
+| Extension | linux | mesa | cpython | abc | Note |
+|-----------|------:|-----:|--------:|----:|------|
+| SIMD intrinsic headers (`immintrin.h` …) | 2 | 18 | 2 | 1 | Not bundled; needs vector arithmetic underneath |
+| `__sync_*` builtins | 116 | 8 | — | 1 | The older atomic spelling |
+| `__atomic_*` builtins | 53 | 5 | 3 | 1 | C11 `<stdatomic.h>` is complete; these are the GCC spellings |
+| `__auto_type` | 5 | 1 | — | — | |
+| nested functions / `__label__` | 17 | — | — | — | |
+
+Vector *arithmetic* belongs here too. `vector_size` gives a type a vector's
+storage, which is what makes glibc's `<link.h>` compile, but element-wise `+`
+and friends need a vector type in the IR and in both backends.
+
+Implemented since this list was first measured: case ranges, designated
+initializer ranges, and computed goto — the three that led it. CPython's
+configure now detects computed gotos, so it builds its indirect-branch
+interpreter rather than the switch fallback.
 
 ## Future Features
 

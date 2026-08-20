@@ -41,6 +41,8 @@ Key source files:
 | `parse/expression.rs` | Expression parsing and constant-expression evaluation |
 | `parse/ast.rs` | AST node definitions |
 | `types.rs` | C type system |
+| `constexpr.rs` | Integer constant-expression folding, shared by the parser and the linearizer |
+| `float.rs` | Wide floating-point literals and target-width conversion |
 | `strings.rs` | String interning (`StringId`); pre-interns keywords at startup |
 | `kw.rs` | Pre-interned keyword constants and tag-based classification |
 | `symbol.rs` | Symbol table with scope management |
@@ -49,10 +51,17 @@ Key source files:
 | `include/` | Bundled freestanding headers (`stdarg.h`, `stdatomic.h`, `float.h`, …) |
 | `diag.rs` | Diagnostics, source-stream tracking, error/warning counts |
 | `rtlib.rs` | Runtime library helpers (libgcc / compiler-rt selection) |
+| `linkargs.rs` | Link-line construction, preserving the order `-L`/`-l`/operands were given in |
+| `ppargs.rs` | `-D`/`-U`/`-I` ordering for the tools that need it |
+| `tools.rs` | Shared exit-status handling for `cflow`/`ctags`/`cxref` |
 | `os/` | OS-specific knobs (linux, macos, freebsd) |
 | `abi/` | Per-ABI classification: `sysv_amd64.rs`, `aapcs64.rs` |
 | `ir/mod.rs` | IR definitions (opcodes, pseudos, instructions, functions). See `ir/README.md`. |
-| `ir/linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`) | AST → IR conversion, SSA construction |
+| `ir/linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`, `_atomic.rs`) | AST → IR conversion, SSA construction |
+| `ir/mem2reg.rs` | Promotion of address-free locals to registers |
+| `ir/tls.rs` | Thread-local access expansion (dynamic model) |
+| `ir/validate.rs` | IR invariant checks |
+| `ir/mach_o_dtors.rs` | Mach-O destructor registration |
 | `ir/ssa.rs` | φ-node insertion |
 | `ir/dominate.rs` | Dominator tree and dominance frontiers (Cooper) |
 | `ir/dce.rs` | Dead code elimination |
@@ -104,7 +113,15 @@ EOF
 Supported:
 - The C17 language, C99 baseline and all C11 additions alike
 - C11 additions: `_Generic`, `_Atomic` / `<stdatomic.h>` (including access through ordinary operators), `<tgmath.h>`, `_Noreturn`, `_Static_assert`, `_Alignas` / `_Alignof`, `_Thread_local` (Local-Exec and Initial-Exec models), anonymous struct/union members, Unicode literals
-- GCC-compatible inline assembly: extended asm with constraints, clobbers, named operands, matching constraints, `asm goto` with labels
+- GCC-compatible inline assembly: extended asm with constraints, clobbers,
+  named operands, matching constraints, `asm goto` with labels, SSE (`x`) and
+  x87 (`t`/`u`) operand classes on x86-64, and vector (`w`) operands with the
+  `b`/`h`/`s`/`d`/`q` width modifiers on AArch64
+- GNU extensions real code depends on: case ranges (`case 1 ... 9:`),
+  designated-initializer ranges (`[0 ... 3] = v`), computed goto (`&&label`
+  and `goto *p`), statement expressions, `typeof`, `__attribute__` including
+  `mode` and `vector_size`, `__builtin_*`, and case-range-style `...` spacing
+  matching gcc's (`case 1...9:` is one pp-number and is rejected there too)
 - Variably modified types everywhere C17 admits them, including a `typedef` of
   one (6.7.7), whose extents are evaluated at the typedef rather than at each use
 - `-fverbose-asm`, annotating each instruction with the source names it came from
@@ -114,6 +131,14 @@ Supported:
 
 Not yet implemented (features we want to add):
 - assembly peephole optimizations
+- vector *arithmetic*. `vector_size` gives a type a vector's storage — the size
+  and alignment GCC gives it, which is what glibc's `<link.h>` needs — but
+  element-wise `+`, `*` and the rest need a vector type in the IR and in both
+  backends, so they are diagnosed rather than silently computed on one element
+- the GCC atomic builtins `__sync_*` and `__atomic_*`. C11 `<stdatomic.h>` is
+  complete; these are the older spellings, and projects use them directly
+- SIMD intrinsic headers (`immintrin.h` and friends) are not bundled
+- `__auto_type`, nested functions, and `__label__`
 
 Will not implement:
 - `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,

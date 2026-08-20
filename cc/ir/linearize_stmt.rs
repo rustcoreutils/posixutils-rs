@@ -234,7 +234,28 @@ impl<'a> super::linearize::Linearizer<'a> {
                 if !declarator.vla_sizes.is_empty() && self.types.kind(typ) == TypeKind::Array {
                     let name = self.symbol_name(declarator.symbol);
                     let (dims, _elem) = self.record_vm_extents(typ, &declarator.vla_sizes, &name);
-                    self.vm_typedef_dims.insert(declarator.symbol, dims);
+                    // Keep only the extents that were *variable*.
+                    //
+                    // `record_vm_extents` reports one entry per array level,
+                    // constant levels included, but the parser mints an
+                    // `ExprKind::VmTypedefExtent(sym, k)` per *size
+                    // expression* -- one per variable level, since a constant
+                    // one has no expression to evaluate. So `k` counts
+                    // variable extents and the vector counted all of them, and
+                    // the two disagreed the moment a constant extent appeared:
+                    // `typedef int T[2][n]; T a;` read `dims[0]`, found the
+                    // constant 2, and gave `a` the extent 2 instead of `n` --
+                    // `sizeof a` 16 against gcc's 80, with every write past
+                    // `a[0][3]` landing outside the object.
+                    //
+                    // Filtering here rather than widening the index keeps the
+                    // meaning the parser already gives it: the k-th variable
+                    // extent of this typedef.
+                    let variable: Vec<VmDim> = dims
+                        .into_iter()
+                        .filter(|d| matches!(d, VmDim::Sym(_)))
+                        .collect();
+                    self.vm_typedef_dims.insert(declarator.symbol, variable);
                 }
                 continue;
             }

@@ -669,6 +669,20 @@ impl<'a> Parser<'a> {
             ));
         }
 
+        // GNU label address: `&&label`, of type `void *`. `&&` is one token,
+        // so this has to be tested before the unary `&` below, which
+        // deliberately excludes it.
+        if self.is_special_token(SpecialToken::LogicalAnd) {
+            let op_pos = self.current_pos();
+            self.advance();
+            let name = self.expect_identifier()?;
+            return Ok(Self::typed_expr(
+                ExprKind::LabelAddr(name),
+                self.types.void_ptr_id,
+                op_pos,
+            ));
+        }
+
         if self.is_special(b'&') && !self.is_special_token(SpecialToken::LogicalAnd) {
             let op_pos = self.current_pos();
             self.advance();

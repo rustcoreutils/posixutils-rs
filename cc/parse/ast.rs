@@ -355,6 +355,13 @@ pub enum ExprKind {
     /// Comma expression: expr1, expr2
     Comma(Vec<Expr>),
 
+    /// GNU label address: `&&label`, of type `void *`.
+    ///
+    /// The label need not be declared yet -- taking its address before the
+    /// labelled statement is the usual shape -- so this holds the name and is
+    /// resolved when the function is linearized.
+    LabelAddr(StringId),
+
     /// Initializer list: {1, 2, 3} or {.x = 1, [0] = 2}
     InitList {
         elements: Vec<InitElement>,
@@ -1080,6 +1087,11 @@ pub enum Stmt {
 
     /// Goto statement: goto label;
     Goto { name: StringId, pos: Position },
+
+    /// GNU computed goto: `goto *expr;`. The operand is a label address
+    /// produced by [`ExprKind::LabelAddr`], though C says only that it is a
+    /// `void *`, so any pointer expression parses here.
+    GotoIndirect { target: Expr, pos: Position },
 
     /// Labeled statement: label: stmt
     Label {

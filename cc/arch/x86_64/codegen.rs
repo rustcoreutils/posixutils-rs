@@ -1827,6 +1827,16 @@ impl X86_64CodeGen {
 
             Opcode::Cbr => if self.emit_cbr(insn, types) {},
 
+            // GNU computed goto: jump through the address in src[0]. The
+            // CFG edges to every address-taken label are recorded on the
+            // block, so liveness and DCE already see the real successors.
+            Opcode::IndirectBr => {
+                if let Some(&val) = insn.src.first() {
+                    self.emit_move(val, Reg::R10, 64);
+                    self.push_lir(X86Inst::JmpIndirect { reg: Reg::R10 });
+                }
+            }
+
             Opcode::Switch => {
                 if let Some(&val) = insn.src.first() {
                     // Derive comparison size from type to handle long/pointer switches

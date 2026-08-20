@@ -801,3 +801,123 @@ int main(void)
     assert_eq!(compile_and_run("case_ranges", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("case_ranges_opt", code), 0);
 }
+
+/// GNU computed goto: the label address `&&label` and the indirect `goto *p`.
+///
+/// The reason the extension exists is interpreter dispatch, so that shape is
+/// the centrepiece here. `&&label` needs no opcode of its own — every basic
+/// block already emits an assembly label, and both backends already lower a
+/// leading-`.` symbol to a pc-relative address — but the branch does: the
+/// reachable blocks are not derivable from the instruction, so the CFG edges
+/// to every address-taken label are recorded on the block, exactly as `asm
+/// goto` does. Without them DCE deletes the targets.
+#[test]
+fn c89_computed_goto() {
+    let code = r#"
+/* A bytecode interpreter's dispatch loop: the shape the extension is for.
+   The table is `static`, so the label addresses go through the data-image
+   path rather than through runtime stores. */
+static int run(const int *code, int n)
+{
+    static void *op[] = { &&ADD, &&MUL, &&END };
+    int acc = 1, i = 0;
+    goto *op[code[i]];
+ADD: acc += 2; if (++i < n) goto *op[code[i]]; return acc;
+MUL: acc *= 3; if (++i < n) goto *op[code[i]]; return acc;
+END: return acc;
+}
+
+/* An automatic table: the runtime-store path. */
+static int pick(int i)
+{
+    void *t[] = { &&A, &&B, &&C };
+    goto *t[i];
+A: return 10;
+B: return 20;
+C: return 30;
+}
+
+/* The address may be taken before the label is seen. */
+static int forward(void)
+{
+    void *p = &&L;
+    goto *p;
+    return 1;
+L:  return 0;
+}
+
+/* A label address outlives the block it was taken in. */
+static int across_scope(void)
+{
+    void *p;
+    { p = &&L; }
+    goto *p;
+L:  return 0;
+}
+
+/* And it is an ordinary value: it can live in a struct. */
+static int in_struct(void)
+{
+    struct { void *p; int n; } s = { &&L, 7 };
+    if (s.n != 7) return 1;
+    goto *s.p;
+L:  return 0;
+}
+
+int main(void)
+{
+    int prog[] = { 0, 1, 0, 2 };   /* acc = ((1+2)*3)+2 = 11 */
+    if (run(prog, 4) != 11) return 1;
+
+    int prog2[] = { 1, 1, 2 };     /* acc = ((1*3)*3) = 9 */
+    if (run(prog2, 3) != 9) return 2;
+
+    if (pick(0) != 10 || pick(1) != 20 || pick(2) != 30) return 3;
+    if (forward()) return 4;
+    if (across_scope()) return 5;
+    if (in_struct()) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("computed_goto", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("computed_goto_opt", code), 0);
+}
+
+/// A value live across an indirect branch must survive it.
+///
+/// The companion to `codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge`,
+/// and the same hazard: liveness is computed from the block's recorded
+/// successors, so if the edges to the address-taken labels were missing, a
+/// pseudo live only along one of them would look dead and its register could
+/// be reused before the branch.
+#[test]
+fn c89_computed_goto_value_survives_the_edge() {
+    let code = r#"
+static int dispatch(int which, int a, int b)
+{
+    void *t[] = { &&X, &&Y };
+    /* `a` and `b` are computed here and used only after the branch, so they
+       are live across it along one edge each. */
+    int sum = a + b;
+    int prod = a * b;
+    goto *t[which];
+X:  return sum;
+Y:  return prod;
+}
+
+int main(void)
+{
+    if (dispatch(0, 3, 4) != 7) return 1;
+    if (dispatch(1, 3, 4) != 12) return 2;
+    /* Enough live values to force spilling around the branch. */
+    if (dispatch(0, 100, 200) != 300) return 3;
+    if (dispatch(1, 100, 200) != 20000) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("computed_goto_liveness", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("computed_goto_liveness_opt", code),
+        0
+    );
+}

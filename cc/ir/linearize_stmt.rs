@@ -165,6 +165,32 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
+            // GNU computed goto. The target address is not statically known,
+            // so every label whose address was taken in this function is
+            // linked as a successor -- the same conservative edge set `asm
+            // goto` uses, and the reason DCE does not delete those blocks.
+            Stmt::GotoIndirect { target, pos } => {
+                // 6.5.3.2: the operand of a computed goto is an address.
+                // Anything else -- `goto *3;` -- would branch to a number.
+                let target_typ = self.expr_type(target);
+                if !self.types.is_scalar(target_typ) || self.types.is_float(target_typ) {
+                    let named = self.types.format_type(target_typ, Some(self.strings));
+                    crate::diag::error_args(
+                        *pos,
+                        "computed goto must be a pointer, not '{0}'",
+                        &[&named],
+                    );
+                }
+                let addr = self.linearize_expr(target);
+                self.emit(Instruction::indirect_br(addr));
+                if let Some(current) = self.current_bb {
+                    for bb in self.addr_taken_labels.clone() {
+                        self.link_bb(current, bb);
+                    }
+                }
+                self.current_bb = None;
+            }
+
             Stmt::Goto { name: label, .. } => {
                 let label_str = self.str(*label).to_string();
                 let target = self.get_or_create_label(&label_str);

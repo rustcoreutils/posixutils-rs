@@ -404,6 +404,9 @@ pub enum X86Inst {
     /// JMP - Unconditional jump
     Jmp { target: Label },
 
+    /// JMP *reg - indirect jump through a register (GNU computed goto)
+    JmpIndirect { reg: Reg },
+
     /// Jcc - Conditional jump
     Jcc { cc: CondCode, target: Label },
 
@@ -1012,6 +1015,9 @@ impl EmitAsm for X86Inst {
             // Control Flow
             X86Inst::Jmp { target: lbl } => {
                 let _ = writeln!(out, "    jmp {}", lbl.name());
+            }
+            X86Inst::JmpIndirect { reg } => {
+                let _ = writeln!(out, "    jmp *{}", reg.name64());
             }
 
             X86Inst::Jcc { cc, target: lbl } => {

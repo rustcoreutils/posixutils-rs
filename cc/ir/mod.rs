@@ -104,6 +104,12 @@ pub enum Opcode {
     Br,     // Unconditional branch
     Cbr,    // Conditional branch
     Switch, // Multi-way branch
+    /// GNU computed goto: branch to the address in `src[0]`.
+    ///
+    /// The reachable blocks are not derivable from the instruction -- any
+    /// label whose address was taken in this function may be the target -- so
+    /// the CFG edges are recorded on the block, exactly as `asm goto` does.
+    IndirectBr,
 
     // Integer arithmetic binary ops
     Add,
@@ -271,6 +277,7 @@ impl Opcode {
                 | Opcode::Br
                 | Opcode::Cbr
                 | Opcode::Switch
+                | Opcode::IndirectBr
                 | Opcode::Unreachable
                 | Opcode::Longjmp
         )
@@ -285,6 +292,7 @@ impl Opcode {
                 | Opcode::Br
                 | Opcode::Cbr
                 | Opcode::Switch
+                | Opcode::IndirectBr
                 | Opcode::Unreachable
                 | Opcode::Store
                 | Opcode::Call
@@ -341,6 +349,7 @@ impl Opcode {
             Opcode::Br => "br",
             Opcode::Cbr => "cbr",
             Opcode::Switch => "switch",
+            Opcode::IndirectBr => "indirectbr",
             Opcode::Add => "add",
             Opcode::Sub => "sub",
             Opcode::Mul => "mul",
@@ -996,6 +1005,11 @@ impl Instruction {
     }
 
     /// Create a switch instruction
+    /// GNU computed goto: branch to the address held in `target`.
+    pub fn indirect_br(target: PseudoId) -> Self {
+        Self::new(Opcode::IndirectBr).with_src(target)
+    }
+
     pub fn switch_insn(
         value: PseudoId,
         cases: Vec<(i64, i64, BasicBlockId)>,

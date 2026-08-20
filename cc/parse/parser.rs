@@ -1864,6 +1864,13 @@ impl Parser<'_> {
                     crate::kw::GOTO => {
                         let pos = self.current_pos();
                         self.advance();
+                        // GNU computed goto: `goto *expr;`
+                        if self.is_special(b'*') {
+                            self.advance();
+                            let target = self.parse_expression()?;
+                            self.expect_special(b';')?;
+                            return Ok(Stmt::GotoIndirect { target, pos });
+                        }
                         let name = self.expect_identifier()?;
                         self.expect_special(b';')?;
                         return Ok(Stmt::Goto { name, pos });

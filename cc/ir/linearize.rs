@@ -232,6 +232,12 @@ pub struct Linearizer<'a> {
     pub(crate) two_reg_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
     pub(crate) current_func_name: String,
+
+    /// Blocks whose address is taken by `&&label` in the function being
+    /// linearized. Every indirect `goto` may reach any of them, so each is
+    /// linked as a successor -- the CFG is explicit `children`/`parents`, and
+    /// without the edges DCE would delete blocks nothing appears to reach.
+    pub(crate) addr_taken_labels: Vec<BasicBlockId>,
     /// Counter for generating unique static local names
     pub(crate) static_local_counter: u32,
     /// Counter for generating unique compound literal names (for file-scope compound literals)
@@ -284,6 +290,7 @@ impl<'a> Linearizer<'a> {
             struct_return_size: 0,
             two_reg_return_type: None,
             current_func_name: String::new(),
+            addr_taken_labels: Vec::new(),
             static_local_counter: 0,
             compound_literal_counter: 0,
             static_locals: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
@@ -739,6 +746,7 @@ impl<'a> Linearizer<'a> {
         self.struct_return_size = 0;
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
+        self.addr_taken_labels.clear();
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
@@ -1398,6 +1406,8 @@ impl<'a> Linearizer<'a> {
             // Reads a hidden local the typedef already stored: no side
             // effect, and re-reading it is what makes the extent stable.
             ExprKind::VmTypedefExtent(..) => true,
+            // A label's address is a constant of the function.
+            ExprKind::LabelAddr(_) => true,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -4730,6 +4740,27 @@ impl<'a> Linearizer<'a> {
         }
 
         match &expr.kind {
+            // GNU `&&label`. The block already emits an assembly label of
+            // exactly this spelling -- `Label::name()` -- and both backends
+            // already lower a leading-`.` global to a pc-relative address, so
+            // this needs no opcode of its own.
+            ExprKind::LabelAddr(name) => {
+                let label = self.str(*name).to_string();
+                let bb = self.get_or_create_label(&label);
+                let sym = format!(".L{}_{}", self.current_func_name, bb.0);
+                let sym_pseudo = self.alloc_pseudo();
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(Pseudo::sym(sym_pseudo, sym));
+                }
+                // The label is a branch target for every indirect goto in this
+                // function, and the CFG has to say so or DCE deletes the block.
+                self.addr_taken_labels.push(bb);
+                let dst = self.alloc_pseudo();
+                let void_ptr = self.types.void_ptr_id;
+                self.emit(Instruction::sym_addr(dst, sym_pseudo, void_ptr));
+                dst
+            }
+
             // One extent of a variably modified `typedef`, evaluated when the
             // typedef's declaration was reached and stored in a hidden local
             // since (C17 6.7.7p3). Reading it back here is what keeps

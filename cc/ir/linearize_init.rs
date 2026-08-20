@@ -202,6 +202,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             ExprKind::FloatLit(v) => Initializer::Float(*v),
             ExprKind::CharLit(c) => Initializer::Int(*c as i128),
 
+            // GNU `&&label` in a static initializer -- `static void *t[] =
+            // {&&a, &&b};`, which is how an interpreter builds its dispatch
+            // table. The label is a real assembler symbol, so this is the same
+            // shape as a string-literal reference.
+            ExprKind::LabelAddr(name) => {
+                let label = self.str(*name).to_string();
+                let bb = self.get_or_create_label(&label);
+                self.addr_taken_labels.push(bb);
+                Initializer::SymAddr(format!(".L{}_{}", self.current_func_name, bb.0))
+            }
+
             // String literal - for arrays, store as String; for pointers, create label reference
             ExprKind::StringLit(s) => {
                 let type_kind = self.types.kind(typ);

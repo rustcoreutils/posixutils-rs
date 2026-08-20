@@ -93,6 +93,14 @@ pub struct InlineCandidate {
     pub uses_varargs: bool,
     /// Whether function uses alloca (dynamic stack)
     pub uses_alloca: bool,
+    /// Whether the function takes a label's address (`&&label`).
+    ///
+    /// Such a function cannot be inlined: the address is a symbol naming a
+    /// block in *this* function -- `.L{fn}_{bb}` -- and inlining renumbers the
+    /// blocks into the caller, leaving the reference pointing at a name
+    /// nothing defines. That linked, with a text relocation against an
+    /// undefined local label, and produced a non-executable binary.
+    pub takes_label_addr: bool,
     /// Number of times this function is called in the module
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
@@ -151,6 +159,26 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
                 Opcode::Alloca => {
                     candidate.uses_alloca = true;
                 }
+                // A label address is a `SymAddr` on a symbol named for a
+                // block of *this* function. An indirect branch is the usual
+                // reason to take one, but a function that merely returns one
+                // has the same problem.
+                Opcode::IndirectBr => {
+                    candidate.takes_label_addr = true;
+                }
+                // A label address is a `SymAddr` on a symbol named for a block
+                // of *this* function. An indirect branch is the usual reason to
+                // take one, but a function that merely returns one has the same
+                // problem.
+                Opcode::SymAddr
+                    if insn
+                        .src
+                        .first()
+                        .and_then(|s| func.sym_name_of(*s))
+                        .is_some_and(|n| n.starts_with(".L")) =>
+                {
+                    candidate.takes_label_addr = true;
+                }
                 Opcode::Call => {
                     if let Some(callee) = &insn.func_name {
                         if callee == &func.name {
@@ -185,7 +213,11 @@ fn should_inline(
     caller_is_recursive: bool,
 ) -> bool {
     // Never inline if disqualifying conditions
-    if candidate.uses_varargs || candidate.is_recursive || candidate.uses_alloca {
+    if candidate.uses_varargs
+        || candidate.is_recursive
+        || candidate.uses_alloca
+        || candidate.takes_label_addr
+    {
         return false;
     }
 
@@ -1454,6 +1486,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,
@@ -1472,6 +1505,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: true,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,
@@ -1490,6 +1524,7 @@ mod tests {
             is_recursive: true,
             uses_varargs: false,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,
@@ -1508,6 +1543,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,
@@ -1526,6 +1562,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,

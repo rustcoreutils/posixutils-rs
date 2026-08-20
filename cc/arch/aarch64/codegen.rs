@@ -2135,6 +2135,21 @@ impl Aarch64CodeGen {
 
             Opcode::Cbr => if self.emit_cbr(insn) {},
 
+            // GNU computed goto: branch through the address in src[0]. The
+
+            // CFG edges to every address-taken label are recorded on the
+
+            // block, so liveness and DCE already see the real successors.
+            Opcode::IndirectBr => {
+                if let Some(&val) = insn.src.first() {
+                    let (scratch, _, _) = Reg::scratch_regs();
+
+                    self.emit_move(val, scratch, 64);
+
+                    self.push_lir(Aarch64Inst::BrReg { reg: scratch });
+                }
+            }
+
             Opcode::Switch => {
                 self.emit_switch(insn, types);
             }

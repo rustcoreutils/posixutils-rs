@@ -477,6 +477,11 @@ pub enum Aarch64Inst {
         target: Label,
     },
 
+    /// BR - indirect branch through a register (GNU computed goto)
+    BrReg {
+        reg: Reg,
+    },
+
     /// B.cond - Conditional branch
     BCond {
         cond: CondCode,
@@ -1186,6 +1191,9 @@ impl EmitAsm for Aarch64Inst {
             }
             Aarch64Inst::Blr { reg } => {
                 let _ = writeln!(out, "    blr {}", reg.name64());
+            }
+            Aarch64Inst::BrReg { reg } => {
+                let _ = writeln!(out, "    br {}", reg.name64());
             }
             Aarch64Inst::AdrpGottpoff { sym, dst } => {
                 let sym_name = sym.format_for_target(target);

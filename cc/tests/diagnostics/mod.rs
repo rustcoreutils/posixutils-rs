@@ -1846,19 +1846,15 @@ fn diagnostics_same_tag_in_another_scope_is_another_type() {
 
 /// An attribute the compiler does not implement used to be dropped in total
 /// silence. That is survivable for one that only hints, and is not for one
-/// that changes what the type *is*: `__attribute__((vector_size(16)))` left
-/// the type scalar and every operation on it scalar, so the program computed
-/// on one element instead of all of them, with nothing said.
+/// that changes what the type *is*.
 ///
-/// So: an error for `vector_size`, which cannot be ignored correctly and which
-/// no C system header uses; a warning for everything else unrecognised.
+/// `vector_size` used to be rejected outright on the reasoning that no C
+/// system header uses it. glibc's `<link.h>` does -- `La_x86_64_xmm` and its
+/// siblings -- so the rejection made that header uncompilable. It is
+/// implemented as storage now (see `c99_vector_size_has_a_vector_s_storage`);
+/// what remains here is the warning for everything else unrecognised.
 #[test]
 fn diagnostics_unimplemented_attributes_are_reported() {
-    compile_expect_error(
-        "vector_size_unimplemented",
-        "typedef int V __attribute__((vector_size(16)));\nint main(void){ return 0; }\n",
-        "'vector_size' attribute is not implemented",
-    );
     compile_expect_warning(
         "unknown_attribute_warns",
         "typedef int T __attribute__((totally_made_up));\nint main(void){ return 0; }\n",

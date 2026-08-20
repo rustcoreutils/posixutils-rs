@@ -1533,3 +1533,90 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("mode_binds_to_declarator", code, &[]), 0);
 }
+
+/// `__attribute__((vector_size(N)))` gives a type a vector's storage.
+///
+/// It used to be rejected outright, on the reasoning that ignoring it would
+/// silently leave the type scalar and that no C system header uses it. The
+/// first half is right; the second is not. glibc's `<link.h>` declares
+/// `La_x86_64_xmm`, `La_x86_64_ymm` and `La_x86_64_zmm` with it, so the
+/// rejection made that header -- and anything including it -- uncompilable.
+///
+/// c17 gives such a type the size and alignment a vector has, modelled as an
+/// array of its elements, which is exactly the layout GCC produces. What it
+/// deliberately does not give is element-wise arithmetic: that needs a real
+/// vector type in the IR and in both backends. An array does not accept `+`,
+/// so the gap surfaces as a diagnostic where the arithmetic is written rather
+/// than as a computation that silently runs on one element -- which is the
+/// failure the outright rejection was guarding against.
+#[test]
+fn c99_vector_size_has_a_vector_s_storage() {
+    let code = r#"
+typedef float V4 __attribute__((vector_size(16)));
+typedef float V8 __attribute__((vector_size(32)));
+typedef double D8 __attribute__((vector_size(64)));
+typedef short S8 __attribute__((vector_size(16)));
+
+/* A vector aligns to its width rounded to a power of two, capped at 16 --
+   GCC's default on both targets. So a 32-byte vector aligns to 16, not 32. */
+_Static_assert(sizeof(V4) == 16 && _Alignof(V4) == 16, "V4");
+_Static_assert(sizeof(V8) == 32 && _Alignof(V8) == 16, "V8 caps at 16");
+_Static_assert(sizeof(D8) == 64 && _Alignof(D8) == 16, "D8 caps at 16");
+_Static_assert(sizeof(S8) == 16 && _Alignof(S8) == 16, "S8");
+
+/* Below the cap the alignment follows the width. */
+typedef float V2 __attribute__((vector_size(8)));
+typedef float V1 __attribute__((vector_size(4)));
+_Static_assert(sizeof(V2) == 8 && _Alignof(V2) == 8, "V2");
+_Static_assert(sizeof(V1) == 4 && _Alignof(V1) == 4, "V1");
+
+/* ...unless the source says otherwise, which is what <link.h> writes. */
+typedef float A8 __attribute__((vector_size(32), aligned(16)));
+_Static_assert(sizeof(A8) == 32, "A8 size");
+_Static_assert(_Alignof(A8) == 16, "an explicit alignment wins over the width");
+
+/* The <link.h> shape: vectors as union and struct members, never operated on. */
+typedef union { V8 ymm[2]; D8 zmm[1]; V4 xmm[4]; } Vec __attribute__((aligned(16)));
+_Static_assert(sizeof(Vec) == 64, "union of vectors");
+_Static_assert(_Alignof(Vec) == 16, "union alignment");
+
+struct Regs { unsigned long a; Vec v[8]; unsigned long b; };
+_Static_assert(_Alignof(struct Regs) == 16, "struct alignment");
+_Static_assert(sizeof(struct Regs) == 544, "struct layout matches gcc");
+
+int main(void)
+{
+    Vec v;
+    /* Element access through the array view still works. */
+    v.xmm[0][0] = 1.5f;
+    v.xmm[3][3] = 2.5f;
+    if (v.xmm[0][0] != 1.5f) return 1;
+    if (v.xmm[3][3] != 2.5f) return 2;
+    if (sizeof v.ymm != 64) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("vector_size_storage", code, &[]), 0);
+}
+
+/// The header that made the rejection a build blocker.
+#[test]
+fn c99_link_h_compiles() {
+    let code = r#"
+#include <link.h>
+int main(void)
+{
+    /* The layout GCC gives these, checked rather than assumed. */
+    if (sizeof(La_x86_64_xmm) != 16 || _Alignof(La_x86_64_xmm) != 16) return 1;
+    if (sizeof(La_x86_64_ymm) != 32 || _Alignof(La_x86_64_ymm) != 16) return 2;
+    if (sizeof(La_x86_64_zmm) != 64 || _Alignof(La_x86_64_zmm) != 16) return 3;
+    if (sizeof(La_x86_64_vector) != 64) return 4;
+    return 0;
+}
+"#;
+    // x86-64 only: the vector typedefs are inside `#ifdef __x86_64__`.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(compile_and_run("link_h_compiles", code, &[]), 0);
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = code;
+}

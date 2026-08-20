@@ -1878,7 +1878,16 @@ impl TypeTable {
     }
 
     /// The alignment the type would have without `_Atomic`.
-    fn natural_alignment(&self, id: TypeId) -> usize {
+    /// The alignment a type inherently requires, ignoring any `explicit_align`
+    /// already recorded on it.
+    ///
+    /// This is what an explicit alignment may not go below. Asking
+    /// `alignment()` instead compares against whatever a *previous* attribute
+    /// set, so a type carrying a derived alignment -- a `vector_size` array,
+    /// which aligns to its own width -- could not then be given the smaller
+    /// alignment the source asked for, though nothing inherent required the
+    /// larger one.
+    pub fn natural_alignment(&self, id: TypeId) -> usize {
         let typ = self.get(id);
         match typ.kind {
             TypeKind::Void => 1,

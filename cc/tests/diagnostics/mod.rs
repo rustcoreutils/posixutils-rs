@@ -3993,16 +3993,32 @@ fn diagnostics_float_constant_is_accepted_by_the_other_asm_classes() {
     }
 }
 
-/// There is one scratch register for this, so a second floating constant under
-/// an SSE constraint would silently overwrite the first. Saying so beats
-/// emitting wrong code.
+/// Only the reserved scratch registers are free across an asm body, and c17
+/// has two of them (Xmm15 and Xmm14). A third SSE-class operand would have to
+/// share one, silently overwriting a value, so it is refused instead.
+///
+/// The budget is shared by inputs and outputs: an `"=x"` output spends one,
+/// leaving one for the inputs.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn diagnostics_two_float_constants_cannot_share_the_sse_scratch() {
-    let src = r#"
-int main(void) { __asm__ ("nop" :: "x"(1.0), "x"(2.0)); return 0; }
-"#;
-    compile_expect_error("asm_two_float_const_sse", src, "only one floating constant");
+fn diagnostics_sse_asm_operands_are_limited_to_the_scratch_registers() {
+    // Two fit.
+    compile_expect_ok(
+        "asm_two_sse_constants",
+        "int main(void) { __asm__ (\"nop\" :: \"x\"(1.0), \"x\"(2.0)); return 0; }\n",
+    );
+    // A third does not.
+    compile_expect_error(
+        "asm_three_sse_constants",
+        "int main(void) { __asm__ (\"nop\" :: \"x\"(1.0), \"x\"(2.0), \"x\"(3.0)); return 0; }\n",
+        "too many SSE register constraints",
+    );
+    // An output spends one of the two, so two more inputs are one too many.
+    compile_expect_error(
+        "asm_sse_output_plus_two_inputs",
+        "double r;\nint main(void) { __asm__ (\"nop\" : \"=x\"(r) : \"x\"(1.0), \"x\"(2.0)); return 0; }\n",
+        "too many SSE register constraints",
+    );
 }
 
 /// #C123: a constraint violation inside an abstract declarator must be

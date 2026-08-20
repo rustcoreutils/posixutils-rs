@@ -112,12 +112,6 @@ Not yet implemented (features we want to add):
 - `-fverbose-asm`
 - assembly peephole optimizations
 
-Known defects:
-- An SSE or vector inline-asm **output** constraint (`"=x"`, `"=w"`) is given a
-  general register, so the template renders as `movsd %xmm15, %rax` and the
-  assembler rejects it. The input side is correct. See #C139 in
-  [audit.md](audit.md).
-
 Will not implement:
 - `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,
   as this line used to claim. Neither gcc nor clang implements them: gcc

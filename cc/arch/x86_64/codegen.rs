@@ -4014,6 +4014,30 @@ impl X86_64CodeGen {
 
         let mut used_regs: std::collections::HashSet<Reg> = reserved_regs.clone();
 
+        // The XMM registers this statement may spend on SSE-class operands,
+        // most-preferred last so `pop` hands them out in order.
+        //
+        // A constant given `"x"`, or an output whose pseudo was allocated a
+        // general register, has to be *put* in an XMM somewhere, and only the
+        // reserved scratches are free across the asm body. Xmm15 is the
+        // primary and Xmm14 the secondary, the same pair `float.rs` uses for
+        // its own scratch needs. Shared by the output and input loops so an
+        // in-and-out pair cannot hand the same register to both.
+        let mut sse_scratch: Vec<XmmReg> = vec![XmmReg::Xmm14, XmmReg::Xmm15];
+
+        // SSE outputs to copy back once the template has run:
+        // (scratch register, destination, operand size in bits).
+        let mut sse_output_moves: Vec<(XmmReg, Loc, u32)> = Vec::new();
+
+        // SSE read-write (`"+x"`) operands whose current value must reach the
+        // scratch before the template runs: (scratch, source pseudo, size).
+        let mut sse_input_moves: Vec<(XmmReg, PseudoId, u32)> = Vec::new();
+
+        // Pseudos already given an SSE scratch, so a tied `"+x"` input reuses
+        // its output's register rather than taking a second one.
+        let mut pseudo_to_xmm: std::collections::HashMap<PseudoId, XmmReg> =
+            std::collections::HashMap::new();
+
         // Process output operands (they go first: %0, %1, etc.)
         for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
@@ -4054,6 +4078,39 @@ impl X86_64CodeGen {
                         // the value at that address.
                         let mem_str = format!("(%{})", self.reg_name_64(r));
                         slots.push(mk(None, Some(mem_str)));
+                    }
+                    // An SSE-class output. `constraint_requires_register` and
+                    // `constraint_requires_memory` know no FP class letter, so
+                    // without this arm `"=x"` fell through to the general
+                    // `Loc::Reg` arm below and the template was handed `%rax`:
+                    // `movsd %xmm0, %rax`, which the assembler refuses (#C139).
+                    //
+                    // The operand is rendered as text rather than a register
+                    // slot because `AsmOperandSlot` carries only a general
+                    // register; `XmmReg::name()` already includes the `%`.
+                    _ if Self::constraint_requires_sse(&output.constraint) => {
+                        match sse_scratch.pop() {
+                            Some(xmm) => {
+                                slots.push(mk(None, Some(xmm.name().to_string())));
+                                pseudo_to_xmm.insert(output.pseudo, xmm);
+                                // Copied back once the template has run. A
+                                // `Loc::Xmm` destination would already be the
+                                // right place, but the pseudo is only ever
+                                // given one by accident today, so the move is
+                                // unconditional and `emit_fp_move_from_xmm`
+                                // makes a same-register copy a no-op.
+                                sse_output_moves.push((xmm, loc.clone(), op_size));
+                            }
+                            None => {
+                                crate::diag::error(
+                                    insn.pos.unwrap_or_default(),
+                                    "too many SSE register constraints in one asm \
+                                     statement; c17 has two scratch registers to \
+                                     give",
+                                );
+                                slots.push(mk(None, Some(XmmReg::Xmm15.name().to_string())));
+                            }
+                        }
                     }
                     Loc::Reg(r) => {
                         // Check if allocated reg conflicts with reserved
@@ -4103,10 +4160,6 @@ impl X86_64CodeGen {
 
         let num_outputs = asm_data.outputs.len();
 
-        // Whether Xmm15 has already been spent materializing a floating
-        // constant for an SSE-class constraint. There is only the one.
-        let mut sse_scratch_taken = false;
-
         // Process input operands
         for input in &asm_data.inputs {
             let op_size = input.size;
@@ -4135,6 +4188,14 @@ impl X86_64CodeGen {
                     if let Some(reg) = slots[match_idx].reg {
                         // Load initial value into the register before asm
                         input_moves.push((reg, loc, op_size));
+                    } else if let Some(&xmm) =
+                        pseudo_to_xmm.get(&asm_data.outputs[match_idx].pseudo)
+                    {
+                        // An SSE `"+x"` operand. Its slot carries text rather
+                        // than a register, so the branch above finds nothing
+                        // and the initial value never reached the scratch:
+                        // `addsd %xmm15, %xmm15` ran on whatever was there.
+                        sse_input_moves.push((xmm, asm_data.outputs[match_idx].pseudo, op_size));
                     }
                     continue; // Skip — don't add a new operand slot
                 }
@@ -4190,20 +4251,25 @@ impl X86_64CodeGen {
                         Loc::FImm(v, imm_size)
                             if Self::constraint_requires_sse(constraint_for_reg) =>
                         {
-                            // Xmm15 is the one register reserved for this, and
-                            // a second constant would silently overwrite the
-                            // first. Say so rather than emit wrong code; the
-                            // caller can always name a variable instead.
-                            if sse_scratch_taken {
-                                crate::diag::error(
-                                    insn.pos.unwrap_or_default(),
-                                    "only one floating constant can be given an SSE \
-                                     register constraint in one asm statement",
-                                );
+                            // Only the scratch registers are free across the
+                            // asm body, and there are two. Say so rather than
+                            // hand the same one to two operands and emit wrong
+                            // code; naming a variable instead always works.
+                            match sse_scratch.pop() {
+                                Some(xmm) => {
+                                    self.emit_fp_imm_to_xmm(v, xmm, imm_size);
+                                    slots.push(mk(None, Some(xmm.name().to_string())));
+                                }
+                                None => {
+                                    crate::diag::error(
+                                        insn.pos.unwrap_or_default(),
+                                        "too many SSE register constraints in one asm \
+                                         statement; c17 has two scratch registers to \
+                                         give",
+                                    );
+                                    slots.push(mk(None, Some(XmmReg::Xmm15.name().to_string())));
+                                }
                             }
-                            sse_scratch_taken = true;
-                            self.emit_fp_imm_to_xmm(v, XmmReg::Xmm15, imm_size);
-                            slots.push(mk(None, Some(XmmReg::Xmm15.name().to_string())));
                         }
                         Loc::Imm(_) if requires_mem => {
                             // Memory constraint with constant address (may be dead code
@@ -4262,6 +4328,12 @@ impl X86_64CodeGen {
         }
 
         // Emit moves from actual locations to specific registers (for inputs)
+        // Load `"+x"` operands into their scratch before the template runs.
+        for (xmm, pseudo, size) in &sse_input_moves {
+            let fp_size = FpSize::from_bits(*size, &self.base.target);
+            self.emit_fp_move(*pseudo, *xmm, fp_size);
+        }
+
         for (specific_reg, actual_loc, size) in &input_moves {
             self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
         }
@@ -4288,6 +4360,23 @@ impl X86_64CodeGen {
             if !trimmed.is_empty() {
                 self.push_lir(X86Inst::Directive(Directive::Raw(trimmed.to_string())));
             }
+        }
+
+        // Copy SSE outputs out of the scratch register into where the
+        // operand actually lives. `emit_raw_mov_to_loc` below cannot do this
+        // -- its source is a general register.
+        for (xmm, actual_loc, size) in &sse_output_moves {
+            // `emit_fp_move_from_xmm` silently does nothing for a destination
+            // it does not handle, which would lose the value. Say so instead.
+            if matches!(actual_loc, Loc::Global(_) | Loc::IncomingArg(_)) {
+                crate::diag::error(
+                    insn.pos.unwrap_or_default(),
+                    "an SSE asm output cannot be written back to this location",
+                );
+                continue;
+            }
+            let fp_size = FpSize::from_bits(*size, &self.base.target);
+            self.emit_fp_move_from_xmm(*xmm, actual_loc, fp_size);
         }
 
         // Emit moves from specific registers to actual locations (for outputs)

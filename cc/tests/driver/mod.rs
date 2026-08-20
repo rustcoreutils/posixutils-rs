@@ -1105,3 +1105,78 @@ fn driver_isystem_does_not_disturb_library_ordering() {
     assert!(r.success, "{}{}", r.stdout, r.stderr);
     assert_eq!(run_exe(&exe), 7);
 }
+
+/// A diagnostic from inside a directive is attributed like every other.
+///
+/// A directive handler pulls its own tokens, so they never pass the
+/// linemarker remap in the main loop. `#pragma pack` captured its position
+/// before remapping and handed it to `parse_pack_body`, which reports five
+/// diagnostics from it -- so a malformed pragma cited the `.i` while the error
+/// on the very next line cited the original file. Two diagnostics about one
+/// file disagreeing on which file it is.
+#[test]
+fn driver_dot_i_attributes_pragma_diagnostics_to_the_original_file() {
+    let w = WorkDir::new("i_pragma_diag");
+    let src = w.write(
+        "pp.i",
+        "# 50 \"orig.c\"\n#pragma pack(bogus)\nint main(void){ return nope; }\n",
+    );
+    let r = run_c17(&["-c", &s(&src), "-o", &s(&w.join("pp.o"))]);
+    assert!(
+        !r.success,
+        "the undeclared identifier should fail the compile"
+    );
+
+    assert!(
+        r.stderr.contains("orig.c:50:"),
+        "the pragma diagnostic was not attributed to orig.c:50:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("orig.c:51:"),
+        "the following error was not attributed to orig.c:51:\n{}",
+        r.stderr
+    );
+    // The physical positions in the preprocessed text must not survive.
+    assert!(
+        !r.stderr.contains("pp.i:2:") && !r.stderr.contains("pp.i:3:"),
+        "a diagnostic still cites the position in the preprocessed text:\n{}",
+        r.stderr
+    );
+}
+
+/// `#ident` and `#sccs` are directives c17 knows, in both modes.
+///
+/// Both were named in the `.i` allowlist while having no dispatch arm, so
+/// they fell through to the unknown-directive arm and warned -- in a `.c` as
+/// well as a `.i`. gcc is silent about both. An allowlist that names a
+/// directive the dispatcher does not handle claims support that is not there.
+#[test]
+fn driver_ident_and_sccs_are_accepted_quietly() {
+    for (name, body) in [
+        (
+            "ident",
+            "#ident \"version string\"\nint main(void){return 0;}\n",
+        ),
+        (
+            "sccs",
+            "#sccs \"version string\"\nint main(void){return 0;}\n",
+        ),
+    ] {
+        for suffix in ["c", "i"] {
+            let w = WorkDir::new(&format!("{name}_{suffix}"));
+            let src = w.write(&format!("t.{suffix}"), body);
+            let r = run_c17(&["-c", &s(&src), "-o", &s(&w.join("t.o"))]);
+            assert!(
+                r.success,
+                "#{name} in a .{suffix} was rejected: {}{}",
+                r.stdout, r.stderr
+            );
+            assert!(
+                r.stderr.is_empty(),
+                "#{name} in a .{suffix} produced a diagnostic:\n{}",
+                r.stderr
+            );
+        }
+    }
+}

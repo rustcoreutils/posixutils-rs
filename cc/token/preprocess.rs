@@ -1238,6 +1238,44 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle a preprocessor directive
+    /// The directives that survive into an already-preprocessed file.
+    ///
+    /// GCC's libcpp marks these `IN_I`. Every one of them is dispatched by
+    /// `handle_directive`; naming one that is not would send it to the
+    /// unknown-directive arm while claiming it was supported.
+    fn survives_preprocessing(id: crate::strings::StringId) -> bool {
+        matches!(
+            id,
+            crate::kw::DEFINE
+                | crate::kw::UNDEF
+                | crate::kw::PRAGMA
+                | crate::kw::PP_IDENT
+                | crate::kw::SCCS
+        )
+    }
+
+    /// Every directive `handle_directive` dispatches.
+    ///
+    /// Kept beside the `match` it mirrors: a directive added there and not
+    /// here would silently stop being diagnosed as a stray `#` in a `.i`.
+    fn is_known_directive(id: crate::strings::StringId) -> bool {
+        Self::survives_preprocessing(id)
+            || matches!(
+                id,
+                crate::kw::IFDEF
+                    | crate::kw::IFNDEF
+                    | crate::kw::IF
+                    | crate::kw::ELIF
+                    | crate::kw::ELSE
+                    | crate::kw::ENDIF
+                    | crate::kw::INCLUDE
+                    | crate::kw::INCLUDE_NEXT
+                    | crate::kw::PP_ERROR
+                    | crate::kw::WARNING
+                    | crate::kw::LINE
+            )
+    }
+
     fn handle_directive<I>(
         &mut self,
         iter: &mut std::iter::Peekable<I>,
@@ -1299,31 +1337,17 @@ impl<'a> Preprocessor<'a> {
         // not be repeated. That is not a wholesale skip of translation phase
         // 4 -- GCC keeps a five-directive allowlist (libcpp's `IN_I` set), and
         // `#pragma pack` in particular has to keep working or a preprocessed
-        // file silently loses its layout. Everything outside the allowlist
-        // leaves the `#` as a stray token, which is what GCC diagnoses.
+        // file silently loses its layout. A *known* directive outside the
+        // allowlist leaves the `#` as a stray token, which is what GCC
+        // diagnoses.
+        //
+        // An identifier that names no directive at all is deliberately not
+        // included: GCC reports `#nonsense` the same way whether the file is
+        // preprocessed or not, so it goes to the unknown-directive arm below
+        // in both modes rather than becoming a stray `#` in one of them.
         if self.preprocessed
-            && !matches!(
-                directive_id,
-                crate::kw::DEFINE
-                    | crate::kw::UNDEF
-                    | crate::kw::PRAGMA
-                    | crate::kw::PP_IDENT
-                    | crate::kw::SCCS
-            )
-            && matches!(
-                directive_id,
-                crate::kw::IFDEF
-                    | crate::kw::IFNDEF
-                    | crate::kw::IF
-                    | crate::kw::ELIF
-                    | crate::kw::ELSE
-                    | crate::kw::ENDIF
-                    | crate::kw::INCLUDE
-                    | crate::kw::INCLUDE_NEXT
-                    | crate::kw::PP_ERROR
-                    | crate::kw::WARNING
-                    | crate::kw::LINE
-            )
+            && Self::is_known_directive(directive_id)
+            && !Self::survives_preprocessing(directive_id)
         {
             // One diagnostic naming the cause, rather than GCC's cascade of
             // follow-on parse errors from feeding the rest of the line to the
@@ -1348,6 +1372,12 @@ impl<'a> Preprocessor<'a> {
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
             crate::kw::PRAGMA => self.handle_pragma(iter, output, idents),
             crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
+            // `#ident` and `#sccs` carry a version string for the object file.
+            // c17 records nothing, but they are directives it knows, so they
+            // are consumed rather than reported as unknown -- GCC is silent
+            // about both, and `survives_preprocessing` names them, which was
+            // untrue while they fell through to the arm below.
+            crate::kw::PP_IDENT | crate::kw::SCCS => self.skip_to_eol(iter),
             _ => {
                 // Unknown directive
                 if !self.is_skipping() {
@@ -3061,18 +3091,21 @@ impl<'a> Preprocessor<'a> {
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
                     if name == "pack" {
-                        let pos = token.pos;
+                        // A directive handler pulls its own tokens, so they
+                        // never pass the remap in the main loop. Attribute the
+                        // position once, here, rather than at the one use that
+                        // needed it: `parse_pack_body` reports five diagnostics
+                        // from this position, and leaving it physical made a
+                        // malformed pragma cite the `.i` while the error on the
+                        // very next line cited the original file.
+                        let pos = self.remap_pos(token.pos);
                         iter.next(); // consume "pack"
                         if let Some(action) = self.parse_pack_pragma(iter, idents, pos) {
                             // The parser decides layout, so the pragma has to
                             // reach it. It travels as a marker in the stream
                             // because that is the only ordering that survives
                             // include splicing.
-                            // A directive handler pulls its own tokens, so
-                            // they never pass the remap in the main loop; the
-                            // marker has to be attributed here or a `.i`
-                            // reports the pragma against the preprocessed file.
-                            let mut marker = Token::new(TokenType::Pragma, self.remap_pos(pos));
+                            let mut marker = Token::new(TokenType::Pragma, pos);
                             marker.value = TokenValue::String(action.encode());
                             output.push(marker);
                         }

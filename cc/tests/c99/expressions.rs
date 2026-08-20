@@ -598,10 +598,21 @@ _Static_assert(sizeof(int) > 3.5, "and compares as a number, not a truncation");
 _Static_assert(_Alignof(int) < 4.5, "_Alignof too");
 _Static_assert((1 ? 2 : 3) < 2.5, "a conditional too");
 
+/* Plain `char` is signed on x86-64 and unsigned on aarch64, so the sign of
+   '\x80' is the platform's business. What must hold either way is that the
+   float fold and the integer fold agree about it -- and that is exactly what
+   reading the literal through `u32` broke: it made '\x80' 4294967168.0 where
+   the integer fold has -128. */
+_Static_assert(('\x80' < 0.0) == ('\x80' < 0), "the two folds agree on sign");
+_Static_assert(('\x80' == 0.0) == ('\x80' == 0), "and on equality");
+_Static_assert(('\x7f' < 0.0) == ('\x7f' < 0), "and on a positive literal");
+
 int main(void)
 {
-    /* `char` is signed on both targets c17 supports, so '\x80' is -128. */
-    if ('\x80' >= 0) return 1;          /* the integer folder always knew */
+    /* And both agree with the run-time answer. */
+    char c = '\x80';
+    if (('\x80' < 0.0) != (c < 0)) return 1;
+    if (('\x80' < 0) != (c < 0)) return 2;
     return 0;
 }
 "#;

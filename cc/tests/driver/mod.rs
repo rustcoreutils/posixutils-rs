@@ -1030,39 +1030,87 @@ fn driver_preprocess_of_a_dot_i_is_stable() {
 /// before clap sees them and the scan runs on the rewritten vector -- so the
 /// entries never matched, the directory was read as a pathname operand, and
 /// `ordering_recovered` went false. The link line then silently fell back to
-/// its unordered shape, which is the one thing the table exists to prevent:
-/// `-l foo` written *before* the operand that needs it must not resolve.
+/// its unordered shape.
+///
+/// The observable is which of two rival archives wins, as in
+/// `driver_library_order_is_significant`: that is a property of the order c17
+/// hands the linker, so it holds everywhere. The sharper negative -- a library
+/// named before its user failing to resolve -- is GNU ld's one-pass archive
+/// semantics rather than a POSIX guarantee, and lives in the Linux-only test
+/// below.
 #[test]
 fn driver_isystem_does_not_disturb_library_ordering() {
     let w = WorkDir::new("isystem_order");
-    std::fs::create_dir_all(w.join("libdir")).unwrap();
+    let libdir = build_rival_archives(&w);
     std::fs::create_dir_all(w.join("inc")).unwrap();
-
-    let helper = w.write("helper.c", HELPER_7);
-    let obj = w.join("helper.o");
-    assert!(run_c17(&["-c", &s(&helper), "-o", &s(&obj)]).success);
-    let archive = w.join("libdir/libhelper.a");
-    assert!(Command::new("ar")
-        .args(["rcs", &s(&archive), &s(&obj)])
-        .status()
-        .expect("ar")
-        .success());
-
-    let main = w.write("main.c", CALLER);
-    let libdir = s(&w.join("libdir"));
+    let user = w.write(
+        "usr.c",
+        "int which(void);\nint main(void){return which();}\n",
+    );
+    let ldir = format!("-L{}", libdir.to_string_lossy());
     let incdir = s(&w.join("inc"));
 
-    // The baseline: an archive named before the operand that needs it does
-    // not resolve.
-    let before = run_c17(&[
-        "-L",
-        &libdir,
-        "-l",
-        "helper",
-        &s(&main),
-        "-o",
-        &s(&w.join("a")),
-    ]);
+    for opt in ["-isystem", "-idirafter"] {
+        let exe1 = w.join("ord1");
+        let r = run_c17(&[
+            opt,
+            &incdir,
+            &s(&user),
+            &ldir,
+            "-lQ",
+            "-lP",
+            "-o",
+            &s(&exe1),
+        ]);
+        assert!(r.success, "{opt} broke the link: {}{}", r.stdout, r.stderr);
+        assert_eq!(
+            run_exe(&exe1),
+            1,
+            "{opt} disturbed ordering: -lQ came first, so libQ must win"
+        );
+
+        let exe2 = w.join("ord2");
+        let r = run_c17(&[
+            opt,
+            &incdir,
+            &s(&user),
+            &ldir,
+            "-lP",
+            "-lQ",
+            "-o",
+            &s(&exe2),
+        ]);
+        assert!(r.success, "{opt} broke the link: {}{}", r.stdout, r.stderr);
+        assert_eq!(
+            run_exe(&exe2),
+            2,
+            "{opt} disturbed ordering: -lP came first, so libP must win"
+        );
+    }
+}
+
+/// The negative half of the pair above: with a search-path option present, a
+/// library named before its user must still fail to resolve.
+///
+/// Linux only, for the reason given on
+/// `driver_library_named_before_its_user_does_not_resolve`: Apple's linker
+/// resolves across every archive regardless of order, so the failure this
+/// looks for cannot be produced there.
+#[cfg(target_os = "linux")]
+#[test]
+fn driver_isystem_does_not_recover_a_library_named_too_early() {
+    let w = WorkDir::new("isystem_early");
+    let libdir = build_rival_archives(&w);
+    std::fs::create_dir_all(w.join("inc")).unwrap();
+    let user = w.write(
+        "usr.c",
+        "int which(void);\nint main(void){return which();}\n",
+    );
+    let ldir = format!("-L{}", libdir.to_string_lossy());
+    let incdir = s(&w.join("inc"));
+
+    // The baseline, without the option.
+    let before = run_c17(&[&ldir, "-lQ", &s(&user), "-o", &s(&w.join("a"))]);
     assert!(
         !before.success,
         "an archive named before its user must not resolve: {}{}",
@@ -1074,11 +1122,9 @@ fn driver_isystem_does_not_disturb_library_ordering() {
         let r = run_c17(&[
             opt,
             &incdir,
-            "-L",
-            &libdir,
-            "-l",
-            "helper",
-            &s(&main),
+            &ldir,
+            "-lQ",
+            &s(&user),
             "-o",
             &s(&w.join("b")),
         ]);
@@ -1088,22 +1134,6 @@ fn driver_isystem_does_not_disturb_library_ordering() {
             r.stdout, r.stderr
         );
     }
-
-    // And the correct order still links and runs, with the option present.
-    let exe = w.join("ok");
-    let r = run_c17(&[
-        "-isystem",
-        &incdir,
-        &s(&main),
-        "-L",
-        &libdir,
-        "-l",
-        "helper",
-        "-o",
-        &s(&exe),
-    ]);
-    assert!(r.success, "{}{}", r.stdout, r.stderr);
-    assert_eq!(run_exe(&exe), 7);
 }
 
 /// A diagnostic from inside a directive is attributed like every other.

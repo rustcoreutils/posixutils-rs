@@ -701,6 +701,125 @@ fn preprocessor_output_with_markers_still_compiles() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
 }
 
+/// A `# N "file" flags` linemarker attributes what follows to the original
+/// file, not to the position in the preprocessed text.
+///
+/// POSIX 87981 makes `c17 -E` output a `.i` operand, and every such file is
+/// built out of these markers. Nothing consumed one: `handle_directive` took a
+/// directive name only from an identifier, so a marker's leading number fell
+/// through to the "not a directive" arm and the whole line was swallowed. Every
+/// diagnostic about a preprocessed file therefore cited the `.i`. GCC reports
+/// `orig.c:42`, and so does c17 now.
+#[test]
+fn preprocessor_linemarker_sets_the_reported_position() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_linemarker_")
+        .tempdir()
+        .unwrap();
+    let i = dir.path().join("m.i");
+    std::fs::write(&i, "# 42 \"orig.c\"\nint main(void){ return bad; }\n").unwrap();
+
+    let r = run_c17(&[
+        "-c",
+        &i.to_string_lossy(),
+        "-o",
+        &dir.path().join("m.o").to_string_lossy(),
+    ]);
+    assert!(!r.success, "undeclared identifier should fail");
+    assert!(
+        r.stderr.contains("orig.c:42:"),
+        "linemarker ignored, diagnostic not attributed to orig.c:42:\n{}",
+        r.stderr
+    );
+    // The operand-level summary still names `m.i`, which is the file the user
+    // named; what must not survive is the *physical* position inside it.
+    assert!(
+        !r.stderr.contains("m.i:2:"),
+        "diagnostic still cites the position in the preprocessed text:\n{}",
+        r.stderr
+    );
+}
+
+/// Successive markers re-attribute, including the return to an earlier file.
+///
+/// The mapping has to bind to the stream the marker was read from, so that
+/// text spliced in from an `#include` keeps its own attribution, and a file
+/// named twice has to resolve to one stream rather than accumulating a new one
+/// per marker.
+#[test]
+fn preprocessor_linemarkers_track_entering_and_returning() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_linemarker_seq_")
+        .tempdir()
+        .unwrap();
+    let i = dir.path().join("multi.i");
+    std::fs::write(
+        &i,
+        "# 10 \"a.c\"\nint p(void){return aa;}\n\
+         # 77 \"b.h\" 1\nint q(void){return bb;}\n\
+         # 12 \"a.c\" 2\nint r(void){return cc;}\n",
+    )
+    .unwrap();
+
+    let r = run_c17(&[
+        "-c",
+        &i.to_string_lossy(),
+        "-o",
+        &dir.path().join("multi.o").to_string_lossy(),
+    ]);
+    assert!(!r.success);
+    for want in ["a.c:10:", "b.h:77:", "a.c:12:"] {
+        assert!(
+            r.stderr.contains(want),
+            "expected a diagnostic at {want}\n{}",
+            r.stderr
+        );
+    }
+}
+
+/// Flag 3 marks a system header, and its warnings are not the user's to act on.
+///
+/// A preprocessed file carries the whole of glibc inline. Without this,
+/// compiling one buries the user's own diagnostics under the system headers'.
+#[test]
+fn preprocessor_linemarker_flag_three_silences_the_stream() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_linemarker_sys_")
+        .tempdir()
+        .unwrap();
+    let body = "int g(void){ return 1<<64; }\n";
+
+    let sys = dir.path().join("s3.i");
+    std::fs::write(&sys, format!("# 5 \"sys.h\" 3\n{body}")).unwrap();
+    let r = run_c17(&[
+        "-c",
+        &sys.to_string_lossy(),
+        "-o",
+        &dir.path().join("s3.o").to_string_lossy(),
+    ]);
+    assert!(
+        !r.stderr.contains("warning"),
+        "a system-header stream still warned:\n{}",
+        r.stderr
+    );
+
+    // Control: the identical body without flag 3 must still warn, or the
+    // assertion above would pass for the wrong reason.
+    let usr = dir.path().join("s1.i");
+    std::fs::write(&usr, format!("# 5 \"usr.h\" 1\n{body}")).unwrap();
+    let r = run_c17(&[
+        "-c",
+        &usr.to_string_lossy(),
+        "-o",
+        &dir.path().join("s1.o").to_string_lossy(),
+    ]);
+    assert!(
+        r.stderr.contains("warning") && r.stderr.contains("usr.h:5:"),
+        "expected the shift warning at usr.h:5:\n{}",
+        r.stderr
+    );
+}
+
 /// C17 6.10.3.2p2: `#` produces a literal whose spelling is the argument's
 /// original spelling — white space between tokens collapses to one space, and
 /// white space that was not there does not appear. `stringify_arg` inserted a

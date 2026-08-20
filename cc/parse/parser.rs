@@ -2556,8 +2556,13 @@ impl Parser<'_> {
                 // 6.7p7: the object needs a size here, and unlike at file
                 // scope nothing later can supply one -- a tag completed further
                 // down the block is a different declaration. An `extern`
-                // declaration defines nothing and is exempt.
-                if !base_type.modifiers.contains(TypeModifiers::EXTERN)
+                // declaration defines nothing and is exempt, and so does a
+                // `typedef`, which declares no object at all: without that,
+                // `typedef struct Incomplete T;` at block scope was rejected
+                // although it names a type nobody has asked to size. The
+                // file-scope twin has had the guard all along.
+                if !is_typedef
+                    && !base_type.modifiers.contains(TypeModifiers::EXTERN)
                     && !self.types.is_composite_complete(typ)
                 {
                     let named = self.types.format_type(typ, Some(self.idents));
@@ -3816,6 +3821,17 @@ impl Parser<'_> {
                     // Skip any __attribute__ after member declaration
                     self.skip_extensions();
 
+                    // A member's type attributes are the member's. Nothing
+                    // consumed them here, so `__attribute__((mode(M)))` on a
+                    // member did two wrong things at once: it did not size the
+                    // member, and it stayed pending, so the next declarator to
+                    // consume one -- the enclosing declaration's -- took it
+                    // instead. `struct Big { int arr[100]; int x
+                    // __attribute__((mode(QI))); } b;` gave `sizeof b == 1`
+                    // where gcc gives 404. The eight declarator sites all do
+                    // this; the member loop was the gap.
+                    let typ = self.apply_pending_type_attrs(typ);
+
                     // Capture any pending _Alignas from type specifier
                     let member_align = self.pending_alignas.take();
 
@@ -4460,6 +4476,13 @@ impl Parser<'_> {
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
 
+            // A parameter's type attributes are the parameter's, and are
+            // applied before the array-to-pointer adjustment below so a mode
+            // names the declared type rather than the adjusted one. Nothing
+            // consumed them here, so `int x __attribute__((mode(QI)))` was
+            // silently an `int`.
+            typ_id = self.apply_pending_type_attrs(typ_id);
+
             // C99 6.7.5.3: Array and function parameters are adjusted to pointers
             // - Array T[] becomes pointer to T
             // - Function type becomes pointer to function type
@@ -4624,6 +4647,15 @@ impl Parser<'_> {
     /// judged here, when nothing more can complete them.
     fn check_deferred_incomplete_definitions(&mut self) {
         for (typ, pos) in std::mem::take(&mut self.tentative_definitions) {
+            // Ask the *tag*, not the recorded id. A qualified spelling --
+            // `volatile struct S` -- is interned as a fresh type carrying a
+            // clone of the tag's composite data as it stood at the time
+            // (`intern_type_with_tag`), and `complete_struct` only ever
+            // mutates the tag's own entry. So the recorded id is a frozen
+            // `is_complete: false` that completing the tag never updates, and
+            // `struct S; volatile struct S vs; struct S { int a; };` was
+            // rejected although the tag is complete.
+            let typ = self.resolve_struct_type(typ);
             if self.types.is_composite_complete(typ) {
                 continue;
             }
@@ -5690,13 +5722,16 @@ impl Parser<'_> {
     /// `eval_const_float_expr` for anything that survives to code generation.
     /// `f64` is enough to decide an ordering that `i128` truncation was
     /// getting wrong.
-    pub(crate) fn eval_const_f64(&self, expr: &Expr) -> Option<f64> {
+    pub(crate) fn eval_const_f64(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
         match &expr.kind {
             ExprKind::FloatLit(v) => Some(v.to_f64()),
             ExprKind::IntLit(v) => Some(*v as f64),
-            ExprKind::CharLit(c) => Some(*c as u32 as f64),
+            // `CharLit` is an `i64` whose signedness the lexer has already
+            // resolved, so `'\x80'` is -128 where `char` is signed. Rounding
+            // it through `u32` made that 4294967168.0.
+            ExprKind::CharLit(c) => Some(*c as f64),
             ExprKind::Cast { expr: inner, .. } => {
-                let v = self.eval_const_f64(inner)?;
+                let v = self.eval_const_f64(scope, inner)?;
                 // A cast to an integer type truncates before the comparison.
                 match expr.typ {
                     Some(t) if self.types.is_integer(t) => Some(v.trunc()),
@@ -5706,10 +5741,10 @@ impl Parser<'_> {
             ExprKind::Unary {
                 op: UnaryOp::Neg,
                 operand,
-            } => Some(-self.eval_const_f64(operand)?),
+            } => Some(-self.eval_const_f64(scope, operand)?),
             ExprKind::Binary { op, left, right } => {
-                let l = self.eval_const_f64(left)?;
-                let r = self.eval_const_f64(right)?;
+                let l = self.eval_const_f64(scope, left)?;
+                let r = self.eval_const_f64(scope, right)?;
                 match op {
                     BinaryOp::Add => Some(l + r),
                     BinaryOp::Sub => Some(l - r),
@@ -5718,7 +5753,12 @@ impl Parser<'_> {
                     _ => None,
                 }
             }
-            _ => None,
+            // Anything else that is an integer constant expression converts to
+            // one. `sizeof`, `_Alignof`, an enumerator and a conditional all
+            // reach here, and each was answered "not a constant expression"
+            // for want of an arm -- so `_Static_assert(sizeof(int) < 4.5, "")`
+            // was rejected although both operands are perfectly constant.
+            _ => crate::constexpr::eval(self, scope, expr).map(|v| v as f64),
         }
     }
 
@@ -5925,7 +5965,7 @@ impl crate::constexpr::ConstEnv for Parser<'_> {
         self.resolve_struct_type(typ)
     }
 
-    fn float_value(&self, _scope: ConstScope, expr: &Expr) -> Option<f64> {
-        self.eval_const_f64(expr)
+    fn float_value(&self, scope: ConstScope, expr: &Expr) -> Option<f64> {
+        self.eval_const_f64(scope, expr)
     }
 }

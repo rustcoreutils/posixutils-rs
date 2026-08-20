@@ -410,6 +410,46 @@ pub struct Preprocessor<'a> {
 
     /// File name override from #line directive
     line_file_override: Option<String>,
+
+    /// The input is already the output of `c17 -E`, so translation phases 1
+    /// through 4 must not run again (POSIX 87982-87983). See the allowlist in
+    /// `handle_directive`.
+    preprocessed: bool,
+
+    /// Attribution established by the most recent `# N "file" flags`
+    /// linemarker, if any. See [`LineMarker`].
+    linemarker: Option<LineMarker>,
+
+    /// Position of the token currently being dispatched, before [`LineMarker`]
+    /// remapping. A linemarker's delta is measured from the physical line and
+    /// binds to the physical stream, so both have to survive the remap that is
+    /// applied to its own `#` token.
+    physical_line: u32,
+    physical_stream: u16,
+}
+
+/// Where a linemarker says the text after it really came from.
+///
+/// `c17 -E` writes `# N "file" flags` at every file transition, and POSIX
+/// 87981 makes that output a `.i` operand. Compiling one has to attribute
+/// diagnostics to the original file and line rather than to the position in
+/// the preprocessed text, which is what GCC does and what c17 did not.
+///
+/// The mapping is applied by rewriting token positions rather than by
+/// consulting a side table at diagnostic time: `Position` already carries a
+/// stream and a line, so a rewritten token needs no further interpretation --
+/// `effective_position`, the include-chain note and the `-E` marker writer all
+/// keep working unchanged, and re-running `-E` over a `.i` re-emits markers
+/// naming the original source rather than the `.i` it is reading.
+#[derive(Debug, Clone, Copy)]
+struct LineMarker {
+    /// Only tokens from this stream are remapped. Text spliced in from an
+    /// `#include` carries its own attribution and must not be touched.
+    origin: u16,
+    /// The stream the marker named.
+    target: u16,
+    /// Added to a physical line number to get the reported one.
+    delta: i64,
 }
 
 /// What a `#pragma pack` directive does to the packing state.
@@ -433,6 +473,29 @@ impl PackAction {
             PackAction::Push(None) => "pack:push".to_string(),
             PackAction::Push(Some(n)) => format!("pack:push:{n}"),
             PackAction::Pop => "pack:pop".to_string(),
+        }
+    }
+
+    /// Spell the action back as the directive that produced it.
+    ///
+    /// `-E` output is a `.i` operand (POSIX 87981), so what it writes for a
+    /// pragma has to be C that the compiler -- ours or anyone's -- will read
+    /// back. `encode` is an internal payload and was reaching the output.
+    pub fn to_pragma_text(self) -> String {
+        match self {
+            PackAction::Set(None) => "#pragma pack()".to_string(),
+            PackAction::Set(Some(n)) => format!("#pragma pack({n})"),
+            PackAction::Push(None) => "#pragma pack(push)".to_string(),
+            PackAction::Push(Some(n)) => format!("#pragma pack(push, {n})"),
+            PackAction::Pop => "#pragma pack(pop)".to_string(),
+        }
+    }
+
+    /// Recover the action from a `TokenType::Pragma` marker's payload.
+    pub fn from_token(token: &Token) -> Option<PackAction> {
+        match &token.value {
+            TokenValue::String(s) => PackAction::decode(s),
+            _ => None,
         }
     }
 
@@ -695,6 +758,10 @@ impl<'a> Preprocessor<'a> {
             lexer_mode: LexerMode::C,
             line_offset: 0,
             line_file_override: None,
+            preprocessed: false,
+            linemarker: None,
+            physical_line: 0,
+            physical_stream: 0,
         };
 
         // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
@@ -1001,7 +1068,15 @@ impl<'a> Preprocessor<'a> {
         let mut output = Vec::new();
         let mut iter = tokens.into_iter().peekable();
 
-        while let Some(token) = iter.next() {
+        while let Some(mut token) = iter.next() {
+            // Attribute the token before anything looks at it, so that macro
+            // expansion, diagnostics and the `-E` marker writer all inherit
+            // the position a linemarker established. The physical position is
+            // kept because the next linemarker's delta is measured from it.
+            self.physical_line = token.pos.line;
+            self.physical_stream = token.pos.stream;
+            token.pos = self.remap_pos(token.pos);
+
             match token.typ {
                 TokenType::StreamBegin | TokenType::StreamEnd => {
                     // Pass through stream markers
@@ -1023,6 +1098,17 @@ impl<'a> Preprocessor<'a> {
 
                 TokenType::Ident => {
                     if self.is_skipping() {
+                        continue;
+                    }
+                    // In an already-preprocessed file every macro has already
+                    // been expanded, so nothing here is a macro name: not a
+                    // `#define` recorded above (GCC records them for debug
+                    // info but never substitutes), not a `-D` from the command
+                    // line, and not a predefined `__LINE__` or `__STDC__`.
+                    // `_Pragma` is a phase-4 operator and is likewise spent --
+                    // `c17 -E` has already lowered it to a `#pragma` line.
+                    if self.preprocessed {
+                        output.push(token);
                         continue;
                     }
                     // Check for macro expansion
@@ -1152,6 +1238,44 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle a preprocessor directive
+    /// The directives that survive into an already-preprocessed file.
+    ///
+    /// GCC's libcpp marks these `IN_I`. Every one of them is dispatched by
+    /// `handle_directive`; naming one that is not would send it to the
+    /// unknown-directive arm while claiming it was supported.
+    fn survives_preprocessing(id: crate::strings::StringId) -> bool {
+        matches!(
+            id,
+            crate::kw::DEFINE
+                | crate::kw::UNDEF
+                | crate::kw::PRAGMA
+                | crate::kw::PP_IDENT
+                | crate::kw::SCCS
+        )
+    }
+
+    /// Every directive `handle_directive` dispatches.
+    ///
+    /// Kept beside the `match` it mirrors: a directive added there and not
+    /// here would silently stop being diagnosed as a stray `#` in a `.i`.
+    fn is_known_directive(id: crate::strings::StringId) -> bool {
+        Self::survives_preprocessing(id)
+            || matches!(
+                id,
+                crate::kw::IFDEF
+                    | crate::kw::IFNDEF
+                    | crate::kw::IF
+                    | crate::kw::ELIF
+                    | crate::kw::ELSE
+                    | crate::kw::ENDIF
+                    | crate::kw::INCLUDE
+                    | crate::kw::INCLUDE_NEXT
+                    | crate::kw::PP_ERROR
+                    | crate::kw::WARNING
+                    | crate::kw::LINE
+            )
+    }
+
     fn handle_directive<I>(
         &mut self,
         iter: &mut std::iter::Peekable<I>,
@@ -1193,11 +1317,45 @@ impl<'a> Preprocessor<'a> {
         let directive_id = match directive_id {
             Some(id) => id,
             None => {
+                // A number where a directive name belongs is the GCC
+                // linemarker `# N "file" flags` -- the form `c17 -E` writes
+                // and POSIX 87981 makes a `.i` operand. It used to be
+                // swallowed whole, which is why every diagnostic about a
+                // preprocessed file cited the position in the preprocessed
+                // text rather than the original.
+                if directive_token.typ == TokenType::Number && !self.is_skipping() {
+                    self.handle_linemarker(iter, &directive_token);
+                    return;
+                }
                 // Consume rest of line
                 self.skip_to_eol(iter);
                 return;
             }
         };
+
+        // POSIX 87982-87983: the processing `c17 -E` already performed shall
+        // not be repeated. That is not a wholesale skip of translation phase
+        // 4 -- GCC keeps a five-directive allowlist (libcpp's `IN_I` set), and
+        // `#pragma pack` in particular has to keep working or a preprocessed
+        // file silently loses its layout. A *known* directive outside the
+        // allowlist leaves the `#` as a stray token, which is what GCC
+        // diagnoses.
+        //
+        // An identifier that names no directive at all is deliberately not
+        // included: GCC reports `#nonsense` the same way whether the file is
+        // preprocessed or not, so it goes to the unknown-directive arm below
+        // in both modes rather than becoming a stray `#` in one of them.
+        if self.preprocessed
+            && Self::is_known_directive(directive_id)
+            && !Self::survives_preprocessing(directive_id)
+        {
+            // One diagnostic naming the cause, rather than GCC's cascade of
+            // follow-on parse errors from feeding the rest of the line to the
+            // parser.
+            diag::error(hash_token.pos, "stray '#' in program");
+            self.skip_to_eol(iter);
+            return;
+        }
 
         match directive_id {
             crate::kw::DEFINE => self.handle_define(iter, idents),
@@ -1214,6 +1372,12 @@ impl<'a> Preprocessor<'a> {
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
             crate::kw::PRAGMA => self.handle_pragma(iter, output, idents),
             crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
+            // `#ident` and `#sccs` carry a version string for the object file.
+            // c17 records nothing, but they are directives it knows, so they
+            // are consumed rather than reported as unknown -- GCC is silent
+            // about both, and `survives_preprocessing` names them, which was
+            // untrue while they fell through to the arm below.
+            crate::kw::PP_IDENT | crate::kw::SCCS => self.skip_to_eol(iter),
             _ => {
                 // Unknown directive
                 if !self.is_skipping() {
@@ -1227,6 +1391,80 @@ impl<'a> Preprocessor<'a> {
                 self.skip_to_eol(iter);
             }
         }
+    }
+
+    /// Apply the active [`LineMarker`] to a position.
+    fn remap_pos(&self, pos: Position) -> Position {
+        match self.linemarker {
+            Some(lm) if lm.origin == pos.stream => Position {
+                stream: lm.target,
+                line: (pos.line as i64 + lm.delta).max(1) as u32,
+                ..pos
+            },
+            _ => pos,
+        }
+    }
+
+    /// Consume a `# N ["file" [flags]]` linemarker and record the attribution
+    /// it establishes for the text that follows.
+    ///
+    /// `number` is the directive-name token, which the caller has already
+    /// taken from the iterator and found to be a number rather than an
+    /// identifier. C17 has no such directive; this is the GCC form that
+    /// `c17 -E` itself writes, and `#line` is deliberately *not* routed here
+    /// (GCC honors only this form in a preprocessed file, and so does c17).
+    fn handle_linemarker<I>(&mut self, iter: &mut std::iter::Peekable<I>, number: &Token)
+    where
+        I: Iterator<Item = Token>,
+    {
+        let origin = self.physical_stream;
+        let TokenValue::Number(ref text) = number.value else {
+            self.skip_to_eol(iter);
+            return;
+        };
+        let Ok(line) = text.parse::<u32>() else {
+            self.skip_to_eol(iter);
+            return;
+        };
+
+        // An optional filename follows; without one the marker renumbers the
+        // current file rather than renaming it.
+        let mut target = self.linemarker.map_or(origin, |lm| lm.target);
+        if let Some(tok) = iter.peek() {
+            if !tok.pos.newline && tok.typ == TokenType::String {
+                if let TokenValue::String(name) = &tok.value {
+                    let name = name.clone();
+                    target = diag::find_or_add_stream(&name);
+                }
+                iter.next();
+            }
+        }
+
+        // Flags 1 (entering) and 2 (returning) are attribution the stream
+        // registry already derives; 4 (extern "C") means nothing here. Only 3
+        // carries a decision: it marks a system header, whose warnings are
+        // not the user's to act on.
+        let mut is_system = false;
+        while let Some(tok) = iter.peek() {
+            if tok.pos.newline {
+                break;
+            }
+            if let TokenValue::Number(flag) = &tok.value {
+                if flag == "3" {
+                    is_system = true;
+                }
+            }
+            iter.next();
+        }
+        diag::set_stream_system(target, is_system);
+
+        // The marker names the line of the text *after* it, so the delta is
+        // measured against the next physical line.
+        self.linemarker = Some(LineMarker {
+            origin,
+            target,
+            delta: line as i64 - (self.physical_line as i64 + 1),
+        });
     }
 
     /// Skip tokens until end of line
@@ -2853,7 +3091,14 @@ impl<'a> Preprocessor<'a> {
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
                     if name == "pack" {
-                        let pos = token.pos;
+                        // A directive handler pulls its own tokens, so they
+                        // never pass the remap in the main loop. Attribute the
+                        // position once, here, rather than at the one use that
+                        // needed it: `parse_pack_body` reports five diagnostics
+                        // from this position, and leaving it physical made a
+                        // malformed pragma cite the `.i` while the error on the
+                        // very next line cited the original file.
+                        let pos = self.remap_pos(token.pos);
                         iter.next(); // consume "pack"
                         if let Some(action) = self.parse_pack_pragma(iter, idents, pos) {
                             // The parser decides layout, so the pragma has to
@@ -2971,7 +3216,7 @@ impl<'a> Preprocessor<'a> {
         }
         if let TokenValue::String(body) = &token.value {
             if let Some(action) = parse_pragma_text(body, token.pos) {
-                let mut marker = Token::new(TokenType::Pragma, token.pos);
+                let mut marker = Token::new(TokenType::Pragma, self.remap_pos(token.pos));
                 marker.value = TokenValue::String(action.encode());
                 output.push(marker);
             }
@@ -4514,6 +4759,9 @@ pub struct PreprocessConfig<'a> {
     pub no_builtin_inc: bool,
     /// If true, apply translation phase 1 trigraph replacement (--trigraphs).
     pub trigraphs: bool,
+    /// If true, the input is a `.i` operand -- already the output of `c17 -E`
+    /// -- and the processing that produced it must not be repeated.
+    pub preprocessed: bool,
 }
 
 /// Preprocess tokens with command-line defines and undefines
@@ -4548,6 +4796,7 @@ pub fn preprocess_with_defines(
         pp.use_builtin_headers = false;
     }
     pp.trigraphs = config.trigraphs;
+    pp.preprocessed = config.preprocessed;
 
     // Add -I include paths
     for path in config.include_paths {

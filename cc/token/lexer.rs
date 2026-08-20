@@ -478,6 +478,11 @@ pub struct Tokenizer<'a, 'b> {
 
     // Lexer mode (C vs Assembly)
     mode: LexerMode,
+
+    // Translation phase 2. Off for a `.i` operand: `c17 -E` already spliced,
+    // so a surviving backslash-newline is text the user meant, and GCC
+    // likewise reports it rather than joining the lines a second time.
+    splice: bool,
 }
 
 impl<'a, 'b> Tokenizer<'a, 'b> {
@@ -502,7 +507,17 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             whitespace: false,
             strings,
             mode,
+            splice: true,
         }
+    }
+
+    /// Stop performing translation phase 2 (backslash-newline splicing).
+    ///
+    /// For a `.i` operand, POSIX 87982-87983 says the processing `c17 -E`
+    /// already performed shall not be repeated, and splicing is part of it.
+    pub fn without_splicing(mut self) -> Self {
+        self.splice = false;
+        self
     }
 
     /// Get current position
@@ -544,7 +559,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
 
             // Handle backslash (potential line splice)
-            if c == b'\\' as i32 && self.offset < self.buffer.len() {
+            if self.splice && c == b'\\' as i32 && self.offset < self.buffer.len() {
                 let next = self.buffer[self.offset];
                 if next == b'\n' {
                     // Line splice: skip backslash-newline
@@ -585,7 +600,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             let c = self.buffer[offset];
 
             // Handle backslash (potential line splice)
-            if c == b'\\' && offset + 1 < self.buffer.len() {
+            if self.splice && c == b'\\' && offset + 1 < self.buffer.len() {
                 let next = self.buffer[offset + 1];
                 if next == b'\n' {
                     // Skip backslash-newline
@@ -673,13 +688,15 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     fn peek_ucn(&self) -> Option<(char, usize)> {
         let mut offset = self.offset;
 
-        // Skip any line splices to find the actual backslash
+        // Skip any line splices to find the actual backslash. With phase 2
+        // off -- a `.i` operand -- there are none to skip, and a backslash
+        // before a newline is text rather than a joint.
         loop {
             if offset >= self.buffer.len() {
                 return None;
             }
             let c = self.buffer[offset];
-            if c == b'\\' && offset + 1 < self.buffer.len() {
+            if self.splice && c == b'\\' && offset + 1 < self.buffer.len() {
                 let next = self.buffer[offset + 1];
                 if next == b'\n' {
                     offset += 2;

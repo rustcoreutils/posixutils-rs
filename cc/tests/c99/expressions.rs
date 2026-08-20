@@ -469,3 +469,152 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("const_fold_float_unsigned", code, &[]), 0);
 }
+
+// ============================================================================
+// The folder converts to the common type before operating (6.3.1.8)
+// ============================================================================
+
+/// A folded comparison, division and remainder take their signedness from the
+/// *common type*, not from "either operand is unsigned" and not from the left
+/// operand.
+///
+/// Both shortcuts get the integer promotions wrong. `(unsigned char)200 > -1`
+/// is a signed comparison because both operands promote to `int` (6.3.1.1p2),
+/// and `-1L < 1u` is signed on LP64 because `long` represents every
+/// `unsigned int`; asking whether *either* operand was unsigned made both
+/// false. `-1 / 2u` is unsigned because the common type is `unsigned int`;
+/// asking the left operand alone made it signed and folded 0 where the answer
+/// is 2147483647.
+///
+/// Every one of these is a constant expression, so a wrong fold is a wrong
+/// program, not a wrong diagnostic.
+#[test]
+fn c99_const_fold_uses_the_common_type() {
+    let code = r#"
+/* Promotions make these signed, and true. */
+_Static_assert(-1L < 1u, "long vs unsigned int is signed on LP64");
+_Static_assert((unsigned char)200 > -1, "unsigned char promotes to int");
+_Static_assert((unsigned short)200 > -1, "unsigned short promotes to int");
+
+/* And these unsigned, and true: no promotion changes the signedness. */
+_Static_assert((unsigned)-1 > 0, "unsigned int stays unsigned");
+_Static_assert(-1 > 1u, "int vs unsigned int is unsigned");
+
+/* Naming the common type is only half of it -- C *converts* both operands to
+   it. Comparing the raw values as u128 made this true, because an i128 -1 is
+   2^128-1 rather than the 4294967295 that -1 converts to. */
+_Static_assert(!(-1 > 4294967295u), "the left operand converts, not widens");
+_Static_assert(-1 == 4294967295u, "and converts to exactly that");
+
+int main(void)
+{
+    enum { UDIV = -1 / 2u };        /* common type unsigned: 2147483647 */
+    enum { UMOD = -1 % 2u };        /* common type unsigned: 1 */
+    enum { SDIV = (unsigned char)200 / -1 };  /* both promote to int: -200 */
+    enum { SMOD = (unsigned char)200 % -1 };  /* -> 0 */
+    enum { LDIV = -1L / 2u };       /* common type long, signed: 0 */
+
+    if (UDIV != 2147483647) return 1;
+    if (UMOD != 1) return 2;
+    if (SDIV != -200) return 3;
+    if (SMOD != 0) return 4;
+    if (LDIV != 0) return 5;
+
+    /* A shift follows the LEFT operand alone (6.5.7p3): the operands are
+       promoted separately and the result is the left operand's type. Making
+       the shift use the common type would break this. */
+    enum { SHR = -8 >> 1u };        /* arithmetic: -4, not a huge unsigned */
+    if (SHR != -4) return 6;
+    if (sizeof(1 << 1L) != sizeof(int)) return 7;
+
+    /* The control: at run time these were always right. */
+    long l = -1; unsigned u = 1;
+    unsigned char uc = 200; int m1 = -1;
+    if (!(l < u)) return 8;
+    if (!(uc > m1)) return 9;
+    if (m1 / 2u != 2147483647u) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("const_fold_common_type", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("const_fold_common_type_opt", code),
+        0
+    );
+}
+
+/// `sizeof` a variably-length array is not an integer constant expression.
+///
+/// `SizeofType` grew a runtime guard; `SizeofExpr` did not, so `sizeof a` for
+/// `int a[n]` folded to 0 -- `size_bits` reports 0 for an array with no extent
+/// -- and `case sizeof a:` was accepted with the wrong value, matching
+/// `switch (0)`. A `TypeId` for `int[n]` is indistinguishable from `int[]`, so
+/// the question has to be asked of the array levels.
+#[test]
+fn c99_sizeof_a_vla_is_not_a_constant_expression() {
+    // `case sizeof a:` must be rejected, not silently folded to 0.
+    let rejected = r#"
+int g(int n)
+{
+    int a[n];
+    switch (n) {
+    case sizeof a: return 1;
+    default: return 0;
+    }
+}
+int main(void) { return g(0); }
+"#;
+    crate::common::compile_expect_error("sizeof_vla_case_label", rejected, "constant");
+
+    // `sizeof` a *fixed* array is still a constant expression.
+    let accepted = r#"
+int main(void)
+{
+    int a[4];
+    switch (sizeof a) {
+    case sizeof a: return 0;
+    default: return 1;
+    }
+}
+"#;
+    assert_eq!(compile_and_run("sizeof_fixed_array_case", accepted, &[]), 0);
+}
+
+/// A floating comparison in a constant expression reaches the integer folder
+/// for its integer-valued operands.
+///
+/// `eval_const_f64` had arms only for literals, casts, negation and the four
+/// arithmetic operators, so `_Static_assert(sizeof(int) < 4.5, "")` was
+/// rejected as "not a constant expression" although both operands are
+/// constant. And `CharLit` -- an `i64` whose signedness the lexer has already
+/// resolved -- was read through `u32`, so `'\x80'` folded to 4294967168.0
+/// instead of -128.0 where `char` is signed.
+#[test]
+fn c99_float_comparison_folds_integer_operands() {
+    let code = r#"
+_Static_assert(sizeof(int) < 4.5, "sizeof reaches the float comparison");
+_Static_assert(sizeof(int) > 3.5, "and compares as a number, not a truncation");
+_Static_assert(_Alignof(int) < 4.5, "_Alignof too");
+_Static_assert((1 ? 2 : 3) < 2.5, "a conditional too");
+
+/* Plain `char` is signed on x86-64 and unsigned on aarch64, so the sign of
+   '\x80' is the platform's business. What must hold either way is that the
+   float fold and the integer fold agree about it -- and that is exactly what
+   reading the literal through `u32` broke: it made '\x80' 4294967168.0 where
+   the integer fold has -128. */
+_Static_assert(('\x80' < 0.0) == ('\x80' < 0), "the two folds agree on sign");
+_Static_assert(('\x80' == 0.0) == ('\x80' == 0), "and on equality");
+_Static_assert(('\x7f' < 0.0) == ('\x7f' < 0), "and on a positive literal");
+
+int main(void)
+{
+    /* And both agree with the run-time answer. */
+    char c = '\x80';
+    if (('\x80' < 0.0) != (c < 0)) return 1;
+    if (('\x80' < 0) != (c < 0)) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_cmp_integer_operands", code, &[]), 0);
+}

@@ -3574,8 +3574,10 @@ impl<'a> Parser<'a> {
                 // floating literal, since 6.6 makes one an integer constant
                 // expression only as the operand of a cast, so the floating
                 // fold has to be asked as well.
-                let is_constant =
-                    self.eval_const_expr(&arg).is_some() || self.eval_const_f64(&arg).is_some();
+                let is_constant = self.eval_const_expr(&arg).is_some()
+                    || self
+                        .eval_const_f64(crate::constexpr::ConstScope::Standard, &arg)
+                        .is_some();
                 Ok(Self::typed_expr(
                     ExprKind::IntLit(if is_constant { 1 } else { 0 }),
                     self.types.int_id,

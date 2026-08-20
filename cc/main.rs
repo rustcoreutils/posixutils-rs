@@ -47,7 +47,7 @@ use target::Os;
 use target::{classify_std, StdRequest, Target};
 use token::{
     preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
-    AsmPreprocessConfig, PreprocessConfig, StreamTable, Tokenizer,
+    AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType, Tokenizer,
 };
 
 // ============================================================================
@@ -486,8 +486,14 @@ fn process_file(
         path
     };
 
+    // POSIX 87981-87983: a `.i` operand is the output of `c17 -E`, and the
+    // processing that produced it "shall not be repeated when the file is
+    // compiled". Phases 1 and 2 are part of that processing, so neither runs
+    // here; phase 4 is narrowed to GCC's allowlist inside the preprocessor.
+    let preprocessed = is_preprocessed_file(path);
+
     // Translation phase 1, before anything else looks at the bytes.
-    let buffer = if args.trigraphs {
+    let buffer = if args.trigraphs && !preprocessed {
         replace_trigraphs(&buffer).into_owned()
     } else {
         buffer
@@ -502,6 +508,10 @@ fn process_file(
     // Tokenize
     let tokens = {
         let mut tokenizer = Tokenizer::new(&buffer, stream_id, &mut strings);
+        // Translation phase 2 likewise already ran.
+        if preprocessed {
+            tokenizer = tokenizer.without_splicing();
+        }
         tokenizer.tokenize()
     };
 
@@ -548,6 +558,7 @@ fn process_file(
             no_std_inc: args.no_std_inc,
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
+            preprocessed,
         },
     );
 
@@ -587,15 +598,38 @@ fn process_file(
                     show_token(token, &strings)
                 )?;
             } else {
-                let text = show_token(token, &strings);
-                // Skip stream markers (e.g., <STREAM_BEGIN>, <STREAM_END>)
-                // but NOT the '<' operator or '<=', etc.
-                if text.starts_with("<STREAM")
-                    || text.starts_with("<ident")
-                    || text.starts_with("<special")
-                {
-                    continue;
-                }
+                // A `#pragma pack` travels to the parser as a marker token
+                // carrying an internal payload, and `show_token` spells that
+                // payload `<PRAGMA pack:set:1>` -- a debug form, not C. It was
+                // reaching the output, so `c17 -E` on any source using the
+                // pragma produced a file that neither c17 nor gcc would
+                // compile. Write the directive that produced it instead;
+                // dropping it would lose the packing, which is the one thing
+                // the marker exists to carry.
+                let pragma = if token.typ == TokenType::Pragma {
+                    match token::preprocess::PackAction::from_token(token) {
+                        Some(action) => Some(action.to_pragma_text()),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
+
+                let text = match &pragma {
+                    Some(directive) => directive.clone(),
+                    None => {
+                        let text = show_token(token, &strings);
+                        // Skip stream markers (e.g., <STREAM_BEGIN>,
+                        // <STREAM_END>) but NOT the '<' operator or '<=', etc.
+                        if text.starts_with("<STREAM")
+                            || text.starts_with("<ident")
+                            || text.starts_with("<special")
+                        {
+                            continue;
+                        }
+                        text
+                    }
+                };
 
                 if current_stream != Some(token.pos.stream) {
                     let (name, line, _) = diag::effective_position(token.pos);
@@ -614,6 +648,18 @@ fn process_file(
                         if returning { 2 } else { 1 }
                     )?;
                     current_stream = Some(token.pos.stream);
+                    at_line_start = true;
+                }
+
+                // A directive owns its line: it has to start one, and the text
+                // after it has to start another.
+                if pragma.is_some() {
+                    if !at_line_start {
+                        writeln!(out.preprocessed)?;
+                    }
+                    writeln!(out.preprocessed, "{}", text)?;
+                    at_line_start = true;
+                    continue;
                 }
 
                 write!(out.preprocessed, "{}", text)?;
@@ -1259,6 +1305,14 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
 /// Check if a file is a C source file (by extension)
 fn is_source_file(path: &str) -> bool {
     path.ends_with(".c") || path.ends_with(".i") || path == "-"
+}
+
+/// A `.i` operand is already the output of `c17 -E` (POSIX 87981).
+///
+/// Standard input is not one of these: like GCC, c17 reads `-` as ordinary
+/// C source, there being no suffix to say otherwise.
+fn is_preprocessed_file(path: &str) -> bool {
+    path.ends_with(".i")
 }
 
 /// Check if a file is an assembly file (by extension)

@@ -38,46 +38,7 @@ pub(crate) fn int128_pair_start(ngrn: usize, num_arg_regs: usize) -> Option<usiz
     (start + 2 <= num_arg_regs).then_some(start)
 }
 
-pub(super) fn f64_to_f16_bits(val: f64) -> u16 {
-    let bits = val.to_bits();
-    let sign = ((bits >> 63) & 1) as u16;
-    let exp = ((bits >> 52) & 0x7FF) as i32;
-    let frac = bits & 0xFFFFFFFFFFFFF;
-
-    // Handle special cases
-    if exp == 0x7FF {
-        // NaN or Infinity
-        if frac != 0 {
-            // NaN: preserve some mantissa bits
-            return (sign << 15) | 0x7E00 | ((frac >> 42) as u16 & 0x1FF);
-        } else {
-            // Infinity
-            return (sign << 15) | 0x7C00;
-        }
-    }
-
-    // Rebias exponent: f64 bias is 1023, f16 bias is 15
-    let new_exp = exp - 1023 + 15;
-
-    if new_exp >= 31 {
-        // Overflow to infinity
-        return (sign << 15) | 0x7C00;
-    }
-
-    if new_exp <= 0 {
-        // Denormal or zero
-        if new_exp < -10 {
-            // Too small, flush to zero
-            return sign << 15;
-        }
-        // Denormal: shift mantissa right
-        let shift = 1 - new_exp;
-        let frac_with_hidden = frac | 0x10000000000000; // Add hidden bit
-        let shifted = frac_with_hidden >> (42 + shift);
-        return (sign << 15) | (shifted as u16 & 0x3FF);
-    }
-
-    // Normal number: truncate mantissa from 52 bits to 10 bits
-    let new_frac = (frac >> 42) as u16;
-    (sign << 15) | ((new_exp as u16) << 10) | (new_frac & 0x3FF)
-}
+/// Half-precision conversion lives in `crate::float`, which is where the
+/// rounding is defined; this target used to carry a verbatim copy, and the
+/// copy is what kept a rounding fix from reaching both backends at once.
+pub(super) use crate::float::f64_to_f16_bits;

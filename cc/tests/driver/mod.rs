@@ -701,3 +701,512 @@ fn driver_source_does_not_clobber_a_like_named_object_operand() {
     );
     assert_eq!(run_exe(&exe), 7);
 }
+
+// ============================================================================
+// #C140 — a `.i` operand is not preprocessed a second time
+//
+// POSIX 87981-87983: a `.i` is "a text file containing the output of c17 -E",
+// and "the processing already performed by c17 -E when the file was produced
+// shall not be repeated when the file is compiled."
+//
+// That is not a wholesale skip of translation phase 4. GCC keeps a five-entry
+// allowlist -- `#define`, `#undef`, `#pragma`, `#ident`, `#sccs` -- plus the
+// null `#` and linemarkers; everything else leaves a stray `#`. These pin both
+// halves, because dropping the allowlist would silently lose `#pragma pack`.
+// ============================================================================
+
+/// Compile `body` as a `.i` and return (success, combined output).
+fn compile_dot_i(name: &str, body: &str, extra: &[&str]) -> (bool, String) {
+    let w = WorkDir::new(name);
+    let src = w.write("t.i", body);
+    let obj = w.join("t.o");
+    let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    args.extend(["-c".to_string(), s(&src), "-o".to_string(), s(&obj)]);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let r = run_c17(&argv);
+    (r.success, format!("{}{}", r.stdout, r.stderr))
+}
+
+/// A macro defined in a `.i` is recorded but never substituted.
+///
+/// This is the headline case: c17 re-ran phase 4 and expanded `X`, so the
+/// program returned 1 where gcc rejects the source outright.
+#[test]
+fn driver_dot_i_does_not_expand_macros() {
+    let (ok, out) = compile_dot_i("i_nomacro", "#define X 1\nint main(void){return X;}\n", &[]);
+    assert!(
+        !ok,
+        "a `.i` was preprocessed again -- `X` must stay undeclared:\n{out}"
+    );
+    assert!(out.contains("X"), "expected a diagnostic naming X:\n{out}");
+}
+
+/// `-D` on the command line is phase-4 processing and does not reach a `.i`.
+#[test]
+fn driver_dot_i_ignores_command_line_defines() {
+    let (ok, out) = compile_dot_i("i_nodef", "int main(void){return X;}\n", &["-D", "X=0"]);
+    assert!(!ok, "-D reached a `.i` operand:\n{out}");
+}
+
+/// Predefined macros are spent too -- `c17 -E` already replaced them.
+#[test]
+fn driver_dot_i_does_not_expand_predefined_macros() {
+    for m in ["__LINE__", "__STDC__", "__FILE__"] {
+        let (ok, out) = compile_dot_i(
+            "i_nopredef",
+            &format!("int f(void){{return sizeof {m};}}\n"),
+            &[],
+        );
+        assert!(!ok, "{m} was expanded inside a `.i`:\n{out}");
+    }
+}
+
+/// The allowlist: these directives still run in a `.i`.
+#[test]
+fn driver_dot_i_keeps_the_allowlisted_directives() {
+    for (what, body) in [
+        ("#define", "#define X 1\nint main(void){return 0;}\n"),
+        ("#undef", "#undef NOPE\nint main(void){return 0;}\n"),
+        (
+            "#pragma",
+            "#pragma GCC unknown_to_everyone\nint main(void){return 0;}\n",
+        ),
+        ("#ident", "#ident \"x\"\nint main(void){return 0;}\n"),
+        ("null #", "#\nint main(void){return 0;}\n"),
+    ] {
+        let (ok, out) = compile_dot_i("i_allow", body, &[]);
+        assert!(ok, "{what} must survive in a `.i`:\n{out}");
+    }
+}
+
+/// Everything outside the allowlist leaves a stray `#`.
+///
+/// `#if 0` is the one that matters most: its body must be *kept*, because the
+/// conditional was already resolved when the `.i` was produced.
+#[test]
+fn driver_dot_i_rejects_directives_outside_the_allowlist() {
+    for (what, body) in [
+        (
+            "#include",
+            "#include <stdio.h>\nint main(void){return 0;}\n",
+        ),
+        ("#if", "#if 0\n#endif\nint main(void){return 0;}\n"),
+        ("#ifdef", "#ifdef NOPE\n#endif\nint main(void){return 0;}\n"),
+        ("#error", "#error boom\nint main(void){return 0;}\n"),
+        ("#line", "#line 100 \"fake.c\"\nint main(void){return 0;}\n"),
+    ] {
+        let (ok, out) = compile_dot_i("i_reject", body, &[]);
+        assert!(!ok, "{what} was processed inside a `.i`:\n{out}");
+        assert!(
+            out.contains("stray '#'"),
+            "{what} should leave a stray `#`:\n{out}"
+        );
+    }
+}
+
+/// `#pragma pack` must still take effect, or a preprocessed file silently
+/// loses its layout -- the reason the allowlist exists rather than a blanket
+/// skip of every `#` line.
+#[test]
+fn driver_dot_i_still_honors_pragma_pack() {
+    let w = WorkDir::new("i_pack");
+    let src = w.write(
+        "t.i",
+        "#pragma pack(1)\nstruct S{char c;int i;};\n\
+         int main(void){return sizeof(struct S)==5?0:1;}\n",
+    );
+    let exe = w.join("t");
+    let r = run_c17(&[&s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 0, "#pragma pack was dropped inside a `.i`");
+}
+
+/// `_Pragma` is a phase-4 operator, and `c17 -E` has already lowered it.
+#[test]
+fn driver_dot_i_does_not_process_the_pragma_operator() {
+    let w = WorkDir::new("i_pragma_op");
+    let src = w.write(
+        "t.i",
+        "_Pragma(\"pack(1)\")\nstruct S{char c;int i;};\n\
+         int main(void){return sizeof(struct S)==5?0:1;}\n",
+    );
+    let r = run_c17(&[&s(&src), "-o", &s(&w.join("t"))]);
+    assert!(!r.success, "_Pragma was executed inside a `.i`");
+}
+
+/// Phases 1 and 2 do not run again either.
+#[test]
+fn driver_dot_i_skips_trigraphs_and_line_splicing() {
+    // Phase 1: a trigraph stays three characters even with --trigraphs.
+    let (ok, out) = compile_dot_i(
+        "i_trigraph",
+        "int main(void){return sizeof(\"??=\")==4?0:1;}\n",
+        &["--trigraphs"],
+    );
+    assert!(ok, "{out}");
+    let w = WorkDir::new("i_trigraph_run");
+    let src = w.write("t.i", "int main(void){return sizeof(\"??=\")==4?0:1;}\n");
+    let exe = w.join("t");
+    let r = run_c17(&["--trigraphs", &s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 0, "a trigraph was folded inside a `.i`");
+
+    // Phase 2: a backslash-newline is text, not a splice.
+    let (ok, out) = compile_dot_i(
+        "i_splice",
+        "int a\\\nb = 0;\nint main(void){return 0;}\n",
+        &[],
+    );
+    assert!(!ok, "a `.i` was line-spliced again:\n{out}");
+}
+
+/// Phases 5 and 6 are the compiler's, not the preprocessor's, and still run.
+#[test]
+fn driver_dot_i_still_runs_the_later_phases() {
+    let w = WorkDir::new("i_late");
+    let src = w.write(
+        "t.i",
+        "int main(void){return sizeof(\"a\" \"b\")==3 && sizeof(\"\\x41\\101\")==3 ? 0 : 1;}\n",
+    );
+    let exe = w.join("t");
+    let r = run_c17(&[&s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(
+        run_exe(&exe),
+        0,
+        "string concatenation or escapes stopped working"
+    );
+}
+
+/// A `.c` holding the same text is still fully preprocessed -- the gate is the
+/// suffix, and nothing about the normal path changed.
+#[test]
+fn driver_dot_c_is_still_preprocessed() {
+    let w = WorkDir::new("i_control");
+    let src = w.write("t.c", "#define X 0\nint main(void){return X;}\n");
+    let exe = w.join("t");
+    let r = run_c17(&[&s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 0);
+}
+
+// ============================================================================
+// #C141 — `-E` output must be C, not the internal pragma marker
+// ============================================================================
+
+/// A `#pragma pack` must survive `-E` as a directive.
+///
+/// It reaches the parser as a marker token carrying an internal payload, and
+/// `show_token` spells that payload `<PRAGMA pack:set:1>` -- a debug form, not
+/// C. The `-E` writer filtered the other internal markers but not this one, so
+/// `c17 -E` on any source using the pragma produced a file that neither c17
+/// nor gcc would compile. POSIX 87981 makes that output a `.i` operand, so
+/// this made the whole `.i` form unreachable for such a source.
+#[test]
+fn driver_preprocess_writes_pragma_pack_as_a_directive() {
+    let w = WorkDir::new("pp_pragma");
+    let src = w.write(
+        "q.c",
+        "#pragma pack(1)\nstruct S{char c;int i;};\n\
+         int main(void){return sizeof(struct S)==5?0:1;}\n",
+    );
+    let i = w.join("q.i");
+    let r = run_c17(&["-E", &s(&src), "-o", &s(&i)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+
+    let body = std::fs::read_to_string(&i).unwrap();
+    assert!(
+        !body.contains("<PRAGMA"),
+        "the internal marker reached the output:\n{body}"
+    );
+    assert!(
+        body.contains("#pragma pack(1)"),
+        "the pragma was dropped instead of written back:\n{body}"
+    );
+
+    // And the round trip has to keep the packing, not merely parse.
+    let exe = w.join("q");
+    let r = run_c17(&[&s(&i), "-o", &s(&exe)]);
+    assert!(
+        r.success,
+        "-E output did not compile: {}{}",
+        r.stdout, r.stderr
+    );
+    assert_eq!(run_exe(&exe), 0, "the packing was lost across -E");
+}
+
+/// Every `#pragma pack` form round-trips, not just the one with a number.
+#[test]
+fn driver_preprocess_writes_every_pragma_pack_form() {
+    let w = WorkDir::new("pp_pragma_forms");
+    let src = w.write(
+        "f.c",
+        "#pragma pack(push, 1)\nstruct A{char c;int i;};\n\
+         #pragma pack(pop)\nstruct B{char c;int i;};\n\
+         #pragma pack()\nstruct C{char c;int i;};\n\
+         int main(void){return sizeof(struct A)==5 && sizeof(struct B)==8 ? 0 : 1;}\n",
+    );
+    let i = w.join("f.i");
+    let r = run_c17(&["-E", &s(&src), "-o", &s(&i)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+
+    let body = std::fs::read_to_string(&i).unwrap();
+    assert!(!body.contains("<PRAGMA"), "internal marker leaked:\n{body}");
+    for want in [
+        "#pragma pack(push, 1)",
+        "#pragma pack(pop)",
+        "#pragma pack()",
+    ] {
+        assert!(body.contains(want), "missing {want}:\n{body}");
+    }
+
+    let exe = w.join("f");
+    let r = run_c17(&[&s(&i), "-o", &s(&exe)]);
+    assert!(r.success, "{}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 0, "push/pop did not survive -E");
+}
+
+/// Preprocessing an already-preprocessed file stays stable and correct.
+///
+/// The second pass must attribute the text to the file the linemarkers name,
+/// not to the `.i` it is reading, and the result must still compile and run.
+#[test]
+fn driver_preprocess_of_a_dot_i_is_stable() {
+    let w = WorkDir::new("pp_idem");
+    let src = w.write(
+        "q.c",
+        "#pragma pack(1)\nstruct S{char c;int i;};\n\
+         int main(void){return sizeof(struct S)==5?0:1;}\n",
+    );
+    let one = w.join("q1.i");
+    let two = w.join("q2.i");
+    let three = w.join("q3.i");
+    assert!(run_c17(&["-E", &s(&src), "-o", &s(&one)]).success);
+    assert!(run_c17(&["-E", &s(&one), "-o", &s(&two)]).success);
+    assert!(run_c17(&["-E", &s(&two), "-o", &s(&three)]).success);
+
+    // The first line names the file being read, so it differs by construction;
+    // everything after it has converged.
+    let skip_first = |p: &Path| {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        skip_first(&two),
+        skip_first(&three),
+        "re-preprocessing keeps changing the output"
+    );
+
+    // The second-generation file names the original source, not the `.i`.
+    let body = std::fs::read_to_string(&two).unwrap();
+    assert!(
+        body.contains("q.c\""),
+        "lost the original file name:\n{body}"
+    );
+
+    for f in [&one, &two, &three] {
+        let exe = w.join("out");
+        let r = run_c17(&[&s(f), "-o", &s(&exe)]);
+        assert!(
+            r.success,
+            "{} did not compile: {}{}",
+            s(f),
+            r.stdout,
+            r.stderr
+        );
+        assert_eq!(run_exe(&exe), 0, "{} lost the packing", s(f));
+    }
+}
+
+/// A search-path option must not be mistaken for a pathname operand.
+///
+/// `VALUE_OPTIONS` tells the link-order scan which options swallow the word
+/// after them. `-isystem` and `-idirafter` were listed under their single-dash
+/// gcc spellings, but `preprocess_args_from` rewrites those to double-dash
+/// before clap sees them and the scan runs on the rewritten vector -- so the
+/// entries never matched, the directory was read as a pathname operand, and
+/// `ordering_recovered` went false. The link line then silently fell back to
+/// its unordered shape.
+///
+/// The observable is which of two rival archives wins, as in
+/// `driver_library_order_is_significant`: that is a property of the order c17
+/// hands the linker, so it holds everywhere. The sharper negative -- a library
+/// named before its user failing to resolve -- is GNU ld's one-pass archive
+/// semantics rather than a POSIX guarantee, and lives in the Linux-only test
+/// below.
+#[test]
+fn driver_isystem_does_not_disturb_library_ordering() {
+    let w = WorkDir::new("isystem_order");
+    let libdir = build_rival_archives(&w);
+    std::fs::create_dir_all(w.join("inc")).unwrap();
+    let user = w.write(
+        "usr.c",
+        "int which(void);\nint main(void){return which();}\n",
+    );
+    let ldir = format!("-L{}", libdir.to_string_lossy());
+    let incdir = s(&w.join("inc"));
+
+    for opt in ["-isystem", "-idirafter"] {
+        let exe1 = w.join("ord1");
+        let r = run_c17(&[
+            opt,
+            &incdir,
+            &s(&user),
+            &ldir,
+            "-lQ",
+            "-lP",
+            "-o",
+            &s(&exe1),
+        ]);
+        assert!(r.success, "{opt} broke the link: {}{}", r.stdout, r.stderr);
+        assert_eq!(
+            run_exe(&exe1),
+            1,
+            "{opt} disturbed ordering: -lQ came first, so libQ must win"
+        );
+
+        let exe2 = w.join("ord2");
+        let r = run_c17(&[
+            opt,
+            &incdir,
+            &s(&user),
+            &ldir,
+            "-lP",
+            "-lQ",
+            "-o",
+            &s(&exe2),
+        ]);
+        assert!(r.success, "{opt} broke the link: {}{}", r.stdout, r.stderr);
+        assert_eq!(
+            run_exe(&exe2),
+            2,
+            "{opt} disturbed ordering: -lP came first, so libP must win"
+        );
+    }
+}
+
+/// The negative half of the pair above: with a search-path option present, a
+/// library named before its user must still fail to resolve.
+///
+/// Linux only, for the reason given on
+/// `driver_library_named_before_its_user_does_not_resolve`: Apple's linker
+/// resolves across every archive regardless of order, so the failure this
+/// looks for cannot be produced there.
+#[cfg(target_os = "linux")]
+#[test]
+fn driver_isystem_does_not_recover_a_library_named_too_early() {
+    let w = WorkDir::new("isystem_early");
+    let libdir = build_rival_archives(&w);
+    std::fs::create_dir_all(w.join("inc")).unwrap();
+    let user = w.write(
+        "usr.c",
+        "int which(void);\nint main(void){return which();}\n",
+    );
+    let ldir = format!("-L{}", libdir.to_string_lossy());
+    let incdir = s(&w.join("inc"));
+
+    // The baseline, without the option.
+    let before = run_c17(&[&ldir, "-lQ", &s(&user), "-o", &s(&w.join("a"))]);
+    assert!(
+        !before.success,
+        "an archive named before its user must not resolve: {}{}",
+        before.stdout, before.stderr
+    );
+
+    // Adding a search-path option must not change that.
+    for opt in ["-isystem", "-idirafter"] {
+        let r = run_c17(&[
+            opt,
+            &incdir,
+            &ldir,
+            "-lQ",
+            &s(&user),
+            "-o",
+            &s(&w.join("b")),
+        ]);
+        assert!(
+            !r.success,
+            "{opt} made link ordering fall back to its unordered shape: {}{}",
+            r.stdout, r.stderr
+        );
+    }
+}
+
+/// A diagnostic from inside a directive is attributed like every other.
+///
+/// A directive handler pulls its own tokens, so they never pass the
+/// linemarker remap in the main loop. `#pragma pack` captured its position
+/// before remapping and handed it to `parse_pack_body`, which reports five
+/// diagnostics from it -- so a malformed pragma cited the `.i` while the error
+/// on the very next line cited the original file. Two diagnostics about one
+/// file disagreeing on which file it is.
+#[test]
+fn driver_dot_i_attributes_pragma_diagnostics_to_the_original_file() {
+    let w = WorkDir::new("i_pragma_diag");
+    let src = w.write(
+        "pp.i",
+        "# 50 \"orig.c\"\n#pragma pack(bogus)\nint main(void){ return nope; }\n",
+    );
+    let r = run_c17(&["-c", &s(&src), "-o", &s(&w.join("pp.o"))]);
+    assert!(
+        !r.success,
+        "the undeclared identifier should fail the compile"
+    );
+
+    assert!(
+        r.stderr.contains("orig.c:50:"),
+        "the pragma diagnostic was not attributed to orig.c:50:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("orig.c:51:"),
+        "the following error was not attributed to orig.c:51:\n{}",
+        r.stderr
+    );
+    // The physical positions in the preprocessed text must not survive.
+    assert!(
+        !r.stderr.contains("pp.i:2:") && !r.stderr.contains("pp.i:3:"),
+        "a diagnostic still cites the position in the preprocessed text:\n{}",
+        r.stderr
+    );
+}
+
+/// `#ident` and `#sccs` are directives c17 knows, in both modes.
+///
+/// Both were named in the `.i` allowlist while having no dispatch arm, so
+/// they fell through to the unknown-directive arm and warned -- in a `.c` as
+/// well as a `.i`. gcc is silent about both. An allowlist that names a
+/// directive the dispatcher does not handle claims support that is not there.
+#[test]
+fn driver_ident_and_sccs_are_accepted_quietly() {
+    for (name, body) in [
+        (
+            "ident",
+            "#ident \"version string\"\nint main(void){return 0;}\n",
+        ),
+        (
+            "sccs",
+            "#sccs \"version string\"\nint main(void){return 0;}\n",
+        ),
+    ] {
+        for suffix in ["c", "i"] {
+            let w = WorkDir::new(&format!("{name}_{suffix}"));
+            let src = w.write(&format!("t.{suffix}"), body);
+            let r = run_c17(&["-c", &s(&src), "-o", &s(&w.join("t.o"))]);
+            assert!(
+                r.success,
+                "#{name} in a .{suffix} was rejected: {}{}",
+                r.stdout, r.stderr
+            );
+            assert!(
+                r.stderr.is_empty(),
+                "#{name} in a .{suffix} produced a diagnostic:\n{}",
+                r.stderr
+            );
+        }
+    }
+}

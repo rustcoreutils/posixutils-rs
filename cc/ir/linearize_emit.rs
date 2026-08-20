@@ -295,9 +295,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             storage_bits,
         ));
 
-        // 4. Sign extend if this is a signed bitfield
-        if !self.types.is_unsigned(typ) && bit_width < storage_bits {
-            self.emit_sign_extend_bitfield(masked, bit_width, storage_bits)
+        // 4. Sign extend if this is a signed bitfield.
+        //
+        // The value's width is the *declared type's*, not the access unit's.
+        // Extending to the unit left `long long a:4` sign-extended only as far
+        // as the unit reached -- for a packed field that unit is one byte, so
+        // -1 came back 4294967295 with `a < 0` false. And where the field
+        // exactly fills its unit the guard was false outright, so a signed
+        // field got no extension at all.
+        let value_bits = self.types.size_bits(typ);
+        if !self.types.is_unsigned(typ) && bit_width < value_bits {
+            self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
         } else {
             masked
         }
@@ -408,8 +416,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             carrier_bits,
         ));
 
-        if !self.types.is_unsigned(typ) && bit_width < carrier_bits {
-            self.emit_sign_extend_bitfield(masked, bit_width, carrier_bits)
+        // As above: the declared type's width, not the carrier's.
+        let value_bits = self.types.size_bits(typ);
+        if !self.types.is_unsigned(typ) && bit_width < value_bits {
+            self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
         } else {
             masked
         }
@@ -431,10 +441,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         // field's top bit at bit 7, where an arithmetic shift sees a positive
         // value and extends nothing. `int a:4` was correct only because its
         // storage unit is 32 bits, which happens to be the operation width.
+        //
+        // A field of `__int128` needs the 128-bit tier: capping the operation
+        // at 64 sign-extended only the low half, so `__int128 f:27 = -1` came
+        // back with its top 64 bits clear.
         let (typ, op_bits) = if target_bits <= 32 {
             (self.types.int_id, 32)
-        } else {
+        } else if target_bits <= 64 {
             (self.types.long_id, 64)
+        } else {
+            (self.types.int128_id, 128)
         };
         let shift_amount = op_bits - bit_width;
 

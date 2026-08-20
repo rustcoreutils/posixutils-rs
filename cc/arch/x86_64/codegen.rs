@@ -4036,6 +4036,15 @@ impl X86_64CodeGen {
         // SSE outputs to copy back once the template has run:
         // (scratch register, destination, operand size in bits).
         let mut sse_output_moves: Vec<(XmmReg, Loc, u32)> = Vec::new();
+        // x87 operands, which live on the FP stack rather than in a register.
+        // Loaded with `fldt` before the template and popped back with `fstpt`
+        // after it; the template names them `%st`. Only one is supported --
+        // keeping a second in step with the stack's own discipline is what
+        // makes an x87 asm easy to get subtly wrong, and a wrong answer here
+        // is worse than a diagnostic.
+        let mut x87_load: Option<Loc> = None;
+        let mut x87_store: Option<Loc> = None;
+        let mut x87_taken = false;
 
         // SSE read-write (`"+x"`) operands whose current value must reach the
         // scratch before the template runs: (scratch, source pseudo, size).
@@ -4096,6 +4105,30 @@ impl X86_64CodeGen {
                     // The operand is rendered as text rather than a register
                     // slot because `AsmOperandSlot` carries only a general
                     // register; `XmmReg::name()` already includes the `%`.
+                    // An x87-class output. The value is popped off the FP
+                    // stack into the operand's own storage after the template.
+                    // A read-write `"+t"` is also loaded before it.
+                    _ if Self::constraint_requires_x87(&output.constraint) => {
+                        if x87_taken {
+                            crate::diag::error(
+                                insn.pos.unwrap_or_default(),
+                                "only one x87 register constraint is supported in one \
+                                 asm statement",
+                            );
+                        }
+                        x87_taken = true;
+                        if !matches!(loc, Loc::Stack(_)) {
+                            crate::diag::error(
+                                insn.pos.unwrap_or_default(),
+                                "an x87 asm operand must live in memory",
+                            );
+                        }
+                        if output.constraint.contains('+') {
+                            x87_load = Some(loc.clone());
+                        }
+                        x87_store = Some(loc.clone());
+                        slots.push(mk(None, Some("%st".to_string())));
+                    }
                     _ if Self::constraint_requires_sse(&output.constraint) => {
                         match sse_scratch.pop() {
                             Some(xmm) => {
@@ -4346,6 +4379,12 @@ impl X86_64CodeGen {
             self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
         }
 
+        // Push an x87 operand onto the FP stack, where `%st` names it.
+        if let Some(Loc::Stack(off)) = &x87_load {
+            let addr = self.stack_mem(*off).format(&self.base.target);
+            self.push_lir(X86Inst::Directive(Directive::Raw(format!("fldt {addr}"))));
+        }
+
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
         let goto_labels_formatted: Vec<(String, String)> = asm_data
             .goto_labels
@@ -4368,6 +4407,12 @@ impl X86_64CodeGen {
             if !trimmed.is_empty() {
                 self.push_lir(X86Inst::Directive(Directive::Raw(trimmed.to_string())));
             }
+        }
+
+        // Pop the x87 result back into the operand's own storage.
+        if let Some(Loc::Stack(off)) = &x87_store {
+            let addr = self.stack_mem(*off).format(&self.base.target);
+            self.push_lir(X86Inst::Directive(Directive::Raw(format!("fstpt {addr}"))));
         }
 
         // Copy SSE outputs out of the scratch register into where the
@@ -4677,9 +4722,22 @@ impl X86_64CodeGen {
     /// the general registers: an operand can be spilled to the stack and still
     /// satisfy `"x"`, but it cannot be handed over as a general register.
     fn constraint_requires_sse(constraint: &str) -> bool {
-        constraint
-            .chars()
-            .any(|c| matches!(c, 'x' | 'f' | 't' | 'u' | 'v' | 'Y'))
+        // `f`, `t` and `u` are the **x87 stack** classes on x86, not SSE:
+        // `f` any x87 register, `t` st(0), `u` st(1). Counting them here sent
+        // a long double through an XMM scratch and emitted `movt ..., %xmm15`,
+        // which is not an instruction -- musl's
+        // `long double sqrtl(long double x){ __asm__("fsqrt" : "+t"(x)); }`
+        // failed to assemble. See `constraint_requires_x87`.
+        constraint.chars().any(|c| matches!(c, 'x' | 'v' | 'Y'))
+    }
+
+    /// An x87 stack class: `t` is st(0), `u` is st(1), `f` is any of them.
+    ///
+    /// c17 keeps a long double in memory and reaches it with `fldt`/`fstpt`,
+    /// so an x87 operand is loaded onto the stack before the template and
+    /// popped back afterwards rather than being given a register.
+    fn constraint_requires_x87(constraint: &str) -> bool {
+        constraint.chars().any(|c| matches!(c, 'f' | 't' | 'u'))
     }
 
     fn constraint_requires_register(constraint: &str) -> bool {

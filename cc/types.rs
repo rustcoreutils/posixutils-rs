@@ -1461,6 +1461,18 @@ impl TypeTable {
             return (!ok).then_some(AssignFault::Incompatible);
         }
 
+        // A null pointer constant assigns to any pointer (6.5.16.1p1), and
+        // `(void *)0` is one (6.3.2.3p3) -- so this has to be asked before the
+        // pointer-to-pointer rules, not after them. It was read only in the
+        // `t_ptr && !v_ptr` branch below, which a null constant that had
+        // already decayed to `void *` never reaches. With glibc's
+        // `#define NULL ((void *)0)` that made every `fp = NULL` on a function
+        // pointer a "ISO C forbids ... function pointer and 'void *'"
+        // diagnostic, and broke any -Werror build using function pointers.
+        if value_is_null_constant && t_ptr {
+            return None;
+        }
+
         if t_ptr && v_ptr {
             let (Some(t_pointee), Some(v_pointee)) = (t_pointee, v_pointee) else {
                 return None;
@@ -1637,6 +1649,106 @@ impl TypeTable {
     #[inline]
     pub fn spelled_unsigned(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
+    }
+
+    /// The common type of two operands under the usual arithmetic conversions
+    /// (C17 6.3.1.8) -- the type C converts both to before operating.
+    ///
+    /// It lives on the table rather than on one of its callers because three
+    /// of them need it and only this one has no other state: the linearizer
+    /// lowering an arithmetic expression, and the constant folder, which
+    /// reaches a `&TypeTable` and nothing else.
+    pub fn common_type(&self, left: TypeId, right: TypeId) -> TypeId {
+        // C99 6.3.1.8 usual arithmetic conversions:
+        // 1. If either is long double, convert to long double
+        // 2. Else if either is double, convert to double
+        // 3. Else if either is float, convert to float
+        // 4. Otherwise apply integer promotions, then:
+        //    a. If both have same type after promotion, done
+        //    b. If both signed or both unsigned, convert narrower to wider
+        //    c. If unsigned has rank >= signed, convert signed to unsigned
+        //    d. If signed can represent all unsigned values, convert to signed
+        //    e. Otherwise convert both to unsigned version of signed type
+
+        // Check for floating point types
+        let left_float = self.is_float(left);
+        let right_float = self.is_float(right);
+
+        let left_kind = self.kind(left);
+        let right_kind = self.kind(right);
+
+        if left_float || right_float {
+            // At least one operand is floating point
+            // Use the wider floating point type
+            if left_kind == TypeKind::Float128 || right_kind == TypeKind::Float128 {
+                return self.float128_id;
+            }
+            if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
+                return self.longdouble_id;
+            }
+            if left_kind == TypeKind::Double || right_kind == TypeKind::Double {
+                return self.double_id;
+            }
+            if left_kind == TypeKind::Float || right_kind == TypeKind::Float {
+                return self.float_id;
+            }
+            // Both are Float16 (C23: _Float16 stays as _Float16)
+            if left_kind == TypeKind::Float16 || right_kind == TypeKind::Float16 {
+                return self.float16_id;
+            }
+            // Fallback to float for any remaining float cases
+            return self.float_id;
+        }
+
+        // Apply integer promotions first (C99 6.3.1.1)
+        let left_promoted = self.integer_promote(left);
+        let right_promoted = self.integer_promote(right);
+
+        let left_size = self.size_bits(left_promoted);
+        let right_size = self.size_bits(right_promoted);
+        let left_unsigned = self.is_unsigned(left_promoted);
+        let right_unsigned = self.is_unsigned(right_promoted);
+        let left_kind = self.kind(left_promoted);
+        let right_kind = self.kind(right_promoted);
+
+        // If both have same type after promotion, use that type
+        if left_kind == right_kind && left_unsigned == right_unsigned && left_size == right_size {
+            return left_promoted;
+        }
+
+        // If both signed or both unsigned, convert narrower to wider
+        if left_unsigned == right_unsigned {
+            return if left_size >= right_size {
+                left_promoted
+            } else {
+                right_promoted
+            };
+        }
+
+        // Mixed signedness case
+        let (signed_id, unsigned_id) = if left_unsigned {
+            (right_promoted, left_promoted)
+        } else {
+            (left_promoted, right_promoted)
+        };
+
+        let signed_size = self.size_bits(signed_id);
+        let unsigned_size = self.size_bits(unsigned_id);
+
+        // If unsigned has rank >= signed, convert to unsigned
+        if unsigned_size >= signed_size {
+            return unsigned_id;
+        }
+
+        // If signed type can represent all values of unsigned type, use signed
+        // (This is true when signed_size > unsigned_size on our platforms)
+        if signed_size > unsigned_size {
+            return signed_id;
+        }
+
+        // Otherwise convert both to unsigned version of signed type
+        // (This case shouldn't happen on LP64 since we already handled size comparisons)
+        self.unsigned_version(signed_id)
     }
 
     /// Apply the integer promotions (C17 6.3.1.1p2).

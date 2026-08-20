@@ -232,6 +232,8 @@ define_keywords! {
     (WARNING,           "warning",           0),
     (PRAGMA,            "pragma",            0),
     (LINE,              "line",              0),
+    (PP_IDENT,          "ident",             0),
+    (SCCS,              "sccs",              0),
 
     // ---- Preprocessor special names ----
     (_,                 "defined",           0),

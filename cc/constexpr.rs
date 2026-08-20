@@ -175,9 +175,21 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             Some((env.types().size_bits(*type_id) / 8) as i128)
         }
 
-        ExprKind::SizeofExpr(inner) => inner
-            .typ
-            .map(|typ| (env.types().size_bits(typ) / 8) as i128),
+        ExprKind::SizeofExpr(inner) => {
+            // `sizeof a` where `a` is a variable-length array is computed at
+            // run time (6.5.3.4p2) and is not an integer constant expression.
+            // `SizeofType` grew this guard; this arm did not, so `case sizeof a:`
+            // folded to 0 -- `size_bits` reports 0 for an array with no extent --
+            // and the case label was silently accepted with the wrong value.
+            //
+            // A `TypeId` for `int[n]` is indistinguishable from one for `int[]`,
+            // so the question has to be asked of the levels, not the size.
+            let typ = inner.typ?;
+            if env.types().unsized_array_levels(typ) > 0 {
+                return None;
+            }
+            Some((env.types().size_bits(typ) / 8) as i128)
+        }
 
         ExprKind::AlignofType(type_id) => Some(env.types().alignment(*type_id) as i128),
 
@@ -250,28 +262,55 @@ fn eval_binary(
     let l = eval(env, scope, left)?;
     let r = eval(env, scope, right)?;
 
-    // C converts both operands to the common type before comparing, so an
-    // unsigned operand makes the comparison unsigned. Doing it signed made
-    // `(unsigned)-1 > 0` false, in an enumerator and in an array size alike.
-    // Ask the predicate rather than the modifier bit: the bit is silent for
-    // the types whose signedness does not live there.
-    if op.is_comparison() {
-        let unsigned = [left, right].iter().any(|e| {
-            e.typ
-                .is_some_and(|t| env.types().is_integer(t) && env.types().is_unsigned(t))
-        });
-        if unsigned {
-            return Some(compare(op, (l as u128).cmp(&(r as u128))) as i128);
+    // C converts both operands to the common type before operating, so the
+    // signedness of the operation is the common type's -- not "either operand
+    // is unsigned", and not the left operand's.
+    //
+    // Both shortcuts get the promotions wrong. `(unsigned char)200 > -1` is a
+    // *signed* comparison, because both operands promote to `int` (6.3.1.1p2)
+    // and the answer is true; asking whether either operand is unsigned made
+    // it false. `-1L < 1u` is *signed* on LP64, because `long` represents
+    // every `unsigned int`; the same shortcut made it false.
+    let common = match (left.typ, right.typ) {
+        (Some(lt), Some(rt)) if env.types().is_integer(lt) && env.types().is_integer(rt) => {
+            Some(env.types().common_type(lt, rt))
         }
-        return Some(compare(op, l.cmp(&r)) as i128);
+        _ => None,
+    };
+    let unsigned = common.is_some_and(|t| env.types().is_unsigned(t));
+
+    // Naming the common type is only half of it: C *converts* both operands to
+    // it, and the walk carries each value reduced to its own type instead. For
+    // `-1 / 2u` the left operand has to become 4294967295 before the unsigned
+    // division, not stay an `i128` -1 whose `as u128` is 2^128-1. Likewise
+    // `-1 > 4294967295u` is false, and comparing the raw values as `u128` made
+    // it true.
+    //
+    // The shifts below deliberately use the raw `l` and `r`: 6.5.7p3 promotes
+    // each operand separately, so there is no common type to convert to.
+    let (lc, rc) = match common {
+        Some(t) => (normalize(env, Some(t), l), normalize(env, Some(t), r)),
+        None => (l, r),
+    };
+
+    if op.is_comparison() {
+        if unsigned {
+            return Some(compare(op, (lc as u128).cmp(&(rc as u128))) as i128);
+        }
+        return Some(compare(op, lc.cmp(&rc)) as i128);
     }
 
-    // Division, remainder and right shift are the three operations whose
-    // answer depends on the operands' signedness. `normalize` has already made
-    // an unsigned operand non-negative for every width it can represent, so
-    // this matters only at 128 bits -- where it matters absolutely, since
-    // `(unsigned __int128)-1` is a negative `i128`.
-    let unsigned = left
+    // Division and remainder are the other operations whose answer depends on
+    // signedness. `normalize` has already made an unsigned operand
+    // non-negative for every width it can represent, so this matters mainly at
+    // 128 bits -- where it matters absolutely, since `(unsigned __int128)-1` is
+    // a negative `i128` -- and wherever the common type's signedness differs
+    // from the left operand's, as in `-1 / 2u`.
+    //
+    // The shifts below deliberately do *not* use it: 6.5.7p3 promotes each
+    // operand separately and makes the result the left operand's type, so a
+    // shift follows the left operand alone.
+    let left_unsigned = left
         .typ
         .is_some_and(|t| env.types().is_integer(t) && env.types().is_unsigned(t));
 
@@ -280,10 +319,10 @@ fn eval_binary(
         BinaryOp::Sub => Some(l.wrapping_sub(r)),
         BinaryOp::Mul => Some(l.wrapping_mul(r)),
         BinaryOp::Div if unsigned => {
-            (r != 0).then(|| ((l as u128).wrapping_div(r as u128)) as i128)
+            (rc != 0).then(|| ((lc as u128).wrapping_div(rc as u128)) as i128)
         }
         BinaryOp::Mod if unsigned => {
-            (r != 0).then(|| ((l as u128).wrapping_rem(r as u128)) as i128)
+            (rc != 0).then(|| ((lc as u128).wrapping_rem(rc as u128)) as i128)
         }
         BinaryOp::Div => (r != 0).then(|| l.wrapping_div(r)),
         BinaryOp::Mod => (r != 0).then(|| l.wrapping_rem(r)),
@@ -315,7 +354,7 @@ fn eval_binary(
                 31
             };
             let amount = (r & mask) as u32;
-            Some(match (op, unsigned) {
+            Some(match (op, left_unsigned) {
                 (BinaryOp::Shl, _) => l.wrapping_shl(amount),
                 // A logical shift, not an arithmetic one. Below 128 bits
                 // `normalize` has already cleared the sign bit; at 128 the

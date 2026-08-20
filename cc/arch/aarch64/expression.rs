@@ -1138,8 +1138,18 @@ fn is_logical_immediate(value: u64, size: u32) -> bool {
     if e == 0 || e == elem_mask {
         return false;
     }
-    let rotations = (0..elem).map(|r| ((e >> r) | (e << (elem - r))) & elem_mask);
-    rotations.into_iter().any(|r| (r + 1) & r == 0)
+    // Rotate within the element. `r == 0` is the unrotated value, and spelling
+    // it as `e << (elem - r)` shifts by `elem`, which is undefined at 64 --
+    // masked to a no-op in release, an "attempt to shift left with overflow"
+    // panic in a debug build, and so an ICE on `x & 0xffffffff00000000`.
+    let rotate = |r: u32| -> u64 {
+        if r == 0 {
+            e
+        } else {
+            ((e >> r) | (e << (elem - r))) & elem_mask
+        }
+    };
+    (0..elem).map(rotate).any(|r| (r + 1) & r == 0)
 }
 
 #[cfg(test)]
@@ -1170,6 +1180,39 @@ mod immediate_tests {
         assert!(!is_logical_immediate(0, 64));
         assert!(!is_logical_immediate(u64::MAX, 64));
         assert!(!is_logical_immediate(0x0123_4567_89AB_CDEF, 64));
+    }
+
+    /// A 64-bit element must survive the unrotated case.
+    ///
+    /// Every value whose halves differ leaves the repeat width at 64, so the
+    /// rotation loop reaches `r == 0` with `elem == 64`. Written as
+    /// `e << (elem - r)` that is a shift by 64: masked to a no-op in release,
+    /// but an "attempt to shift left with overflow" panic in a debug build --
+    /// which made `cargo test` fail outright and a debug-built c17 ICE on
+    /// `x & 0xffffffff00000000`. Release and debug must agree.
+    #[test]
+    fn logical_immediates_handle_an_unrotated_64_bit_element() {
+        // Encodable only at rotation 0 or by wrapping: a single run of ones
+        // that does not repeat below 64 bits.
+        assert!(is_logical_immediate(0x0000_0000_FFFF_FFFF, 64));
+        assert!(is_logical_immediate(0xFFFF_FFFF_0000_0000, 64));
+        assert!(is_logical_immediate(0x0000_FFFF_FFFF_0000, 64));
+        // Not encodable, and still must not panic.
+        for v in [
+            0x0123_4567_89AB_CDEFu64,
+            0xDEAD_BEEF_CAFE_BABE,
+            0x8000_0000_0000_0001,
+        ] {
+            let _ = is_logical_immediate(v, 64);
+        }
+        // The whole 64-bit space of single-bit values, every one of which
+        // leaves `elem` at 64 and so walks the full rotation loop.
+        for bit in 0..64 {
+            assert!(
+                is_logical_immediate(1u64 << bit, 64),
+                "a single set bit at {bit} is always encodable"
+            );
+        }
     }
 
     /// Each family has its own encoding, and one 0..=4095 test used to serve

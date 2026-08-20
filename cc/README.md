@@ -105,10 +105,18 @@ Supported:
 - The C17 language, C99 baseline and all C11 additions alike
 - C11 additions: `_Generic`, `_Atomic` / `<stdatomic.h>` (including access through ordinary operators), `<tgmath.h>`, `_Noreturn`, `_Static_assert`, `_Alignas` / `_Alignof`, `_Thread_local` (Local-Exec and Initial-Exec models), anonymous struct/union members, Unicode literals
 - GCC-compatible inline assembly: extended asm with constraints, clobbers, named operands, matching constraints, `asm goto` with labels
+- Variably modified types everywhere C17 admits them, including a `typedef` of
+  one (6.7.7), whose extents are evaluated at the typedef rather than at each use
 
 Not yet implemented (features we want to add):
 - `-fverbose-asm`
 - assembly peephole optimizations
+
+Known defects:
+- An SSE or vector inline-asm **output** constraint (`"=x"`, `"=w"`) is given a
+  general register, so the template renders as `movsd %xmm15, %rax` and the
+  assembler rejects it. The input side is correct. See #C139 in
+  [audit.md](audit.md).
 
 Will not implement:
 - `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,

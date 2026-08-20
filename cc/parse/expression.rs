@@ -1076,13 +1076,25 @@ impl<'a> Parser<'a> {
 
     /// Apply trailing qualifiers to a type and return the qualified type id
     /// Used for patterns like "struct foo const *" where const comes after the struct
-    fn apply_trailing_qualifiers(&mut self, base_type: TypeId) -> TypeId {
-        let trailing_mods = self.consume_type_qualifiers();
-        if trailing_mods.is_empty() {
+    /// Apply the qualifiers written after a tag reference, plus `leading` --
+    /// the ones already collected before it.
+    ///
+    /// Both halves matter and only the trailing half used to be applied, so
+    /// `_Atomic struct S;` for an already-declared tag quietly produced the
+    /// unqualified struct. That is invisible for `const` and `volatile`, which
+    /// the back end does not act on, and load-bearing for `_Atomic`, which
+    /// decides both the access and the alignment.
+    fn apply_trailing_qualifiers_with(
+        &mut self,
+        base_type: TypeId,
+        leading: TypeModifiers,
+    ) -> TypeId {
+        let mods = leading | self.consume_type_qualifiers();
+        if mods.is_empty() {
             base_type
         } else {
             let mut qualified_type = self.types.get(base_type).clone();
-            qualified_type.modifiers |= trailing_mods;
+            qualified_type.modifiers |= mods;
             self.types.intern(qualified_type)
         }
     }
@@ -1140,10 +1152,58 @@ impl<'a> Parser<'a> {
                 dims.extend(spec_dims);
                 Some((typ, dims))
             }
-            _ => {
+            // A *named* declarator means this was never a type-name -- `(x)`
+            // in a cast position, say. Rewind and let the caller read it as
+            // an expression.
+            Ok(_) => {
                 self.pos = saved_pos;
                 None
             }
+            // The specifier-qualifier list parsed, so this *is* a type-name
+            // and the declarator after it is simply invalid. Report the
+            // declarator's own error instead of rewinding (#C123).
+            //
+            // Rewinding here discarded the real diagnostic and let the caller
+            // re-read the tokens as an expression, which produced two about
+            // neither problem: `sizeof(char[-1])` said "undeclared identifier
+            // 'char'" and "subscripted value is neither array nor pointer"
+            // where gcc says "size of unnamed array is negative". Every
+            // constraint an abstract declarator can violate was reported that
+            // way, not just these two.
+            Err(e) => {
+                crate::diag::error(e.pos, &e.message);
+                self.resync_to_enclosing_paren();
+                Some((self.types.int_id, Vec::new()))
+            }
+        }
+    }
+
+    /// After a committed type-name error, skip to the `)` that closes the
+    /// construct the caller opened, so one bad declarator draws one
+    /// diagnostic rather than cascading into "expected ')'".
+    ///
+    /// Every caller of `try_parse_type_name_vm` is positioned just inside a
+    /// `(` -- `sizeof(`, `_Alignof(`, `_Atomic(`, `typeof(`, a cast, a
+    /// compound literal -- so the token that ends the construct is the first
+    /// `)` not nested inside a bracket or paren opened after this point.
+    ///
+    /// The cursor usually sits *inside* an unclosed `[` when this is called,
+    /// the array bound being where the declarator failed, so a closer with no
+    /// opener is one of the caller's and must not drive the depth negative.
+    fn resync_to_enclosing_paren(&mut self) {
+        let mut depth = 0i32;
+        while !self.is_eof() {
+            if self.is_special(b'(') || self.is_special(b'[') {
+                depth += 1;
+            } else if self.is_special(b']') {
+                depth = (depth - 1).max(0);
+            } else if self.is_special(b')') {
+                if depth == 0 {
+                    return;
+                }
+                depth -= 1;
+            }
+            self.advance();
         }
     }
 
@@ -1173,6 +1233,9 @@ impl<'a> Parser<'a> {
         // Track typedef type separately - we continue parsing after a typedef
         // to collect trailing qualifiers like "z_word_t const"
         let mut typedef_base: Option<TypeId> = None;
+        // The extents of a variably modified typedef, when the name resolves
+        // to one. Kept beside the type because they cannot live in it.
+        let mut typedef_dims: Option<Vec<Expr>> = None;
 
         loop {
             if self.peek() != TokenType::Ident {
@@ -1394,7 +1457,7 @@ impl<'a> Parser<'a> {
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                                 return Some((
-                                    self.apply_trailing_qualifiers(existing.typ),
+                                    self.apply_trailing_qualifiers_with(existing.typ, modifiers),
                                     Vec::new(),
                                 ));
                             }
@@ -1427,7 +1490,7 @@ impl<'a> Parser<'a> {
                             self.advance(); // consume tag name
                             if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                                 return Some((
-                                    self.apply_trailing_qualifiers(existing.typ),
+                                    self.apply_trailing_qualifiers_with(existing.typ, modifiers),
                                     Vec::new(),
                                 ));
                             }
@@ -1463,8 +1526,16 @@ impl<'a> Parser<'a> {
                     // Check if it's a typedef name
                     // Only consume if we haven't already seen a base type or typedef
                     if base_kind.is_none() && typedef_base.is_none() {
-                        if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
+                        if let Some((sym, typedef_type_id)) =
+                            self.symbols.lookup_typedef_symbol(name_id)
+                        {
                             self.advance();
+                            // A variably modified typedef's extents cannot be
+                            // recovered from its `TypeId`, so `sizeof(T)` is
+                            // handed the ones its declaration evaluated -- the
+                            // same channel a type-name's own `[n]` levels use
+                            // (C17 6.7.7p3).
+                            typedef_dims = self.vm_typedef_extents(sym);
                             // Save the typedef type and continue looping to collect trailing
                             // qualifiers (e.g., "z_word_t const" where const comes after typedef)
                             typedef_base = Some(typedef_type_id);
@@ -1506,7 +1577,7 @@ impl<'a> Parser<'a> {
             self.types.intern(typ)
         };
 
-        Some((result_id, Vec::new()))
+        Some((result_id, typedef_dims.unwrap_or_default()))
     }
 
     /// Parse postfix expression: x++, x--, x[i], x.member, x->member, x(args)
@@ -2541,12 +2612,22 @@ impl<'a> Parser<'a> {
                 self.usual_arithmetic_conversions(left_type, right_type)
             }
 
-            // Bitwise and shift operators use integer promotions
-            BinaryOp::BitAnd
-            | BinaryOp::BitOr
-            | BinaryOp::BitXor
-            | BinaryOp::Shl
-            | BinaryOp::Shr => self.usual_arithmetic_conversions(left_type, right_type),
+            // The bitwise operators take the usual arithmetic conversions.
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                self.usual_arithmetic_conversions(left_type, right_type)
+            }
+
+            // A shift does not. C17 6.5.7p3: the integer promotions are
+            // performed on *each* operand and "the type of the result is that
+            // of the promoted left operand" -- the right operand's type never
+            // reaches the result. Taking the usual arithmetic conversions here
+            // let it through, so `1 << 1L` came out `long` and
+            // `sizeof(1 << 1L)` answered 8 where gcc answers 4.
+            BinaryOp::Shl | BinaryOp::Shr => {
+                let promoted = self.types.integer_promote(left_type);
+                self.check_shift_count(op, promoted, &right);
+                promoted
+            }
         };
 
         let pos = left.pos;
@@ -2559,6 +2640,40 @@ impl<'a> Parser<'a> {
             result_type,
             pos,
         )
+    }
+
+    /// Warn when a shift's constant count cannot name a bit of the value
+    /// being shifted (#C125).
+    ///
+    /// C17 6.5.7p3 makes a count that is negative, or not less than the width
+    /// of the promoted left operand, undefined. c17 folds such a shift by
+    /// masking the count the way the hardware does, and keeps the run-time
+    /// path in agreement -- so the *value* is as defensible as gcc's, which is
+    /// not even self-consistent (`1 << 64` folds to 0 while `-1 >> 64` stays
+    /// -1). The gap was the silence.
+    ///
+    /// This sits with the type check rather than in the constant folder
+    /// because the folder is called speculatively -- by `__builtin_constant_p`
+    /// merely asking whether an expression folds, and by the backtracking
+    /// type-name parse -- and would report on expressions that are never
+    /// evaluated, sometimes twice. A shift's type is computed exactly once.
+    ///
+    /// Only the *count* need be constant, as in gcc: `x << 64` warns.
+    fn check_shift_count(&mut self, op: BinaryOp, promoted_left: TypeId, right: &Expr) {
+        let Some(count) = self.eval_const_expr(right) else {
+            return;
+        };
+        let width = self.types.size_bits(promoted_left) as i128;
+        let side = if op == BinaryOp::Shl { "left" } else { "right" };
+
+        // gcc spells these as two groups, and so does `-Wno-`.
+        if count < 0 {
+            if crate::diag::warning_group_enabled("shift-count-negative") {
+                crate::diag::warning(right.pos, &format!("{} shift count is negative", side));
+            }
+        } else if count >= width && crate::diag::warning_group_enabled("shift-count-overflow") {
+            crate::diag::warning(right.pos, &format!("{} shift count >= width of type", side));
+        }
     }
 
     /// Compute usual arithmetic conversions (C99 6.3.1.8)

@@ -153,6 +153,41 @@ pub fn exit_status() -> i32 {
     }
 }
 
+/// Render an `io::Error` the way a system utility reports one.
+///
+/// Rust's `Display` appends `" (os error 2)"` to the strerror text, so a
+/// diagnostic built with `{}` reads `No such file or directory (os error 2)`
+/// where every other utility on the system says `No such file or directory`.
+///
+/// For an error that came from the operating system this returns `strerror`'s
+/// own text, which is the locale's — the `LC_MESSAGES` obligation that
+/// formatting the Rust error can never meet, since Rust's table is English
+/// regardless of locale. Errors we constructed ourselves have no `errno` and
+/// are passed through with the parenthetical stripped if one is somehow there.
+pub fn io_error_text(e: &io::Error) -> String {
+    if let Some(errno) = e.raw_os_error() {
+        // `strerror_r` rather than `strerror`: the latter may return a pointer
+        // into a shared static buffer for an unrecognized errno, which is a
+        // data race between two threads reporting at once. Same shape as
+        // `tree/common/mod.rs`'s `error_string`.
+        let mut buf = [0 as libc::c_char; 128];
+        // SAFETY: `buf` is a live, correctly sized array and `strerror_r`
+        // writes at most `buf.len()` bytes, NUL-terminating within it.
+        let rc = unsafe { libc::strerror_r(errno as _, buf.as_mut_ptr(), buf.len()) };
+        if rc == 0 {
+            let bytes = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_bytes();
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+    }
+    // No errno, or strerror_r declined: fall back to Rust's own text with the
+    // parenthetical removed.
+    let s = e.to_string();
+    match s.find(" (os error ") {
+        Some(idx) => s[..idx].to_string(),
+        None => s,
+    }
+}
+
 /// Emit an error diagnostic with no source-position information.
 /// Output format: `"<util>: <msg>"`.
 pub fn error(msg: &str) {

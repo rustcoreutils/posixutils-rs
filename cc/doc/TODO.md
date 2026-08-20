@@ -2,6 +2,7 @@
 
 ## Table of Contents
 
+- [Deferred indefinitely](#deferred-indefinitely)
 - [Technical Debt](#technical-debt)
 - [Known Divergences](#known-divergences)
 - [Future Features](#future-features)
@@ -9,7 +10,11 @@
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
 - [External Test Suites](#external-test-suites)
 
-## Technical Debt
+## Deferred indefinitely
+
+These are open by maintainer decision (2026-08-19), not by oversight. Neither
+is scheduled; both are recorded so a future reader knows the reasoning rather
+than rediscovering it.
 
 ### `_FORTIFY_SOURCE` compiles but checks nothing
 
@@ -42,6 +47,18 @@ compile the wrappers at all) is a regression rather than a fix: it has been
 implemented and reverted three times, most recently after measuring the
 duplicate-symbol failure that turned out to be layer 5. `__OPTIMIZE__` and
 layer 6 must land together.
+
+### Trigraphs are off by default
+
+POSIX APPLICATION USAGE 88224 says outright that a compiler doing this is "not
+conforming to POSIX.1-2024". `--trigraphs` implements translation phase 1
+exactly. The default is off because replacement reaches inside string
+literals — `"What??!"` becomes `"What|"` — and `??` is far likelier to appear
+by accident than by intent; gcc and clang default them off for the same
+reason. Flipping the default and offering an opt-out is the whole fix, and is
+a decision rather than a piece of work. See #C55 in `cc/audit.md`.
+
+## Technical Debt
 
 ### Stack frames are larger than gcc's
 
@@ -127,9 +144,22 @@ rather than the rejection an earlier version of this list called for.
 Two entries that used to sit here were removed after being probed rather than
 implemented. Rejecting `_Atomic` on a struct or union with a VLA member is
 unreachable: such a type cannot be formed at all, since a VLA member is
-rejected outright and the typedef route is rejected at the typedef. And
-`int *_Atomic p;` now parses -- it was a qualifier-list bug at file scope, not
-a missing feature.
+rejected outright and a member reaching one through a typedef is refused by
+6.7.2.1p9. (That second half used to read "the typedef route is rejected at
+the typedef", which stopped being true when #C138 implemented 6.7.7; the
+conclusion survives, the reason changed. Re-probed 2026-08-19, both spellings.)
+And `int *_Atomic p;` now parses -- it was a qualifier-list bug at file scope,
+not a missing feature.
+
+### Variably modified `typedef` — done
+
+C17 6.7.7 is implemented as of #C138. The interesting half is 6.7.7p3's "the
+array size expressions are evaluated each time the declaration of the typedef
+name is reached in the order of execution": at the typedef, once, however many
+objects the name then declares, and again on re-entry. `ExprKind::VmTypedefExtent`
+names an extent the typedef already evaluated, so a use rides the existing VLA
+machinery rather than repeating the size expressions -- copying those to each
+use would re-evaluate them and get all three rules wrong.
 
 ### C11 Thread-Local Storage
 

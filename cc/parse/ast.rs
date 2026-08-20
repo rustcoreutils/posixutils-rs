@@ -328,6 +328,21 @@ pub enum ExprKind {
     /// [`sizeof_type_is_runtime`] rather than testing the `Vec` directly.
     SizeofType(TypeId, Vec<Expr>),
 
+    /// One recorded array extent of a variably modified `typedef`, by the
+    /// typedef's symbol and the level's index (outermost is 0).
+    ///
+    /// C17 6.7.7p3 evaluates a variably modified typedef's size expressions
+    /// "each time the declaration of the typedef name is reached", *not* at
+    /// each use -- so `typedef int T[n]; n = 100; T a;` still gives `a` the
+    /// extent `n` had at the typedef. Copying the original expressions to
+    /// every use would re-evaluate them and get that wrong.
+    ///
+    /// The typedef's declaration evaluates each extent once into a hidden
+    /// local; this names one of those. It reads as an ordinary run-time
+    /// integer everywhere else, so a use rides the existing VLA machinery
+    /// through `vla_sizes` and `SizeofType`'s dimension list.
+    VmTypedefExtent(SymbolId, u32),
+
     /// sizeof expression: sizeof expr
     SizeofExpr(Box<Expr>),
 

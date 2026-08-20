@@ -136,10 +136,44 @@ fn handle_confstr(
         // Strip only the NUL terminator; the value is printed verbatim per the
         // spec "%s\n" format (do not trim significant trailing whitespace, #G4).
         let s = std::str::from_utf8(&buf).unwrap().trim_end_matches('\0');
-        println!("{}", s);
+        println!("{}", restate_environment_names(var, s));
     }
 
     Ok(())
+}
+
+/// Answer a `POSIX_V8_*` query with V8-spelled environment names.
+///
+/// `POSIX_V8_WIDTH_RESTRICTED_ENVS` is a list of environment *names* meant to
+/// be fed back to `getconf -v` (c17.md 88129-88132). glibc has no V8 confstr,
+/// so the V8 query aliases the V7 one and the host answers
+/// `POSIX_V7_LP64_OFF64` -- a V7 name in reply to a V8 question. Austin Group
+/// Defect 1330 renamed the names without changing the environments they
+/// describe, so the two spellings denote the same thing and `getconf -v`
+/// accepts either; re-stating them in the queried issue is the honest answer
+/// rather than a behavioral change.
+///
+/// Every earlier spelling is restated, not just V7: which one comes back
+/// depends on the constant the host has. glibc answers a V8 query from its V7
+/// confstr, while macOS has neither and answers from its V6 one, so a V8 query
+/// could come back `POSIX_V6_LP64_OFF64`.
+///
+/// Only the names are rewritten. A `_CFLAGS` / `_LDFLAGS` / `_LIBS` value is
+/// compiler flags, not environment names, and is passed through untouched; so
+/// is a reply that names no environment at all, such as `undefined`.
+fn restate_environment_names(var: &str, value: &str) -> String {
+    if !var.contains("POSIX_V8_") || !var.ends_with("WIDTH_RESTRICTED_ENVS") {
+        return value.to_string();
+    }
+    value
+        .lines()
+        .map(|name| {
+            name.replace("POSIX_V5_", "POSIX_V8_")
+                .replace("POSIX_V6_", "POSIX_V8_")
+                .replace("POSIX_V7_", "POSIX_V8_")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn handle_pathconf(

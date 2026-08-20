@@ -462,6 +462,22 @@ impl SymbolTable {
         self.lookup(name, Namespace::Tag)
     }
 
+    /// Look up a typedef by name, returning its symbol as well as its type.
+    ///
+    /// A variably modified typedef's array extents cannot live in the
+    /// `TypeId` -- `int[n]`, `int[m]` and `int[]` all intern to one type --
+    /// so they hang off the *symbol*, and resolving one needs its identity
+    /// rather than only its type. See C17 6.7.7p3.
+    pub fn lookup_typedef_symbol(&self, name: StringId) -> Option<(SymbolId, TypeId)> {
+        let id = self.lookup_id(name, Namespace::Ordinary)?;
+        let sym = self.get(id);
+        if sym.is_typedef() {
+            Some((id, sym.typ))
+        } else {
+            None
+        }
+    }
+
     /// Look up a typedef by name
     /// Returns the aliased TypeId if found
     pub fn lookup_typedef(&self, name: StringId) -> Option<TypeId> {

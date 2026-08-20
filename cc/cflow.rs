@@ -630,7 +630,12 @@ fn generate_from_grammar(file: &str, ext: &str) -> io::Result<GeneratedSource> {
     let output = cmd.output().map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!("{}: {}: {}", gettext("cannot run"), tool, e),
+            format!(
+                "{}: {}: {}",
+                gettext("cannot run"),
+                tool,
+                plib::diag::io_error_text(&e)
+            ),
         )
     })?;
 
@@ -1135,7 +1140,7 @@ fn main() -> ExitCode {
                     &undefines,
                     &args.include_paths,
                 ) {
-                    plib::diag::error(&format!("{}: {}", file, e));
+                    plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)));
                 }
             }
             // POSIX OPERANDS: ".l shall be taken to be lex input, .y as yacc
@@ -1154,10 +1159,12 @@ fn main() -> ExitCode {
                         &undefines,
                         &args.include_paths,
                     ) {
-                        plib::diag::error(&format!("{}: {}", file, e));
+                        plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)));
                     }
                 }
-                Err(e) => plib::diag::error(&format!("{}: {}", file, e)),
+                Err(e) => {
+                    plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
+                }
             },
             "s" => {
                 plib::diag::error(&format!(
@@ -1172,10 +1179,12 @@ fn main() -> ExitCode {
             _ => match std::fs::read(file) {
                 Ok(buffer) => {
                     if let Err(e) = process_object_file(file, &mut graph, &buffer) {
-                        plib::diag::error(&format!("{}: {}", file, e));
+                        plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)));
                     }
                 }
-                Err(e) => plib::diag::error(&format!("{}: {}", file, e)),
+                Err(e) => {
+                    plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
+                }
             },
         }
     }

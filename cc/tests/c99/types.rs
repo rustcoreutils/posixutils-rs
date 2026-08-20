@@ -1246,3 +1246,120 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("transparent_union_abi", code, &[]), 0);
 }
+
+// ============================================================================
+// C17 6.7.7 — typedef of a variably modified type
+//
+// "If a typedef name specifies a variably modified type then it shall have
+// block scope. The array size expressions are evaluated each time the
+// declaration of the typedef name is reached in the order of execution."
+//
+// c17 rejected these outright: "typedef of a variable-length array type is not
+// supported". Two hazards justified the rejection rather than a miscompile --
+// the `vla_sizes` side channel made a typedef'd VM type indistinguishable from
+// an incomplete `int a[]`, and `linearize_local_decl` dispatched on STATIC and
+// `vla_sizes` without ever testing TYPEDEF, so a block-scope one was lowered
+// as a runtime allocation of the array itself.
+// ============================================================================
+
+/// The size is fixed when the typedef is *declared*, not when it is used, so
+/// changing `n` afterwards must not change the type. Every expected value here
+/// was taken from `gcc -std=c17`.
+#[test]
+fn c17_vm_typedef_evaluates_its_extent_at_the_typedef() {
+    let code = r#"
+int n = 4;
+int main(void) {
+    typedef int T[n];
+    n = 100;                    /* after the typedef */
+    T a;
+    if (sizeof(T) != 4 * sizeof(int)) return 1;
+    if (sizeof(a) != 4 * sizeof(int)) return 2;
+    a[0] = 1; a[3] = 2;
+    if (a[0] + a[3] != 3) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c17_vm_typedef_extent", code, &[]), 0);
+}
+
+/// "evaluated each time the declaration ... is reached", which means *once*
+/// per execution of the typedef, however many objects it then declares.
+#[test]
+fn c17_vm_typedef_evaluates_its_extent_exactly_once() {
+    let code = r#"
+static int calls = 0;
+static int side(void) { calls++; return 4; }
+
+int main(void) {
+    typedef int T[side()];
+    T a, b;
+    if (calls != 1) return 1;               /* one evaluation, two objects */
+    if (sizeof(a) != sizeof(b)) return 2;
+    if (sizeof(a) != 4 * sizeof(int)) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c17_vm_typedef_once", code, &[]), 0);
+}
+
+/// Reaching the declaration again re-evaluates it: each turn of the loop gets
+/// the extent in force at that turn.
+#[test]
+fn c17_vm_typedef_re_evaluates_when_reached_again() {
+    let code = r#"
+int main(void) {
+    unsigned long total = 0;
+    for (int i = 1; i <= 3; i++) {
+        typedef int T[i];
+        T a;
+        a[0] = i;
+        total += sizeof(T) / sizeof(int);
+    }
+    return total == 6 ? 0 : 1;      /* 1 + 2 + 3 */
+}
+"#;
+    assert_eq!(compile_and_run("c17_vm_typedef_reeval", code, &[]), 0);
+}
+
+/// A pointer to a variably modified array, and a two-dimensional one: the
+/// extents belong to the pointee, so the object itself is an ordinary pointer.
+#[test]
+fn c17_vm_typedef_composes_with_pointers_and_dimensions() {
+    let code = r#"
+int main(void) {
+    int n = 3, m = 4;
+    typedef int Row[m];
+    typedef int Grid[n][m];
+
+    Grid g;
+    if (sizeof(g) != (unsigned long)n * m * sizeof(int)) return 1;
+    if (sizeof(g[0]) != (unsigned long)m * sizeof(int)) return 2;
+
+    Row *p = g;
+    p[1][2] = 7;
+    if (g[1][2] != 7) return 3;
+
+    typedef int (*PRow)[m];
+    if (sizeof(PRow) != sizeof(int *)) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c17_vm_typedef_compose", code, &[]), 0);
+}
+
+/// 6.7.7p3's other half: such a typedef "shall have block scope". At file
+/// scope there is nothing to evaluate the extent, and c17 must say so.
+#[test]
+fn c17_vm_typedef_is_rejected_at_file_scope() {
+    let code = r#"
+int n = 4;
+typedef int T[n];
+int main(void) { return 0; }
+"#;
+    assert_eq!(
+        compile_and_run("c17_vm_typedef_file_scope", code, &[]),
+        -1,
+        "a file-scope variably modified typedef must be rejected"
+    );
+}

@@ -508,7 +508,13 @@ fn read_lines(path: &Path) -> Result<Vec<String>, JoinError> {
     let mut buf = String::new();
     input_stream_dashed(path)
         .and_then(|mut r| r.read_to_string(&mut buf))
-        .map_err(|e| JoinError(format!("{}: {}", path.display(), strip_os_error(&e))))?;
+        .map_err(|e| {
+            JoinError(format!(
+                "{}: {}",
+                path.display(),
+                plib::diag::io_error_text(&e)
+            ))
+        })?;
     if buf.is_empty() {
         return Ok(Vec::new());
     }
@@ -517,16 +523,6 @@ fn read_lines(path: &Path) -> Result<Vec<String>, JoinError> {
         lines.pop();
     }
     Ok(lines)
-}
-
-/// Render an `io::Error` without the trailing "(os error N)" that Rust appends,
-/// matching the diagnostic style of system utilities.
-fn strip_os_error(e: &io::Error) -> String {
-    let s = e.to_string();
-    match s.find(" (os error ") {
-        Some(idx) => s[..idx].to_string(),
-        None => s,
-    }
 }
 
 fn run(args: Args) -> Result<bool, JoinError> {
@@ -624,8 +620,10 @@ fn run(args: Args) -> Result<bool, JoinError> {
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    merge_join(&mut r1, &mut r2, &mut st, &mut out).map_err(|e| JoinError(strip_os_error(&e)))?;
-    out.flush().map_err(|e| JoinError(strip_os_error(&e)))?;
+    merge_join(&mut r1, &mut r2, &mut st, &mut out)
+        .map_err(|e| JoinError(plib::diag::io_error_text(&e)))?;
+    out.flush()
+        .map_err(|e| JoinError(plib::diag::io_error_text(&e)))?;
 
     Ok(st.any_disorder)
 }

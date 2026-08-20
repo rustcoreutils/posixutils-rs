@@ -71,11 +71,41 @@ pub fn input_reader(
 /// content intact or, on success, the new content fully visible.
 ///
 /// If `path` already exists, the new file inherits its mode (`st_mode &
-/// 0o7777`); otherwise the umask determines it.
+/// 0o7777`). If it does not, the file is created `0o666 & ~umask`, which is
+/// what XCU 1.1.1.4 requires of a utility that creates a file.
+///
+/// The mode has to be set explicitly because the temporary this writes through
+/// is created `O_EXCL|0600` — deliberately, since it is world-visible in the
+/// target's directory before the rename. Inheriting *that* is how a fresh
+/// `tags` file and a fresh `ar` archive came out `-rw-------`.
 ///
 /// Used by utilities like `ar` and `strip` that rewrite a binary in place
 /// where a partial write would corrupt the artifact on disk.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mode = match fs::metadata(path) {
+        Ok(meta) => {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode()
+        }
+        // Only "there is no file here" means a file is being created. Every
+        // other stat failure is reported rather than read as absence: an
+        // `Err(_)` arm would take, say, EACCES on a path component or ENOTDIR
+        // on a parent as "missing" and go on to pick a mode for a file it
+        // could not have looked at.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => crate::modestr::default_create_mode(),
+        Err(e) => return Err(e),
+    };
+    write_atomic_mode(path, bytes, mode)
+}
+
+/// `write_atomic`, with the resulting file's mode named outright.
+///
+/// For the callers whose spec, or whose security posture, fixes the mode
+/// rather than deriving it — `crontab` writes the spool copy `0600` whether or
+/// not one was already there.
+pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -86,14 +116,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     tmp.as_file_mut().write_all(bytes)?;
     tmp.as_file_mut().sync_all()?;
 
-    // Preserve the existing file's mode if it exists. New files get their
-    // mode from the umask via NamedTempFile's default.
-    if let Ok(meta) = fs::metadata(path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        let perms = std::fs::Permissions::from_mode(mode);
-        tmp.as_file().set_permissions(perms)?;
-    }
+    // Before the rename, so the file is never visible at `path` under the
+    // temporary's 0600.
+    tmp.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode))?;
 
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
@@ -135,6 +161,10 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"replaced");
     }
 
+    /// Content only. The created file's *mode* is a function of the umask, so
+    /// it is asserted in `plib/tests/write_atomic_umask.rs`, which gets its own
+    /// process — this test binary also runs `modestr::mutate`, which reads the
+    /// umask by setting it to 0 and back.
     #[test]
     fn write_atomic_creates_when_missing() {
         let dir = tempfile::tempdir().unwrap();

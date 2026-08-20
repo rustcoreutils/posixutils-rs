@@ -1034,6 +1034,46 @@ fn ctags_default_output_file_is_tags() {
     );
 }
 
+/// XCU 1.1.1.4: a file a utility creates gets `S_IRUSR|S_IWUSR|S_IRGRP|
+/// S_IWGRP|S_IROTH|S_IWOTH` with the umask cleared. `ctags.md` states no
+/// override, so a fresh tags file is `0o666 & ~umask` — not the `0o600` it
+/// used to inherit from `write_atomic`'s temporary.
+///
+/// The umask is only *read* here, and nothing in this test binary sets one,
+/// so no serialization is needed; `plib/tests/write_atomic_umask.rs` is where
+/// the mask is varied.
+#[test]
+fn ctags_creates_the_tags_file_with_the_mandated_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = src(&dir, "m.c", "int moded(void){return 0;}\n");
+
+    let cwd = TempDir::new().unwrap();
+    let out = Command::new(exe_for("ctags"))
+        .arg(&path)
+        .current_dir(cwd.path())
+        .output()
+        .expect("failed to run ctags");
+    assert!(out.status.success());
+
+    // The reference is a file created the ordinary way: `File::create` opens
+    // with mode 0o666 and lets the kernel apply the umask, which is exactly
+    // what XCU 1.1.1.4 describes. Comparing against it keeps this test from
+    // restating plib's own arithmetic, and needs no libc dependency here.
+    let reference = cwd.path().join("reference");
+    fs::File::create(&reference).unwrap();
+    let want = fs::metadata(&reference).unwrap().permissions().mode() & 0o7777;
+
+    let tags = cwd.path().join("tags");
+    let got = fs::metadata(&tags).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        got, want,
+        "tags file is {:04o}, an ordinarily-created file is {:04o}",
+        got, want
+    );
+}
+
 /// `/` and `\` inside a search pattern must be escaped, or the pattern ends
 /// early and the editor jumps nowhere. The behavior was right; nothing pinned it.
 #[test]
@@ -1128,4 +1168,63 @@ fn ctags_append_keeps_the_whole_file_sorted() {
     assert_eq!(run("ctags", &["-a", "-f", &tags, &b]).2, 0);
     let after = fs::read_to_string(&tags).unwrap().lines().count();
     assert_eq!(before, after, "re-appending the same file duplicated tags");
+}
+
+/// A diagnostic naming a failed system call must read the way every other
+/// utility on the system reads it: `No such file or directory`, not Rust's
+/// `No such file or directory (os error 2)`.
+///
+/// The text now comes from `strerror`, so it is the *locale's* — which is the
+/// `LC_MESSAGES` obligation that formatting Rust's `io::Error` can never meet,
+/// its table being English whatever the locale says. All four binaries in this
+/// crate leaked the parenthetical (audit #U7).
+#[test]
+fn tools_io_errors_carry_no_rust_os_error_suffix() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir
+        .path()
+        .join("no_such_source.c")
+        .to_string_lossy()
+        .into_owned();
+    let a_directory = dir.path().to_string_lossy().into_owned();
+
+    for bin in ["cflow", "ctags", "cxref"] {
+        for operand in [&missing, &a_directory] {
+            let (_, stderr, _) = run(bin, &[operand]);
+            assert!(
+                !stderr.contains("os error"),
+                "{} leaked Rust's os-error suffix on {}:\n{}",
+                bin,
+                operand,
+                stderr
+            );
+        }
+        // The missing-file case must still say *something*, or the assertion
+        // above would pass against a utility that had gone silent.
+        let (_, stderr, code) = run(bin, &[&missing]);
+        assert_ne!(code, 0, "{} must fail on a missing operand", bin);
+        assert!(
+            stderr.contains("No such file"),
+            "{} lost the strerror text entirely:\n{}",
+            bin,
+            stderr
+        );
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_c17"))
+        .arg(&missing)
+        .output()
+        .expect("failed to run c17");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "c17 must fail on a missing operand");
+    assert!(
+        !stderr.contains("os error"),
+        "c17 leaked Rust's os-error suffix:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("No such file"),
+        "c17 lost the strerror text entirely:\n{}",
+        stderr
+    );
 }

@@ -3597,6 +3597,10 @@ impl Aarch64CodeGen {
 
         let num_outputs = asm_data.outputs.len();
 
+        // Whether V16 has already been spent materializing a floating
+        // constant for a vector-class constraint. There is only the one.
+        let mut fp_scratch_taken = false;
+
         // Process input operands
         for input in &asm_data.inputs {
             // Handle matching constraints - use the matched output's location
@@ -3630,6 +3634,78 @@ impl Aarch64CodeGen {
                 Loc::Imm(v) => {
                     // Immediate value
                     slots.push(mk(None, Some(format!("#{}", v as i64))));
+                }
+                // A floating constant has no address, so a memory-class
+                // constraint cannot be satisfied. gcc says the same and stops.
+                Loc::FImm(..) if requires_mem => {
+                    crate::diag::error(
+                        insn.pos.unwrap_or_default(),
+                        &format!("memory input {} is not directly addressable", slots.len()),
+                    );
+                    slots.push(mk(None, Some("[sp]".to_string())));
+                }
+                // A register-class constraint wants the value in a register,
+                // and a constant is never allocated one. Materialize it into
+                // a scratch: nothing else is live there across the asm.
+                Loc::FImm(v, imm_size)
+                    if Self::constraint_requires_reg_class(&input.constraint) =>
+                {
+                    let bits = v.to_bits_at_width(imm_size);
+                    let (scratch, _, _) = Reg::scratch_regs();
+                    self.emit_mov_imm(scratch, bits, 64);
+                    if Self::constraint_requires_vector(&input.constraint) {
+                        // Only the one scratch V register, so a second
+                        // constant would overwrite the first.
+                        if fp_scratch_taken {
+                            crate::diag::error(
+                                insn.pos.unwrap_or_default(),
+                                "only one floating constant can be given a vector \
+                                 register constraint in one asm statement",
+                            );
+                        }
+                        fp_scratch_taken = true;
+                        let (fp_size, name) = match imm_size {
+                            16 => (FpSize::Half, VReg::V16.name_h()),
+                            32 => (FpSize::Single, VReg::V16.name_s()),
+                            _ => (FpSize::Double, VReg::V16.name_d()),
+                        };
+                        self.push_lir(Aarch64Inst::FmovFromGp {
+                            size: fp_size,
+                            src: scratch,
+                            dst: VReg::V16,
+                        });
+                        // A vector operand has to be pre-rendered: the slot
+                        // carries only a general register, and `%w`-style
+                        // width modifiers do not apply to one of these.
+                        slots.push(mk(None, Some(name.to_string())));
+                    } else {
+                        // A *register* slot, not a pre-rendered name: the
+                        // template decides the width it wants, and `%w1`
+                        // against a hard-coded `x9` assembled as
+                        // `mov w0, x9`.
+                        slots.push(mk(Some(scratch), None));
+                    }
+                }
+                // An FP *value* under a general-register constraint. Nothing
+                // put it in a general register, and rendering the vector
+                // register's name gave `mov x0, d0` -- the assembler reads
+                // `d0` as an undefined symbol. Pre-existing, and reachable
+                // from any FP variable passed as `"r"`, not just a constant:
+                // `-0.0` arrives here rather than as an `FImm` because it is
+                // computed as `fneg` of zero.
+                Loc::VReg(v) if !Self::constraint_requires_vector(&input.constraint) => {
+                    let (scratch, _, _) = Reg::scratch_regs();
+                    let fp_size = match op_size {
+                        16 => FpSize::Half,
+                        32 => FpSize::Single,
+                        _ => FpSize::Double,
+                    };
+                    self.push_lir(Aarch64Inst::FmovToGp {
+                        size: fp_size,
+                        src: v,
+                        dst: scratch,
+                    });
+                    slots.push(mk(Some(scratch), None));
                 }
                 _ => {
                     // Memory or other location
@@ -3690,6 +3766,19 @@ impl Aarch64CodeGen {
     /// because the operand can take its non-memory form. C9 multi-
     /// alternative `"rm"` therefore returns false (register or
     /// memory both work; codegen picks register if available).
+    /// Whether the constraint asks for a vector (SIMD/FP) register.
+    fn constraint_requires_vector(constraint: &str) -> bool {
+        constraint.chars().any(|c| matches!(c, 'w' | 'x' | 'y'))
+    }
+
+    /// Whether the constraint asks for the operand in a register at all,
+    /// general or vector — as opposed to an immediate or memory class.
+    fn constraint_requires_reg_class(constraint: &str) -> bool {
+        constraint
+            .chars()
+            .any(|c| matches!(c, 'r' | 'w' | 'x' | 'y'))
+    }
+
     fn constraint_requires_memory(constraint: &str) -> bool {
         let mut has_mem_class = false;
         let mut has_non_mem_class = false;
@@ -3722,10 +3811,12 @@ impl Aarch64CodeGen {
             }
             Loc::Imm(v) => format!("#{}", *v as i64),
             Loc::VReg(vreg) => vreg.name_d().to_string(),
-            Loc::FImm(_, _) => {
-                // Float immediates not directly usable in inline asm
-                panic!("Float immediate not supported in inline asm operand")
-            }
+            // An immediate-class constraint takes the constant's bit pattern:
+            // there is no other way to name a floating value in an assembler
+            // operand. The register and memory classes never reach here --
+            // `emit_inline_asm` materializes or diagnoses them first -- and
+            // this used to `panic!` for all three.
+            Loc::FImm(v, fp_size) => format!("#{}", v.to_bits_at_width(*fp_size)),
             Loc::Global(name) => name.clone(),
         }
     }

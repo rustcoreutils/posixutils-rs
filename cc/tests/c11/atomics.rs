@@ -856,3 +856,94 @@ int main(void) { int v[4] = {0}; f(v); return 0; }
         0
     );
 }
+
+/// C17 6.2.5p27 lets an atomic type have a different alignment from its
+/// unqualified version, and it must: an atomic access at width N needs N-byte
+/// alignment. `_Atomic struct S8 { int a, b; }` took the struct's natural 4,
+/// so on aarch64 the 8-byte access raised SIGBUS, and on x86-64 it quietly
+/// performed one that was not atomic across a cache line.
+///
+/// The rule is gcc's, measured on both targets: a power-of-two size up to 16
+/// aligns to its own size; anything else keeps its natural alignment, there
+/// being no lock-free access to align for. Every row here was taken from
+/// `gcc -std=c17` and agrees on x86-64 and aarch64 alike.
+#[test]
+fn c11_atomic_alignment_follows_the_width() {
+    let code = r#"
+struct S1  { char a; };
+struct S2  { char a, b; };
+struct S3  { char a, b, c; };
+struct S4  { char a, b, c, d; };
+struct S8  { int a, b; };
+struct S12 { int a, b, c; };
+struct S16 { long a, b; };
+struct S24 { long a, b, c; };
+
+int main(void) {
+    /* A power-of-two width up to 16 aligns to itself. */
+    if (_Alignof(_Atomic struct S1)  != 1)  return 1;
+    if (_Alignof(_Atomic struct S2)  != 2)  return 2;
+    if (_Alignof(_Atomic struct S4)  != 4)  return 3;
+    if (_Alignof(_Atomic struct S8)  != 8)  return 4;
+    if (_Alignof(_Atomic struct S16) != 16) return 5;
+
+    /* Anything else keeps the natural alignment. */
+    if (_Alignof(_Atomic struct S3)  != _Alignof(struct S3))  return 6;
+    if (_Alignof(_Atomic struct S12) != _Alignof(struct S12)) return 7;
+    if (_Alignof(_Atomic struct S24) != _Alignof(struct S24)) return 8;
+
+    /* The plain types are untouched by any of this. */
+    if (_Alignof(struct S8) != 4) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomic_alignment_width", code, &[]), 0);
+}
+
+/// The alignment has to reach the *object*, not just `_Alignof`. A file-scope
+/// `_Atomic` aggregate used to be emitted `.comm g,8,4`, which is what the
+/// SIGBUS was.
+#[test]
+fn c11_atomic_object_is_aligned_for_its_access() {
+    let code = r#"
+struct S8 { int a, b; };
+_Atomic struct S8 g;
+static _Atomic struct S8 s;
+
+int main(void) {
+    _Atomic struct S8 automatic;
+    if ((unsigned long)&g % 8 != 0) return 1;
+    if ((unsigned long)&s % 8 != 0) return 2;
+    if ((unsigned long)&automatic % 8 != 0) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomic_object_alignment", code, &[]), 0);
+}
+
+/// Every spelling of the type has to carry `_Atomic`, and the bare-specifier
+/// form before an already-declared tag did not: the tag-reference path in the
+/// type-name parser applied the qualifiers written *after* the tag and dropped
+/// the ones before it. Invisible for `const` and `volatile`, which the back
+/// end does not act on; load-bearing for `_Atomic`.
+#[test]
+fn c11_atomic_survives_every_spelling_of_the_type() {
+    let code = r#"
+struct S8 { int a, b; };
+union  U8 { int a; long b; };
+typedef _Atomic struct S8 AT;
+_Atomic struct S8 g;
+AT t;
+
+int main(void) {
+    if (_Alignof(g) != 8) return 1;
+    if (_Alignof(t) != 8) return 2;
+    if (_Alignof(AT) != 8) return 3;
+    if (_Alignof(_Atomic(struct S8)) != 8) return 4;
+    if (_Alignof(_Atomic struct S8) != 8) return 5;
+    if (_Alignof(_Atomic union U8) != 8) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c11_atomic_spellings", code, &[]), 0);
+}

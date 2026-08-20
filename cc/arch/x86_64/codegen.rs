@@ -17,7 +17,6 @@ use crate::arch::codegen::{is_variadic_function, BswapSize, CodeGenBase, CodeGen
 use crate::arch::lir::{
     complex_fp_info, complex_sse_regs, CondCode, Directive, FpSize, Label, OperandSize, Symbol,
 };
-use crate::arch::x86_64::float::f64_to_f16_bits;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
@@ -2467,31 +2466,19 @@ impl X86_64CodeGen {
                 }
             }
             Loc::FImm(v, fp_size) => {
-                // Float immediate to GP register - used for Float16 rtlib calls
-                // Convert the float value to its bit representation and load as integer
-                if fp_size == 16 {
-                    // Float16: convert to 16-bit representation
-                    let bits = f64_to_f16_bits(v.to_f64());
+                // A floating constant in a general register is its bit
+                // pattern -- used for the Float16 rtlib calls, and for an
+                // inline-asm operand under a general-register constraint.
+                let bits = v.to_bits_at_width(fp_size);
+                if fp_size <= 32 {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
-                        src: GpOperand::Imm(bits as i64),
-                        dst: GpOperand::Reg(dst),
-                    });
-                } else if fp_size == 32 {
-                    // float: convert to 32-bit representation
-                    let bits = (v.to_f64() as f32).to_bits();
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Imm(bits as i64),
+                        src: GpOperand::Imm(bits),
                         dst: GpOperand::Reg(dst),
                     });
                 } else {
-                    // double: convert to 64-bit representation
-                    let bits = v.to_f64().to_bits();
-                    self.push_lir(X86Inst::MovAbs {
-                        imm: bits as i64,
-                        dst,
-                    });
+                    // A double's pattern does not fit a 32-bit immediate.
+                    self.push_lir(X86Inst::MovAbs { imm: bits, dst });
                 }
             }
         }
@@ -4116,6 +4103,10 @@ impl X86_64CodeGen {
 
         let num_outputs = asm_data.outputs.len();
 
+        // Whether Xmm15 has already been spent materializing a floating
+        // constant for an SSE-class constraint. There is only the one.
+        let mut sse_scratch_taken = false;
+
         // Process input operands
         for input in &asm_data.inputs {
             let op_size = input.size;
@@ -4178,6 +4169,42 @@ impl X86_64CodeGen {
                     let requires_mem = Self::constraint_requires_memory(constraint_for_reg);
                     // No specific register - use allocated location
                     match loc {
+                        // A floating constant has no address, so a
+                        // memory-class constraint cannot be satisfied. gcc
+                        // says the same thing and stops; c17 used to reach
+                        // `loc_to_asm_string` and panic.
+                        Loc::FImm(..) if requires_mem => {
+                            crate::diag::error(
+                                insn.pos.unwrap_or_default(),
+                                &format!(
+                                    "memory input {} is not directly addressable",
+                                    slots.len()
+                                ),
+                            );
+                            slots.push(mk(None, Some("(%rip)".to_string())));
+                        }
+                        // An SSE-class constraint wants the value in an XMM
+                        // register, and a constant is never allocated one.
+                        // Materialize it into the reserved scratch: nothing
+                        // else is live there across the asm.
+                        Loc::FImm(v, imm_size)
+                            if Self::constraint_requires_sse(constraint_for_reg) =>
+                        {
+                            // Xmm15 is the one register reserved for this, and
+                            // a second constant would silently overwrite the
+                            // first. Say so rather than emit wrong code; the
+                            // caller can always name a variable instead.
+                            if sse_scratch_taken {
+                                crate::diag::error(
+                                    insn.pos.unwrap_or_default(),
+                                    "only one floating constant can be given an SSE \
+                                     register constraint in one asm statement",
+                                );
+                            }
+                            sse_scratch_taken = true;
+                            self.emit_fp_imm_to_xmm(v, XmmReg::Xmm15, imm_size);
+                            slots.push(mk(None, Some(XmmReg::Xmm15.name().to_string())));
+                        }
                         Loc::Imm(_) if requires_mem => {
                             // Memory constraint with constant address (may be dead code
                             // from unoptimized switch on constant ORDER in atomic macros).
@@ -4337,6 +4364,18 @@ impl X86_64CodeGen {
                     mov, *v as i64, dest_name
                 ))));
             }
+            // A general register holding a floating constant holds its bits,
+            // which is what gcc materializes for `"r"(1.0)`. A `double`'s
+            // pattern does not fit a 32-bit immediate, so the load is always
+            // 64-bit -- `movl $0x3ff0000000000000` would be truncated.
+            Loc::FImm(v, fp_size) => {
+                let bits = v.to_bits_at_width(*fp_size);
+                let (wide_mov, wide_name) = ("movabsq", self.reg_name_64(dest_reg));
+                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
+                    "{} ${}, %{}",
+                    wide_mov, bits, wide_name
+                ))));
+            }
             Loc::Global(name) => {
                 // Check TLS before GOT - TLS symbols need special access pattern
                 if self.tls_symbols.contains(name) && self.base.target.os == Os::Linux {
@@ -4454,10 +4493,12 @@ impl X86_64CodeGen {
             }
             Loc::Imm(v) => format!("${}", *v as i64),
             Loc::Xmm(xmm) => xmm.name().to_string(),
-            Loc::FImm(_, _) => {
-                // Float immediates not directly usable in inline asm
-                panic!("Float immediate not supported in inline asm operand")
-            }
+            // An immediate-class constraint takes the constant's bit pattern,
+            // which is what gcc substitutes: `"i"(1.0)` gives
+            // `$0x3ff0000000000000`. The register and memory classes never
+            // reach here -- `emit_inline_asm` materializes or diagnoses them
+            // first -- and this used to `panic!` for all three.
+            Loc::FImm(v, fp_size) => format!("${}", v.to_bits_at_width(*fp_size)),
             Loc::Global(name) => {
                 format!("{}(%rip)", self.format_symbol_name(name))
             }
@@ -4533,6 +4574,17 @@ impl X86_64CodeGen {
     /// satisfied by a memory operand.
     /// C10 adds the x86_64 class letters `q`/`R`/`l` (register-class
     /// synonyms) and `X` (any-of-three, same as `g`).
+    /// Whether the constraint asks for an SSE register specifically.
+    ///
+    /// These are separate from `constraint_requires_register`, which is about
+    /// the general registers: an operand can be spilled to the stack and still
+    /// satisfy `"x"`, but it cannot be handed over as a general register.
+    fn constraint_requires_sse(constraint: &str) -> bool {
+        constraint
+            .chars()
+            .any(|c| matches!(c, 'x' | 'f' | 't' | 'u' | 'v' | 'Y'))
+    }
+
     fn constraint_requires_register(constraint: &str) -> bool {
         let mut has_reg_class = false;
         let mut has_mem_class = false;

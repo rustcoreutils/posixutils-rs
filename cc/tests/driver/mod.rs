@@ -270,6 +270,108 @@ fn driver_early_exit_modes_do_not_link() {
     );
 }
 
+/// `-E` used to accept `-o` and then discard it: the preprocessed text went to
+/// stdout, no file appeared, and the exit status was 0. POSIX leaves the
+/// combination unspecified (88941-88942), but silently ignoring an option is
+/// not one of the available readings, and every build system running
+/// `cc -E -o foo.i foo.c` assumes the gcc/clang behavior.
+#[test]
+fn driver_preprocess_honors_dash_o() {
+    let w = WorkDir::new("eout");
+    let src = w.write("pp.c", "#define N 7\nint frag(void){return N;}\n");
+    let out = w.join("pp.i");
+
+    let r = run_c17(&["-E", &s(&src), "-o", &s(&out)]);
+    assert!(r.success, "-E -o failed: {}{}", r.stdout, r.stderr);
+    assert!(out.exists(), "-E -o produced no file");
+    assert!(
+        r.stdout.is_empty(),
+        "-E -o must not also write to stdout:\n{}",
+        r.stdout
+    );
+
+    let body = std::fs::read_to_string(&out).unwrap();
+    assert!(body.contains("frag"), "no preprocessed text in the file");
+    assert!(body.contains("7"), "the macro was not expanded");
+    // STDOUT 88032-88038: the mandated line marker must survive the rerouting.
+    assert!(
+        body.contains("# 1 \""),
+        "no line marker in the file:\n{}",
+        body
+    );
+}
+
+/// `-o -` is stdout, matching the spelling `-S` already used.
+#[test]
+fn driver_preprocess_dash_o_dash_is_stdout() {
+    let w = WorkDir::new("edash");
+    let src = w.write("pp.c", "int frag(void){return 1;}\n");
+
+    let r = run_c17(&["-E", &s(&src), "-o", "-"]);
+    assert!(r.success, "-E -o - failed: {}", r.stderr);
+    assert!(r.stdout.contains("frag"), "-E -o - produced no output");
+    assert!(
+        !w.join("-").exists(),
+        "-o - must not create a file named '-'"
+    );
+}
+
+/// Several sources share one `-E` sink, so they concatenate rather than each
+/// truncating the last — the same thing they already did on stdout.
+#[test]
+fn driver_preprocess_dash_o_collects_every_source() {
+    let w = WorkDir::new("emulti");
+    let a = w.write("p1.c", "int one(void){return 1;}\n");
+    let b = w.write("p2.c", "int two(void){return 2;}\n");
+    let out = w.join("both.i");
+
+    let r = run_c17(&["-E", &s(&a), &s(&b), "-o", &s(&out)]);
+    assert!(r.success, "-E of two sources failed: {}", r.stderr);
+    assert!(
+        r.stderr.contains("warning") && r.stderr.contains("-o"),
+        "expected a warning about -o with several sources, got:\n{}",
+        r.stderr
+    );
+
+    let body = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        body.contains("one") && body.contains("two"),
+        "one source overwrote the other:\n{}",
+        body
+    );
+}
+
+/// 87883-87885: with `-E`, "no compilation shall be performed". An assembler
+/// operand was dispatched to `as` regardless of the mode, so `c17 -E foo.s`
+/// assembled it and left a foo.o behind.
+#[test]
+fn driver_preprocess_does_not_assemble() {
+    let w = WorkDir::new("easm");
+    let asm = w.write("bare.s", ".text\n.globl bare\nbare: ret\n");
+
+    let r = run_c17(&["-E", &s(&asm)]);
+    assert!(r.success, "-E of an .s operand failed: {}", r.stderr);
+    assert!(
+        !w.join("bare.o").exists(),
+        "-E must not assemble an .s operand"
+    );
+}
+
+/// `-o` belongs to the compile or link output in every other mode. `-E` is the
+/// only one that may open it, and opening it eagerly would truncate the
+/// executable a normal compile is about to write.
+#[test]
+fn driver_dash_o_is_untouched_without_dash_e() {
+    let w = WorkDir::new("noeout");
+    let a = w.write("m1.c", CALLER);
+    let b = w.write("m2.c", HELPER_7);
+    let exe = w.join("prog");
+
+    let r = run_c17(&[&s(&a), &s(&b), "-o", &s(&exe)]);
+    assert!(r.success, "link failed: {}{}", r.stdout, r.stderr);
+    assert_eq!(run_exe(&exe), 7, "the executable was clobbered");
+}
+
 // ============================================================================
 // #U3 — -L/-l order relative to the operands is significant
 // ============================================================================
@@ -347,6 +449,83 @@ fn driver_library_named_before_its_user_does_not_resolve() {
     assert!(
         !r.success,
         "a library searched before its user must leave the reference unresolved"
+    );
+}
+
+// ============================================================================
+// #C50 — the seven standard libraries shall be found
+// ============================================================================
+
+/// 88089-88093: `c`, `l`, `m`, `pthread`, `rt`, `xnet` and `y` *shall be
+/// found* when named as a `-l` option-argument, and — except for the shared C
+/// library — "need not exist as regular files".
+///
+/// `xnet` and `y` exist on no glibc system and no macOS; their interfaces are
+/// in libc. c17 used to forward the name to the host linker, which answered
+/// `cannot find -lxnet` and failed the link.
+#[test]
+fn driver_finds_every_standard_library() {
+    let w = WorkDir::new("stdlibs");
+    let src = w.write("t.c", "int main(void){return 0;}\n");
+
+    for lib in ["c", "l", "m", "pthread", "rt", "xnet", "y"] {
+        let exe = w.join(&format!("std_{}", lib));
+        let r = run_c17(&[&s(&src), "-l", lib, "-o", &s(&exe)]);
+        assert!(
+            r.success,
+            "-l {} failed to link: {}{}",
+            lib, r.stdout, r.stderr
+        );
+        assert!(exe.exists(), "-l {} produced no executable", lib);
+        assert_eq!(run_exe(&exe), 0);
+    }
+}
+
+/// Dropping is confined to the seven names. A library the user named and the
+/// host does not have must still be a link error, or a typo becomes silence.
+#[test]
+fn driver_still_fails_on_a_missing_ordinary_library() {
+    let w = WorkDir::new("nolib");
+    let src = w.write("t.c", "int main(void){return 0;}\n");
+    let exe = w.join("t.out");
+
+    let r = run_c17(&[&s(&src), "-l", "c17nosuchlibrary", "-o", &s(&exe)]);
+    assert!(!r.success, "a missing ordinary library must fail the link");
+}
+
+/// A standard name the host *does* provide is forwarded, not dropped — and one
+/// the user supplies under `-L` counts as providing it. Here `libm.a` in the
+/// scratch directory defines the symbol `main` calls, so the program can only
+/// link, and only return 42, if the `-l m` really reached the linker.
+#[test]
+fn driver_prefers_a_supplied_standard_library() {
+    let w = WorkDir::new("ownlibm");
+    let libdir = w.join("libdir");
+    std::fs::create_dir_all(&libdir).unwrap();
+
+    let src = w.write("m_impl.c", "int c17_probe(void){return 42;}\n");
+    let obj = w.join("m_impl.o");
+    assert!(run_c17(&["-c", &s(&src), "-o", &s(&obj)]).success);
+    let ar = Command::new("ar")
+        .arg("rcs")
+        .arg(libdir.join("libm.a"))
+        .arg(&obj)
+        .status()
+        .expect("failed to run ar");
+    assert!(ar.success(), "ar failed for libm.a");
+
+    let user = w.write(
+        "u.c",
+        "int c17_probe(void);\nint main(void){return c17_probe();}\n",
+    );
+    let exe = w.join("ownm");
+    let ldir = format!("-L{}", libdir.to_string_lossy());
+    let r = run_c17(&[&s(&user), &ldir, "-l", "m", "-o", &s(&exe)]);
+    assert!(r.success, "-L dir -l m failed: {}{}", r.stdout, r.stderr);
+    assert_eq!(
+        run_exe(&exe),
+        42,
+        "the -L directory's libm.a was not searched"
     );
 }
 

@@ -657,7 +657,12 @@ fn main() -> ExitCode {
                 output_file = Box::new(f);
             }
             Err(e) => {
-                plib::diag::error(&format!("{}: {}: {}", path, gettext("cannot open"), e));
+                plib::diag::error(&format!(
+                    "{}: {}: {}",
+                    path,
+                    gettext("cannot open"),
+                    plib::diag::io_error_text(&e)
+                ));
                 return ExitCode::from(1);
             }
         }
@@ -683,7 +688,7 @@ fn main() -> ExitCode {
         ) {
             Ok(()) => true,
             Err(e) => {
-                plib::diag::error(&format!("{}: {}", file, e));
+                plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)));
                 false
             }
         };

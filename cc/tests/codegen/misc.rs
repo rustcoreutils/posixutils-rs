@@ -9357,3 +9357,60 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("const_fold_static_init", code, &[]), 0);
 }
+
+/// AArch64 gives each instruction family its own immediate encoding, and c17
+/// tested one 0..=4095 range for all of them. `add`/`sub` do take a 12-bit
+/// unsigned value, but the logical operations take a *bitmask* immediate that
+/// cannot represent 0 at all, and a shift takes an amount below the operand
+/// width — so `x & 0` emitted `and w1, w1, #0`, `x | 1000` emitted
+/// `orr w1, w1, #1000`, and `x << 32` emitted `lsl w1, w1, #32`, each of which
+/// the assembler refuses. The build failed; nothing was miscompiled.
+///
+/// Pre-existing, and invisible to this suite because `compile_and_run` targets
+/// the host. Found by the aarch64 sweep after it was taught that a program
+/// c17 cannot build, where gcc can, is a defect rather than something to skip.
+#[test]
+fn codegen_logical_and_shift_immediates_are_encodable() {
+    let code = r#"
+unsigned u32and(unsigned x, unsigned m) { return x & m; }
+
+int main(void) {
+    unsigned x = 0xFFFFu;
+
+    /* Zero has no bitmask encoding on aarch64. */
+    if ((x & 0u) != 0u) return 1;
+    if ((x | 0u) != 0xFFFFu) return 2;
+    if ((x ^ 0u) != 0xFFFFu) return 3;
+
+    /* Ordinary numbers mostly have none either. */
+    if ((x & 1000u) != (0xFFFFu & 1000u)) return 4;
+    if ((x | 3000u) != (0xFFFFu | 3000u)) return 5;
+    if ((x ^ 1000u) != (0xFFFFu ^ 1000u)) return 6;
+
+    /* The ones that do encode must still work. */
+    if ((x & 255u) != 255u) return 7;
+    if ((x & 4095u) != 4095u) return 8;
+    if ((x | 0xF0F0F0F0u) != (0xFFFFu | 0xF0F0F0F0u)) return 9;
+
+    /* Shift amounts at and beyond the width. 6.5.7p3 leaves the value
+       undefined, but the compiler must still emit something assemblable. */
+    unsigned s = 1u;
+    if ((s << 31) != 0x80000000u) return 10;
+
+    /* 64-bit logical immediates, encodable and not. */
+    unsigned long q = ~0UL;
+    if ((q & 0xFFFFFFFF00000000UL) != 0xFFFFFFFF00000000UL) return 11;
+    if ((q & 0x0123456789ABCDEFUL) != 0x0123456789ABCDEFUL) return 12;
+    if ((0UL | 0x5555555555555555UL) != 0x5555555555555555UL) return 13;
+
+    /* And through a call, so the operand is a register on both sides. */
+    if (u32and(x, 0u) != 0u) return 14;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("logical_imm_encodable", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("logical_imm_encodable_opt", code),
+        0
+    );
+}

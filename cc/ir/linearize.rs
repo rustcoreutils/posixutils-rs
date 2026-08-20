@@ -501,102 +501,6 @@ impl<'a> Linearizer<'a> {
             bb.add_insn(insn);
         }
     }
-
-    /// Compute the common type for usual arithmetic conversions (C99 6.3.1.8)
-    /// Returns the wider type that both operands should be converted to
-    pub(crate) fn common_type(&self, left: TypeId, right: TypeId) -> TypeId {
-        // C99 6.3.1.8 usual arithmetic conversions:
-        // 1. If either is long double, convert to long double
-        // 2. Else if either is double, convert to double
-        // 3. Else if either is float, convert to float
-        // 4. Otherwise apply integer promotions, then:
-        //    a. If both have same type after promotion, done
-        //    b. If both signed or both unsigned, convert narrower to wider
-        //    c. If unsigned has rank >= signed, convert signed to unsigned
-        //    d. If signed can represent all unsigned values, convert to signed
-        //    e. Otherwise convert both to unsigned version of signed type
-
-        // Check for floating point types
-        let left_float = self.types.is_float(left);
-        let right_float = self.types.is_float(right);
-
-        let left_kind = self.types.kind(left);
-        let right_kind = self.types.kind(right);
-
-        if left_float || right_float {
-            // At least one operand is floating point
-            // Use the wider floating point type
-            if left_kind == TypeKind::Float128 || right_kind == TypeKind::Float128 {
-                return self.types.float128_id;
-            }
-            if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
-                return self.types.longdouble_id;
-            }
-            if left_kind == TypeKind::Double || right_kind == TypeKind::Double {
-                return self.types.double_id;
-            }
-            if left_kind == TypeKind::Float || right_kind == TypeKind::Float {
-                return self.types.float_id;
-            }
-            // Both are Float16 (C23: _Float16 stays as _Float16)
-            if left_kind == TypeKind::Float16 || right_kind == TypeKind::Float16 {
-                return self.types.float16_id;
-            }
-            // Fallback to float for any remaining float cases
-            return self.types.float_id;
-        }
-
-        // Apply integer promotions first (C99 6.3.1.1)
-        let left_promoted = self.types.integer_promote(left);
-        let right_promoted = self.types.integer_promote(right);
-
-        let left_size = self.types.size_bits(left_promoted);
-        let right_size = self.types.size_bits(right_promoted);
-        let left_unsigned = self.types.is_unsigned(left_promoted);
-        let right_unsigned = self.types.is_unsigned(right_promoted);
-        let left_kind = self.types.kind(left_promoted);
-        let right_kind = self.types.kind(right_promoted);
-
-        // If both have same type after promotion, use that type
-        if left_kind == right_kind && left_unsigned == right_unsigned && left_size == right_size {
-            return left_promoted;
-        }
-
-        // If both signed or both unsigned, convert narrower to wider
-        if left_unsigned == right_unsigned {
-            return if left_size >= right_size {
-                left_promoted
-            } else {
-                right_promoted
-            };
-        }
-
-        // Mixed signedness case
-        let (signed_id, unsigned_id) = if left_unsigned {
-            (right_promoted, left_promoted)
-        } else {
-            (left_promoted, right_promoted)
-        };
-
-        let signed_size = self.types.size_bits(signed_id);
-        let unsigned_size = self.types.size_bits(unsigned_id);
-
-        // If unsigned has rank >= signed, convert to unsigned
-        if unsigned_size >= signed_size {
-            return unsigned_id;
-        }
-
-        // If signed type can represent all values of unsigned type, use signed
-        // (This is true when signed_size > unsigned_size on our platforms)
-        if signed_size > unsigned_size {
-            return signed_id;
-        }
-
-        // Otherwise convert both to unsigned version of signed type
-        // (This case shouldn't happen on LP64 since we already handled size comparisons)
-        self.types.unsigned_version(signed_id)
-    }
-
     /// Emit a type conversion if needed
     /// Returns the (possibly converted) pseudo ID
     pub(crate) fn emit_convert(
@@ -3496,7 +3400,7 @@ impl<'a> Linearizer<'a> {
             // For comparisons, compute common type for both operands
             // (usual arithmetic conversions)
             let operand_typ = if op.is_comparison() {
-                self.common_type(left_typ, right_typ)
+                self.types.common_type(left_typ, right_typ)
             } else {
                 result_typ
             };

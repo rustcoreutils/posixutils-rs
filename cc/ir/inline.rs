@@ -140,6 +140,10 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 /// Analyze a single function for inlineability
 fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
+        // Recorded by the linearizer. Matching on the symbol name instead
+        // caught `.LC0` and stopped every function containing a string
+        // literal from being inlined.
+        takes_label_addr: func.takes_label_addr,
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
         has_inline_hint: func.is_inline,
@@ -164,19 +168,6 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
                 // reason to take one, but a function that merely returns one
                 // has the same problem.
                 Opcode::IndirectBr => {
-                    candidate.takes_label_addr = true;
-                }
-                // A label address is a `SymAddr` on a symbol named for a block
-                // of *this* function. An indirect branch is the usual reason to
-                // take one, but a function that merely returns one has the same
-                // problem.
-                Opcode::SymAddr
-                    if insn
-                        .src
-                        .first()
-                        .and_then(|s| func.sym_name_of(*s))
-                        .is_some_and(|n| n.starts_with(".L")) =>
-                {
                     candidate.takes_label_addr = true;
                 }
                 Opcode::Call => {
@@ -659,7 +650,16 @@ fn clone_instruction(
 
         // Switch: remap value (src[0]) and all branch targets
         Opcode::Switch => {
+            // Built fresh rather than cloned, so everything the switch needs
+            // has to be carried over by hand -- and the operation width was
+            // not. A 64-bit switch became a 32-bit compare once inlined, so
+            // `case 4294967296ul:` matched 0. Pre-existing; a `case lo ... hi`
+            // range made it visible because its subtraction exposes the top
+            // half where an equality compare on the low half often agrees by
+            // accident.
             let mut new_insn = Instruction::new(Opcode::Switch);
+            new_insn.size = insn.size;
+            new_insn.typ = insn.typ;
             new_insn.src = insn
                 .src
                 .iter()

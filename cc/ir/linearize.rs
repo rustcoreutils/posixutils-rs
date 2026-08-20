@@ -239,6 +239,14 @@ pub struct Linearizer<'a> {
     /// without the edges DCE would delete blocks nothing appears to reach.
     pub(crate) addr_taken_labels: Vec<BasicBlockId>,
 
+    /// `&&label` references in this function, with where each was written.
+    /// Checked against `defined_labels` once the body is walked, because a
+    /// forward reference is legal and only the end of the function settles it.
+    pub(crate) label_addr_refs: Vec<(String, crate::diag::Position)>,
+
+    /// Labels this function actually defines.
+    pub(crate) defined_labels: std::collections::HashSet<String>,
+
     /// The one block every computed `goto` in this function branches through,
     /// and the hidden local carrying the target address to it.
     ///
@@ -303,6 +311,8 @@ impl<'a> Linearizer<'a> {
             two_reg_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
+            label_addr_refs: Vec::new(),
+            defined_labels: std::collections::HashSet::new(),
             indirect_dispatch: None,
             static_local_counter: 0,
             compound_literal_counter: 0,
@@ -760,6 +770,8 @@ impl<'a> Linearizer<'a> {
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
+        self.label_addr_refs.clear();
+        self.defined_labels.clear();
         self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
@@ -4764,6 +4776,17 @@ impl<'a> Linearizer<'a> {
             // this needs no opcode of its own.
             ExprKind::LabelAddr(name) => {
                 let label = self.str(*name).to_string();
+                // Outside a function there is no block to name, and
+                // `get_or_create_label` would unwrap a `None` current
+                // function -- an ICE on `void *g = &&L;` at file scope.
+                if self.current_func.is_none() {
+                    crate::diag::error_args(
+                        expr.pos,
+                        "label '{0}' referenced outside of any function",
+                        &[&label],
+                    );
+                    return self.emit_const(0, self.types.void_ptr_id);
+                }
                 let bb = self.get_or_create_label(&label);
                 let sym = format!(".L{}_{}", self.current_func_name, bb.0);
                 let sym_pseudo = self.alloc_pseudo();
@@ -4773,6 +4796,10 @@ impl<'a> Linearizer<'a> {
                 // The label is a branch target for every indirect goto in this
                 // function, and the CFG has to say so or DCE deletes the block.
                 self.addr_taken_labels.push(bb);
+                self.label_addr_refs.push((label.clone(), expr.pos));
+                if let Some(func) = &mut self.current_func {
+                    func.takes_label_addr = true;
+                }
                 let dst = self.alloc_pseudo();
                 let void_ptr = self.types.void_ptr_id;
                 self.emit(Instruction::sym_addr(dst, sym_pseudo, void_ptr));

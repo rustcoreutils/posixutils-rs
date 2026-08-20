@@ -12,7 +12,7 @@
 use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::float::FloatVal;
-use crate::ir::{Function, Initializer, Instruction, Module, Opcode};
+use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
 
@@ -131,6 +131,17 @@ pub struct CodeGenBase<I: LirInst> {
     /// what selects the thread-local access model. Set for `-shared` and for
     /// `-fPIC`; see [`CodeGenBase::use_tls_dynamic`].
     pub shared_mode: bool,
+    /// `-fverbose-asm`: annotate the generated instructions.
+    pub verbose_asm: bool,
+    /// Trailing comments to hang off individual LIR instructions, by their
+    /// index in `lir_buffer`.
+    ///
+    /// A comment cannot travel *on* the instruction: `X86Inst` and
+    /// `Aarch64Inst` are plain enums with no metadata field, and `EmitAsm`
+    /// sees only the instruction and the target. Keeping the text beside the
+    /// buffer lets `emit_all` append it to the line it has just written,
+    /// without a new field on either enum or a change to any `emit` arm.
+    pub lir_comments: std::collections::HashMap<usize, String>,
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -146,6 +157,17 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             last_debug_file: 0,
             emit_debug: false,
             shared_mode: false,
+            verbose_asm: false,
+            lir_comments: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Attach `text` to the next instruction pushed, as a trailing comment.
+    ///
+    /// Does nothing unless `-fverbose-asm` asked for it.
+    pub fn annotate_next(&mut self, text: String) {
+        if self.verbose_asm {
+            self.lir_comments.insert(self.lir_buffer.len(), text);
         }
     }
 
@@ -194,14 +216,31 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
     /// Emit all buffered LIR instructions to the output string
     pub fn emit_all(&mut self) {
-        for inst in &self.lir_buffer {
+        let comment = asm_comment_prefix(&self.target);
+        for (idx, inst) in self.lir_buffer.iter().enumerate() {
+            let before = self.output.len();
             inst.emit(&self.target, &mut self.output);
+            let Some(text) = self.lir_comments.get(&idx) else {
+                continue;
+            };
+            // One instruction can emit several lines, or none. Hang the
+            // comment off the last line that has anything on it.
+            if self.output.len() <= before || !self.output.ends_with('\n') {
+                continue;
+            }
+            self.output.pop();
+            if self.output[before..].trim().is_empty() {
+                self.output.push('\n');
+                continue;
+            }
+            self.output.push_str(&format!(" {} {}\n", comment, text));
         }
     }
 
     /// Clear LIR buffer (for reuse between functions)
     pub fn clear_lir(&mut self) {
         self.lir_buffer.clear();
+        self.lir_comments.clear();
     }
 
     /// Reset debug state for new module
@@ -991,6 +1030,54 @@ pub trait CodeGenerator {
     /// In shared library mode, TLS uses Initial Exec/General Dynamic model.
     /// In PIE/executable mode, TLS uses Local Exec for local variables.
     fn set_shared_mode(&mut self, shared: bool);
+
+    /// Set `-fverbose-asm`: annotate the generated instructions.
+    fn set_verbose_asm(&mut self, verbose: bool);
+}
+
+/// The `-fverbose-asm` annotation for one IR instruction: what it came from.
+///
+/// gcc writes the operands' source-level names, and the source line beside the
+/// instructions it produced. `Pseudo::name` carries the variable a pseudo came
+/// from, when it came from one, which is the same information.
+pub fn verbose_annotation(insn: &Instruction, pseudos: &[Pseudo]) -> Option<String> {
+    let name_of = |id: PseudoId| -> Option<&str> {
+        pseudos
+            .get(id.0 as usize)
+            .and_then(|p| p.name.as_deref())
+            .filter(|n| !n.is_empty())
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = insn.target.and_then(name_of) {
+        parts.push(t.to_string());
+    }
+    let srcs: Vec<&str> = insn.src.iter().filter_map(|s| name_of(*s)).collect();
+    if !srcs.is_empty() {
+        parts.push(srcs.join(", "));
+    }
+    if let Some(name) = &insn.func_name {
+        parts.push(name.clone());
+    }
+
+    // An instruction naming nothing the source wrote still says which
+    // operation it is; a bare opcode is more use than a blank comment.
+    if parts.is_empty() {
+        return Some(format!("{:?}", insn.op).to_lowercase());
+    }
+    Some(parts.join(" <- "))
+}
+
+/// The assembler's comment introducer for `target`.
+///
+/// x86-64 gas takes `#`; aarch64 gas takes `//`, and reads a *trailing* `#` as
+/// the start of an immediate -- so this is a correctness requirement of any
+/// trailing annotation, not a cosmetic one.
+pub fn asm_comment_prefix(target: &Target) -> &'static str {
+    match target.arch {
+        crate::target::Arch::Aarch64 => "//",
+        _ => "#",
+    }
 }
 
 /// Create a code generator for the given target
@@ -999,6 +1086,7 @@ pub fn create_codegen(
     emit_unwind_tables: bool,
     pic_mode: bool,
     shared_mode: bool,
+    verbose_asm: bool,
 ) -> Box<dyn CodeGenerator> {
     use crate::target::Arch;
 
@@ -1009,5 +1097,6 @@ pub fn create_codegen(
     codegen.set_emit_unwind_tables(emit_unwind_tables);
     codegen.set_pic_mode(pic_mode);
     codegen.set_shared_mode(shared_mode);
+    codegen.set_verbose_asm(verbose_asm);
     codegen
 }

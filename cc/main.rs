@@ -143,6 +143,10 @@ struct Args {
     #[arg(long = "idirafter", action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add a system include path, searched after the target's own"))]
     idirafter_paths: Vec<String>,
 
+    /// Annotate the generated assembly with what each instruction came from.
+    #[arg(long = "fverbose-asm", help = gettext("Annotate the generated assembly"))]
+    verbose_asm: bool,
+
     /// Disable all standard include paths (system and builtin), as gcc does.
     #[arg(long = "nostdinc", help = gettext("Disable standard system include paths"))]
     no_std_inc: bool,
@@ -782,8 +786,13 @@ fn process_file(
     // what Local Exec cannot satisfy, while `-fPIE` and the PIE default do not,
     // because a PIE executable still resolves its own thread-locals at link
     // time. gcc draws the line in the same place.
-    let mut codegen =
-        arch::codegen::create_codegen(target.clone(), emit_unwind_tables, pic_mode, shared_mode);
+    let mut codegen = arch::codegen::create_codegen(
+        target.clone(),
+        emit_unwind_tables,
+        pic_mode,
+        shared_mode,
+        args.verbose_asm,
+    );
     let asm = codegen.generate(&module, &types);
 
     // Codegen can diagnose too. Inline asm is the case that reaches here: a
@@ -1145,6 +1154,12 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 );
                 std::process::exit(1);
             }
+            i += 1;
+        } else if arg == "-fverbose-asm" {
+            // Rewritten rather than swallowed: the catch-all below used to
+            // drop it before clap saw it, so the flag was accepted and did
+            // nothing at all.
+            result.push("--fverbose-asm".to_string());
             i += 1;
         } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
             // Catch-all: silently ignore any other -f* flag we don't handle

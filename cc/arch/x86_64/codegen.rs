@@ -1799,6 +1799,14 @@ impl X86_64CodeGen {
     fn emit_insn(&mut self, insn: &Instruction, types: &TypeTable) {
         // Emit .loc directive for debug info
         self.emit_loc(insn);
+        // `-fverbose-asm`: hang the source-level names off the first
+        // instruction this one produces. Recorded before emission, since
+        // the index is the position the next push will take.
+        if self.base.verbose_asm {
+            if let Some(text) = crate::arch::codegen::verbose_annotation(insn, &self.pseudos) {
+                self.base.annotate_next(text);
+            }
+        }
 
         match insn.op {
             Opcode::Entry => {
@@ -5679,5 +5687,9 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_shared_mode(&mut self, shared: bool) {
         self.base.shared_mode = shared;
+    }
+
+    fn set_verbose_asm(&mut self, verbose: bool) {
+        self.base.verbose_asm = verbose;
     }
 }

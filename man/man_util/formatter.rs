@@ -1094,7 +1094,7 @@ fn merge_onelined(
             merge(&mut onelines, &mut lines, line_width, indent_str, offset);
 
             let mut el = el.split("\n").map(|s| s.to_string()).collect::<Vec<_>>();
-            if let Some(s) = el.iter_mut().next() {
+            if let Some(s) = el.first_mut() {
                 if s.is_empty() {
                     *s = indent_str.to_string() + "\\&";
                 }

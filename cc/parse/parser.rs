@@ -570,6 +570,21 @@ pub struct Parser<'a> {
     /// because the attribute is seen while the declarator is being consumed and
     /// can only be applied once the type is final.
     pending_mode: Option<(String, Position)>,
+
+    /// The width in bytes named by `__attribute__((vector_size(N)))` on the
+    /// declaration being parsed, and where it was written. Held like
+    /// `pending_mode`, and applied at the same point, because it replaces the
+    /// declared type.
+    pending_vector_size: Option<(u64, Position)>,
+
+    /// The alignment written by `__attribute__((aligned(N)))` in the list
+    /// being parsed, recorded as it is seen.
+    ///
+    /// `apply_attribute_alignment` folds the same value into `pending_alignas`
+    /// later, which is too late for `vector_size`: a vector aligns to its own
+    /// width unless the source says otherwise, and the two are written in one
+    /// list -- `__attribute__((vector_size(32), aligned(16)))`.
+    pending_attr_align: Option<u32>,
     /// `__attribute__((transparent_union))` written *after* the declarator,
     /// which is how glibc spells it -- `typedef union { ... } __SOCKADDR_ARG
     /// __attribute__((__transparent_union__));`. Held for the same reason as
@@ -690,6 +705,8 @@ impl<'a> Parser<'a> {
             pos: 0,
             pending_alignas: None,
             pending_mode: None,
+            pending_vector_size: None,
+            pending_attr_align: None,
             pending_transparent_union: None,
             tentative_definitions: Vec::new(),
             pending_declarator_align: None,
@@ -1073,6 +1090,20 @@ impl<'a> Parser<'a> {
                     None
                 }
             }
+            // A negative argument. Without this the sign was skipped as an
+            // unknown token and the magnitude parsed on its own, so
+            // `vector_size(-16)` read as `vector_size(16)` and silently
+            // produced a type the source never asked for.
+            TokenType::Special if self.is_special(b'-') => {
+                self.advance();
+                if let TokenValue::Number(s) = &self.current().value {
+                    let n = s.parse::<i64>().unwrap_or(0);
+                    self.advance();
+                    Some(AttributeArg::Int(-n))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -1095,16 +1126,13 @@ impl<'a> Parser<'a> {
         let recognised = id.is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR));
         if !recognised {
             if name.trim_matches('_') == "vector_size" {
-                // Ignoring this cannot produce a correct program: the type
-                // stays scalar, every operation on it stays scalar, and the
-                // mistake surfaces far from here as arithmetic on one element
-                // instead of all of them. Refusing is the honest answer until
-                // vector types exist.
-                diag::error_args(
-                    pos,
-                    "'{0}' attribute is not implemented, and ignoring it would change the type",
-                    &[&name],
-                );
+                // Captured below, once the byte count is parsed, and applied
+                // with the other type attributes. c17 gives it the *storage* a
+                // vector has -- the right size and the right alignment -- and
+                // not vector arithmetic, which is what glibc's <link.h> needs
+                // and all it declares these types for. What cannot be done is
+                // ignore it: the type would stay scalar and every operation on
+                // it would silently compute on one element.
             } else if name.trim_matches('_') == "mode" {
                 // Applied below, once the argument is parsed: a mode replaces
                 // the declared type, and getting it wrong is not cosmetic --
@@ -1139,6 +1167,19 @@ impl<'a> Parser<'a> {
             if name.trim_matches('_') == "mode" {
                 if let Some(AttributeArg::Ident(m)) = args.first() {
                     self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
+                }
+            } else if name.trim_matches('_') == "vector_size" {
+                match args.first() {
+                    Some(AttributeArg::Int(n)) if *n > 0 => {
+                        self.pending_vector_size = Some((*n as u64, pos));
+                    }
+                    _ => diag::error(pos, "'vector_size' requires a positive byte count"),
+                }
+            } else if name.trim_matches('_') == "aligned" {
+                if let Some(AttributeArg::Int(n)) = args.first() {
+                    if *n > 0 && (*n as u32).is_power_of_two() {
+                        self.pending_attr_align = Some(*n as u32);
+                    }
                 }
             }
             Some(Attribute::with_args(name, args))
@@ -1567,6 +1608,7 @@ impl<'a> Parser<'a> {
     /// remembering which attributes exist.
     fn apply_pending_type_attrs(&mut self, typ: TypeId) -> TypeId {
         let typ = self.apply_pending_mode(typ);
+        let typ = self.apply_pending_vector_size(typ);
         if let Some(pos) = self.pending_transparent_union.take() {
             if self.types.kind(typ) == TypeKind::Union {
                 self.types.set_transparent_union(typ);
@@ -1575,6 +1617,76 @@ impl<'a> Parser<'a> {
             }
         }
         typ
+    }
+
+    /// Apply `__attribute__((vector_size(N)))` to a declared type.
+    ///
+    /// c17 gives such a type a vector's *storage* and not its arithmetic: it
+    /// becomes an array of `N / sizeof(element)` elements, aligned to `N`.
+    /// That is exactly the layout GCC gives it, so a struct or union holding
+    /// one -- which is all glibc's `<link.h>` does with `La_x86_64_xmm` and
+    /// its siblings -- lays out identically.
+    ///
+    /// What it deliberately does not get is element-wise `+`, `*` and the
+    /// rest. Those need a real vector type in the IR and both backends. An
+    /// array does not accept them, so the gap is a diagnostic at the point of
+    /// use rather than arithmetic that silently runs on one element -- which
+    /// is the failure the outright rejection was guarding against.
+    fn apply_pending_vector_size(&mut self, typ: TypeId) -> TypeId {
+        let Some((bytes, pos)) = self.pending_vector_size.take() else {
+            return typ;
+        };
+        let elem_size = self.types.size_bytes(typ);
+        if elem_size == 0 || !self.types.is_arithmetic(typ) {
+            diag::error(pos, "'vector_size' requires an arithmetic element type");
+            return typ;
+        }
+        // The same ceiling `derive_array_type` applies, and for the same
+        // reason: this interns an array directly, so nothing else would catch
+        // an absurd width. Without it `vector_size(4294967296)` quietly
+        // produced a four-gigabyte type, and a width near `u64::MAX` made
+        // `next_power_of_two` overflow -- a panic in a debug build.
+        if bytes > TypeTable::MAX_OBJECT_BYTES as u64 {
+            diag::error_args(
+                pos,
+                "'vector_size' of {0} exceeds the maximum object size of {1} bytes",
+                &[&bytes.to_string(), &TypeTable::MAX_OBJECT_BYTES.to_string()],
+            );
+            return typ;
+        }
+        if bytes % elem_size as u64 != 0 {
+            let named = self.types.format_type(typ, Some(self.idents));
+            diag::error_args(
+                pos,
+                "'vector_size' of {0} is not a multiple of sizeof({1})",
+                &[&bytes.to_string(), &named],
+            );
+            return typ;
+        }
+        let count = bytes / elem_size as u64;
+        let mut vector = Type {
+            kind: TypeKind::Array,
+            base: Some(typ),
+            array_size: Some(count as usize),
+            ..Default::default()
+        };
+        // A vector aligns to its width rounded up to a power of two, capped
+        // at sixteen -- which is what GCC does by default on both targets c17
+        // supports. A 32-byte vector therefore aligns to 16, not 32; only
+        // `-mavx2` raises the cap, and c17 does not model that. Measured
+        // against gcc across widths 4 through 128 rather than assumed, because
+        // "aligns to its own width" is the obvious rule and is wrong.
+        //
+        // An `aligned(n)` written alongside takes precedence, which is what
+        // `<link.h>` does: `__vector_size__(32), __aligned__(16)`. It has to
+        // be applied here rather than left to the later attribute pass, since
+        // an explicit alignment may not reduce one already recorded.
+        const MAX_VECTOR_ALIGN: u32 = 16;
+        vector.explicit_align = Some(match self.pending_attr_align.take() {
+            Some(written) => written,
+            None => (bytes.next_power_of_two() as u32).min(MAX_VECTOR_ALIGN),
+        });
+        self.types.intern(vector)
     }
 
     /// Apply `__attribute__((mode(M)))` to a declared type.
@@ -5927,7 +6039,7 @@ impl Parser<'_> {
                 // exceeds the natural alignment of the underlying type (that's the point).
                 // Only reject explicit _Alignas that reduces below natural.
                 if declaration_align.is_some() {
-                    let natural = self.types.alignment(typ) as u32;
+                    let natural = self.types.natural_alignment(typ) as u32;
                     if explicit < natural {
                         return Err(ParseError::new(
                             format!(

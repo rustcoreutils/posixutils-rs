@@ -1846,19 +1846,15 @@ fn diagnostics_same_tag_in_another_scope_is_another_type() {
 
 /// An attribute the compiler does not implement used to be dropped in total
 /// silence. That is survivable for one that only hints, and is not for one
-/// that changes what the type *is*: `__attribute__((vector_size(16)))` left
-/// the type scalar and every operation on it scalar, so the program computed
-/// on one element instead of all of them, with nothing said.
+/// that changes what the type *is*.
 ///
-/// So: an error for `vector_size`, which cannot be ignored correctly and which
-/// no C system header uses; a warning for everything else unrecognised.
+/// `vector_size` used to be rejected outright on the reasoning that no C
+/// system header uses it. glibc's `<link.h>` does -- `La_x86_64_xmm` and its
+/// siblings -- so the rejection made that header uncompilable. It is
+/// implemented as storage now (see `c99_vector_size_has_a_vector_s_storage`);
+/// what remains here is the warning for everything else unrecognised.
 #[test]
 fn diagnostics_unimplemented_attributes_are_reported() {
-    compile_expect_error(
-        "vector_size_unimplemented",
-        "typedef int V __attribute__((vector_size(16)));\nint main(void){ return 0; }\n",
-        "'vector_size' attribute is not implemented",
-    );
     compile_expect_warning(
         "unknown_attribute_warns",
         "typedef int T __attribute__((totally_made_up));\nint main(void){ return 0; }\n",
@@ -4288,5 +4284,68 @@ fn diagnostics_function_pointer_is_spelled_as_a_declarator() {
         run.stderr.contains("int (*)(void)"),
         "expected `int (*)(void)`, got:\n{}",
         run.stderr
+    );
+}
+
+/// An x87 asm operand that c17 cannot address is refused, not miscompiled.
+///
+/// `get_x87_mem_addr` has no arm for `Loc::Xmm` and falls back to `[rbp+0]` --
+/// the saved frame pointer -- so an x87 constraint on a value sitting in an
+/// XMM register, which is where a `double` lives, emitted `fldl (%rbp)` and
+/// silently read garbage. gcc spills such an operand; c17 cannot yet, so it
+/// says so.
+///
+/// The same shape with a `long double`, which lives in memory, still works --
+/// see `codegen_inline_asm_x87_constraint`.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn diagnostics_x87_operand_must_be_addressable() {
+    compile_expect_error(
+        "x87_xmm_operand",
+        "int f(double x){ int r; __asm__(\"fistpl %0\" : \"=m\"(r) : \"t\"(x)); return r; }\n\
+         int main(void){ return f(7.0); }\n",
+        "addressable",
+    );
+}
+
+/// Only one x87 asm output, because only one can be written back.
+///
+/// The write-back is a single slot; a second output would overwrite it and the
+/// first result would be dropped, with the FP stack depth no longer matching
+/// what the template left behind.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn diagnostics_one_x87_asm_output() {
+    compile_expect_error(
+        "x87_two_outputs",
+        "struct P { long double a, b; };\n\
+         void g(struct P *p){ __asm__(\"fldz\\nfld1\" : \"=t\"(p->a), \"=u\"(p->b)); }\n\
+         int main(void){ struct P p; g(&p); return 0; }\n",
+        "x87 asm output",
+    );
+}
+
+/// A `vector_size` beyond the maximum object size is refused.
+///
+/// This interns an array type directly, so nothing else would catch an absurd
+/// width: `vector_size(4294967296)` quietly produced a four-gigabyte type, and
+/// a width near `u64::MAX` overflowed `next_power_of_two` -- a panic in a
+/// debug build.
+#[test]
+fn diagnostics_vector_size_is_bounded() {
+    compile_expect_error(
+        "vector_size_too_big",
+        "typedef float V __attribute__((vector_size(4294967296)));\nint main(void){ return 0; }\n",
+        "maximum object size",
+    );
+    compile_expect_error(
+        "vector_size_negative",
+        "typedef float V __attribute__((vector_size(-16)));\nint main(void){ return 0; }\n",
+        "positive byte count",
+    );
+    compile_expect_error(
+        "vector_size_not_multiple",
+        "typedef double V __attribute__((vector_size(12)));\nint main(void){ return 0; }\n",
+        "not a multiple",
     );
 }

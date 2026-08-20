@@ -1568,11 +1568,36 @@ fn codegen_inline_asm_x87_constraint() {
 static long double my_sqrtl(long double x) { __asm__("fsqrt" : "+t"(x)); return x; }
 static long double my_absl(long double x)  { __asm__("fabs"  : "+t"(x)); return x; }
 
+/* An x87 *input* -- the template consumes it and leaves nothing to store. */
+static int to_int(long double x) { int r; __asm__("fistpl %0" : "=m"(r) : "t"(x)); return r; }
+
+/* Two x87 operands: `t` is st(0) and `u` is st(1), so `u` must be pushed
+   first for `t` to end up on top. Getting this backwards computes b/a. */
+static long double mul(long double a, long double b) {
+    __asm__("fmulp" : "+t"(a) : "u"(b));
+    return a;
+}
+static long double sub(long double a, long double b) {
+    __asm__("fsubrp" : "+t"(a) : "u"(b));
+    return a;
+}
+
 int main(void) {
     if (my_sqrtl(4.0L) != 2.0L) return 1;
     if (my_sqrtl(16.0L) != 4.0L) return 2;
     if (my_absl(-3.5L) != 3.5L) return 3;
     if (my_absl(3.5L) != 3.5L) return 4;
+
+    if (to_int(7.0L) != 7) return 5;
+    if (to_int(-3.0L) != -3) return 6;
+
+    if (mul(2.0L, 3.0L) != 6.0L) return 7;
+    /* `fsubrp` computes st(1) - st(0), i.e. b - a. Asymmetric, so having the
+       two operands the wrong way round flips the sign rather than passing by
+       coincidence -- which is the whole point, since `u` must be pushed
+       before `t` for `t` to land on top. */
+    if (sub(10.0L, 4.0L) != -6.0L) return 8;
+    if (sub(4.0L, 10.0L) != 6.0L) return 9;
     return 0;
 }
 "#;

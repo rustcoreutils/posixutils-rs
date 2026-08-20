@@ -2570,7 +2570,7 @@ impl Sed {
         // at parse time). Pre-create/truncate every wfile named in the script,
         // as required by POSIX (each wfile is created before processing begins).
         self.create_wfiles();
-        for mut input in self.input_sources.drain(..).collect::<Vec<_>>() {
+        for mut input in std::mem::take(&mut self.input_sources) {
             self.current_file = Some(if input == "-" {
                 Box::new(BufReader::new(std::io::stdin()))
             } else {

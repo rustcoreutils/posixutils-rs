@@ -319,14 +319,13 @@ impl Hunks {
         hunk_start2: usize,
         hunk_end2: usize,
     ) {
-        let kind: Change;
-        if hunk_start1 == hunk_end1 {
-            kind = Change::Insert;
+        let kind: Change = if hunk_start1 == hunk_end1 {
+            Change::Insert
         } else if hunk_start2 == hunk_end2 {
-            kind = Change::Delete;
+            Change::Delete
         } else {
-            kind = Change::Substitute;
-        }
+            Change::Substitute
+        };
         self.hunks.push(Hunk {
             kind,
             ln2_start: hunk_start2,

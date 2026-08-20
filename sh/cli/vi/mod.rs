@@ -672,7 +672,7 @@ impl ViEditor {
             }
             CommandOp::CutLine => {
                 self.edit_current_line(shell);
-                self.save_buffer = self.edit_line.drain(..).collect();
+                self.save_buffer = std::mem::take(&mut self.edit_line);
                 self.cursor.position = 0;
             }
             CommandOp::CutToEnd => {

@@ -319,7 +319,7 @@ impl GrepModel {
     ///
     /// Returns [i32](i32) that represents *exit status code*.
     fn grep(&mut self) -> i32 {
-        for input_name in self.input_files.drain(..).collect::<Vec<_>>() {
+        for input_name in std::mem::take(&mut self.input_files) {
             if input_name == "-" {
                 let reader = Box::new(BufReader::new(io::stdin()));
                 self.process_input("(standard input)", reader);

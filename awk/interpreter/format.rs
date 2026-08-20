@@ -519,15 +519,11 @@ pub fn fmt_write_hex_float(
 
     let bits = value.to_bits();
     let biased_exponent = ((bits >> 52) & 0x7ff) as i64;
-    let first_digit;
-    let exponent;
-    if biased_exponent == 0 {
+    let (exponent, first_digit) = if biased_exponent == 0 {
         // subnormal number
-        exponent = -1022;
-        first_digit = '0';
+        (-1022, '0')
     } else {
-        exponent = biased_exponent - 1023;
-        first_digit = '1';
+        (biased_exponent - 1023, '1')
     };
     let exponent_sign = if exponent < 0 { '-' } else { '+' };
     let mut exponent_buffer = [0u8; 4];

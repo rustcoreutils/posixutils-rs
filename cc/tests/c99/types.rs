@@ -1474,3 +1474,62 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("qualified_tentative_def", code, &[]), 0);
 }
+
+/// `__attribute__((mode(M)))` belongs to the declarator it is written on.
+///
+/// Only the eight *declarator* sites consumed the pending mode. A struct
+/// member's declarator was not one of them, so a mode on a member did two
+/// wrong things at once: it did not size the member, and it stayed pending
+/// until the next declarator that did consume one -- the enclosing
+/// declaration's. `struct Big { int arr[100]; int x
+/// __attribute__((mode(QI))); } b;` gave `sizeof b == 1` against gcc's 404,
+/// because the QI mode was applied to `b` rather than to `x`.
+///
+/// Parameters had the same gap, without the leak: a mode on a parameter was
+/// silently ignored.
+#[test]
+fn c99_mode_attribute_binds_to_its_own_declarator() {
+    let code = r#"
+/* The regression: a member's mode must not reach the enclosing object. */
+struct Big { int arr[100]; int x __attribute__((mode(QI))); } b;
+_Static_assert(sizeof b == 404, "a member's mode is not the object's");
+_Static_assert(sizeof b.x == 1, "and it does size the member");
+
+/* Both spellings, before and after the declarator. */
+struct After  { int a __attribute__((mode(QI))); };
+struct Before { int __attribute__((mode(QI))) a; };
+_Static_assert(sizeof(struct After) == 1, "mode after the declarator");
+_Static_assert(sizeof(struct Before) == 1, "mode before the declarator");
+
+/* It must not reach the *next* member either. */
+struct Two { int a __attribute__((mode(QI))); int b; };
+_Static_assert(sizeof(struct Two) == 8, "a mode stops at its own member");
+
+/* Widening as well as narrowing. */
+struct Wide { int a __attribute__((mode(DI))); };
+_Static_assert(sizeof(struct Wide) == 8, "mode(DI) widens a member");
+
+/* Signedness is the declared type's, not the mode's. */
+struct Signs {
+    unsigned u __attribute__((mode(QI)));
+    int s __attribute__((mode(QI)));
+};
+
+int param_sized(int x __attribute__((mode(QI)))) { return sizeof x; }
+
+int main(void)
+{
+    struct Signs sg;
+    sg.u = 200; sg.s = -1;
+    if (sg.u != 200) return 1;
+    if (sg.s != -1) return 2;
+
+    if (param_sized(0) != 1) return 3;
+
+    b.x = 1;
+    if (sizeof b != 404) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("mode_binds_to_declarator", code, &[]), 0);
+}

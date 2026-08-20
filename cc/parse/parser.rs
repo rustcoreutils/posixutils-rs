@@ -3821,6 +3821,17 @@ impl Parser<'_> {
                     // Skip any __attribute__ after member declaration
                     self.skip_extensions();
 
+                    // A member's type attributes are the member's. Nothing
+                    // consumed them here, so `__attribute__((mode(M)))` on a
+                    // member did two wrong things at once: it did not size the
+                    // member, and it stayed pending, so the next declarator to
+                    // consume one -- the enclosing declaration's -- took it
+                    // instead. `struct Big { int arr[100]; int x
+                    // __attribute__((mode(QI))); } b;` gave `sizeof b == 1`
+                    // where gcc gives 404. The eight declarator sites all do
+                    // this; the member loop was the gap.
+                    let typ = self.apply_pending_type_attrs(typ);
+
                     // Capture any pending _Alignas from type specifier
                     let member_align = self.pending_alignas.take();
 
@@ -4464,6 +4475,13 @@ impl Parser<'_> {
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
+
+            // A parameter's type attributes are the parameter's, and are
+            // applied before the array-to-pointer adjustment below so a mode
+            // names the declared type rather than the adjusted one. Nothing
+            // consumed them here, so `int x __attribute__((mode(QI)))` was
+            // silently an `int`.
+            typ_id = self.apply_pending_type_attrs(typ_id);
 
             // C99 6.7.5.3: Array and function parameters are adjusted to pointers
             // - Array T[] becomes pointer to T

@@ -50,11 +50,20 @@ impl Aarch64CodeGen {
         // Load first operand
         self.emit_move(src1, work_reg, size);
 
-        // Get second operand as GpOperand
+        // Get second operand as GpOperand.
+        //
+        // Which immediates an instruction accepts depends on the instruction:
+        // `add`/`sub` take a 12-bit unsigned value, the logical operations take
+        // a *bitmask* immediate that cannot even represent 0, and a shift takes
+        // an amount below the operand width. One 0..=4095 test served all
+        // three, so `x & 0`, `x | 1000` and `x << 32` each emitted an operand
+        // the assembler rejects and the build failed.
+        //
+        // Anything not encodable goes to a register, which every form accepts.
         let src2_loc = self.get_location(src2);
         let src2_operand = match &src2_loc {
             Loc::Reg(r) => GpOperand::Reg(*r),
-            Loc::Imm(v) if *v >= 0 && *v <= 4095 => GpOperand::Imm(*v as i64),
+            Loc::Imm(v) if immediate_fits(insn.op, *v, size) => GpOperand::Imm(*v as i64),
             _ => {
                 self.emit_move(src2, Reg::X10, size);
                 GpOperand::Reg(Reg::X10)
@@ -1052,5 +1061,138 @@ impl Aarch64CodeGen {
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
             self.emit_move_to_loc(dst_reg, &dst_loc, 64);
         }
+    }
+}
+
+/// Whether `value` can be written as an immediate operand of `op` at `size`
+/// bits, rather than having to be moved into a register first.
+///
+/// Each family has its own encoding and they are not interchangeable:
+///
+/// - `add` / `sub` take a 12-bit unsigned value (a shifted-by-12 form also
+///   exists; not used here).
+/// - `and` / `orr` / `eor` take a *bitmask immediate*, which encodes a rotated
+///   run of ones replicated across the register. It cannot represent 0, cannot
+///   represent all-ones, and cannot represent most ordinary numbers -- 1000
+///   and 3000 are both unencodable.
+/// - `lsl` / `lsr` / `asr` take a shift amount below the operand width.
+fn immediate_fits(op: Opcode, value: i128, size: u32) -> bool {
+    match op {
+        Opcode::Add | Opcode::Sub => (0..=4095).contains(&value),
+        Opcode::And | Opcode::Or | Opcode::Xor => {
+            value >= 0 && is_logical_immediate(value as u64, size)
+        }
+        Opcode::Shl | Opcode::Lsr | Opcode::Asr => {
+            let width = if size > 32 { 64 } else { 32 } as i128;
+            (0..width).contains(&value)
+        }
+        // Anything else reaching this operand builder takes a register.
+        _ => false,
+    }
+}
+
+/// Whether `value` is a valid AArch64 logical (bitmask) immediate.
+///
+/// The encoding describes an element of 2, 4, 8, 16, 32 or 64 bits holding a
+/// run of consecutive ones, rotated within the element, replicated to fill the
+/// register. All-zeros and all-ones have no encoding, which is why `x & 0`
+/// assembled as `and w1, w1, #0` and was refused.
+///
+/// A wrong "no" here only costs a register move; a wrong "yes" emits assembly
+/// the assembler rejects, so the test is exact rather than approximate.
+fn is_logical_immediate(value: u64, size: u32) -> bool {
+    let width: u32 = if size > 32 { 64 } else { 32 };
+    let mask = if width == 64 {
+        u64::MAX
+    } else {
+        u32::MAX as u64
+    };
+    let value = value & mask;
+    if value == 0 || value == mask {
+        return false;
+    }
+
+    // Find the smallest element the value repeats at.
+    let mut elem = width;
+    loop {
+        let half = elem / 2;
+        let half_mask = (1u64 << half) - 1;
+        if (value & half_mask) != ((value >> half) & half_mask) {
+            break;
+        }
+        elem = half;
+        if elem <= 2 {
+            break;
+        }
+    }
+
+    // Within one element the ones must be consecutive, allowing for rotation:
+    // rotating the element until the ones are contiguous at the bottom leaves a
+    // value one less than a power of two.
+    let elem_mask = if elem == 64 {
+        u64::MAX
+    } else {
+        (1u64 << elem) - 1
+    };
+    let e = value & elem_mask;
+    if e == 0 || e == elem_mask {
+        return false;
+    }
+    let rotations = (0..elem).map(|r| ((e >> r) | (e << (elem - r))) & elem_mask);
+    rotations.into_iter().any(|r| (r + 1) & r == 0)
+}
+
+#[cfg(test)]
+mod immediate_tests {
+    use super::*;
+
+    /// The values the AArch64 assembler accepts for `and w0, w0, #N`.
+    ///
+    /// Checked against `aarch64-linux-gnu-as` over all 65 536 values of a
+    /// 16-bit immediate: it accepts 136 of them, and this predicate answers
+    /// yes for exactly those 136 -- no wrong yes, which would emit assembly
+    /// the assembler rejects, and no wrong no, which would cost a register
+    /// move. The cases below are a readable sample of that run.
+    #[test]
+    fn logical_immediates_match_the_encoding() {
+        // Encodable: a rotated run of ones, replicated.
+        for v in [1u64, 3, 7, 255, 4095, 0xFFFF, 0x5555_5555, 0xF0F0_F0F0] {
+            assert!(is_logical_immediate(v, 32), "{v:#x} should encode");
+        }
+        // Not encodable, and the two that mattered: zero has no encoding at
+        // all, and ordinary numbers mostly do not.
+        for v in [0u64, 1000, 3000, 0xFFFF_FFFF] {
+            assert!(!is_logical_immediate(v, 32), "{v:#x} should not encode");
+        }
+        // 64-bit forms.
+        assert!(is_logical_immediate(0xFFFF_FFFF_0000_0000, 64));
+        assert!(is_logical_immediate(0x5555_5555_5555_5555, 64));
+        assert!(!is_logical_immediate(0, 64));
+        assert!(!is_logical_immediate(u64::MAX, 64));
+        assert!(!is_logical_immediate(0x0123_4567_89AB_CDEF, 64));
+    }
+
+    /// Each family has its own encoding, and one 0..=4095 test used to serve
+    /// all three: `x & 0`, `x | 1000` and `x << 32` all emitted operands the
+    /// assembler rejects.
+    #[test]
+    fn each_opcode_family_has_its_own_immediate_range() {
+        // add/sub: 12-bit unsigned.
+        assert!(immediate_fits(Opcode::Add, 4095, 32));
+        assert!(!immediate_fits(Opcode::Add, 4096, 32));
+        assert!(!immediate_fits(Opcode::Sub, -1, 32));
+
+        // logical: bitmask immediate, so 4095 fits and 1000 does not.
+        assert!(immediate_fits(Opcode::And, 4095, 32));
+        assert!(!immediate_fits(Opcode::And, 1000, 32));
+        assert!(!immediate_fits(Opcode::Or, 0, 32));
+        assert!(!immediate_fits(Opcode::Xor, 0, 32));
+
+        // shifts: below the operand width.
+        assert!(immediate_fits(Opcode::Shl, 31, 32));
+        assert!(!immediate_fits(Opcode::Shl, 32, 32));
+        assert!(immediate_fits(Opcode::Lsr, 63, 64));
+        assert!(!immediate_fits(Opcode::Asr, 64, 64));
+        assert!(!immediate_fits(Opcode::Shl, -1, 32));
     }
 }

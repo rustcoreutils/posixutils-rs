@@ -4125,7 +4125,17 @@ impl X86_64CodeGen {
                         // refused rather than guessed at: addressing it
                         // through an uninitialised register is how this
                         // segfaulted while being developed.
-                        if matches!(loc, Loc::Stack(_)) {
+                        if x87_store.is_some() {
+                            // `x87_store` holds one operand. A second output
+                            // would overwrite it and the first result would be
+                            // dropped on the floor, with the stack depth no
+                            // longer matching what the template left.
+                            crate::diag::error(
+                                insn.pos.unwrap_or_default(),
+                                "only one x87 asm output is supported in one asm \
+                                 statement",
+                            );
+                        } else if matches!(loc, Loc::Stack(_)) {
                             if output.constraint.contains('+') {
                                 x87_pushes.push((output.pseudo, op_size));
                             }
@@ -4294,7 +4304,15 @@ impl X86_64CodeGen {
                         _ if Self::constraint_requires_x87(constraint_for_reg) => {
                             let name = Self::x87_slot_name(x87_slots);
                             x87_slots += 1;
-                            x87_pushes.push((input.pseudo, input.size));
+                            if Self::x87_addressable(&loc) {
+                                x87_pushes.push((input.pseudo, input.size));
+                            } else {
+                                crate::diag::error(
+                                    insn.pos.unwrap_or_default(),
+                                    "an x87 asm operand must live somewhere addressable; \
+                                     c17 cannot spill one here",
+                                );
+                            }
                             slots.push(mk(None, Some(name)));
                         }
                         Loc::FImm(..) if requires_mem => {
@@ -4403,7 +4421,7 @@ impl X86_64CodeGen {
 
         // Push the x87 operands. Reversed, so that the first declared ends on
         // top of the stack where `%st` names it and the second at `%st(1)`.
-        for (pseudo, size) in x87_pushes.clone().into_iter().rev() {
+        for (pseudo, size) in x87_pushes.into_iter().rev() {
             let addr = self.get_x87_mem_addr(pseudo).format(&self.base.target);
             let mnemonic = match size {
                 32 => "flds",
@@ -4775,6 +4793,20 @@ impl X86_64CodeGen {
     /// c17 keeps a long double in memory and reaches it with `fldt`/`fstpt`,
     /// so an x87 operand is loaded onto the stack before the template and
     /// popped back afterwards rather than being given a register.
+    /// Whether `get_x87_mem_addr` can address this location soundly.
+    ///
+    /// It has no arm for `Loc::Xmm` and falls back to `[rbp+0]` -- the saved
+    /// frame pointer -- so an x87 constraint on a value sitting in an XMM
+    /// register, which is where a `double` lives, silently read garbage.
+    /// Refusing is not gcc's answer, which spills it, but it is the honest one
+    /// until c17 can spill here.
+    fn x87_addressable(loc: &Loc) -> bool {
+        matches!(
+            loc,
+            Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) | Loc::Reg(_) | Loc::FImm(..)
+        )
+    }
+
     /// How the template names the `n`th x87 operand.
     ///
     /// `t` is the top of the stack and `u` the one below it, and operands are

@@ -1090,6 +1090,20 @@ impl<'a> Parser<'a> {
                     None
                 }
             }
+            // A negative argument. Without this the sign was skipped as an
+            // unknown token and the magnitude parsed on its own, so
+            // `vector_size(-16)` read as `vector_size(16)` and silently
+            // produced a type the source never asked for.
+            TokenType::Special if self.is_special(b'-') => {
+                self.advance();
+                if let TokenValue::Number(s) = &self.current().value {
+                    let n = s.parse::<i64>().unwrap_or(0);
+                    self.advance();
+                    Some(AttributeArg::Int(-n))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -1625,6 +1639,19 @@ impl<'a> Parser<'a> {
         let elem_size = self.types.size_bytes(typ);
         if elem_size == 0 || !self.types.is_arithmetic(typ) {
             diag::error(pos, "'vector_size' requires an arithmetic element type");
+            return typ;
+        }
+        // The same ceiling `derive_array_type` applies, and for the same
+        // reason: this interns an array directly, so nothing else would catch
+        // an absurd width. Without it `vector_size(4294967296)` quietly
+        // produced a four-gigabyte type, and a width near `u64::MAX` made
+        // `next_power_of_two` overflow -- a panic in a debug build.
+        if bytes > TypeTable::MAX_OBJECT_BYTES as u64 {
+            diag::error_args(
+                pos,
+                "'vector_size' of {0} exceeds the maximum object size of {1} bytes",
+                &[&bytes.to_string(), &TypeTable::MAX_OBJECT_BYTES.to_string()],
+            );
             return typ;
         }
         if bytes % elem_size as u64 != 0 {

@@ -80,6 +80,19 @@ const VALUE_OPTIONS: &[&str] = &[
 /// glibc system and every macOS.
 pub const POSIX_STANDARD_LIBRARIES: &[&str] = &["c", "l", "m", "pthread", "rt", "xnet", "y"];
 
+/// The file forms a library can take, in the order worth probing.
+///
+/// `.so` and `.a` are the two POSIX names (88924-88929). `.dylib` is
+/// macOS's shared form and `.tbd` its SDK link-time stub, both of which the
+/// linker resolves for `-l<name>`; a user who puts one in a `-L` directory has
+/// supplied that library, and probing only the POSIX pair would drop the `-l`
+/// and silently ignore it.
+///
+/// Probed unconditionally rather than under `#[cfg(target_os)]`: the `-L`
+/// directories are the user's, and the search is performed by the host linker
+/// whatever target c17 was asked for.
+const LIBRARY_SUFFIXES: &[&str] = &["so", "a", "dylib", "tbd"];
+
 /// Whether `-l <name>` must be dropped rather than handed to the linker.
 ///
 /// Only the seven standard names are ever dropped, and only when the host has
@@ -94,13 +107,26 @@ pub const POSIX_STANDARD_LIBRARIES: &[&str] = &["c", "l", "m", "pthread", "rt", 
 /// `lib_paths` is the `-L` directories seen *before* this `-l`, per 88925-88929
 /// — a later `-L` cannot satisfy an earlier `-l`.
 pub fn drop_standard_library(name: &str, lib_paths: &[String]) -> bool {
+    // 88090-88091 exempts one of the seven: "except for the shared library
+    // version of the c library, need not exist as regular files". libc is the
+    // one that does exist, so `-l c` is always forwarded and never decided by
+    // a probe. That matters on macOS, where none of the seven can be found as
+    // a file at all -- /usr/lib/libc.dylib has not been on disk since the
+    // dyld shared cache, only an SDK `.tbd` stub the driver resolves itself --
+    // so probing would have dropped even this one.
+    if name == "c" {
+        return false;
+    }
     POSIX_STANDARD_LIBRARIES.contains(&name) && !standard_library_exists(name, lib_paths)
 }
 
-/// Whether `lib<name>.so` or `lib<name>.a` can be found, in `lib_paths` or on
-/// the host driver's own default search path.
+/// Whether a library file for `name` can be found, in `lib_paths` or on the
+/// host driver's own default search path.
 fn standard_library_exists(name: &str, lib_paths: &[String]) -> bool {
-    let files = [format!("lib{}.so", name), format!("lib{}.a", name)];
+    let files = LIBRARY_SUFFIXES
+        .iter()
+        .map(|suffix| format!("lib{}.{}", name, suffix))
+        .collect::<Vec<_>>();
 
     for dir in lib_paths {
         if files.iter().any(|f| Path::new(dir).join(f).exists()) {
@@ -112,10 +138,10 @@ fn standard_library_exists(name: &str, lib_paths: &[String]) -> bool {
     // than guessing at directory layouts. `-print-file-name` echoes the bare
     // name back when it finds nothing, which is the "absent" answer.
     //
-    // Both suffixes have to be tried: glibc 2.34 folded librt and libpthread
-    // into libc and left empty `librt.a` / `libpthread.a` stubs behind, with
-    // no `.so` of either. Probing only `.so` would drop a `-l rt` that links
-    // perfectly well.
+    // Every suffix has to be tried, not just `.so`: glibc 2.34 folded librt
+    // and libpthread into libc and left empty `librt.a` / `libpthread.a` stubs
+    // behind with no `.so` of either, so probing only `.so` would drop a
+    // `-l rt` that links perfectly well.
     files.iter().any(|f| {
         Command::new("cc")
             .arg(format!("-print-file-name={}", f))
@@ -267,11 +293,40 @@ mod tests {
         assert!(!drop_standard_library("stdc++", &[]));
     }
 
-    /// The C library exists everywhere c17 runs, so it is never the dropped
-    /// case — 88089-88093 exempts it from "need not exist as regular files".
+    /// 88090-88091 exempts libc from "need not exist as regular files": it is
+    /// the one of the seven the spec says does exist, so `-l c` is forwarded
+    /// unconditionally and never decided by a probe.
+    ///
+    /// Asserted as the rule rather than by probing, because the probe is
+    /// exactly what gets this wrong. On macOS none of the seven can be found
+    /// as a file — /usr/lib/libc.dylib has not been on disk since the dyld
+    /// shared cache — so this test failed on macOS CI while passing on Linux.
     #[test]
-    fn libc_is_always_present() {
+    fn libc_is_never_dropped() {
         assert!(!drop_standard_library("c", &[]));
+        // Not even when a -L directory is given and holds nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().to_string_lossy().into_owned()];
+        assert!(!drop_standard_library("c", &paths));
+    }
+
+    /// Every file form a library can take is probed, not just the two POSIX
+    /// spells. A user who puts a `.dylib` in a `-L` directory has supplied
+    /// that library, and dropping the `-l` would silently ignore it.
+    #[test]
+    fn a_supplied_library_is_found_under_any_suffix() {
+        for suffix in LIBRARY_SUFFIXES {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = vec![dir.path().to_string_lossy().into_owned()];
+            // `xnet` exists on no glibc system and no macOS: the drop case.
+            assert!(drop_standard_library("xnet", &paths));
+            std::fs::write(dir.path().join(format!("libxnet.{}", suffix)), b"").unwrap();
+            assert!(
+                !drop_standard_library("xnet", &paths),
+                "libxnet.{} was not recognized",
+                suffix
+            );
+        }
     }
 
     /// A `-L` directory holding the library settles it without asking the host
@@ -287,23 +342,6 @@ mod tests {
         // ...until the user puts one there.
         std::fs::write(dir.path().join("libxnet.a"), b"").unwrap();
         assert!(!drop_standard_library("xnet", &paths));
-    }
-
-    /// Either suffix counts. glibc 2.34 folded librt and libpthread into libc
-    /// and left empty `.a` stubs with no `.so`, so probing only `.so` would
-    /// drop a `-l rt` that links perfectly well.
-    #[test]
-    fn either_suffix_counts_as_present() {
-        for suffix in ["so", "a"] {
-            let dir = tempfile::tempdir().unwrap();
-            let paths = vec![dir.path().to_string_lossy().into_owned()];
-            std::fs::write(dir.path().join(format!("liby.{}", suffix)), b"").unwrap();
-            assert!(
-                !drop_standard_library("y", &paths),
-                "liby.{} was not recognized",
-                suffix
-            );
-        }
     }
 
     #[test]

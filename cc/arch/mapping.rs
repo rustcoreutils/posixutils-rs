@@ -1265,6 +1265,68 @@ pub(crate) fn expand_float16_arith(
     insns
 }
 
+/// Lower `__int128` -> `_Float16` as int128 -> float -> half, for a target
+/// whose half conversions are native.
+///
+/// `map_int128_float_convert` declines a `_Float16` destination, because
+/// `float_suffix` has no arm for it, so nothing lowered this and codegen
+/// emitted a native conversion from the low 64 bits of the value:
+/// `(_Float16)((__int128)1 << 100)` came out 0 where it must be infinite.
+///
+/// The narrowing step is left as an ordinary `FCvtF` rather than a call:
+/// aarch64 has `fcvt h, s` in hardware, and its libgcc defines no
+/// `__truncsfhf2` to call instead. The widening step must be a call -- there is
+/// no instruction that reads 128 bits.
+pub(crate) fn map_int128_to_float16(
+    insn: &Instruction,
+    ctx: &mut MappingCtx<'_>,
+) -> Option<MappedInsn> {
+    let types = ctx.types;
+    match insn.op {
+        Opcode::SCvtF | Opcode::UCvtF => {
+            let dst_typ = insn.typ?;
+            if types.kind(dst_typ) != TypeKind::Float16 {
+                return None;
+            }
+            let src_typ = insn.src_typ?;
+            if types.kind(src_typ) != TypeKind::Int128 {
+                return None;
+            }
+
+            let float_type = types.float_id;
+            let float_size = types.size_bits(float_type);
+            let result = insn.target?;
+            let src = *insn.src.first()?;
+            let as_float = ctx.func.create_reg_pseudo();
+
+            let mut widen = Instruction::unop(insn.op, as_float, src, float_type, float_size);
+            widen.src_typ = Some(src_typ);
+            widen.src_size = 128;
+            widen.pos = insn.pos;
+            let name = if insn.op == Opcode::UCvtF {
+                "__floatuntisf"
+            } else {
+                "__floattisf"
+            };
+            let call = build_convert_rtlib_call(&widen, name, types, ctx.target);
+
+            let mut narrow = Instruction::unop(
+                Opcode::FCvtF,
+                result,
+                as_float,
+                dst_typ,
+                types.size_bits(dst_typ),
+            );
+            narrow.src_typ = Some(float_type);
+            narrow.src_size = float_size;
+            narrow.pos = insn.pos;
+
+            Some(MappedInsn::Replace(vec![call, narrow]))
+        }
+        _ => None,
+    }
+}
+
 /// Expand a `_Float16` <-> integer conversion by going through `float`.
 ///
 /// libgcc implements no half<->integer helper at all: `__fixhfsi`,

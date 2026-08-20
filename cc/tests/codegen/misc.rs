@@ -5398,6 +5398,16 @@ int main(void) {
     _Float16 from_long = (_Float16)1234L;
     if ((float)from_long < 1233.0f || (float)from_long > 1235.0f) return 35;
 
+    /* A 128-bit operand must use the 128-bit helper. Choosing by
+       `dst_size <= 32` handed these the 64-bit one and read half the value:
+       (_Float16)(1<<100) came out 0 rather than infinite. */
+    __int128 big = (__int128)1 << 100;
+    _Float16 from_big = (_Float16)big;
+    if ((float)from_big <= 65504.0f) return 36;      /* must overflow to inf */
+
+    _Float16 exact = 2048.0f16;
+    if ((long long)(__int128)exact != 2048) return 37;
+
     /* Compound assignment */
     _Float16 ca = 10.0f16;
     ca += 5.0f16;

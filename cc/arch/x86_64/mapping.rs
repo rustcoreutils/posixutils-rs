@@ -772,4 +772,74 @@ mod tests {
             }
         }
     }
+
+    /// A 128-bit operand builds its own libcall inside the expansion rather
+    /// than leaving a `float` <-> `__int128` conversion for a later pass:
+    /// `map_function` does not re-map a replacement. Picking the helper by
+    /// `dst_size <= 32`, as the old code did, handed a 128-bit operand the
+    /// 64-bit `__fixhfdi` / `__floatdihf` and would have read half of it.
+    #[test]
+    fn test_x86_64_float16_int128_conversions_use_the_128_bit_helper() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = X86_64Mapper;
+
+        let cases = [
+            (
+                Opcode::FCvtS,
+                types.int128_id,
+                128,
+                types.float16_id,
+                16,
+                ["__extendhfsf2", "__fixsfti"],
+            ),
+            (
+                Opcode::FCvtU,
+                types.uint128_id,
+                128,
+                types.float16_id,
+                16,
+                ["__extendhfsf2", "__fixunssfti"],
+            ),
+            (
+                Opcode::SCvtF,
+                types.float16_id,
+                16,
+                types.int128_id,
+                128,
+                ["__floattisf", "__truncsfhf2"],
+            ),
+            (
+                Opcode::UCvtF,
+                types.float16_id,
+                16,
+                types.uint128_id,
+                128,
+                ["__floatuntisf", "__truncsfhf2"],
+            ),
+        ];
+
+        for (op, dst, dst_size, src, src_size, expected) in cases {
+            let insn = make_convert_insn(op, dst, dst_size, src, src_size);
+            let mut func = make_minimal_func(&types);
+            let mut ctx = MappingCtx {
+                func: &mut func,
+                types: &types,
+                target: &target,
+            };
+            let MappedInsn::Replace(insns) = mapper.map_insn(&insn, &mut ctx) else {
+                panic!("{op:?} should be expanded");
+            };
+            let calls: Vec<&str> = insns
+                .iter()
+                .filter(|i| i.op == Opcode::Call)
+                .filter_map(|i| i.func_name.as_deref())
+                .collect();
+            assert_eq!(
+                calls,
+                expected.to_vec(),
+                "{op:?}: both steps must be libgcc-provided calls"
+            );
+        }
+    }
 }

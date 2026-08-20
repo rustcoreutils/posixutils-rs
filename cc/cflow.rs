@@ -847,43 +847,49 @@ fn process_file(
     // Create string table for identifier interning
     let mut strings = StringTable::new();
 
-    // Tokenize
-    let tokens = {
-        let mut tokenizer = Tokenizer::new(&buffer, stream_id, &mut strings);
-        tokenizer.tokenize()
-    };
-
-    // Preprocess.
-    //
     // A .i operand is already the output of `c17 -E`; POSIX (via c17's OPERANDS
     // section) says "the processing already performed by c17 -E when the file
-    // was produced shall not be repeated", so it goes straight to the parser.
-    let target = Target::host();
+    // was produced shall not be repeated".
+    //
+    // Skipping the preprocessor outright, which is what this did, does not
+    // achieve that -- it breaks it. Real `-E` output is built out of
+    // `# N "file"` linemarkers, and the parser has no `#` of its own, so the
+    // first one was a syntax error and `cflow` rejected every preprocessed
+    // file it was given. The preprocessor's own `.i` mode is what skips the
+    // right things: it keeps consuming linemarkers and pragmas while running
+    // no macro expansion, no conditionals and no includes.
     let already_preprocessed = Path::new(path)
         .extension()
         .and_then(|s| s.to_str())
         .map(|e| e == "i")
         .unwrap_or(false);
-    let preprocessed = if already_preprocessed {
-        tokens
-    } else {
-        preprocess_with_defines(
-            tokens,
-            &target,
-            &mut strings,
-            path,
-            &PreprocessConfig {
-                search: Default::default(),
-                defines,
-                undefines,
-                include_paths,
-                no_std_inc: false,
-                no_builtin_inc: false,
-                trigraphs: false,
-                preprocessed: false,
-            },
-        )
+
+    // Tokenize. Translation phase 2 has already run on a .i, like phase 1.
+    let tokens = {
+        let mut tokenizer = Tokenizer::new(&buffer, stream_id, &mut strings);
+        if already_preprocessed {
+            tokenizer = tokenizer.without_splicing();
+        }
+        tokenizer.tokenize()
     };
+
+    let target = Target::host();
+    let preprocessed = preprocess_with_defines(
+        tokens,
+        &target,
+        &mut strings,
+        path,
+        &PreprocessConfig {
+            search: Default::default(),
+            defines,
+            undefines,
+            include_paths,
+            no_std_inc: false,
+            no_builtin_inc: false,
+            trigraphs: false,
+            preprocessed: already_preprocessed,
+        },
+    );
 
     // Create symbol table and type table
     let mut symbols = SymbolTable::new();
@@ -918,6 +924,23 @@ fn process_file(
     let text = String::from_utf8_lossy(&buffer);
     let lines: Vec<&str> = text.lines().collect();
 
+    // Where an object is defined, as the linemarkers say rather than as the
+    // operand's own text says. For a `.i` these differ: the definitions came
+    // from the `.c` the marker names, and reporting them against the
+    // preprocessed file names a place the reader cannot go look.
+    //
+    // The declarator refinement only applies when the two agree, because it
+    // scans `lines`, which is the operand's physical text; against a remapped
+    // line that would be the wrong line of the wrong file.
+    let locate = |pos: posixutils_cc::diag::Position, name: &str| -> (String, u32) {
+        let (file, line, _) = posixutils_cc::diag::effective_position(pos);
+        if file == display {
+            (file, declarator_line(&lines, line, name))
+        } else {
+            (file, line)
+        }
+    };
+
     // Pass 1: file-scope data objects. Needed both as graph nodes (under -i x)
     // and as the set that tells pass 2 which identifier references are data.
     let mut data_symbols: HashMap<String, FunctionInfo> = HashMap::new();
@@ -934,13 +957,13 @@ fn process_file(
                     continue;
                 }
                 let name = strings.get(sym.name).to_string();
-                let line = declarator_line(&lines, d.pos.line, &name);
+                let (file, line) = locate(d.pos, &name);
                 data_symbols.insert(
                     name.clone(),
                     FunctionInfo::from_source(
                         name,
                         &types.format_type(d.typ, Some(&strings)),
-                        display,
+                        &file,
                         line,
                         Vec::new(),
                         NodeKind::Data,
@@ -955,7 +978,7 @@ fn process_file(
         if let ExternalDecl::FunctionDef(func) = item {
             let name = strings.get(func.name).to_string();
             let return_type = types.format_type(func.return_type, Some(&strings));
-            let line = declarator_line(&lines, func.pos.line, &name);
+            let (file, line) = locate(func.pos, &name);
 
             let mut calls = Vec::new();
             extract_calls_from_stmt(&func.body, &strings, &symbols, &mut calls);
@@ -978,7 +1001,7 @@ fn process_file(
             graph.add_function(FunctionInfo::from_source(
                 name,
                 &return_type,
-                display,
+                &file,
                 line,
                 calls,
                 NodeKind::Function,

@@ -245,3 +245,96 @@ fn tools_cflow_prints_the_whole_type() {
         );
     }
 }
+
+// ============================================================================
+// #F10 (reopened) — a `.i` operand must actually work
+//
+// The original fix skipped the preprocessor outright for a `.i`. That does not
+// achieve "the processing already performed by c17 -E ... shall not be
+// repeated" -- it breaks it. Real `-E` output is built out of `# N "file"`
+// linemarkers, and the parser has no `#` of its own, so the first marker was a
+// syntax error and cflow rejected every preprocessed file it was handed. The
+// entry was closed [static], on the premise that preprocessing is "usually
+// idempotent"; it was never run against real output.
+// ============================================================================
+
+/// A lone linemarker is enough to reproduce the original failure.
+#[test]
+fn cflow_accepts_a_linemarker() {
+    let dir = tempfile::Builder::new()
+        .prefix("cflow_dot_i_")
+        .tempdir()
+        .unwrap();
+    let i = dir.path().join("tiny.i");
+    std::fs::write(&i, "# 1 \"x.c\"\nint f(void){return 0;}\n").unwrap();
+
+    let (out, err, ok) = run_cflow(&[&i.to_string_lossy()]);
+    assert!(ok, "cflow rejected a linemarker: {err}");
+    assert!(out.contains("f:"), "no entry for f:\n{out}");
+}
+
+/// Real `c17 -E` output must give the same answer as the source it came from.
+///
+/// This is the property the `.i` operand exists for, and the one thing the
+/// original fix could not do.
+#[test]
+fn cflow_on_preprocessed_output_matches_the_source() {
+    let dir = tempfile::Builder::new()
+        .prefix("cflow_dot_i_roundtrip_")
+        .tempdir()
+        .unwrap();
+    let c = dir.path().join("cf.c");
+    std::fs::write(
+        &c,
+        "#include <stddef.h>\nint helper(void){return 1;}\n\
+         int main(void){helper();return 0;}\n",
+    )
+    .unwrap();
+    let i = dir.path().join("cf.i");
+
+    let pp = Command::new(env!("CARGO_BIN_EXE_c17"))
+        .args(["-E", &c.to_string_lossy(), "-o", &i.to_string_lossy()])
+        .output()
+        .expect("failed to run c17 -E");
+    assert!(
+        pp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pp.stderr)
+    );
+
+    let (from_c, _, ok_c) = run_cflow(&[&c.to_string_lossy()]);
+    assert!(ok_c);
+    let (from_i, err_i, ok_i) = run_cflow(&[&i.to_string_lossy()]);
+    assert!(ok_i, "cflow rejected real -E output: {err_i}");
+
+    // Identical, including the file each definition is attributed to: the
+    // definitions came from `cf.c`, and naming `cf.i` points the reader at a
+    // place the code does not live.
+    assert_eq!(
+        from_i, from_c,
+        "a preprocessed file gave a different graph than its source"
+    );
+    assert!(
+        !from_i.contains("cf.i"),
+        "definitions attributed to the preprocessed file:\n{from_i}"
+    );
+}
+
+/// A `.i` is not preprocessed again, in cflow as in c17.
+#[test]
+fn cflow_does_not_expand_macros_in_a_dot_i() {
+    let dir = tempfile::Builder::new()
+        .prefix("cflow_dot_i_nomacro_")
+        .tempdir()
+        .unwrap();
+    let i = dir.path().join("m.i");
+    // If the macro were expanded again, `f` would be renamed to `g`.
+    std::fs::write(&i, "#define f g\nint f(void){return 0;}\n").unwrap();
+
+    let (out, err, ok) = run_cflow(&[&i.to_string_lossy()]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("f:") && !out.contains("g:"),
+        "the macro was expanded a second time:\n{out}"
+    );
+}

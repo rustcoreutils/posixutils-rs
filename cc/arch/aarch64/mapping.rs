@@ -10,8 +10,8 @@
 //
 
 use crate::arch::mapping::{
-    map_binary128, map_int128_divmod, map_int128_expand, map_int128_float_convert, ArchMapper,
-    MappedInsn, MappingCtx,
+    map_binary128, map_int128_divmod, map_int128_expand, map_int128_float_convert,
+    map_int128_to_float16, ArchMapper, MappedInsn, MappingCtx,
 };
 use crate::ir::Instruction;
 
@@ -30,6 +30,12 @@ impl ArchMapper for Aarch64Mapper {
         }
         // Shared: int128↔float → rtlib
         if let Some(r) = map_int128_float_convert(insn, ctx) {
+            return r;
+        }
+        // int128 → _Float16, which the pass above declines: it has no
+        // `float_suffix` for a half. Left unlowered, codegen emitted a native
+        // `scvtf h0, x9` reading only the low 64 bits.
+        if let Some(r) = map_int128_to_float16(insn, ctx) {
             return r;
         }
         // Shared: IEEE binary128 → rtlib soft-float. On this target that is

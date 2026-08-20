@@ -2059,6 +2059,14 @@ impl Aarch64CodeGen {
     ) {
         // Emit .loc directive for debug info
         self.emit_loc(insn);
+        // `-fverbose-asm`: hang the source-level names off the first
+        // instruction this one produces. Recorded before emission, since
+        // the index is the position the next push will take.
+        if self.base.verbose_asm {
+            if let Some(text) = crate::arch::codegen::verbose_annotation(insn, &self.pseudos) {
+                self.base.annotate_next(text);
+            }
+        }
 
         let (_total_frame, callee_saved, callee_saved_fp) = frame_info;
 
@@ -4669,6 +4677,10 @@ impl CodeGenerator for Aarch64CodeGen {
 
     fn set_shared_mode(&mut self, shared: bool) {
         self.base.shared_mode = shared;
+    }
+
+    fn set_verbose_asm(&mut self, verbose: bool) {
+        self.base.verbose_asm = verbose;
     }
 }
 

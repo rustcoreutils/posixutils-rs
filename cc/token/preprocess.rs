@@ -658,7 +658,11 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Create a new preprocessor
-    pub fn new(target: &'a Target, filename: &str) -> Self {
+    /// `search` supplies the sysroot and the `-isystem` / `-idirafter`
+    /// directories, which have to be known here rather than applied later:
+    /// `init_predefined_macros` probes the include path to decide
+    /// `__STDC_NO_THREADS__`, so the list must already be the real one.
+    pub fn new(target: &'a Target, filename: &str, search: &SystemSearch<'_>) -> Self {
         let current_dir = Path::new(filename)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -694,8 +698,18 @@ impl<'a> Preprocessor<'a> {
         };
 
         // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
-        for path in os::get_include_paths(target) {
-            pp.system_include_paths.push(path.to_string());
+        //
+        // One list, in gcc's order: `-isystem` ahead of the target's own
+        // directories, `-idirafter` behind them. Keeping it as a single vector
+        // is what lets `#include_next`'s index walk stay coherent.
+        for path in search.isystem {
+            pp.system_include_paths.push(path.clone());
+        }
+        for path in os::get_include_paths(target, search.sysroot) {
+            pp.system_include_paths.push(path);
+        }
+        for path in search.idirafter {
+            pp.system_include_paths.push(path.clone());
         }
 
         pp.init_predefined_macros();
@@ -4469,6 +4483,20 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 // Public API
 // ============================================================================
 
+/// Where the system headers are, and what the command line added to that.
+///
+/// Separate from [`PreprocessConfig`] because the preprocessor needs it at
+/// construction, before any other option is applied.
+#[derive(Debug, Clone, Default)]
+pub struct SystemSearch<'a> {
+    /// `--sysroot`: the target's directories are read from under this prefix.
+    pub sysroot: Option<&'a str>,
+    /// `-isystem`: system directories searched ahead of the target's own.
+    pub isystem: &'a [String],
+    /// `-idirafter`: system directories searched behind the target's own.
+    pub idirafter: &'a [String],
+}
+
 /// Configuration for preprocessing command-line options
 #[derive(Default)]
 pub struct PreprocessConfig<'a> {
@@ -4478,6 +4506,8 @@ pub struct PreprocessConfig<'a> {
     pub undefines: &'a [String],
     /// Command-line -I include paths
     pub include_paths: &'a [String],
+    /// Where the system headers are; see [`SystemSearch`].
+    pub search: SystemSearch<'a>,
     /// If true, disable system include paths (-nostdinc)
     pub no_std_inc: bool,
     /// If true, disable builtin headers (-nobuiltininc)
@@ -4504,9 +4534,12 @@ pub fn preprocess_with_defines(
     filename: &str,
     config: &PreprocessConfig<'_>,
 ) -> Vec<Token> {
-    let mut pp = Preprocessor::new(target, filename);
+    let mut pp = Preprocessor::new(target, filename, &config.search);
 
-    // Handle -nostdinc and -nobuiltininc flags
+    // -nostdinc drops the bundled headers as well as the system directories,
+    // which is what gcc does: `gcc -nostdinc` cannot find <stddef.h> either,
+    // its own include directory being one of the standard ones. Probed rather
+    // than assumed -- this was very nearly "aligned" the other way.
     if config.no_std_inc {
         pp.use_system_headers = false;
         pp.use_builtin_headers = false;
@@ -4547,6 +4580,8 @@ pub struct AsmPreprocessConfig<'a> {
     pub undefines: &'a [String],
     /// Command-line -I include paths
     pub include_paths: &'a [String],
+    /// Where the system headers are; see [`SystemSearch`].
+    pub search: SystemSearch<'a>,
     /// If true, disable system include paths (-nostdinc)
     pub no_std_inc: bool,
 }
@@ -4586,7 +4621,7 @@ pub fn preprocess_asm_file(
     // Create preprocessor with assembly-specific predefined macros. The C
     // standard macros are undefined immediately below, so nothing the language
     // mode contributes survives into an assembly translation unit.
-    let mut pp = Preprocessor::new(target, filename);
+    let mut pp = Preprocessor::new(target, filename, &config.search);
 
     // Use assembly lexer mode for included files as well
     pp.lexer_mode = LexerMode::Assembly;
@@ -4788,7 +4823,7 @@ mod tests {
     #[test]
     fn test_predefined_stdc() {
         let target = Target::host();
-        let pp = Preprocessor::new(&target, "test.c");
+        let pp = Preprocessor::new(&target, "test.c", &SystemSearch::default());
         assert!(pp.is_defined("__STDC__"));
         assert!(pp.is_defined("__STDC_VERSION__"));
     }
@@ -4796,7 +4831,7 @@ mod tests {
     #[test]
     fn test_predefined_arch() {
         let target = Target::host();
-        let pp = Preprocessor::new(&target, "test.c");
+        let pp = Preprocessor::new(&target, "test.c", &SystemSearch::default());
 
         // Should have either x86_64 or aarch64 defined
         assert!(pp.is_defined("__x86_64__") || pp.is_defined("__aarch64__"));

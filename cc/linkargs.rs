@@ -68,6 +68,9 @@ const VALUE_OPTIONS: &[&str] = &[
     "--c17-fno-builtin-func",
     "--c17-linker-flag",
     "--c17-unsupported-mflag",
+    "--sysroot",
+    "-isystem",
+    "-idirafter",
 ];
 
 /// The libraries `-l` is required to find, c17.md 88057-88093.

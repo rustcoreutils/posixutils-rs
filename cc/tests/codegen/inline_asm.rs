@@ -1475,3 +1475,76 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("asm_width_modifier_const", code, &[]), 0);
 }
+
+// ============================================================================
+// SSE register constraints on an inline-asm *output* (#C139)
+//
+// `constraint_requires_register` and `constraint_requires_memory` know no FP
+// class letter, so `"=x"` matched neither and the output fell through to the
+// general-register arm: the template was handed `%rax` and `movsd %xmm0, %rax`
+// was refused by the assembler. The input side had been given
+// `constraint_requires_sse`; the output side had not.
+//
+// x86-64 only. aarch64's output loop falls through to `loc_to_asm_string`,
+// which renders a vector register as `dN` correctly.
+// ============================================================================
+
+/// The plain case: a value out of the asm through an SSE register.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_sse_output_constraint() {
+    let code = r#"
+double src = 2.25;
+int main(void) {
+    double back = 0;
+    __asm__ ("movsd %1, %0" : "=x"(back) : "x"(src));
+    return back == 2.25 ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("asm_sse_output", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_sse_output_opt", code), 0);
+}
+
+/// A read-write `"+x"` operand. Its slot carries text rather than a register,
+/// so the tied-input path that loads an output's initial value found nothing
+/// and `addsd %xmm15, %xmm15` ran on whatever happened to be in the scratch.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_sse_read_write_constraint() {
+    let code = r#"
+double d = 1.5;
+float  f = 1.25f;
+int main(void) {
+    __asm__ ("addsd %0, %0" : "+x"(d));
+    if (d != 3.0) return 1;
+    __asm__ ("addss %0, %0" : "+x"(f));
+    if (f != 2.5f) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_sse_readwrite", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_sse_readwrite_opt", code), 0);
+}
+
+/// An output and inputs together, which needs both scratch registers and so
+/// pins that the two loops share one budget rather than each claiming Xmm15.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_sse_output_and_inputs_share_the_scratch_budget() {
+    let code = r#"
+double a = 1.5, b = 2.25;
+int main(void) {
+    double r = 0;
+    __asm__ ("movsd %1, %0; addsd %2, %0" : "=&x"(r) : "x"(a), "x"(b));
+    if (r != 3.75) return 1;
+
+    /* An SSE constant alongside an SSE output: one scratch each. */
+    double c = 0;
+    __asm__ ("movsd %1, %0" : "=x"(c) : "x"(0.5));
+    if (c != 0.5) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_sse_budget", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_sse_budget_opt", code), 0);
+}

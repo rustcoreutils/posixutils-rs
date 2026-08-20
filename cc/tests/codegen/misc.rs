@@ -5377,13 +5377,36 @@ int main(void) {
     _Float16 from_double = (_Float16)d;
     if ((float)from_double < 3.49f || (float)from_double > 3.51f) return 23;
 
-    /* Float16 <-> int via float intermediary (avoids __fixhfsi) */
-    float fa = (float)a;
-    int i = (int)fa;
+    /* Float16 <-> int, directly. These used to be written through a float
+       intermediary by hand, to avoid __fixhfsi and the seven siblings libgcc
+       does not define; the compiler goes through float itself now. */
+    int i = (int)a;
     if (i != 3) return 30;
 
-    _Float16 from_int = (_Float16)(float)42;
+    _Float16 from_int = (_Float16)42;
     if ((float)from_int < 41.9f || (float)from_int > 42.1f) return 31;
+
+    unsigned u = (unsigned)a;
+    if (u != 3u) return 32;
+
+    long l = (long)a;
+    if (l != 3L) return 33;
+
+    _Float16 neg = -3.5f16;
+    if ((int)neg != -3) return 34;
+
+    _Float16 from_long = (_Float16)1234L;
+    if ((float)from_long < 1233.0f || (float)from_long > 1235.0f) return 35;
+
+    /* A 128-bit operand must use the 128-bit helper. Choosing by
+       `dst_size <= 32` handed these the 64-bit one and read half the value:
+       (_Float16)(1<<100) came out 0 rather than infinite. */
+    __int128 big = (__int128)1 << 100;
+    _Float16 from_big = (_Float16)big;
+    if ((float)from_big <= 65504.0f) return 36;      /* must overflow to inf */
+
+    _Float16 exact = 2048.0f16;
+    if ((long long)(__int128)exact != 2048) return 37;
 
     /* Compound assignment */
     _Float16 ca = 10.0f16;

@@ -107,16 +107,13 @@ Supported:
 - GCC-compatible inline assembly: extended asm with constraints, clobbers, named operands, matching constraints, `asm goto` with labels
 - Variably modified types everywhere C17 admits them, including a `typedef` of
   one (6.7.7), whose extents are evaluated at the typedef rather than at each use
+- `-fverbose-asm`, annotating each instruction with the source names it came from
+- Cross-compilation as far as `-S`: `--sysroot`, `-isystem` and `-idirafter`
+  give `--target` the target's headers. `as` and `cc` are still the host's, so
+  assembling and linking for another target is not supported
 
 Not yet implemented (features we want to add):
-- `-fverbose-asm`
 - assembly peephole optimizations
-
-Known defects:
-- An SSE or vector inline-asm **output** constraint (`"=x"`, `"=w"`) is given a
-  general register, so the template renders as `movsd %xmm15, %rax` and the
-  assembler rejects it. The input side is correct. See #C139 in
-  [audit.md](audit.md).
 
 Will not implement:
 - `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,

@@ -2556,8 +2556,13 @@ impl Parser<'_> {
                 // 6.7p7: the object needs a size here, and unlike at file
                 // scope nothing later can supply one -- a tag completed further
                 // down the block is a different declaration. An `extern`
-                // declaration defines nothing and is exempt.
-                if !base_type.modifiers.contains(TypeModifiers::EXTERN)
+                // declaration defines nothing and is exempt, and so does a
+                // `typedef`, which declares no object at all: without that,
+                // `typedef struct Incomplete T;` at block scope was rejected
+                // although it names a type nobody has asked to size. The
+                // file-scope twin has had the guard all along.
+                if !is_typedef
+                    && !base_type.modifiers.contains(TypeModifiers::EXTERN)
                     && !self.types.is_composite_complete(typ)
                 {
                     let named = self.types.format_type(typ, Some(self.idents));
@@ -4624,6 +4629,15 @@ impl Parser<'_> {
     /// judged here, when nothing more can complete them.
     fn check_deferred_incomplete_definitions(&mut self) {
         for (typ, pos) in std::mem::take(&mut self.tentative_definitions) {
+            // Ask the *tag*, not the recorded id. A qualified spelling --
+            // `volatile struct S` -- is interned as a fresh type carrying a
+            // clone of the tag's composite data as it stood at the time
+            // (`intern_type_with_tag`), and `complete_struct` only ever
+            // mutates the tag's own entry. So the recorded id is a frozen
+            // `is_complete: false` that completing the tag never updates, and
+            // `struct S; volatile struct S vs; struct S { int a; };` was
+            // rejected although the tag is complete.
+            let typ = self.resolve_struct_type(typ);
             if self.types.is_composite_complete(typ) {
                 continue;
             }

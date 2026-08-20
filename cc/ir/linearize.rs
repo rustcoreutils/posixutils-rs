@@ -4781,7 +4781,22 @@ impl<'a> Linearizer<'a> {
                 let all_unsigned = self.types.is_unsigned(a_typ)
                     && self.types.is_unsigned(b_typ)
                     && self.types.is_unsigned(dst_typ);
-                let wide = if all_unsigned {
+                // A difference can be negative even when every operand is
+                // unsigned, and negative is exactly the unrepresentable case
+                // for an unsigned destination. Computing it in an unsigned
+                // `wide` wraps it instead, and then nothing downstream can see
+                // it: `exact < 0` is never true in unsigned arithmetic, and
+                // with `wide == dst_typ` the narrow fast path reports a hard
+                // "no overflow". `__builtin_sub_overflow(0u, 1u, &u128)`
+                // answered 0 where gcc answers 1.
+                //
+                // A sum or product of unsigned operands still needs the
+                // unsigned range: two 64-bit values can exceed the signed
+                // 128-bit maximum. A difference cannot -- it needs one bit
+                // more than the wider operand, and both are under 128 here --
+                // so signing it costs nothing.
+                let subtracting = matches!(op, crate::parse::ast::CheckedOp::Sub);
+                let wide = if all_unsigned && !subtracting {
                     self.types.uint128_id
                 } else {
                     self.types.int128_id

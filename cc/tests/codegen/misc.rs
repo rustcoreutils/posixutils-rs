@@ -9437,3 +9437,201 @@ int main(void) {
         0
     );
 }
+
+/// A variably modified typedef's extents are indexed by *variable* extent.
+///
+/// The parser mints one `VmTypedefExtent(sym, k)` per size expression -- one
+/// per variable level, since a constant level has no expression to evaluate --
+/// but the linearizer recorded one entry per *array level*, constants
+/// included. The two agreed only while every level was variable. Add one
+/// constant extent and the index slid:
+///
+///   typedef int T[2][n]; T a;   read the constant 2 where `n` belonged, so
+///                               `sizeof a` was 16 against gcc's 80 and every
+///                               write past `a[0][3]` landed outside `a`.
+#[test]
+fn codegen_vm_typedef_extents_index_the_variable_levels() {
+    let code = r#"
+#include <string.h>
+
+int main(void)
+{
+    int n = 10, m = 5;
+
+    /* A leading constant extent: the case that slid. */
+    {
+        typedef int T[2][n];
+        T a;
+        if (sizeof a != 2 * 10 * sizeof(int)) return 1;
+        if (sizeof a[0] != 10 * sizeof(int)) return 2;
+        memset(a, 0, sizeof a);
+        a[1][9] = 7;
+        if (a[1][9] != 7) return 3;
+    }
+
+    /* A trailing constant extent. */
+    {
+        typedef int T[n][4];
+        T a;
+        if (sizeof a != 10 * 4 * sizeof(int)) return 4;
+        memset(a, 0, sizeof a);
+        a[9][3] = 7;
+        if (a[9][3] != 7) return 5;
+    }
+
+    /* A constant between two variables. */
+    {
+        typedef int T[n][3][m];
+        T a;
+        if (sizeof a != 10 * 3 * 5 * sizeof(int)) return 6;
+        memset(a, 0, sizeof a);
+        a[9][2][4] = 7;
+        if (a[9][2][4] != 7) return 7;
+    }
+
+    /* All variable: the shape that always worked, kept as the control. */
+    {
+        typedef int T[n][m];
+        T a;
+        if (sizeof a != 10 * 5 * sizeof(int)) return 8;
+    }
+
+    /* 6.7.7p3: the extents are the ones in effect at the typedef. */
+    {
+        typedef int T[2][n];
+        n = 100;
+        T a;
+        if (sizeof a != 2 * 10 * sizeof(int)) return 9;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("vm_typedef_extent_index", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("vm_typedef_extent_index_opt", code),
+        0
+    );
+}
+
+/// A signed bit-field sign-extends to its declared type's width.
+///
+/// The extension was measured against the *access unit* the field is carried
+/// in. For a packed `long long a:4` that unit is one byte, so the value was
+/// extended only as far as the unit reached and -1 came back 4294967295 with
+/// `a < 0` false. Where the field exactly filled its unit the guard was false
+/// outright and no extension was emitted at all.
+#[test]
+fn codegen_signed_bitfield_extends_to_its_declared_type() {
+    let code = r#"
+#pragma pack(1)
+struct Packed {
+    long long a : 4;
+    long long b : 20;
+    int c : 3;
+};
+#pragma pack()
+
+struct Plain {
+    int a : 4;
+    long long b : 40;
+    short c : 9;
+    signed char d : 8;
+    __int128 e : 27;
+};
+
+int main(void)
+{
+    struct Packed p;
+    p.a = -1; p.b = -1; p.c = -1;
+    if (p.a != -1 || !(p.a < 0)) return 1;
+    if (p.b != -1 || !(p.b < 0)) return 2;
+    if (p.c != -1 || !(p.c < 0)) return 3;
+    p.a = -8; p.b = -524288;
+    if (p.a != -8 || p.b != -524288) return 4;
+    p.a = 7; p.b = 524287;
+    if (p.a != 7 || p.b != 524287) return 5;
+
+    struct Plain q;
+    q.a = -1; q.b = -1; q.c = -1; q.d = -1; q.e = -1;
+    if (q.a != -1 || !(q.a < 0)) return 6;
+    if (q.b != -1 || !(q.b < 0)) return 7;
+    if (q.c != -1 || !(q.c < 0)) return 8;
+    if (q.d != -1 || !(q.d < 0)) return 9;
+    if (q.e != -1 || !(q.e < 0)) return 10;
+
+    /* A field that exactly fills its unit still sign-extends. */
+    q.d = -128;
+    if (q.d != -128) return 11;
+
+    /* Unsigned fields are unaffected. */
+    struct U { unsigned x : 4; unsigned long long y : 40; } u;
+    u.x = 15; u.y = 0xFFFFFFFFFFULL;
+    if (u.x != 15u) return 12;
+    if (u.y != 0xFFFFFFFFFFULL) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("signed_bitfield_extend", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("signed_bitfield_extend_opt", code),
+        0
+    );
+}
+
+/// A checked subtraction computes signed, because a difference can be
+/// negative even when every operand is unsigned.
+///
+/// Negative is exactly the unrepresentable case for an unsigned destination,
+/// and computing in an unsigned 128-bit type wraps it instead. Then nothing
+/// downstream could see it: `exact < 0` is never true in unsigned arithmetic,
+/// and the narrow fast path returned a hard "no overflow" whenever the wide
+/// type equalled the destination.
+#[test]
+fn codegen_checked_sub_sees_a_negative_difference() {
+    let code = r#"
+int main(void)
+{
+    unsigned __int128 u;
+    unsigned long long ull;
+    unsigned un;
+
+    /* The regression: a negative difference into an unsigned 128-bit
+       destination. */
+    if (!__builtin_sub_overflow(1u, 2u, &u)) return 1;
+    if (!__builtin_sub_overflow(0u, 1u, &u)) return 2;
+    if (!__builtin_sub_overflow(0ull, 1ull, &u)) return 3;
+
+    /* And one that does not overflow. */
+    if (__builtin_sub_overflow(5u, 2u, &u)) return 4;
+    if (u != 3) return 5;
+
+    /* Narrower unsigned destinations were already right; keep them so. */
+    if (!__builtin_sub_overflow(1u, 2u, &un)) return 6;
+    if (__builtin_sub_overflow(5u, 2u, &un)) return 7;
+    if (un != 3) return 8;
+    if (!__builtin_sub_overflow(0ull, 1ull, &ull)) return 9;
+
+    /* Signed destinations, and the sibling operations. */
+    __int128 s;
+    if (__builtin_sub_overflow(1u, 2u, &s)) return 10;
+    if (s != -1) return 11;
+    if (__builtin_add_overflow(1u, 2u, &u)) return 12;
+    if (u != 3) return 13;
+    if (__builtin_mul_overflow(3u, 4u, &u)) return 14;
+    if (u != 12) return 15;
+
+    /* A product of two 64-bit values still needs the unsigned range. */
+    unsigned long long big = 0xFFFFFFFFFFFFFFFFULL;
+    if (__builtin_mul_overflow(big, big, &u)) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("checked_sub_negative", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("checked_sub_negative_opt", code),
+        0
+    );
+}

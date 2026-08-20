@@ -238,6 +238,18 @@ pub struct Linearizer<'a> {
     /// linked as a successor -- the CFG is explicit `children`/`parents`, and
     /// without the edges DCE would delete blocks nothing appears to reach.
     pub(crate) addr_taken_labels: Vec<BasicBlockId>,
+
+    /// The one block every computed `goto` in this function branches through,
+    /// and the hidden local carrying the target address to it.
+    ///
+    /// A `goto *p` can reach any address-taken label, and recording that
+    /// directly gives one edge per (goto, label) pair -- N² for an interpreter
+    /// dispatch loop, where every handler ends in a `goto *`. CPython's
+    /// `ceval.c` has over two hundred of each, and the iterative dataflow over
+    /// that CFG did not finish in twenty minutes. Funnelling every indirect
+    /// branch through a single block makes it 2N: each `goto` has one
+    /// successor, and only the dispatch block fans out.
+    pub(crate) indirect_dispatch: Option<(BasicBlockId, PseudoId)>,
     /// Counter for generating unique static local names
     pub(crate) static_local_counter: u32,
     /// Counter for generating unique compound literal names (for file-scope compound literals)
@@ -291,6 +303,7 @@ impl<'a> Linearizer<'a> {
             two_reg_return_type: None,
             current_func_name: String::new(),
             addr_taken_labels: Vec::new(),
+            indirect_dispatch: None,
             static_local_counter: 0,
             compound_literal_counter: 0,
             static_locals: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
@@ -747,6 +760,7 @@ impl<'a> Linearizer<'a> {
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
         self.addr_taken_labels.clear();
+        self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
@@ -1230,6 +1244,10 @@ impl<'a> Linearizer<'a> {
 
         // Linearize body
         self.linearize_stmt(&func.body);
+
+        // The address-taken set is complete only now, so the dispatch block's
+        // successors are linked here rather than at each computed goto.
+        self.finish_indirect_dispatch();
 
         // Ensure function ends with a return
         if !self.is_terminated() {

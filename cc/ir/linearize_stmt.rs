@@ -182,11 +182,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                 }
                 let addr = self.linearize_expr(target);
-                self.emit(Instruction::indirect_br(addr));
+                let (dispatch_bb, slot) = self.indirect_dispatch_block();
+                // Hand the address over in the hidden local and branch to the
+                // one dispatch block, which is the only place that fans out to
+                // the labels. See `Linearizer::indirect_dispatch`.
+                let void_ptr = self.types.void_ptr_id;
+                self.emit(Instruction::store(addr, slot, 0, void_ptr, 64));
+                self.emit(Instruction::br(dispatch_bb));
                 if let Some(current) = self.current_bb {
-                    for bb in self.addr_taken_labels.clone() {
-                        self.link_bb(current, bb);
-                    }
+                    self.link_bb(current, dispatch_bb);
                 }
                 self.current_bb = None;
             }
@@ -1418,6 +1422,50 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// look and the name says what the problem is. This used to report at the
     /// declaration for want of anything better: the jump and label statements
     /// carried no position until #C106 gave them one.
+    /// The block every computed `goto` in this function branches through,
+    /// creating it on first use along with the hidden local that carries the
+    /// target address to it.
+    ///
+    /// Its successors are the address-taken labels, and they are linked once
+    /// the whole function has been walked -- the set is not complete until
+    /// then, since `&&label` may appear after the `goto *` that reaches it.
+    fn indirect_dispatch_block(&mut self) -> (BasicBlockId, PseudoId) {
+        if let Some(existing) = self.indirect_dispatch {
+            return existing;
+        }
+        let void_ptr = self.types.void_ptr_id;
+        let slot = self.alloc_pseudo();
+        let name = format!("__goto_target.{}", slot.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(crate::ir::Pseudo::sym(slot, name.clone()));
+            func.add_local(&name, slot, void_ptr, false, false, None, None);
+        }
+
+        let dispatch_bb = self.alloc_bb();
+        let saved = self.current_bb;
+        self.switch_bb(dispatch_bb);
+        let loaded = self.alloc_pseudo();
+        self.emit(Instruction::load(loaded, slot, 0, void_ptr, 64));
+        self.emit(Instruction::indirect_br(loaded));
+        self.current_bb = saved;
+
+        self.indirect_dispatch = Some((dispatch_bb, slot));
+        (dispatch_bb, slot)
+    }
+
+    /// Link the dispatch block to every label whose address was taken.
+    ///
+    /// Called once the function body is walked, because `&&label` may appear
+    /// after the `goto *` that can reach it.
+    pub(crate) fn finish_indirect_dispatch(&mut self) {
+        let Some((dispatch_bb, _)) = self.indirect_dispatch else {
+            return;
+        };
+        for bb in self.addr_taken_labels.clone() {
+            self.link_bb(dispatch_bb, bb);
+        }
+    }
+
     pub(crate) fn check_jumps_into_variably_modified_scopes(&self, body: &Stmt) {
         let mut w = VmScopeWalk {
             open: Vec::new(),

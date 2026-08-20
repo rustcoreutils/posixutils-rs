@@ -1548,3 +1548,106 @@ int main(void) {
     assert_eq!(compile_and_run("asm_sse_budget", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("asm_sse_budget_opt", code), 0);
 }
+
+/// An x87 register constraint reaches the x87 stack, not an XMM register.
+///
+/// On x86 `f`, `t` and `u` are the **x87 stack** classes -- `t` is st(0), `u`
+/// is st(1), `f` is any of them -- and they were counted as SSE. So a long
+/// double operand was routed through an XMM scratch and the assembler was
+/// handed `movt -48(%rbp), %xmm15`, which is not an instruction. musl's
+///
+///   long double sqrtl(long double x) { __asm__("fsqrt" : "+t"(x)); return x; }
+///
+/// failed to build. c17 keeps a long double in memory and reaches it with
+/// `fldt`/`fstpt`, so an x87 operand is pushed onto the FP stack before the
+/// template and popped back after it.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn codegen_inline_asm_x87_constraint() {
+    let code = r#"
+static long double my_sqrtl(long double x) { __asm__("fsqrt" : "+t"(x)); return x; }
+static long double my_absl(long double x)  { __asm__("fabs"  : "+t"(x)); return x; }
+
+int main(void) {
+    if (my_sqrtl(4.0L) != 2.0L) return 1;
+    if (my_sqrtl(16.0L) != 4.0L) return 2;
+    if (my_absl(-3.5L) != 3.5L) return 3;
+    if (my_absl(3.5L) != 3.5L) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_x87_constraint", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_x87_constraint_opt", code), 0);
+}
+
+/// A vector-class operand gets a vector register, on both sides of the asm.
+///
+/// The aarch64 output loop had no vector arm at all, so a `"=w"` output took
+/// whatever the allocator gave the pseudo -- a general register -- and emitted
+/// `fmov d17, x0` around a template the assembler then rejected. #C139 fixed
+/// the x86-64 twin and recorded this target as sound; it was not, because the
+/// output never reaches the path that renders a `Loc::VReg` correctly.
+///
+/// The `b`/`h`/`s`/`d`/`q` operand modifiers land with it: without them a
+/// vector operand could not be named in a template at all, so there was no
+/// way to write a working `"w"` asm.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn codegen_inline_asm_vector_constraint() {
+    let code = r#"
+static double vsqrt(double a) { double r; __asm__("fsqrt %d0, %d1" : "=w"(r) : "w"(a)); return r; }
+static float  fsqrt_(float a) { float  r; __asm__("fsqrt %s0, %s1" : "=w"(r) : "w"(a)); return r; }
+
+int main(void) {
+    if (vsqrt(4.0) != 2.0) return 1;
+    if (vsqrt(16.0) != 4.0) return 2;
+    if (fsqrt_(9.0f) != 3.0f) return 3;
+
+    /* Three vector operands at once: all three scratch registers. */
+    double r;
+    __asm__("fadd %d0, %d1, %d2" : "=w"(r) : "w"(1.5), "w"(2.5));
+    if (r != 4.0) return 4;
+
+    /* A read-write vector operand is loaded before the template. */
+    double x = 4.0;
+    __asm__("fsqrt %d0, %d0" : "+w"(x));
+    if (x != 2.0) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_vector_constraint", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("asm_vector_constraint_opt", code),
+        0
+    );
+}
+
+/// Two general-register operands get two different registers.
+///
+/// Both scratch-taking arms took `Reg::scratch_regs().0` -- X9 -- with no
+/// tracking of whether it was already spent, so `"r"(a), "r"(b)` with two FP
+/// values emitted `fmov x9, d0; fmov x9, d1; add x0, x9, x9`: operand 1
+/// destroyed, the result twice operand 2, and no diagnostic. X10 and X11 were
+/// reserved and idle the whole time.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn codegen_inline_asm_two_general_operands_are_distinct() {
+    let code = r#"
+static long bits(double d) { union { double d; long l; } u; u.d = d; return u.l; }
+
+static long add_bits(double a, double b) {
+    long r;
+    __asm__("add %0, %1, %2" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+
+int main(void) {
+    double x = 2.0, y = 3.0;
+    if (add_bits(x, y) != bits(x) + bits(y)) return 1;
+    /* Distinct values, so sharing a register cannot pass by coincidence. */
+    if (add_bits(1.0, 8.0) != bits(1.0) + bits(8.0)) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_two_gp_operands", code, &[]), 0);
+}

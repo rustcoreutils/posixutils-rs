@@ -3570,6 +3570,20 @@ impl Aarch64CodeGen {
         let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
         let mut slots: Vec<crate::arch::AsmOperandSlot<Reg>> = Vec::with_capacity(operand_count);
 
+        // Scratch budgets, shared by the output and input loops so two
+        // operands can never be handed the same register. `Reg::scratch_regs`
+        // reserves X9/X10/X11 and `VReg::allocatable` reserves V16/V17/V18;
+        // both loops used to take the first of each unconditionally, so
+        // `"r"(a), "r"(b)` rendered `fmov x9, d0; fmov x9, d1; add x0,x9,x9`
+        // -- operand 1 destroyed, result 2*b, no diagnostic. Popped from the
+        // end so X9 and V16 go first, as before.
+        let mut gp_scratch: Vec<Reg> = vec![Reg::X11, Reg::X10, Reg::X9];
+        let mut v_scratch: Vec<VReg> = vec![VReg::V18, VReg::V17, VReg::V16];
+        // Vector operands copied back out of their scratch after the template.
+        let mut vec_output_moves: Vec<(VReg, Loc, u32)> = Vec::new();
+        // Vector operands copied into their scratch before it.
+        let mut vec_input_moves: Vec<(VReg, Loc, u32)> = Vec::new();
+
         // Process output operands (they go first: %0, %1, etc.)
         for output in &asm_data.outputs {
             let loc = self.get_location(output.pseudo);
@@ -3592,6 +3606,31 @@ impl Aarch64CodeGen {
                     // label or encodable integer pc offset").
                     slots.push(mk(None, Some(format!("[{}]", asm_reg_name_64(r)))));
                 }
+                // A vector-class output. Without this arm the output loop
+                // had no notion of one at all, so a `"=w"` output took
+                // whatever the allocator gave the pseudo -- a general
+                // register -- and emitted `fmov d17, x0` around a template the
+                // assembler then rejected. The x86-64 side grew the same arm
+                // as #C139; this target was recorded as sound and was not.
+                _ if Self::constraint_requires_vector(&output.constraint) => {
+                    match v_scratch.pop() {
+                        Some(v) => {
+                            slots.push(mk(None, Some(Self::vreg_name(v, op_size).to_string())));
+                            vec_output_moves.push((v, loc.clone(), op_size));
+                            if output.constraint.contains('+') {
+                                vec_input_moves.push((v, loc.clone(), op_size));
+                            }
+                        }
+                        None => {
+                            crate::diag::error(
+                                insn.pos.unwrap_or_default(),
+                                "too many vector register constraints in one asm \
+                                 statement; c17 has three scratch registers to give",
+                            );
+                            slots.push(mk(None, Some(VReg::V16.name_d().to_string())));
+                        }
+                    }
+                }
                 Loc::Reg(r) => {
                     slots.push(mk(Some(r), None));
                 }
@@ -3607,7 +3646,6 @@ impl Aarch64CodeGen {
 
         // Whether V16 has already been spent materializing a floating
         // constant for a vector-class constraint. There is only the one.
-        let mut fp_scratch_taken = false;
 
         // Process input operands
         for input in &asm_data.inputs {
@@ -3659,33 +3697,41 @@ impl Aarch64CodeGen {
                     if Self::constraint_requires_reg_class(&input.constraint) =>
                 {
                     let bits = v.to_bits_at_width(imm_size);
-                    let (scratch, _, _) = Reg::scratch_regs();
+                    let Some(scratch) = gp_scratch.pop() else {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "too many register constraints in one asm statement; \
+                             c17 has three general scratch registers to give",
+                        );
+                        slots.push(mk(Some(Reg::X9), None));
+                        continue;
+                    };
                     self.emit_mov_imm(scratch, bits, 64);
                     if Self::constraint_requires_vector(&input.constraint) {
-                        // Only the one scratch V register, so a second
-                        // constant would overwrite the first.
-                        if fp_scratch_taken {
+                        // Three scratch V registers are reserved, not one.
+                        let Some(vreg) = v_scratch.pop() else {
                             crate::diag::error(
                                 insn.pos.unwrap_or_default(),
-                                "only one floating constant can be given a vector \
-                                 register constraint in one asm statement",
+                                "too many vector register constraints in one asm \
+                                 statement; c17 has three scratch registers to give",
                             );
-                        }
-                        fp_scratch_taken = true;
-                        let (fp_size, name) = match imm_size {
-                            16 => (FpSize::Half, VReg::V16.name_h()),
-                            32 => (FpSize::Single, VReg::V16.name_s()),
-                            _ => (FpSize::Double, VReg::V16.name_d()),
+                            slots.push(mk(None, Some(VReg::V16.name_d().to_string())));
+                            continue;
+                        };
+                        let fp_size = match imm_size {
+                            16 => FpSize::Half,
+                            32 => FpSize::Single,
+                            _ => FpSize::Double,
                         };
                         self.push_lir(Aarch64Inst::FmovFromGp {
                             size: fp_size,
                             src: scratch,
-                            dst: VReg::V16,
+                            dst: vreg,
                         });
                         // A vector operand has to be pre-rendered: the slot
                         // carries only a general register, and `%w`-style
                         // width modifiers do not apply to one of these.
-                        slots.push(mk(None, Some(name.to_string())));
+                        slots.push(mk(None, Some(Self::vreg_name(vreg, imm_size).to_string())));
                     } else {
                         // A *register* slot, not a pre-rendered name: the
                         // template decides the width it wants, and `%w1`
@@ -3701,8 +3747,37 @@ impl Aarch64CodeGen {
                 // from any FP variable passed as `"r"`, not just a constant:
                 // `-0.0` arrives here rather than as an `FImm` because it is
                 // computed as `fneg` of zero.
+                // Already in a vector register, and that is what was asked
+                // for: name it directly at the operand's width.
+                Loc::VReg(v) if Self::constraint_requires_vector(&input.constraint) => {
+                    slots.push(mk(None, Some(Self::vreg_name(v, op_size).to_string())));
+                }
+                // A vector-class input that is not in a vector register. The
+                // output loop's note applies: without this the operand named
+                // whatever the allocator gave the pseudo.
+                _ if Self::constraint_requires_vector(&input.constraint) => {
+                    let Some(vreg) = v_scratch.pop() else {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "too many vector register constraints in one asm \
+                             statement; c17 has three scratch registers to give",
+                        );
+                        slots.push(mk(None, Some(VReg::V16.name_d().to_string())));
+                        continue;
+                    };
+                    slots.push(mk(None, Some(Self::vreg_name(vreg, op_size).to_string())));
+                    vec_input_moves.push((vreg, loc.clone(), op_size));
+                }
                 Loc::VReg(v) if !Self::constraint_requires_vector(&input.constraint) => {
-                    let (scratch, _, _) = Reg::scratch_regs();
+                    let Some(scratch) = gp_scratch.pop() else {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "too many register constraints in one asm statement; \
+                             c17 has three general scratch registers to give",
+                        );
+                        slots.push(mk(Some(Reg::X9), None));
+                        continue;
+                    };
                     let fp_size = match op_size {
                         16 => FpSize::Half,
                         32 => FpSize::Single,
@@ -3734,6 +3809,11 @@ impl Aarch64CodeGen {
             })
             .collect();
 
+        // Load vector operands into their scratch before the template runs.
+        for (vreg, loc, size) in &vec_input_moves {
+            self.emit_vec_load_from_loc(*vreg, loc, *size, insn.pos);
+        }
+
         // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
         let asm_output =
             self.substitute_asm_operands(&asm_data.template, &slots, &goto_labels_formatted);
@@ -3745,6 +3825,12 @@ impl Aarch64CodeGen {
             if !trimmed.is_empty() {
                 self.push_lir(Aarch64Inst::Directive(Directive::Raw(trimmed.to_string())));
             }
+        }
+
+        // Copy vector outputs out of their scratch into where the operand
+        // actually lives.
+        for (vreg, loc, size) in &vec_output_moves {
+            self.emit_vec_store_to_loc(*vreg, loc, *size, insn.pos);
         }
 
         // Handle clobbers - for now just emit comments for documentation
@@ -3774,6 +3860,106 @@ impl Aarch64CodeGen {
     /// because the operand can take its non-memory form. C9 multi-
     /// alternative `"rm"` therefore returns false (register or
     /// memory both work; codegen picks register if available).
+    /// Move an operand's value into a scratch vector register.
+    fn emit_vec_load_from_loc(
+        &mut self,
+        dst: VReg,
+        loc: &Loc,
+        size: u32,
+        pos: Option<crate::diag::Position>,
+    ) {
+        let fp_size = match size {
+            16 => FpSize::Half,
+            32 => FpSize::Single,
+            _ => FpSize::Double,
+        };
+        match loc {
+            Loc::VReg(src) => {
+                if *src != dst {
+                    self.push_lir(Aarch64Inst::FmovReg {
+                        size: fp_size,
+                        src: *src,
+                        dst,
+                    });
+                }
+            }
+            Loc::Reg(src) => self.push_lir(Aarch64Inst::FmovFromGp {
+                size: fp_size,
+                src: *src,
+                dst,
+            }),
+            Loc::Stack(off) => {
+                let addr = self.stack_mem(*off);
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
+                    addr,
+                    dst,
+                });
+            }
+            _ => crate::diag::error(
+                pos.unwrap_or_default(),
+                "a vector asm operand cannot be read from this location",
+            ),
+        }
+    }
+
+    /// Move a scratch vector register's value back to where the operand lives.
+    fn emit_vec_store_to_loc(
+        &mut self,
+        src: VReg,
+        loc: &Loc,
+        size: u32,
+        pos: Option<crate::diag::Position>,
+    ) {
+        let fp_size = match size {
+            16 => FpSize::Half,
+            32 => FpSize::Single,
+            _ => FpSize::Double,
+        };
+        match loc {
+            Loc::VReg(dst) => {
+                if *dst != src {
+                    self.push_lir(Aarch64Inst::FmovReg {
+                        size: fp_size,
+                        src,
+                        dst: *dst,
+                    });
+                }
+            }
+            Loc::Reg(dst) => self.push_lir(Aarch64Inst::FmovToGp {
+                size: fp_size,
+                src,
+                dst: *dst,
+            }),
+            Loc::Stack(off) => {
+                let addr = self.stack_mem(*off);
+                self.push_lir(Aarch64Inst::StrFp {
+                    size: fp_size,
+                    src,
+                    addr,
+                });
+            }
+            _ => crate::diag::error(
+                pos.unwrap_or_default(),
+                "a vector asm output cannot be written back to this location",
+            ),
+        }
+    }
+
+    /// The vector register spelling an operand of `size_bits` wants.
+    ///
+    /// AArch64 names the same register `b`/`h`/`s`/`d`/`q` by the width being
+    /// operated on, and an instruction that wants `d0` rejects `v0`.
+    fn vreg_name(v: VReg, size_bits: u32) -> &'static str {
+        match size_bits {
+            0..=8 => v.name_b(),
+            16 => v.name_h(),
+            32 => v.name_s(),
+            64 => v.name_d(),
+            _ => v.name_q(),
+        }
+    }
+
     /// Whether the constraint asks for a vector (SIMD/FP) register.
     fn constraint_requires_vector(constraint: &str) -> bool {
         constraint.chars().any(|c| matches!(c, 'w' | 'x' | 'y'))
@@ -4517,7 +4703,18 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
     type Reg = Reg;
 
     fn size_modifiers(&self) -> &'static [char] {
-        &['w', 'x'] // 32, 64-bit
+        // `w`/`x` name a general register's two widths; `b`/`h`/`s`/`d`/`q`
+        // name a vector register's five. Without the vector set a `"w"`
+        // operand could not be referenced at all -- `fsqrt %d0, %d1` reached
+        // the assembler with the `%d0` intact -- so there was no way to write
+        // a working vector asm.
+        //
+        // A vector operand is pre-rendered at its own type's width, and the
+        // substitution emits that text, so the modifier selects the operand
+        // rather than re-widening it. That agrees with the width the modifier
+        // names in every case where the two are consistent, which is what
+        // real code writes.
+        &['w', 'x', 'b', 'h', 's', 'd', 'q']
     }
 
     fn format_reg_sized(&self, reg: Reg, size_mod: char) -> String {

@@ -127,7 +127,23 @@ struct Args {
     #[arg(short = 'I', action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add include path"))]
     include_paths: Vec<String>,
 
-    /// Disable all standard include paths (system and builtin)
+    /// Re-root the target's system include directories under this prefix.
+    ///
+    /// Without it `--target` names the *host's* directories whatever target
+    /// was asked for, so cross-compiling anything that includes a system
+    /// header fails on the first header that header includes.
+    #[arg(long = "sysroot", value_name = "dir", help = gettext("Use dir as the root of the target's system directories"))]
+    sysroot: Option<String>,
+
+    /// System include directories searched ahead of the target's own.
+    #[arg(long = "isystem", action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add a system include path, searched before the target's own"))]
+    isystem_paths: Vec<String>,
+
+    /// System include directories searched behind the target's own.
+    #[arg(long = "idirafter", action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add a system include path, searched after the target's own"))]
+    idirafter_paths: Vec<String>,
+
+    /// Disable all standard include paths (system and builtin), as gcc does.
     #[arg(long = "nostdinc", help = gettext("Disable standard system include paths"))]
     no_std_inc: bool,
 
@@ -403,6 +419,15 @@ enum Compiled {
     Object { path: String, temporary: bool },
 }
 
+/// The system header search this invocation asked for.
+fn system_search(args: &Args) -> token::preprocess::SystemSearch<'_> {
+    token::preprocess::SystemSearch {
+        sysroot: args.sysroot.as_deref(),
+        isystem: &args.isystem_paths,
+        idirafter: &args.idirafter_paths,
+    }
+}
+
 /// Where `-E` writes.
 ///
 /// `-o` is honored here, as gcc and clang do and as every build system that
@@ -515,6 +540,7 @@ fn process_file(
             defines: &args.defines,
             undefines: &args.undefines,
             include_paths: &args.include_paths,
+            search: system_search(args),
             no_std_inc: args.no_std_inc,
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
@@ -1123,6 +1149,30 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
             // Catch-all: silently ignore any other -f* flag we don't handle
             i += 1;
+        } else if arg == "-nostdinc" || arg == "-nobuiltininc" {
+            // gcc spells these with one dash and clap declares them long-only,
+            // so they used to reach it unrewritten and be rejected outright.
+            result.push(format!("-{}", arg));
+            i += 1;
+        } else if arg == "-isystem" || arg == "-idirafter" || arg == "--sysroot" {
+            // Value options gcc spells with one dash. `--sysroot` is already
+            // two, but takes its value as a separate word here either way.
+            let long = if arg.starts_with("--") {
+                arg.to_string()
+            } else {
+                format!("-{}", arg)
+            };
+            result.push(long);
+            if let Some(v) = raw_args.get(i + 1) {
+                result.push(v.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if let Some(dir) = arg.strip_prefix("--sysroot=") {
+            result.push("--sysroot".to_string());
+            result.push(dir.to_string());
+            i += 1;
         } else if arg == "-p" || arg == "-pg" {
             // Profiling flags - silently ignore (c17 doesn't support profiling)
             i += 1;
@@ -1313,6 +1363,7 @@ fn assemble_operand(
             defines: &args.defines,
             undefines: &args.undefines,
             include_paths: &args.include_paths,
+            search: system_search(args),
             no_std_inc: args.no_std_inc,
         };
         let preprocessed = preprocess_asm_file(&content, target, path, &asm_config);

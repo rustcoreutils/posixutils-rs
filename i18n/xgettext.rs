@@ -646,6 +646,7 @@ impl Walker {
             &mut strings,
             &path,
             &PreprocessConfig {
+                search: Default::default(),
                 defines: &[],
                 undefines: &[],
                 include_paths: &[],

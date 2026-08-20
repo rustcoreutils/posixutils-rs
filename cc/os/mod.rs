@@ -46,11 +46,26 @@ pub fn get_os_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
     macros
 }
 
-/// Get standard include paths for the OS
-pub fn get_include_paths(target: &Target) -> Vec<&'static str> {
-    match target.os {
+/// The system include directories for `target`, under `sysroot` if one was
+/// given.
+///
+/// Owned `String`s rather than `&'static str`: a sysroot has to be joined on,
+/// and there is nothing to borrow it from. Without that, `--target` could only
+/// ever name the *host's* directories, so cross-compiling anything that
+/// included a system header failed on `bits/libc-header-start.h`.
+pub fn get_include_paths(target: &Target, sysroot: Option<&str>) -> Vec<String> {
+    let paths = match target.os {
         Os::Linux => linux::get_include_paths(target),
         Os::MacOS => macos::get_include_paths(),
         Os::FreeBSD => freebsd::get_include_paths(),
+    };
+    match sysroot {
+        // `/usr/include` under `/x` is `/x/usr/include`. `Path::join` would
+        // discard the prefix, an absolute path replacing the base entirely.
+        Some(root) => {
+            let root = root.trim_end_matches('/');
+            paths.iter().map(|p| format!("{}{}", root, p)).collect()
+        }
+        None => paths.iter().map(|p| p.to_string()).collect(),
     }
 }

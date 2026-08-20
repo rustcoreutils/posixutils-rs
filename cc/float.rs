@@ -55,50 +55,79 @@ pub struct FloatVal {
     sig: u128,
 }
 
-/// Convert f64 to IEEE 754 half-precision (binary16) bits.
-/// This handles the conversion from 64-bit double to 16-bit half precision.
+/// Convert an `f64` to IEEE 754 half-precision (binary16) bits.
+///
+/// Rounds to nearest, ties to even, which is the default rounding mode every
+/// target uses and what the standard requires of a conversion. Truncating
+/// instead put every inexact `_Float16` constant one ulp below the value the
+/// source named -- `0.3f16` came out 0.299805 where gcc gives 0.300049 -- so
+/// a program's constants disagreed with the same constants computed at run
+/// time.
 pub(crate) fn f64_to_f16_bits(val: f64) -> u16 {
     let bits = val.to_bits();
     let sign = ((bits >> 63) & 1) as u16;
     let exp = ((bits >> 52) & 0x7FF) as i32;
-    let frac = bits & 0xFFFFFFFFFFFFF;
+    let frac = bits & 0xF_FFFF_FFFF_FFFF;
 
-    // Handle special cases
     if exp == 0x7FF {
-        // NaN or Infinity
+        // NaN keeps its quiet bit and as much payload as fits; infinity is
+        // exact either way.
         if frac != 0 {
-            // NaN: preserve some mantissa bits
             return (sign << 15) | 0x7E00 | ((frac >> 42) as u16 & 0x1FF);
-        } else {
-            // Infinity
-            return (sign << 15) | 0x7C00;
         }
+        return (sign << 15) | 0x7C00;
     }
 
-    // Rebias exponent: f64 bias is 1023, f16 bias is 15
+    // Rebias: f64 is excess-1023, f16 excess-15.
     let new_exp = exp - 1023 + 15;
 
     if new_exp >= 31 {
-        // Overflow to infinity
         return (sign << 15) | 0x7C00;
     }
 
     if new_exp <= 0 {
-        // Denormal or zero
-        if new_exp < -10 {
-            // Too small, flush to zero
+        // Subnormal, or small enough to vanish. The significand carries its
+        // hidden bit and is shifted a further `1 - new_exp` places.
+        let shift = (1 - new_exp) as u32;
+        let Some(drop) = 42u32.checked_add(shift).filter(|d| *d < 64) else {
+            // Below half the smallest subnormal: rounds to zero, and the
+            // shift would be undefined.
             return sign << 15;
-        }
-        // Denormal: shift mantissa right
-        let shift = 1 - new_exp;
-        let frac_with_hidden = frac | 0x10000000000000; // Add hidden bit
-        let shifted = frac_with_hidden >> (42 + shift);
-        return (sign << 15) | (shifted as u16 & 0x3FF);
+        };
+        let sig = frac | 0x10_0000_0000_0000;
+        // A carry out of the ten fraction bits lands in the exponent field as
+        // exponent 1, fraction 0 -- the smallest normal, which is exactly the
+        // value being rounded to.
+        return (sign << 15) | (round_to_nearest_even(sig, drop) as u16 & 0x7FFF);
     }
 
-    // Normal number: truncate mantissa from 52 bits to 10 bits
-    let new_frac = (frac >> 42) as u16;
-    (sign << 15) | ((new_exp as u16) << 10) | (new_frac & 0x3FF)
+    let rounded = round_to_nearest_even(frac, 42);
+    // A carry out of the fraction is one more power of two.
+    let (new_exp, new_frac) = if rounded > 0x3FF {
+        (new_exp + 1, 0)
+    } else {
+        (new_exp, rounded)
+    };
+    if new_exp >= 31 {
+        return (sign << 15) | 0x7C00;
+    }
+    (sign << 15) | ((new_exp as u16) << 10) | (new_frac as u16 & 0x3FF)
+}
+
+/// Shift `value` right by `drop` bits, rounding to nearest with ties to even.
+///
+/// The result can be one greater than `value >> drop` fits, which the callers
+/// read as a carry into the exponent.
+fn round_to_nearest_even(value: u64, drop: u32) -> u64 {
+    debug_assert!(drop > 0 && drop < 64);
+    let kept = value >> drop;
+    let half = 1u64 << (drop - 1);
+    let rest = value & ((1u64 << drop) - 1);
+    if rest > half || (rest == half && kept & 1 == 1) {
+        kept + 1
+    } else {
+        kept
+    }
 }
 
 impl FloatVal {

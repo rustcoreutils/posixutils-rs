@@ -9635,3 +9635,65 @@ int main(void)
         0
     );
 }
+
+/// A `_Float16` constant rounds to nearest, ties to even.
+///
+/// The conversion truncated the significand, which put every inexact
+/// `_Float16` constant one ulp below the value the source named: `0.3f16`
+/// came out 0.299805 where gcc gives 0.300049. So a program's constants
+/// disagreed with the same values computed at run time, and with every other
+/// compiler.
+///
+/// The aarch64 backend carried a verbatim copy of the conversion, which is
+/// what would have kept this fix on one target.
+#[test]
+fn codegen_float16_constants_round_to_nearest_even() {
+    let code = r#"
+int main(void)
+{
+    /* The headline case: 0.3 is 1.2 x 2^-2, and 0.2 x 1024 is 204.8, so the
+       fraction rounds up to 205 -- truncation gave 204. */
+    _Float16 a = 0.3f16;
+    if ((float)a <= 0.30004f || (float)a >= 0.30006f) return 1;
+
+    /* Rounding up and rounding down both have to happen. */
+    _Float16 b = 1.0009765625f16;   /* exactly representable: 1 + 1/1024 */
+    if ((float)b != 1.0009765625f) return 2;
+
+    /* A tie rounds to even, not away from zero. Above 2048 the spacing is 2,
+       so every odd value is exactly halfway between two representable ones,
+       and the one with the even fraction wins -- which sends ties in both
+       directions. Truncation would send all four down. */
+    _Float16 t1 = 2049.0f16;   /* between 2048 and 2050; 2048 is even */
+    _Float16 t2 = 2051.0f16;   /* between 2050 and 2052; 2052 is even */
+    _Float16 t3 = 2053.0f16;   /* between 2052 and 2054; 2052 is even */
+    _Float16 t4 = 2055.0f16;   /* between 2054 and 2056; 2056 is even */
+    if ((float)t1 != 2048.0f) return 3;
+    if ((float)t2 != 2052.0f) return 4;
+    if ((float)t3 != 2052.0f) return 11;
+    if ((float)t4 != 2056.0f) return 12;
+
+    /* Exact values are unaffected. */
+    if ((float)(_Float16)1.0f16 != 1.0f) return 5;
+    if ((float)(_Float16)0.5f16 != 0.5f) return 6;
+    if ((float)(_Float16)(-2.0f16) != -2.0f) return 7;
+    if ((float)(_Float16)0.0f16 != 0.0f) return 8;
+
+    /* Overflow and underflow still saturate. */
+    _Float16 big = 1e30f16;
+    if (!(big > 60000.0f16 || big != big)) return 9;
+
+    /* A constant must agree with the same value converted at run time. */
+    volatile float src = 0.3f;
+    _Float16 converted = (_Float16)src;
+    if ((float)converted != (float)a) return 10;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float16_round_nearest", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("float16_round_nearest_opt", code),
+        0
+    );
+}

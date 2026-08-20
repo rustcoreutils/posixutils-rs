@@ -273,7 +273,7 @@ fn check_branch_targets_valid(func: &Function, out: &mut Vec<ValidationError>) {
             if let Some(t) = insn.bb_false {
                 check(bb_idx, insn_idx, insn.op, t, out);
             }
-            for (_, target) in &insn.switch_cases {
+            for (_, _, target) in &insn.switch_cases {
                 check(bb_idx, insn_idx, insn.op, *target, out);
             }
             if let Some(t) = insn.switch_default {

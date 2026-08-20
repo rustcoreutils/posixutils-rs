@@ -11,7 +11,7 @@
 // Consolidates: if/while/for/do-while/switch/goto/break/continue tests from c17/
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C89 control flow (loops, conditionals, jumps)
@@ -717,4 +717,87 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("switch_non_compound_body", code, &[]), 0);
+}
+
+/// GNU case ranges: `case lo ... hi:`.
+///
+/// Measured as the most-used extension c17 rejected — 612 files in the Linux
+/// tree, 18 in mesa, 4 in CPython. GCC requires whitespace around the `...`
+/// (`case 1...9:` lexes as one pp-number and is rejected there too), so only
+/// the spaced form is accepted.
+///
+/// A range is *not* expanded into individual labels: `case 0 ... 1000000:` is
+/// legal, and every label costs a basic block and a comparison. It lowers to
+/// `(x - lo) <=unsigned (hi - lo)`, one subtraction and one compare whatever
+/// the width.
+#[test]
+fn c89_case_ranges() {
+    let code = r#"
+static int basic(int x) { switch (x) { case 1 ... 9: return 0; default: return 1; } }
+
+static int edges(int x) { switch (x) { case 3 ... 7: return 1; default: return 0; } }
+
+static int mixed(int x) {
+    switch (x) {
+    case 0:        return 10;
+    case 1 ... 3:  return 20;
+    case 9:        return 30;
+    default:       return 40;
+    }
+}
+
+/* A range falls through to the next label like any other. */
+static int fallthrough(int x) {
+    int n = 0;
+    switch (x) {
+    case 1 ... 3: n++;
+    case 4:       n += 10; break;
+    default:      n = 99;
+    }
+    return n;
+}
+
+/* Not expanded: a million values must still compile quickly. */
+static int huge(int x) { switch (x) { case 0 ... 1000000: return 0; default: return 1; } }
+
+static int negative(int x) { switch (x) { case -5 ... -1: return 0; default: return 1; } }
+
+/* Wider than 32 bits, so the immediate does not fit a compare. */
+static int wide(long x) {
+    switch (x) { case 100000000000L ... 100000000010L: return 0; default: return 1; }
+}
+
+/* An empty range never matches; GCC warns and compiles. */
+static int empty(int x) { switch (x) { case 9 ... 1: return 0; default: return 1; } }
+
+int main(void)
+{
+    if (basic(5)) return 1;
+    if (basic(0) != 1 || basic(10) != 1) return 2;
+
+    /* Both endpoints are inclusive. */
+    if (!edges(3) || !edges(7) || !edges(5)) return 3;
+    if (edges(2) || edges(8)) return 4;
+
+    if (mixed(0) != 10 || mixed(2) != 20 || mixed(9) != 30 || mixed(5) != 40) return 5;
+    if (fallthrough(2) != 11) return 6;
+
+    if (huge(0) || huge(999999) || huge(1000000)) return 7;
+    if (huge(-1) != 1 || huge(1000001) != 1) return 8;
+
+    if (negative(-3) || negative(-5) || negative(-1)) return 9;
+    if (negative(0) != 1 || negative(-6) != 1) return 10;
+
+    if (wide(100000000005L)) return 11;
+    if (wide(99999999999L) != 1) return 12;
+
+    if (empty(5) != 1 || empty(1) != 1 || empty(9) != 1) return 13;
+
+    /* A single-value range is the ordinary label. */
+    switch (3) { case 3 ... 3: break; default: return 14; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("case_ranges", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("case_ranges_opt", code), 0);
 }

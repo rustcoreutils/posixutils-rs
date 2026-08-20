@@ -4349,3 +4349,55 @@ fn diagnostics_vector_size_is_bounded() {
         "not a multiple",
     );
 }
+
+/// Case ranges are checked for overlap, not just equality.
+///
+/// 6.8.4.2p3 forbids two equal case constants, and GCC extends that to
+/// overlapping ranges. The check here was `Vec::contains` over individual
+/// values; a range needs an interval test. Without it an overlapping arm
+/// becomes silently unreachable, because the body walk resolves a label by
+/// finding the first match.
+#[test]
+fn diagnostics_overlapping_case_ranges_are_rejected() {
+    compile_expect_error(
+        "case_range_overlap",
+        "int f(int x){ switch(x){ case 1 ... 5: return 0; case 4 ... 9: return 1; } return 2; }\n\
+         int main(void){ return f(0); }\n",
+        "overlapping",
+    );
+    // A range that swallows a plain label is the same fault.
+    compile_expect_error(
+        "case_range_covers_single",
+        "int f(int x){ switch(x){ case 1 ... 5: return 0; case 3: return 1; } return 2; }\n\
+         int main(void){ return f(0); }\n",
+        "case value",
+    );
+    // Adjacent ranges do not overlap and must be accepted.
+    compile_expect_ok(
+        "case_ranges_adjacent",
+        "int f(int x){ switch(x){ case 1 ... 5: return 0; case 6 ... 9: return 1; } return 2; }\n\
+         int main(void){ return f(0); }\n",
+    );
+}
+
+/// An empty case range warns and never matches, as in GCC.
+#[test]
+fn diagnostics_empty_case_range_warns() {
+    compile_expect_warning(
+        "case_range_empty",
+        "int f(int x){ switch(x){ case 9 ... 1: return 0; default: return 1; } }\n\
+         int main(void){ return f(5); }\n",
+        "empty range",
+    );
+}
+
+/// Both endpoints of a range must be integer constant expressions.
+#[test]
+fn diagnostics_case_range_endpoints_must_be_constant() {
+    compile_expect_error(
+        "case_range_runtime_high",
+        "int f(int x, int n){ switch(x){ case 1 ... n: return 0; } return 2; }\n\
+         int main(void){ return f(0, 1); }\n",
+        "constant expression",
+    );
+}

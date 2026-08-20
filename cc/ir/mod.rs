@@ -763,8 +763,13 @@ pub struct Instruction {
     pub src_size: u32,
     /// Source type for conversion operations (interned TypeId)
     pub src_typ: Option<TypeId>,
-    /// For switch: case value to target block mapping
-    pub switch_cases: Vec<(i64, BasicBlockId)>,
+    /// For switch: case range to target block mapping, as `(lo, hi, block)`.
+    ///
+    /// An ordinary `case v:` is the degenerate range `(v, v, block)`. Ranges
+    /// are held rather than expanded because the GNU `case lo ... hi:` form
+    /// admits `case 0 ... 1000000:`, and each entry costs a basic block and a
+    /// compare in both backends.
+    pub switch_cases: Vec<(i64, i64, BasicBlockId)>,
     /// For switch: default block (if no case matches)
     pub switch_default: Option<BasicBlockId>,
     /// For calls: argument types (parallel to src for Call instructions, interned TypeIds)
@@ -993,7 +998,7 @@ impl Instruction {
     /// Create a switch instruction
     pub fn switch_insn(
         value: PseudoId,
-        cases: Vec<(i64, BasicBlockId)>,
+        cases: Vec<(i64, i64, BasicBlockId)>,
         default: Option<BasicBlockId>,
         size: u32,
     ) -> Self {
@@ -1290,8 +1295,12 @@ impl fmt::Display for Instruction {
                 if let Some(val) = self.src.first() {
                     write!(f, " {}", val)?;
                 }
-                for (case_val, bb) in &self.switch_cases {
-                    write!(f, ", {} => {}", case_val, bb)?;
+                for (lo, hi, bb) in &self.switch_cases {
+                    if lo == hi {
+                        write!(f, ", {} => {}", lo, bb)?;
+                    } else {
+                        write!(f, ", {}..={} => {}", lo, hi, bb)?;
+                    }
                 }
                 if let Some(default_bb) = &self.switch_default {
                     write!(f, ", default => {}", default_bb)?;
@@ -2598,7 +2607,7 @@ mod tests {
     fn test_switch_insn_uses_src() {
         let insn = Instruction::switch_insn(
             PseudoId(5),
-            vec![(0, BasicBlockId(1)), (1, BasicBlockId(2))],
+            vec![(0, 0, BasicBlockId(1)), (1, 1, BasicBlockId(2))],
             Some(BasicBlockId(3)),
             32,
         );

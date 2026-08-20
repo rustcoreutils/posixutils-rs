@@ -1086,8 +1086,12 @@ pub enum Stmt {
     /// Switch statement: switch (expr) { cases }
     Switch { expr: Expr, body: Box<Stmt> },
 
-    /// Case label: case expr: (within switch body)
-    Case(Expr),
+    /// Case label: `case expr:`, or the GNU range `case lo ... hi:`.
+    ///
+    /// The second endpoint is `None` for an ordinary label. A range is *not*
+    /// expanded into individual labels: `case 0 ... 1000000:` is legal and
+    /// compiles in GCC, and each label costs a basic block and a compare here.
+    Case(Expr, Option<Expr>),
 
     /// Default label (within switch body)
     Default(Position),

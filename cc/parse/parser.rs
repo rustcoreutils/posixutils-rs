@@ -838,7 +838,12 @@ impl<'a> Parser<'a> {
                 TokenValue::Ident(id) => {
                     format!("identifier '{}'", self.idents.get_opt(*id).unwrap_or("?"))
                 }
-                TokenValue::Special(v) => format!("'{}'", char::from_u32(*v).unwrap_or('?')),
+                // A multi-character special has a discriminant above the ASCII
+                // range -- `...` is 278 -- so rendering it as a `char` printed
+                // a stray Latin letter. `show_special` spells all of them.
+                TokenValue::Special(v) => {
+                    format!("'{}'", crate::token::lexer::show_special(*v))
+                }
                 other => format!("{:?}", other),
             };
             Err(ParseError::new(
@@ -2091,7 +2096,7 @@ impl Parser<'_> {
         let mut items = Vec::new();
         loop {
             let stmt = self.parse_statement()?;
-            let is_label = matches!(stmt, Stmt::Case(_) | Stmt::Default(_));
+            let is_label = matches!(stmt, Stmt::Case(..) | Stmt::Default(_));
             items.push(BlockItem::Statement(Box::new(stmt)));
             // A label prefixes a statement, so one more must follow it. Anything
             // else ends the body. The `}`/EOF guard keeps a body that is nothing
@@ -2111,12 +2116,22 @@ impl Parser<'_> {
         Ok(Stmt::Block(items))
     }
 
-    /// Parse a case label
+    /// Parse a case label, including the GNU range form `case lo ... hi:`.
+    ///
+    /// GCC requires whitespace around the `...`: `case 1...9:` lexes as one
+    /// pp-number and is rejected there too ("too many decimal points in
+    /// number"), so only the spaced form is accepted here as well.
     fn parse_case_label(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'case'
         let expr = self.parse_conditional_expr()?;
+        let high = if self.is_special_token(SpecialToken::Ellipsis) {
+            self.advance();
+            Some(self.parse_conditional_expr()?)
+        } else {
+            None
+        };
         self.expect_special(b':')?;
-        Ok(Stmt::Case(expr))
+        Ok(Stmt::Case(expr, high))
     }
 
     /// Parse a default label

@@ -198,7 +198,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.linearize_switch(expr, body);
             }
 
-            Stmt::Case(_) | Stmt::Default(_) => {
+            Stmt::Case(..) | Stmt::Default(_) => {
                 // Case/Default labels are handled by linearize_switch
                 // If we encounter them outside a switch, ignore them
             }
@@ -1297,10 +1297,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
 
         // Build switch instruction with case -> block mapping
-        let switch_cases: Vec<(i64, BasicBlockId)> = case_values
+        let switch_cases: Vec<(i64, i64, BasicBlockId)> = case_values
             .iter()
             .zip(case_bbs.iter())
-            .map(|(val, bb)| (*val, *bb))
+            .map(|((lo, hi), bb)| (*lo, *hi, *bb))
             .collect();
 
         // Default goes to default_bb if present, otherwise exit_bb
@@ -1316,7 +1316,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Link CFG edges from current block to all case/default/exit blocks
         if let Some(current) = self.current_bb {
-            for &(_, bb) in &switch_cases {
+            for &(_, _, bb) in &switch_cases {
                 self.link_bb(current, bb);
             }
             self.link_bb(current, default_target);
@@ -1359,7 +1359,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// only `Stmt::Block` here collected no cases from it -- so the switch was
     /// emitted with an empty table and every value took the default edge.
     /// A non-compound body is one statement, so it is walked as one.
-    pub(crate) fn collect_switch_cases(&self, body: &Stmt) -> (Vec<i64>, bool) {
+    pub(crate) fn collect_switch_cases(&self, body: &Stmt) -> (Vec<(i64, i64)>, bool) {
         let mut case_values = Vec::new();
         let mut has_default = false;
 
@@ -1455,28 +1455,75 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
     }
 
+    /// Report a case endpoint the constant folder could not reduce.
+    ///
+    /// Split out because a range has two of them and both need the same
+    /// distinction: a non-constant label is the program's error, while a
+    /// constant this partial evaluator cannot fold is ours.
+    fn report_unfoldable_case(&self, expr: &Expr) {
+        if self.expr_is_runtime(expr) {
+            error(expr.pos, "case label is not an integer constant expression");
+        } else {
+            error(
+                expr.pos,
+                "case label is a constant expression this compiler cannot evaluate",
+            );
+        }
+    }
+
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
-        case_values: &mut Vec<i64>,
+        case_values: &mut Vec<(i64, i64)>,
         has_default: &mut bool,
     ) {
         match stmt {
-            Stmt::Case(expr) => {
+            Stmt::Case(expr, high) => {
                 // Extract constant value from case expression
                 if let Some(val) = self.eval_const_expr(expr) {
                     let val = val as i64; // switch cases truncated to i64
-                                          // C99 6.8.4.2p3: no two case constants may be equal.
-                                          // Consumption looks the value up with `.position()`, which
-                                          // finds the first match, so a duplicate silently re-entered
-                                          // the earlier case's block and merged the two bodies.
-                    if case_values.contains(&val) {
-                        error(
-                            expr.pos,
-                            &format!("duplicate case value '{}' in switch", val),
-                        );
+
+                    // A GNU range `case lo ... hi:`. An absent high endpoint
+                    // is the ordinary label, held as the degenerate range
+                    // `(v, v)` so that everything downstream has one shape.
+                    let hi = match high {
+                        None => Some(val),
+                        Some(hi_expr) => match self.eval_const_expr(hi_expr) {
+                            Some(h) => Some(h as i64),
+                            None => {
+                                self.report_unfoldable_case(hi_expr);
+                                None
+                            }
+                        },
+                    };
+                    let Some(hi) = hi else { return };
+
+                    // 6.8.4.2p3 forbids two equal case constants, and GCC
+                    // extends that to overlapping ranges -- an overlap would
+                    // otherwise make one arm silently unreachable, since the
+                    // body walk resolves a label by finding the first match.
+                    if hi < val {
+                        // GCC accepts an empty range, warns, and never matches
+                        // it. Nothing is recorded, so nothing can overlap it.
+                        crate::diag::warning(expr.pos, "empty range specified");
+                        return;
                     }
-                    case_values.push(val);
+                    if let Some((lo2, hi2)) = case_values
+                        .iter()
+                        .find(|(lo2, hi2)| val <= *hi2 && *lo2 <= hi)
+                        .copied()
+                    {
+                        let what = if val == hi && lo2 == hi2 {
+                            format!("duplicate case value '{}' in switch", val)
+                        } else {
+                            format!(
+                                "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
+                                val, hi, lo2, hi2
+                            )
+                        };
+                        error(expr.pos, &what);
+                    }
+                    case_values.push((val, hi));
                 } else if self.expr_is_runtime(expr) {
                     // A non-constant label can never match; it used to be
                     // dropped without a word.
@@ -1940,7 +1987,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_body(
         &mut self,
         body: &Stmt,
-        case_values: &[i64],
+        case_values: &[(i64, i64)],
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
     ) {
@@ -1975,16 +2022,26 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_stmt(
         &mut self,
         stmt: &Stmt,
-        case_values: &[i64],
+        case_values: &[(i64, i64)],
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
         case_idx: &mut usize,
     ) {
         match stmt {
-            Stmt::Case(expr) => {
-                // Find the matching case block
+            Stmt::Case(expr, high) => {
+                // Find the matching case block. A label is identified by its
+                // whole range, so that `case 1 ... 3:` and a later `case 1:`
+                // could not resolve to the same block -- the overlap check
+                // rejects that pair anyway, but matching on the low endpoint
+                // alone would have made the two indistinguishable here.
                 if let Some(val) = self.eval_const_expr(expr) {
-                    if let Some(idx) = case_values.iter().position(|v| *v as i128 == val) {
+                    let lo = val as i64;
+                    let hi = match high {
+                        None => Some(lo),
+                        Some(hi_expr) => self.eval_const_expr(hi_expr).map(|h| h as i64),
+                    };
+                    let Some(hi) = hi else { return };
+                    if let Some(idx) = case_values.iter().position(|r| *r == (lo, hi)) {
                         let case_bb = case_bbs[idx];
 
                         // Fall through from previous case if not terminated
@@ -2665,11 +2722,11 @@ impl VmScopeWalk {
                 }
             }
 
-            Stmt::Case(_) | Stmt::Default(_) => {
+            Stmt::Case(..) | Stmt::Default(_) => {
                 // 6.8.1p2: a `case` or `default` belongs to a `switch`.
                 if self.switch_depth == 0 {
                     let (pos, what) = match stmt {
-                        Stmt::Case(expr) => (expr.pos, "case"),
+                        Stmt::Case(expr, _) => (expr.pos, "case"),
                         Stmt::Default(pos) => (*pos, "default"),
                         _ => unreachable!(),
                     };
@@ -2681,7 +2738,7 @@ impl VmScopeWalk {
                 // its declaration running.
                 if let Some(outer) = switch_scopes {
                     let label_pos = match stmt {
-                        Stmt::Case(expr) => expr.pos,
+                        Stmt::Case(expr, _) => expr.pos,
                         Stmt::Default(pos) => *pos,
                         _ => unreachable!("only a case or default reaches this arm"),
                     };

@@ -5574,7 +5574,7 @@ fn test_switch_with_non_compound_body_keeps_its_labelled_statement() {
     let BlockItem::Statement(label) = &inner[0] else {
         panic!("expected the case label")
     };
-    assert!(matches!(**label, Stmt::Case(_)), "{label:#?}");
+    assert!(matches!(**label, Stmt::Case(..)), "{label:#?}");
     let BlockItem::Statement(labelled) = &inner[1] else {
         panic!("expected the labelled statement")
     };

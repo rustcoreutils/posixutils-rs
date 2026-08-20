@@ -2018,29 +2018,75 @@ impl Aarch64CodeGen {
             Loc::VReg(_) | Loc::FImm(..) => {}
         }
 
+        // Compare `src` against a constant, materializing it when it does
+        // not fit the 12-bit unsigned immediate `cmp` accepts.
+        let cmp_const = |gen: &mut Self, src: Reg, v: i64| {
+            if (0..4096).contains(&v) {
+                gen.push_lir(Aarch64Inst::Cmp {
+                    size: op_size,
+                    src1: src,
+                    src2: GpOperand::Imm(v),
+                });
+            } else {
+                gen.push_lir(Aarch64Inst::Mov {
+                    size: op_size,
+                    src: GpOperand::Imm(v),
+                    dst: scratch1,
+                });
+                gen.push_lir(Aarch64Inst::Cmp {
+                    size: op_size,
+                    src1: src,
+                    src2: GpOperand::Reg(scratch1),
+                });
+            }
+        };
+
         // Generate comparisons for each case
-        for (case_val, target_bb) in &insn.switch_cases {
-            if *case_val >= 0 && *case_val < 4096 {
-                self.push_lir(Aarch64Inst::Cmp {
+        for (lo, hi, target_bb) in insn.switch_cases.clone() {
+            let target = Label::new(&self.base.current_fn, target_bb.0);
+            if lo == hi {
+                cmp_const(self, scratch0, lo);
+                self.push_lir(Aarch64Inst::BCond {
+                    cond: CondCode::Eq,
+                    target,
+                });
+                continue;
+            }
+
+            // A GNU range `case lo ... hi:`, tested as
+            // `(x - lo) <=unsigned (hi - lo)`: subtracting the low endpoint
+            // wraps everything below it to a large unsigned value, so a single
+            // unsigned comparison decides both ends. Expanding a range into one
+            // compare per value is not an option -- `case 0 ... 1000000:` is
+            // legal C.
+            //
+            // scratch0 holds the switch value and later cases reuse it, so the
+            // difference goes to scratch2.
+            let (_, _, scratch2) = Reg::scratch_regs();
+            if (0..4096).contains(&lo) {
+                self.push_lir(Aarch64Inst::Sub {
                     size: op_size,
                     src1: scratch0,
-                    src2: GpOperand::Imm(*case_val),
+                    src2: GpOperand::Imm(lo),
+                    dst: scratch2,
                 });
             } else {
                 self.push_lir(Aarch64Inst::Mov {
                     size: op_size,
-                    src: GpOperand::Imm(*case_val),
+                    src: GpOperand::Imm(lo),
                     dst: scratch1,
                 });
-                self.push_lir(Aarch64Inst::Cmp {
+                self.push_lir(Aarch64Inst::Sub {
                     size: op_size,
                     src1: scratch0,
                     src2: GpOperand::Reg(scratch1),
+                    dst: scratch2,
                 });
             }
+            cmp_const(self, scratch2, hi.wrapping_sub(lo));
             self.push_lir(Aarch64Inst::BCond {
-                cond: CondCode::Eq,
-                target: Label::new(&self.base.current_fn, target_bb.0),
+                cond: CondCode::Ule,
+                target,
             });
         }
 

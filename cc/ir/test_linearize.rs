@@ -554,9 +554,9 @@ fn test_switch_basic() {
 
     // Build switch body: { case 1: return 10; case 2: return 20; default: return 0; }
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types), None))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types))))),
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types), None))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types))))),
         BlockItem::Statement(Box::new(Stmt::Default(test_pos()))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
@@ -618,7 +618,7 @@ fn test_switch_with_break() {
     let x_sym = ctx.var("x", int_type);
 
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types), None))),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,

@@ -636,7 +636,7 @@ fn clone_instruction(
             new_insn.switch_cases = insn
                 .switch_cases
                 .iter()
-                .map(|(val, bb)| (*val, ctx.remap_bb(*bb)))
+                .map(|(lo, hi, bb)| (*lo, *hi, ctx.remap_bb(*bb)))
                 .collect();
             new_insn.switch_default = insn.switch_default.map(|bb| ctx.remap_bb(bb));
             vec![new_insn]

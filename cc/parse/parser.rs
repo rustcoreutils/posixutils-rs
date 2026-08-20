@@ -2334,6 +2334,38 @@ impl Parser<'_> {
         .then_some(only.value.as_ref())
     }
 
+    /// Report an array designator that addresses past the end of its array.
+    ///
+    /// Only the outermost list is walked, and only when the bound is known: an
+    /// array sized *by* this initializer cannot overflow it, and a designator
+    /// inside a nested list addresses a different object than `typ`.
+    fn check_designator_bounds(&self, typ: TypeId, elements: &[InitElement]) {
+        if self.types.kind(typ) != TypeKind::Array {
+            return;
+        }
+        let Some(capacity) = self.types.array_size(typ).filter(|&n| n > 0) else {
+            return;
+        };
+        for element in elements {
+            let Some(designator) = element.designators.first() else {
+                continue;
+            };
+            let end = match designator {
+                Designator::Index(i) => *i,
+                Designator::IndexRange(_, hi) => *hi,
+                Designator::Field(_) => continue,
+            };
+            if end >= capacity as i64 {
+                diag::error_args(
+                    element.value.pos,
+                    "array index in initializer exceeds array bounds ({0} >= {1})",
+                    &[&end.to_string(), &capacity.to_string()],
+                );
+                return;
+            }
+        }
+    }
+
     /// Report an initializer list with more elements than the object it
     /// initializes can hold (C17 6.7.9p2).
     ///
@@ -2350,6 +2382,13 @@ impl Parser<'_> {
         let ExprKind::InitList { elements } = &init.kind else {
             return;
         };
+        // A designator names its own position, so the *count* of elements says
+        // nothing -- but the position itself can still be out of range, and
+        // nothing checked that anywhere: `int a[4] = {[10] = 7};` compiled and
+        // wrote past the array. GCC rejects it. Ranges make it easy to write by
+        // accident, so the bound is checked here where the array's size is
+        // known; the element-count check below still stands aside.
+        self.check_designator_bounds(typ, elements);
         if elements.iter().any(|e| !e.designators.is_empty()) {
             return;
         }
@@ -2507,15 +2546,32 @@ impl Parser<'_> {
         while idx < elements.len() {
             let element = &elements[idx];
             let mut designator_index = None;
+            let mut designator_high = None;
             for designator in &element.designators {
-                if let Designator::Index(index) = designator {
-                    designator_index = Some(*index);
-                    break;
+                match designator {
+                    Designator::Index(index) => {
+                        designator_index = Some(*index);
+                        break;
+                    }
+                    Designator::IndexRange(lo, hi) => {
+                        designator_index = Some(*lo);
+                        designator_high = Some(*hi);
+                        break;
+                    }
+                    Designator::Field(_) => {}
                 }
             }
 
             let index = if let Some(explicit_index) = designator_index {
-                current_index = explicit_index + 1;
+                // A range advances the cursor past its high endpoint and
+                // extends the inferred bound to it: `int a[] = {[0 ... 3] = 1}`
+                // is four elements. This is a second, independent copy of the
+                // rule in `group_array_init_elements`; both have to know.
+                let end = designator_high.unwrap_or(explicit_index);
+                current_index = end + 1;
+                if end > max_index {
+                    max_index = end;
+                }
                 explicit_index
             } else {
                 let i = current_index;

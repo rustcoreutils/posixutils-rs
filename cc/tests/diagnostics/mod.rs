@@ -4401,3 +4401,53 @@ fn diagnostics_case_range_endpoints_must_be_constant() {
         "constant expression",
     );
 }
+
+/// An array designator that addresses past the end of its array is rejected.
+///
+/// Nothing checked this anywhere: `int a[4] = {[10] = 7};` compiled and wrote
+/// past the array, statically and at run time alike. GCC rejects it. Ranges
+/// make it easy to write by accident, so the bound is checked where the array
+/// size is known.
+#[test]
+fn diagnostics_designator_out_of_bounds() {
+    compile_expect_error(
+        "designator_past_end",
+        "int a[4] = {[10] = 7};\nint main(void){ return a[0]; }\n",
+        "exceeds array bounds",
+    );
+    compile_expect_error(
+        "designator_range_past_end",
+        "int a[4] = {[2 ... 9] = 7};\nint main(void){ return a[0]; }\n",
+        "exceeds array bounds",
+    );
+    // An array sized *by* its initializer cannot overflow it.
+    compile_expect_ok(
+        "designator_infers_size",
+        "int a[] = {[10] = 7};\nint main(void){ return a[10] == 7 ? 0 : 1; }\n",
+    );
+    // The last valid index is still valid.
+    compile_expect_ok(
+        "designator_last_index",
+        "int a[4] = {[3] = 7};\nint main(void){ return a[3] == 7 ? 0 : 1; }\n",
+    );
+}
+
+/// A reversed or negative index range is rejected, as in GCC.
+#[test]
+fn diagnostics_designator_range_is_well_formed() {
+    compile_expect_error(
+        "designator_range_reversed",
+        "int a[4] = {[3 ... 1] = 5};\nint main(void){ return 0; }\n",
+        "empty index range",
+    );
+    compile_expect_error(
+        "designator_negative",
+        "int a[4] = {[-1] = 5};\nint main(void){ return 0; }\n",
+        "negative",
+    );
+    // A single-element range is well formed.
+    compile_expect_ok(
+        "designator_range_single",
+        "int a[4] = {[1 ... 1] = 5};\nint main(void){ return a[1] == 5 ? 0 : 1; }\n",
+    );
+}

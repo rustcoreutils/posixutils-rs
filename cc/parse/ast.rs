@@ -824,6 +824,11 @@ pub enum Designator {
     Field(StringId),
     /// Index designator: [constant_expr] - evaluated at parse time
     Index(i64),
+    /// GNU index range designator: `[lo ... hi] =`, both ends inclusive and
+    /// evaluated at parse time. Kept apart from `Index` so that every match
+    /// on a designator has to say what it does with a range, rather than
+    /// silently treating one as its low endpoint.
+    IndexRange(i64, i64),
 }
 
 /// A single element in an initializer list

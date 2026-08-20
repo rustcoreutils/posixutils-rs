@@ -802,17 +802,29 @@ impl<'a> super::linearize::Linearizer<'a> {
         while elem_idx < elements.len() {
             let element = &elements[elem_idx];
             let mut index = None;
+            let mut index_high = None;
             let mut index_pos = None;
             for (pos, designator) in element.designators.iter().enumerate() {
-                if let Designator::Index(idx) = designator {
-                    index = Some(*idx);
-                    index_pos = Some(pos);
-                    break;
+                match designator {
+                    Designator::Index(idx) => {
+                        index = Some(*idx);
+                        index_pos = Some(pos);
+                        break;
+                    }
+                    Designator::IndexRange(lo, hi) => {
+                        index = Some(*lo);
+                        index_high = Some(*hi);
+                        index_pos = Some(pos);
+                        break;
+                    }
+                    Designator::Field(_) => {}
                 }
             }
 
             let element_index = if let Some(idx) = index {
-                current_idx = idx + 1;
+                // A range leaves the cursor past its *high* endpoint, so a
+                // positional element after `[0 ... 2] = 1` lands at 3.
+                current_idx = index_high.unwrap_or(idx) + 1;
                 idx
             } else {
                 let idx = current_idx;
@@ -838,26 +850,33 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
 
-            let entry = element_lists.entry(element_index).or_insert_with(|| {
-                element_indices.push(element_index);
-                Vec::new()
-            });
+            // A GNU range `[lo ... hi] = v` initializes every element it
+            // covers with the same value, so it becomes one entry per element.
+            // Expanding here keeps both lowering paths -- the static data
+            // image and the runtime stores -- unchanged, and matches how c17
+            // already lowers a bulk initializer element by element.
+            let span_end = index_high.unwrap_or(element_index);
+            for target_index in element_index..=span_end {
+                let entry = element_lists.entry(target_index).or_insert_with(|| {
+                    element_indices.push(target_index);
+                    Vec::new()
+                });
 
-            if remaining_designators.is_empty() {
-                if let ExprKind::InitList {
-                    elements: nested_elements,
-                } = &element.value.kind
-                {
-                    entry.extend(nested_elements.clone());
-                    elem_idx += 1;
-                    continue;
+                if remaining_designators.is_empty() {
+                    if let ExprKind::InitList {
+                        elements: nested_elements,
+                    } = &element.value.kind
+                    {
+                        entry.extend(nested_elements.clone());
+                        continue;
+                    }
                 }
-            }
 
-            entry.push(InitElement {
-                designators: remaining_designators,
-                value: element.value.clone(),
-            });
+                entry.push(InitElement {
+                    designators: remaining_designators.clone(),
+                    value: element.value.clone(),
+                });
+            }
             elem_idx += 1;
         }
 
@@ -1214,6 +1233,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                         access_bytes = None;
                     }
                 }
+                // A range inside a *chain* -- `.m[0 ... 3] = v` -- names many
+                // offsets, and this resolves to one. Refused rather than
+                // silently collapsed to the low endpoint, which would drop
+                // every element but the first. A range in a nested list,
+                // `.m = {[0 ... 3] = v}`, is the common spelling and goes
+                // through `group_array_init_elements` instead.
+                Designator::IndexRange(..) => return None,
                 Designator::Index(index) => {
                     if self.types.kind(typ) != TypeKind::Array {
                         return None;

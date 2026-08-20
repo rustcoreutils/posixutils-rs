@@ -428,6 +428,44 @@ pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
     );
 }
 
+/// Compile `content` and require it to be accepted **without** a diagnostic
+/// mentioning `forbidden`.
+///
+/// The inverse of `compile_expect_warning`, and the only way to pin a
+/// *spurious* diagnostic: `compile_expect_ok` checks the exit status, which a
+/// warning does not change, so a wrongly-warned program passes it.
+pub fn compile_expect_no_diagnostic(name: &str, content: &str, forbidden: &str) {
+    let c_file = create_c_file(name, content);
+    let asm = tempfile::Builder::new()
+        .prefix(&format!("c17_nodiag_{}_", name))
+        .suffix(".s")
+        .tempfile()
+        .expect("failed to create temp file");
+
+    let args = vec![
+        "-S".to_string(),
+        "-o".to_string(),
+        asm.path().to_string_lossy().to_string(),
+        c_file.path().to_string_lossy().to_string(),
+    ];
+    let output = run_test_base("c17", &args, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "'{}' should have compiled cleanly, but was rejected.\nSource:\n{}\nstderr:\n{}",
+        name,
+        content,
+        stderr
+    );
+    assert!(
+        !stderr.contains(forbidden),
+        "'{}' compiled, but emitted a diagnostic mentioning {:?}.\nstderr:\n{}",
+        name,
+        forbidden,
+        stderr
+    );
+}
+
 /// Preprocess `content` with `-E` and return the run.
 ///
 /// Every other preprocessor test asserts on the exit code of a compiled

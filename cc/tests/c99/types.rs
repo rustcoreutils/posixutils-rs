@@ -1363,3 +1363,114 @@ int main(void) { return 0; }
         "a file-scope variably modified typedef must be rejected"
     );
 }
+
+// ============================================================================
+// Declarations that must be accepted
+// ============================================================================
+
+/// A null pointer constant assigns to a function pointer.
+///
+/// 6.5.16.1p1 lets a null pointer constant assign to any pointer, and
+/// 6.3.2.3p3 makes `(void *)0` one -- which is exactly how glibc spells
+/// `NULL`. The check for it was read only in the "target is a pointer, value
+/// is not" branch, which a null constant that has already decayed to `void *`
+/// never reaches: it was judged by the pointer-to-pointer rules instead, and
+/// those diagnose a `void *` meeting a function pointer. So every `fp = NULL`
+/// warned, and any `-Werror` build using function pointers broke.
+#[test]
+fn c99_null_constant_assigns_to_a_function_pointer() {
+    let code = r#"
+#include <stddef.h>
+
+typedef void (*handler)(int);
+static handler h1 = NULL;
+static handler h2 = (void *)0;
+static handler h3 = 0;
+
+static void hit(int x) { (void)x; }
+
+int main(void)
+{
+    handler h = NULL;
+    if (h != NULL) return 1;
+    h = (void *)0;
+    if (h) return 2;
+    h = hit;
+    if (!h) return 3;
+    h = 0;
+    if (h) return 4;
+    if (h1 || h2 || h3) return 5;
+
+    /* A void* still round-trips through an object pointer. */
+    int i = 7;
+    void *v = &i;
+    int *p = v;
+    if (*p != 7) return 6;
+    return 0;
+}
+"#;
+    // The warning is the defect, so the compile must be clean, not merely
+    // successful.
+    crate::common::compile_expect_no_diagnostic("null_fnptr", code, "forbids");
+    assert_eq!(compile_and_run("null_fnptr_run", code, &[]), 0);
+}
+
+/// A `typedef` of an incomplete type is legal at block scope.
+///
+/// 6.7p7 asks for a complete type where an *object* is declared. A typedef
+/// declares no object, and the file-scope path has always said so; the
+/// block-scope path did not, so `typedef struct Incomplete T;` inside a
+/// function was rejected.
+#[test]
+fn c99_block_scope_typedef_of_an_incomplete_type() {
+    let code = r#"
+struct Incomplete;
+union AlsoIncomplete;
+
+int main(void)
+{
+    typedef struct Incomplete T;
+    typedef union AlsoIncomplete U;
+    T *p = 0;
+    U *q = 0;
+
+    /* Completing it later in the block is a different declaration, and the
+       typedef still names the incomplete one -- but a pointer to it is fine. */
+    if (p || q) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("block_typedef_incomplete", code, &[]), 0);
+}
+
+/// A qualified tentative definition is completed by completing its tag.
+///
+/// 6.9.2p3 lets a file-scope tentative definition be completed later. A
+/// qualified spelling -- `volatile struct S` -- is interned as a fresh type
+/// holding a clone of the tag's composite data as it stood at the time, and
+/// completing the tag mutates only the tag's own entry. Judging the recorded
+/// id therefore read a frozen "incomplete" that nothing could ever update.
+#[test]
+fn c99_qualified_tentative_definition_is_completed_by_its_tag() {
+    let code = r#"
+struct S;
+volatile struct S vs;
+const struct S cs;
+struct S plain;
+struct S { int a; };
+
+union U;
+volatile union U vu;
+union U { int b; };
+
+int main(void)
+{
+    if (vs.a != 0) return 1;
+    if (cs.a != 0) return 2;
+    if (plain.a != 0) return 3;
+    if (vu.b != 0) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("qualified_tentative_def", code, &[]), 0);
+}

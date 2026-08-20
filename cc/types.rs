@@ -1461,6 +1461,18 @@ impl TypeTable {
             return (!ok).then_some(AssignFault::Incompatible);
         }
 
+        // A null pointer constant assigns to any pointer (6.5.16.1p1), and
+        // `(void *)0` is one (6.3.2.3p3) -- so this has to be asked before the
+        // pointer-to-pointer rules, not after them. It was read only in the
+        // `t_ptr && !v_ptr` branch below, which a null constant that had
+        // already decayed to `void *` never reaches. With glibc's
+        // `#define NULL ((void *)0)` that made every `fp = NULL` on a function
+        // pointer a "ISO C forbids ... function pointer and 'void *'"
+        // diagnostic, and broke any -Werror build using function pointers.
+        if value_is_null_constant && t_ptr {
+            return None;
+        }
+
         if t_ptr && v_ptr {
             let (Some(t_pointee), Some(v_pointee)) = (t_pointee, v_pointee) else {
                 return None;

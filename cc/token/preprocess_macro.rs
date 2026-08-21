@@ -26,6 +26,18 @@ pub(super) fn replacement_lists_identical(a: &[MacroToken], b: &[MacroToken]) ->
     })
 }
 
+/// Strip the "begins a line" flag from a token being placed into a macro
+/// expansion.
+///
+/// Nothing an expansion produces starts a line: C17 6.10.3p11 makes a
+/// directive built by an expansion undefined, and `-E` breaks lines on this
+/// flag. Argument tokens are the ones that carry it in, since they come
+/// straight from the file and an argument list may span lines.
+fn clear_newline(mut token: Token) -> Token {
+    token.pos.newline = false;
+    token
+}
+
 impl<'a> Preprocessor<'a> {
     /// Resolve one `defined` operator: `defined X` or `defined ( X )`.
     ///
@@ -471,16 +483,13 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Try to expand a macro
-    pub(super) fn try_expand_macro<I>(
+    pub(super) fn try_expand_macro(
         &mut self,
         name: &str,
         pos: &Position,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         idents: &mut IdentTable,
-    ) -> Option<Vec<Token>>
-    where
-        I: Iterator<Item = Token>,
-    {
+    ) -> Option<Vec<Token>> {
         // Check for recursion
         if self.expanding.contains(name) {
             return None;
@@ -514,16 +523,13 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Collect arguments for a function-like macro call
-    pub(super) fn collect_macro_args<I>(
+    pub(super) fn collect_macro_args(
         &self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         _idents: &IdentTable,
         macro_pos: &Position,
         macro_name: &str,
-    ) -> Vec<Vec<Token>>
-    where
-        I: Iterator<Item = Token>,
-    {
+    ) -> Vec<Vec<Token>> {
         let mut args = Vec::new();
         let mut current_arg = Vec::new();
         // Start at depth 1 because the opening '(' has already been consumed
@@ -668,9 +674,17 @@ impl<'a> Preprocessor<'a> {
                         args.get(*idx).cloned().unwrap_or_default()
                     };
                     let text = self.stringify_arg(&arg, idents);
+                    // The result is one token of the expansion, not the
+                    // invocation: it takes the `#` operator's spacing, and it
+                    // never starts a line. Copying `*pos` verbatim gave a
+                    // line-initial `S(x)` a stringified token flagged as
+                    // beginning a line, which `-E` then broke a line on.
+                    let mut str_pos = *pos;
+                    str_pos.whitespace = mt.whitespace;
+                    str_pos.newline = false;
                     result.push(Token::with_value(
                         TokenType::String,
-                        *pos,
+                        str_pos,
                         TokenValue::String(text),
                     ));
                 }
@@ -685,7 +699,11 @@ impl<'a> Preprocessor<'a> {
                             let pasted = self.paste_tokens(&prev, &arg, pos, idents);
                             result.extend(pasted);
                         } else {
-                            result.extend(arg);
+                            // Raw argument tokens, straight from the file. An
+                            // argument may span lines, and a token that still
+                            // says it begins one would be read back as
+                            // starting a directive.
+                            result.extend(arg.into_iter().map(clear_newline));
                         }
                     } else {
                         // Expand the argument
@@ -809,11 +827,19 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // The FIRST token of a macro expansion should inherit whitespace
-        // from the macro invocation position, not the macro body.
-        // This ensures "MACRO(args)" expands with proper spacing.
+        // The FIRST token of a macro expansion stands where the invocation
+        // stood: it inherits both the spacing before it and whether it begins
+        // a line. Body tokens carry neither, since they were written somewhere
+        // else entirely.
+        //
+        // The line flag used to be dropped, so an expansion at the start of a
+        // line ran onto the previous one in `-E` output -- `M int b;` came out
+        // as `int a; 42 int b;` where gcc breaks the line. Stringification hid
+        // that for its own case by copying the invocation position wholesale,
+        // which then made a `#x` result claim to begin a line even mid-line.
         if let Some(first) = filtered.first_mut() {
             first.pos.whitespace = pos.whitespace;
+            first.pos.newline = pos.newline;
         }
 
         Some(filtered)
@@ -838,7 +864,7 @@ impl<'a> Preprocessor<'a> {
         // Re-tokenize the combined string using the same shared string table
         // Since we use the same StringTable, all StringIds are consistent
         // and no ID remapping is needed.
-        let stream_id = diag::init_stream("<paste>");
+        let stream_id = self.paste_stream();
         let tokens = {
             let mut tokenizer = Tokenizer::new(combined.as_bytes(), stream_id, idents);
             tokenizer.tokenize()
@@ -854,8 +880,9 @@ impl<'a> Preprocessor<'a> {
             })
             .collect();
 
-        // Add remaining right tokens
-        result.extend(right.iter().skip(1).cloned());
+        // Add remaining right tokens. Only `right[0]` went through the
+        // tokenizer above, so these still carry the file's line flags.
+        result.extend(right.iter().skip(1).cloned().map(clear_newline));
 
         result
     }
@@ -929,11 +956,19 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // The FIRST token of a macro expansion should inherit whitespace
-        // from the macro invocation position, not the macro body.
-        // This ensures "extern __inline" expands to "extern inline" with space.
+        // The FIRST token of a macro expansion stands where the invocation
+        // stood: it inherits both the spacing before it and whether it begins
+        // a line. Body tokens carry neither, since they were written somewhere
+        // else entirely.
+        //
+        // The line flag used to be dropped, so an expansion at the start of a
+        // line ran onto the previous one in `-E` output -- `M int b;` came out
+        // as `int a; 42 int b;` where gcc breaks the line. Stringification hid
+        // that for its own case by copying the invocation position wholesale,
+        // which then made a `#x` result claim to begin a line even mid-line.
         if let Some(first) = filtered.first_mut() {
             first.pos.whitespace = pos.whitespace;
+            first.pos.newline = pos.newline;
         }
 
         Some(filtered)
@@ -981,17 +1016,14 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Expand a builtin macro
-    pub(super) fn expand_builtin<I>(
+    pub(super) fn expand_builtin(
         &mut self,
         builtin: BuiltinMacro,
         pos: &Position,
         mac: &Macro,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         idents: &mut IdentTable,
-    ) -> Option<Vec<Token>>
-    where
-        I: Iterator<Item = Token>,
-    {
+    ) -> Option<Vec<Token>> {
         match builtin {
             BuiltinMacro::Line => {
                 let effective_line = (pos.line as i32 + self.line_offset) as u32;

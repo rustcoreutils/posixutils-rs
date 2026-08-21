@@ -1403,3 +1403,41 @@ fn preprocessor_if_char_signedness_is_per_target() {
         assert_has(&r.stdout, want, target);
     }
 }
+
+/// An expansion stands where the invocation stood, so one at the start of a
+/// line still starts a line. c17 dropped that flag and ran the expansion onto
+/// the previous line; stringification hid the bug for its own case by copying
+/// the invocation position wholesale, which then made a `#x` result claim to
+/// begin a line even in the middle of one.
+#[test]
+fn preprocessor_expansion_keeps_the_invocation_line_break() {
+    let src = "#define M 42\n#define F(x) (x)\n#define S(x) #x\n\
+               int a;\nM int b;\nint c;\nF(9) int d;\nint e;\nS(hi) int f;\n";
+    let r = preprocess_text("expansion_linebreak", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+
+    // Each expansion begins its own line, exactly as gcc lays it out.
+    for (before, after) in [
+        ("int a;", "42 int b;"),
+        ("int c;", "(9) int d;"),
+        ("int e;", "\"hi\" int f;"),
+    ] {
+        assert_lacks(
+            &r.stdout,
+            &format!("{} {}", before, after),
+            "expansion ran onto the previous line",
+        );
+        assert_has(&r.stdout, after, "the expansion itself");
+    }
+}
+
+/// A macro argument may span lines, and its tokens go into the expansion
+/// carrying the file's flags. One that still says it begins a line would be
+/// read back as starting a directive once expansions are rescanned in place.
+#[test]
+fn preprocessor_multiline_argument_does_not_begin_a_line() {
+    let src = "#define C(a,b) a##b\nint xy_z = 1;\nint v = C(x,\ny_z);\n";
+    let r = preprocess_text("multiline_arg", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "int v = xy_z;", "pasted across a line break");
+}

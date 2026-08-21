@@ -9,6 +9,7 @@
 // Token module - lexer and preprocessor
 //
 
+pub mod cursor;
 pub mod lexer;
 pub mod literal;
 pub mod preprocess;

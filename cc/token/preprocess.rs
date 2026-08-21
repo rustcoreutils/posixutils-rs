@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
     literal_payload, payload_bytes, payload_text, report_forbidden_ucn, tokens_to_source_bytes,
     write_token, IdentTable, LexerMode, Position, Punctuator, SpecialToken, Spelling, Token,
@@ -438,6 +439,14 @@ pub struct Preprocessor<'a> {
     /// applied to its own `#` token.
     physical_line: u32,
     physical_stream: u16,
+    /// The one diagnostic stream every `##` result is attributed to.
+    ///
+    /// `diag::init_stream` appends to a registry and returns its length as a
+    /// `u16`. Calling it per paste grew that registry without bound and wrapped
+    /// silently past 65535, at which point *other* files' stream ids collided
+    /// and every later diagnostic named the wrong file. A translation unit
+    /// does far more than 65535 pastes.
+    paste_stream: std::cell::Cell<Option<u16>>,
     /// Set while a `#if`/`#elif` controlling expression is being expanded.
     ///
     /// C17 6.10.1p1 exempts the operand of `defined` from macro expansion, and
@@ -782,6 +791,7 @@ impl<'a> Preprocessor<'a> {
             linemarker: None,
             physical_line: 0,
             physical_stream: 0,
+            paste_stream: std::cell::Cell::new(None),
             in_if_condition: false,
         };
 
@@ -1053,11 +1063,13 @@ impl<'a> Preprocessor<'a> {
         };
         // handle_define expects to start at the macro name, and stream markers
         // would be taken for one.
-        let mut iter = tokens
-            .into_iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .peekable();
-        self.handle_define(&mut iter, idents);
+        let mut cursor = TokenCursor::new(
+            tokens
+                .into_iter()
+                .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+                .collect(),
+        );
+        self.handle_define(&mut cursor, idents);
     }
 
     /// Undefine a macro
@@ -1068,6 +1080,18 @@ impl<'a> Preprocessor<'a> {
     /// Check if a macro is defined
     pub fn is_defined(&self, name: &str) -> bool {
         self.macros.contains_key(name)
+    }
+
+    /// The `<paste>` stream id, created once.
+    fn paste_stream(&self) -> u16 {
+        match self.paste_stream.get() {
+            Some(id) => id,
+            None => {
+                let id = diag::init_stream("<paste>");
+                self.paste_stream.set(Some(id));
+                id
+            }
+        }
     }
 
     /// Check if we're currently skipping tokens
@@ -1085,16 +1109,27 @@ impl<'a> Preprocessor<'a> {
         // Tracks `defined X` / `defined ( X )` so the operand escapes macro
         // expansion; inert outside a controlling expression.
         let mut defined_scan = DefinedScan::Idle;
-        let mut iter = tokens.into_iter().peekable();
+        let mut cursor = TokenCursor::new(tokens);
 
-        while let Some(mut token) = iter.next() {
+        while let Some(mut token) = cursor.next() {
             // Attribute the token before anything looks at it, so that macro
             // expansion, diagnostics and the `-E` marker writer all inherit
             // the position a linemarker established. The physical position is
             // kept because the next linemarker's delta is measured from it.
-            self.physical_line = token.pos.line;
-            self.physical_stream = token.pos.stream;
-            token.pos = self.remap_pos(token.pos);
+            //
+            // Only for tokens read from the file. A token from an expansion
+            // already carries the invocation's position, remapped when the
+            // invoking token came through here, and `remap_pos` is not
+            // idempotent when a linemarker's target is its own origin -- which
+            // is what `# 100 "this-file.c"` produces -- so a second pass
+            // applies the delta twice. Letting an expansion token write
+            // `physical_line` is worse still: the next linemarker measures its
+            // delta from that already-remapped line.
+            if cursor.provenance() == Provenance::Main {
+                self.physical_line = token.pos.line;
+                self.physical_stream = token.pos.stream;
+                token.pos = self.remap_pos(token.pos);
+            }
 
             match token.typ {
                 TokenType::StreamBegin | TokenType::StreamEnd => {
@@ -1106,7 +1141,7 @@ impl<'a> Preprocessor<'a> {
                     if let TokenValue::Special(code) = &token.value {
                         // Check for # at start of line (preprocessor directive)
                         if *code == b'#' as u32 && token.pos.newline {
-                            self.handle_directive(&mut iter, &token, &mut output, idents);
+                            self.handle_directive(&mut cursor, &token, &mut output, idents);
                             continue;
                         }
                     }
@@ -1151,7 +1186,7 @@ impl<'a> Preprocessor<'a> {
                             // _Pragma("string") is equivalent to #pragma string
                             // We silently consume it since we ignore #pragma anyway
                             if name == "_Pragma" {
-                                self.handle_pragma_operator(&mut iter, &mut output);
+                                self.handle_pragma_operator(&mut cursor, &mut output);
                                 continue;
                             }
 
@@ -1165,7 +1200,7 @@ impl<'a> Preprocessor<'a> {
                             }
 
                             if let Some(expanded) =
-                                self.try_expand_macro(&name, &token.pos, &mut iter, idents)
+                                self.try_expand_macro(&name, &token.pos, &mut cursor, idents)
                             {
                                 output.extend(expanded);
 
@@ -1194,7 +1229,7 @@ impl<'a> Preprocessor<'a> {
                                     }
 
                                     // Check if next token is '('
-                                    let Some(next) = iter.peek() else { break };
+                                    let Some(next) = cursor.peek() else { break };
                                     let TokenValue::Special(code) = &next.value else {
                                         break;
                                     };
@@ -1215,9 +1250,9 @@ impl<'a> Preprocessor<'a> {
                                         output.push(last_token);
                                         break;
                                     }
-                                    iter.next(); // consume '('
+                                    cursor.next(); // consume '('
                                     let args = self.collect_macro_args(
-                                        &mut iter,
+                                        &mut cursor,
                                         idents,
                                         &last_token.pos,
                                         &macro_name,
@@ -1284,10 +1319,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Collect tokens until end of line
-    fn collect_to_eol<I>(&self, iter: &mut std::iter::Peekable<I>) -> Vec<Token>
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn collect_to_eol(&self, iter: &mut TokenCursor) -> Vec<Token> {
         let mut tokens = Vec::new();
         while let Some(token) = iter.peek() {
             if token.pos.newline {
@@ -1360,15 +1392,12 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Reduce `#pragma pack(...)`'s tokens to `PackTok`s and read them.
-    fn parse_pack_pragma<I>(
+    fn parse_pack_pragma(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         idents: &IdentTable,
         pos: Position,
-    ) -> Option<PackAction>
-    where
-        I: Iterator<Item = Token>,
-    {
+    ) -> Option<PackAction> {
         let mut toks = Vec::new();
         while let Some(tok) = iter.peek() {
             if tok.pos.newline && !toks.is_empty() {

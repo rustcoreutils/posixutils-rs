@@ -56,15 +56,13 @@ impl<'a> Preprocessor<'a> {
             )
     }
 
-    pub(super) fn handle_directive<I>(
+    pub(super) fn handle_directive(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         hash_token: &Token,
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
         // C17 6.10p7: a `#` alone on a line is the null directive and has no
         // effect. Check before consuming, because the next token belongs to the
         // *next* line — taking it unconditionally treated that line's first
@@ -187,10 +185,7 @@ impl<'a> Preprocessor<'a> {
     /// identifier. C17 has no such directive; this is the GCC form that
     /// `c17 -E` itself writes, and `#line` is deliberately *not* routed here
     /// (GCC honors only this form in a preprocessed file, and so does c17).
-    fn handle_linemarker<I>(&mut self, iter: &mut std::iter::Peekable<I>, number: &Token)
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_linemarker(&mut self, iter: &mut TokenCursor, number: &Token) {
         let origin = self.physical_stream;
         let TokenValue::Number(ref text) = number.value else {
             self.skip_to_eol(iter);
@@ -241,10 +236,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Skip tokens until end of line
-    fn skip_to_eol<I>(&self, iter: &mut std::iter::Peekable<I>)
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn skip_to_eol(&self, iter: &mut TokenCursor) {
         while let Some(token) = iter.peek() {
             if token.pos.newline {
                 break;
@@ -254,13 +246,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #define
-    pub(super) fn handle_define<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        idents: &IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    pub(super) fn handle_define(&mut self, iter: &mut TokenCursor, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -408,10 +394,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #undef
-    fn handle_undef<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &IdentTable)
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_undef(&mut self, iter: &mut TokenCursor, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -431,14 +414,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #ifdef
-    fn handle_ifdef<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        idents: &IdentTable,
-        pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
         let defined = if let Some(token) = iter.next() {
             if let TokenType::Ident = &token.typ {
                 if let TokenValue::Ident(id) = &token.value {
@@ -462,14 +438,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #ifndef
-    fn handle_ifndef<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        idents: &IdentTable,
-        pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_ifndef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
         let defined = if let Some(token) = iter.next() {
             if let TokenType::Ident = &token.typ {
                 if let TokenValue::Ident(id) = &token.value {
@@ -493,14 +462,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #if
-    fn handle_if<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        idents: &mut IdentTable,
-        pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_if(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
         let value = if self.is_skipping() {
             false
@@ -514,14 +476,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #elif
-    fn handle_elif<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        idents: &mut IdentTable,
-        pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_elif(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
 
         // Check if we should evaluate this branch
@@ -561,10 +516,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #else
-    fn handle_else<I>(&mut self, iter: &mut std::iter::Peekable<I>)
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_else(&mut self, iter: &mut TokenCursor) {
         self.skip_to_eol(iter);
 
         if let Some(cond) = self.cond_stack.last_mut() {
@@ -587,25 +539,20 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #endif
-    fn handle_endif<I>(&mut self, iter: &mut std::iter::Peekable<I>)
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_endif(&mut self, iter: &mut TokenCursor) {
         self.skip_to_eol(iter);
         self.cond_stack.pop();
     }
 
     /// Handle #include
-    fn handle_include<I>(
+    fn handle_include(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
         hash_token: &Token,
         is_include_next: bool,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -1423,14 +1370,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #error
-    fn handle_error<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        pos: &Position,
-        idents: &IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_error(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -1442,14 +1382,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #warning
-    fn handle_warning<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        pos: &Position,
-        idents: &IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_warning(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -1461,14 +1394,12 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #pragma
-    fn handle_pragma<I>(
+    fn handle_pragma(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         output: &mut Vec<Token>,
         idents: &IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -1571,13 +1502,11 @@ impl<'a> Preprocessor<'a> {
     /// Handle _Pragma operator (C99)
     /// _Pragma("string") is equivalent to #pragma string
     /// Since we ignore most pragmas anyway, this just consumes the tokens
-    pub(super) fn handle_pragma_operator<I>(
+    pub(super) fn handle_pragma_operator(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         output: &mut Vec<Token>,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
         // Expect '('
         if let Some(token) = iter.next() {
             if !matches!(&token.value, TokenValue::Special(code) if *code == b'(' as u32) {
@@ -1621,14 +1550,12 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #line directive
-    fn handle_line<I>(
+    fn handle_line(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         idents: &mut IdentTable,
         directive_pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;

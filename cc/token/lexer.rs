@@ -628,11 +628,17 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             return c as i32;
         }
 
-        // Handle tab
+        // Handle tab.
+        //
+        // The column is only ever reported, never computed with, so a line
+        // wider than `col` can hold pins the count at the maximum. Machine-
+        // generated and minified C routinely exceeds 65535 columns, where the
+        // unchecked arithmetic wrapped to a nonsense column in a release build
+        // and panicked outright in a debug one.
         if c == b'\t' {
-            self.col = (self.col + 8) & !7; // Round to next multiple of 8
+            self.col = self.col.saturating_add(8) & !7; // Round to next multiple of 8
         } else {
-            self.col += 1;
+            self.col = self.col.saturating_add(1);
         }
 
         c as i32
@@ -2192,6 +2198,23 @@ mod tests {
         // The long form spans more digits, so it spans more splices.
         let (tokens, idents) = tokenize_str("a\\U000\\\n000\\\ne9b");
         assert_eq!(show_token(&tokens[1], &idents), "a\u{e9}b");
+    }
+
+    #[test]
+    fn test_column_saturates_on_very_long_line() {
+        let mut src = " ".repeat(70000);
+        src.push('x');
+        let (tokens, idents) = tokenize_str(&src);
+        assert_eq!(show_token(&tokens[1], &idents), "x");
+        assert_eq!(tokens[1].pos.col, u16::MAX);
+        assert_eq!(tokens[1].pos.line, 1);
+
+        // Tabs advance to the next multiple of eight, which must saturate too.
+        let mut src = "\t".repeat(70000);
+        src.push('x');
+        let (tokens, idents) = tokenize_str(&src);
+        assert_eq!(show_token(&tokens[1], &idents), "x");
+        assert!(tokens[1].pos.col >= u16::MAX - 8);
     }
 
     /// A `%:` whose following `%` does not complete the `%:%:` digraph used to

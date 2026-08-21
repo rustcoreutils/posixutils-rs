@@ -189,14 +189,35 @@ pub enum BuiltinMacro {
     HasIncludeNext,
 }
 
+thread_local! {
+    /// A string table for tokenizing predefined macro values.
+    ///
+    /// `Macro::predefined` needs a table only because the tokenizer takes one;
+    /// every identifier it interns is de-interned again before the function
+    /// returns, so no id escapes. Building a fresh table per call was not free:
+    /// `StringTable::new` pre-interns every keyword at a fixed slot, and the
+    /// compiler defines about fifty of these macros before it reads a line of
+    /// source. That was half the instructions executed for an empty
+    /// translation unit.
+    ///
+    /// Shared rather than keyword-free so the fixed keyword slots -- which the
+    /// directive dispatch matches against as integers -- still hold.
+    static SCRATCH_IDENTS: std::cell::RefCell<IdentTable> =
+        std::cell::RefCell::new(IdentTable::new());
+}
+
+/// Run `f` with the shared scratch string table.
+fn scratch_idents<T>(f: impl FnOnce(&mut IdentTable) -> T) -> T {
+    SCRATCH_IDENTS.with(|cell| f(&mut cell.borrow_mut()))
+}
+
 impl Macro {
     /// Create a predefined macro (value is treated as a number/literal)
     pub fn predefined(name: &str, value: Option<&str>) -> Self {
         let body = match value {
-            Some(v) => {
+            Some(v) => scratch_idents(|idents| {
                 // Tokenize the value string properly so (-1021) becomes (, -, 1021, )
-                let mut idents = IdentTable::new();
-                let mut tokenizer = Tokenizer::new(v.as_bytes(), 0, &mut idents);
+                let mut tokenizer = Tokenizer::new(v.as_bytes(), 0, idents);
                 let tokens = tokenizer.tokenize();
 
                 tokens
@@ -233,7 +254,7 @@ impl Macro {
                         }
                     })
                     .collect()
-            }
+            }),
             None => vec![],
         };
         Self {
@@ -356,7 +377,7 @@ pub struct Preprocessor<'a> {
     target: &'a Target,
 
     /// Macro definitions
-    macros: HashMap<String, Macro>,
+    macros: HashMap<String, std::rc::Rc<Macro>>,
 
     /// Conditional compilation stack
     cond_stack: Vec<Conditional>,
@@ -1043,7 +1064,7 @@ impl<'a> Preprocessor<'a> {
 
     /// Define a macro
     pub fn define_macro(&mut self, mac: Macro) {
-        self.macros.insert(mac.name.clone(), mac);
+        self.macros.insert(mac.name.clone(), std::rc::Rc::new(mac));
     }
 
     /// Apply one command-line `-D` specification.
@@ -1195,24 +1216,33 @@ impl<'a> Preprocessor<'a> {
                     // Check for macro expansion
                     if let TokenValue::Ident(id) = &token.value {
                         if let Some(name) = idents.get_opt(*id) {
-                            let name = name.to_string();
+                            // Everything that can reject this token is decided
+                            // against the interned name, before it is copied.
+                            // Almost every identifier in a translation unit is
+                            // not a macro, and copying each one to find that
+                            // out was an allocation per identifier -- the cost
+                            // was paid by programs that define no macros at
+                            // all. The copy is needed only past this point,
+                            // because expanding wants `idents` mutably.
+                            let is_pragma = name == "_Pragma";
+                            let is_macro = self.macros.contains_key(name);
+                            let hidden = token.is_no_expand(name);
 
                             // Handle _Pragma operator (C99)
                             // _Pragma("string") is equivalent to #pragma string
                             // We silently consume it since we ignore #pragma anyway
-                            if name == "_Pragma" {
+                            if is_pragma {
                                 self.handle_pragma_operator(&mut cursor, &mut output);
                                 continue;
                             }
 
-                            // Check blue-painting: if this token was marked as no-expand
-                            // for this macro (from a previous expansion), don't expand it.
-                            // Per C99 6.10.3.4, macro names in their own expansion are
-                            // "blue painted" and should not be re-expanded.
-                            if token.is_no_expand(&name) {
+                            // Per C99 6.10.3.4, a macro name that its own
+                            // expansion put here is not expanded again.
+                            if !is_macro || hidden {
                                 output.push(token);
                                 continue;
                             }
+                            let name = name.to_string();
 
                             if let Some(expanded) =
                                 self.try_expand_macro(&name, &token, &mut cursor, idents)

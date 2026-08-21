@@ -705,6 +705,11 @@ impl<'a> Preprocessor<'a> {
     ) -> Option<Vec<Token>> {
         self.check_macro_arity(mac, args, pos);
 
+        // One fully-replaced form per argument, filled in on first use. Only
+        // the unquoted uses go through it: `#x` needs the argument's original
+        // spelling and `a##b` needs its unexpanded tokens.
+        let mut expanded_args: Vec<Option<Vec<Token>>> = vec![None; args.len()];
+
         // Arguments are macro-replaced on their own first (C17 6.10.3.1p1:
         // "as if they formed the rest of the preprocessing file"), and are not
         // yet hidden by this macro -- so `#define f(x) (x)` expands `f(f(1))`
@@ -773,26 +778,39 @@ impl<'a> Preprocessor<'a> {
                             result.extend(arg.into_iter().map(clear_newline));
                         }
                     } else {
-                        // Expand the argument
-                        let expanded = self.preprocess(arg, idents);
-                        for mut tok in expanded {
-                            if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd) {
-                                continue;
+                        // Expand the argument once, however many times the body
+                        // names the parameter. C17 6.10.3.1p1 replaces a
+                        // parameter with the *same* fully-replaced sequence
+                        // each time, so re-running the pass per occurrence
+                        // could only produce the same tokens again -- and it
+                        // dominated the cost of any macro that used a parameter
+                        // more than once.
+                        if expanded_args[*idx].is_none() {
+                            let expanded = self.preprocess(arg, idents);
+                            let mut out = Vec::with_capacity(expanded.len());
+                            for mut tok in expanded {
+                                if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd)
+                                {
+                                    continue;
+                                }
+                                // Re-point the token at the invocation for
+                                // diagnostics, but keep whether it was preceded
+                                // by white space: that belongs to the
+                                // argument's own spelling, and 6.10.3.2p2 makes
+                                // `#` reproduce it. Taking `whitespace` from
+                                // the invocation site gave every expanded token
+                                // one, so the two-level `XSTR(x)`/`STR(x)`
+                                // idiom turned `1+2` into `"1 + 2"` while the
+                                // direct `STR(1+2)` was right.
+                                let whitespace = tok.pos.whitespace;
+                                tok.pos = *pos;
+                                tok.pos.newline = false;
+                                tok.pos.whitespace = whitespace;
+                                out.push(tok);
                             }
-                            // Re-point the token at the invocation for
-                            // diagnostics, but keep whether it was preceded by
-                            // white space: that belongs to the argument's own
-                            // spelling, and 6.10.3.2p2 makes `#` reproduce it.
-                            // Taking `whitespace` from the invocation site gave
-                            // every expanded token one, so the two-level
-                            // `XSTR(x)`/`STR(x)` idiom turned `1+2` into
-                            // `"1 + 2"` while the direct `STR(1+2)` was right.
-                            let whitespace = tok.pos.whitespace;
-                            tok.pos = *pos;
-                            tok.pos.newline = false;
-                            tok.pos.whitespace = whitespace;
-                            result.push(tok);
+                            expanded_args[*idx] = Some(out);
                         }
+                        result.extend(expanded_args[*idx].as_ref().unwrap().iter().cloned());
                     }
                 }
                 MacroTokenValue::VaArgs => {

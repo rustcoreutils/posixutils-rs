@@ -114,6 +114,25 @@ fn preprocessor_non_ascii_header_name_opens() {
     );
 }
 
+/// A `#error` message is the directive's tokens spelled as they were written
+/// -- GCC echoes the line verbatim. The renderer handled four token types and
+/// silently dropped the rest, so quotes vanished from strings and character
+/// and wide-string operands disappeared entirely.
+#[test]
+fn preprocessor_error_message_spells_every_token() {
+    let r = preprocess_text(
+        "error_spelling",
+        "#error \"quoted\" and 'c' and L\"wide\" and 3.5 >> 1\n",
+        &[],
+    );
+    assert!(!r.success, "#error must fail the run");
+    assert_has(
+        &r.stderr,
+        "#error \"quoted\" and 'c' and L\"wide\" and 3.5 >> 1",
+        "#error message",
+    );
+}
+
 // ============================================================================
 // #P2 — the null directive
 // ============================================================================

@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::lexer::{
-    literal_payload, payload_text, tokens_to_source_bytes, IdentTable, LexerMode, Position,
-    SpecialToken, Token, TokenType, TokenValue, Tokenizer,
+    literal_payload, payload_text, show_token, tokens_to_source_bytes, IdentTable, LexerMode,
+    Position, SpecialToken, Token, TokenType, TokenValue, Tokenizer,
 };
 use crate::arch;
 use crate::builtin_headers;
@@ -3023,7 +3023,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         let tokens = self.collect_to_eol(iter);
-        let msg = self.tokens_to_text(&tokens, idents);
+        let msg = self.tokens_to_message(&tokens, idents);
         diag::error_args(*pos, "#error {0}", &[&msg.to_string()]);
     }
 
@@ -3042,7 +3042,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         let tokens = self.collect_to_eol(iter);
-        let msg = self.tokens_to_text(&tokens, idents);
+        let msg = self.tokens_to_message(&tokens, idents);
         diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
     }
 
@@ -3318,35 +3318,24 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Convert tokens to text for error messages
-    fn tokens_to_text(&self, tokens: &[Token], idents: &IdentTable) -> String {
+    /// Render tokens as the message of a `#error` or `#warning`, spelled the
+    /// way they were written.
+    ///
+    /// Not to be confused with the free `tokens_to_source_bytes`, which
+    /// reproduces a whole translation unit for `-E` with its line structure
+    /// intact. This one produces one line for a human to read.
+    ///
+    /// Built on `show_token` so that every token type is covered: the
+    /// hand-written match this replaces handled four of them and silently
+    /// dropped the rest, so `#error "a" 'b' L"c"` reported `#error a  and`
+    /// -- quotes stripped, two of the three operands gone.
+    fn tokens_to_message(&self, tokens: &[Token], idents: &IdentTable) -> String {
         let mut result = String::new();
         for token in tokens {
             if !result.is_empty() && token.pos.whitespace {
                 result.push(' ');
             }
-            match &token.value {
-                TokenValue::Ident(id) => {
-                    if let Some(name) = idents.get_opt(*id) {
-                        result.push_str(name);
-                    }
-                }
-                TokenValue::Number(n) => result.push_str(n),
-                TokenValue::String(s) => result.push_str(s),
-                TokenValue::Special(code) if *code < SpecialToken::BASE => {
-                    result.push(*code as u8 as char);
-                }
-                // A punctuator of more than one character has a spelling too.
-                // Dropping it turned `a >> b` into `a  b`, in `#x` (6.10.3.2p2
-                // asks for "the spelling of the preprocessing token") and in
-                // the text a `_Pragma` is rebuilt from alike.
-                TokenValue::Special(code) => {
-                    if let Some(punct) = SpecialToken::from_code(*code) {
-                        result.push_str(punct.spelling());
-                    }
-                }
-                _ => {}
-            }
+            result.push_str(&show_token(token, idents));
         }
         result
     }

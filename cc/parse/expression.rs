@@ -5349,7 +5349,20 @@ impl<'a> Parser<'a> {
         // The types are not modelled -- only how many arguments are fixed --
         // so each is spelled as the widest integer the ABI passes in one
         // register, which a pointer, a size and a flag all classify as.
-        let params = vec![self.types.ulong_id; fixed];
+        //
+        // A `double` does not. It is passed in an SSE register, so declaring
+        // one of these as an integer sent the argument to the wrong register
+        // file outright: `__builtin_sqrt(4.0)` read whatever was in xmm0 and
+        // came back 0.0, and `__builtin_copysign(1.0, -1.0)` answered 1.0
+        // because the sign argument never arrived. Both are silent wrong
+        // answers -- the call links and runs. The library functions of the
+        // same names are unaffected; this path is only taken when the header
+        // that would declare them was not included.
+        let param_typ = match name {
+            "sqrt" | "copysign" => self.types.double_id,
+            _ => self.types.ulong_id,
+        };
+        let params = vec![param_typ; fixed];
 
         let func_type = self.types.intern(Type {
             kind: TypeKind::Function,

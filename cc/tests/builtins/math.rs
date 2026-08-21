@@ -338,3 +338,47 @@ int main(void) {
         0
     );
 }
+
+/// A library builtin taking `double` must be declared taking `double`.
+///
+/// When the header that would declare `sqrt` or `copysign` has not been
+/// included, these builtins synthesize a declaration. Every synthesized
+/// parameter was an `unsigned long` — right for the `_chk` family, whose
+/// arguments are pointers, sizes and flags, and wrong for a `double`, which
+/// the ABI passes in an SSE register instead. The argument went to the wrong
+/// register file entirely, so `__builtin_sqrt(4.0)` read whatever was in xmm0
+/// and answered 0.0, and `__builtin_copysign(1.0, -1.0)` answered 1.0 because
+/// the sign argument never arrived.
+///
+/// Silent: the call links and runs. The library functions of the same name
+/// were always correct, which is what narrowed it to this path.
+///
+/// No `<math.h>` here on purpose — including it declares them properly and
+/// the synthesized path is never taken.
+#[test]
+fn builtins_library_math_builtins_take_doubles() {
+    let code = r#"
+int main(void) {
+    if (__builtin_sqrt(4.0) != 2.0) return 1;
+    if (__builtin_sqrt(9.0) != 3.0) return 2;
+    if (__builtin_sqrt(0.0) != 0.0) return 3;
+
+    if (__builtin_copysign(1.0, -1.0) != -1.0) return 4;
+    if (__builtin_copysign(-1.0, 1.0) != 1.0) return 5;
+    if (__builtin_copysign(-5.0, 2.0) != 5.0) return 6;
+    /* The magnitude has to survive too: this answered 0.0, not -3.0. */
+    if (__builtin_copysign(3.0, -0.0) != -3.0) return 7;
+
+    /* A non-constant argument takes the same path. */
+    volatile double v = 16.0;
+    if (__builtin_sqrt(v) != 4.0) return 8;
+    volatile double sign = -2.0;
+    if (__builtin_copysign(7.0, sign) != -7.0) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("builtins_lib_math", code, &["-lm".to_string()]),
+        0
+    );
+}

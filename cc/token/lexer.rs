@@ -40,6 +40,69 @@ pub enum LexerMode {
     Assembly,
 }
 
+/// How a token was written, where its type and value do not say.
+///
+/// Two constructs in C spell a token differently without changing anything
+/// else about it, and C99 6.10.3.2p2 asks `#` for "the spelling of the
+/// preprocessing token" -- so the spelling has to survive to the point where
+/// `#` and `-E` read it. Kept beside the type rather than as types of their
+/// own: a path that fails to carry this loses the spelling, which is what
+/// every path did before, rather than losing the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Spelling {
+    /// Written the one canonical way for this token's type and value.
+    #[default]
+    Canonical,
+    /// A string literal written `u8"..."`. C11 6.4.5p6 gives it type
+    /// `char[]`, so it is a narrow string in every respect but this.
+    Utf8Prefix,
+    /// A punctuator written as one of the six digraphs (C99 6.4.6):
+    /// `<: :> <% %> %: %:%:`. 6.4.6p3 makes them behave exactly as
+    /// `[ ] { } # ##` "except for their spelling".
+    Digraph,
+}
+
+/// A punctuator token that was written as a digraph. The value is the primary
+/// token's, because 6.4.6p3 makes it mean exactly that; only the spelling
+/// differs.
+fn digraph_token(pos: Position, value: TokenValue) -> Token {
+    let mut token = Token::with_value(TokenType::Special, pos, value);
+    token.spelling = Spelling::Digraph;
+    token
+}
+
+/// How a punctuator token is written.
+///
+/// A single-character punctuator's value **is** a source byte -- a non-ASCII
+/// byte outside a literal lexes as its own punctuator -- while a digraph or a
+/// multi-character operator has a spelling that is text. Everything that
+/// builds a byte stream or a literal payload has to keep the two apart:
+/// rendering the byte through a Rust `String` UTF-8-encodes it, which doubled
+/// it in `-E` output, in preprocessed assembly, and in `#` stringification.
+///
+/// The distinction is in this type rather than in a comment because all three
+/// of those were separate bugs with one cause.
+pub enum Punctuator {
+    /// One source byte, verbatim.
+    Byte(u8),
+    /// An ASCII spelling: a digraph, a multi-character operator, or the
+    /// `<special:N>` placeholder for a code with neither.
+    Text(String),
+}
+
+/// The digraph that spells the punctuator `code`, for a token written as one.
+fn digraph_spelling(code: u32) -> Option<&'static str> {
+    Some(match code {
+        c if c == b'[' as u32 => "<:",
+        c if c == b']' as u32 => ":>",
+        c if c == b'{' as u32 => "<%",
+        c if c == b'}' as u32 => "%>",
+        c if c == b'#' as u32 => "%:",
+        c if c == SpecialToken::HashHash as u32 => "%:%:",
+        _ => return None,
+    })
+}
+
 /// Where a header name (C99 6.4.7) may appear.
 ///
 /// A header name is one preprocessing token, but only in a `#include`,
@@ -228,6 +291,153 @@ pub(crate) fn report_forbidden_ucn(pos: Position, val: u32) {
         pos,
         &format!("\\{prefix}{val:0width$x} is not a valid universal character"),
     );
+}
+
+// ============================================================================
+// Identifier characters (C17 Annex D)
+// ============================================================================
+
+/// Annex D.1: the characters an identifier may contain beyond the basic
+/// source character set.
+///
+/// Transcribed from GCC's `libcpp/ucnid.tab` (`[C11]` + `[C11NOSTART]`),
+/// which states that it reproduces the table in ISO/IEC 9899 Annex D, itself
+/// a reproduction of ISO/IEC TR 10176. Clang's independent transcription in
+/// `clang/lib/Lex/UnicodeCharSets.h` agrees with it on every code point, and
+/// so does this one.
+///
+/// Deliberately *not* Unicode's XID_Start/XID_Continue, which C23 moved to
+/// and which differs here in over ten thousand code points.
+static IDENT_ALLOWED: &[(u32, u32)] = &[
+    (0x00A8, 0x00A8),
+    (0x00AA, 0x00AA),
+    (0x00AD, 0x00AD),
+    (0x00AF, 0x00AF),
+    (0x00B2, 0x00B5),
+    (0x00B7, 0x00BA),
+    (0x00BC, 0x00BE),
+    (0x00C0, 0x00D6),
+    (0x00D8, 0x00F6),
+    (0x00F8, 0x167F),
+    (0x1681, 0x180D),
+    (0x180F, 0x1FFF),
+    (0x200B, 0x200D),
+    (0x202A, 0x202E),
+    (0x203F, 0x2040),
+    (0x2054, 0x2054),
+    (0x2060, 0x218F),
+    (0x2460, 0x24FF),
+    (0x2776, 0x2793),
+    (0x2C00, 0x2DFF),
+    (0x2E80, 0x2FFF),
+    (0x3004, 0x3007),
+    (0x3021, 0x302F),
+    (0x3031, 0xD7FF),
+    (0xF900, 0xFD3D),
+    (0xFD40, 0xFDCF),
+    (0xFDF0, 0xFE44),
+    (0xFE47, 0xFFFD),
+    (0x10000, 0x1FFFD),
+    (0x20000, 0x2FFFD),
+    (0x30000, 0x3FFFD),
+    (0x40000, 0x4FFFD),
+    (0x50000, 0x5FFFD),
+    (0x60000, 0x6FFFD),
+    (0x70000, 0x7FFFD),
+    (0x80000, 0x8FFFD),
+    (0x90000, 0x9FFFD),
+    (0xA0000, 0xAFFFD),
+    (0xB0000, 0xBFFFD),
+    (0xC0000, 0xCFFFD),
+    (0xD0000, 0xDFFFD),
+    (0xE0000, 0xEFFFD),
+];
+
+/// Annex D.2: of the characters above, those that may not appear first.
+///
+/// All combining marks -- an identifier beginning with one would render as
+/// though it modified whatever preceded it. GCC's `[C11NOSTART]` and Clang's
+/// `C11DisallowedInitialIDCharRanges` are both exactly these four ranges.
+static IDENT_NOT_INITIAL: &[(u32, u32)] = &[
+    (0x0300, 0x036F),
+    (0x1DC0, 0x1DFF),
+    (0x20D0, 0x20FF),
+    (0xFE20, 0xFE2F),
+];
+
+fn in_ranges(ranges: &[(u32, u32)], val: u32) -> bool {
+    ranges
+        .binary_search_by(|&(lo, hi)| {
+            if val < lo {
+                std::cmp::Ordering::Greater
+            } else if val > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// Where in an identifier a character is being used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentPos {
+    /// The first character, which C17 Annex D.2 restricts further.
+    Initial,
+    /// Any later character.
+    Continue,
+}
+
+/// Whether `ch` may appear in an identifier at `pos` (C17 Annex D).
+///
+/// Distinct from [`ucn_is_forbidden`], which is 6.4.3p2's rule about what a
+/// universal character name may *name* -- a question that applies to string
+/// literals too, and that admits characters no identifier may contain.
+/// A UCN in an identifier has to satisfy both; a character written directly
+/// satisfies only this one. Conflating them let `int \u00A0x;` through, which
+/// gcc rejects, and let a combining mark start an identifier.
+pub(crate) fn identifier_char(ch: char, pos: IdentPos) -> bool {
+    let val = ch as u32;
+    // The basic source character set, which the byte-level table already
+    // answers for; spelled here so one predicate covers every caller.
+    if val < 0x80 {
+        return is_letter_or_digit(val as u8)
+            && (pos == IdentPos::Continue || !is_digit(val as u8));
+    }
+    if !in_ranges(IDENT_ALLOWED, val) {
+        return false;
+    }
+    pos == IdentPos::Continue || !in_ranges(IDENT_NOT_INITIAL, val)
+}
+
+/// The length in bytes of the UTF-8 character `lead` begins, or `None` if
+/// `lead` is ASCII, a continuation byte, or an over-long form's lead.
+fn utf8_len(lead: u8) -> Option<usize> {
+    match lead {
+        0xC2..=0xDF => Some(2),
+        0xE0..=0xEF => Some(3),
+        0xF0..=0xF4 => Some(4),
+        _ => None,
+    }
+}
+
+/// Decode the UTF-8 character that `lead` begins, taking its continuation
+/// bytes from `peek`. Returns the character and its total length in bytes.
+///
+/// `std::str::from_utf8` does the validation, so over-long forms and
+/// surrogates are rejected by construction rather than by hand.
+fn decode_utf8(lead: u8, peek: &mut Peek<'_>) -> Option<(char, usize)> {
+    let len = utf8_len(lead)?;
+    let mut buf = [lead, 0, 0, 0];
+    for byte in buf.iter_mut().take(len).skip(1) {
+        let c = peek.next()?;
+        if c & 0xC0 != 0x80 {
+            return None;
+        }
+        *byte = c;
+    }
+    let ch = std::str::from_utf8(&buf[..len]).ok()?.chars().next()?;
+    Some((ch, len))
 }
 
 pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
@@ -429,16 +639,8 @@ pub struct Token {
     pub typ: TokenType,
     pub pos: Position,
     pub value: TokenValue,
-    /// Spelled `u8"..."`.
-    ///
-    /// The one thing [`TokenType`] cannot say about a literal. C11 6.4.5p6
-    /// gives a `u8` string type `char[]`, so it *is* a narrow string
-    /// everywhere but in its spelling -- which 6.10.3.2p2 makes `#`
-    /// reproduce, and which `-E` has to round-trip. Kept as a flag beside the
-    /// type rather than as a type of its own so that a path which fails to
-    /// carry it loses the prefix, the way every path did before, instead of
-    /// losing the string.
-    pub utf8_prefix: bool,
+    /// How this token was written, where its type and value do not say.
+    pub spelling: Spelling,
     /// Macros that should not expand this token (C preprocessor "blue painting").
     /// When a macro's expansion contains its own name, those tokens are marked.
     /// This prevents re-expansion in nested contexts per C99 6.10.3.4.
@@ -451,7 +653,7 @@ impl Token {
             typ,
             pos,
             value: TokenValue::None,
-            utf8_prefix: false,
+            spelling: Spelling::Canonical,
             no_expand: None,
         }
     }
@@ -461,7 +663,7 @@ impl Token {
             typ,
             pos,
             value,
-            utf8_prefix: false,
+            spelling: Spelling::Canonical,
             no_expand: None,
         }
     }
@@ -470,11 +672,27 @@ impl Token {
     /// that do not imply one. Only `u8` qualifies: `L`, `u` and `U` are each
     /// a token type of their own.
     pub fn encoding_prefix(&self) -> &'static str {
-        if self.utf8_prefix {
+        if self.spelling == Spelling::Utf8Prefix {
             "u8"
         } else {
             ""
         }
+    }
+
+    /// How this token's punctuator is written.
+    ///
+    /// See [`Punctuator`]: a single-character one is a source *byte*, and
+    /// only a digraph or a longer operator has a spelling that is text.
+    pub fn punctuator(&self, code: u32) -> Punctuator {
+        if code < SpecialToken::BASE && self.spelling == Spelling::Canonical {
+            return Punctuator::Byte(code as u8);
+        }
+        Punctuator::Text(match self.spelling {
+            Spelling::Digraph => digraph_spelling(code)
+                .map(str::to_string)
+                .unwrap_or_else(|| show_special(code)),
+            _ => show_special(code),
+        })
     }
 
     /// Mark this token as not expandable for the given macro name
@@ -786,6 +1004,18 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Token::with_value(TokenType::Number, pos, TokenValue::Number(num))
     }
 
+    /// The UTF-8 character at the current position and how many `nextchar()`
+    /// calls consume it, or `None` if the bytes there do not form one.
+    ///
+    /// Splice-aware, like every other lookahead here: phase 2 runs before
+    /// phase 3, so a backslash-newline between two bytes of a character is
+    /// deleted and the bytes join.
+    fn peek_utf8(&self) -> Option<(char, usize)> {
+        let mut peek = self.peek_at(self.offset);
+        let lead = peek.next()?;
+        decode_utf8(lead, &mut peek)
+    }
+
     /// The character a UCN at the current position denotes, and how many
     /// `nextchar()` calls consume it.
     ///
@@ -804,6 +1034,11 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
     /// Shared tail of both UCN entry points, with `peek` positioned just past
     /// the backslash. Returns the character and how many hex digits spelled it.
+    ///
+    /// Only 6.4.3p2 is checked here -- whether the UCN may name the character
+    /// at all. Whether an *identifier* may contain it is Annex D's question,
+    /// which the callers ask, because they are the ones that know the
+    /// position.
     fn peek_ucn_after_backslash(&self, peek: &mut Peek<'_>) -> Option<(char, usize)> {
         let digits = match peek.next()? {
             b'u' => 4,
@@ -828,10 +1063,14 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Some((char::from_u32(val)?, digits))
     }
 
-    /// Try to consume a UCN sequence. If successful, returns the decoded character.
-    /// Otherwise returns None and leaves position unchanged.
-    fn try_consume_ucn(&mut self) -> Option<char> {
+    /// Try to consume a UCN sequence naming a character an identifier may
+    /// contain at `pos`. If successful, returns the decoded character;
+    /// otherwise returns None and leaves the position unchanged.
+    fn try_consume_ucn(&mut self, pos: IdentPos) -> Option<char> {
         let (ch, chars) = self.peek_ucn()?;
+        if !identifier_char(ch, pos) {
+            return None;
+        }
         self.consume_chars(chars);
         Some(ch)
     }
@@ -842,6 +1081,9 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     fn try_consume_ucn_after_backslash(&mut self) -> Option<char> {
         let mut peek = self.peek_at(self.offset);
         let (ch, digits) = self.peek_ucn_after_backslash(&mut peek)?;
+        if !identifier_char(ch, IdentPos::Initial) {
+            return None;
+        }
         self.consume_chars(1 + digits);
         Some(ch)
     }
@@ -873,12 +1115,28 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
             // Check for UCN escape sequence (\uXXXX or \UXXXXXXXX) - C99 6.4.3
             if cu == b'\\' {
-                match self.try_consume_ucn() {
+                match self.try_consume_ucn(IdentPos::Continue) {
                     Some(uc) => name.push(uc),
                     // Not a valid UCN, end identifier
                     None => return Some(cu),
                 }
                 continue;
+            }
+
+            // A character written directly rather than as a UCN (C23, and a
+            // GCC extension long before it). Annex D admits the same set
+            // either way.
+            if cu >= 0x80 {
+                match self.peek_utf8() {
+                    Some((ch, len)) if identifier_char(ch, IdentPos::Continue) => {
+                        self.consume_chars(len);
+                        name.push(ch);
+                        continue;
+                    }
+                    // Not a character, or not one an identifier may contain:
+                    // the identifier ends here and the bytes lex as before.
+                    _ => return Some(cu),
+                }
             }
 
             if !is_letter_or_digit(cu) {
@@ -1025,7 +1283,9 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         let mut token = Token::with_value(typ, pos, value);
         // `u8` is folded into the narrow type above; the flag is what keeps
         // the spelling, which `#` and `-E` both have to reproduce.
-        token.utf8_prefix = enc == LiteralEncoding::Utf8;
+        if enc == LiteralEncoding::Utf8 {
+            token.spelling = Spelling::Utf8Prefix;
+        }
         token
     }
 
@@ -1114,41 +1374,25 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             let next = self.peekchar();
             if next == b':' as i32 {
                 self.nextchar();
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b'[' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b'[' as u32)));
             }
             if next == b'%' as i32 {
                 self.nextchar();
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b'{' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b'{' as u32)));
             }
         }
         if first == b':' {
             let next = self.peekchar();
             if next == b'>' as i32 {
                 self.nextchar();
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b']' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b']' as u32)));
             }
         }
         if first == b'%' {
             let next = self.peekchar();
             if next == b'>' as i32 {
                 self.nextchar();
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b'}' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b'}' as u32)));
             }
             if next == b':' as i32 {
                 self.nextchar();
@@ -1160,18 +1404,13 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 let mut peek = self.peek_at(self.offset);
                 if peek.next() == Some(b'%') && peek.next() == Some(b':') {
                     self.consume_chars(2);
-                    return Some(Token::with_value(
-                        TokenType::Special,
+                    return Some(digraph_token(
                         pos,
                         TokenValue::Special(SpecialToken::HashHash as u32),
                     ));
                 }
                 // Just %: -> #
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b'#' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b'#' as u32)));
             }
         }
 
@@ -1280,6 +1519,19 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         if c == b'\\' {
             if let Some(uc) = self.try_consume_ucn_after_backslash() {
                 return Some(self.get_identifier_from_ucn(uc));
+            }
+        }
+
+        // An extended character written directly, starting an identifier.
+        // The lead byte is already consumed, so only the continuation bytes
+        // remain to be taken.
+        if c >= 0x80 {
+            let mut peek = self.peek_at(self.offset);
+            if let Some((ch, len)) = decode_utf8(c, &mut peek) {
+                if identifier_char(ch, IdentPos::Initial) {
+                    self.consume_chars(len - 1);
+                    return Some(self.get_identifier_from_ucn(ch));
+                }
             }
         }
 
@@ -1507,10 +1759,16 @@ pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
             out.extend(payload_bytes(payload));
             out.push(delim);
         }
-        // A header name already carries its own delimiters.
         None => match &token.value {
+            // A header name already carries its own delimiters.
             TokenValue::HeaderName(h) if token.typ == TokenType::HeaderName => {
                 out.extend(payload_bytes(h))
+            }
+            TokenValue::Special(v) if token.typ == TokenType::Special => {
+                match token.punctuator(*v) {
+                    Punctuator::Byte(b) => out.push(b),
+                    Punctuator::Text(t) => out.extend_from_slice(t.as_bytes()),
+                }
             }
             _ => out.extend_from_slice(show_other_token(token, strings).as_bytes()),
         },
@@ -1522,12 +1780,16 @@ pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
 /// Lossy for a literal holding bytes that are not valid UTF-8; use
 /// [`write_token`] wherever the exact source bytes matter.
 pub fn show_token(token: &Token, strings: &StringTable) -> String {
-    if literal_parts(token).is_none() {
-        return show_other_token(token, strings);
-    }
     let mut out = Vec::new();
     write_token(&mut out, token, strings);
-    String::from_utf8_lossy(&out).into_owned()
+    match String::from_utf8(out) {
+        Ok(text) => text,
+        // A token holding bytes that are not valid UTF-8 on their own -- one
+        // byte of a multi-byte character, lexed as its own punctuator. Only
+        // the byte stream can put those back together, which is why
+        // `write_token` exists.
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 /// Everything [`literal_parts`] declines: the non-literal token types, plus a
@@ -1556,7 +1818,10 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
         }
         TokenType::Special => {
             if let TokenValue::Special(v) = &token.value {
-                show_special(*v)
+                match token.punctuator(*v) {
+                    Punctuator::Byte(b) => (b as char).to_string(),
+                    Punctuator::Text(t) => t,
+                }
             } else {
                 "<special?>".to_string()
             }
@@ -1666,1308 +1931,5 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
-
-    #[test]
-    fn test_replace_trigraphs() {
-        // All nine sequences of C17 5.2.1.1.
-        assert_eq!(
-            replace_trigraphs(b"??=??(??/??)??'??<??!??>??-").as_ref(),
-            br"#[\]^{|}~"
-        );
-        // A buffer with no trigraph is returned untouched.
-        assert!(matches!(
-            replace_trigraphs(b"int main(void) { return 0; }"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-        // `??` not followed by a trigraph character stays literal — this is
-        // the case that makes the feature opt-in.
-        assert_eq!(replace_trigraphs(b"What??!").as_ref(), b"What|");
-        assert_eq!(replace_trigraphs(b"What??x").as_ref(), b"What??x");
-        assert_eq!(replace_trigraphs(b"a??").as_ref(), b"a??");
-        // ...and is borrowed, not copied: a `??` that forms no trigraph must
-        // not cost an allocation, or the doc's promise is only half true.
-        assert!(matches!(
-            replace_trigraphs(b"puts(\"Really??\");"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-        assert!(matches!(
-            replace_trigraphs(b"a??"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-        // Overlapping question marks: only a complete `??x` is replaced.
-        assert_eq!(replace_trigraphs(b"???=").as_ref(), b"?#");
-    }
-
-    #[test]
-    fn test_literal_encoding_prefixes() {
-        let mut strings = StringTable::new();
-        let src = br#"u8"a" u"b" U"c" L"d" u'e' U'f' L'g' "h" 'i'"#;
-        let tokens = Tokenizer::new(src, 0, &mut strings).tokenize();
-        let kinds: Vec<TokenType> = tokens
-            .iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .map(|t| t.typ)
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                // u8"..." has type char[], so it is an ordinary narrow string.
-                TokenType::String,
-                TokenType::Utf16String,
-                TokenType::Utf32String,
-                TokenType::WideString,
-                TokenType::Utf16Char,
-                TokenType::Utf32Char,
-                TokenType::WideChar,
-                TokenType::String,
-                TokenType::Char,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_u8_prefix_only_applies_to_strings() {
-        // There is no `u8'x'` character constant in C11, so `u8` before a
-        // quote must stay an identifier.
-        let mut strings = StringTable::new();
-        let tokens = Tokenizer::new(b"u8'x'", 0, &mut strings).tokenize();
-        let kinds: Vec<TokenType> = tokens
-            .iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .map(|t| t.typ)
-            .collect();
-        assert_eq!(kinds, vec![TokenType::Ident, TokenType::Char]);
-    }
-    use super::*;
-
-    fn tokenize_str(input: &str) -> (Vec<Token>, StringTable) {
-        let mut strings = StringTable::new();
-        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
-        let tokens = tokenizer.tokenize();
-        (tokens, strings)
-    }
-
-    #[test]
-    fn test_simple_tokens() {
-        let (tokens, idents) = tokenize_str("int main");
-        // StreamBegin, "int", "main", StreamEnd
-        assert_eq!(tokens.len(), 4);
-        assert_eq!(tokens[0].typ, TokenType::StreamBegin);
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(tokens[2].typ, TokenType::Ident);
-        assert_eq!(tokens[3].typ, TokenType::StreamEnd);
-
-        assert_eq!(show_token(&tokens[1], &idents), "int");
-        assert_eq!(show_token(&tokens[2], &idents), "main");
-    }
-
-    #[test]
-    fn test_numbers() {
-        let (tokens, _) = tokenize_str("123 0x1F 3.14 1e10 0.5e-3");
-        // Skip StreamBegin/End
-        assert_eq!(tokens[1].typ, TokenType::Number);
-        assert_eq!(tokens[2].typ, TokenType::Number);
-        assert_eq!(tokens[3].typ, TokenType::Number);
-        assert_eq!(tokens[4].typ, TokenType::Number);
-        assert_eq!(tokens[5].typ, TokenType::Number);
-
-        if let TokenValue::Number(n) = &tokens[1].value {
-            assert_eq!(n, "123");
-        }
-        if let TokenValue::Number(n) = &tokens[2].value {
-            assert_eq!(n, "0x1F");
-        }
-        if let TokenValue::Number(n) = &tokens[3].value {
-            assert_eq!(n, "3.14");
-        }
-        if let TokenValue::Number(n) = &tokens[4].value {
-            assert_eq!(n, "1e10");
-        }
-        if let TokenValue::Number(n) = &tokens[5].value {
-            assert_eq!(n, "0.5e-3");
-        }
-    }
-
-    #[test]
-    fn test_strings() {
-        let (tokens, _) = tokenize_str(r#""hello" "world""#);
-        assert_eq!(tokens[1].typ, TokenType::String);
-        assert_eq!(tokens[2].typ, TokenType::String);
-
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "hello");
-        }
-        if let TokenValue::String(s) = &tokens[2].value {
-            assert_eq!(s, "world");
-        }
-    }
-
-    #[test]
-    fn test_char_literals() {
-        let (tokens, _) = tokenize_str("'a' '\\n' '\\0'");
-        assert_eq!(tokens[1].typ, TokenType::Char);
-        assert_eq!(tokens[2].typ, TokenType::Char);
-        assert_eq!(tokens[3].typ, TokenType::Char);
-    }
-
-    #[test]
-    fn test_operators() {
-        let (tokens, idents) = tokenize_str("+ += ++ - -= -- -> * *= / /= % %= = ==");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            ops,
-            vec![
-                "+", "+=", "++", "-", "-=", "--", "->", "*", "*=", "/", "/=", "%", "%=", "=", "=="
-            ]
-        );
-    }
-
-    #[test]
-    fn test_comparison_ops() {
-        let (tokens, idents) = tokenize_str("< <= > >= == != && || !");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["<", "<=", ">", ">=", "==", "!=", "&&", "||", "!"]);
-    }
-
-    #[test]
-    fn test_bitwise_ops() {
-        let (tokens, idents) = tokenize_str("& &= | |= ^ ^= ~ << >> <<= >>=");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            ops,
-            vec!["&", "&=", "|", "|=", "^", "^=", "~", "<<", ">>", "<<=", ">>="]
-        );
-    }
-
-    #[test]
-    fn test_punctuation() {
-        let (tokens, idents) = tokenize_str("( ) [ ] { } ; , . ...");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            ops,
-            vec!["(", ")", "[", "]", "{", "}", ";", ",", ".", "..."]
-        );
-    }
-
-    #[test]
-    fn test_line_comment() {
-        let (tokens, idents) = tokenize_str("a // comment\nb");
-        assert_eq!(tokens.len(), 4); // StreamBegin, a, b, StreamEnd
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-        assert_eq!(show_token(&tokens[2], &idents), "b");
-    }
-
-    #[test]
-    fn test_block_comment() {
-        let (tokens, idents) = tokenize_str("a /* comment */ b");
-        assert_eq!(tokens.len(), 4);
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-        assert_eq!(show_token(&tokens[2], &idents), "b");
-    }
-
-    #[test]
-    fn test_line_splice() {
-        let (tokens, idents) = tokenize_str("a\\\nb");
-        // Line splice joins 'a' and 'b' into one identifier "ab"
-        // In C, backslash-newline is deleted, so this becomes "ab"
-        assert_eq!(tokens.len(), 3); // StreamBegin, ab, StreamEnd
-        assert_eq!(show_token(&tokens[1], &idents), "ab");
-    }
-
-    #[test]
-    fn test_wide_string() {
-        let (tokens, _) = tokenize_str(r#"L"wide""#);
-        assert_eq!(tokens[1].typ, TokenType::WideString);
-        if let TokenValue::WideString(s) = &tokens[1].value {
-            assert_eq!(s, "wide");
-        }
-    }
-
-    #[test]
-    fn test_wide_char() {
-        let (tokens, _) = tokenize_str("L'w'");
-        assert_eq!(tokens[1].typ, TokenType::WideChar);
-    }
-
-    #[test]
-    fn test_position_tracking() {
-        let (tokens, _) = tokenize_str("a\nb");
-        // 'a' is on line 1
-        assert_eq!(tokens[1].pos.line, 1);
-        // 'b' is on line 2
-        assert_eq!(tokens[2].pos.line, 2);
-    }
-
-    #[test]
-    fn test_newline_flag_first_token() {
-        // First token at start of file should have newline=true
-        let (tokens, _) = tokenize_str("#define");
-        // tokens[0] is STREAM_BEGIN, tokens[1] is the first real token '#'
-        assert!(
-            tokens[1].pos.newline,
-            "First token should have newline=true"
-        );
-    }
-
-    #[test]
-    fn test_newline_flag_after_newline() {
-        // Token after newline should have newline=true
-        let (tokens, _) = tokenize_str("a\n#define");
-        // tokens[0] is STREAM_BEGIN, tokens[1] is 'a', tokens[2] is '#'
-        // First token's newline flag isn't constrained - just verify we can access it
-        let _ = tokens[1].pos.newline;
-        assert!(
-            tokens[2].pos.newline,
-            "Token after newline should have newline=true"
-        );
-    }
-
-    #[test]
-    fn test_preprocessor_tokens() {
-        // C99 6.4.7: the header name is one preprocessing token, delimiters
-        // included. Lexed as `<`, `stdio`, `.`, `h`, `>` it had to be
-        // reassembled afterwards, and anything the ordinary rules touched --
-        // a `//`, an apostrophe -- never survived to be reassembled.
-        let (tokens, idents) = tokenize_str("#include <stdio.h>");
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(toks, vec!["#", "include", "<stdio.h>"]);
-        assert_eq!(tokens[3].typ, TokenType::HeaderName);
-    }
-
-    #[test]
-    fn test_header_name_is_opaque() {
-        for src in [
-            "#include <sys//types.h>",
-            "#include <it's.h>",
-            "#include \"it's.h\"",
-            "#include <a\\b.h>",
-            "#include <a /* not a comment */ b.h>",
-        ] {
-            let (tokens, idents) = tokenize_str(src);
-            assert_eq!(
-                tokens[3].typ,
-                TokenType::HeaderName,
-                "not lexed as a header name: {src}"
-            );
-            let spelled = show_token(&tokens[3], &idents);
-            assert_eq!(spelled, &src["#include ".len()..], "wrong spelling: {src}");
-            // Nothing follows it on the line.
-            assert_eq!(
-                tokens[4].typ,
-                TokenType::StreamEnd,
-                "trailing tokens: {src}"
-            );
-        }
-
-        // `__has_include` in a condition takes one too, and more than one.
-        let (tokens, idents) = tokenize_str("#if __has_include(<a//b.h>) && __has_include(<c.h>)");
-        let headers: Vec<_> = tokens
-            .iter()
-            .filter(|t| t.typ == TokenType::HeaderName)
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(headers, vec!["<a//b.h>", "<c.h>"]);
-    }
-
-    #[test]
-    fn test_header_name_only_where_one_can_appear() {
-        // A `<` outside a header-name context is the operator it always was.
-        let (tokens, idents) = tokenize_str("if (a<b.c>d) x;");
-        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
-        assert_eq!(show_token(&tokens[4], &idents), "<");
-
-        // `#define` is not an include, so `<stdio.h>` there is ordinary.
-        let (tokens, _) = tokenize_str("#define H <stdio.h>");
-        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
-
-        // No closing delimiter before end of line: lex it the old way rather
-        // than swallow the line, which `#if 0` blocks full of prose need.
-        let (tokens, idents) = tokenize_str("#include <unterminated\nint x;");
-        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
-        assert_eq!(show_token(&tokens[3], &idents), "<");
-    }
-
-    #[test]
-    fn test_function_declaration() {
-        let (tokens, idents) = tokenize_str("int main(void) { return 0; }");
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            toks,
-            vec!["int", "main", "(", "void", ")", "{", "return", "0", ";", "}"]
-        );
-    }
-
-    // ========================================================================
-    // Additional coverage tests for multi-char operators
-    // ========================================================================
-
-    #[test]
-    fn test_hashhash_operator() {
-        // ## is the preprocessor token paste operator
-        let (tokens, idents) = tokenize_str("a ## b");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["a", "##", "b"]);
-    }
-
-    #[test]
-    fn test_dotdot_operator() {
-        // .. is a two-character operator (range extension)
-        let (tokens, idents) = tokenize_str("a .. b");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["a", "..", "b"]);
-    }
-
-    #[test]
-    fn test_ternary_operators() {
-        // ? and : for ternary expressions
-        let (tokens, idents) = tokenize_str("a ? b : c");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["a", "?", "b", ":", "c"]);
-    }
-
-    #[test]
-    fn test_all_two_char_operators() {
-        // Comprehensive test of ALL 2-char operators
-        let (tokens, idents) =
-            tokenize_str("+= ++ -= -- -> *= /= %= <= >= == != && &= || |= ^= ## << >> ..");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            ops,
-            vec![
-                "+=", "++", "-=", "--", "->", "*=", "/=", "%=", "<=", ">=", "==", "!=", "&&", "&=",
-                "||", "|=", "^=", "##", "<<", ">>", ".."
-            ]
-        );
-    }
-
-    #[test]
-    fn test_all_three_char_operators() {
-        // Test all 3-char operators
-        let (tokens, idents) = tokenize_str("<<= >>= ...");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["<<=", ">>=", "..."]);
-    }
-
-    #[test]
-    fn test_three_char_in_context() {
-        // 3-char operators in realistic context
-        let (tokens, idents) = tokenize_str("x <<= 2; y >>= 1; void f(int a, ...)");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            ops,
-            vec![
-                "x", "<<=", "2", ";", "y", ">>=", "1", ";", "void", "f", "(", "int", "a", ",",
-                "...", ")"
-            ]
-        );
-    }
-
-    // ========================================================================
-    // Multi-line comment tests
-    // ========================================================================
-
-    #[test]
-    fn test_multiline_block_comment() {
-        let (tokens, idents) = tokenize_str("a /* this is\na multi-line\ncomment */ b");
-        assert_eq!(tokens.len(), 4); // StreamBegin, a, b, StreamEnd
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-        assert_eq!(show_token(&tokens[2], &idents), "b");
-    }
-
-    #[test]
-    fn test_block_comment_with_stars() {
-        // Comment with * characters inside (common in doc comments)
-        let (tokens, idents) = tokenize_str("a /* ** stars ** */ b");
-        assert_eq!(tokens.len(), 4);
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-        assert_eq!(show_token(&tokens[2], &idents), "b");
-    }
-
-    #[test]
-    fn test_block_comment_with_slashes() {
-        // Comment with / characters inside
-        let (tokens, idents) = tokenize_str("a /* // not a line comment */ b");
-        assert_eq!(tokens.len(), 4);
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-        assert_eq!(show_token(&tokens[2], &idents), "b");
-    }
-
-    #[test]
-    fn test_block_comment_asterisk_not_end() {
-        // * followed by non-/ should not end comment
-        let (tokens, idents) = tokenize_str("a /* x * y */ b");
-        assert_eq!(tokens.len(), 4);
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-        assert_eq!(show_token(&tokens[2], &idents), "b");
-    }
-
-    #[test]
-    fn test_multiline_comment_position_tracking() {
-        // After a multiline comment, position should be correct
-        let (tokens, _) = tokenize_str("a\n/* comment\nspanning\nlines */\nb");
-        // a is on line 1, b is on line 5
-        assert_eq!(tokens[1].pos.line, 1);
-        assert_eq!(tokens[2].pos.line, 5);
-    }
-
-    // ========================================================================
-    // Additional number format tests
-    // ========================================================================
-
-    #[test]
-    fn test_hex_float_numbers() {
-        // Hex floats with p/P exponent (C99 feature)
-        let (tokens, _) = tokenize_str("0x1p5 0x1.0p10 0xABCp-5 0x1P+3");
-        assert_eq!(tokens[1].typ, TokenType::Number);
-        assert_eq!(tokens[2].typ, TokenType::Number);
-        assert_eq!(tokens[3].typ, TokenType::Number);
-        assert_eq!(tokens[4].typ, TokenType::Number);
-
-        if let TokenValue::Number(n) = &tokens[1].value {
-            assert_eq!(n, "0x1p5");
-        }
-        if let TokenValue::Number(n) = &tokens[2].value {
-            assert_eq!(n, "0x1.0p10");
-        }
-        if let TokenValue::Number(n) = &tokens[3].value {
-            assert_eq!(n, "0xABCp-5");
-        }
-        if let TokenValue::Number(n) = &tokens[4].value {
-            assert_eq!(n, "0x1P+3");
-        }
-    }
-
-    #[test]
-    fn test_number_suffixes() {
-        // Integer suffixes
-        let (tokens, _) = tokenize_str("123L 456UL 789LL 0xFFu 42lu");
-        for token in tokens.iter().skip(1).take(5) {
-            assert_eq!(token.typ, TokenType::Number);
-        }
-        if let TokenValue::Number(n) = &tokens[1].value {
-            assert_eq!(n, "123L");
-        }
-        if let TokenValue::Number(n) = &tokens[2].value {
-            assert_eq!(n, "456UL");
-        }
-    }
-
-    #[test]
-    fn test_float_suffixes() {
-        // Float suffixes
-        let (tokens, _) = tokenize_str("3.14f 2.71F 1.0l 9.8L");
-        for token in tokens.iter().skip(1).take(4) {
-            assert_eq!(token.typ, TokenType::Number);
-        }
-    }
-
-    #[test]
-    fn test_dot_starting_number() {
-        // Numbers starting with .
-        let (tokens, _) = tokenize_str(".5 .123 .0e10");
-        assert_eq!(tokens[1].typ, TokenType::Number);
-        assert_eq!(tokens[2].typ, TokenType::Number);
-        assert_eq!(tokens[3].typ, TokenType::Number);
-
-        if let TokenValue::Number(n) = &tokens[1].value {
-            assert_eq!(n, ".5");
-        }
-    }
-
-    // ========================================================================
-    // Edge cases and tricky sequences
-    // ========================================================================
-
-    #[test]
-    fn test_operator_adjacency() {
-        // Operators without spaces - maximal munch
-        let (tokens, idents) = tokenize_str("a+++b"); // a ++ + b
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["a", "++", "+", "b"]);
-    }
-
-    #[test]
-    fn test_operator_adjacency_minus() {
-        let (tokens, idents) = tokenize_str("a---b"); // a -- - b
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["a", "--", "-", "b"]);
-    }
-
-    #[test]
-    fn test_shift_vs_templates() {
-        // >> should be one token (not two > >)
-        let (tokens, idents) = tokenize_str("a>>b");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["a", ">>", "b"]);
-    }
-
-    #[test]
-    fn test_arrow_vs_minus_gt() {
-        // -> should be one token
-        let (tokens, idents) = tokenize_str("ptr->field");
-        let ops: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(ops, vec!["ptr", "->", "field"]);
-    }
-
-    #[test]
-    fn test_string_with_comment_chars() {
-        // String containing /* and */ should not be treated as comment
-        let (tokens, _) = tokenize_str(r#""/* not a comment */""#);
-        assert_eq!(tokens.len(), 3); // StreamBegin, string, StreamEnd
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "/* not a comment */");
-        }
-    }
-
-    #[test]
-    fn test_char_with_quote() {
-        // Character literal with escaped quote
-        let (tokens, _) = tokenize_str(r#"'\''"#);
-        assert_eq!(tokens[1].typ, TokenType::Char);
-        if let TokenValue::Char(s) = &tokens[1].value {
-            assert_eq!(s, "\\'");
-        }
-    }
-
-    #[test]
-    fn test_string_with_escaped_quote() {
-        let (tokens, _) = tokenize_str(r#""hello \"world\"""#);
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "hello \\\"world\\\"");
-        }
-    }
-
-    #[test]
-    fn test_empty_string() {
-        let (tokens, _) = tokenize_str(r#""""#);
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "");
-        }
-    }
-
-    #[test]
-    fn test_empty_char() {
-        // Empty char literal (technically invalid C, but lexer should handle)
-        let (tokens, _) = tokenize_str("''");
-        assert_eq!(tokens[1].typ, TokenType::Char);
-        if let TokenValue::Char(s) = &tokens[1].value {
-            assert_eq!(s, "");
-        }
-    }
-
-    #[test]
-    fn test_consecutive_comments() {
-        let (tokens, idents) = tokenize_str("a /* c1 */ /* c2 */ b");
-        assert_eq!(tokens.len(), 4);
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-        assert_eq!(show_token(&tokens[2], &idents), "b");
-    }
-
-    #[test]
-    fn test_comment_at_eof() {
-        let (tokens, idents) = tokenize_str("a /* comment */");
-        assert_eq!(tokens.len(), 3); // StreamBegin, a, StreamEnd
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-    }
-
-    #[test]
-    fn test_line_comment_at_eof() {
-        let (tokens, idents) = tokenize_str("a // comment");
-        assert_eq!(tokens.len(), 3);
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-    }
-
-    // ========================================================================
-    // UCN (Universal Character Name) tests - C99 6.4.3
-    // ========================================================================
-
-    #[test]
-    fn test_ucn_in_identifier() {
-        // Identifier with UCN: caf\u00E9 should become "café"
-        let (tokens, idents) = tokenize_str("caf\\u00E9");
-        assert_eq!(tokens.len(), 3); // StreamBegin, ident, StreamEnd
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &idents), "café");
-    }
-
-    #[test]
-    fn test_ucn_identifier_start() {
-        // Identifier starting with UCN: \u00E9tat -> "état"
-        let (tokens, idents) = tokenize_str("\\u00E9tat");
-        assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &idents), "état");
-    }
-
-    #[test]
-    fn test_ucn_long_form() {
-        // Long UCN form, with a code point it is allowed to name.
-        //
-        // This used to use `\U00000041` and assert the identifier `testAbc`,
-        // which C17 6.4.3p2 forbids: a UCN may not name a character below
-        // 00A0 other than `$`, `@` and `` ` ``, precisely so it cannot spell
-        // an `A` that already has a spelling. gcc rejects that input, and so
-        // does c17 now, so the long form is exercised with `\U000000E9`.
-        let (tokens, idents) = tokenize_str("test\\U000000E9bc");
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &idents), "testébc");
-    }
-
-    #[test]
-    fn test_ucn_forbidden_characters() {
-        // C17 6.4.3p2, in both the short and long forms, and at both ends of
-        // the surrogate range -- a surrogate has no `char`, so it used to fail
-        // `char::from_u32` and be taken for "not an escape" entirely.
-        for src in [
-            "test\\u0041bc",
-            "test\\U00000041bc",
-            "\\u0061bc",
-            "test\\u0020bc",
-            "test\\ud800bc",
-            "test\\udfffbc",
-        ] {
-            assert!(
-                ucn_is_forbidden(match src.split_once("\\u").or(src.split_once("\\U")) {
-                    Some((_, rest)) => u32::from_str_radix(&rest[..4.min(rest.len())], 16)
-                        .unwrap_or_else(|_| u32::from_str_radix(&rest[..8], 16).unwrap()),
-                    None => unreachable!(),
-                }),
-                "{src} should name a forbidden character"
-            );
-        }
-        // The three carve-outs, and everything from 00A0 up.
-        for val in [0x24, 0x40, 0x60, 0xA0, 0xE9, 0xC5, 0x1F600] {
-            assert!(!ucn_is_forbidden(val), "{val:#x} is permitted");
-        }
-    }
-
-    #[test]
-    fn test_ucn_multiple_in_identifier() {
-        // Multiple UCNs in one identifier
-        let (tokens, idents) = tokenize_str("\\u00E9l\\u00E8ve");
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &idents), "élève");
-    }
-
-    #[test]
-    fn test_ucn_only_identifier() {
-        // Identifier consisting only of UCN
-        let (tokens, idents) = tokenize_str("\\u03B1"); // Greek alpha
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &idents), "α");
-    }
-
-    #[test]
-    fn test_ucn_lowercase_hex() {
-        // UCN with lowercase hex digits
-        let (tokens, idents) = tokenize_str("caf\\u00e9");
-        assert_eq!(show_token(&tokens[1], &idents), "café");
-    }
-
-    /// Translation phase 2 runs before phase 3, so a splice anywhere in or
-    /// around a UCN is simply not there by the time the UCN is lexed. The
-    /// UCN lookahead used to count *bytes* and the consumer to spend them as
-    /// *characters*, so each splice silently ate that many source characters.
-    #[test]
-    fn test_ucn_across_line_splices() {
-        // Splice immediately before the UCN: the trailing `zz` must survive.
-        let (tokens, idents) = tokenize_str("caf\\\n\\u00e9zz");
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
-        assert_eq!(tokens[2].typ, TokenType::StreamEnd);
-
-        // Splice between the backslash and the `u`.
-        let (tokens, idents) = tokenize_str("caf\\\\\nu00e9zz");
-        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
-
-        // Splice in the middle of the hex digits.
-        let (tokens, idents) = tokenize_str("caf\\u00\\\ne9zz");
-        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
-
-        // Same, for a UCN that *starts* the identifier.
-        let (tokens, idents) = tokenize_str("\\u00\\\ne9tat");
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &idents), "\u{e9}tat");
-
-        // The long form spans more digits, so it spans more splices.
-        let (tokens, idents) = tokenize_str("a\\U000\\\n000\\\ne9b");
-        assert_eq!(show_token(&tokens[1], &idents), "a\u{e9}b");
-    }
-
-    /// An unterminated literal ends at the newline it ran into, so the token
-    /// after it starts a line -- GCC recovers the same way and goes on to
-    /// process a directive there. Clearing the flag after lexing every token
-    /// swallowed that newline.
-    #[test]
-    fn test_unterminated_literal_yields_the_newline_it_ate() {
-        let (tokens, idents) = tokenize_str("char *s = \"abc\n#define ZZZ 9\n");
-        let hash = tokens
-            .iter()
-            .position(|t| show_token(t, &idents) == "#")
-            .expect("the `#` must survive as its own token");
-        assert!(tokens[hash].pos.newline);
-    }
-
-    /// A literal payload holds one `char` per source byte, so its spelling has
-    /// to be written a byte at a time. Formatting one through a Rust `String`
-    /// UTF-8-encoded each of those chars and doubled every byte >= 0x80.
-    #[test]
-    fn test_write_token_emits_source_bytes() {
-        let (tokens, idents) = tokenize_str("\"caf\u{e9}\"");
-        assert_eq!(tokens[1].typ, TokenType::String);
-
-        let mut out = Vec::new();
-        write_token(&mut out, &tokens[1], &idents);
-        assert_eq!(out, b"\"caf\xc3\xa9\"");
-
-        // Round-trips through show_token when the bytes are valid UTF-8.
-        assert_eq!(show_token(&tokens[1], &idents), "\"caf\u{e9}\"");
-
-        // literal_payload is the inverse: Rust text into payload form.
-        assert_eq!(literal_payload("caf\u{e9}"), "caf\u{c3}\u{a9}");
-        assert_eq!(
-            payload_bytes(&literal_payload("caf\u{e9}")).collect::<Vec<_>>(),
-            b"caf\xc3\xa9"
-        );
-    }
-
-    #[test]
-    fn test_column_saturates_on_very_long_line() {
-        let mut src = " ".repeat(70000);
-        src.push('x');
-        let (tokens, idents) = tokenize_str(&src);
-        assert_eq!(show_token(&tokens[1], &idents), "x");
-        assert_eq!(tokens[1].pos.col, u16::MAX);
-        assert_eq!(tokens[1].pos.line, 1);
-
-        // Tabs advance to the next multiple of eight, which must saturate too.
-        let mut src = "\t".repeat(70000);
-        src.push('x');
-        let (tokens, idents) = tokenize_str(&src);
-        assert_eq!(show_token(&tokens[1], &idents), "x");
-        assert!(tokens[1].pos.col >= u16::MAX - 8);
-    }
-
-    /// A `%:` whose following `%` does not complete the `%:%:` digraph used to
-    /// be consumed and then rewound by hand. The rewind restored `offset` and
-    /// `col` but not `line`, so a splice between the two halves was counted
-    /// once on the way in and again on the way out.
-    #[test]
-    fn test_digraph_hash_not_hashhash_keeps_line_count() {
-        let (tokens, idents) = tokenize_str("%:\\\n% x\ny");
-        let spelled: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(spelled, vec!["#", "%", "x", "y"]);
-        // Phase 2 deletes the splice but the physical lines still count, so
-        // `x` is on line 2 and `y` on line 3 -- each crossed exactly once.
-        assert_eq!(tokens[3].pos.line, 2);
-        assert_eq!(tokens[4].pos.line, 3);
-    }
-
-    /// With phase 2 off (a `.i` operand) a backslash-newline is text, not a
-    /// joint, so none of the above applies and the UCN does not form.
-    #[test]
-    fn test_ucn_splice_disabled() {
-        let mut strings = StringTable::new();
-        let mut tokenizer = Tokenizer::new(b"caf\\u00\\\ne9", 0, &mut strings).without_splicing();
-        let tokens = tokenizer.tokenize();
-        assert_eq!(tokens[1].typ, TokenType::Ident);
-        assert_eq!(show_token(&tokens[1], &strings), "caf");
-    }
-
-    // ========================================================================
-    // Diagnostic warning tests
-    // ========================================================================
-
-    #[test]
-    fn test_unterminated_string() {
-        // Unterminated string should still produce a token (warning emitted)
-        let (tokens, _) = tokenize_str("\"hello");
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "hello");
-        }
-    }
-
-    #[test]
-    fn test_unterminated_char() {
-        // Unterminated char should still produce a token (warning emitted)
-        let (tokens, _) = tokenize_str("'a");
-        assert_eq!(tokens[1].typ, TokenType::Char);
-        if let TokenValue::Char(s) = &tokens[1].value {
-            assert_eq!(s, "a");
-        }
-    }
-
-    #[test]
-    fn test_newline_in_string() {
-        // Newline terminates string literal (warning emitted)
-        let (tokens, _) = tokenize_str("\"hello\nworld\"");
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "hello");
-        }
-        // 'world"' becomes identifier 'world' and unterminated string
-        assert_eq!(tokens[2].typ, TokenType::Ident);
-    }
-
-    #[test]
-    fn test_unterminated_block_comment() {
-        // Unterminated block comment (warning emitted)
-        let (tokens, idents) = tokenize_str("a /* unterminated");
-        assert_eq!(tokens.len(), 3); // StreamBegin, a, StreamEnd
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-    }
-
-    #[test]
-    fn test_hex_escape_no_digits() {
-        // \x without hex digits should warn
-        let (tokens, _) = tokenize_str("\"\\xg\"");
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "\\xg"); // Raw escape preserved
-        }
-    }
-
-    #[test]
-    fn test_hex_escape_at_end() {
-        // \x at end of string should warn
-        let (tokens, _) = tokenize_str("\"\\x\"");
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "\\x");
-        }
-    }
-
-    #[test]
-    fn test_hex_escape_valid() {
-        // Valid \x escape (no warning)
-        let (tokens, _) = tokenize_str("\"\\x41\"");
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "\\x41"); // Raw escape preserved
-        }
-    }
-
-    #[test]
-    fn test_octal_escape_preserved() {
-        // Octal escapes should be preserved as raw
-        let (tokens, _) = tokenize_str("\"\\0\\377\"");
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "\\0\\377");
-        }
-    }
-
-    #[test]
-    fn test_standard_escapes_preserved() {
-        // Standard escapes should be preserved as raw
-        let (tokens, _) = tokenize_str("\"\\n\\t\\r\\\\\"");
-        assert_eq!(tokens[1].typ, TokenType::String);
-        if let TokenValue::String(s) = &tokens[1].value {
-            assert_eq!(s, "\\n\\t\\r\\\\");
-        }
-    }
-
-    #[test]
-    fn test_token_no_expand_initially_none() {
-        let token = Token::new(TokenType::Ident, Position::default());
-        assert!(token.no_expand.is_none());
-        assert!(!token.is_no_expand("FOO"));
-    }
-
-    #[test]
-    fn test_token_mark_no_expand() {
-        let mut token = Token::new(TokenType::Ident, Position::default());
-
-        // Mark a macro as no-expand
-        token.mark_no_expand("FOO");
-        assert!(token.is_no_expand("FOO"));
-        assert!(!token.is_no_expand("BAR"));
-
-        // Can mark multiple macros
-        token.mark_no_expand("BAR");
-        assert!(token.is_no_expand("FOO"));
-        assert!(token.is_no_expand("BAR"));
-        assert!(!token.is_no_expand("BAZ"));
-    }
-
-    #[test]
-    fn test_token_with_value_no_expand_none() {
-        let token = Token::with_value(
-            TokenType::Number,
-            Position::default(),
-            TokenValue::Number("42".to_string()),
-        );
-        assert!(token.no_expand.is_none());
-    }
-
-    #[test]
-    fn test_multiline_comment_newline_flag() {
-        // After a multiline comment, the next token should NOT have
-        // newline=true just because the comment spanned lines.
-        // The comment fix resets the newline flag.
-        let (tokens, idents) = tokenize_str("a /* multi\nline\ncomment */ b");
-        assert_eq!(tokens.len(), 4); // StreamBegin, a, b, StreamEnd
-
-        // 'a' and 'b' should both be identifiers
-        assert_eq!(show_token(&tokens[1], &idents), "a");
-        assert_eq!(show_token(&tokens[2], &idents), "b");
-
-        // 'b' should NOT have newline=true (it follows comment on same logical line)
-        // The comment was on the same line as 'a', so 'b' continues that line
-        assert!(
-            !tokens[2].pos.newline,
-            "token after multiline comment should not have newline flag"
-        );
-    }
-
-    // ========================================================================
-    // Assembly mode tests
-    // ========================================================================
-
-    fn tokenize_asm(input: &str) -> (Vec<Token>, StringTable) {
-        let mut strings = StringTable::new();
-        let mut tokenizer =
-            Tokenizer::new_with_mode(input.as_bytes(), 0, &mut strings, LexerMode::Assembly);
-        let tokens = tokenizer.tokenize();
-        (tokens, strings)
-    }
-
-    #[test]
-    fn test_asm_semicolon_not_comment() {
-        // In assembly mode, `;` is NOT treated as comment (it's a statement
-        // separator in GAS/AT&T syntax). Comment handling is left to the assembler.
-        let (tokens, idents) = tokenize_asm("mov eax, ebx ; move register");
-        // Should get full line tokenized, including ; and subsequent identifiers
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            toks,
-            vec!["mov", "eax", ",", "ebx", ";", "move", "register"]
-        );
-    }
-
-    #[test]
-    fn test_asm_comments_are_stripped() {
-        // GCC's assembler-with-cpp strips `//` and `/* */` from assembly just
-        // as it does from C, so c17 does too.
-        let (tokens, idents) = tokenize_asm("a // b");
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(toks, vec!["a"]);
-
-        let (tokens, idents) = tokenize_asm("a /* b */ c");
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(toks, vec!["a", "c"]);
-    }
-
-    /// An apostrophe in assembly is prose or a GNU as character constant, not
-    /// the start of a C literal. Lexing it as one swallowed the rest of the
-    /// line, so a `.S` file whose comment said "don't" assembled to something
-    /// else entirely -- or failed outright.
-    #[test]
-    fn test_asm_apostrophe_is_not_a_literal() {
-        let (tokens, idents) = tokenize_asm("# don't panic\nmovl $7, %eax");
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            toks,
-            vec!["#", "don", "'", "t", "panic", "movl", "$", "7", ",", "%", "eax"]
-        );
-
-        // GNU as writes an unterminated character constant `'a`, and a
-        // terminated one `'b'`; both are just punctuation plus identifiers.
-        let (tokens, idents) = tokenize_asm(".byte 'a\n.byte 'b'");
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(
-            toks,
-            vec![".", "byte", "'", "a", ".", "byte", "'", "b", "'"]
-        );
-
-        // `"` still opens a string, so an apostrophe inside one is content.
-        let (tokens, idents) = tokenize_asm(".ascii \"it's fine\"");
-        assert_eq!(tokens[3].typ, TokenType::String);
-        assert_eq!(show_token(&tokens[3], &idents), "\"it's fine\"");
-    }
-
-    #[test]
-    fn test_asm_semicolon_at_start_of_line() {
-        // Semicolon comment at start of line
-        let (tokens, _) = tokenize_asm("; This is a full line comment\nmov eax, 1");
-        // First line should be completely ignored
-        assert!(tokens.len() >= 4); // StreamBegin, mov, eax, ..., StreamEnd
-    }
-
-    #[test]
-    fn test_asm_mode_preserves_preprocessor_directives() {
-        // Assembly preprocessing should still handle # directives
-        let (tokens, idents) = tokenize_asm("#define FOO 1\nmov eax, FOO");
-        // Should tokenize the # directive
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert!(toks.contains(&"#".to_string()));
-        assert!(toks.contains(&"define".to_string()));
-    }
-
-    #[test]
-    fn test_c_mode_semicolon_not_comment() {
-        // In C mode, `;` is a statement terminator, not a comment
-        let (tokens, idents) = tokenize_str("int x; int y");
-        let toks: Vec<_> = tokens[1..tokens.len() - 1]
-            .iter()
-            .map(|t| show_token(t, &idents))
-            .collect();
-        assert_eq!(toks, vec!["int", "x", ";", "int", "y"]);
-    }
-
-    // ========================================================================
-    // tokens_to_source_bytes tests
-    // ========================================================================
-
-    fn source_text(input: &str) -> String {
-        let (tokens, strings) = tokenize_str(input);
-        String::from_utf8(tokens_to_source_bytes(&tokens, &strings)).expect("not UTF-8")
-    }
-
-    #[test]
-    fn test_tokens_to_source_bytes_simple() {
-        // Note: semicolon doesn't have whitespace flag set, so no space before it
-        assert_eq!(source_text("int x = 42;").trim(), "int x = 42;");
-    }
-
-    #[test]
-    fn test_tokens_to_source_bytes_multiline() {
-        let text = source_text("int x;\nint y;");
-        // Should preserve the newline between statements
-        assert!(text.contains('\n'));
-        assert!(text.contains("int"));
-    }
-
-    #[test]
-    fn test_tokens_to_source_bytes_ends_with_newline() {
-        assert!(source_text("x").ends_with('\n'));
-    }
-
-    /// The reason this path deals in bytes: a literal payload is one `char`
-    /// per source byte, and rendering it as a Rust string doubles every byte
-    /// of 0x80 or more.
-    #[test]
-    fn test_tokens_to_source_bytes_keeps_literal_bytes() {
-        let (tokens, strings) = tokenize_str(".ascii \"caf\u{e9}\"");
-        let out = tokens_to_source_bytes(&tokens, &strings);
-        assert_eq!(out, b".ascii \"caf\xc3\xa9\"\n");
-    }
-
-    // ========================================================================
-    // C99 6.4.6 Digraph tests
-    // ========================================================================
-
-    #[test]
-    fn test_digraph_brackets() {
-        // <: and :> are digraphs for [ and ]
-        let (tokens, _) = tokenize_str("<:0:>");
-        // StreamBegin, [, 0, ], StreamEnd
-        assert_eq!(tokens.len(), 5);
-        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'[' as u32));
-        assert!(matches!(&tokens[2].value, TokenValue::Number(n) if n == "0"));
-        assert!(matches!(&tokens[3].value, TokenValue::Special(c) if *c == b']' as u32));
-    }
-
-    #[test]
-    fn test_digraph_braces() {
-        // <% and %> are digraphs for { and }
-        let (tokens, _) = tokenize_str("<% %>");
-        // StreamBegin, {, }, StreamEnd
-        assert_eq!(tokens.len(), 4);
-        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'{' as u32));
-        assert!(matches!(&tokens[2].value, TokenValue::Special(c) if *c == b'}' as u32));
-    }
-
-    #[test]
-    fn test_digraph_hash() {
-        // %: is digraph for #
-        let (tokens, _) = tokenize_str("%: define");
-        // StreamBegin, #, define, StreamEnd
-        assert_eq!(tokens.len(), 4);
-        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'#' as u32));
-    }
-
-    #[test]
-    fn test_digraph_hashhash() {
-        // %:%: is digraph for ##
-        let (tokens, _) = tokenize_str("%:%:");
-        // StreamBegin, ##, StreamEnd
-        assert_eq!(tokens.len(), 3);
-        assert!(
-            matches!(&tokens[1].value, TokenValue::Special(c) if *c == SpecialToken::HashHash as u32)
-        );
-    }
-
-    // ========================================================================
-    // Character classification table tests
-    // ========================================================================
-
-    #[test]
-    fn test_char_table_digits() {
-        for c in b'0'..=b'9' {
-            let cl = char_class(c);
-            assert_eq!(cl & DIGIT, DIGIT, "digit {}", c as char);
-            assert_eq!(cl & HEX, HEX, "digit hex {}", c as char);
-            assert_eq!(cl & LETTER, 0, "digit not letter {}", c as char);
-        }
-    }
-
-    #[test]
-    fn test_char_table_hex_letters() {
-        for c in *b"ABCDFabcdf" {
-            let cl = char_class(c);
-            assert_eq!(cl & LETTER, LETTER, "hex letter {}", c as char);
-            assert_eq!(cl & HEX, HEX, "hex flag {}", c as char);
-        }
-    }
-
-    #[test]
-    fn test_char_table_exp_letters() {
-        for c in *b"EePp" {
-            let cl = char_class(c);
-            assert_eq!(cl & EXP, EXP, "exp {}", c as char);
-            assert_eq!(cl & LETTER, LETTER, "exp letter {}", c as char);
-        }
-        // E and e are also hex
-        assert_ne!(char_class(b'E') & HEX, 0);
-        assert_ne!(char_class(b'e') & HEX, 0);
-        // P and p are NOT hex
-        assert_eq!(char_class(b'P') & HEX, 0);
-        assert_eq!(char_class(b'p') & HEX, 0);
-    }
-
-    #[test]
-    fn test_char_table_plain_letters() {
-        // Non-hex, non-exp uppercase
-        for c in b'G'..=b'O' {
-            let cl = char_class(c);
-            assert_eq!(cl, LETTER, "plain upper {}", c as char);
-        }
-        for c in b'Q'..=b'Z' {
-            let cl = char_class(c);
-            assert_eq!(cl, LETTER, "plain upper {}", c as char);
-        }
-        // Non-hex, non-exp lowercase
-        for c in b'g'..=b'o' {
-            let cl = char_class(c);
-            assert_eq!(cl, LETTER, "plain lower {}", c as char);
-        }
-        for c in b'q'..=b'z' {
-            let cl = char_class(c);
-            assert_eq!(cl, LETTER, "plain lower {}", c as char);
-        }
-        assert_eq!(char_class(b'_'), LETTER);
-    }
-
-    #[test]
-    fn test_char_table_dot() {
-        let cl = char_class(b'.');
-        assert_ne!(cl & DOT, 0);
-        assert_ne!(cl & VALID_SECOND, 0);
-    }
-
-    #[test]
-    fn test_char_table_valid_second() {
-        for c in *b"=+-><&|#" {
-            assert_ne!(
-                char_class(c) & VALID_SECOND,
-                0,
-                "valid_second {}",
-                c as char
-            );
-        }
-    }
-
-    #[test]
-    fn test_char_table_quote() {
-        assert_ne!(char_class(b'\'') & QUOTE, 0);
-        assert_ne!(char_class(b'"') & QUOTE, 0);
-    }
-
-    #[test]
-    fn test_char_table_comment() {
-        assert_ne!(char_class(b'/') & COMMENT, 0);
-    }
-
-    #[test]
-    fn test_char_table_zero_for_others() {
-        // Control characters, whitespace, misc punctuation not in the table
-        for c in [0u8, b' ', b'\t', b'\n', b'@', b'$', b'`', b'~', 0x80, 0xFF] {
-            assert_eq!(char_class(c), 0, "zero for byte {:#x}", c);
-        }
-    }
-}
+#[path = "test_lexer.rs"]
+mod tests;

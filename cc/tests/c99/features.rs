@@ -794,3 +794,187 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("c99_extreme_float_literals", code, &[]), 0);
 }
+
+/// A VLA's local slot holds a *pointer* to the storage, not the storage, so
+/// `&a` has to yield the pointer's value -- the same address the array decays
+/// to (C99 6.5.3.2p3, and 6.3.2.1p3 for the decay). c17 took the slot's
+/// address instead, so `&a` differed from `a` for every VLA and
+/// `int (*p)[n] = &a` pointed at the pointer.
+#[test]
+fn c99_address_of_a_vla_is_the_array_address() {
+    let code = r#"
+int main(void) {
+    int n = 4, m = 5;
+
+    /* One dimension. */
+    int b[n];
+    for (int i = 0; i < n; i++) b[i] = i + 100;
+    if ((void *)&b != (void *)b) return 1;
+    if ((void *)&b[0] != (void *)b) return 2;
+    int (*pb)[n] = &b;
+    if ((*pb)[2] != 102) return 3;
+
+    /* Two dimensions. */
+    int a[n][m];
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < m; j++) a[i][j] = i * m + j;
+    if ((void *)&a != (void *)a) return 4;
+    if ((void *)&a[0] != (void *)a) return 5;
+    int (*pa)[n][m] = &a;
+    if ((void *)pa != (void *)a) return 6;
+    if (pa[0][3][4] != 19) return 7;
+
+    /* Through a variably modified typedef (6.7.7). */
+    typedef int T[n][m];
+    T *pt = &a;
+    if ((void *)pt != (void *)a) return 8;
+    if (pt[0][1][0] != 5) return 9;
+
+    /* The row type still decays the ordinary way. */
+    int (*q)[m] = a;
+    if (q[3][4] != 19) return 10;
+
+    /* A VLA in an inner scope, so the slot is reused. */
+    {
+        int c[n];
+        for (int i = 0; i < n; i++) c[i] = i * 7;
+        if ((void *)&c != (void *)c) return 11;
+        int (*pc)[n] = &c;
+        if ((*pc)[3] != 21) return 12;
+    }
+
+    /* And a VLA whose extent is itself an expression. */
+    int d[n * 2 + 1];
+    for (int i = 0; i < n * 2 + 1; i++) d[i] = i;
+    if ((void *)&d != (void *)d) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_address_of_a_vla", code, &[]),
+        0,
+        "&vla must be the array's address"
+    );
+}
+
+/// Dereferencing a pointer to a variably-modified array has to keep the
+/// array's run-time extents: `(*p)[i]` steps a whole row, and `sizeof(*p)` is
+/// the run-time size (C99 6.5.3.4p2 -- "if the type is variable length, the
+/// size is computed at execution time").
+///
+/// The extents were carried only on the way *in*: `p[0][i][j]` indexed
+/// correctly while `(*p)[i][j]` -- the same address, spelled with a deref --
+/// used a stride of zero, and every `sizeof(*p)` answered 0.
+#[test]
+fn c99_deref_of_a_pointer_to_a_vm_array() {
+    let code = r#"
+int main(void) {
+    int n = 4, m = 5;
+    unsigned long isz = sizeof(int);
+
+    int a[n][m];
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < m; j++) a[i][j] = i * m + j;
+    int b[n];
+    for (int i = 0; i < n; i++) b[i] = i + 100;
+
+    /* Pointer to a one-dimensional VM array. */
+    int (*pb)[n] = &b;
+    if ((*pb)[2] != 102) return 1;
+    if (sizeof(*pb) != (unsigned long)n * isz) return 2;
+
+    /* Pointer to a two-dimensional VM array: the deref must step rows. */
+    int (*pa)[n][m] = &a;
+    if ((*pa)[0][0] != 0) return 3;
+    if ((*pa)[1][0] != 5) return 4;
+    if ((*pa)[3][4] != 19) return 5;
+    if (sizeof(*pa) != (unsigned long)(n * m) * isz) return 6;
+    if (sizeof((*pa)[0]) != (unsigned long)m * isz) return 7;
+
+    /* The same through a variably modified typedef (6.7.7). */
+    typedef int T[n][m];
+    T *pt = &a;
+    if ((*pt)[1][0] != 5) return 8;
+    if ((*pt)[3][4] != 19) return 9;
+    if (sizeof(*pt) != (unsigned long)(n * m) * isz) return 10;
+
+    /* Indexing without the deref must keep working. */
+    if (pa[0][3][4] != 19) return 11;
+    int (*q)[m] = a;
+    if (q[3][4] != 19) return 12;
+    if (sizeof(*q) != (unsigned long)m * isz) return 13;
+
+    /* Writing through the deref lands in the original array. */
+    (*pa)[2][1] = 777;
+    if (a[2][1] != 777) return 14;
+
+    /* Pointer arithmetic steps whole arrays. */
+    if ((char *)(pa + 1) - (char *)pa != (long)(n * m) * (long)isz) return 15;
+    if ((char *)(pb + 1) - (char *)pb != (long)n * (long)isz) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_deref_vm_pointer", code, &[]),
+        0,
+        "deref of a pointer to a variably-modified array"
+    );
+}
+
+/// Every way of stepping a pointer to a variably-modified array has to use
+/// the run-time stride, not just the two that were fixed first.
+///
+/// `++p` and `p + 1` took it; `p++`, `p += 1` and `p - q` did not. So the
+/// pointer silently did not move for two of the five spellings, and a
+/// difference whose left operand was not a bare identifier divided by a
+/// compile-time size of zero and trapped.
+#[test]
+fn c99_vm_pointer_arithmetic_every_spelling() {
+    let code = r#"
+int main(void) {
+    int n = 3, m = 5;
+    long row = (long)m * (long)sizeof(int);
+    int a[n][m];
+    int (*p)[m] = a;
+    int (*r)[m];
+
+    /* All five spellings step exactly one row. */
+    r = p; r++;        if ((char *)r - (char *)p != row) return 1;
+    r = p; ++r;        if ((char *)r - (char *)p != row) return 2;
+    r = p; r += 1;     if ((char *)r - (char *)p != row) return 3;
+    r = p; r = r + 1;  if ((char *)r - (char *)p != row) return 4;
+    r = p; r = 1 + r;  if ((char *)r - (char *)p != row) return 5;
+
+    /* And backwards. */
+    r = p + 2; r--;    if ((char *)r - (char *)p != row) return 6;
+    r = p + 2; --r;    if ((char *)r - (char *)p != row) return 7;
+    r = p + 2; r -= 1; if ((char *)r - (char *)p != row) return 8;
+    r = p + 2; r = r - 1; if ((char *)r - (char *)p != row) return 9;
+
+    /* Difference, including operands that are not bare identifiers. */
+    r = p + 2;
+    if (r - p != 2) return 10;
+    if ((p + 2) - p != 2) return 11;
+    if (r - (p + 1) != 1) return 12;
+    if ((p + 2) - (p + 1) != 1) return 13;
+
+    /* The post forms yield the old value and still move. */
+    r = p;
+    if ((char *)(r++) - (char *)p != 0) return 14;
+    if ((char *)r - (char *)p != row) return 15;
+
+    /* A two-dimensional VM pointee steps the whole array. */
+    int (*w)[n][m] = &a;
+    if ((char *)(w + 1) - (char *)w != (long)(n * m) * (long)sizeof(int)) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_vm_pointer_arith", code, &[]),
+        0,
+        "pointer arithmetic on a variably-modified pointee"
+    );
+}

@@ -242,3 +242,117 @@ int main(void) {
         0,
     );
 }
+
+/// A standard header declares what its clause says it declares, and nothing
+/// more (C17 7.1.3: identifiers other than those a header declares are not
+/// reserved by it).
+///
+/// glibc gets that by asking the compiler's `<stddef.h>` and `<stdarg.h>` for
+/// one definition at a time -- `<string.h>` does `#define __need_size_t` and
+/// `#define __need_NULL` before including `<stddef.h>`. c17's builtin headers
+/// ignored the protocol and defined everything, so `<string.h>` declared
+/// `wchar_t`, `ptrdiff_t` and `max_align_t`, and `<stdio.h>` defined the
+/// `va_*` macros. Redefining any of those -- which a program is entitled to
+/// do -- was rejected where gcc accepts it.
+///
+/// `va_list` is deliberately *not* tested here: glibc's `<stdio.h>` declares
+/// it under `__USE_XOPEN2K8`, as POSIX requires, and gcc rejects the same
+/// redefinition in its default `gnu17` mode. Only `-std=c17` hides it, and
+/// c17 does not define `__STRICT_ANSI__` -- see `std_dialect.rs`.
+#[test]
+fn c99_headers_declare_only_their_own_names() {
+    let code = r#"
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+
+/* A header that wants only size_t and NULL must not bring the va_* macros
+   with it (7.21.1 gives <stdio.h> no such macro). */
+#if defined(va_arg) || defined(va_start) || defined(va_end) || defined(va_copy)
+#error "a header leaked the va_* macros"
+#endif
+
+/* 7.24.1, 7.21.1 and 7.27.1 give these headers size_t and NULL (and stdio
+   also FILE, time also clock_t &c). None of them declares any of the
+   following, so a program may use each name for itself. */
+typedef struct { int a; } wchar_t;
+typedef struct { int b; } ptrdiff_t;
+typedef struct { int c; } max_align_t;
+
+/* What they *do* declare is still there. */
+static size_t n = 0;
+static void *p = NULL;
+static FILE *f;
+
+int main(void) {
+    wchar_t w = { 1 };
+    ptrdiff_t d = { 2 };
+    max_align_t m = { 3 };
+    f = 0;
+    return (int)n + (p ? 1 : 0) + (f ? 1 : 0) + w.a + d.b + m.c - 6;
+}
+"#;
+    assert_eq!(compile_and_run("c99_header_namespace", code, &[]), 0);
+}
+
+/// The other half of the same protocol: a partial include must not stop the
+/// full one from completing the set. `<string.h>` asks only for `size_t` and
+/// `NULL`, so a later `#include <stddef.h>` still has to deliver
+/// `ptrdiff_t`, `wchar_t`, `max_align_t` and `offsetof`.
+#[test]
+fn c99_stddef_completes_after_a_partial_include() {
+    let code = r#"
+#include <string.h>
+#include <stddef.h>
+
+struct Pair { int a; double b; };
+
+int main(void) {
+    ptrdiff_t d = 1;
+    wchar_t w = 2;
+    max_align_t m;
+    size_t n = sizeof(m);
+    void *p = NULL;
+    if (offsetof(struct Pair, b) == 0) return 1;
+    if (n == 0 || p != 0) return 2;
+    return (int)d + (int)w - 3;
+}
+"#;
+    assert_eq!(compile_and_run("c99_stddef_completes", code, &[]), 0);
+}
+
+/// And the plain case: `<stddef.h>` on its own defines all of it, and does so
+/// only once however many times it is included.
+#[test]
+fn c99_stddef_alone_defines_everything() {
+    let code = r#"
+#include <stddef.h>
+#include <stddef.h>
+#include <stdarg.h>
+#include <stdarg.h>
+
+struct Pair { int a; double b; };
+
+static int sum(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    int t = 0;
+    for (int i = 0; i < count; i++) t += va_arg(ap, int);
+    va_end(ap);
+    return t;
+}
+
+int main(void) {
+    ptrdiff_t d = 1;
+    wchar_t w = 2;
+    max_align_t m;
+    size_t n = sizeof(m);
+    void *p = NULL;
+    if (offsetof(struct Pair, b) == 0) return 1;
+    if (n == 0 || p != 0) return 2;
+    if (sum(3, 10, 20, 30) != 60) return 3;
+    return (int)d + (int)w - 3;
+}
+"#;
+    assert_eq!(compile_and_run("c99_stddef_alone", code, &[]), 0);
+}

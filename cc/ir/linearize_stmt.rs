@@ -356,7 +356,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     vla_size_sym: None,
                     vla_elem_type: None,
                     vm_row_dims: vec![],
-                    is_indirect: false,
+                    storage: crate::ir::linearize::Storage::InSlot,
                 },
             );
 
@@ -562,7 +562,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // One index step consumes the outermost extent, so what a row
                 // still spans is everything after it.
                 vm_row_dims: dims[1..].to_vec(),
-                is_indirect: false,
+                // The slot holds the `alloca` result, not the elements.
+                storage: crate::ir::linearize::Storage::Indirect(ptr_type),
             },
         );
     }
@@ -634,7 +635,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 vla_size_sym: None,
                 vla_elem_type: None,
                 vm_row_dims: vec![],
-                is_indirect: false,
+                storage: crate::ir::linearize::Storage::InSlot,
             },
         );
 

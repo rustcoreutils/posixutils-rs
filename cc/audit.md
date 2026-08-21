@@ -3,7 +3,7 @@
 This file collects per-utility POSIX conformance audits for the C compiler
 crate. Each audit follows the playbook in `audits.md`.
 
-**First audited:** 2026-08-01 · **Last reconciled:** 2026-08-21
+**First audited:** 2026-08-01 · **Last reconciled:** 2026-08-21 (ISO C rows re-probed)
 **Crate:** `cc/` — 113,690 lines of implementation (excluding tests) +
 41,949 lines of tests (1,815 `#[test]` functions)
 **Spec slices:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/{c17,cflow,ctags,cxref}.md`
@@ -17,9 +17,16 @@ crate. Each audit follows the playbook in `audits.md`.
 
 ## Status
 
-**Open: 2.** Both are standing decisions rather than work items — #C55
-(trigraphs off by default) and #C12 (`_FORTIFY_SOURCE`), both under **Open**
-in the `c17` section below with the reasoning that settled them.
+**Open: 1.** One standing decision rather than a work item — #C55, trigraphs
+off by default. #C157 and #C158 came out of the 2026-08-21 ISO C re-probe and
+are both closed.
+
+This file tracks conformance to POSIX.1-2024 and to the ISO C standard it
+incorporates, and nothing else, so the Open count means exactly one thing:
+places where c17 knowingly diverges from the standard. Engineering debt that
+is *not* a conformance question lives in `cc/doc/TODO.md` — `_FORTIFY_SOURCE`
+(formerly #C12) moved there, since `_FORTIFY_SOURCE`, `__builtin_object_size`
+and the `_chk` family appear nowhere in POSIX.1-2024.
 
 **Everything else is closed.** The per-finding entries used to be kept here
 after they were fixed; they are not any more, because 252 of them made the file
@@ -102,24 +109,29 @@ the remaining operands and exits non-zero; `-E` carries the mandated
 libraries are all found. 4 200 external identifiers compile against a
 mandated minimum of 4 095.
 
-The language is C17, and says so: `__STDC_VERSION__ == 201710L`. A sweep of
-C11/C17 features against `gcc -std=c17` -- `_Generic`, `_Atomic` including
-access through ordinary operators, `_Static_assert`, `_Alignas`/`_Alignof`,
-`_Thread_local`, `_Noreturn`, anonymous members, Unicode literals, `<tgmath.h>`,
-`<threads.h>`, complex arithmetic, VLAs in every position including a
-variably modified `typedef` (6.7.7), designated initializers, compound
-literals, flexible array members, `restrict`, `static` array parameters,
-digraphs, `_Pragma`, `__has_include` -- finds no gap.
+The language is C17, and says so: `__STDC_VERSION__ == 201710L`.
 
-What is open is small and listed under **Priority issues**: `-l` resolution and
-the trigraph default are the two POSIX items, both recorded there with their
-status, and the rest are diagnostic-quality or technical debt. Two findings are
-**deferred indefinitely by maintainer decision** and are not oversights:
+**The sweep that used to be summarised here "finds no gap" was written from
+reading, and it was wrong.** Re-probing it on 2026-08-21 -- running the built
+binary against `gcc -std=c17`, case by case -- turned up eleven defects in
+translation phases 1-4, a 6.4.7 implementation that did not exist, digraph
+spellings silently discarded, `#__VA_ARGS__` keeping only its first argument,
+a VLA miscompile -- `&a` on a variable-length array yielded the address of its
+pointer slot rather than the array, at `-O0` and `-O2` alike, with no test
+anywhere in the tree taking a VLA's address -- and two builtin headers
+defining names their clauses do not give them. Review of that work then found
+three more in the same area and two regressions the pass itself introduced;
+see #C159 and the note above the code-generation section. All are fixed and each row of
+the ISO C table now names the probe that established it.
 
-- **#C12** `_FORTIFY_SOURCE` fortifies nothing. Five of six layers are done;
-  the sixth is folding `__builtin_object_size` after inlining, and
-  `__OPTIMIZE__` has to land in the same change. Not a conformance issue --
-  the fortification is a glibc extension.
+One open finding came out of that same pass; see **Open**. And
+the distinction the pass turned on is worth stating plainly, because it is the
+one this document keeps getting wrong: a row backed by a code citation is a
+claim about the source, not about the compiler.
+
+The remaining items are diagnostic-quality or technical debt. One finding is
+**deferred indefinitely by maintainer decision** and is not an oversight:
+
 - **#C55** trigraphs are off by default, where APPLICATION USAGE 88224 says a
   compiler that does so is "not conforming to POSIX.1-2024". Deliberate:
   replacement reaches inside string literals, so `"What??!"` becomes `"What|"`,
@@ -128,12 +140,10 @@ status, and the rest are diagnostic-quality or technical debt. Two findings are
 
 ## Open
 
-Two, and both are standing decisions rather than pending work. They are kept
-here so neither gets re-raised as a to-do.
+One, and it is a standing decision rather than pending work. It is kept here
+so it does not get re-raised as a to-do.
 
 - [ ] **#C55 — Trigraphs are off by default.** **SETTLED by maintainer decision — not deferred, not awaiting anything, and not to be re-raised.** The c17 APPLICATION USAGE says it outright (88224): "Some c17 compilers *not conforming to POSIX.1-2024* do not support trigraphs by default." #P11 implemented them behind `--trigraphs` because replacement reaches inside string literals, so `"What??!"` becomes `"What|"` — which is exactly what C17 phase 1 specifies and what the POSIX RATIONALE laments without granting an exemption. A deliberate divergence, not a missing feature; the fix is to flip the default and offer an opt-out. Deliberately out of scope of the 2026-08-15 series.
-
-- [ ] **#C12 — `_FORTIFY_SOURCE` compiles but fortifies nothing.** **Deferred indefinitely by maintainer decision (2026-08-19). Open, Minor.** Originally diagnosed as one defect — `__builtin_object_size` answering `(size_t)-1` — it turned out to be six, each hidden behind the one before it, and only visible by fixing a layer and re-measuring. Four are now closed: real object sizes, implicit `__builtin___*_chk` declarations, asm label renaming (below), and `always_inline`. The two that remain are `__gnu_inline__` emitting no out-of-line definition, and folding `__builtin_object_size` *after* inlining rather than before — see `cc/doc/TODO.md` for the measurements. Not a conformance issue — the fortification is a glibc extension — but a security-relevant one for anyone who sets the flag expecting it to work.
 
 ## Detailed conformance matrix
 
@@ -222,23 +232,82 @@ here so neither gets re-raised as a to-do.
 
 ### ISO C language conformance summary
 
-| Area | Status |
-|---|---|
-| Translation phase 1 (trigraphs) | CONFORMS behind `--trigraphs`, off by default (#P11) |
-| Translation phase 2 (line splicing) | CONFORMS — handled in `nextchar`/`peekchar` (`cc/token/lexer.rs:322-417`), so transparent to identifiers, literals, and comments alike |
-| Translation phase 3 (comments) | CONFORMS — #P10 closed |
-| Directives | CONFORMS |
-| Computed `#include`, `_Pragma`, digraphs, `#include_next` | CONFORMS — **[probed]** computed include and `_Pragma` both work |
-| Include cycle/depth guard | CONFORMS — **[probed]** a self-including header exits 1, no hang (`max_include_depth = 200`) |
-| Macro expansion (blue paint, rescanning, `##` placemarkers) | CONFORMS |
-| `#if` constant expressions | CONFORMS — #P6, #P14 closed |
-| Predefined macros | CONFORMS — #P1, #P7 and #X8 all closed |
-| C89 core | CONFORMS (declarators, bitfields, storage classes, tentative definitions, promotions). **This row was overstated until 2026-08-21:** an init-declarator list whose first declarator was a function -- `int f(int), g(int);` -- was a syntax error, which is ISO C and so a conformance defect, not merely a compatibility one. Found by building sparse, not by re-reading this file |
-| C99 | CONFORMS for everything audited (VLAs, designated initializers, compound literals, flexible array members, `restrict`, `inline`, `_Bool`, `long long`, `_Complex`, `__func__`, UCNs, hex floats) |
-| C11 | CONFORMS for everything audited — #X1, #X3, #X6 and #X7 are all closed, so `_Generic`, `_Atomic` through ordinary operators, the full `<stdatomic.h>` and the `CMPLX` macros join the rest |
-| C17 | CLAIMED — `__STDC_VERSION__` is `201710L`, and it is the only language c17 compiles. C17 is DR-only; DR 412 (`_Static_assert` as a struct member) is honored at `cc/parse/parser.rs`, and DR 423 is live now that `_Generic` exists |
-| Translation limits (C99 5.2.4.1) | CONFORMS — `Vec`/`BTreeMap`-backed throughout; `cc/tests/c99/translation_limits.rs` exercises 130-member structs, 20 params, 30 cases. **[probed 2026-08-15]** eleven of the 5.2.4.1 minimums measured directly against the built binary (127 nested blocks, 63 nested `#if`s, 12 pointer modifiers, 127 parameters, 4095 macros, a 4095-character string literal, 1023 `case` labels, 1023 struct members, a 63-character identifier, a 4095-character logical line): all pass. The twelfth — 63 nesting levels of *parenthesized declarators* — failed at level **2**, and is #C44. Residual risk: the recursive-descent parser has no explicit depth guard, so very deep nesting depends on stack size |
-| Diagnostics for constraint violations (C17 5.1.1.3) | CONFORMS — and this row was **overstated until 2026-08-15**. "For everything audited" was carrying the whole claim: the audited set was small, and a 26-case probe of the built binary found **21 constraint violations accepted in total silence**, two of which silently miscompiled (`int x; double x;` emitted `.comm x,4,4`; `int *p; p = 1.5;` compiled to a `cvttsd2si`). All 21 are now diagnosed at gcc's severity — error where gcc errors, warning where gcc warns — across #C45-#C49. A 35-case matrix (21 violations, 14 accept-side controls) agrees with `gcc -std=c17` on every row. Two places stay deliberately *stricter* than gcc: `return` with a value in a `void` function, and a bare `return` in a non-`void` one, both genuine 6.8.6.4 violations |
+**Re-probed 2026-08-21.** Every row below was checked by running the built
+binary against `gcc -std=c17` on a purpose-written case, not by reading the
+source. That distinction is the whole point of this pass: the rows that had
+been written from a code citation rather than a probe are exactly the ones
+that turned out to be wrong.
+
+What the re-probe found, in one day: eleven defects in translation phases 1-4
+(a row that said "CONFORMS -- handled in `nextchar`/`peekchar`"), a missing
+6.4.7 implementation this table did not mention at all, digraph spellings
+discarded (a row marked **[probed]**, where the probe had only checked that
+digraphs were *accepted*), two VLA defects including a silent miscompile
+(under a row claiming "VLAs in every position"), and `#__VA_ARGS__` keeping
+only its first argument. All are fixed; the numbers are #C150-#C156 and
+`git log --grep` finds each one.
+
+The lesson is recorded rather than the individual findings: **a row here means
+nothing unless it names the probe that established it.** Rows are now written
+as what was run.
+
+| Area | Status | Probe |
+|---|---|---|
+| Translation phase 1 (trigraphs) | CONFORMS behind `--trigraphs`, off by default (#C55) | all nine sequences accepted with the flag, rejected without |
+| Translation phase 2 (line splicing) | CONFORMS **[probed 2026-08-21]** | splices inside an identifier, inside a UCN's hex digits, between `\` and `u`, inside a string, and inside a macro *name* -- all agree with gcc. Was **not** conforming until #C150: three hand-written copies of the rule disagreed, and a splice before a UCN silently ate source characters |
+| Translation phase 3 (comments) | CONFORMS **[probed 2026-08-21]** | `//`, `/* */` spanning lines, `/*/`, comment-as-one-space in `#` stringification; and in assembly, where `'` used to open a literal inside a comment (#C152) |
+| 6.4.6 digraphs | CONFORMS **[probed 2026-08-21]** | `<: :> <% %> %: %:%:` each keep their own spelling through `#` and `-E` while meaning the primary token as syntax, as a directive introducer and as `##`. The spelling half was wrong until #C154 |
+| 6.4.7 header names | CONFORMS **[probed 2026-08-21]** | `#include <sub//t.h>` and `#include <it's.h>` compile and run. Not implemented at all until #C153 -- a header name was lexed as ordinary tokens, so `//` became a comment and `'` opened a literal |
+| Directives, computed `#include`, `_Pragma`, `#include_next` | CONFORMS **[probed 2026-08-21]** | computed include, `__has_include` present and absent, `#line` renaming and renumbering |
+| Include cycle/depth guard | CONFORMS **[probed]** | a self-including header exits 1, no hang (`max_include_depth = 200`) |
+| Macro expansion (6.10.3) | CONFORMS **[probed 2026-08-21]** | blue paint, rescanning (`f(2)(9)`), mutual recursion, `##` placemarkers, empty arguments, arity diagnostics, `__VA_ARGS__`. `#__VA_ARGS__` kept only its first argument until #C156. One divergence remains, pinned by `preprocessor_va_args_loses_space_before_a_separator`: the splitter discards the separating comma, so `V(a , b)` stringifies as `"a, b"` where gcc gives `"a , b"` |
+| `#if` constant expressions | CONFORMS **[probed 2026-08-21]** | `intmax_t` arithmetic, arithmetic right shift, signed wraparound, unqualified-`u` promotion, short-circuit around `1/0`, character constants, `0xFFFFFFFFFFFFFFFF` |
+| Predefined macros | CONFORMS **[probed 2026-08-21]** | `__STDC__`, `__STDC_VERSION__ == 201710L`, `__STDC_HOSTED__`, `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, `__COUNTER__` |
+| C89 core | CONFORMS | declarators, bitfields, storage classes, tentative definitions, promotions. **This row was overstated until 2026-08-21:** an init-declarator list whose first declarator was a function -- `int f(int), g(int);` -- was a syntax error, which is ISO C and so a conformance defect. Found by building sparse, not by re-reading this file |
+| C99 | CONFORMS **[probed 2026-08-21, widened after review]** | VLAs: address-of, deref, `sizeof` at depths 0-2, variably modified `typedef`, VLA parameters, and pointer arithmetic in all five spellings -- `p++`, `++p`, `p += 1`, `p + 1`, `1 + p` -- their decrementing forms, and differences whose operands are not bare identifiers. `c99_address_of_a_vla_is_the_array_address`, `c99_deref_of_a_pointer_to_a_vm_array` and `c99_vm_pointer_arithmetic_every_spelling` are what back this row. Also probed: designated initializers, compound literals, flexible array members, `restrict`, `inline`, `_Bool`, `long long`, `_Complex`, `__func__`, UCNs, hex floats |
+| C11 | CONFORMS **[probed 2026-08-21]** | one program exercising `_Generic` (including `default:`), `_Atomic` through ordinary operators and through `<stdatomic.h>`, `_Static_assert`, `_Thread_local`, `alignas`/`alignof`/`max_align_t`, anonymous members, `CMPLX`, and all three Unicode literal prefixes |
+| C17 | CLAIMED | `__STDC_VERSION__` is `201710L`, and it is the only language c17 compiles. C17 is DR-only; DR 412 (`_Static_assert` as a struct member) is honored at `cc/parse/parser.rs`, and DR 423 is live now that `_Generic` exists |
+| Translation limits (C99 5.2.4.1) | CONFORMS **[re-probed 2026-08-21]** | the twelve minimums, including the one that used to fail: 63 nesting levels of parenthesized declarators now compile (#C44 closed). Residual risk unchanged -- the recursive-descent parser has no explicit depth guard, so very deep nesting depends on stack size |
+| Identifiers (C17 6.4.2.1, Annex D) | CONFORMS **[probed 2026-08-21, exhaustively]** | The Annex D table is transcribed from GCC's `libcpp/ucnid.tab` (`[C11]`+`[C11NOSTART]`), which states it reproduces ISO/IEC 9899 Annex D; Clang's independent table agrees on every code point, and so does c17's -- compared over all 1.1M code points in both positions, not sampled. Extended characters are accepted written directly as well as as a UCN (#C158), and both spellings name the same identifier. Until then the direct spelling was rejected outright, and the UCN path applied only 6.4.3p2 -- what a UCN may *name* -- so it admitted characters no identifier may contain and let a combining mark come first. **Two deliberate divergences from GCC's binary:** U+FD3E and U+FD3F, which Annex D excludes and which GCC's own table and Clang's both omit |
+| Header namespace (C17 7.1.3) | CONFORMS **[probed 2026-08-21]** | `<string.h>`, `<stdio.h>` and `<time.h>` declare what their clauses give them and leave the rest of the namespace alone. Was **not** conforming until #C157: the builtin `<stddef.h>` and `<stdarg.h>` ignored glibc's `__need_*` protocol, so `<string.h>` declared `wchar_t`, `ptrdiff_t` and `max_align_t` and `<stdio.h>` defined the `va_*` macros. `va_list` from `<stdio.h>` is not a leak -- glibc declares it under `__USE_XOPEN2K8`, as POSIX requires, and gcc's default `gnu17` mode does the same |
+| Diagnostics for constraint violations (C17 5.1.1.3) | CONFORMS **[probed 2026-08-15]** | a 35-case matrix -- 21 constraint violations, 14 accept-side controls -- agrees with `gcc -std=c17` on every row. Two places stay deliberately *stricter* than gcc: `return` with a value in a `void` function, and a bare `return` in a non-`void` one, both genuine 6.8.6.4 violations |
+| Code generation | **NOT ESTABLISHED THE SAME WAY** | see *Code generation evidence* below |
+
+> **A "[probed]" row is only as good as the cases the probe ran.** This row
+> first said "pointer arithmetic" on the strength of a probe that had tried
+> `p + 1` and `++p`. Review found that `p++` and `p += 1` did not move the
+> pointer at all, and that a difference whose left operand was not a bare
+> identifier divided by a compile-time size of zero and raised SIGFPE -- three
+> more defects (#C159) under a row that had just been rewritten to say it was
+> probed. Naming the probe is necessary; it is not sufficient. Where a rule
+> has several spellings, the row has to say it covered them, and the test has
+> to be the kind that enumerates rather than samples.
+
+### Code generation evidence
+
+Conformance of the *language* is now probed. Correctness of the *output* is
+not, and this table should not be read as if it were.
+
+What backs it today: CPython 3.12.9 built and tested at `-O2`
+(`run=40,817 skipped=1,857 -- SUCCESS`), 9,200-odd workspace tests, and only
+three optimization passes in existence (`instcombine`, `dce`, `inline`), which
+is a real if backhanded argument -- most miscompiles live in the passes that
+are not there.
+
+What does not back it:
+
+- **No adversarial suite has ever been run.** GCC's `gcc.c-torture/execute`
+  and the clang suite are both listed as "Not run against c17" in
+  `cc/doc/TODO.md`. A hand-written differential probe of nine ordinary
+  constructs (bitfields, unions, struct ABI, varargs, floats, VLAs, control
+  flow, `setjmp`, alignment) at `-O0` and `-O2` found a miscompile in the
+  first hour (#C155). CPython is one program in a conservative style and will
+  never reach `&vla`.
+- **The acceptance gate is manual.** CI runs `cargo test` only. The CPython
+  build and the aarch64 qemu differential sweep are both run by hand, so
+  "40,817 SUCCESS" is a periodic claim, not a continuous one.
+- **aarch64 has no equivalent of CPython.** `compile_and_run` always targets
+  the host, so aarch64-only defects surface only in the manual sweep.
 
 ### Extensions accepted
 
@@ -269,8 +338,11 @@ Not covered:
 - [x] Header-search precedence between builtin headers and `-I`/dir-of-file (#P9) — `preprocessor_local_header_wins_over_builtin`, `preprocessor_dash_i_wins_over_builtin`, `preprocessor_builtin_headers_still_resolve`, plus `preprocessor_missing_include_is_still_an_error` so the shadowing tests cannot pass vacuously.
 - [x] aarch64 `long double` round-trip (#H4) — `c17_long_double_round_trip`. Passes on x86_64; aarch64 CI settles the question.
 
+- [x] The 2026-08-21 ISO C re-probe — every finding it produced carries a test: `test_ucn_across_line_splices`, `test_ucn_splice_disabled`, `test_digraph_hash_not_hashhash_keeps_line_count`, `test_column_saturates_on_very_long_line`, `test_unterminated_literal_yields_the_newline_it_ate`, `test_asm_apostrophe_is_not_a_literal`, `test_asm_comments_are_stripped`, `test_write_token_emits_source_bytes`, `test_tokens_to_source_bytes_keeps_literal_bytes`, `test_header_name_is_opaque`, `test_header_name_only_where_one_can_appear`, `test_digraph_keeps_its_own_spelling` (lexer unit tests); `preprocessor_non_ascii_literal_survives_byte_for_byte`, `preprocessor_synthesized_literals_use_payload_form`, `preprocessor_non_ascii_header_name_opens`, `preprocessor_error_message_spells_every_token`, `preprocessor_u8_prefix_survives`, `preprocessor_header_name_is_one_token`, `preprocessor_digraph_spelling_survives`, `preprocessor_digraphs_still_mean_their_primary_tokens`, `preprocessor_stringified_va_args_keeps_every_argument` (`cc/tests/preprocessor/conformance.rs`); `driver_asm_apostrophe_in_comment` (`cc/tests/driver/mod.rs`); `c99_address_of_a_vla_is_the_array_address`, `c99_deref_of_a_pointer_to_a_vm_array` (`cc/tests/c99/features.rs`).
+
 Actively pinning current behavior (must change alongside the fix):
 - [x] `cc/tests/c11/core.rs` asserted `__STDC_VERSION__ == 201112L`; it now asserts `201710L`, and `cc/tests/preprocessor/std_dialect.rs` covers the whole `-std=` matrix in both directions.
+- [x] `preprocessor_va_args_loses_space_before_a_separator` pins the one divergence left in `#__VA_ARGS__`: the argument splitter discards the separating comma, so the space before it is gone. Closing it means carrying the separator's spacing out of `collect_macro_args`, and the test must change with the fix.
 - [x] `test_macro_redefinition` documented silent macro override as intended (#P3) — rewritten in Phase 4. It still pins that the later definition wins and that the diagnostic is non-fatal, but no longer asserts the silence as correct.
 
 ---

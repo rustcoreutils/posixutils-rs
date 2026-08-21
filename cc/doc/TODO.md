@@ -18,19 +18,44 @@ and so neither is raised again as a question.
 
 ### `_FORTIFY_SOURCE` compiles but checks nothing
 
-Not a conformance item. `_FORTIFY_SOURCE`, `__builtin_object_size` and the
-`_chk` family appear nowhere in POSIX.1-2024 — this is a security-hardening
-gap in a glibc extension, deferred by decision rather than scheduled.
+**Not a conformance item, and the sole record of this one.** It was also
+tracked as **#C12** in `cc/audit.md` until 2026-08-21, when it was removed
+from there: `_FORTIFY_SOURCE`, `__builtin_object_size` and the `_chk` family
+appear nowhere in POSIX.1-2024, so an entry in a POSIX conformance audit's
+Open list overstated what it was. The number is kept here so
+`git log --grep '#C12'` still finds the history. **Deferred indefinitely by
+maintainer decision (2026-08-19)** — a decision, not a backlog item.
+
+What *is* required of the compiler already works, and should not be confused
+with what is missing: c17 accepts `-D_FORTIFY_SOURCE=2`, compiles glibc's
+fortified headers, and links. Distro builds and `configure` scripts pass the
+flag by default, so this is load-bearing. (CPython's own `configure.ac` passes
+`-U_FORTIFY_SOURCE` for libmpdec, because glibc's `memmove`/`bcopy` wrappers
+are wrong there — so the acceptance gate does not lean on it either.)
+
+What is missing is the checking, and the symptom is silence rather than
+breakage. `-D_FORTIFY_SOURCE=2` now compiles glibc's fortified wrappers and
+emits `__*_chk` calls — before `__OPTIMIZE__` was predefined it emitted none at
+all, because glibc compiled no wrapper to begin with. What it still does not do
+is *check*: `__builtin_object_size` folds to `-1` at parse time, and `-1` is
+the encoding for "do not check". The program now pays for the wrappers and
+checks nothing.
+
+Anyone who sets the flag expecting hardening does not get it, and gets no
+diagnostic saying so. That is layer 8 below.
 
 Peeling this apart one layer at a time has been the only way to see it: each
-fix exposes the next blocker, and three of the layers are invisible until the
-one before it is in place. Five are done:
+fix exposes the next blocker, and most of the layers are invisible until the
+one before it is in place. Seven are done:
 
 1. `__builtin_object_size` computing real sizes rather than "unknown".
 2. Implicit declarations for the `__builtin___*_chk` family.
 3. Asm label renaming, so glibc's `__REDIRECT` aliases resolve.
 4. `always_inline`, so the fortified wrapper reaches the caller at all.
 5. Inline definitions emitting no external definition.
+6. `__builtin_va_arg_pack` / `_len`, so the wrappers' argument forwarding
+   compiles at all — see below.
+7. Predefining `__OPTIMIZE__`, which is what makes glibc compile the wrappers.
 
 ~~**Layer 5 — `__gnu_inline__` / `extern inline` must emit no out-of-line
 definition.**~~ Done. It turned out not to be a fortify problem at all: `inline`
@@ -38,7 +63,21 @@ was never recorded on a function definition in the first place, so *every*
 spelling emitted an external definition and an `inline` function in a shared
 header failed to link.
 
-**Layer 6 — `__builtin_object_size` has to be folded after inlining.** The
+**Layer 6 — `__builtin_va_arg_pack`.** ~~Done.~~ This, not layer 8, was the
+next thing in the way, and this file did not know it. glibc's `bits/stdio2.h`
+forwards `sprintf`/`printf` into the `__*_chk` family with `__va_arg_pack()`,
+and those wrappers are compiled only when `__OPTIMIZE__` is defined — so
+predefining `__OPTIMIZE__` without the builtin failed to compile *any* program
+including `<stdio.h>` with `_FORTIFY_SOURCE`. The claim below that
+`__OPTIMIZE__` and the object-size fold "must land together" was therefore
+wrong twice over: the pairing it named was not the blocking one, and neither
+had to wait for the other.
+
+**Layer 7 — `__OPTIMIZE__`.** Done, with `__OPTIMIZE_SIZE__` and
+`__NO_INLINE__` alongside it. Every row matches gcc; see
+`c17_optimization_macros_match_gcc`.
+
+**Layer 8 — `__builtin_object_size` has to be folded after inlining.** The
 wrapper computes the size of its own `__dest` *parameter*, which is genuinely
 unknown, so the front end folds it to `-1` before the inliner ever runs and the
 `_chk` call is handed `-1` — a value that means "do not check". gcc defers the
@@ -46,11 +85,17 @@ fold until after inlining, when `__dest` is known to be the caller's `buf`.
 Fixing this means carrying the query into the IR and folding it in a
 post-inline pass that can trace a pointer back to its object.
 
-Until layer 6 lands, predefining `__OPTIMIZE__` (which is what makes glibc
-compile the wrappers at all) is a regression rather than a fix: it has been
-implemented and reverted three times, most recently after measuring the
-duplicate-symbol failure that turned out to be layer 5. `__OPTIMIZE__` and
-layer 6 must land together.
+`__OPTIMIZE__` was previously reverted three times, most recently after
+measuring the duplicate-symbol failure that turned out to be layer 5. It is in
+now, and it did not need layer 8 to get there: the fortified wrappers compile,
+link and run, they simply do not check. That is worse than checking and better
+than not compiling, and it is where GCC parity stops.
+
+Layer 8 is the whole remaining job, and it is a real one. There is no IR
+representation for an unresolved builtin query — no opcode, no expression node
+that survives linearization, and no post-inline pointer-provenance analysis to
+build one on. `instcombine` refuses to touch `Call` and every memory-touching
+opcode, and its `Simplification` enum can only copy or fold to a constant.
 
 ### Trigraphs are off by default — decided, not deferred
 
@@ -124,7 +169,12 @@ byte, as gcc does on both targets._
 
 | Area | Divergence |
 |------|-----------|
-| `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
+| `_FORTIFY_SOURCE` | Compiles the wrappers and emits `__*_chk` calls, but still checks nothing. Seven of eight layers are done; the one that remains -- folding `__builtin_object_size` after inlining -- is described above, and is an ordinary compiler feature rather than fortify-specific work |
+| `-Ofast`, `-Oz` | Refused by name with a reason, where gcc and clang accept them. `-Ofast` relaxes IEEE arithmetic and c17 has no fast-math mode to relax into; `-Oz` has no smaller-than-`-Os` tier to select. `-Os` and `-Og` are supported |
+| Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which ISO C Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary. See #C158 |
+| Non-NFC identifiers | GCC warns `-Wnormalized=` when an identifier is not in Normalization Form C; c17 is silent. A diagnostic-quality gap, not a conformance one -- both compile the same program |
+| `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
+| `max_align_t` | `long double` here (16 bytes), a struct of `long long` + `long double` under gcc (32). Both meet the alignment requirement; `sizeof` differs. Implementation-defined (C17 7.19) |
 
 ## GNU extensions: what c17 will and will not grow
 
@@ -428,3 +478,11 @@ work, and were never a claim about the language.
 |-------|------|
 | GCC torture tests (C99 subset) | Not run against c17 |
 | clang test suite (C99 subset) | Not run against c17 |
+
+**Reclassified 2026-08-21.** These are no longer only test-coverage work. A
+hand-written differential probe of nine ordinary constructs against
+`gcc -std=c17`, at `-O0` and `-O2`, found a silent miscompile in its first
+hour (#C155, `&vla`), in a mandated C99 feature that CPython's 40,817 passing
+tests never reach. `gcc.c-torture/execute` is a few thousand self-checking
+programs needing no reference compiler, and is the highest-yield item on this
+page.

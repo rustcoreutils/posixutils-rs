@@ -70,9 +70,26 @@ pub(crate) struct LocalVarInfo {
     /// sizeof(vla_elem_type)` -- a variably-modified type reports a
     /// compile-time size of 0, so without this every such stride would be 0.
     pub(crate) vm_row_dims: Vec<VmDim>,
-    /// True if this local holds a pointer to the actual data (e.g., va_list parameters).
-    /// When true, linearize_lvalue loads the pointer instead of taking the address.
-    pub(crate) is_indirect: bool,
+    /// Where the object lives relative to this local's stack slot.
+    pub(crate) storage: Storage,
+}
+
+/// Where a local's object lives relative to its stack slot.
+#[derive(Clone, Copy)]
+pub(crate) enum Storage {
+    /// The slot *is* the object, so `&x` is the slot's address.
+    InSlot,
+    /// The slot holds a *pointer* to the object, which lives elsewhere: a
+    /// VLA's `alloca`d storage, or the caller's `va_list`. `&x` is that
+    /// pointer's value and has to be loaded; taking the slot's address
+    /// yields a pointer to the pointer, which is what made `&vla` differ
+    /// from the same array decayed.
+    ///
+    /// The [`TypeId`] is the type of the pointer *in the slot*. The two
+    /// producers spell [`LocalVarInfo::typ`] differently -- a `va_list`
+    /// parameter records the pointee there, a VLA records the pointer --
+    /// so deriving it from `typ` cannot be right for both.
+    Indirect(TypeId),
 }
 
 pub(crate) struct ResolvedDesignator {
@@ -1047,7 +1064,10 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vm_row_dims: vec![],
-                        is_indirect: true, // va_list param: local holds a pointer
+                        // va_list param: the slot holds a pointer to the
+                        // caller's va_list, array decay having happened at
+                        // the call site.
+                        storage: Storage::Indirect(ptr_type),
                     },
                 );
             }
@@ -1147,7 +1167,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vm_row_dims: vec![],
-                        is_indirect: false,
+                        storage: Storage::InSlot,
                     },
                 );
             }
@@ -1190,7 +1210,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vm_row_dims: vec![],
-                        is_indirect: false,
+                        storage: Storage::InSlot,
                     },
                 );
             }
@@ -1225,7 +1245,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vm_row_dims: vec![],
-                        is_indirect: false,
+                        storage: Storage::InSlot,
                     },
                 );
             }
@@ -1445,6 +1465,10 @@ impl<'a> Linearizer<'a> {
             ExprKind::VmTypedefExtent(..) => true,
             // A label's address is a constant of the function.
             ExprKind::LabelAddr(_) => true,
+            // The forwarding builtins read the caller's arguments and write
+            // nothing. `VaArgPack` is not a value at all -- the call it sits
+            // in carries it -- but it is no less pure for that.
+            ExprKind::VaArgPack | ExprKind::VaArgPackLen => true,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -1746,12 +1770,13 @@ impl<'a> Linearizer<'a> {
                             unreachable!("static local sentinel without static_locals entry");
                         }
                     }
-                    // Check if this local holds a pointer to the actual data
-                    // (e.g., va_list parameters due to array-to-pointer decay at call site).
-                    // If so, load the pointer instead of taking the address.
-                    if local.is_indirect {
-                        // The local stores a pointer; load and return it
-                        let ptr_type = self.types.pointer_to(local.typ);
+                    // When the slot holds a pointer to the object -- a VLA's
+                    // `alloca`d storage, or a `va_list` parameter -- the
+                    // object's address is that pointer's value, not the
+                    // slot's. Taking the slot's address made `&a` differ from
+                    // `a` for every VLA, so `int (*p)[n] = &a` pointed at the
+                    // pointer and read back garbage.
+                    if let Storage::Indirect(ptr_type) = local.storage {
                         let result = self.alloc_pseudo();
                         let size = self.types.size_bits(ptr_type);
                         self.emit(Instruction::load(result, local.sym, 0, ptr_type, size));
@@ -1818,7 +1843,7 @@ impl<'a> Linearizer<'a> {
                             vla_size_sym: None,
                             vla_elem_type: None,
                             vm_row_dims: vec![],
-                            is_indirect: false,
+                            storage: Storage::InSlot,
                         },
                     );
 
@@ -2271,12 +2296,19 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Peel `Index` nodes off `expr` to reach the object being indexed,
-    /// returning it with the number of index steps that separate them.
+    /// Peel index steps off `expr` to reach the object being indexed,
+    /// returning it with the number of steps that separate them.
     ///
-    /// `b` gives depth 0, `b[i]` gives 1, `b[i][j]` gives 2. Anything that is
-    /// not an identifier under a chain of indexes has no recorded extents, so
-    /// it yields None and the caller falls back to the compile-time size.
+    /// `b` gives depth 0, `b[i]` gives 1, `b[i][j]` gives 2. A dereference is
+    /// an index step too -- 6.5.2.1p2 defines `E1[E2]` as `(*((E1)+(E2)))`,
+    /// so `*p` and `p[0]` are the same expression. Counting only `Index`
+    /// meant the extents were carried on the way in and dropped on the way
+    /// out: `p[0][i][j]` indexed correctly while `(*p)[i][j]` used a stride
+    /// of zero, and `sizeof(*p)` answered 0.
+    ///
+    /// Anything that is not an identifier under such a chain has no recorded
+    /// extents, so it yields None and the caller falls back to the
+    /// compile-time size.
     fn vm_index_base(expr: &Expr) -> Option<(SymbolId, usize)> {
         let mut depth = 0usize;
         let mut cur = expr;
@@ -2287,9 +2319,52 @@ impl<'a> Linearizer<'a> {
                     depth += 1;
                     cur = array;
                 }
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand,
+                } => {
+                    depth += 1;
+                    cur = operand;
+                }
+                // `p + i` and `i + p` denote the same kind of object as `p`,
+                // at the same depth: adding to a pointer does not change what
+                // it points at. Whichever side reaches an object is the
+                // pointer, which needs no type information to decide.
+                // Without this, `(p + 2) - p` found no extents and divided by
+                // a compile-time size of zero, which traps at run time.
+                ExprKind::Binary {
+                    op: BinaryOp::Add | BinaryOp::Sub,
+                    left,
+                    right,
+                } => {
+                    if let Some((sym, extra)) = Self::vm_index_base(left) {
+                        return Some((sym, depth + extra));
+                    }
+                    if let Some((sym, extra)) = Self::vm_index_base(right) {
+                        return Some((sym, depth + extra));
+                    }
+                    return None;
+                }
                 _ => return None,
             }
         }
+    }
+
+    /// Bytes that one step of `ptr_expr` spans, as a run-time value.
+    ///
+    /// A variably-modified pointee reports a compile-time size of 0, so the
+    /// stride has to come from the object's recorded extents. Every place
+    /// that scales by a pointee's size goes through here -- `p[i]`, `p + i`,
+    /// `p - q`, `++p`, `p++`, `p += i` -- because each of them used to work it
+    /// out separately, and fixing three of the six left the other three
+    /// stepping nowhere.
+    pub(crate) fn pointer_step_bytes(&mut self, ptr_expr: &Expr, ptr_typ: TypeId) -> PseudoId {
+        if let Some(stride) = self.vm_index_stride(ptr_expr) {
+            return stride;
+        }
+        let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
+        let elem_size = self.types.size_bits(elem_type) / 8;
+        self.emit_const(elem_size as i128, self.types.long_id)
     }
 
     /// Record the extents of a variably-modified `array_type`, evaluating each
@@ -2886,6 +2961,20 @@ impl<'a> Linearizer<'a> {
         // two-register passing for 9-16 byte structs, we don't implement that yet.
         // For complex types, pass address so codegen can load real/imag into XMM registers
         // For arrays (including VLAs), decay to pointer
+        // `__builtin_va_arg_pack()` is not an argument -- it stands for the
+        // caller's whole argument list, which is not known until the enclosing
+        // function is inlined. Lift it off here and record it on the call; the
+        // inliner appends the real arguments. 6.10 has nothing to say about
+        // this; the rule is GCC's, and GCC likewise allows it only last.
+        let mut ends_with_va_arg_pack = false;
+        let args: &[Expr] = match args.split_last() {
+            Some((last, rest)) if matches!(last.kind, ExprKind::VaArgPack) => {
+                ends_with_va_arg_pack = true;
+                rest
+            }
+            _ => args,
+        };
+
         for (arg_idx, a) in args.iter().enumerate() {
             let mut arg_type = self.expr_type(a);
             let arg_kind = self.types.kind(arg_type);
@@ -3096,6 +3185,7 @@ impl<'a> Linearizer<'a> {
                 )
             };
             call_insn.variadic_arg_start = variadic_arg_start;
+            call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
@@ -3133,6 +3223,7 @@ impl<'a> Linearizer<'a> {
                 )
             };
             call_insn.variadic_arg_start = variadic_arg_start;
+            call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
@@ -3186,9 +3277,7 @@ impl<'a> Linearizer<'a> {
 
         // For pointers, increment/decrement by element size; for others, by 1
         let delta = if is_ptr {
-            let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-            let elem_size = self.types.size_bits(elem_type) / 8;
-            self.emit_const(elem_size as i128, self.types.long_id)
+            self.pointer_step_bytes(operand, typ)
         } else if is_float {
             self.emit_fconst(FloatVal::from_f64(1.0), typ)
         } else {
@@ -3369,12 +3458,7 @@ impl<'a> Linearizer<'a> {
                 64,
             ));
 
-            // Get element size from the pointer type
-            let elem_type = self.types.base_type(left_typ).unwrap_or(self.types.char_id);
-            let elem_size = self.types.size_bits(elem_type) / 8;
-
-            // Divide by element size
-            let scale = self.emit_const(elem_size as i128, self.types.long_id);
+            let scale = self.pointer_step_bytes(left, left_typ);
             let result = self.alloc_pseudo();
             self.emit(Instruction::binop(
                 Opcode::DivS,
@@ -3398,12 +3482,8 @@ impl<'a> Linearizer<'a> {
                 (ptr, right_typ, int)
             };
 
-            // Get element size
-            let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
-            let elem_size = self.types.size_bits(elem_type) / 8;
-
-            // Scale the integer by element size
-            let scale = self.emit_const(elem_size as i128, self.types.long_id);
+            let ptr_expr = if left_is_ptr_or_arr { left } else { right };
+            let scale = self.pointer_step_bytes(ptr_expr, ptr_typ);
             let scaled_offset = self.alloc_pseudo();
             // Extend int_val to 64-bit for proper address arithmetic
             let actual_int_type = if left_is_ptr_or_arr {
@@ -3556,9 +3636,7 @@ impl<'a> Linearizer<'a> {
 
             // Compute new value - for pointers, scale by element size
             let increment = if is_ptr {
-                let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                self.emit_const(elem_size as i128, self.types.long_id)
+                self.pointer_step_bytes(operand, typ)
             } else if is_float {
                 self.emit_fconst(FloatVal::from_f64(1.0), typ)
             } else {
@@ -3803,10 +3881,9 @@ impl<'a> Linearizer<'a> {
                 // va_list is defined as __va_list_tag[1] (an array type), so it decays to
                 // a pointer when used in expressions (C99 6.3.2.1, 7.15.1). A target
                 // whose va_list is itself a pointer falls through to the scalar load.
-                if local.is_indirect {
+                if let Storage::Indirect(ptr_type) = local.storage {
                     // va_list parameter: local holds a pointer to the va_list struct
                     // Load the pointer value (array decay already happened at call site)
-                    let ptr_type = self.types.pointer_to(local.typ);
                     let ptr_size = self.types.size_bits(ptr_type);
                     self.emit(Instruction::load(result, local.sym, 0, ptr_type, ptr_size));
                 } else {
@@ -4992,6 +5069,29 @@ impl<'a> Linearizer<'a> {
         }
 
         match &expr.kind {
+            // `__builtin_va_arg_pack()` is not a value: it stands for the
+            // caller's argument list, and `linearize_call` lifts it off the
+            // argument list into a flag on the call. Reaching here means it
+            // was written somewhere no argument list could carry it.
+            ExprKind::VaArgPack => {
+                crate::diag::error(
+                    expr.pos,
+                    "'__builtin_va_arg_pack' may only appear as the last argument of a call",
+                );
+                self.emit_const(0, self.types.int_id)
+            }
+            // Resolved when the enclosing function is inlined, since it counts
+            // the *caller's* arguments. A leftover is diagnosed after the
+            // inliner runs, by `opt::check_forwarding_resolved`.
+            ExprKind::VaArgPackLen => {
+                let result = self.alloc_reg_pseudo();
+                self.emit(
+                    Instruction::new(Opcode::VaArgPackLen)
+                        .with_target(result)
+                        .with_type_and_size(self.types.int_id, 32),
+                );
+                result
+            }
             // GNU `&&label`. The block already emits an assembly label of
             // exactly this spelling -- `Label::name()` -- and both backends
             // already lower a leading-`.` global to a pc-relative address, so

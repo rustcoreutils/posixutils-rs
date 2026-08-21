@@ -857,39 +857,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.emit(Instruction::load(result, src, 0, typ, size));
                 return result;
             }
-            UnaryOp::PreInc => {
-                let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
-                let increment = if is_ptr {
-                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i128, self.types.long_id)
-                } else if is_float {
-                    self.emit_fconst(FloatVal::from_f64(1.0), typ)
-                } else {
-                    self.emit_const(1, typ)
-                };
-                let opcode = if is_float { Opcode::FAdd } else { Opcode::Add };
-                self.emit(Instruction::binop(
-                    opcode, result, src, increment, typ, size,
-                ));
-                return result;
-            }
-            UnaryOp::PreDec => {
-                let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
-                let decrement = if is_ptr {
-                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i128, self.types.long_id)
-                } else if is_float {
-                    self.emit_fconst(FloatVal::from_f64(1.0), typ)
-                } else {
-                    self.emit_const(1, typ)
-                };
-                let opcode = if is_float { Opcode::FSub } else { Opcode::Sub };
-                self.emit(Instruction::binop(
-                    opcode, result, src, decrement, typ, size,
-                ));
-                return result;
+            // Intercepted in `linearize_unary`, which needs the operand
+            // expression: a pointer's step is not always its pointee's
+            // compile-time size, and a variably-modified one reports 0.
+            UnaryOp::PreInc | UnaryOp::PreDec => {
+                unreachable!("++/-- are lowered before emit_unary")
             }
         };
 
@@ -1718,12 +1690,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Convert RHS to target type if needed (but not for pointer arithmetic)
         let rhs = if is_ptr_arith {
             // For pointer arithmetic, scale the integer by element size
-            let elem_type = self
-                .types
-                .base_type(target_typ)
-                .unwrap_or(self.types.char_id);
-            let elem_size = self.types.size_bits(elem_type) / 8;
-            let scale = self.emit_const(elem_size as i128, self.types.long_id);
+            let scale = self.pointer_step_bytes(target, target_typ);
 
             // Extend the integer to 64-bit for proper arithmetic
             let rhs_extended = self.emit_convert(rhs, value_typ, self.types.long_id);

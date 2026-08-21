@@ -21,6 +21,8 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_va_end",
     "__builtin_va_arg",
     "__builtin_va_copy",
+    "__builtin_va_arg_pack",
+    "__builtin_va_arg_pack_len",
     // Byte swap
     "__builtin_bswap16",
     "__builtin_bswap32",

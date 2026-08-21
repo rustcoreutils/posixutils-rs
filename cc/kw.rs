@@ -250,6 +250,12 @@ define_keywords! {
     (BUILTIN_VA_END,    "__builtin_va_end",   BUILTIN),
     (BUILTIN_VA_ARG,    "__builtin_va_arg",   BUILTIN),
     (BUILTIN_VA_COPY,   "__builtin_va_copy",  BUILTIN),
+    // Forwarding builtins: inside an `always_inline` variadic function these
+    // name the *caller's* variadic arguments, and are resolved when it is
+    // inlined. glibc forwards sprintf/printf into the `__*_chk` family with
+    // them.
+    (BUILTIN_VA_ARG_PACK,     "__builtin_va_arg_pack",     BUILTIN),
+    (BUILTIN_VA_ARG_PACK_LEN, "__builtin_va_arg_pack_len", BUILTIN),
     (BUILTIN_BSWAP16,   "__builtin_bswap16",  BUILTIN),
     (BUILTIN_BSWAP32,   "__builtin_bswap32",  BUILTIN),
     (BUILTIN_BSWAP64,   "__builtin_bswap64",  BUILTIN),

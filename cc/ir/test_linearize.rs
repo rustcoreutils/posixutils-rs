@@ -6416,3 +6416,199 @@ fn test_bitfield_value_mask_covers_the_full_carrier() {
         assert_eq!(m.trailing_ones(), w, "width {w} is not low-contiguous");
     }
 }
+
+/// `vm_index_base` finds the object whose recorded extents give the stride for
+/// a variably-modified type, and counts the index steps that separate them.
+///
+/// A dereference is an index step: 6.5.2.1p2 defines `E1[E2]` as
+/// `(*((E1)+(E2)))`, so `*p` and `p[0]` are the same expression at the same
+/// depth. Counting only `Index` carried the extents in and dropped them out,
+/// which is why `p[0][i][j]` indexed correctly while `(*p)[i][j]` used a
+/// stride of zero and `sizeof(*p)` answered 0.
+#[test]
+fn test_vm_index_base_counts_a_deref_as_an_index_step() {
+    let mut ctx = TestContext::new();
+    let int_t = ctx.int_type();
+    let sym = ctx.var("a", int_t);
+
+    let ident = || Expr {
+        kind: ExprKind::Ident(sym),
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    let zero = || {
+        Box::new(Expr {
+            kind: ExprKind::IntLit(0),
+            typ: Some(int_t),
+            pos: test_pos(),
+        })
+    };
+    let index = |base: Expr| Expr {
+        kind: ExprKind::Index {
+            array: Box::new(base),
+            index: zero(),
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    let deref = |base: Expr| Expr {
+        kind: ExprKind::Unary {
+            op: UnaryOp::Deref,
+            operand: Box::new(base),
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+
+    // The object itself is depth 0.
+    assert_eq!(Linearizer::vm_index_base(&ident()), Some((sym, 0)));
+
+    // `a[0]` and `*a` are the same depth, and so are `a[0][0]`, `(*a)[0]`,
+    // `*(a[0])` and `**a`.
+    assert_eq!(Linearizer::vm_index_base(&index(ident())), Some((sym, 1)));
+    assert_eq!(Linearizer::vm_index_base(&deref(ident())), Some((sym, 1)));
+    for at_two in [
+        index(index(ident())),
+        index(deref(ident())),
+        deref(index(ident())),
+        deref(deref(ident())),
+    ] {
+        assert_eq!(Linearizer::vm_index_base(&at_two), Some((sym, 2)));
+    }
+
+    // Anything else under the chain has no recorded extents, so the caller
+    // must fall back to the compile-time size rather than guess.
+    let not_an_object = Expr {
+        kind: ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand: Box::new(ident()),
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    assert_eq!(Linearizer::vm_index_base(&not_an_object), None);
+    assert_eq!(Linearizer::vm_index_base(&index(not_an_object)), None);
+
+    // A unary operator that is not a dereference is not an index step.
+    let addr_of = Expr {
+        kind: ExprKind::Unary {
+            op: UnaryOp::AddrOf,
+            operand: Box::new(ident()),
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    assert_eq!(Linearizer::vm_index_base(&addr_of), None);
+
+    // Adding to a pointer does not change what it points at, so `p + 2` sits
+    // at the same depth as `p` -- from either side, and for `-` as well.
+    // Without this, `(p + 2) - p` found no extents and divided by a
+    // compile-time size of zero, which traps.
+    let two = || {
+        Box::new(Expr {
+            kind: ExprKind::IntLit(2),
+            typ: Some(int_t),
+            pos: test_pos(),
+        })
+    };
+    let arith = |op, left: Expr, swap: bool| Expr {
+        kind: ExprKind::Binary {
+            op,
+            left: if swap { two() } else { Box::new(left.clone()) },
+            right: if swap { Box::new(left) } else { two() },
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    assert_eq!(
+        Linearizer::vm_index_base(&arith(BinaryOp::Add, ident(), false)),
+        Some((sym, 0))
+    );
+    assert_eq!(
+        Linearizer::vm_index_base(&arith(BinaryOp::Add, ident(), true)),
+        Some((sym, 0))
+    );
+    assert_eq!(
+        Linearizer::vm_index_base(&arith(BinaryOp::Sub, ident(), false)),
+        Some((sym, 0))
+    );
+    // And the steps compose: `(*p + 2)[0]` is two steps from `p`.
+    assert_eq!(
+        Linearizer::vm_index_base(&index(arith(BinaryOp::Add, deref(ident()), false))),
+        Some((sym, 2))
+    );
+    // An arithmetic operator that is not `+`/`-` reaches no object.
+    assert_eq!(
+        Linearizer::vm_index_base(&arith(BinaryOp::Mul, ident(), false)),
+        None
+    );
+}
+
+/// `__builtin_va_arg_pack()` is not an argument: it stands for the caller's
+/// whole argument list, which is unknown until the enclosing function is
+/// inlined. The linearizer therefore lifts it off the argument list and
+/// records it on the call, rather than emitting an operand for it.
+#[test]
+fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
+    use crate::ir::Opcode;
+
+    let mut ctx = TestContext::new();
+    let int_t = ctx.int_type();
+    let name = ctx.str("fwd");
+    let target = ctx.str("target");
+
+    // fwd(): target(1, __builtin_va_arg_pack());
+    let call = Expr {
+        kind: ExprKind::Call {
+            func: Box::new(Expr {
+                kind: ExprKind::Ident(ctx.var("target", int_t)),
+                typ: Some(int_t),
+                pos: test_pos(),
+            }),
+            args: vec![
+                Expr {
+                    kind: ExprKind::IntLit(1),
+                    typ: Some(int_t),
+                    pos: test_pos(),
+                },
+                Expr {
+                    kind: ExprKind::VaArgPack,
+                    typ: Some(ctx.types.void_id),
+                    pos: test_pos(),
+                },
+            ],
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    let _ = target;
+
+    let body = Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(call)))]);
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(make_simple_func(
+            name, body, &ctx.types,
+        ))],
+    };
+    let module = ctx.linearize(&tu);
+
+    let calls: Vec<_> = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .filter(|i| i.op == Opcode::Call)
+        .collect();
+    assert_eq!(calls.len(), 1, "expected one call");
+
+    // The pack is recorded, and contributed no operand: only the `1` is there.
+    assert!(
+        calls[0].ends_with_va_arg_pack,
+        "the call should carry the pack"
+    );
+    assert_eq!(
+        calls[0].src.len(),
+        1,
+        "the pack must not become an argument: {:?}",
+        calls[0].src
+    );
+    assert_eq!(calls[0].arg_types.len(), calls[0].src.len());
+}

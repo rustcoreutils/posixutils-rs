@@ -189,6 +189,184 @@ fn preprocessor_header_name_is_one_token() {
     }
 }
 
+/// C99 6.4.6p3: the six digraphs "behave the same, respectively, as the six
+/// primary tokens ... **except for their spelling**". 6.10.3.2p2 then asks `#`
+/// for "the spelling of the preprocessing token", and `-E` has to round-trip
+/// it. c17 lexed each digraph straight to its primary token, so the spelling
+/// was gone before either could ask: `S(<:1:>)` stringified to `"[1]"` and
+/// `c17 -E` rewrote every digraph in the output.
+#[test]
+fn preprocessor_digraph_spelling_survives() {
+    let r = preprocess_text(
+        "digraph_spelling",
+        "#define S(x) #x\n\
+         a: S(<:1:>)\n\
+         b: S(%:%:)\n\
+         c: S(<% %>)\n\
+         d: <% %> <: :> %: %:%:\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "\"<:1:>\"", "stringified <: :>");
+    assert_has(&r.stdout, "\"%:%:\"", "stringified %:%:");
+    assert_has(&r.stdout, "\"<% %>\"", "stringified <% %>");
+    assert_has(&r.stdout, "<% %> <: :> %: %:%:", "digraphs in plain text");
+    // The primary spellings must not appear where a digraph was written.
+    assert_lacks(
+        &r.stdout,
+        "\"[1]\"",
+        "digraph rewritten to its primary token",
+    );
+    assert_lacks(
+        &r.stdout,
+        "\"##\"",
+        "digraph rewritten to its primary token",
+    );
+}
+
+/// A digraph still *means* its primary token everywhere else (6.4.6p3), so it
+/// has to keep working as syntax, as a directive introducer, and as `##`.
+#[test]
+fn preprocessor_digraphs_still_mean_their_primary_tokens() {
+    let r = preprocess_text(
+        "digraph_meaning",
+        "%:define CAT(a,b) a%:%:b\n\
+         %:define STR(x) %:x\n\
+         int main(void) <% int v<:2:> = <%7,8%>; return CAT(v,)<:0:> + v<:1:> - 15; %>\n\
+         s: STR(q)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "\"q\"", "%: as the stringify operator");
+    assert_has(&r.stdout, "v<:0:>", "%:%: as ## still pastes");
+}
+
+/// C99 6.10.3.1p2 makes `__VA_ARGS__` stand for the *whole* variadic token
+/// sequence, commas included. c17 stringified only its first element, so
+/// `#define V(...) #__VA_ARGS__` turned `V(1,2,3)` into `"1"` -- everything
+/// after the first comma silently gone, with no diagnostic. The idiom is
+/// common in logging macros.
+#[test]
+fn preprocessor_stringified_va_args_keeps_every_argument() {
+    let r = preprocess_text(
+        "va_args_stringify",
+        "#define V(...) #__VA_ARGS__\n\
+         #define W(a, ...) a: #__VA_ARGS__\n\
+         #define X(...) __VA_ARGS__\n\
+         A V(1,2,3)\n\
+         B V(1)\n\
+         C V()\n\
+         D W(k, 1,2)\n\
+         E X(1,2,3)\n\
+         F V(f(1,2),3)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "A \"1,2,3\"", "all variadic arguments");
+    assert_has(&r.stdout, "B \"1\"", "one variadic argument");
+    assert_has(&r.stdout, "C \"\"", "no variadic arguments");
+    assert_has(
+        &r.stdout,
+        "D k: \"1,2\"",
+        "named parameter before the variadic ones",
+    );
+    assert_has(
+        &r.stdout,
+        "E 1,2,3",
+        "unstringified __VA_ARGS__ does not gain spaces",
+    );
+    assert_has(
+        &r.stdout,
+        "F \"f(1,2),3\"",
+        "a parenthesised comma is not a separator",
+    );
+}
+
+/// `__VA_ARGS__` is spaced as it was written in the macro *body*, like every
+/// other body token. Taking the spacing from the invocation instead ran the
+/// expansion into the token before it.
+#[test]
+fn preprocessor_va_args_takes_the_body_spacing() {
+    let r = preprocess_text(
+        "va_args_spacing",
+        "#define F(...) x __VA_ARGS__\n#define G(...) (__VA_ARGS__)\n\
+         A F(*p)\nB F(y)\nC G(y)\nD G(1,2)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "A x *p", "a space in the body is kept");
+    assert_has(&r.stdout, "B x y", "and still separates identifiers");
+    // No space in the body, and none invented.
+    assert_has(&r.stdout, "C (y)", "no space where the body had none");
+    assert_has(&r.stdout, "D (1,2)", "nor around the separators");
+}
+
+/// Pins a known divergence, so closing it is a deliberate change.
+///
+/// The argument splitter discards the separating comma, so the white space
+/// that preceded it is gone by the time `#__VA_ARGS__` rebuilds the sequence:
+/// `V(a , b)` stringifies as `"a, b"` where GCC gives `"a , b"`. Everything
+/// else about the sequence is right; only the space *before* a separator is
+/// lost, and only when the source writes one.
+#[test]
+fn preprocessor_va_args_loses_space_before_a_separator() {
+    let r = preprocess_text(
+        "va_args_sep_space",
+        "#define V(...) #__VA_ARGS__\nA V(a , b)\nB V(a, b)\nC V(a ,b)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    // What GCC gives is "a , b"; c17 drops the space before the comma.
+    assert_has(&r.stdout, "A \"a, b\"", "space before a separator");
+    // Space *after* a separator is preserved, and so is its absence.
+    assert_has(&r.stdout, "B \"a, b\"", "space after a separator");
+    assert_has(&r.stdout, "C \"a,b\"", "no space around a separator");
+}
+
+/// A non-ASCII byte outside a literal lexes as its own single-character
+/// punctuator, so its value is a source *byte*. Both consumers of a
+/// punctuator's spelling have to keep that apart from text: `#`
+/// stringification builds a payload (one `char` per byte), and a `#error`
+/// message is assembled from bytes and decoded once at the end.
+///
+/// Rendering the byte through a Rust `String` UTF-8-encodes it. Doing that
+/// inside stringification doubled it; doing it per-token in the message
+/// renderer left a replacement character, because one byte of a multi-byte
+/// character is not valid UTF-8 on its own.
+#[test]
+fn preprocessor_non_ascii_punctuator_bytes_survive() {
+    let r = preprocess_text(
+        "punct_bytes",
+        "#define S(x) #x\nA S(café)\nB S(a<:1:>b)\nC S(a >> b)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "A \"café\"", "stringified non-ASCII bytes");
+    assert_lacks(&r.stdout, "Ã", "double-encoded UTF-8");
+    assert_lacks(&r.stdout, "\u{fffd}", "a byte lost to lossy decoding");
+    // The text spellings still work.
+    assert_has(&r.stdout, "B \"a<:1:>b\"", "digraph spelling");
+    assert_has(&r.stdout, "C \"a >> b\"", "multi-character operator");
+}
+
+/// The same bytes in a `#error` message, which is assembled by a different
+/// renderer and so needs the same care.
+#[test]
+fn preprocessor_error_message_keeps_non_ascii_bytes() {
+    let r = preprocess_text("err_bytes", "#error café is bad\n", &[]);
+    assert!(!r.success, "#error must fail the run");
+    assert!(
+        r.stderr.contains("café is bad"),
+        "expected the message verbatim, got:\n{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains('\u{fffd}'),
+        "a byte was lost to lossy decoding:\n{}",
+        r.stderr
+    );
+}
+
 // ============================================================================
 // #P2 — the null directive
 // ============================================================================

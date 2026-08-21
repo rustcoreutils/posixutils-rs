@@ -572,6 +572,8 @@ fn process_file(
             no_builtin_inc: false,
             trigraphs: false,
             preprocessed: false,
+            // Not a compiler: nothing here optimizes, so nothing claims to.
+            optimization: Default::default(),
         },
     );
 

@@ -14,6 +14,8 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 | `__builtin_va_arg(ap, type)` | Get next arg of `type`, advance va_list |
 | `__builtin_va_end(ap)` | Clean up va_list |
 | `__builtin_va_copy(dest, src)` | Copy va_list |
+| `__builtin_va_arg_pack()` | The caller's variadic arguments, spliced in at the call site. Only in an `always_inline` variadic function, and only as the last argument of a call |
+| `__builtin_va_arg_pack_len()` | How many arguments the pack stands for. Same restriction |
 
 ## Byte Swapping
 
@@ -204,12 +206,14 @@ These exist so glibc's fortified headers compile: with `_FORTIFY_SOURCE` set,
 `__builtin_object_size` computes real sizes — 10 for a `char[10]` — and the
 `_chk` family has the implicit declarations glibc's headers expect.
 
-**Limit:** `-D_FORTIFY_SOURCE=2` still buys nothing, but no longer because of
-these builtins. c17 does not predefine `__OPTIMIZE__`, without which glibc
-compiles no fortified wrapper at all; and enabling it needs
-`__builtin_object_size` folded *after* inlining, since the wrapper measures its
-own parameter and would otherwise be handed "unknown". See `#C12` in
-`../audit.md` and the `_FORTIFY_SOURCE` entry in `TODO.md`.
+**Limit:** `-D_FORTIFY_SOURCE=2` now compiles glibc's fortified wrappers and
+emits `__*_chk` calls -- `__OPTIMIZE__` is predefined, and
+`__builtin_va_arg_pack` makes their argument forwarding compile. It still does
+not *check*: `__builtin_object_size` is folded at parse time, where a wrapper
+measuring its own parameter can only answer "unknown", and folding it after
+inlining is the remaining work. See the `_FORTIFY_SOURCE` entry in `TODO.md`,
+which is where this is tracked; it was also `#C12` in `../audit.md` until that
+file was narrowed to conformance findings alone.
 
 ## C11 Atomic Builtins
 
@@ -243,7 +247,7 @@ system header takes.
 |---------|-------------|
 | `__builtin_classify_type` | Needed by the host's `<tgmath.h>`; c17 bundles its own, built on `_Generic`, so this is not a blocker. `__has_builtin` answers 0, so guarded code is already correct |
 | `__builtin_clear_padding` | Would have to walk a type to find its padding |
-| `__builtin_setjmp`, `__builtin_va_arg_pack` | Not implemented; the ordinary `setjmp`/`longjmp` are |
+| `__builtin_setjmp` | Not implemented; the ordinary `setjmp`/`longjmp` are |
 
 `__real__` and `__imag__` used to be listed here and are **implemented** — see
 `#C29` in `../audit.md`.

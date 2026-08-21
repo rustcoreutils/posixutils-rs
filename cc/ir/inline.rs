@@ -23,6 +23,7 @@
 use super::{
     BasicBlock, BasicBlockId, Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind,
 };
+use crate::opt::Optimization;
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -199,7 +200,7 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
 /// - Recursive callers get an estimated-stack check (LLVM-style)
 fn should_inline(
     candidate: &InlineCandidate,
-    opt_level: u32,
+    opt: Optimization,
     caller_size: usize,
     caller_is_recursive: bool,
 ) -> bool {
@@ -246,7 +247,7 @@ fn should_inline(
     let forced = candidate.is_always_inline;
 
     // At -O0, inline nothing but the forced functions.
-    if opt_level == 0 && !forced {
+    if !opt.inlines_generally() && !forced {
         return false;
     }
 
@@ -288,7 +289,7 @@ fn should_inline(
         || (candidate.has_inline_hint && candidate.estimated_size <= HINT_INLINE_SIZE)
     {
         true
-    } else if opt_level >= 2 {
+    } else if opt.inlines_aggressively() {
         if candidate.call_count == 1 && candidate.estimated_size <= MAX_INLINE_SIZE {
             true
         } else {
@@ -324,6 +325,14 @@ fn should_inline(
 // ============================================================================
 
 /// Context for cloning a function body into caller
+/// The caller's variadic arguments, for `__builtin_va_arg_pack()`.
+#[derive(Default, Clone)]
+struct ForwardedArgs {
+    vals: Vec<PseudoId>,
+    types: Vec<crate::types::TypeId>,
+    classes: Vec<crate::abi::ArgClass>,
+}
+
 struct InlineContext {
     /// Map from callee PseudoId to caller PseudoId
     pseudo_map: HashMap<PseudoId, PseudoId>,
@@ -338,6 +347,14 @@ struct InlineContext {
     next_bb_id: u32,
     /// Arguments passed at the call site (replace Arg(n) with these)
     call_args: Vec<PseudoId>,
+    /// The outer call's variadic arguments -- everything past the callee's
+    /// declared parameters -- with the type and ABI class each was given.
+    ///
+    /// This is what `__builtin_va_arg_pack()` stands for. The three vectors
+    /// are parallel and are indexed in parallel by both backends, and the
+    /// classes are *copied* rather than recomputed because this pass has no
+    /// TypeTable or Target to recompute them from.
+    forwarded: ForwardedArgs,
     /// Block to jump to after inlined function returns
     return_continuation_bb: BasicBlockId,
     /// Pseudo to store return value (if any)
@@ -370,6 +387,11 @@ struct InlineContext {
     /// Pseudos allocated as PhiSource targets in the cloned Ret blocks.
     /// Added to the caller alongside other inlined pseudos.
     phisrc_pseudos: Vec<Pseudo>,
+    /// Value pseudos created while cloning -- a constant's value lives on its
+    /// pseudo, not on the instruction, so resolving
+    /// `__builtin_va_arg_pack_len()` makes one. Added to the caller with the
+    /// rest.
+    const_pseudos: Vec<Pseudo>,
 }
 
 /// Global counter for unique inline IDs
@@ -385,6 +407,7 @@ impl InlineContext {
         caller: &Function,
         callee: &Function,
         call_args: Vec<PseudoId>,
+        forwarded: ForwardedArgs,
         return_continuation_bb: BasicBlockId,
         return_target: Option<PseudoId>,
     ) -> Self {
@@ -402,6 +425,7 @@ impl InlineContext {
             next_pseudo_id: caller.next_pseudo,
             next_bb_id: max_bb + 1,
             call_args,
+            forwarded,
             return_continuation_bb,
             return_target,
             inline_id: next_inline_id(),
@@ -412,6 +436,7 @@ impl InlineContext {
             ret_typ: None,
             ret_size: 0,
             phisrc_pseudos: Vec::new(),
+            const_pseudos: Vec::new(),
         }
     }
 
@@ -720,8 +745,46 @@ fn clone_instruction(
             new_insn.indirect_target = insn
                 .indirect_target
                 .map(|t| ctx.remap_pseudo(t, callee_func));
+
+            // `f(a, __builtin_va_arg_pack())`: the caller's variadic
+            // arguments belong on the end, and now they are known. `src`,
+            // `arg_types` and `abi_info.params` are parallel and indexed in
+            // parallel by both backends, so all three grow together.
+            if new_insn.ends_with_va_arg_pack {
+                new_insn.src.extend_from_slice(&ctx.forwarded.vals);
+                new_insn.arg_types.extend_from_slice(&ctx.forwarded.types);
+                if let Some(abi) = new_insn.abi_info.as_mut() {
+                    abi.params.extend_from_slice(&ctx.forwarded.classes);
+                }
+                // Anything spliced in is variadic by construction: it came
+                // from past the callee's declared parameters. If the inner
+                // call had no variadic tail of its own, one starts here.
+                let fixed = new_insn.src.len() - ctx.forwarded.vals.len();
+                new_insn.variadic_arg_start =
+                    Some(new_insn.variadic_arg_start.unwrap_or(fixed).min(fixed));
+                new_insn.ends_with_va_arg_pack = false;
+            }
+
             // Keep func_name and other call metadata unchanged
             vec![new_insn]
+        }
+
+        // `__builtin_va_arg_pack_len()`: how many arguments the pack stands
+        // for, which is a constant now that the call site is known.
+        Opcode::VaArgPackLen => {
+            let count = ctx.forwarded.vals.len() as i128;
+            let target = match insn.target.map(|t| ctx.remap_pseudo(t, callee_func)) {
+                Some(t) => t,
+                None => return Vec::new(),
+            };
+            // A constant carries its value on the pseudo, so the pseudo has
+            // to be replaced rather than reused.
+            ctx.const_pseudos.push(Pseudo::val(target, count));
+            let mut set = Instruction::new(Opcode::SetVal);
+            set.target = Some(target);
+            set.typ = insn.typ;
+            set.size = insn.size;
+            vec![set]
         }
 
         // SymAddr on an Arg pseudo: after inlining, the Arg maps to call_args[n]
@@ -908,11 +971,33 @@ fn inline_call_site(
     let return_target = call_insn.target;
     let call_bb_id = call_bb.id;
 
+    // Everything the caller passed past the callee's declared parameters is
+    // what `__builtin_va_arg_pack()` inside the callee stands for. Its type
+    // and ABI class come along, because this pass cannot recompute them.
+    let forwarded = {
+        let first = callee.params.len();
+        let classes = call_insn
+            .abi_info
+            .as_ref()
+            .map(|abi| abi.params.clone())
+            .unwrap_or_default();
+        ForwardedArgs {
+            vals: call_insn.src.get(first..).unwrap_or_default().to_vec(),
+            types: call_insn
+                .arg_types
+                .get(first..)
+                .unwrap_or_default()
+                .to_vec(),
+            classes: classes.get(first..).unwrap_or_default().to_vec(),
+        }
+    };
+
     // Initialize inline context (continuation_bb_id will be allocated after callee BBs)
     let mut ctx = InlineContext::new(
         caller,
         callee,
         call_args,
+        forwarded,
         BasicBlockId(0), // Placeholder, will be set after allocating callee BBs
         return_target,
     );
@@ -1081,6 +1166,12 @@ fn inline_call_site(
     for pseudo in implicit_copy_pseudos {
         caller.add_pseudo(pseudo);
     }
+    // Add value pseudos for constants materialized while cloning, replacing
+    // the placeholder the clone made for the same id.
+    for pseudo in std::mem::take(&mut ctx.const_pseudos) {
+        caller.pseudos.retain(|p| p.id != pseudo.id);
+        caller.add_pseudo(pseudo);
+    }
     // Add PhiSource target pseudos generated for the return-value Phi.
     for pseudo in std::mem::take(&mut ctx.phisrc_pseudos) {
         if !caller.pseudos.iter().any(|p| p.id == pseudo.id) {
@@ -1218,8 +1309,8 @@ fn reorder_blocks_topologically(func: &mut Function) {
 /// `__attribute__((always_inline))` functions. gcc honours that attribute with
 /// optimization off, and code that uses it -- inline assembly wrappers,
 /// intrinsics headers -- is usually relying on the body being spliced in.
-pub fn run(module: &mut Module, opt_level: u32) -> bool {
-    if opt_level == 0 && !module.functions.iter().any(|f| f.is_always_inline) {
+pub fn run(module: &mut Module, opt: Optimization) -> bool {
+    if !opt.inlines_generally() && !module.functions.iter().any(|f| f.is_always_inline) {
         return false;
     }
 
@@ -1261,12 +1352,7 @@ pub fn run(module: &mut Module, opt_level: u32) -> bool {
                     if insn.op == Opcode::Call {
                         if let Some(callee_name) = &insn.func_name {
                             if let Some(candidate) = candidates.get(callee_name) {
-                                if should_inline(
-                                    candidate,
-                                    opt_level,
-                                    caller_size,
-                                    caller_is_recursive,
-                                ) {
+                                if should_inline(candidate, opt, caller_size, caller_is_recursive) {
                                     // Don't inline recursive calls
                                     if *callee_name != caller_name {
                                         call_sites.push((bb_idx, insn_idx, callee_name.clone()));
@@ -1325,7 +1411,7 @@ pub fn run(module: &mut Module, opt_level: u32) -> bool {
     // optimization in its own right, and at -O0 gcc still emits one. Running
     // it here just because an `always_inline` callee brought us into this pass
     // would delete unrelated functions the user asked to keep.
-    if any_changed && opt_level > 0 {
+    if any_changed && opt.optimizes() {
         remove_dead_functions(module);
     }
 
@@ -1430,6 +1516,11 @@ fn remove_dead_functions(module: &mut Module) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-O<level>`, for the decisions `should_inline` reads off it.
+    fn opt_at(level: u8) -> Optimization {
+        Optimization::from_flag(&level.to_string()).expect("valid level")
+    }
     use crate::ir::{GlobalDef, Initializer};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -1494,7 +1585,7 @@ mod tests {
         };
 
         // Small function should always inline at -O1
-        assert!(should_inline(&candidate, 1, 100, false));
+        assert!(should_inline(&candidate, opt_at(1), 100, false));
     }
 
     #[test]
@@ -1513,7 +1604,7 @@ mod tests {
         };
 
         // Varargs functions should never inline
-        assert!(!should_inline(&candidate, 2, 100, false));
+        assert!(!should_inline(&candidate, opt_at(2), 100, false));
     }
 
     #[test]
@@ -1532,7 +1623,7 @@ mod tests {
         };
 
         // Recursive functions should not inline
-        assert!(!should_inline(&candidate, 2, 100, false));
+        assert!(!should_inline(&candidate, opt_at(2), 100, false));
     }
 
     #[test]
@@ -1551,7 +1642,7 @@ mod tests {
         };
 
         // Should not inline at -O0
-        assert!(!should_inline(&candidate, 0, 100, false));
+        assert!(!should_inline(&candidate, opt_at(0), 100, false));
     }
 
     #[test]
@@ -1570,14 +1661,14 @@ mod tests {
         };
 
         // 30 instructions with inline hint should inline
-        assert!(should_inline(&candidate, 1, 100, false));
+        assert!(should_inline(&candidate, opt_at(1), 100, false));
 
         // Without hint, 30 instructions is too large
         let candidate_no_hint = InlineCandidate {
             has_inline_hint: false,
             ..candidate
         };
-        assert!(!should_inline(&candidate_no_hint, 1, 100, false));
+        assert!(!should_inline(&candidate_no_hint, opt_at(1), 100, false));
     }
 
     #[test]
@@ -1844,9 +1935,10 @@ mod tests {
         let mut ctx = InlineContext::new(
             &caller,
             &callee,
-            vec![],           // no call args
-            BasicBlockId(99), // return continuation
-            None,             // no return target
+            vec![],                   // no call args
+            ForwardedArgs::default(), // nothing forwarded
+            BasicBlockId(99),         // return continuation
+            None,                     // no return target
         );
 
         // Build a PhiSource instruction to clone:

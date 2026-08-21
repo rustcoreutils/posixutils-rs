@@ -417,6 +417,19 @@ pub enum ExprKind {
         ap: Box<Expr>,
     },
 
+    /// `__builtin_va_arg_pack()` -- the caller's variadic arguments.
+    ///
+    /// Only meaningful as the last argument of a call inside an
+    /// `always_inline` variadic function, and only resolvable once that
+    /// function is inlined, since it names the *caller's* arguments. The
+    /// linearizer turns it into a flag on the call rather than an argument;
+    /// the inliner then splices the real ones in.
+    VaArgPack,
+
+    /// `__builtin_va_arg_pack_len()` -- how many arguments [`ExprKind::VaArgPack`]
+    /// stands for. Constant at the call site, but not before inlining.
+    VaArgPackLen,
+
     /// __builtin_va_copy(dest, src)
     /// Copies a va_list
     VaCopy {

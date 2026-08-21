@@ -19,6 +19,7 @@ mod complex;
 mod complex_abi;
 mod expressions;
 mod features;
+mod identifiers;
 mod initializers;
 mod stdlib_headers;
 mod translation_limits;

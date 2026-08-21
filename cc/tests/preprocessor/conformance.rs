@@ -282,6 +282,25 @@ fn preprocessor_stringified_va_args_keeps_every_argument() {
     );
 }
 
+/// `__VA_ARGS__` is spaced as it was written in the macro *body*, like every
+/// other body token. Taking the spacing from the invocation instead ran the
+/// expansion into the token before it.
+#[test]
+fn preprocessor_va_args_takes_the_body_spacing() {
+    let r = preprocess_text(
+        "va_args_spacing",
+        "#define F(...) x __VA_ARGS__\n#define G(...) (__VA_ARGS__)\n\
+         A F(*p)\nB F(y)\nC G(y)\nD G(1,2)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "A x *p", "a space in the body is kept");
+    assert_has(&r.stdout, "B x y", "and still separates identifiers");
+    // No space in the body, and none invented.
+    assert_has(&r.stdout, "C (y)", "no space where the body had none");
+    assert_has(&r.stdout, "D (1,2)", "nor around the separators");
+}
+
 /// Pins a known divergence, so closing it is a deliberate change.
 ///
 /// The argument splitter discards the separating comma, so the white space

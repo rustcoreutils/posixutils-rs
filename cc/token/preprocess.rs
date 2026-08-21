@@ -3785,9 +3785,14 @@ impl<'a> Preprocessor<'a> {
                             }
                         }
                     }
-                    // The sequence as a whole sits where __VA_ARGS__ did.
+                    // The sequence as a whole is spaced as `__VA_ARGS__` was
+                    // in the macro body -- `mt.whitespace`, the same source
+                    // every other body token uses through
+                    // `macro_token_to_token`. Taking it from `pos` used the
+                    // *invocation's* spacing instead, so `#define F(...) x
+                    // __VA_ARGS__` expanded `F(*p)` to `x*p`.
                     if let Some(first) = result.get_mut(va_start) {
-                        first.pos.whitespace = pos.whitespace;
+                        first.pos.whitespace = mt.whitespace;
                     }
                 }
                 _ => {

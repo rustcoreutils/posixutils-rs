@@ -216,6 +216,10 @@ impl Macro {
                             TokenValue::WideChar(c)
                             | TokenValue::Utf16Char(c)
                             | TokenValue::Utf32Char(c) => MacroTokenValue::Char(c.clone()),
+                            // A header name cannot occur in a macro body --
+                            // one is lexed only inside #include -- but the
+                            // type carries it back either way.
+                            TokenValue::HeaderName(h) => MacroTokenValue::String(h.clone()),
                             TokenValue::None => MacroTokenValue::None,
                         };
                         MacroToken {
@@ -1973,6 +1977,7 @@ impl<'a> Preprocessor<'a> {
             TokenValue::WideChar(c) | TokenValue::Utf16Char(c) | TokenValue::Utf32Char(c) => {
                 MacroTokenValue::Char(c.clone())
             }
+            TokenValue::HeaderName(h) => MacroTokenValue::String(h.clone()),
             TokenValue::None => MacroTokenValue::None,
         };
 
@@ -2275,6 +2280,21 @@ impl<'a> Preprocessor<'a> {
         if tokens.is_empty() {
             return (String::new(), false);
         }
+
+        // A header name the lexer already recognised (C99 6.4.7): one token,
+        // delimiters included, with nothing inside it reinterpreted.
+        if let TokenValue::HeaderName(h) = &tokens[0].value {
+            let spelled = payload_text(h);
+            let is_system = spelled.starts_with('<');
+            let name = spelled
+                .strip_prefix(['<', '"'])
+                .and_then(|r| r.strip_suffix(['>', '"']))
+                .unwrap_or(&spelled);
+            return (name.to_string(), is_system);
+        }
+
+        // Otherwise the header name came out of a macro expansion, and has to
+        // be reassembled from whatever tokens it expanded to.
 
         // Check for <filename>
         if let TokenValue::Special(code) = &tokens[0].value {
@@ -3910,6 +3930,7 @@ impl<'a> Preprocessor<'a> {
                 TokenType::WideString => TokenValue::WideString(s.clone()),
                 TokenType::Utf16String => TokenValue::Utf16String(s.clone()),
                 TokenType::Utf32String => TokenValue::Utf32String(s.clone()),
+                TokenType::HeaderName => TokenValue::HeaderName(s.clone()),
                 _ => TokenValue::String(s.clone()),
             },
             MacroTokenValue::Char(c) => match mt.typ {

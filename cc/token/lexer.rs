@@ -40,6 +40,26 @@ pub enum LexerMode {
     Assembly,
 }
 
+/// Where a header name (C99 6.4.7) may appear.
+///
+/// A header name is one preprocessing token, but only in a `#include`,
+/// `#include_next` or `#import` directive and inside `__has_include(...)`.
+/// Everywhere else `<` and `"` mean what they always mean, so the lexer has
+/// to be told which it is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderNamePos {
+    /// Not in a directive that can contain one.
+    No,
+    /// A `#` has just started a line.
+    AfterHash,
+    /// Inside `#if`/`#elif`, where `__has_include(` can introduce one.
+    InCondition,
+    /// `__has_include` seen inside a condition; a `(` opens the header name.
+    AfterHasInclude,
+    /// The next token is a header name if it opens with `<` or `"`.
+    Expect { in_condition: bool },
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -132,6 +152,14 @@ pub enum TokenType {
     Utf16String,
     /// `U"..."` — a `char32_t` string literal.
     Utf32String,
+    /// A header name: `<stdio.h>` or `"local.h"` (C99 6.4.7).
+    ///
+    /// One preprocessing token, delimiters and all, and only where a header
+    /// name can appear -- after `#include` and inside `__has_include`. None
+    /// of the ordinary rules apply between the delimiters, so lexing the
+    /// characters as tokens destroyed any header whose name contained `//`
+    /// or an apostrophe.
+    HeaderName,
     Special,
     StreamBegin,
     StreamEnd,
@@ -385,6 +413,10 @@ pub enum TokenValue {
     Utf16Char(String),
     /// `U'x'` content.
     Utf32Char(String),
+    /// A header name (C99 6.4.7), spelling and delimiters included, as in
+    /// `<stdio.h>` or `"local.h"`. A payload like the literals above: one
+    /// `char` per source byte.
+    HeaderName(String),
 }
 
 // ============================================================================
@@ -1262,12 +1294,96 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         self.get_special(c, class)
     }
 
+    /// Lex a header name (C99 6.4.7), the opening delimiter already consumed.
+    ///
+    /// Between the delimiters the source is one preprocessing token: `//` is
+    /// not a comment, `'` does not open a character literal, and `\` is not
+    /// an escape. Lexing those as ordinary tokens destroyed the directive --
+    /// `#include <sys//types.h>` lost everything after the `//`, and
+    /// `#include <it's.h>` opened a literal that ate the rest of the file.
+    ///
+    /// Returns `None` when no closing delimiter arrives before the end of the
+    /// line, leaving the characters to be lexed as before. The whole file is
+    /// tokenized up front, including `#if 0` blocks full of prose, so a run
+    /// that is not a header name has to lex the way it always did.
+    fn try_get_header_name(&mut self, open: u8) -> Option<Token> {
+        let close = if open == b'<' { b'>' } else { b'"' };
+
+        let mut peek = self.peek_at(self.offset);
+        let mut len = 0;
+        loop {
+            match peek.next() {
+                None | Some(b'\n') => return None,
+                Some(c) => {
+                    len += 1;
+                    if c == close {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let pos = self.pos();
+        let mut spelling = String::with_capacity(len + 1);
+        spelling.push(open as char);
+        for _ in 0..len {
+            spelling.push(self.nextchar() as u8 as char);
+        }
+        Some(Token::with_value(
+            TokenType::HeaderName,
+            pos,
+            TokenValue::HeaderName(spelling),
+        ))
+    }
+
+    /// Advance the header-name state machine past `token`.
+    fn next_header_name_pos(&self, state: HeaderNamePos, token: &Token) -> HeaderNamePos {
+        use HeaderNamePos::*;
+
+        let ident = match &token.value {
+            TokenValue::Ident(id) => Some(self.strings.get(*id)),
+            _ => None,
+        };
+        let is_punct = |c: u8| matches!(&token.value, TokenValue::Special(v) if *v == c as u32);
+
+        // A `#` starting a line restarts the machine wherever it was.
+        if token.pos.newline && is_punct(b'#') {
+            return AfterHash;
+        }
+
+        match state {
+            No => No,
+            AfterHash => match ident {
+                Some("include" | "include_next" | "import") => Expect {
+                    in_condition: false,
+                },
+                Some("if" | "elif") => InCondition,
+                _ => No,
+            },
+            InCondition | AfterHasInclude => match ident {
+                Some("__has_include" | "__has_include_next") => AfterHasInclude,
+                None if state == AfterHasInclude && is_punct(b'(') => Expect { in_condition: true },
+                _ => InCondition,
+            },
+            // A condition may name more than one header.
+            Expect { in_condition } => {
+                if in_condition {
+                    InCondition
+                } else {
+                    No
+                }
+            }
+        }
+    }
+
     /// Tokenize the entire input, returning all tokens
     pub fn tokenize(&mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
 
         // Add stream begin token
         tokens.push(Token::new(TokenType::StreamBegin, self.pos()));
+
+        let mut header_pos = HeaderNamePos::No;
 
         loop {
             // Skip whitespace - this updates newline/whitespace flags
@@ -1286,10 +1402,21 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             let newline = std::mem::take(&mut self.newline);
             let whitespace = std::mem::take(&mut self.whitespace);
 
-            match self.get_one_token(c as u8) {
+            // C99 6.4.7: where a header name can appear, it is one token and
+            // none of the ordinary rules apply inside it.
+            let header = matches!(header_pos, HeaderNamePos::Expect { .. })
+                && (c == b'<' as i32 || c == b'"' as i32);
+            let token = if header {
+                self.try_get_header_name(c as u8)
+            } else {
+                None
+            };
+
+            match token.or_else(|| self.get_one_token(c as u8)) {
                 Some(mut token) => {
                     token.pos.newline = newline;
                     token.pos.whitespace = whitespace;
+                    header_pos = self.next_header_name_pos(header_pos, &token);
                     tokens.push(token);
                 }
                 // A comment produced no token. It is transparent to
@@ -1411,7 +1538,13 @@ pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
             out.extend(payload_bytes(payload));
             out.push(delim);
         }
-        None => out.extend_from_slice(show_other_token(token, strings).as_bytes()),
+        // A header name already carries its own delimiters.
+        None => match &token.value {
+            TokenValue::HeaderName(h) if token.typ == TokenType::HeaderName => {
+                out.extend(payload_bytes(h))
+            }
+            _ => out.extend_from_slice(show_other_token(token, strings).as_bytes()),
+        },
     }
 }
 
@@ -1459,6 +1592,13 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
                 "<special?>".to_string()
             }
         }
+        TokenType::HeaderName => {
+            if let TokenValue::HeaderName(h) = &token.value {
+                payload_text(h)
+            } else {
+                "<header?>".to_string()
+            }
+        }
         // A literal type reaches here only when its value does not match.
         typ => format!("<{}?>", token_type_name(typ).to_lowercase()),
     }
@@ -1478,6 +1618,7 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
         TokenType::Utf32Char => "U32CHAR",
         TokenType::Utf16String => "U16STRING",
         TokenType::Utf32String => "U32STRING",
+        TokenType::HeaderName => "HEADER_NAME",
         TokenType::Special => "SPECIAL",
         TokenType::StreamBegin => "STREAM_BEGIN",
         TokenType::StreamEnd => "STREAM_END",
@@ -1827,13 +1968,70 @@ mod tests {
 
     #[test]
     fn test_preprocessor_tokens() {
+        // C99 6.4.7: the header name is one preprocessing token, delimiters
+        // included. Lexed as `<`, `stdio`, `.`, `h`, `>` it had to be
+        // reassembled afterwards, and anything the ordinary rules touched --
+        // a `//`, an apostrophe -- never survived to be reassembled.
         let (tokens, idents) = tokenize_str("#include <stdio.h>");
         let toks: Vec<_> = tokens[1..tokens.len() - 1]
             .iter()
             .map(|t| show_token(t, &idents))
             .collect();
-        // # include < stdio . h >
-        assert_eq!(toks, vec!["#", "include", "<", "stdio", ".", "h", ">"]);
+        assert_eq!(toks, vec!["#", "include", "<stdio.h>"]);
+        assert_eq!(tokens[3].typ, TokenType::HeaderName);
+    }
+
+    #[test]
+    fn test_header_name_is_opaque() {
+        for src in [
+            "#include <sys//types.h>",
+            "#include <it's.h>",
+            "#include \"it's.h\"",
+            "#include <a\\b.h>",
+            "#include <a /* not a comment */ b.h>",
+        ] {
+            let (tokens, idents) = tokenize_str(src);
+            assert_eq!(
+                tokens[3].typ,
+                TokenType::HeaderName,
+                "not lexed as a header name: {src}"
+            );
+            let spelled = show_token(&tokens[3], &idents);
+            assert_eq!(spelled, &src["#include ".len()..], "wrong spelling: {src}");
+            // Nothing follows it on the line.
+            assert_eq!(
+                tokens[4].typ,
+                TokenType::StreamEnd,
+                "trailing tokens: {src}"
+            );
+        }
+
+        // `__has_include` in a condition takes one too, and more than one.
+        let (tokens, idents) = tokenize_str("#if __has_include(<a//b.h>) && __has_include(<c.h>)");
+        let headers: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.typ == TokenType::HeaderName)
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(headers, vec!["<a//b.h>", "<c.h>"]);
+    }
+
+    #[test]
+    fn test_header_name_only_where_one_can_appear() {
+        // A `<` outside a header-name context is the operator it always was.
+        let (tokens, idents) = tokenize_str("if (a<b.c>d) x;");
+        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
+        assert_eq!(show_token(&tokens[4], &idents), "<");
+
+        // `#define` is not an include, so `<stdio.h>` there is ordinary.
+        let (tokens, _) = tokenize_str("#define H <stdio.h>");
+        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
+
+        // No closing delimiter before end of line: lex it the old way rather
+        // than swallow the line, which `#if 0` blocks full of prose need.
+        let (tokens, idents) = tokenize_str("#include <unterminated\nint x;");
+        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
+        assert_eq!(show_token(&tokens[3], &idents), "<");
     }
 
     #[test]

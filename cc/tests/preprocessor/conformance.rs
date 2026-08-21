@@ -150,6 +150,45 @@ fn preprocessor_u8_prefix_survives() {
     assert_has(&r.stdout, "u8\"plain\"", "u8 literal in plain text");
 }
 
+/// C99 6.4.7: a header name is one preprocessing token, and nothing inside it
+/// is reinterpreted. Lexing the characters as ordinary tokens meant `//`
+/// became a comment and an apostrophe opened a character literal, so the
+/// directive was destroyed before it could be reassembled.
+#[test]
+fn preprocessor_header_name_is_one_token() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_header_name_")
+        .tempdir()
+        .expect("failed to create work dir");
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/t.h"), "int seven(void){return 7;}\n").unwrap();
+    std::fs::write(dir.path().join("it's.h"), "int eight(void){return 8;}\n").unwrap();
+
+    for (header, call, want) in [
+        ("<sub//t.h>", "seven()", 7),
+        ("<it's.h>", "eight()", 8),
+        ("\"it's.h\"", "eight()", 8),
+    ] {
+        let src = dir.path().join("main.c");
+        std::fs::write(
+            &src,
+            format!("#include {header}\nint main(void){{return {call}-{want};}}\n"),
+        )
+        .unwrap();
+        let exe = dir.path().join("prog");
+        let r = run_c17(&[
+            &src.to_string_lossy(),
+            "-o",
+            &exe.to_string_lossy(),
+            "-I",
+            &dir.path().to_string_lossy(),
+        ]);
+        assert!(r.success, "#include {header} failed:\n{}", r.stderr);
+        let status = std::process::Command::new(&exe).status().unwrap();
+        assert_eq!(status.code(), Some(0), "wrong result for #include {header}");
+    }
+}
+
 // ============================================================================
 // #P2 — the null directive
 // ============================================================================

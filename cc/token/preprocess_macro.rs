@@ -638,7 +638,7 @@ impl<'a> Preprocessor<'a> {
                 back.extend(arg);
             }
             back.extend(current_arg);
-            iter.push_expansion(back, open_paren.pos.whitespace, open_paren.pos.newline);
+            iter.unread(back);
             return None;
         }
 

@@ -1089,13 +1089,26 @@ impl<'a> Preprocessor<'a> {
         };
         // handle_define expects to start at the macro name, and stream markers
         // would be taken for one.
+        //
+        // The line flags are cleared too. A `-D` is one directive however the
+        // shell wrapped it, but its first token is the first token of its own
+        // buffer and so is flagged as beginning a line -- which the operand's
+        // same-line check then reads as `#define` with nothing after it.
+        // `-DGITVERSION="..."`, which CPython's build passes, was rejected.
         let mut cursor = TokenCursor::new(
             tokens
                 .into_iter()
                 .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+                .map(|mut t| {
+                    t.pos.newline = false;
+                    t
+                })
                 .collect(),
         );
-        self.handle_define(&mut cursor, idents);
+        // A `-D` has no `#` to blame, so a malformed one is reported at the
+        // start of the synthesized directive.
+        let pos = cursor.peek().map(|t| t.pos).unwrap_or_default();
+        self.handle_define(&mut cursor, idents, pos);
     }
 
     /// Undefine a macro

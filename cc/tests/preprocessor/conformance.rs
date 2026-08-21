@@ -1646,3 +1646,31 @@ fn preprocessor_malformed_define_is_diagnosed() {
         );
     }
 }
+
+/// Recovery from an unterminated call puts *file* tokens back in front of the
+/// cursor. They have to be read back as file tokens: `remap_pos` and the
+/// directive check both ask where a token came from, so tokens unread as if
+/// they were macro output leave the rest of the file unpreprocessed — the
+/// later `#define` was not processed and `LATER` came out unexpanded.
+#[test]
+fn preprocessor_recovery_keeps_processing_the_rest_of_the_file() {
+    let src = "#define f(x) ((x)+1)\n#define BAD f(\nint before;\nBAD\n\
+               #define LATER 7\nint after = LATER;\n";
+    let r = preprocess_text("recovery_provenance", src, &[]);
+    assert!(
+        !r.success,
+        "an unterminated call is an error:\n{}",
+        r.stdout
+    );
+    assert_has(
+        &r.stdout,
+        "int after = 7;",
+        "the later #define was processed",
+    );
+    assert_lacks(&r.stdout, "LATER", "the macro should have expanded");
+    assert_lacks(
+        &r.stdout,
+        "#define",
+        "the later directive is not passed through",
+    );
+}

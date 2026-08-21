@@ -43,8 +43,12 @@ pub(super) enum Provenance {
 pub(super) struct TokenCursor {
     /// The file, in order.
     main: std::vec::IntoIter<Token>,
-    /// Pending expansion tokens, held reversed so `pop` is the next one.
-    pushback: Vec<Token>,
+    /// Pending tokens, held reversed so `pop` is the next one, each with the
+    /// provenance it should be read back with. An expansion's output is not
+    /// the only thing that gets pushed here: recovery from a malformed
+    /// construct puts untouched *file* tokens back, and those have to stay
+    /// file tokens or the rest of the file stops being preprocessed.
+    pushback: Vec<(Token, Provenance)>,
     /// Where the token most recently returned by `next` came from.
     last: Provenance,
     /// Spacing an expansion left for whichever token comes next.
@@ -65,7 +69,7 @@ impl TokenCursor {
     /// and from the file otherwise.
     pub(super) fn peek(&self) -> Option<&Token> {
         match self.pushback.last() {
-            Some(token) => Some(token),
+            Some((token, _)) => Some(token),
             None => self.main.as_slice().first(),
         }
     }
@@ -93,15 +97,22 @@ impl TokenCursor {
     pub(super) fn push_expansion(&mut self, tokens: Vec<Token>, whitespace: bool, newline: bool) {
         self.pending_spacing = Some((whitespace, newline));
         self.pushback.reserve(tokens.len());
-        self.pushback.extend(tokens.into_iter().rev());
+        self.pushback
+            .extend(tokens.into_iter().rev().map(|t| (t, Provenance::Expansion)));
     }
 
-    /// Whether anything is waiting in front of the file.
+    /// Put file tokens back, to be read again exactly as they were.
     ///
-    /// A directive is only ever recognised on a token read from the file, so
-    /// this holds whenever one is being handled; the handlers assert it.
-    pub(super) fn pushback_is_empty(&self) -> bool {
-        self.pushback.is_empty()
+    /// This is recovery, not expansion: a construct was rejected and its tokens
+    /// belong to the file, so they keep `Main` provenance and their own
+    /// spacing. Pushing them as an expansion instead would leave the rest of
+    /// the file unpreprocessed -- `remap_pos` skipped, and a `#` no longer
+    /// recognised as a directive, since both of those ask where the token came
+    /// from.
+    pub(super) fn unread(&mut self, tokens: Vec<Token>) {
+        self.pushback.reserve(tokens.len());
+        self.pushback
+            .extend(tokens.into_iter().rev().map(|t| (t, Provenance::Main)));
     }
 }
 
@@ -110,8 +121,8 @@ impl Iterator for TokenCursor {
 
     fn next(&mut self) -> Option<Token> {
         let token = match self.pushback.pop() {
-            Some(token) => {
-                self.last = Provenance::Expansion;
+            Some((token, provenance)) => {
+                self.last = provenance;
                 Some(token)
             }
             None => {

@@ -63,15 +63,11 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
     ) {
-        // The `#` was read from the file, and the cursor hands back everything
-        // pushed in front of the file before reading from it again -- so
-        // nothing can be pending here. The line-oriented helpers below rely on
-        // that: they stop at the next token flagged as beginning a line, which
-        // is a property of the file's tokens.
-        debug_assert!(
-            iter.pushback_is_empty(),
-            "a directive was recognised with a macro expansion still pending"
-        );
+        // No assertion about the pushback being empty here. It used to say so,
+        // on the premise that file provenance implies nothing is pending --
+        // which stopped being true once recovery began unreading file tokens.
+        // What the line-oriented helpers below actually need is that this token
+        // came from the file, which is what the caller already checked.
 
         // C17 6.10p7: a `#` alone on a line is the null directive and has no
         // effect. Check before consuming, because the next token belongs to the
@@ -146,8 +142,8 @@ impl<'a> Preprocessor<'a> {
         }
 
         match directive_id {
-            crate::kw::DEFINE => self.handle_define(iter, idents),
-            crate::kw::UNDEF => self.handle_undef(iter, idents),
+            crate::kw::DEFINE => self.handle_define(iter, idents, hash_token.pos),
+            crate::kw::UNDEF => self.handle_undef(iter, idents, hash_token.pos),
             crate::kw::IFDEF => self.handle_ifdef(iter, idents, hash_token.pos),
             crate::kw::IFNDEF => self.handle_ifndef(iter, idents, hash_token.pos),
             crate::kw::IF => self.handle_if(iter, idents, hash_token.pos),
@@ -246,6 +242,48 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Skip tokens until end of line
+    /// The next token, only if it is on the directive's own line.
+    ///
+    /// A directive's operand cannot be on the next line. There is no newline
+    /// token in the stream, so a bare `next()` silently reaches into the
+    /// following line and `skip_to_eol` then eats the rest of it -- deleting a
+    /// line of source. The same check already guards the directive *name* in
+    /// `handle_directive`; this is that check applied to the operands, where it
+    /// was missing.
+    fn next_on_line(&self, iter: &mut TokenCursor) -> Option<Token> {
+        match iter.peek() {
+            Some(token) if !token.pos.newline => iter.next(),
+            _ => None,
+        }
+    }
+
+    /// The macro name a `#define`, `#undef`, `#ifdef` or `#ifndef` operates on.
+    ///
+    /// `None` means the directive was malformed and has been diagnosed; the
+    /// caller must not go on to define, undefine or test anything, but must
+    /// still keep the conditional stack balanced where that applies.
+    fn macro_name_operand(
+        &self,
+        iter: &mut TokenCursor,
+        idents: &IdentTable,
+        directive: &str,
+        pos: Position,
+    ) -> Option<String> {
+        let Some(token) = self.next_on_line(iter) else {
+            diag::error_args(pos, "no macro name given in #{0} directive", &[directive]);
+            return None;
+        };
+        match &token.value {
+            TokenValue::Ident(id) if token.typ == TokenType::Ident => {
+                Some(idents.get_opt(*id)?.to_string())
+            }
+            _ => {
+                diag::error(token.pos, &gettext("macro names must be identifiers"));
+                None
+            }
+        }
+    }
+
     fn skip_to_eol(&self, iter: &mut TokenCursor) {
         while let Some(token) = iter.peek() {
             if token.pos.newline {
@@ -256,35 +294,22 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #define
-    pub(super) fn handle_define(&mut self, iter: &mut TokenCursor, idents: &IdentTable) {
+    pub(super) fn handle_define(
+        &mut self,
+        iter: &mut TokenCursor,
+        idents: &IdentTable,
+        pos: Position,
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
         }
 
         // Get macro name
-        let name_token = match iter.next() {
-            Some(t) => t,
-            None => return,
-        };
-
-        let macro_name = match &name_token.typ {
-            TokenType::Ident => {
-                if let TokenValue::Ident(id) = &name_token.value {
-                    idents.get_opt(*id).map(|s| s.to_string())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-        let name = match macro_name {
-            Some(n) => n,
-            None => {
-                self.skip_to_eol(iter);
-                return;
-            }
+        let name_pos = iter.peek().map(|t| t.pos).unwrap_or(pos);
+        let Some(name) = self.macro_name_operand(iter, idents, "define", pos) else {
+            self.skip_to_eol(iter);
+            return;
         };
 
         // C17 6.10.8p4: `defined` is not available to be defined. Accepting it
@@ -292,7 +317,7 @@ impl<'a> Preprocessor<'a> {
         // operator is recognised before expansion.
         if name == "defined" {
             diag::error(
-                name_token.pos,
+                name_pos,
                 &gettext("\"defined\" cannot be used as a macro name"),
             );
             self.skip_to_eol(iter);
@@ -326,11 +351,7 @@ impl<'a> Preprocessor<'a> {
                         // trailing arguments rather than being a parameter of
                         // its own.
                         let mut ident_immediately_before = false;
-                        while let Some(param_tok) = iter.next() {
-                            if param_tok.pos.newline {
-                                break;
-                            }
-
+                        while let Some(param_tok) = self.next_on_line(iter) {
                             match &param_tok.value {
                                 TokenValue::Special(c) if *c == b')' as u32 => {
                                     closed_params = true;
@@ -354,10 +375,7 @@ impl<'a> Preprocessor<'a> {
                                         }
                                     }
                                     // Consume closing paren
-                                    for t in iter.by_ref() {
-                                        if t.pos.newline {
-                                            break;
-                                        }
+                                    while let Some(t) = self.next_on_line(iter) {
                                         if let TokenValue::Special(c) = &t.value {
                                             if *c == b')' as u32 {
                                                 closed_params = true;
@@ -406,7 +424,7 @@ impl<'a> Preprocessor<'a> {
                         }
                         if !closed_params {
                             diag::error(
-                                name_token.pos,
+                                name_pos,
                                 &gettext("expected ')' at end of macro parameter list"),
                             );
                             malformed_params = true;
@@ -416,6 +434,11 @@ impl<'a> Preprocessor<'a> {
             }
         }
         if malformed_params {
+            // The parameter list was rejected, so the replacement list is not a
+            // macro body -- it is not anything. Returning without draining the
+            // line left it in the stream to be emitted as ordinary code, after
+            // the directive that produced it had already been diagnosed.
+            self.skip_to_eol(iter);
             return;
         }
 
@@ -447,11 +470,7 @@ impl<'a> Preprocessor<'a> {
         // break a great deal of code that redefines a macro benignly.
         if let Some(existing) = self.macros.get(&name) {
             if let Some(why) = macro_redefinition_conflict(existing, &mac) {
-                diag::warning_args(
-                    name_token.pos,
-                    "'{0}' redefined: {1}",
-                    &[&name.to_string(), why],
-                );
+                diag::warning_args(name_pos, "'{0}' redefined: {1}", &[&name.to_string(), why]);
             }
         }
 
@@ -459,20 +478,14 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #undef
-    fn handle_undef(&mut self, iter: &mut TokenCursor, idents: &IdentTable) {
+    fn handle_undef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
         }
 
-        if let Some(token) = iter.next() {
-            if let TokenType::Ident = &token.typ {
-                if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get_opt(*id) {
-                        self.undef_macro(name);
-                    }
-                }
-            }
+        if let Some(name) = self.macro_name_operand(iter, idents, "undef", pos) {
+            self.undef_macro(&name);
         }
 
         self.skip_to_eol(iter);
@@ -480,50 +493,34 @@ impl<'a> Preprocessor<'a> {
 
     /// Handle #ifdef
     fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
-        let defined = if let Some(token) = iter.next() {
-            if let TokenType::Ident = &token.typ {
-                if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get_opt(*id) {
-                        self.is_defined(name)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+        // A malformed operand still pushes a group, so the matching
+        // `#endif` closes something and one bad directive does not cascade
+        // into a run of "#endif without #if". The group is skipped, since
+        // nothing was established about the name.
+        let name = self.macro_name_operand(iter, idents, "ifdef", pos);
+        let take_branch = match &name {
+            Some(name) => self.is_defined(name),
+            None => false,
         };
 
         self.skip_to_eol(iter);
-        self.push_conditional(defined, pos);
+        self.push_conditional(take_branch, pos);
     }
 
     /// Handle #ifndef
     fn handle_ifndef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
-        let defined = if let Some(token) = iter.next() {
-            if let TokenType::Ident = &token.typ {
-                if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get_opt(*id) {
-                        self.is_defined(name)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+        // A malformed operand still pushes a group, so the matching
+        // `#endif` closes something and one bad directive does not cascade
+        // into a run of "#endif without #if". The group is skipped, since
+        // nothing was established about the name.
+        let name = self.macro_name_operand(iter, idents, "ifndef", pos);
+        let take_branch = match &name {
+            Some(name) => !self.is_defined(name),
+            None => false,
         };
 
         self.skip_to_eol(iter);
-        self.push_conditional(!defined, pos);
+        self.push_conditional(take_branch, pos);
     }
 
     /// Handle #if

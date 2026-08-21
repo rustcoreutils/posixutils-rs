@@ -4520,3 +4520,124 @@ fn diagnostics_index_range_after_field_designator() {
          int main(void){ return (s.m[3] == 7 && s.t == 9) ? 0 : 1; }\n",
     );
 }
+
+// ============================================================================
+// #C164 — a declaration that declares nothing (C17 6.7p2)
+// ============================================================================
+
+/// 6.7p2 wants a declarator, a tag, or enumeration members. These have none.
+///
+/// All of them were **accepted silently** except the bare-specifier forms,
+/// which drew "type specifier missing" -- blaming the half that was absent
+/// rather than the declarator that was. gcc errors on `register`/`inline` here
+/// and warns on the rest; c17 errors on all of them, which 6.7p2 permits since
+/// it asks only for a diagnostic.
+#[test]
+fn diagnostics_declaration_that_declares_nothing_is_rejected() {
+    // A storage class or qualifier is named, the way gcc names it.
+    for (name, src, spec) in [
+        ("declnothing_register", "int register;\n", "register"),
+        ("declnothing_inline", "int inline;\n", "inline"),
+        ("declnothing_static", "static;\n", "static"),
+        ("declnothing_extern", "extern;\n", "extern"),
+        ("declnothing_typedef", "int typedef;\n", "typedef"),
+        ("declnothing_const", "const;\n", "const"),
+        ("declnothing_volatile", "volatile;\n", "volatile"),
+    ] {
+        compile_expect_error(name, src, &format!("'{spec}' in empty declaration"));
+    }
+
+    // Nothing to name: just a type that declares no object.
+    compile_expect_error("declnothing_int", "int;\n", "declaration declares nothing");
+    compile_expect_error(
+        "declnothing_unsigned",
+        "unsigned;\n",
+        "declaration declares nothing",
+    );
+
+    // Block scope has the same rule and its own parse path.
+    compile_expect_error(
+        "declnothing_block_static",
+        "void f(void){ static; }\n",
+        "'static' in empty declaration",
+    );
+    compile_expect_error(
+        "declnothing_block_register",
+        "void f(void){ int register; }\n",
+        "'register' in empty declaration",
+    );
+}
+
+/// The accept side, which is the half that can silently break real source.
+///
+/// A tag *is* something declared, so the whole point of this declaration form
+/// keeps working; and a stray `;` stays legal because any function-like macro
+/// expanding to nothing produces one (CPython's `_Py_DECLARE_STR()`).
+#[test]
+fn diagnostics_declarations_that_do_declare_something_are_accepted() {
+    for (name, src) in [
+        (
+            "declok_struct_fwd",
+            "struct S;\nint main(void){return 0;}\n",
+        ),
+        ("declok_union_fwd", "union U;\nint main(void){return 0;}\n"),
+        (
+            "declok_enum_def",
+            "enum E { A };\nint main(void){return A;}\n",
+        ),
+        (
+            "declok_struct_def",
+            "struct S { int a; };\nint main(void){ struct S s = {0}; return s.a; }\n",
+        ),
+        ("declok_stray_semi", ";\nint main(void){return 0;}\n"),
+        ("declok_object", "int x;\nint main(void){return x;}\n"),
+        (
+            "declok_static_object",
+            "static int x;\nint main(void){return x;}\n",
+        ),
+        (
+            "declok_typedef",
+            "typedef int T;\nint main(void){ T t = 0; return t; }\n",
+        ),
+        (
+            "declok_extern_object",
+            "extern int x;\nint main(void){return 0;}\n",
+        ),
+        (
+            "declok_register_local",
+            "int main(void){ register int x = 0; return x; }\n",
+        ),
+        (
+            "declok_inline_fn",
+            "inline int f(void){return 0;}\nint main(void){return 0;}\n",
+        ),
+        (
+            "declok_thread_local",
+            "_Thread_local int x;\nint main(void){return x;}\n",
+        ),
+        (
+            "declok_block_struct",
+            "int main(void){ struct S; return 0; }\n",
+        ),
+        ("declok_block_semi", "int main(void){ ; return 0; }\n"),
+        // A tag declared *with* a storage class still declares the tag.
+        (
+            "declok_typedef_struct",
+            "typedef struct S T;\nint main(void){return 0;}\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// The implicit-int diagnostic must survive: it belongs to declarations that
+/// *do* declare a declarator, which is the case this change routes around.
+#[test]
+fn diagnostics_implicit_int_still_outranks_the_empty_case() {
+    compile_expect_error("stillint_global", "static x;\n", "type specifier missing");
+    compile_expect_error(
+        "stillint_local",
+        "int main(void){ const y = 3; return y-3; }\n",
+        "type specifier missing",
+    );
+}

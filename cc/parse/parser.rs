@@ -2640,7 +2640,13 @@ impl Parser<'_> {
         // Parse type specifiers
         let decl_pos = self.current_pos();
         let base_type = self.parse_type_specifier()?;
-        self.check_implicit_int(decl_pos);
+        // A declaration that stops right here declares nothing, and that --
+        // not a missing type specifier -- is what to report. `static;` used to
+        // draw "type specifier missing", blaming the half that was absent
+        // rather than the declarator that was. The `;` arms below do it.
+        if !self.is_special(b';') {
+            self.check_implicit_int(decl_pos);
+        }
         // Skip __attribute__ between type and declarator (GCC extension)
         self.skip_extensions();
 
@@ -2692,7 +2698,9 @@ impl Parser<'_> {
 
         // Check for struct/union/enum-only declaration (no declarators)
         // e.g., "struct point { int x; int y; };"
-        if !self.is_special(b';') {
+        if self.is_special(b';') {
+            self.check_declares_something(decl_pos, &base_type);
+        } else {
             loop {
                 let decl_pos = self.current_pos();
                 let (name, mut typ, mut vla_sizes, _func_params) =
@@ -3591,6 +3599,55 @@ impl Parser<'_> {
             // follows is usually well-formed, and one diagnostic per
             // declaration reads better than a cascade.
             self.saw_explicit_type = true;
+        }
+    }
+
+    /// The specifier a declaration led with, for the diagnostic below.
+    ///
+    /// Ordered so the one a reader would blame comes first: a storage class
+    /// is more surprising in an empty declaration than a bare qualifier.
+    fn leading_specifier_name(modifiers: TypeModifiers) -> Option<&'static str> {
+        const SPELLINGS: &[(TypeModifiers, &str)] = &[
+            (TypeModifiers::TYPEDEF, "typedef"),
+            (TypeModifiers::EXTERN, "extern"),
+            (TypeModifiers::STATIC, "static"),
+            (TypeModifiers::REGISTER, "register"),
+            (TypeModifiers::AUTO, "auto"),
+            (TypeModifiers::THREAD_LOCAL, "_Thread_local"),
+            (TypeModifiers::INLINE, "inline"),
+            (TypeModifiers::CONST, "const"),
+            (TypeModifiers::VOLATILE, "volatile"),
+        ];
+        SPELLINGS
+            .iter()
+            .find(|(m, _)| modifiers.contains(*m))
+            .map(|(_, name)| *name)
+    }
+
+    /// Diagnose a declaration that stops at `;` having declared nothing.
+    ///
+    /// C17 6.7p2 requires a declaration to declare a declarator, a tag, or the
+    /// members of an enumeration. `struct S;` and `enum E { A };` declare a
+    /// tag and are the reason this arm exists at all; `int;`, `static;` and
+    /// `int register;` declare nothing whatsoever and were accepted silently.
+    ///
+    /// Reported rather than warned: the constraint is violated, and a
+    /// declaration that declares nothing is always a typo or a stray token.
+    /// (gcc errors on `register`/`inline` here and warns on the rest; both are
+    /// conforming, since 6.7p2 asks only for a diagnostic.)
+    fn check_declares_something(&mut self, pos: Position, base_type: &Type) {
+        // A tag -- declared or defined -- is the thing this declaration form
+        // exists to express, so it always counts.
+        if matches!(
+            base_type.kind,
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
+        ) {
+            return;
+        }
+
+        match Self::leading_specifier_name(base_type.modifiers) {
+            Some(spec) => diag::error_args(pos, "'{0}' in empty declaration", &[spec]),
+            None => diag::error(pos, &gettext("declaration declares nothing")),
         }
     }
 
@@ -4997,7 +5054,13 @@ impl Parser<'_> {
         let decl_pos = self.current_pos();
         // Parse type specifier
         let base_type = self.parse_type_specifier()?;
-        self.check_implicit_int(decl_pos);
+        // A declaration that stops right here declares nothing, and that --
+        // not a missing type specifier -- is what to report. `static;` used to
+        // draw "type specifier missing", blaming the half that was absent
+        // rather than the declarator that was. The `;` arms below do it.
+        if !self.is_special(b';') {
+            self.check_implicit_int(decl_pos);
+        }
         // Skip __attribute__ between type and declarator (GCC extension)
         self.skip_extensions();
         // Check modifiers before interning (storage class specifiers)
@@ -5022,6 +5085,7 @@ impl Parser<'_> {
         // This happens when a composite type is defined but no variables are declared
         if self.is_special(b';') {
             self.advance();
+            self.check_declares_something(decl_pos, &base_type);
             // Return empty declaration - the type was already registered in parse_*_specifier
             return Ok(ExternalDecl::Declaration(Declaration {
                 declarators: vec![],

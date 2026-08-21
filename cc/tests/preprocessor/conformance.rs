@@ -133,6 +133,23 @@ fn preprocessor_error_message_spells_every_token() {
     );
 }
 
+/// C99 6.10.3.2p2 asks `#` for "the spelling of the preprocessing token", and
+/// `-E` has to round-trip it. `u8"..."` has type `char[]` (C11 6.4.5p6) so it
+/// folds into the narrow string token, and the prefix was dropped with it.
+#[test]
+fn preprocessor_u8_prefix_survives() {
+    let r = preprocess_text(
+        "u8_prefix",
+        "#define S(x) #x\n#define B u8\"body\"\n\
+         const char *a = S(u8\"hi\");\nconst char *b = B;\nconst char *c = u8\"plain\";\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "\"u8\\\"hi\\\"\"", "stringified u8 literal");
+    assert_has(&r.stdout, "u8\"body\"", "u8 literal from a macro body");
+    assert_has(&r.stdout, "u8\"plain\"", "u8 literal in plain text");
+}
+
 // ============================================================================
 // #P2 — the null directive
 // ============================================================================

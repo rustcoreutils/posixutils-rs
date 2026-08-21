@@ -397,6 +397,16 @@ pub struct Token {
     pub typ: TokenType,
     pub pos: Position,
     pub value: TokenValue,
+    /// Spelled `u8"..."`.
+    ///
+    /// The one thing [`TokenType`] cannot say about a literal. C11 6.4.5p6
+    /// gives a `u8` string type `char[]`, so it *is* a narrow string
+    /// everywhere but in its spelling -- which 6.10.3.2p2 makes `#`
+    /// reproduce, and which `-E` has to round-trip. Kept as a flag beside the
+    /// type rather than as a type of its own so that a path which fails to
+    /// carry it loses the prefix, the way every path did before, instead of
+    /// losing the string.
+    pub utf8_prefix: bool,
     /// Macros that should not expand this token (C preprocessor "blue painting").
     /// When a macro's expansion contains its own name, those tokens are marked.
     /// This prevents re-expansion in nested contexts per C99 6.10.3.4.
@@ -409,6 +419,7 @@ impl Token {
             typ,
             pos,
             value: TokenValue::None,
+            utf8_prefix: false,
             no_expand: None,
         }
     }
@@ -418,7 +429,19 @@ impl Token {
             typ,
             pos,
             value,
+            utf8_prefix: false,
             no_expand: None,
+        }
+    }
+
+    /// The encoding prefix this literal is written with, for the token types
+    /// that do not imply one. Only `u8` qualifies: `L`, `u` and `U` are each
+    /// a token type of their own.
+    pub fn encoding_prefix(&self) -> &'static str {
+        if self.utf8_prefix {
+            "u8"
+        } else {
+            ""
         }
     }
 
@@ -975,7 +998,11 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         };
 
-        Token::with_value(typ, pos, value)
+        let mut token = Token::with_value(typ, pos, value);
+        // `u8` is folded into the narrow type above; the flag is what keeps
+        // the spelling, which `#` and `-E` both have to reproduce.
+        token.utf8_prefix = enc == LiteralEncoding::Utf8;
+        token
     }
 
     /// Skip a single-line comment (// ...)
@@ -1327,7 +1354,7 @@ pub fn show_special(value: u32) -> String {
 /// had to be edited in step.
 fn literal_parts(token: &Token) -> Option<(&'static str, u8, &str)> {
     let (prefix, delim, payload) = match (token.typ, &token.value) {
-        (TokenType::String, TokenValue::String(s)) => ("", b'"', s),
+        (TokenType::String, TokenValue::String(s)) => (token.encoding_prefix(), b'"', s),
         (TokenType::WideString, TokenValue::WideString(s)) => ("L", b'"', s),
         (TokenType::Utf16String, TokenValue::Utf16String(s)) => ("u", b'"', s),
         (TokenType::Utf32String, TokenValue::Utf32String(s)) => ("U", b'"', s),

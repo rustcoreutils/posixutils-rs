@@ -144,6 +144,9 @@ pub struct MacroToken {
     pub typ: TokenType,
     pub value: MacroTokenValue,
     pub whitespace: bool,
+    /// Spelled `u8"..."`; see [`Token::utf8_prefix`]. Carried through a macro
+    /// body so that `#define B u8"hi"` still spells the prefix once expanded.
+    pub utf8_prefix: bool,
 }
 
 /// Value of a macro token
@@ -219,6 +222,7 @@ impl Macro {
                             typ: token.typ,
                             value,
                             whitespace: i > 0 && token.pos.whitespace,
+                            utf8_prefix: token.utf8_prefix,
                         }
                     })
                     .collect()
@@ -249,6 +253,7 @@ impl Macro {
                 typ: TokenType::Ident,
                 value: MacroTokenValue::Ident(word.to_string()),
                 whitespace: i > 0, // Add whitespace before all but the first token
+                utf8_prefix: false,
             })
             .collect();
         Self {
@@ -272,6 +277,7 @@ impl Macro {
                 typ: TokenType::Ident,
                 value: MacroTokenValue::Ident(value.to_string()),
                 whitespace: false,
+                utf8_prefix: false,
             }]
         };
         Self {
@@ -1570,6 +1576,7 @@ impl<'a> Preprocessor<'a> {
                                 "0".to_string()
                             }),
                             pos,
+                            utf8_prefix: false,
                             no_expand: None,
                         });
                         continue;
@@ -1608,6 +1615,7 @@ impl<'a> Preprocessor<'a> {
                             typ: TokenType::Number,
                             value: TokenValue::Number("0".to_string()),
                             pos: token.pos,
+                            utf8_prefix: false,
                             no_expand: None,
                         });
                     }
@@ -1617,6 +1625,7 @@ impl<'a> Preprocessor<'a> {
                         typ: TokenType::Number,
                         value: TokenValue::Number("0".to_string()),
                         pos: token.pos,
+                        utf8_prefix: false,
                         no_expand: None,
                     });
                 }
@@ -1831,6 +1840,7 @@ impl<'a> Preprocessor<'a> {
                                     typ: TokenType::Special,
                                     value: MacroTokenValue::Paste,
                                     whitespace: token.pos.whitespace,
+                                    utf8_prefix: false,
                                 });
                                 i += 2;
                                 continue;
@@ -1850,6 +1860,7 @@ impl<'a> Preprocessor<'a> {
                                             typ: TokenType::Special,
                                             value: MacroTokenValue::Stringify(param.index),
                                             whitespace: token.pos.whitespace,
+                                            utf8_prefix: false,
                                         });
                                         found_param = true;
                                         break;
@@ -1866,6 +1877,7 @@ impl<'a> Preprocessor<'a> {
                                         typ: TokenType::Special,
                                         value: MacroTokenValue::Stringify(params.len()),
                                         whitespace: token.pos.whitespace,
+                                        utf8_prefix: false,
                                     });
                                     i += 2;
                                     continue;
@@ -1891,6 +1903,7 @@ impl<'a> Preprocessor<'a> {
                         typ: TokenType::Special,
                         value: MacroTokenValue::Paste,
                         whitespace: token.pos.whitespace,
+                        utf8_prefix: false,
                     });
                     i += 1;
                     continue;
@@ -1907,6 +1920,7 @@ impl<'a> Preprocessor<'a> {
                             typ: TokenType::Ident,
                             value: MacroTokenValue::VaArgs,
                             whitespace: token.pos.whitespace,
+                            utf8_prefix: false,
                         });
                         i += 1;
                         continue;
@@ -1920,6 +1934,7 @@ impl<'a> Preprocessor<'a> {
                                 typ: TokenType::Ident,
                                 value: MacroTokenValue::Param(param.index),
                                 whitespace: token.pos.whitespace,
+                                utf8_prefix: false,
                             });
                             found_param = true;
                             break;
@@ -1965,6 +1980,7 @@ impl<'a> Preprocessor<'a> {
             typ: token.typ,
             value,
             whitespace: token.pos.whitespace,
+            utf8_prefix: token.utf8_prefix,
         }
     }
 
@@ -3365,12 +3381,14 @@ impl<'a> Preprocessor<'a> {
                 | TokenValue::Utf16String(s)
                 | TokenValue::Utf32String(s) => {
                     // The encoding prefix is part of the spelling, so it must
-                    // survive stringification (C99 6.10.3.2p2).
+                    // survive stringification (C99 6.10.3.2p2). `u8` is not
+                    // one of the token types -- it folds into the narrow one
+                    // -- so it comes off the token's own flag.
                     result.push_str(match &token.value {
                         TokenValue::WideString(_) => "L",
                         TokenValue::Utf16String(_) => "u",
                         TokenValue::Utf32String(_) => "U",
-                        _ => "",
+                        _ => token.encoding_prefix(),
                     });
                     // C99 6.10.3.2p2: insert \ before each " and \ including delimiters
                     result.push('\\');
@@ -3904,7 +3922,9 @@ impl<'a> Preprocessor<'a> {
             _ => TokenValue::None,
         };
 
-        Token::with_value(mt.typ, new_pos, value)
+        let mut token = Token::with_value(mt.typ, new_pos, value);
+        token.utf8_prefix = mt.utf8_prefix;
+        token
     }
 
     /// Expand a builtin macro
@@ -5487,11 +5507,13 @@ second
             typ: TokenType::Number,
             value: MacroTokenValue::Number("2".into()),
             whitespace: false,
+            utf8_prefix: false,
         }];
         let b = vec![MacroToken {
             typ: TokenType::Number,
             value: MacroTokenValue::Number("2".into()),
             whitespace: true,
+            utf8_prefix: false,
         }];
         assert!(replacement_lists_identical(&a, &b));
 
@@ -5502,11 +5524,13 @@ second
                     typ: TokenType::Number,
                     value: MacroTokenValue::Number("1".into()),
                     whitespace: false,
+                    utf8_prefix: false,
                 },
                 MacroToken {
                     typ: TokenType::Number,
                     value: MacroTokenValue::Number("2".into()),
                     whitespace: ws,
+                    utf8_prefix: false,
                 },
             ]
         };

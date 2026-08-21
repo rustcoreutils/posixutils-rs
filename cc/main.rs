@@ -210,7 +210,17 @@ struct Args {
           num_args = 0..=1, value_name = "level",
           value_parser = opt::Optimization::from_flag,
           help = gettext("Optimization level"))]
-    optimization: opt::Optimization,
+    opt_arg: opt::Optimization,
+
+    /// `-fno-inline` / `-finline`, rewritten by `preprocess_args_from` so the
+    /// two spellings share one option and the last occurrence wins.
+    #[arg(
+        long = "c17-inline",
+        hide = true,
+        value_name = "enabled",
+        overrides_with = "inline_arg"
+    )]
+    inline_arg: Option<bool>,
 
     #[arg(short = 'W', action = clap::ArgAction::Append, value_name = "warning",
           num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
@@ -848,7 +858,7 @@ fn process_file(
     // Optimize IR. Called even at -O0, where the only pass that does anything
     // is inlining of `__attribute__((always_inline))` functions, which gcc
     // honours with optimization off.
-    opt::optimize_module(&mut module, args.optimization);
+    opt::optimize_module(&mut module, args.optimization());
 
     dump_ir(args, &module, "post-opt");
 
@@ -1088,6 +1098,21 @@ fn link_objects(
 /// Wider than [`opt::Optimization::from_flag`] on purpose: `fast` and `z` are
 /// recognised here so they reach the parser and are turned down by name,
 /// instead of being mistaken for a file and producing a confusing error.
+impl Args {
+    /// The optimization the command line asked for: `-O...` combined with
+    /// `-f[no-]inline`.
+    ///
+    /// One value, so that what the optimizer does and what `__OPTIMIZE__`,
+    /// `__OPTIMIZE_SIZE__` and `__NO_INLINE__` claim cannot drift apart.
+    fn optimization(&self) -> opt::Optimization {
+        let mut opt = self.opt_arg;
+        if let Some(enabled) = self.inline_arg {
+            opt.set_inlining(enabled);
+        }
+        opt
+    }
+}
+
 fn is_valid_opt_level(s: &str) -> bool {
     matches!(s, "0" | "1" | "2" | "3" | "s" | "z" | "fast" | "g")
 }
@@ -1249,6 +1274,14 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 );
                 std::process::exit(1);
             }
+            i += 1;
+        } else if arg == "-fno-inline" || arg == "-finline" {
+            // Both spellings become one option so clap's last-wins applies,
+            // as it does in GCC. Note `-fno-inline-functions` is a *different*
+            // flag -- it only stops functions not declared `inline` from being
+            // inlined, and does not define `__NO_INLINE__` -- so it falls
+            // through to the catch-all below, accepted and ignored.
+            result.push(format!("--c17-inline={}", arg == "-finline"));
             i += 1;
         } else if arg == "-fverbose-asm" {
             // Rewritten rather than swallowed: the catch-all below used to

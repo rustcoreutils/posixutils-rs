@@ -37,6 +37,12 @@ pub struct Optimization {
     /// `-Os`: prefer smaller code where the choice arises. Read by
     /// `__OPTIMIZE_SIZE__`; c17 makes no size-vs-speed choice of its own yet.
     for_size: bool,
+    /// `-fno-inline`: general inlining is off whatever the level says.
+    ///
+    /// Separate from the level because GCC keeps them separate: `-O2
+    /// -fno-inline` still optimizes, and still defines `__OPTIMIZE__`, while
+    /// also defining `__NO_INLINE__`.
+    no_inline: bool,
 }
 
 impl Optimization {
@@ -70,7 +76,11 @@ impl Optimization {
             "z" => return Err("-Oz is not supported. Use -Os.".to_string()),
             other => return Err(format!("invalid optimization level '{other}'")),
         };
-        Ok(Self { level, for_size })
+        Ok(Self {
+            level,
+            for_size,
+            no_inline: false,
+        })
     }
 
     /// Whether any optimization runs at all. Drives `__OPTIMIZE__`.
@@ -82,6 +92,22 @@ impl Optimization {
     /// ceiling rather than the small one -- what `-O2` buys over `-O1`.
     pub fn inlines_aggressively(&self) -> bool {
         self.level >= 2
+    }
+
+    /// Whether functions are inlined on their merits.
+    ///
+    /// False at `-O0` and under `-fno-inline`. `__attribute__((always_inline))`
+    /// is *not* covered by this and still fires either way -- that is GCC's
+    /// behaviour, and glibc's `__fortify_function` depends on it. Drives
+    /// `__NO_INLINE__`, which GCC likewise defines while still honouring the
+    /// attribute.
+    pub fn inlines_generally(&self) -> bool {
+        self.optimizes() && !self.no_inline
+    }
+
+    /// Record `-fno-inline` / `-finline`, last one winning.
+    pub fn set_inlining(&mut self, enabled: bool) {
+        self.no_inline = !enabled;
     }
 }
 
@@ -190,5 +216,32 @@ mod tests {
 
         // No -O at all is no optimization.
         assert!(!Optimization::default().optimizes());
+    }
+
+    /// `-fno-inline` is orthogonal to the level: it stops general inlining
+    /// without stopping optimization, which is why GCC defines `__OPTIMIZE__`
+    /// and `__NO_INLINE__` together for `-O2 -fno-inline`.
+    #[test]
+    fn optimization_separates_inlining_from_the_level() {
+        let mut o2 = Optimization::from_flag("2").unwrap();
+        assert!(o2.optimizes() && o2.inlines_generally());
+
+        o2.set_inlining(false);
+        assert!(o2.optimizes(), "-fno-inline must not stop optimization");
+        assert!(!o2.inlines_generally());
+        assert!(o2.inlines_aggressively(), "still level 2");
+
+        // Last one wins.
+        o2.set_inlining(true);
+        assert!(o2.inlines_generally());
+
+        // At -O0 nothing is inlined generally, with or without the flag.
+        let mut o0 = Optimization::from_flag("0").unwrap();
+        assert!(!o0.inlines_generally());
+        o0.set_inlining(true);
+        assert!(
+            !o0.inlines_generally(),
+            "-finline does not turn on inlining at -O0, as in GCC"
+        );
     }
 }

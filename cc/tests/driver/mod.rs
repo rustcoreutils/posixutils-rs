@@ -394,6 +394,56 @@ fn driver_asm_label_keeps_source_bytes() {
     assert_eq!(run_exe(&exe), 0, "the label did not resolve to the symbol");
 }
 
+/// `-fno-inline` turns general inlining off without turning optimization off,
+/// and `__attribute__((always_inline))` still fires -- GCC's behaviour, and
+/// what glibc's `__fortify_function` depends on.
+///
+/// The flag used to be swallowed by the `-f*` catch-all and do nothing at all.
+#[test]
+fn driver_fno_inline_stops_general_inlining_only() {
+    let w = WorkDir::new("noinline");
+    let src = w.write(
+        "t.c",
+        "static int helper(int x) { return x + 1; }\n\
+         __attribute__((always_inline)) static inline int forced(int x) { return x + 2; }\n\
+         int main(void) { return helper(1) + forced(2); }\n",
+    );
+
+    // (flags, helper is called, forced is called)
+    for (flags, helper_called) in [
+        (vec!["-O2"], false),
+        (vec!["-O2", "-fno-inline"], true),
+        // Last one wins, as in GCC.
+        (vec!["-O2", "-fno-inline", "-finline"], false),
+        // A *different* flag: it governs functions not declared `inline`,
+        // and must not be mistaken for -fno-inline.
+        (vec!["-O2", "-fno-inline-functions"], false),
+        (vec!["-O0"], true),
+    ] {
+        let mut argv = flags.clone();
+        argv.push("-S");
+        let src_s = s(&src);
+        let out = w.join("t.s");
+        let out_s = s(&out);
+        argv.extend_from_slice(&[&src_s, "-o", &out_s]);
+        let r = run_c17(&argv);
+        assert!(r.success, "{flags:?} failed:\n{}", r.stderr);
+
+        let asm = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            asm.contains("helper"),
+            helper_called,
+            "{flags:?}: helper should {} be called\n{asm}",
+            if helper_called { "" } else { "not" }
+        );
+        // always_inline is honoured whatever the flags say.
+        assert!(
+            !asm.contains("call\tforced") && !asm.contains("bl\tforced"),
+            "{flags:?}: always_inline must still fire\n{asm}"
+        );
+    }
+}
+
 /// Every `-O` spelling GCC and Clang accept must be answered, not crashed on.
 ///
 /// `is_valid_opt_level` claimed `s`, `z`, `fast` and `g` and forwarded them to

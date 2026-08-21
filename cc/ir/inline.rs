@@ -247,7 +247,7 @@ fn should_inline(
     let forced = candidate.is_always_inline;
 
     // At -O0, inline nothing but the forced functions.
-    if !opt.optimizes() && !forced {
+    if !opt.inlines_generally() && !forced {
         return false;
     }
 
@@ -1220,7 +1220,7 @@ fn reorder_blocks_topologically(func: &mut Function) {
 /// optimization off, and code that uses it -- inline assembly wrappers,
 /// intrinsics headers -- is usually relying on the body being spliced in.
 pub fn run(module: &mut Module, opt: Optimization) -> bool {
-    if !opt.optimizes() && !module.functions.iter().any(|f| f.is_always_inline) {
+    if !opt.inlines_generally() && !module.functions.iter().any(|f| f.is_always_inline) {
         return false;
     }
 

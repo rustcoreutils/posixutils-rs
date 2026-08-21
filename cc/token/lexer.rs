@@ -1084,27 +1084,21 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
             if next == b':' as i32 {
                 self.nextchar();
-                // Check for %:%: (digraph for ##)
-                let third = self.peekchar();
-                if third == b'%' as i32 {
-                    // Save position in case we need to back out
-                    let saved_offset = self.offset;
-                    let saved_col = self.col;
-                    self.nextchar(); // consume second %
-                    let fourth = self.peekchar();
-                    if fourth == b':' as i32 {
-                        self.nextchar(); // consume second :
-                        return Some(Token::with_value(
-                            TokenType::Special,
-                            pos,
-                            TokenValue::Special(SpecialToken::HashHash as u32),
-                        ));
-                    }
-                    // Not %:%: — back out the third char (%)
-                    self.offset = saved_offset;
-                    self.col = saved_col;
+                // %:%: is the digraph for ##. Decided by looking two characters
+                // ahead rather than by consuming and backing out: rewinding
+                // `offset` cannot undo the line counting a splice between the
+                // two halves already did, and the double count desynchronised
+                // __LINE__ for the rest of the file.
+                let mut peek = self.peek_at(self.offset);
+                if peek.next() == Some(b'%') && peek.next() == Some(b':') {
+                    self.consume_chars(2);
+                    return Some(Token::with_value(
+                        TokenType::Special,
+                        pos,
+                        TokenValue::Special(SpecialToken::HashHash as u32),
+                    ));
                 }
-                // Just %: → #
+                // Just %: -> #
                 return Some(Token::with_value(
                     TokenType::Special,
                     pos,
@@ -2198,6 +2192,24 @@ mod tests {
         // The long form spans more digits, so it spans more splices.
         let (tokens, idents) = tokenize_str("a\\U000\\\n000\\\ne9b");
         assert_eq!(show_token(&tokens[1], &idents), "a\u{e9}b");
+    }
+
+    /// A `%:` whose following `%` does not complete the `%:%:` digraph used to
+    /// be consumed and then rewound by hand. The rewind restored `offset` and
+    /// `col` but not `line`, so a splice between the two halves was counted
+    /// once on the way in and again on the way out.
+    #[test]
+    fn test_digraph_hash_not_hashhash_keeps_line_count() {
+        let (tokens, idents) = tokenize_str("%:\\\n% x\ny");
+        let spelled: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(spelled, vec!["#", "%", "x", "y"]);
+        // Phase 2 deletes the splice but the physical lines still count, so
+        // `x` is on line 2 and `y` on line 3 -- each crossed exactly once.
+        assert_eq!(tokens[3].pos.line, 2);
+        assert_eq!(tokens[4].pos.line, 3);
     }
 
     /// With phase 2 off (a `.i` operand) a backslash-newline is text, not a

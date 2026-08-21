@@ -357,6 +357,43 @@ fn driver_preprocess_does_not_assemble() {
     );
 }
 
+/// An `__asm__` label names a symbol the assembler and linker will see, so the
+/// bytes have to be the source's. The label is a string literal, whose payload
+/// holds one `char` per source byte; reading it as if it were already Rust
+/// text turned `caf\u{e9}` into `caf\u{c3}\u{a9}`, and the reference no longer
+/// matched a symbol of that name.
+///
+/// Proven by resolving against a symbol defined in assembly, so a mangled
+/// label fails the link rather than agreeing with itself.
+///
+/// Linux-only: the fixture spells ELF directives, and Mach-O's symbol naming
+/// for asm labels is not something this can check from here.
+#[cfg(target_os = "linux")]
+#[test]
+fn driver_asm_label_keeps_source_bytes() {
+    let w = WorkDir::new("asmlabel");
+    let asm = w.write(
+        "sym.S",
+        "\t.data\n\
+         \t.globl café\n\
+         café:\n\
+         \t.long 7\n",
+    );
+    let src = w.write(
+        "use.c",
+        "extern int v __asm__(\"café\");\nint main(void){ return v - 7; }\n",
+    );
+    let exe = w.join("prog");
+
+    let r = run_c17(&[&s(&asm), &s(&src), "-o", &s(&exe)]);
+    assert!(
+        r.success,
+        "link with a UTF-8 asm label failed:\n{}",
+        r.stderr
+    );
+    assert_eq!(run_exe(&exe), 0, "the label did not resolve to the symbol");
+}
+
 /// An apostrophe in an assembly comment is prose, not the start of a literal.
 /// Lexing it as C did swallowed the rest of the line, so a `.S` file whose
 /// comment said "don't" either assembled to the wrong bytes or made `as` fail

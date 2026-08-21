@@ -1534,10 +1534,23 @@ pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
             out.extend(payload_bytes(payload));
             out.push(delim);
         }
-        // A header name already carries its own delimiters.
         None => match &token.value {
+            // A header name already carries its own delimiters.
             TokenValue::HeaderName(h) if token.typ == TokenType::HeaderName => {
                 out.extend(payload_bytes(h))
+            }
+            // A single-character punctuator *is* a source byte. Rendering it
+            // through a Rust `String` UTF-8-encodes anything >= 0x80 and so
+            // doubles it -- which corrupted preprocessed assembly, where such
+            // a byte is ordinary: a `.S` symbol named `café` assembled as
+            // `cafÃ©` and no longer linked. Digraphs are excluded because
+            // their spelling is not their value.
+            TokenValue::Special(v)
+                if token.typ == TokenType::Special
+                    && *v < SpecialToken::BASE
+                    && token.spelling == Spelling::Canonical =>
+            {
+                out.push(*v as u8)
             }
             _ => out.extend_from_slice(show_other_token(token, strings).as_bytes()),
         },
@@ -1549,12 +1562,16 @@ pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
 /// Lossy for a literal holding bytes that are not valid UTF-8; use
 /// [`write_token`] wherever the exact source bytes matter.
 pub fn show_token(token: &Token, strings: &StringTable) -> String {
-    if literal_parts(token).is_none() {
-        return show_other_token(token, strings);
-    }
     let mut out = Vec::new();
     write_token(&mut out, token, strings);
-    String::from_utf8_lossy(&out).into_owned()
+    match String::from_utf8(out) {
+        Ok(text) => text,
+        // A token holding bytes that are not valid UTF-8 on their own -- one
+        // byte of a multi-byte character, lexed as its own punctuator. Only
+        // the byte stream can put those back together, which is why
+        // `write_token` exists.
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 /// Everything [`literal_parts`] declines: the non-literal token types, plus a
@@ -2487,6 +2504,26 @@ mod tests {
         assert!(tokens[hash].pos.newline);
     }
 
+    /// A non-ASCII byte outside a literal is lexed as its own single-character
+    /// punctuator, and so is a *byte*, not a character. Rendering one through
+    /// a Rust `String` UTF-8-encoded it and doubled it, which corrupted every
+    /// preprocessed `.S` file: a symbol named `café` assembled as `cafÃ©`.
+    #[test]
+    fn test_write_token_emits_raw_punctuator_bytes() {
+        let (tokens, idents) = tokenize_asm(".globl caf\u{e9}");
+        let mut out = Vec::new();
+        for t in &tokens[1..tokens.len() - 1] {
+            write_token(&mut out, t, &idents);
+        }
+        // `caf` is an identifier; the two bytes of `é` are punctuators. The
+        // stream has to put them back together.
+        assert_eq!(out, b".globlcaf\xc3\xa9");
+
+        // tokens_to_source_bytes keeps the spacing and the bytes alike.
+        let out = tokens_to_source_bytes(&tokens, &idents);
+        assert_eq!(out, b".globl caf\xc3\xa9\n");
+    }
+
     /// A literal payload holds one `char` per source byte, so its spelling has
     /// to be written a byte at a time. Formatting one through a Rust `String`
     /// UTF-8-encoded each of those chars and doubled every byte >= 0x80.
@@ -2508,6 +2545,28 @@ mod tests {
             payload_bytes(&literal_payload("caf\u{e9}")).collect::<Vec<_>>(),
             b"caf\xc3\xa9"
         );
+
+        // payload_text reads one back out, for the consumers that want Rust
+        // text: a header name to open, an `__asm__` symbol, a message to
+        // print. Reading a payload as if it were already text gave mojibake.
+        assert_eq!(payload_text(&literal_payload("caf\u{e9}")), "caf\u{e9}");
+        assert_eq!(payload_text("caf\u{c3}\u{a9}"), "caf\u{e9}");
+        for text in ["", "plain", "caf\u{e9}", "\u{2603} \u{1f600}"] {
+            assert_eq!(
+                payload_text(&literal_payload(text)),
+                text,
+                "round trip {text:?}"
+            );
+        }
+
+        // And the payload of a literal the lexer produced decodes to what the
+        // source said, which is the property the two conventions must share.
+        let (tokens, _) = tokenize_str("\"caf\u{e9}\"");
+        if let TokenValue::String(payload) = &tokens[1].value {
+            assert_eq!(payload_text(payload), "caf\u{e9}");
+        } else {
+            panic!("not a string literal");
+        }
     }
 
     #[test]

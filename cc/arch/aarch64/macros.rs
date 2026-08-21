@@ -32,18 +32,17 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // Apple, and this list cannot tell them apart.
         // char is unsigned on ARM by default
         ("__CHAR_UNSIGNED__", Some("1")),
-        // SIMD
-        ("__ARM_NEON", Some("1")),
-        ("__ARM_NEON__", Some("1")),
+        // __ARM_NEON / __ARM_NEON__ are deliberately absent: they guard
+        // `#include <arm_neon.h>`, which c17 does not ship, so defining them
+        // opened a door onto a missing header when the `#else` beside it
+        // would have compiled.
         // FP support
         ("__ARM_FP", Some("14")), // VFPv3 compatible
         ("__ARM_FP16_FORMAT_IEEE", Some("1")),
         ("__ARM_FEATURE_FMA", Some("1")),
-        // Atomic primitives
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", Some("1")),
+        // __GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8} is deliberately absent;
+        // see the note on the x86-64 list. c17 implements no `__sync_*`
+        // builtin, so advertising them only sent guarded code into a wall.
         // Lock-free atomics
         ("__GCC_ATOMIC_BOOL_LOCK_FREE", Some("2")),
         ("__GCC_ATOMIC_CHAR_LOCK_FREE", Some("2")),

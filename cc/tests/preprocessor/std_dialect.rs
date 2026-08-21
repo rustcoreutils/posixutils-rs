@@ -371,3 +371,115 @@ fn c17_suppression_does_not_hide_an_unknown_std() {
         assert!(run.stderr.contains("c42"), "got: {}", run.stderr);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Capability macros must not outrun the capability (#C163).
+//
+// A predefined feature macro is a promise to the preprocessor, and guarded
+// code takes it at its word: `#ifdef __GCC_HAVE_SYNC_COMPARE_AND_SWAP_4` opens
+// a branch that calls `__sync_bool_compare_and_swap`, and the `#else` beside
+// it is a portable fallback that would have compiled. Defining the macro
+// without the builtin does not make the feature available -- it makes the
+// fallback unreachable, so the file fails where it would otherwise have built.
+//
+// These tests pin the *relationship*, not the absence: if the builtins are
+// ever implemented, the sync assertions below are meant to fail so the macro
+// gets restored along with them.
+// ---------------------------------------------------------------------------
+
+/// The `__sync_*` family c17 does not implement, and the macros that guard it.
+const SYNC_CAS_MACROS: &[&str] = &[
+    "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1",
+    "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2",
+    "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4",
+    "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8",
+];
+
+#[test]
+fn c17_does_not_advertise_the_sync_builtins_it_lacks() {
+    for macro_name in SYNC_CAS_MACROS {
+        let got = expand_under("sync_cas", None, macro_name);
+        assert!(
+            is_undefined(&got, macro_name),
+            "{macro_name} must not be defined while `__sync_*` is unimplemented, got {got}"
+        );
+    }
+}
+
+/// The other half of the promise: the builtin really is absent. If this starts
+/// failing, implement-and-restore is the fix -- not deleting the test.
+#[test]
+fn c17_sync_builtins_are_genuinely_absent() {
+    // If this stops failing to compile, the feature arrived: restore
+    // __GCC_HAVE_SYNC_COMPARE_AND_SWAP_* alongside it rather than deleting
+    // this test.
+    crate::common::compile_expect_error(
+        "sync_absent",
+        "int main(void){ int x = 1;\n\
+         return __sync_bool_compare_and_swap(&x, 1, 2) ? 0 : 1; }\n",
+        "__sync_bool_compare_and_swap",
+    );
+}
+
+/// A program guarded on the macro must reach its portable `#else` and run.
+#[test]
+fn c17_sync_guarded_code_takes_the_portable_branch() {
+    let src = "#ifdef __GCC_HAVE_SYNC_COMPARE_AND_SWAP_4\n\
+               int main(void){ int x = 1;\n\
+               return __sync_bool_compare_and_swap(&x, 1, 2) ? 0 : 1; }\n\
+               #else\n\
+               int main(void){ return 0; }\n\
+               #endif\n";
+    assert_eq!(
+        crate::common::compile_and_run("sync_guarded", src, &[]),
+        0,
+        "guarded code must fall through to the portable branch and run"
+    );
+}
+
+/// aarch64 advertised NEON with no `<arm_neon.h>` behind it. Probed through
+/// `--target`, so the assertion holds from any host.
+#[test]
+fn c17_does_not_advertise_neon_without_the_header() {
+    for macro_name in ["__ARM_NEON", "__ARM_NEON__"] {
+        let got = expand_under("neon", Some("--target=aarch64-linux-gnu"), macro_name);
+        assert!(
+            is_undefined(&got, macro_name),
+            "{macro_name} must not be defined while <arm_neon.h> is not shipped, got {got}"
+        );
+    }
+
+    // Same target, same reason, other family.
+    for macro_name in SYNC_CAS_MACROS {
+        let got = expand_under("neon_sync", Some("--target=aarch64-linux-gnu"), macro_name);
+        assert!(
+            is_undefined(&got, macro_name),
+            "{macro_name} must not be defined on aarch64 either, got {got}"
+        );
+    }
+}
+
+/// Facts about the hardware, not promises about headers: these stay.
+#[test]
+fn c17_keeps_the_capability_macros_it_can_back() {
+    // C11 atomics are complete, so the lock-free advertisement is honest.
+    for macro_name in [
+        "__GCC_ATOMIC_INT_LOCK_FREE",
+        "__GCC_ATOMIC_POINTER_LOCK_FREE",
+    ] {
+        assert_eq!(expand_under("atomic_lockfree", None, macro_name), "2");
+    }
+
+    // __SSE2__ is knowingly still advertised without intrinsic headers -- the
+    // drop is deferred because it is the one change that could flip a
+    // configure decision. Pinned so a later sweep cannot take it silently;
+    // see "GNU extensions" in cc/doc/TODO.md.
+    #[cfg(target_arch = "x86_64")]
+    for macro_name in ["__SSE__", "__SSE2__", "__MMX__"] {
+        assert_eq!(
+            expand_under("sse_baseline", None, macro_name),
+            "1",
+            "{macro_name} is deliberately kept; changing it is a decision, not a sweep"
+        );
+    }
+}

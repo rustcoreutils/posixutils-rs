@@ -110,10 +110,10 @@ impl Aarch64CodeGen {
     /// so a `Loc::Stack` operand needs one more load than a `Loc::Reg` one.
     fn va_list_addr(&mut self, loc: &Loc, dst: Reg) -> Option<Reg> {
         match loc {
-            Loc::Stack(offset) => {
+            l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
-                    addr: self.stack_mem(*offset),
+                    addr: self.loc_mem(l).unwrap(),
                     dst,
                 });
                 Some(dst)
@@ -887,10 +887,10 @@ impl Aarch64CodeGen {
                     dst: scratch,
                 });
             }
-            Loc::Stack(off) => {
+            l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 self.push_lir(Aarch64Inst::Ldr {
                     size: op_size,
-                    addr: self.stack_mem(*off),
+                    addr: self.loc_mem(l).unwrap(),
                     dst: scratch,
                 });
             }
@@ -972,10 +972,10 @@ impl Aarch64CodeGen {
                     dst: scratch,
                 });
             }
-            Loc::Stack(off) => {
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 self.push_lir(Aarch64Inst::Ldr {
                     size: src_size,
-                    addr: self.stack_mem(off),
+                    addr: self.loc_mem(l).unwrap(),
                     dst: scratch,
                 });
             }
@@ -1047,10 +1047,10 @@ impl Aarch64CodeGen {
                     dst: scratch,
                 });
             }
-            Loc::Stack(off) => {
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 self.push_lir(Aarch64Inst::Ldr {
                     size: src_size,
-                    addr: self.stack_mem(off),
+                    addr: self.loc_mem(l).unwrap(),
                     dst: scratch,
                 });
             }
@@ -1114,10 +1114,10 @@ impl Aarch64CodeGen {
                     dst: scratch,
                 });
             }
-            Loc::Stack(off) => {
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 self.push_lir(Aarch64Inst::Ldr {
                     size: src_size,
-                    addr: self.stack_mem(off),
+                    addr: self.loc_mem(l).unwrap(),
                     dst: scratch,
                 });
             }

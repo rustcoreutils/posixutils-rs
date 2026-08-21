@@ -765,14 +765,20 @@ pub enum Loc {
     Reg(Reg),
     /// In a floating-point register
     VReg(VReg),
-    /// On the stack, in whichever of two frames the sign selects -- the
-    /// distinction `LocalSlot` and `IncomingOff` make at the producer, and
-    /// which this type has yet to make. A *negative* offset is the callee's
-    /// own frame: a local, a spill slot or an alloca, addressed below the
-    /// frame pointer, or below the aligned base when the frame has one. A
-    /// *positive* offset is an incoming stack argument in the caller's frame,
-    /// starting at +16 past the saved FP and LR. See #C34 in `cc/audit.md`.
-    Stack(i32),
+    /// A slot in the **callee's own** frame: a local, a spill slot or an
+    /// alloca, addressed below the frame pointer -- or below the aligned base
+    /// when the frame has one.
+    ///
+    /// Carries a [`LocalSlot`] rather than a bare `i32` so it cannot be
+    /// confused with [`Loc::IncomingArg`]. The two used to share this variant
+    /// and be told apart by the *sign*, which is how one refactor moved the
+    /// negation into a pair of closures, updated only one, and had the store
+    /// side write the caller's frame while the load side read the callee's --
+    /// both perfectly valid `i32`s. See #C34 in `cc/audit.md`.
+    Stack(LocalSlot),
+    /// An incoming stack argument, in the **caller's** frame: at +16 past the
+    /// saved FP and LR, growing upwards.
+    IncomingArg(IncomingOff),
     /// Immediate constant
     Imm(i128),
     /// Floating-point immediate constant (value, size in bits)
@@ -1352,7 +1358,7 @@ impl RegAlloc {
                             (*size_bits / 8) as i32,
                             types.alignment(arg.typ) as i32,
                         );
-                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
+                        self.locations.insert(pseudo, Loc::IncomingArg(at));
                         self.fp_pseudos.insert(pseudo);
                     }
                     fp_arg_idx += 1;
@@ -1387,7 +1393,7 @@ impl RegAlloc {
                             (count * elem_bytes) as i32,
                             types.alignment(arg.typ) as i32,
                         );
-                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
+                        self.locations.insert(pseudo, Loc::IncomingArg(at));
                         self.fp_pseudos.insert(pseudo);
                         // AAPCS64 §6.4.2: once an argument is laid out on the
                         // stack, NSRN is set to 8 and every later
@@ -1412,7 +1418,8 @@ impl RegAlloc {
                         int_arg_idx = start;
                         self.stack_offset += 16;
                         let slot = -self.stack_offset;
-                        self.locations.insert(pseudo, Loc::Stack(slot));
+                        self.locations
+                            .insert(pseudo, Loc::Stack(LocalSlot::from_displacement(slot)));
                         self.free_regs.retain(|&r| {
                             r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
                         });
@@ -1424,7 +1431,7 @@ impl RegAlloc {
                             16,
                             types.alignment(arg.typ) as i32,
                         );
-                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
+                        self.locations.insert(pseudo, Loc::IncomingArg(at));
                         // Stage C.11: NGRN becomes 8, so nothing after it takes
                         // a register either.
                         int_arg_idx = int_arg_regs.len();
@@ -1451,7 +1458,7 @@ impl RegAlloc {
                             16,
                             types.alignment(arg.typ) as i32,
                         );
-                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
+                        self.locations.insert(pseudo, Loc::IncomingArg(at));
                     }
                     int_arg_idx += 2;
                 }
@@ -1472,7 +1479,7 @@ impl RegAlloc {
                             8,
                             types.alignment(arg.typ) as i32,
                         );
-                        self.locations.insert(pseudo, Loc::Stack(at.displacement()));
+                        self.locations.insert(pseudo, Loc::IncomingArg(at));
                     }
                     int_arg_idx += 1;
                 }
@@ -1486,7 +1493,7 @@ impl RegAlloc {
             func,
             &mut self.stack_offset,
             &mut self.locations,
-            |off| Loc::Stack(-off),
+            |off| Loc::Stack(LocalSlot::from_displacement(-off)),
         );
     }
 
@@ -1514,7 +1521,7 @@ impl RegAlloc {
                     None
                 }
             },
-            |off| Loc::Stack(-off),
+            |off| Loc::Stack(LocalSlot::from_displacement(-off)),
             |pseudo, from_reg, to_stack_offset| {
                 // The shared helper hands both closures the same raw counter.
                 // `LocalSlot` applies the sign once, so this record and the
@@ -1553,8 +1560,7 @@ impl RegAlloc {
                         bytes,
                     });
 
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(slot.displacement()));
+                    self.locations.insert(interval.pseudo, Loc::Stack(slot));
                     self.free_fp_regs.push(from_reg);
                 }
             }
@@ -1599,7 +1605,10 @@ impl RegAlloc {
         );
         if reusable {
             if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
-                self.locations.insert(interval.pseudo, Loc::Stack(reused));
+                self.locations.insert(
+                    interval.pseudo,
+                    Loc::Stack(LocalSlot::from_displacement(reused)),
+                );
                 self.active_stack.push(crate::arch::regalloc::ActiveSlot {
                     current: interval.clone(),
                     past,
@@ -1614,7 +1623,10 @@ impl RegAlloc {
         }
         self.stack_offset += size;
         let offset = -self.stack_offset;
-        self.locations.insert(interval.pseudo, Loc::Stack(offset));
+        self.locations.insert(
+            interval.pseudo,
+            Loc::Stack(LocalSlot::from_displacement(offset)),
+        );
         if reusable {
             self.active_stack.push(crate::arch::regalloc::ActiveSlot {
                 current: interval.clone(),

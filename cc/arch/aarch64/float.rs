@@ -195,11 +195,13 @@ impl Aarch64CodeGen {
                     dst,
                 });
             }
-            Loc::Stack(offset) => {
-                // FP-relative for alloca safety
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
+                // FP-relative for alloca safety. A floating-point argument
+                // that overflowed the register file arrives in the caller's
+                // frame and is loaded the same way.
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
-                    addr: self.stack_mem(offset),
+                    addr: self.loc_mem(l).unwrap(),
                     dst,
                 });
             }

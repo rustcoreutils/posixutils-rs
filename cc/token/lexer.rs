@@ -21,13 +21,22 @@ pub use crate::diag::Position;
 // Lexer Mode
 // ============================================================================
 
-/// Lexer mode - controls comment syntax recognition
+/// Lexer mode - controls how a few characters are classified
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LexerMode {
-    /// C mode: // and /* */ comments
+    /// C mode: `'` and `"` both open a literal.
     #[default]
     C,
-    /// Assembly mode: ; comments (no // or /* */)
+    /// Assembly mode, matching GCC's `assembler-with-cpp`.
+    ///
+    /// Only `"` opens a literal here. GNU as spells a character constant `'a`
+    /// with no closing quote, and an apostrophe in a comment is ordinary
+    /// prose -- "don't" is common in real `.S` files -- so lexing `'` as C
+    /// does swallows the rest of the line and mangles the output.
+    ///
+    /// `;` is a statement separator rather than a comment introducer, and is
+    /// passed through for the assembler to interpret. `//` and `/* */` are
+    /// comments in both modes; GCC strips them from assembly too.
     Assembly,
 }
 
@@ -813,7 +822,8 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             } else {
                 // An encoding prefix directly before a quote: L, u, U, u8
                 // (C11 6.4.4.4 / 6.4.5). `u8` applies to strings only.
-                if cu == b'"' || cu == b'\'' {
+                // Assembly has no such prefixes.
+                if self.mode == LexerMode::C && (cu == b'"' || cu == b'\'') {
                     let enc = match name.as_str() {
                         "L" => Some(LiteralEncoding::Wide),
                         "u" => Some(LiteralEncoding::Utf16),
@@ -1002,8 +1012,9 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     fn get_special(&mut self, first: u8, class: u8) -> Option<Token> {
         let pos = self.pos();
 
-        // Check for string/char literals
-        if class & QUOTE != 0 {
+        // Check for string/char literals. Assembly mode admits only `"`; see
+        // LexerMode::Assembly for why `'` is an ordinary punctuator there.
+        if class & QUOTE != 0 && (first == b'"' || self.mode == LexerMode::C) {
             return Some(self.get_string_or_char(first, LiteralEncoding::Narrow));
         }
 
@@ -1015,34 +1026,27 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         }
 
-        // Check for comments (mode-dependent)
+        // Check for comments. Both modes strip `//` and `/* */`, as GCC does
+        // for assembler-with-cpp.
+        //
+        // Translation phase 3 replaces each comment with one space, so the
+        // token after a comment is "preceded by whitespace" even when no
+        // actual space is there. That flag is what `#` stringification and -E
+        // spacing read, so without it `S(a/**/b)` stringified as "ab" instead
+        // of "a b".
         if class & COMMENT != 0 {
-            match self.mode {
-                LexerMode::C => {
-                    // C mode: // and /* */ comments.
-                    //
-                    // Translation phase 3 replaces each comment with one space,
-                    // so the token after a comment is "preceded by whitespace"
-                    // even when no actual space is there. That flag is what
-                    // `#` stringification and -E spacing read, so without it
-                    // `S(a/**/b)` stringified as "ab" instead of "a b".
-                    let next = self.peekchar();
-                    if next == b'/' as i32 {
-                        self.nextchar();
-                        self.skip_line_comment();
-                        self.whitespace = true;
-                        return None; // No token, continue tokenizing
-                    }
-                    if next == b'*' as i32 {
-                        self.nextchar();
-                        self.skip_block_comment();
-                        self.whitespace = true;
-                        return None; // No token, continue tokenizing
-                    }
-                }
-                LexerMode::Assembly => {
-                    // Assembly mode: comment handling is left to the assembler.
-                }
+            let next = self.peekchar();
+            if next == b'/' as i32 {
+                self.nextchar();
+                self.skip_line_comment();
+                self.whitespace = true;
+                return None; // No token, continue tokenizing
+            }
+            if next == b'*' as i32 {
+                self.nextchar();
+                self.skip_block_comment();
+                self.whitespace = true;
+                return None; // No token, continue tokenizing
             }
         }
 
@@ -2449,27 +2453,56 @@ mod tests {
     }
 
     #[test]
-    fn test_asm_double_slash_not_comment() {
-        // In assembly mode, `//` is NOT a comment - just two `/` operators
+    fn test_asm_comments_are_stripped() {
+        // GCC's assembler-with-cpp strips `//` and `/* */` from assembly just
+        // as it does from C, so c17 does too.
         let (tokens, idents) = tokenize_asm("a // b");
         let toks: Vec<_> = tokens[1..tokens.len() - 1]
             .iter()
             .map(|t| show_token(t, &idents))
             .collect();
-        // Should tokenize as: a, /, /, b (no comment skipping)
-        assert_eq!(toks, vec!["a", "/", "/", "b"]);
-    }
+        assert_eq!(toks, vec!["a"]);
 
-    #[test]
-    fn test_asm_block_comment_not_comment() {
-        // In assembly mode, `/* */` is NOT a comment
         let (tokens, idents) = tokenize_asm("a /* b */ c");
         let toks: Vec<_> = tokens[1..tokens.len() - 1]
             .iter()
             .map(|t| show_token(t, &idents))
             .collect();
-        // Should tokenize as individual tokens, not as comment
-        assert_eq!(toks, vec!["a", "/", "*", "b", "*", "/", "c"]);
+        assert_eq!(toks, vec!["a", "c"]);
+    }
+
+    /// An apostrophe in assembly is prose or a GNU as character constant, not
+    /// the start of a C literal. Lexing it as one swallowed the rest of the
+    /// line, so a `.S` file whose comment said "don't" assembled to something
+    /// else entirely -- or failed outright.
+    #[test]
+    fn test_asm_apostrophe_is_not_a_literal() {
+        let (tokens, idents) = tokenize_asm("# don't panic\nmovl $7, %eax");
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(
+            toks,
+            vec!["#", "don", "'", "t", "panic", "movl", "$", "7", ",", "%", "eax"]
+        );
+
+        // GNU as writes an unterminated character constant `'a`, and a
+        // terminated one `'b'`; both are just punctuation plus identifiers.
+        let (tokens, idents) = tokenize_asm(".byte 'a\n.byte 'b'");
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(
+            toks,
+            vec![".", "byte", "'", "a", ".", "byte", "'", "b", "'"]
+        );
+
+        // `"` still opens a string, so an apostrophe inside one is content.
+        let (tokens, idents) = tokenize_asm(".ascii \"it's fine\"");
+        assert_eq!(tokens[3].typ, TokenType::String);
+        assert_eq!(show_token(&tokens[3], &idents), "\"it's fine\"");
     }
 
     #[test]

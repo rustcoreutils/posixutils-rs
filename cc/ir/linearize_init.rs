@@ -65,7 +65,7 @@ fn describe_expr(kind: &ExprKind) -> &'static str {
         ExprKind::Ident(_) => "the value of a variable",
         ExprKind::Comma { .. } => "a comma expression",
         ExprKind::Binary { .. } => "this arithmetic",
-        ExprKind::Conditional { .. } => "this conditional",
+        ExprKind::Conditional { .. } | ExprKind::CondElvis { .. } => "this conditional",
         _ => "this expression",
     }
 }
@@ -470,6 +470,26 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Compile-time ternary: cond ? then_expr : else_expr
             // Used in CPython's _Py_LATIN1_CHR() macro for static initializers
+            // `a ?: b` in a static initializer: the condition is constant or
+            // this is an error either way, so folding it needs no temporary.
+            ExprKind::CondElvis { cond, else_expr } => {
+                if let Some(cond_val) = self.eval_const_init_expr(cond) {
+                    if cond_val != 0 {
+                        return self.ast_init_to_ir(cond, typ);
+                    } else {
+                        return self.ast_init_to_ir(else_expr, typ);
+                    }
+                }
+                error(
+                    self.current_pos.unwrap_or_default(),
+                    &format!(
+                        "non-constant condition in global initializer ternary: {:?}",
+                        cond.kind
+                    ),
+                );
+                Initializer::None
+            }
+
             ExprKind::Conditional {
                 cond,
                 then_expr,

@@ -1350,3 +1350,38 @@ fn preprocessed_output_preserves_source_line_numbers() {
         );
     }
 }
+
+/// `cflow` and `cxref` must walk through GNU `a ?: b`.
+///
+/// The node has no middle operand, so a walker written for the three-operand
+/// form skips it silently rather than failing to compile — the `_` arm swallows
+/// it. A call in either half would then be absent from the graph.
+#[test]
+fn tools_see_through_an_omitted_middle_operand() {
+    let dir = TempDir::new().unwrap();
+    let f = src(
+        &dir,
+        "elv.c",
+        "int fallback(void);\nint primary(void);\n\
+         int chooser(void) { return primary() ?: fallback(); }\n\
+         int main(void) { return chooser(); }\n",
+    );
+
+    let (flow, stderr, code) = run("cflow", &[&f]);
+    assert_eq!(code, 0, "{}", stderr);
+    for callee in ["primary", "fallback"] {
+        assert!(
+            flow.contains(callee),
+            "cflow should reach {callee} through `?:`: {flow:?}"
+        );
+    }
+
+    let (xref, stderr, code) = run("cxref", &["-s", &f]);
+    assert_eq!(code, 0, "{}", stderr);
+    for name in ["primary", "fallback"] {
+        assert!(
+            !cxref_rows(&xref, name).is_empty(),
+            "cxref should list {name} referenced through `?:`: {xref:?}"
+        );
+    }
+}

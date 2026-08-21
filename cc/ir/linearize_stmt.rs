@@ -1821,6 +1821,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                     || self.expr_is_runtime(then_expr)
                     || self.expr_is_runtime(else_expr)
             }
+            ExprKind::CondElvis { cond, else_expr } => {
+                self.expr_is_runtime(cond) || self.expr_is_runtime(else_expr)
+            }
             ExprKind::Cast { expr: inner, .. } => self.expr_is_runtime(inner),
 
             // `sizeof` of a variable length array type is the exception: it

@@ -399,6 +399,32 @@ impl<'a> Parser<'a> {
 
         if self.is_special(b'?') {
             self.advance();
+
+            // GNU `a ?: b`: the middle operand may be omitted, and then the
+            // condition is also the value when it is true. Kept as its own
+            // node rather than rewritten to `a ? a : b`, because 6.5.15 would
+            // then evaluate `a` twice -- `f() ?: 0` must call `f` once.
+            if self.is_special(b':') {
+                self.advance();
+                let else_expr = self.parse_conditional_expr()?;
+
+                let cond_typ = cond.typ.unwrap_or(self.types.int_id);
+                let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
+                let cond_decayed = self.decayed_type(cond_typ);
+                let else_decayed = self.decayed_type(else_typ);
+                let typ = self.ternary_common_type(cond_decayed, else_decayed);
+
+                let pos = cond.pos;
+                return Ok(Self::typed_expr(
+                    ExprKind::CondElvis {
+                        cond: Box::new(cond),
+                        else_expr: Box::new(else_expr),
+                    },
+                    typ,
+                    pos,
+                ));
+            }
+
             let then_expr = self.parse_expression()?;
             self.expect_special(b':')?;
             // Right-to-left: parse else as another conditional

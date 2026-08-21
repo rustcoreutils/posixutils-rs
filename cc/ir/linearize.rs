@@ -1500,6 +1500,12 @@ impl<'a> Linearizer<'a> {
                     && self.is_pure_expr(else_expr)
             }
 
+            // `a ?: b` evaluates `a` once and `b` only when `a` is false, so
+            // it is pure exactly when both are.
+            ExprKind::CondElvis { cond, else_expr } => {
+                self.is_pure_expr(cond) && self.is_pure_expr(else_expr)
+            }
+
             // Function calls are never pure (may have side effects)
             ExprKind::Call { .. } => false,
 
@@ -3993,6 +3999,112 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Lower GNU `a ?: b`.
+    ///
+    /// The whole point is that `a` is evaluated **once**: it supplies both the
+    /// branch test and the value taken when it is true. Rewriting to
+    /// `a ? a : b` in the parser would have called `f` twice in `f() ?: 0`.
+    pub(crate) fn linearize_elvis(
+        &mut self,
+        expr: &Expr,
+        cond: &Expr,
+        else_expr: &Expr,
+    ) -> PseudoId {
+        let result_typ = self.expr_type(expr);
+        let cond_typ = self.expr_type(cond);
+
+        // A constant condition picks one side outright and never evaluates the
+        // other, for the reason `linearize_ternary` records.
+        if let Some(cond_const) = self.eval_const_expr(cond) {
+            let (taken, taken_typ) = if cond_const != 0 {
+                (cond, cond_typ)
+            } else {
+                (else_expr, self.expr_type(else_expr))
+            };
+            let value = self.linearize_expr(taken);
+            return self.emit_convert(value, taken_typ, result_typ);
+        }
+
+        let size = if self.types.kind(result_typ) == TypeKind::Function {
+            64
+        } else {
+            self.types.size_bits(result_typ)
+        };
+
+        // Evaluated here, before either form below, so there is exactly one
+        // evaluation on every path.
+        let cond_val = self.linearize_expr(cond);
+        let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+
+        // The true value is the condition itself, widened to the result type
+        // the same way the ternary widens its arms.
+        let cond_size = self.types.size_bits(cond_typ);
+        let then_val = if cond_size < size && cond_size <= 32 && self.types.is_integer(cond_typ) {
+            self.emit_convert(cond_val, cond_typ, result_typ)
+        } else {
+            cond_val
+        };
+
+        if self.is_pure_expr(else_expr) && size <= 64 {
+            let mut else_val = self.linearize_expr(else_expr);
+            let else_typ = self.expr_type(else_expr);
+            let else_size = self.types.size_bits(else_typ);
+            if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
+                else_val = self.emit_convert(else_val, else_typ, result_typ);
+            }
+            let result = self.alloc_pseudo();
+            self.emit(Instruction::select(
+                result, cond_bool, then_val, else_val, result_typ, size,
+            ));
+            return result;
+        }
+
+        // Impure right-hand side: it must not be evaluated when the condition
+        // is true, so it needs its own block.
+        let then_bb = self.alloc_bb();
+        let else_bb = self.alloc_bb();
+        let merge_bb = self.alloc_bb();
+        let cond_end_bb = self.current_bb.unwrap();
+
+        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+        self.link_bb(cond_end_bb, then_bb);
+        self.link_bb(cond_end_bb, else_bb);
+
+        // Nothing to compute on the true side; the value is already in hand.
+        self.switch_bb(then_bb);
+        let then_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(then_end_bb, merge_bb);
+
+        self.switch_bb(else_bb);
+        let mut else_val = self.linearize_expr(else_expr);
+        let else_typ = self.expr_type(else_expr);
+        let else_size = self.types.size_bits(else_typ);
+        if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
+            else_val = self.emit_convert(else_val, else_typ, result_typ);
+        }
+        let else_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(else_end_bb, merge_bb);
+
+        self.switch_bb(merge_bb);
+        let result = self.alloc_pseudo();
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
+        let mut phi_insn = Instruction::phi(result, result_typ, size);
+        let phisrc1 =
+            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, result_typ, size);
+        phi_insn.phi_list.push((then_end_bb, phisrc1));
+        let phisrc2 =
+            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, result_typ, size);
+        phi_insn.phi_list.push((else_end_bb, phisrc2));
+        self.emit(phi_insn);
+
+        result
+    }
+
     pub(crate) fn linearize_compound_literal(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
             ExprKind::CompoundLiteral { typ, elements } => {
@@ -5033,6 +5145,8 @@ impl<'a> Linearizer<'a> {
                 then_expr,
                 else_expr,
             } => self.linearize_ternary(expr, cond, then_expr, else_expr),
+
+            ExprKind::CondElvis { cond, else_expr } => self.linearize_elvis(expr, cond, else_expr),
 
             ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
 

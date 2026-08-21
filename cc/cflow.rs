@@ -247,6 +247,12 @@ fn extract_calls_from_expr(
             extract_calls_from_expr(then_expr, strings, symbols, calls);
             extract_calls_from_expr(else_expr, strings, symbols, calls);
         }
+        // `a ?: b` has no middle operand to walk, but a call in either half
+        // still belongs in the graph.
+        ExprKind::CondElvis { cond, else_expr } => {
+            extract_calls_from_expr(cond, strings, symbols, calls);
+            extract_calls_from_expr(else_expr, strings, symbols, calls);
+        }
         ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => {
             extract_calls_from_expr(expr, strings, symbols, calls);
         }

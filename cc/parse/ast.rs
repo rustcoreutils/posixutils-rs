@@ -279,6 +279,15 @@ pub enum ExprKind {
         else_expr: Box<Expr>,
     },
 
+    /// GNU `a ?: b` -- a conditional whose middle operand is omitted, so the
+    /// condition is also the value when it is true. Held apart from
+    /// `Conditional` rather than desugared to `a ? a : b` because the
+    /// condition must be evaluated exactly once.
+    CondElvis {
+        cond: Box<Expr>,
+        else_expr: Box<Expr>,
+    },
+
     /// Function call
     Call {
         func: Box<Expr>,

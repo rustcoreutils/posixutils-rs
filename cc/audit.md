@@ -17,11 +17,9 @@ crate. Each audit follows the playbook in `audits.md`.
 
 ## Status
 
-**Open: 3.** Two are standing decisions rather than work items — #C55
-(trigraphs off by default) and #C12 (`_FORTIFY_SOURCE`). One is a live finding
-from the 2026-08-21 ISO C re-probe — #C158 (raw UTF-8 identifiers), a
-compatibility gap rather than a standards one. #C157 came out of the same pass
-and is closed. All three are under **Open** in the `c17` section below.
+**Open: 2.** Both are standing decisions rather than work items — #C55
+(trigraphs off by default) and #C12 (`_FORTIFY_SOURCE`). #C157 and #C158 came
+out of the 2026-08-21 ISO C re-probe and are both closed.
 
 **Everything else is closed.** The per-finding entries used to be kept here
 after they were fixed; they are not any more, because 252 of them made the file
@@ -139,14 +137,12 @@ The remaining items are diagnostic-quality or technical debt. Two findings are
 
 ## Open
 
-Three: two standing decisions, kept here so neither gets re-raised as a to-do,
-and one live finding from the 2026-08-21 re-probe.
+Two, and both are standing decisions rather than pending work. They are kept
+here so neither gets re-raised as a to-do.
 
 - [ ] **#C55 — Trigraphs are off by default.** **SETTLED by maintainer decision — not deferred, not awaiting anything, and not to be re-raised.** The c17 APPLICATION USAGE says it outright (88224): "Some c17 compilers *not conforming to POSIX.1-2024* do not support trigraphs by default." #P11 implemented them behind `--trigraphs` because replacement reaches inside string literals, so `"What??!"` becomes `"What|"` — which is exactly what C17 phase 1 specifies and what the POSIX RATIONALE laments without granting an exemption. A deliberate divergence, not a missing feature; the fix is to flip the default and offer an opt-out. Deliberately out of scope of the 2026-08-15 series.
 
 - [ ] **#C12 — `_FORTIFY_SOURCE` compiles but fortifies nothing.** **Deferred indefinitely by maintainer decision (2026-08-19). Open, Minor.** Originally diagnosed as one defect — `__builtin_object_size` answering `(size_t)-1` — it turned out to be six, each hidden behind the one before it, and only visible by fixing a layer and re-measuring. Four are now closed: real object sizes, implicit `__builtin___*_chk` declarations, asm label renaming (below), and `always_inline`. The two that remain are `__gnu_inline__` emitting no out-of-line definition, and folding `__builtin_object_size` *after* inlining rather than before — see `cc/doc/TODO.md` for the measurements. Not a conformance issue — the fortification is a glibc extension — but a security-relevant one for anyone who sets the flag expecting it to work.
-
-- [ ] **#C158 — raw UTF-8 characters are not accepted in identifiers.** **Open, Minor — an extension, not a conformance gap. [probed 2026-08-21]** C17 6.4.2.1 admits an extended character only through a universal character name, and c17 implements exactly that: `int café = 1;` is rejected, `int caf\u00e9 = 1;` is accepted. gcc and clang both take the raw spelling (it is C23 behaviour, offered as an extension in earlier modes), and real source does use it, so this is a compatibility gap rather than a standards one. Noted here because a probe written against gcc will trip over it and read as a phase-2 defect, which is how it first surfaced.
 
 ## Detailed conformance matrix
 
@@ -271,6 +267,7 @@ as what was run.
 | C11 | CONFORMS **[probed 2026-08-21]** | one program exercising `_Generic` (including `default:`), `_Atomic` through ordinary operators and through `<stdatomic.h>`, `_Static_assert`, `_Thread_local`, `alignas`/`alignof`/`max_align_t`, anonymous members, `CMPLX`, and all three Unicode literal prefixes |
 | C17 | CLAIMED | `__STDC_VERSION__` is `201710L`, and it is the only language c17 compiles. C17 is DR-only; DR 412 (`_Static_assert` as a struct member) is honored at `cc/parse/parser.rs`, and DR 423 is live now that `_Generic` exists |
 | Translation limits (C99 5.2.4.1) | CONFORMS **[re-probed 2026-08-21]** | the twelve minimums, including the one that used to fail: 63 nesting levels of parenthesized declarators now compile (#C44 closed). Residual risk unchanged -- the recursive-descent parser has no explicit depth guard, so very deep nesting depends on stack size |
+| Identifiers (C17 6.4.2.1, Annex D) | CONFORMS **[probed 2026-08-21, exhaustively]** | The Annex D table is transcribed from GCC's `libcpp/ucnid.tab` (`[C11]`+`[C11NOSTART]`), which states it reproduces ISO/IEC 9899 Annex D; Clang's independent table agrees on every code point, and so does c17's -- compared over all 1.1M code points in both positions, not sampled. Extended characters are accepted written directly as well as as a UCN (#C158), and both spellings name the same identifier. Until then the direct spelling was rejected outright, and the UCN path applied only 6.4.3p2 -- what a UCN may *name* -- so it admitted characters no identifier may contain and let a combining mark come first. **Two deliberate divergences from GCC's binary:** U+FD3E and U+FD3F, which Annex D excludes and which GCC's own table and Clang's both omit |
 | Header namespace (C17 7.1.3) | CONFORMS **[probed 2026-08-21]** | `<string.h>`, `<stdio.h>` and `<time.h>` declare what their clauses give them and leave the rest of the namespace alone. Was **not** conforming until #C157: the builtin `<stddef.h>` and `<stdarg.h>` ignored glibc's `__need_*` protocol, so `<string.h>` declared `wchar_t`, `ptrdiff_t` and `max_align_t` and `<stdio.h>` defined the `va_*` macros. `va_list` from `<stdio.h>` is not a leak -- glibc declares it under `__USE_XOPEN2K8`, as POSIX requires, and gcc's default `gnu17` mode does the same |
 | Diagnostics for constraint violations (C17 5.1.1.3) | CONFORMS **[probed 2026-08-15]** | a 35-case matrix -- 21 constraint violations, 14 accept-side controls -- agrees with `gcc -std=c17` on every row. Two places stay deliberately *stricter* than gcc: `return` with a value in a `void` function, and a bare `return` in a non-`void` one, both genuine 6.8.6.4 violations |
 | Code generation | **NOT ESTABLISHED THE SAME WAY** | see *Code generation evidence* below |

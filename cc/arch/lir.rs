@@ -485,9 +485,9 @@ impl Symbol {
     /// macOS prepends underscore to external symbols
     pub fn format_for_target(&self, target: &Target) -> String {
         if let Some(verbatim) = strip_verbatim(&self.name) {
-            return verbatim.to_string();
+            return quote_symbol_if_needed(verbatim);
         }
-        if self.is_local {
+        let decorated = if self.is_local {
             // Local symbols don't get underscore prefix
             self.name.clone()
         } else {
@@ -495,8 +495,49 @@ impl Symbol {
                 Os::MacOS => format!("_{}", self.name),
                 Os::Linux | Os::FreeBSD => self.name.clone(),
             }
-        }
+        };
+        quote_symbol_if_needed(&decorated)
     }
+}
+
+/// Whether `b` may appear in a symbol name the assembler reads unquoted.
+///
+/// LLVM's `MCAsmInfo::isAcceptableChar`, minus the cases it makes conditional
+/// on a target c17 does not have (`[`/`]` on AIX, `#` on HLASM). `@` is
+/// deliberately absent: it introduces a relocation suffix -- `sym@PLT`,
+/// `sym@PAGE` -- which is appended *after* this, so a name containing one
+/// would have to be quoted rather than silently spliced.
+fn is_bare_symbol_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$')
+}
+
+/// Render `name` so an assembler will read it as one symbol.
+///
+/// Assemblers take a limited character set bare and require anything else to
+/// be quoted. GNU as tolerates a raw non-ASCII byte; Mach-O's assembler does
+/// not, and an identifier holding one produced `_café: error: invalid
+/// operand` and `adrp x0, _café@PAGE: error: unexpected token`. That is not a
+/// niche case -- C17 6.4.2.1 admits extended characters in identifiers, by
+/// UCN since C99 and written directly as of #C158.
+///
+/// LLVM does exactly this in `MCSymbol::print`, and quoting is accepted
+/// everywhere c17 emits a name: bare, in `.globl`/`.type`/`.size`, as a call
+/// target, and with a relocation suffix attached (`"café"@PLT`, `"café"@PAGE`)
+/// -- verified against GNU as on both x86-64 and aarch64.
+pub fn quote_symbol_if_needed(name: &str) -> String {
+    if !name.is_empty() && name.bytes().all(is_bare_symbol_byte) {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('"');
+    for ch in name.chars() {
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
 }
 
 /// Marks an assembler name that must reach the assembler exactly as written.
@@ -1257,6 +1298,86 @@ impl EmitAsm for Directive {
 mod tests {
     use super::*;
     use crate::target::Arch;
+
+    /// A symbol whose name an assembler will not take bare has to be quoted.
+    /// Mach-O's assembler rejects a raw non-ASCII byte outright -- `_café:` is
+    /// "invalid operand" -- and C17 6.4.2.1 admits extended characters in
+    /// identifiers, so this is reachable from ordinary source.
+    #[test]
+    fn test_quote_symbol_if_needed() {
+        // Everything an assembler takes bare stays byte-identical. This half
+        // matters most: quoting a name that did not need it would rewrite
+        // every line of every .s file c17 emits.
+        for name in [
+            "main",
+            "_start",
+            "x",
+            "L0",
+            ".LC0",
+            "__libc_start_main",
+            "foo.bar.1",
+            "$dollar",
+            "a$b.c_d9",
+            "_ZN3fooE",
+        ] {
+            assert_eq!(quote_symbol_if_needed(name), name, "{name} must stay bare");
+        }
+
+        // Anything else is quoted.
+        assert_eq!(quote_symbol_if_needed("caf\u{e9}"), "\"caf\u{e9}\"");
+        assert_eq!(
+            quote_symbol_if_needed("\u{4e2d}\u{6587}"),
+            "\"\u{4e2d}\u{6587}\""
+        );
+        assert_eq!(quote_symbol_if_needed("_caf\u{e9}"), "\"_caf\u{e9}\"");
+        assert_eq!(quote_symbol_if_needed("a-b"), "\"a-b\"");
+        assert_eq!(quote_symbol_if_needed("with space"), "\"with space\"");
+        // `@` introduces a relocation suffix, appended after this; a name
+        // holding one must be quoted rather than silently spliced.
+        assert_eq!(quote_symbol_if_needed("a@b"), "\"a@b\"");
+
+        // The two characters that would end the quoted form are escaped.
+        assert_eq!(quote_symbol_if_needed("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote_symbol_if_needed("a\\b"), "\"a\\\\b\"");
+
+        // An empty name is not a valid bare symbol either.
+        assert_eq!(quote_symbol_if_needed(""), "\"\"");
+    }
+
+    /// The decorated name is what gets quoted, so the quotes wrap the
+    /// underscore Mach-O adds rather than sitting inside it; and an asm label,
+    /// which is the final name and takes no decoration, is quoted too.
+    #[test]
+    fn test_format_for_target_quotes_after_decorating() {
+        let linux = Target::new(Arch::X86_64, Os::Linux);
+        let macos = Target::new(Arch::Aarch64, Os::MacOS);
+
+        assert_eq!(Symbol::global("plain").format_for_target(&linux), "plain");
+        assert_eq!(Symbol::global("plain").format_for_target(&macos), "_plain");
+
+        assert_eq!(
+            Symbol::global("caf\u{e9}").format_for_target(&linux),
+            "\"caf\u{e9}\""
+        );
+        assert_eq!(
+            Symbol::global("caf\u{e9}").format_for_target(&macos),
+            "\"_caf\u{e9}\""
+        );
+
+        // A local symbol takes no underscore, on either target.
+        assert_eq!(
+            Symbol::local("caf\u{e9}").format_for_target(&macos),
+            "\"caf\u{e9}\""
+        );
+
+        // An asm label is the final name: no underscore, but still quoted.
+        let label = Symbol::global(verbatim("caf\u{e9}"));
+        assert_eq!(label.format_for_target(&macos), "\"caf\u{e9}\"");
+        assert_eq!(
+            Symbol::global(verbatim("plain")).format_for_target(&macos),
+            "plain"
+        );
+    }
 
     #[test]
     fn test_operand_size() {

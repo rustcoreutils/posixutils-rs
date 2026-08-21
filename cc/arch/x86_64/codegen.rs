@@ -4784,17 +4784,23 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Format a symbol name with platform-specific prefix
+    /// Format a symbol name with platform-specific prefix.
+    ///
+    /// Decorates like [`Symbol::format_for_target`] but decides "local" from
+    /// the name's leading `.` rather than from a flag, because the callers
+    /// here have a bare `&str`. The quoting rule is shared, so the two cannot
+    /// disagree about *that* even while they still differ about decoration.
     fn format_symbol_name(&self, name: &str) -> String {
         // An asm label is the final name; see `lir::VERBATIM_MARKER`.
         if let Some(verbatim) = crate::arch::lir::strip_verbatim(name) {
-            return verbatim.to_string();
+            return crate::arch::lir::quote_symbol_if_needed(verbatim);
         }
-        if self.base.target.os == Os::MacOS && !name.starts_with('.') {
+        let decorated = if self.base.target.os == Os::MacOS && !name.starts_with('.') {
             format!("_{}", name)
         } else {
             name.to_string()
-        }
+        };
+        crate::arch::lir::quote_symbol_if_needed(&decorated)
     }
 
     /// Get the 64-bit register name

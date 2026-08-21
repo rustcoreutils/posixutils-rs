@@ -6416,3 +6416,87 @@ fn test_bitfield_value_mask_covers_the_full_carrier() {
         assert_eq!(m.trailing_ones(), w, "width {w} is not low-contiguous");
     }
 }
+
+/// `vm_index_base` finds the object whose recorded extents give the stride for
+/// a variably-modified type, and counts the index steps that separate them.
+///
+/// A dereference is an index step: 6.5.2.1p2 defines `E1[E2]` as
+/// `(*((E1)+(E2)))`, so `*p` and `p[0]` are the same expression at the same
+/// depth. Counting only `Index` carried the extents in and dropped them out,
+/// which is why `p[0][i][j]` indexed correctly while `(*p)[i][j]` used a
+/// stride of zero and `sizeof(*p)` answered 0.
+#[test]
+fn test_vm_index_base_counts_a_deref_as_an_index_step() {
+    let mut ctx = TestContext::new();
+    let int_t = ctx.int_type();
+    let sym = ctx.var("a", int_t);
+
+    let ident = || Expr {
+        kind: ExprKind::Ident(sym),
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    let zero = || {
+        Box::new(Expr {
+            kind: ExprKind::IntLit(0),
+            typ: Some(int_t),
+            pos: test_pos(),
+        })
+    };
+    let index = |base: Expr| Expr {
+        kind: ExprKind::Index {
+            array: Box::new(base),
+            index: zero(),
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    let deref = |base: Expr| Expr {
+        kind: ExprKind::Unary {
+            op: UnaryOp::Deref,
+            operand: Box::new(base),
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+
+    // The object itself is depth 0.
+    assert_eq!(Linearizer::vm_index_base(&ident()), Some((sym, 0)));
+
+    // `a[0]` and `*a` are the same depth, and so are `a[0][0]`, `(*a)[0]`,
+    // `*(a[0])` and `**a`.
+    assert_eq!(Linearizer::vm_index_base(&index(ident())), Some((sym, 1)));
+    assert_eq!(Linearizer::vm_index_base(&deref(ident())), Some((sym, 1)));
+    for at_two in [
+        index(index(ident())),
+        index(deref(ident())),
+        deref(index(ident())),
+        deref(deref(ident())),
+    ] {
+        assert_eq!(Linearizer::vm_index_base(&at_two), Some((sym, 2)));
+    }
+
+    // Anything else under the chain has no recorded extents, so the caller
+    // must fall back to the compile-time size rather than guess.
+    let not_an_object = Expr {
+        kind: ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand: Box::new(ident()),
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    assert_eq!(Linearizer::vm_index_base(&not_an_object), None);
+    assert_eq!(Linearizer::vm_index_base(&index(not_an_object)), None);
+
+    // A unary operator that is not a dereference is not an index step.
+    let addr_of = Expr {
+        kind: ExprKind::Unary {
+            op: UnaryOp::AddrOf,
+            operand: Box::new(ident()),
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    assert_eq!(Linearizer::vm_index_base(&addr_of), None);
+}

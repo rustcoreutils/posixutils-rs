@@ -17,11 +17,11 @@ crate. Each audit follows the playbook in `audits.md`.
 
 ## Status
 
-**Open: 4.** Two are standing decisions rather than work items — #C55
-(trigraphs off by default) and #C12 (`_FORTIFY_SOURCE`). Two are live findings
-from the 2026-08-21 ISO C re-probe — #C157 (`<stddef.h>` ignores glibc's
-`__need_*` protocol) and #C158 (raw UTF-8 identifiers). All four are under
-**Open** in the `c17` section below.
+**Open: 3.** Two are standing decisions rather than work items — #C55
+(trigraphs off by default) and #C12 (`_FORTIFY_SOURCE`). One is a live finding
+from the 2026-08-21 ISO C re-probe — #C158 (raw UTF-8 identifiers), a
+compatibility gap rather than a standards one. #C157 came out of the same pass
+and is closed. All three are under **Open** in the `c17` section below.
 
 **Everything else is closed.** The per-finding entries used to be kept here
 after they were fixed; they are not any more, because 252 of them made the file
@@ -111,12 +111,13 @@ reading, and it was wrong.** Re-probing it on 2026-08-21 -- running the built
 binary against `gcc -std=c17`, case by case -- turned up eleven defects in
 translation phases 1-4, a 6.4.7 implementation that did not exist, digraph
 spellings silently discarded, `#__VA_ARGS__` keeping only its first argument,
-and a VLA miscompile: `&a` on a variable-length array yielded the address of
-its pointer slot rather than the array, at `-O0` and `-O2` alike, with no test
-anywhere in the tree taking a VLA's address. All are fixed and each row of the
-ISO C table now names the probe that established it.
+a VLA miscompile -- `&a` on a variable-length array yielded the address of its
+pointer slot rather than the array, at `-O0` and `-O2` alike, with no test
+anywhere in the tree taking a VLA's address -- and two builtin headers
+defining names their clauses do not give them. All are fixed and each row of
+the ISO C table now names the probe that established it.
 
-Two of the four open findings came out of that same pass; see **Open**. And
+One open finding came out of that same pass; see **Open**. And
 the distinction the pass turned on is worth stating plainly, because it is the
 one this document keeps getting wrong: a row backed by a code citation is a
 claim about the source, not about the compiler.
@@ -136,14 +137,12 @@ The remaining items are diagnostic-quality or technical debt. Two findings are
 
 ## Open
 
-Four: two standing decisions, kept here so neither gets re-raised as a to-do,
-and two live findings from the 2026-08-21 re-probe.
+Three: two standing decisions, kept here so neither gets re-raised as a to-do,
+and one live finding from the 2026-08-21 re-probe.
 
 - [ ] **#C55 — Trigraphs are off by default.** **SETTLED by maintainer decision — not deferred, not awaiting anything, and not to be re-raised.** The c17 APPLICATION USAGE says it outright (88224): "Some c17 compilers *not conforming to POSIX.1-2024* do not support trigraphs by default." #P11 implemented them behind `--trigraphs` because replacement reaches inside string literals, so `"What??!"` becomes `"What|"` — which is exactly what C17 phase 1 specifies and what the POSIX RATIONALE laments without granting an exemption. A deliberate divergence, not a missing feature; the fix is to flip the default and offer an opt-out. Deliberately out of scope of the 2026-08-15 series.
 
 - [ ] **#C12 — `_FORTIFY_SOURCE` compiles but fortifies nothing.** **Deferred indefinitely by maintainer decision (2026-08-19). Open, Minor.** Originally diagnosed as one defect — `__builtin_object_size` answering `(size_t)-1` — it turned out to be six, each hidden behind the one before it, and only visible by fixing a layer and re-measuring. Four are now closed: real object sizes, implicit `__builtin___*_chk` declarations, asm label renaming (below), and `always_inline`. The two that remain are `__gnu_inline__` emitting no out-of-line definition, and folding `__builtin_object_size` *after* inlining rather than before — see `cc/doc/TODO.md` for the measurements. Not a conformance issue — the fortification is a glibc extension — but a security-relevant one for anyone who sets the flag expecting it to work.
-
-- [ ] **#C157 — the builtin `<stddef.h>` ignores glibc's `__need_*` protocol.** **Open, Minor. [probed 2026-08-21]** glibc's headers ask for one definition at a time — `<string.h>` does `#define __need_size_t` / `#define __need_NULL` before including `<stddef.h>` — and c17's builtin `<stddef.h>` defines all of `ptrdiff_t`, `size_t`, `wchar_t`, `NULL`, `offsetof` and `max_align_t` unconditionally, then latches `_STDDEF_H` so a later include asking for something else gets nothing. The visible effect: `#include <string.h>` declares `wchar_t`, which C17 7.24.1 does not permit, so a program that defines its own `wchar_t` after including `<string.h>` is rejected where gcc accepts it. Fix is to honour each `__need_*` and guard each typedef separately, as gcc's own `<stddef.h>` does. Touches the most-included header in the tree, so it wants the CPython gate.
 
 - [ ] **#C158 — raw UTF-8 characters are not accepted in identifiers.** **Open, Minor — an extension, not a conformance gap. [probed 2026-08-21]** C17 6.4.2.1 admits an extended character only through a universal character name, and c17 implements exactly that: `int café = 1;` is rejected, `int caf\u00e9 = 1;` is accepted. gcc and clang both take the raw spelling (it is C23 behaviour, offered as an extension in earlier modes), and real source does use it, so this is a compatibility gap rather than a standards one. Noted here because a probe written against gcc will trip over it and read as a phase-2 defect, which is how it first surfaced.
 
@@ -270,6 +269,7 @@ as what was run.
 | C11 | CONFORMS **[probed 2026-08-21]** | one program exercising `_Generic` (including `default:`), `_Atomic` through ordinary operators and through `<stdatomic.h>`, `_Static_assert`, `_Thread_local`, `alignas`/`alignof`/`max_align_t`, anonymous members, `CMPLX`, and all three Unicode literal prefixes |
 | C17 | CLAIMED | `__STDC_VERSION__` is `201710L`, and it is the only language c17 compiles. C17 is DR-only; DR 412 (`_Static_assert` as a struct member) is honored at `cc/parse/parser.rs`, and DR 423 is live now that `_Generic` exists |
 | Translation limits (C99 5.2.4.1) | CONFORMS **[re-probed 2026-08-21]** | the twelve minimums, including the one that used to fail: 63 nesting levels of parenthesized declarators now compile (#C44 closed). Residual risk unchanged -- the recursive-descent parser has no explicit depth guard, so very deep nesting depends on stack size |
+| Header namespace (C17 7.1.3) | CONFORMS **[probed 2026-08-21]** | `<string.h>`, `<stdio.h>` and `<time.h>` declare what their clauses give them and leave the rest of the namespace alone. Was **not** conforming until #C157: the builtin `<stddef.h>` and `<stdarg.h>` ignored glibc's `__need_*` protocol, so `<string.h>` declared `wchar_t`, `ptrdiff_t` and `max_align_t` and `<stdio.h>` defined the `va_*` macros. `va_list` from `<stdio.h>` is not a leak -- glibc declares it under `__USE_XOPEN2K8`, as POSIX requires, and gcc's default `gnu17` mode does the same |
 | Diagnostics for constraint violations (C17 5.1.1.3) | CONFORMS **[probed 2026-08-15]** | a 35-case matrix -- 21 constraint violations, 14 accept-side controls -- agrees with `gcc -std=c17` on every row. Two places stay deliberately *stricter* than gcc: `return` with a value in a `void` function, and a bare `return` in a non-`void` one, both genuine 6.8.6.4 violations |
 | Code generation | **NOT ESTABLISHED THE SAME WAY** | see *Code generation evidence* below |
 

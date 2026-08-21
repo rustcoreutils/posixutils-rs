@@ -6320,6 +6320,55 @@ PASTE(foo, bar)
     // Stringify, paste, include, and #if edge-case tests
     // ========================================================================
 
+    /// 6.10.3.1p2 makes `__VA_ARGS__` the whole variadic token sequence,
+    /// commas included. Substitution took its first element alone, so
+    /// `V(1,2,3)` stringified to `"1"` -- silently, and the idiom is common
+    /// in logging macros.
+    #[test]
+    fn test_stringify_all_va_args() {
+        for (code, want) in [
+            ("#define V(...) #__VA_ARGS__\nV(1,2,3)", "\"1,2,3\""),
+            ("#define V(...) #__VA_ARGS__\nV(1)", "\"1\""),
+            ("#define W(a, ...) #__VA_ARGS__\nW(k, 1,2)", "\"1,2\""),
+            // A comma inside parentheses is not a separator.
+            ("#define V(...) #__VA_ARGS__\nV(f(1,2),3)", "\"f(1,2),3\""),
+            // Spacing that the source has is kept; spacing it lacks is not
+            // invented, which is what made `V(1,2,3)` come out `"1 , 2 , 3"`
+            // once every argument survived.
+            ("#define V(...) #__VA_ARGS__\nV(a, b)", "\"a, b\""),
+        ] {
+            let (tokens, idents) = preprocess_str(code);
+            let strs = get_token_strings(&tokens, &idents);
+            assert!(
+                strs.contains(&want.to_string()),
+                "expected {want:?} from {code:?}, got: {strs:?}"
+            );
+        }
+    }
+
+    /// 6.4.6p3: a digraph behaves as its primary token "except for their
+    /// spelling", and 6.10.3.2p2 asks `#` for that spelling. The punctuator
+    /// renderer used the primary token's, so `S(<:1:>)` came out `"[1]"`.
+    #[test]
+    fn test_stringify_keeps_digraph_spelling() {
+        for (code, want) in [
+            ("#define S(x) #x\nS(<:1:>)", "\"<:1:>\""),
+            ("#define S(x) #x\nS(%:%:)", "\"%:%:\""),
+            ("#define S(x) #x\nS(<% %>)", "\"<% %>\""),
+            // The primary tokens still spell themselves.
+            ("#define S(x) #x\nS([1])", "\"[1]\""),
+            // And a multi-character punctuator is not dropped.
+            ("#define S(x) #x\nS(a >> b)", "\"a >> b\""),
+        ] {
+            let (tokens, idents) = preprocess_str(code);
+            let strs = get_token_strings(&tokens, &idents);
+            assert!(
+                strs.contains(&want.to_string()),
+                "expected {want:?} from {code:?}, got: {strs:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_stringify_empty_va_args() {
         // #__VA_ARGS__ with zero variadic args should produce an empty string ""

@@ -126,7 +126,6 @@ byte, as gcc does on both targets._
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
 | Raw UTF-8 in identifiers | `int café = 1;` is rejected; C17 6.4.2.1 admits an extended character only through a UCN, and `int caf\u00e9 = 1;` works. gcc and clang take the raw spelling as an extension. See #C158 |
-| `<stddef.h>` and `__need_*` | The builtin header defines every typedef unconditionally instead of honouring glibc's one-at-a-time protocol, so `<string.h>` leaks `wchar_t`. See #C157 |
 | `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
 | `max_align_t` | `long double` here (16 bytes), a struct of `long long` + `long double` under gcc (32). Both meet the alignment requirement; `sizeof` differs. Implementation-defined (C17 7.19) |
 

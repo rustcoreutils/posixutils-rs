@@ -18,9 +18,33 @@ and so neither is raised again as a question.
 
 ### `_FORTIFY_SOURCE` compiles but checks nothing
 
-Not a conformance item. `_FORTIFY_SOURCE`, `__builtin_object_size` and the
-`_chk` family appear nowhere in POSIX.1-2024 — this is a security-hardening
-gap in a glibc extension, deferred by decision rather than scheduled.
+**Not a conformance item, and the sole record of this one.** It was also
+tracked as **#C12** in `cc/audit.md` until 2026-08-21, when it was removed
+from there: `_FORTIFY_SOURCE`, `__builtin_object_size` and the `_chk` family
+appear nowhere in POSIX.1-2024, so an entry in a POSIX conformance audit's
+Open list overstated what it was. The number is kept here so
+`git log --grep '#C12'` still finds the history. **Deferred indefinitely by
+maintainer decision (2026-08-19)** — a decision, not a backlog item.
+
+What *is* required of the compiler already works, and should not be confused
+with what is missing: c17 accepts `-D_FORTIFY_SOURCE=2`, compiles glibc's
+fortified headers, and links. Distro builds and `configure` scripts pass the
+flag by default, so this is load-bearing. (CPython's own `configure.ac` passes
+`-U_FORTIFY_SOURCE` for libmpdec, because glibc's `memmove`/`bcopy` wrappers
+are wrong there — so the acceptance gate does not lean on it either.)
+
+What is missing is the checking, and the symptom is silence rather than
+breakage. **Probed 2026-08-21:** `-D_FORTIFY_SOURCE=2` at `-O0` and `-O2`
+compiles, links, runs, and emits *no* `__*_chk` call at all — c17 does not
+predefine `__OPTIMIZE__`, so glibc compiles no fortified wrapper to begin with.
+Anyone who sets the flag expecting hardening does not get it, and gets no
+diagnostic saying so.
+
+Predefining `__OPTIMIZE__` on its own does not fix that, it only moves the
+silence: the wrappers would then be compiled, but `__builtin_object_size` folds
+to `-1` before the inliner runs, and `-1` is the encoding for "do not check".
+The program would pay for the wrappers and still check nothing. That is why
+layer 6 below and `__OPTIMIZE__` have to land in the same change.
 
 Peeling this apart one layer at a time has been the only way to see it: each
 fix exposes the next blocker, and three of the layers are invisible until the

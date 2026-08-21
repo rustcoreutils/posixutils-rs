@@ -17,9 +17,16 @@ crate. Each audit follows the playbook in `audits.md`.
 
 ## Status
 
-**Open: 2.** Both are standing decisions rather than work items — #C55
-(trigraphs off by default) and #C12 (`_FORTIFY_SOURCE`). #C157 and #C158 came
-out of the 2026-08-21 ISO C re-probe and are both closed.
+**Open: 1.** One standing decision rather than a work item — #C55, trigraphs
+off by default. #C157 and #C158 came out of the 2026-08-21 ISO C re-probe and
+are both closed.
+
+This file tracks conformance to POSIX.1-2024 and to the ISO C standard it
+incorporates, and nothing else, so the Open count means exactly one thing:
+places where c17 knowingly diverges from the standard. Engineering debt that
+is *not* a conformance question lives in `cc/doc/TODO.md` — `_FORTIFY_SOURCE`
+(formerly #C12) moved there, since `_FORTIFY_SOURCE`, `__builtin_object_size`
+and the `_chk` family appear nowhere in POSIX.1-2024.
 
 **Everything else is closed.** The per-finding entries used to be kept here
 after they were fixed; they are not any more, because 252 of them made the file
@@ -122,13 +129,9 @@ the distinction the pass turned on is worth stating plainly, because it is the
 one this document keeps getting wrong: a row backed by a code citation is a
 claim about the source, not about the compiler.
 
-The remaining items are diagnostic-quality or technical debt. Two findings are
-**deferred indefinitely by maintainer decision** and are not oversights:
+The remaining items are diagnostic-quality or technical debt. One finding is
+**deferred indefinitely by maintainer decision** and is not an oversight:
 
-- **#C12** `_FORTIFY_SOURCE` fortifies nothing. Five of six layers are done;
-  the sixth is folding `__builtin_object_size` after inlining, and
-  `__OPTIMIZE__` has to land in the same change. Not a conformance issue --
-  the fortification is a glibc extension.
 - **#C55** trigraphs are off by default, where APPLICATION USAGE 88224 says a
   compiler that does so is "not conforming to POSIX.1-2024". Deliberate:
   replacement reaches inside string literals, so `"What??!"` becomes `"What|"`,
@@ -137,12 +140,10 @@ The remaining items are diagnostic-quality or technical debt. Two findings are
 
 ## Open
 
-Two, and both are standing decisions rather than pending work. They are kept
-here so neither gets re-raised as a to-do.
+One, and it is a standing decision rather than pending work. It is kept here
+so it does not get re-raised as a to-do.
 
 - [ ] **#C55 — Trigraphs are off by default.** **SETTLED by maintainer decision — not deferred, not awaiting anything, and not to be re-raised.** The c17 APPLICATION USAGE says it outright (88224): "Some c17 compilers *not conforming to POSIX.1-2024* do not support trigraphs by default." #P11 implemented them behind `--trigraphs` because replacement reaches inside string literals, so `"What??!"` becomes `"What|"` — which is exactly what C17 phase 1 specifies and what the POSIX RATIONALE laments without granting an exemption. A deliberate divergence, not a missing feature; the fix is to flip the default and offer an opt-out. Deliberately out of scope of the 2026-08-15 series.
-
-- [ ] **#C12 — `_FORTIFY_SOURCE` compiles but fortifies nothing.** **Deferred indefinitely by maintainer decision (2026-08-19). Open, Minor.** Originally diagnosed as one defect — `__builtin_object_size` answering `(size_t)-1` — it turned out to be six, each hidden behind the one before it, and only visible by fixing a layer and re-measuring. Four are now closed: real object sizes, implicit `__builtin___*_chk` declarations, asm label renaming (below), and `always_inline`. The two that remain are `__gnu_inline__` emitting no out-of-line definition, and folding `__builtin_object_size` *after* inlining rather than before — see `cc/doc/TODO.md` for the measurements. Not a conformance issue — the fortification is a glibc extension — but a security-relevant one for anyone who sets the flag expecting it to work.
 
 ## Detailed conformance matrix
 

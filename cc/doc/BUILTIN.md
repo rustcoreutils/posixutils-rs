@@ -208,8 +208,10 @@ These exist so glibc's fortified headers compile: with `_FORTIFY_SOURCE` set,
 these builtins. c17 does not predefine `__OPTIMIZE__`, without which glibc
 compiles no fortified wrapper at all; and enabling it needs
 `__builtin_object_size` folded *after* inlining, since the wrapper measures its
-own parameter and would otherwise be handed "unknown". See `#C12` in
-`../audit.md` and the `_FORTIFY_SOURCE` entry in `TODO.md`.
+own parameter and would otherwise be handed "unknown". See the
+`_FORTIFY_SOURCE` entry in `TODO.md`, which is where this is tracked; it was
+also `#C12` in `../audit.md` until that file was narrowed to conformance
+findings alone.
 
 ## C11 Atomic Builtins
 

@@ -114,7 +114,9 @@ spellings silently discarded, `#__VA_ARGS__` keeping only its first argument,
 a VLA miscompile -- `&a` on a variable-length array yielded the address of its
 pointer slot rather than the array, at `-O0` and `-O2` alike, with no test
 anywhere in the tree taking a VLA's address -- and two builtin headers
-defining names their clauses do not give them. All are fixed and each row of
+defining names their clauses do not give them. Review of that work then found
+three more in the same area and two regressions the pass itself introduced;
+see #C159 and the note above the code-generation section. All are fixed and each row of
 the ISO C table now names the probe that established it.
 
 One open finding came out of that same pass; see **Open**. And
@@ -265,13 +267,23 @@ as what was run.
 | `#if` constant expressions | CONFORMS **[probed 2026-08-21]** | `intmax_t` arithmetic, arithmetic right shift, signed wraparound, unqualified-`u` promotion, short-circuit around `1/0`, character constants, `0xFFFFFFFFFFFFFFFF` |
 | Predefined macros | CONFORMS **[probed 2026-08-21]** | `__STDC__`, `__STDC_VERSION__ == 201710L`, `__STDC_HOSTED__`, `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, `__COUNTER__` |
 | C89 core | CONFORMS | declarators, bitfields, storage classes, tentative definitions, promotions. **This row was overstated until 2026-08-21:** an init-declarator list whose first declarator was a function -- `int f(int), g(int);` -- was a syntax error, which is ISO C and so a conformance defect. Found by building sparse, not by re-reading this file |
-| C99 | CONFORMS **[probed 2026-08-21]** | VLAs re-probed in full after #C155: address-of, deref, `sizeof` at every depth, pointer arithmetic, variably modified `typedef`, VLA parameters. `&a` on a VLA used to yield the address of its pointer slot -- a silent miscompile in a mandated feature, with no test anywhere taking a VLA's address. Also probed: designated initializers, compound literals, flexible array members, `restrict`, `inline`, `_Bool`, `long long`, `_Complex`, `__func__`, UCNs, hex floats |
+| C99 | CONFORMS **[probed 2026-08-21, widened after review]** | VLAs: address-of, deref, `sizeof` at depths 0-2, variably modified `typedef`, VLA parameters, and pointer arithmetic in all five spellings -- `p++`, `++p`, `p += 1`, `p + 1`, `1 + p` -- their decrementing forms, and differences whose operands are not bare identifiers. `c99_address_of_a_vla_is_the_array_address`, `c99_deref_of_a_pointer_to_a_vm_array` and `c99_vm_pointer_arithmetic_every_spelling` are what back this row. Also probed: designated initializers, compound literals, flexible array members, `restrict`, `inline`, `_Bool`, `long long`, `_Complex`, `__func__`, UCNs, hex floats |
 | C11 | CONFORMS **[probed 2026-08-21]** | one program exercising `_Generic` (including `default:`), `_Atomic` through ordinary operators and through `<stdatomic.h>`, `_Static_assert`, `_Thread_local`, `alignas`/`alignof`/`max_align_t`, anonymous members, `CMPLX`, and all three Unicode literal prefixes |
 | C17 | CLAIMED | `__STDC_VERSION__` is `201710L`, and it is the only language c17 compiles. C17 is DR-only; DR 412 (`_Static_assert` as a struct member) is honored at `cc/parse/parser.rs`, and DR 423 is live now that `_Generic` exists |
 | Translation limits (C99 5.2.4.1) | CONFORMS **[re-probed 2026-08-21]** | the twelve minimums, including the one that used to fail: 63 nesting levels of parenthesized declarators now compile (#C44 closed). Residual risk unchanged -- the recursive-descent parser has no explicit depth guard, so very deep nesting depends on stack size |
 | Header namespace (C17 7.1.3) | CONFORMS **[probed 2026-08-21]** | `<string.h>`, `<stdio.h>` and `<time.h>` declare what their clauses give them and leave the rest of the namespace alone. Was **not** conforming until #C157: the builtin `<stddef.h>` and `<stdarg.h>` ignored glibc's `__need_*` protocol, so `<string.h>` declared `wchar_t`, `ptrdiff_t` and `max_align_t` and `<stdio.h>` defined the `va_*` macros. `va_list` from `<stdio.h>` is not a leak -- glibc declares it under `__USE_XOPEN2K8`, as POSIX requires, and gcc's default `gnu17` mode does the same |
 | Diagnostics for constraint violations (C17 5.1.1.3) | CONFORMS **[probed 2026-08-15]** | a 35-case matrix -- 21 constraint violations, 14 accept-side controls -- agrees with `gcc -std=c17` on every row. Two places stay deliberately *stricter* than gcc: `return` with a value in a `void` function, and a bare `return` in a non-`void` one, both genuine 6.8.6.4 violations |
 | Code generation | **NOT ESTABLISHED THE SAME WAY** | see *Code generation evidence* below |
+
+> **A "[probed]" row is only as good as the cases the probe ran.** This row
+> first said "pointer arithmetic" on the strength of a probe that had tried
+> `p + 1` and `++p`. Review found that `p++` and `p += 1` did not move the
+> pointer at all, and that a difference whose left operand was not a bare
+> identifier divided by a compile-time size of zero and raised SIGFPE -- three
+> more defects (#C159) under a row that had just been rewritten to say it was
+> probed. Naming the probe is necessary; it is not sufficient. Where a rule
+> has several spellings, the row has to say it covered them, and the test has
+> to be the kind that enumerates rather than samples.
 
 ### Code generation evidence
 

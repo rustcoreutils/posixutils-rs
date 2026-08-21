@@ -241,6 +241,69 @@ fn preprocessor_digraphs_still_mean_their_primary_tokens() {
     assert_has(&r.stdout, "v<:0:>", "%:%: as ## still pastes");
 }
 
+/// C99 6.10.3.1p2 makes `__VA_ARGS__` stand for the *whole* variadic token
+/// sequence, commas included. c17 stringified only its first element, so
+/// `#define V(...) #__VA_ARGS__` turned `V(1,2,3)` into `"1"` -- everything
+/// after the first comma silently gone, with no diagnostic. The idiom is
+/// common in logging macros.
+#[test]
+fn preprocessor_stringified_va_args_keeps_every_argument() {
+    let r = preprocess_text(
+        "va_args_stringify",
+        "#define V(...) #__VA_ARGS__\n\
+         #define W(a, ...) a: #__VA_ARGS__\n\
+         #define X(...) __VA_ARGS__\n\
+         A V(1,2,3)\n\
+         B V(1)\n\
+         C V()\n\
+         D W(k, 1,2)\n\
+         E X(1,2,3)\n\
+         F V(f(1,2),3)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "A \"1,2,3\"", "all variadic arguments");
+    assert_has(&r.stdout, "B \"1\"", "one variadic argument");
+    assert_has(&r.stdout, "C \"\"", "no variadic arguments");
+    assert_has(
+        &r.stdout,
+        "D k: \"1,2\"",
+        "named parameter before the variadic ones",
+    );
+    assert_has(
+        &r.stdout,
+        "E 1,2,3",
+        "unstringified __VA_ARGS__ does not gain spaces",
+    );
+    assert_has(
+        &r.stdout,
+        "F \"f(1,2),3\"",
+        "a parenthesised comma is not a separator",
+    );
+}
+
+/// Pins a known divergence, so closing it is a deliberate change.
+///
+/// The argument splitter discards the separating comma, so the white space
+/// that preceded it is gone by the time `#__VA_ARGS__` rebuilds the sequence:
+/// `V(a , b)` stringifies as `"a, b"` where GCC gives `"a , b"`. Everything
+/// else about the sequence is right; only the space *before* a separator is
+/// lost, and only when the source writes one.
+#[test]
+fn preprocessor_va_args_loses_space_before_a_separator() {
+    let r = preprocess_text(
+        "va_args_sep_space",
+        "#define V(...) #__VA_ARGS__\nA V(a , b)\nB V(a, b)\nC V(a ,b)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    // What GCC gives is "a , b"; c17 drops the space before the comma.
+    assert_has(&r.stdout, "A \"a, b\"", "space before a separator");
+    // Space *after* a separator is preserved, and so is its absence.
+    assert_has(&r.stdout, "B \"a, b\"", "space after a separator");
+    assert_has(&r.stdout, "C \"a,b\"", "no space around a separator");
+}
+
 // ============================================================================
 // #P2 — the null directive
 // ============================================================================

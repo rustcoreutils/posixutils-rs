@@ -3457,6 +3457,35 @@ impl<'a> Preprocessor<'a> {
         result
     }
 
+    /// The comma that separates two variadic arguments.
+    ///
+    /// It abuts what precedes it: whatever space the source had before it
+    /// belongs to the token that follows, which carries its own flag.
+    fn variadic_separator(pos: Position) -> Token {
+        let mut comma =
+            Token::with_value(TokenType::Special, pos, TokenValue::Special(b',' as u32));
+        comma.pos.whitespace = false;
+        comma.pos.newline = false;
+        comma
+    }
+
+    /// The variadic arguments as the single token sequence `__VA_ARGS__`
+    /// denotes (6.10.3.1p2), with the separating commas restored.
+    fn join_variadic_args(args: &[Vec<Token>], start: usize) -> Vec<Token> {
+        let mut out: Vec<Token> = Vec::new();
+        for (j, arg) in args.iter().enumerate().skip(start) {
+            if j > start {
+                let pos = arg.first().map_or_else(
+                    || out.last().map_or(Position::new(0, 1, 0), |t: &Token| t.pos),
+                    |t| t.pos,
+                );
+                out.push(Self::variadic_separator(pos));
+            }
+            out.extend(arg.iter().cloned());
+        }
+        out
+    }
+
     /// Try to expand a macro
     fn try_expand_macro<I>(
         &mut self,
@@ -3642,8 +3671,18 @@ impl<'a> Preprocessor<'a> {
                     continue;
                 }
                 MacroTokenValue::Stringify(idx) => {
-                    // Stringify the argument per C99 6.10.3.2p2
-                    let arg = args.get(*idx).cloned().unwrap_or_default();
+                    // Stringify the argument per C99 6.10.3.2p2.
+                    //
+                    // `#__VA_ARGS__` stringifies the *whole* variadic token
+                    // sequence, commas included -- 6.10.3.1p2 makes
+                    // __VA_ARGS__ that sequence, not its first element.
+                    // Taking args[idx] alone silently dropped everything
+                    // after the first comma, so `V(1,2,3)` came out `"1"`.
+                    let arg = if *idx >= mac.params.len() {
+                        Self::join_variadic_args(args, *idx)
+                    } else {
+                        args.get(*idx).cloned().unwrap_or_default()
+                    };
                     let text = self.stringify_arg(&arg, idents);
                     result.push(Token::with_value(
                         TokenType::String,
@@ -3709,13 +3748,10 @@ impl<'a> Preprocessor<'a> {
                         continue;
                     }
 
+                    let va_start = result.len();
                     for (j, arg) in args.iter().enumerate().skip(start) {
                         if j > start {
-                            result.push(Token::with_value(
-                                TokenType::Special,
-                                *pos,
-                                TokenValue::Special(b',' as u32),
-                            ));
+                            result.push(Self::variadic_separator(*pos));
                         }
                         if next_is_paste || prev_was_paste {
                             result.extend(arg.clone());
@@ -3726,11 +3762,21 @@ impl<'a> Preprocessor<'a> {
                                 {
                                     continue;
                                 }
+                                // Keep each token's own spacing. Overwriting
+                                // it with the macro body's position gave every
+                                // argument a leading space, so `X(1,2,3)`
+                                // expanded to `1 , 2 , 3`.
+                                let whitespace = tok.pos.whitespace;
                                 tok.pos = *pos;
                                 tok.pos.newline = false;
+                                tok.pos.whitespace = whitespace;
                                 result.push(tok);
                             }
                         }
+                    }
+                    // The sequence as a whole sits where __VA_ARGS__ did.
+                    if let Some(first) = result.get_mut(va_start) {
+                        first.pos.whitespace = pos.whitespace;
                     }
                 }
                 _ => {

@@ -854,56 +854,73 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         }
     }
 
+    /// Scan the rest of an identifier onto `name`, stopping at the first
+    /// character that cannot continue one.
+    ///
+    /// Returns the character it stopped on, so the caller can decide whether
+    /// it means something there -- an encoding prefix is only a prefix when a
+    /// quote follows it. Shared by both entry points: the duplicate of this
+    /// loop is what let the UCN over-consumption bug reach each of them
+    /// independently.
+    fn scan_identifier_tail(&mut self, name: &mut String) -> Option<u8> {
+        loop {
+            // Use peek to avoid consuming characters that would affect line/col tracking
+            let c = self.peekchar();
+            if c == EOF {
+                return None;
+            }
+            let cu = c as u8;
+
+            // Check for UCN escape sequence (\uXXXX or \UXXXXXXXX) - C99 6.4.3
+            if cu == b'\\' {
+                match self.try_consume_ucn() {
+                    Some(uc) => name.push(uc),
+                    // Not a valid UCN, end identifier
+                    None => return Some(cu),
+                }
+                continue;
+            }
+
+            if !is_letter_or_digit(cu) {
+                return Some(cu);
+            }
+            self.nextchar(); // Now consume it
+            name.push(cu as char);
+        }
+    }
+
+    /// Intern `name` as an identifier token at `pos`.
+    fn ident_token(&mut self, pos: Position, name: &str) -> Token {
+        let id = self.strings.intern(name);
+        Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
+    }
+
     /// Get an identifier token
     fn get_identifier(&mut self, first: u8) -> Token {
         let pos = self.pos();
         let mut name = String::new();
         name.push(first as char);
 
-        loop {
-            // Use peek to avoid consuming characters that would affect line/col tracking
-            let c = self.peekchar();
-            if c == EOF {
-                break;
-            }
-            let cu = c as u8;
-
-            // Check for UCN escape sequence (\uXXXX or \UXXXXXXXX) - C99 6.4.3
-            if cu == b'\\' {
-                if let Some(uc) = self.try_consume_ucn() {
-                    name.push(uc);
-                    continue;
+        // An encoding prefix directly before a quote: L, u, U, u8
+        // (C11 6.4.4.4 / 6.4.5). `u8` applies to strings only.
+        // Assembly has no such prefixes.
+        if let Some(cu) = self.scan_identifier_tail(&mut name) {
+            if self.mode == LexerMode::C && (cu == b'"' || cu == b'\'') {
+                let enc = match name.as_str() {
+                    "L" => Some(LiteralEncoding::Wide),
+                    "u" => Some(LiteralEncoding::Utf16),
+                    "U" => Some(LiteralEncoding::Utf32),
+                    "u8" if cu == b'"' => Some(LiteralEncoding::Utf8),
+                    _ => None,
+                };
+                if let Some(enc) = enc {
+                    self.nextchar(); // Consume the quote
+                    return self.get_string_or_char(cu, enc);
                 }
-                // Not a valid UCN, end identifier
-                break;
-            }
-
-            if is_letter_or_digit(cu) {
-                self.nextchar(); // Now consume it
-                name.push(cu as char);
-            } else {
-                // An encoding prefix directly before a quote: L, u, U, u8
-                // (C11 6.4.4.4 / 6.4.5). `u8` applies to strings only.
-                // Assembly has no such prefixes.
-                if self.mode == LexerMode::C && (cu == b'"' || cu == b'\'') {
-                    let enc = match name.as_str() {
-                        "L" => Some(LiteralEncoding::Wide),
-                        "u" => Some(LiteralEncoding::Utf16),
-                        "U" => Some(LiteralEncoding::Utf32),
-                        "u8" if cu == b'"' => Some(LiteralEncoding::Utf8),
-                        _ => None,
-                    };
-                    if let Some(enc) = enc {
-                        self.nextchar(); // Consume the quote
-                        return self.get_string_or_char(cu, enc);
-                    }
-                }
-                break;
             }
         }
 
-        let id = self.strings.intern(&name);
-        Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
+        self.ident_token(pos, &name)
     }
 
     /// Get an identifier token starting with a UCN character (already consumed)
@@ -911,33 +928,8 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         let pos = self.pos();
         let mut name = String::new();
         name.push(first_ucn);
-
-        loop {
-            let c = self.peekchar();
-            if c == EOF {
-                break;
-            }
-            let cu = c as u8;
-
-            // Check for UCN escape sequence
-            if cu == b'\\' {
-                if let Some(uc) = self.try_consume_ucn() {
-                    name.push(uc);
-                    continue;
-                }
-                break;
-            }
-
-            if is_letter_or_digit(cu) {
-                self.nextchar();
-                name.push(cu as char);
-            } else {
-                break;
-            }
-        }
-
-        let id = self.strings.intern(&name);
-        Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
+        self.scan_identifier_tail(&mut name);
+        self.ident_token(pos, &name)
     }
 
     /// Get a string or character literal
@@ -1445,32 +1437,9 @@ pub fn show_special(value: u32) -> String {
         return (value as u8 as char).to_string();
     }
 
-    match value {
-        x if x == SpecialToken::AddAssign as u32 => "+=".to_string(),
-        x if x == SpecialToken::Increment as u32 => "++".to_string(),
-        x if x == SpecialToken::SubAssign as u32 => "-=".to_string(),
-        x if x == SpecialToken::Decrement as u32 => "--".to_string(),
-        x if x == SpecialToken::Arrow as u32 => "->".to_string(),
-        x if x == SpecialToken::MulAssign as u32 => "*=".to_string(),
-        x if x == SpecialToken::DivAssign as u32 => "/=".to_string(),
-        x if x == SpecialToken::ModAssign as u32 => "%=".to_string(),
-        x if x == SpecialToken::Lte as u32 => "<=".to_string(),
-        x if x == SpecialToken::Gte as u32 => ">=".to_string(),
-        x if x == SpecialToken::Equal as u32 => "==".to_string(),
-        x if x == SpecialToken::NotEqual as u32 => "!=".to_string(),
-        x if x == SpecialToken::LogicalAnd as u32 => "&&".to_string(),
-        x if x == SpecialToken::AndAssign as u32 => "&=".to_string(),
-        x if x == SpecialToken::LogicalOr as u32 => "||".to_string(),
-        x if x == SpecialToken::OrAssign as u32 => "|=".to_string(),
-        x if x == SpecialToken::XorAssign as u32 => "^=".to_string(),
-        x if x == SpecialToken::HashHash as u32 => "##".to_string(),
-        x if x == SpecialToken::LeftShift as u32 => "<<".to_string(),
-        x if x == SpecialToken::RightShift as u32 => ">>".to_string(),
-        x if x == SpecialToken::DotDot as u32 => "..".to_string(),
-        x if x == SpecialToken::ShlAssign as u32 => "<<=".to_string(),
-        x if x == SpecialToken::ShrAssign as u32 => ">>=".to_string(),
-        x if x == SpecialToken::Ellipsis as u32 => "...".to_string(),
-        _ => format!("<special:{}>", value),
+    match SpecialToken::from_code(value) {
+        Some(punct) => punct.spelling().to_string(),
+        None => format!("<special:{}>", value),
     }
 }
 

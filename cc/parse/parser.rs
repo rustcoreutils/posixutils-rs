@@ -616,6 +616,14 @@ pub struct Parser<'a> {
     /// specifiers, between the type and the declarator, or after the
     /// parameter list. Cleared at the start of each external declaration.
     pending_fn_attrs: crate::parse::ast::FunctionAttrs,
+
+    /// Set while parsing the body of a function that may use the forwarding
+    /// builtins: one that is both variadic and `always_inline`.
+    ///
+    /// `__builtin_va_arg_pack()` names the caller's variadic arguments, so it
+    /// needs both facts, and this is the last place either is visible --
+    /// `ir::Function` records neither.
+    pub(crate) in_forwarding_function: bool,
     /// Every function attribute seen for a given name anywhere in the
     /// translation unit.
     ///
@@ -714,6 +722,7 @@ impl<'a> Parser<'a> {
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
+            in_forwarding_function: false,
             declared_fn_attrs: BTreeMap::new(),
             pending_asm_label: None,
             declared_asm_labels: BTreeMap::new(),
@@ -4997,6 +5006,24 @@ impl Parser<'_> {
     /// Called for declarations as well as definitions, so that an attribute on
     /// a prototype reaches the definition parsed later; see
     /// [`Parser::declared_fn_attrs`].
+    /// Parse a function body, recording whether the forwarding builtins may
+    /// appear in it.
+    ///
+    /// `__builtin_va_arg_pack()` names the caller's variadic arguments, so it
+    /// needs the enclosing function to be variadic (there are arguments) and
+    /// `always_inline` (there is a known caller to take them from).
+    fn parse_forwarding_body(
+        &mut self,
+        attrs: &crate::parse::ast::FunctionAttrs,
+        is_variadic: bool,
+    ) -> ParseResult<Stmt> {
+        let outer = self.in_forwarding_function;
+        self.in_forwarding_function = is_variadic && attrs.always_inline;
+        let body = self.parse_block_stmt_no_scope();
+        self.in_forwarding_function = outer;
+        body
+    }
+
     fn accumulate_fn_attrs(&mut self, name: StringId) -> crate::parse::ast::FunctionAttrs {
         let pending = self.pending_fn_attrs.clone();
         let seen = self.declared_fn_attrs.entry(name).or_default();
@@ -5136,7 +5163,7 @@ impl Parser<'_> {
                     // Storage class (static, inline) comes from base_type, not the function type
                     let func_type = self.types.get(typ);
                     let return_type = func_type.base.unwrap();
-                    let _is_variadic = func_type.variadic;
+                    let is_variadic_fn = func_type.variadic;
                     let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
                     let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
 
@@ -5169,7 +5196,7 @@ impl Parser<'_> {
                     }
 
                     // Parse body without creating another scope
-                    let body = self.parse_block_stmt_no_scope()?;
+                    let body = self.parse_forwarding_body(&all_fn_attrs, is_variadic_fn)?;
 
                     // Leave function scope
                     self.symbols.leave_scope();
@@ -5340,6 +5367,7 @@ impl Parser<'_> {
                     // Storage class (static, inline) comes from base_type, not the function type
                     let func_type = self.types.get(full_typ);
                     let return_type = func_type.base.unwrap();
+                    let is_variadic_fn = func_type.variadic;
                     let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
                     let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
 
@@ -5367,7 +5395,7 @@ impl Parser<'_> {
                     }
 
                     // Parse body without creating another scope
-                    let body = self.parse_block_stmt_no_scope()?;
+                    let body = self.parse_forwarding_body(&all_fn_attrs, is_variadic_fn)?;
 
                     // Leave function scope
                     self.symbols.leave_scope();
@@ -5528,6 +5556,8 @@ impl Parser<'_> {
                 } else {
                     Type::function_no_prototype(typ_id, is_noreturn)
                 };
+                // An old-style declarator has no `...` to be variadic with.
+                let is_variadic_fn = prototyped && variadic;
                 let func_type_id = self.types.intern(func_type);
                 self.check_redeclaration(name, func_type_id, decl_pos);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
@@ -5549,7 +5579,7 @@ impl Parser<'_> {
                 }
 
                 // Parse body without creating another scope
-                let body = self.parse_block_stmt_no_scope()?;
+                let body = self.parse_forwarding_body(&all_fn_attrs, is_variadic_fn)?;
 
                 // Leave function scope
                 self.symbols.leave_scope();

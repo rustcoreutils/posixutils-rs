@@ -1465,6 +1465,10 @@ impl<'a> Linearizer<'a> {
             ExprKind::VmTypedefExtent(..) => true,
             // A label's address is a constant of the function.
             ExprKind::LabelAddr(_) => true,
+            // The forwarding builtins read the caller's arguments and write
+            // nothing. `VaArgPack` is not a value at all -- the call it sits
+            // in carries it -- but it is no less pure for that.
+            ExprKind::VaArgPack | ExprKind::VaArgPackLen => true,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -2957,6 +2961,20 @@ impl<'a> Linearizer<'a> {
         // two-register passing for 9-16 byte structs, we don't implement that yet.
         // For complex types, pass address so codegen can load real/imag into XMM registers
         // For arrays (including VLAs), decay to pointer
+        // `__builtin_va_arg_pack()` is not an argument -- it stands for the
+        // caller's whole argument list, which is not known until the enclosing
+        // function is inlined. Lift it off here and record it on the call; the
+        // inliner appends the real arguments. 6.10 has nothing to say about
+        // this; the rule is GCC's, and GCC likewise allows it only last.
+        let mut ends_with_va_arg_pack = false;
+        let args: &[Expr] = match args.split_last() {
+            Some((last, rest)) if matches!(last.kind, ExprKind::VaArgPack) => {
+                ends_with_va_arg_pack = true;
+                rest
+            }
+            _ => args,
+        };
+
         for (arg_idx, a) in args.iter().enumerate() {
             let mut arg_type = self.expr_type(a);
             let arg_kind = self.types.kind(arg_type);
@@ -3167,6 +3185,7 @@ impl<'a> Linearizer<'a> {
                 )
             };
             call_insn.variadic_arg_start = variadic_arg_start;
+            call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
@@ -3204,6 +3223,7 @@ impl<'a> Linearizer<'a> {
                 )
             };
             call_insn.variadic_arg_start = variadic_arg_start;
+            call_insn.ends_with_va_arg_pack = ends_with_va_arg_pack;
             call_insn.is_noreturn_call = is_noreturn_call;
             call_insn.abi_info = Some(call_abi_info);
             self.emit(call_insn);
@@ -5049,6 +5069,29 @@ impl<'a> Linearizer<'a> {
         }
 
         match &expr.kind {
+            // `__builtin_va_arg_pack()` is not a value: it stands for the
+            // caller's argument list, and `linearize_call` lifts it off the
+            // argument list into a flag on the call. Reaching here means it
+            // was written somewhere no argument list could carry it.
+            ExprKind::VaArgPack => {
+                crate::diag::error(
+                    expr.pos,
+                    "'__builtin_va_arg_pack' may only appear as the last argument of a call",
+                );
+                self.emit_const(0, self.types.int_id)
+            }
+            // Resolved when the enclosing function is inlined, since it counts
+            // the *caller's* arguments. A leftover is diagnosed after the
+            // inliner runs, by `opt::check_forwarding_resolved`.
+            ExprKind::VaArgPackLen => {
+                let result = self.alloc_reg_pseudo();
+                self.emit(
+                    Instruction::new(Opcode::VaArgPackLen)
+                        .with_target(result)
+                        .with_type_and_size(self.types.int_id, 32),
+                );
+                result
+            }
             // GNU `&&label`. The block already emits an assembly label of
             // exactly this spelling -- `Label::name()` -- and both backends
             // already lower a leading-`.` global to a pc-relative address, so

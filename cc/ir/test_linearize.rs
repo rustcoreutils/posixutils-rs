@@ -6543,3 +6543,72 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         None
     );
 }
+
+/// `__builtin_va_arg_pack()` is not an argument: it stands for the caller's
+/// whole argument list, which is unknown until the enclosing function is
+/// inlined. The linearizer therefore lifts it off the argument list and
+/// records it on the call, rather than emitting an operand for it.
+#[test]
+fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
+    use crate::ir::Opcode;
+
+    let mut ctx = TestContext::new();
+    let int_t = ctx.int_type();
+    let name = ctx.str("fwd");
+    let target = ctx.str("target");
+
+    // fwd(): target(1, __builtin_va_arg_pack());
+    let call = Expr {
+        kind: ExprKind::Call {
+            func: Box::new(Expr {
+                kind: ExprKind::Ident(ctx.var("target", int_t)),
+                typ: Some(int_t),
+                pos: test_pos(),
+            }),
+            args: vec![
+                Expr {
+                    kind: ExprKind::IntLit(1),
+                    typ: Some(int_t),
+                    pos: test_pos(),
+                },
+                Expr {
+                    kind: ExprKind::VaArgPack,
+                    typ: Some(ctx.types.void_id),
+                    pos: test_pos(),
+                },
+            ],
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    let _ = target;
+
+    let body = Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(call)))]);
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(make_simple_func(
+            name, body, &ctx.types,
+        ))],
+    };
+    let module = ctx.linearize(&tu);
+
+    let calls: Vec<_> = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .filter(|i| i.op == Opcode::Call)
+        .collect();
+    assert_eq!(calls.len(), 1, "expected one call");
+
+    // The pack is recorded, and contributed no operand: only the `1` is there.
+    assert!(
+        calls[0].ends_with_va_arg_pack,
+        "the call should carry the pack"
+    );
+    assert_eq!(
+        calls[0].src.len(),
+        1,
+        "the pack must not become an argument: {:?}",
+        calls[0].src
+    );
+    assert_eq!(calls[0].arg_types.len(), calls[0].src.len());
+}

@@ -119,6 +119,45 @@ const MAX_ITERATIONS: usize = 10;
 // Pass Runner
 // ============================================================================
 
+/// Whether `func` names its caller's variadic arguments -- that is, whether
+/// its body contains `__builtin_va_arg_pack()` or `__builtin_va_arg_pack_len()`.
+fn forwards_caller_arguments(func: &Function) -> bool {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .any(|i| i.ends_with_va_arg_pack || i.op == crate::ir::Opcode::VaArgPackLen)
+}
+
+/// Keep a forwarding function's body out of the object file.
+///
+/// The parser has already required it to be `always_inline`, so every call is
+/// substituted; the standalone copy would have nothing to forward.
+fn suppress_forwarding_bodies(module: &mut Module) {
+    for func in &mut module.functions {
+        if forwards_caller_arguments(func) {
+            func.emit = false;
+        }
+    }
+}
+
+/// Diagnose a pack the inliner could not resolve.
+///
+/// Reachable when `always_inline` is refused for a reason of its own -- the
+/// caller-size and recursion caps in `ir::inline` outrank the attribute -- and
+/// the call would otherwise be emitted with its forwarded arguments missing.
+/// GCC diagnoses the same situation rather than miscompiling it.
+fn check_forwarding_resolved(module: &Module) {
+    for func in &module.functions {
+        if func.emit && forwards_caller_arguments(func) {
+            crate::diag::error_args(
+                crate::diag::Position::default(),
+                "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
+                &[&func.name],
+            );
+        }
+    }
+}
+
 /// Optimize a module as `opt` asks.
 ///
 /// Level 0: nothing but `__attribute__((always_inline))` inlining
@@ -131,7 +170,19 @@ pub fn optimize_module(module: &mut Module, opt: Optimization) {
     // Runs even at -O0, where it admits only `__attribute__((always_inline))`
     // functions -- gcc honours that attribute with optimization off. It is a
     // no-op for a module that has none.
+    // A function that forwards its caller's variadic arguments has no
+    // out-of-line form: what it forwards exists only at a call site. GCC emits
+    // no standalone copy of one either. Without this, `-O0` emitted a body
+    // that called through with the forwarded arguments simply missing and the
+    // count register never written -- wrong code, sitting in the object.
+    suppress_forwarding_bodies(module);
+
     inline::run(module, opt);
+
+    // Every pack should have been resolved by the splice above. One that
+    // survives would be emitted as a call with its arguments missing, so say
+    // so instead.
+    check_forwarding_resolved(module);
 
     if !opt.optimizes() {
         return;

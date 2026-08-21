@@ -198,7 +198,11 @@ pub enum Opcode {
     VaStart, // Initialize va_list
     VaArg,   // Get next vararg
     VaEnd,   // Clean up va_list (usually no-op)
-    VaCopy,  // Copy va_list
+    VaCopy,
+    /// `__builtin_va_arg_pack_len()`: how many variadic arguments the caller
+    /// passed. Replaced with a constant when the enclosing `always_inline`
+    /// function is inlined; a survivor is diagnosed, never emitted.
+    VaArgPackLen, // Copy va_list
 
     // Byte-swapping builtins
     Bswap16, // Byte-swap 16-bit value
@@ -409,6 +413,7 @@ impl Opcode {
             Opcode::VaArg => "va_arg",
             Opcode::VaEnd => "va_end",
             Opcode::VaCopy => "va_copy",
+            Opcode::VaArgPackLen => "va_arg_pack_len",
             Opcode::Bswap16 => "bswap16",
             Opcode::Bswap32 => "bswap32",
             Opcode::Bswap64 => "bswap64",
@@ -786,6 +791,13 @@ pub struct Instruction {
     /// For variadic calls: index where variadic arguments start (0-based)
     /// All arguments at this index and beyond are variadic (should be passed on stack)
     pub variadic_arg_start: Option<usize>,
+    /// For calls: the argument list ended with `__builtin_va_arg_pack()`.
+    ///
+    /// The enclosing function's own variadic arguments belong here, and are
+    /// only known once it is inlined, so the inliner appends them and clears
+    /// this. A call still carrying it after inlining cannot be emitted, and is
+    /// diagnosed by `opt::check_forwarding_resolved`.
+    pub ends_with_va_arg_pack: bool,
     /// For calls: true if the called function is noreturn (never returns).
     /// Code after a noreturn call is unreachable.
     pub is_noreturn_call: bool,
@@ -822,6 +834,7 @@ impl Default for Instruction {
             switch_default: None,
             arg_types: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             variadic_arg_start: None,
+            ends_with_va_arg_pack: false,
             is_noreturn_call: false,
             indirect_target: None,
             pos: None,

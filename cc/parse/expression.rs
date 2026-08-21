@@ -3016,6 +3016,40 @@ impl<'a> Parser<'a> {
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
         match name_id {
+            crate::kw::BUILTIN_VA_ARG_PACK | crate::kw::BUILTIN_VA_ARG_PACK_LEN => Some((|| {
+                let is_len = name_id == crate::kw::BUILTIN_VA_ARG_PACK_LEN;
+                let spelling = if is_len {
+                    "__builtin_va_arg_pack_len"
+                } else {
+                    "__builtin_va_arg_pack"
+                };
+                self.expect_special(b'(')?;
+                self.expect_special(b')')?;
+
+                // Both name the *caller's* variadic arguments, so there has to
+                // be a caller whose arguments are known: the enclosing
+                // function must be variadic, and must be `always_inline` so
+                // that the call site is substituted in. Checked here because
+                // this is the last point where either fact is visible --
+                // `ir::Function` records neither, and the backends infer
+                // variadic-ness from the presence of `va_start`.
+                if !self.in_forwarding_function {
+                    crate::diag::error_args(
+                        token_pos,
+                        "'{0}' may only be used in a variadic function declared __attribute__((always_inline))",
+                        &[spelling],
+                    );
+                }
+
+                let (kind, typ) = if is_len {
+                    (ExprKind::VaArgPackLen, self.types.int_id)
+                } else {
+                    (ExprKind::VaArgPack, self.types.void_id)
+                };
+                Ok(Self::typed_expr(kind, typ, token_pos))
+            })(
+            )),
+
             crate::kw::BUILTIN_VA_START => Some((|| {
                 // __builtin_va_start(ap, last_param)
                 self.expect_special(b'(')?;

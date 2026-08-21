@@ -36,6 +36,15 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 | `__builtin_popcount(x)` | Count set bits in `unsigned int` |
 | `__builtin_popcountl(x)` | Count set bits in `unsigned long` |
 | `__builtin_popcountll(x)` | Count set bits in `unsigned long long` |
+| `__builtin_parity(x)` | Low bit of the population count of `unsigned int` |
+| `__builtin_parityl(x)` | Same, `unsigned long` |
+| `__builtin_parityll(x)` | Same, `unsigned long long` |
+| `__builtin_clrsb(x)` | Redundant sign bits in `int` — the bits below the sign bit that repeat it. **Defined for every input**, unlike the `clz` family: 0 and -1 both answer 31 |
+| `__builtin_clrsbl(x)` | Same, `long` |
+| `__builtin_clrsbll(x)` | Same, `long long` |
+| `__builtin_ffs(x)` | One-based index of the lowest set bit of `int`, 0 if none |
+| `__builtin_ffsl(x)` | Same, `long` |
+| `__builtin_ffsll(x)` | Same, `long long` |
 
 ## Type Introspection
 
@@ -43,6 +52,7 @@ differs from gcc, the row says so rather than leaving the reader to find out.
 |---------|-------------|
 | `__builtin_constant_p(expr)` | Returns 1 if expr is compile-time constant |
 | `__builtin_types_compatible_p(t1, t2)` | Returns 1 if types are compatible (ignores qualifiers) |
+| `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`; the untaken arm is not evaluated and need not even type-check |
 
 ## Memory
 
@@ -104,6 +114,9 @@ The member can be a chain like `field.subfield` or `arr[index].field`.
 | `__builtin_isnormal(x)` | 1 if `x` is finite, non-zero and not subnormal |
 | `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five class codes describes `x` |
 | `__builtin_flt_rounds()` | Current FP rounding mode |
+| `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
+| `__builtin_sqrt(x)` | Square root. Calls the library `sqrt`, so it needs `-lm`; gcc folds a constant argument and does not |
+| `__builtin_copysign(x, y)` | Magnitude of `x` with the sign of `y`. Calls the library `copysign` |
 
 ## Stack Introspection
 
@@ -126,6 +139,53 @@ Usable at file scope and in a static initializer as well as in a function
 body: `double _Complex g = 1.0 + 2.0*I;` and `CMPLX(3.0, 4.0)` both work, at
 every precision. (This entry used to record the opposite as a limit; that was
 fixed by `#C11` and the note outlived it.)
+
+## Checked Arithmetic
+
+C23 spells the generic three as `ckd_add`, `ckd_sub` and `ckd_mul`. Each
+stores the wrapped result through the pointer and returns 1 if the true
+result did not fit, 0 if it did — so the result is written either way.
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_add_overflow(a, b, *r)` | Type-generic; the operands and `*r` may differ in type |
+| `__builtin_sub_overflow(a, b, *r)` | |
+| `__builtin_mul_overflow(a, b, *r)` | |
+| `__builtin_sadd_overflow(a, b, *r)` | Add, `int` |
+| `__builtin_saddl_overflow(a, b, *r)` | Add, `long` |
+| `__builtin_saddll_overflow(a, b, *r)` | Add, `long long` |
+| `__builtin_uadd_overflow(a, b, *r)` | Add, `unsigned int` |
+| `__builtin_uaddl_overflow(a, b, *r)` | Add, `unsigned long` |
+| `__builtin_uaddll_overflow(a, b, *r)` | Add, `unsigned long long` |
+| `__builtin_ssub_overflow(a, b, *r)` | Subtract, `int` |
+| `__builtin_ssubl_overflow(a, b, *r)` | Subtract, `long` |
+| `__builtin_ssubll_overflow(a, b, *r)` | Subtract, `long long` |
+| `__builtin_usub_overflow(a, b, *r)` | Subtract, `unsigned int` |
+| `__builtin_usubl_overflow(a, b, *r)` | Subtract, `unsigned long` |
+| `__builtin_usubll_overflow(a, b, *r)` | Subtract, `unsigned long long` |
+| `__builtin_smul_overflow(a, b, *r)` | Multiply, `int` |
+| `__builtin_smull_overflow(a, b, *r)` | Multiply, `long` |
+| `__builtin_smulll_overflow(a, b, *r)` | Multiply, `long long` |
+| `__builtin_umul_overflow(a, b, *r)` | Multiply, `unsigned int` |
+| `__builtin_umull_overflow(a, b, *r)` | Multiply, `unsigned long` |
+| `__builtin_umulll_overflow(a, b, *r)` | Multiply, `unsigned long long` |
+
+## Library Functions
+
+The builtin of the same name as a library function. c17 emits a call to that
+function, so the usual library rules apply — `__builtin_sqrt` needs `-lm`.
+They exist so a translation unit may use one without having included the
+header that declares it, which is what gcc allows and what glibc's fortified
+headers rely on.
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_strlen(s)` | |
+| `__builtin_strcmp(a, b)` | |
+| `__builtin_abs(x)` | Absolute value, `int` |
+| `__builtin_labs(x)` | Absolute value, `long` |
+| `__builtin_llabs(x)` | Absolute value, `long long` |
+| `__builtin_trap()` | Abnormal termination; lowered to `abort` |
 
 ## Object Size and Fortification
 

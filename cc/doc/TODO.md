@@ -215,11 +215,19 @@ AArch32 spelling, and gcc does not define it there. c17 did, which was simply
 wrong.
 
 Implemented since this list was first measured: case ranges, designated
-initializer ranges, and computed goto. Those three passed the same filter for a
-reason worth recording — each is a *syntax* over control flow and initializers
-c17 already had, none added a subsystem, and all three block outright with no
-fallback path. CPython's configure now detects computed gotos, so it builds its
-indirect-branch interpreter rather than the switch fallback.
+initializer ranges, computed goto, and the omitted middle operand `a ?: b`
+(1373 files of the Linux kernel, and five of the six sparse files c17 could not
+parse). All four passed the same filter for a reason worth recording — each is
+a *syntax* over control flow, initializers or an operator c17 already had, none
+added a subsystem, and all four block outright with no fallback path. CPython's
+configure now detects computed gotos, so it builds its indirect-branch
+interpreter rather than the switch fallback.
+
+`a ?: b` is the one that could not simply be rewritten to `a ? a : b`: the
+condition must be evaluated exactly once, so it has its own AST node. The
+missing bit-manipulation builtins went in alongside it — `__builtin_clrsb` and
+its wider forms, and `__builtin_ffsll`, which completed a family whose first
+two members were already there.
 
 ## Future Features
 

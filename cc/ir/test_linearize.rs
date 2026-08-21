@@ -554,9 +554,9 @@ fn test_switch_basic() {
 
     // Build switch body: { case 1: return 10; case 2: return 20; default: return 0; }
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types), None))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types))))),
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(2, &ctx.types), None))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types))))),
         BlockItem::Statement(Box::new(Stmt::Default(test_pos()))),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
@@ -618,7 +618,7 @@ fn test_switch_with_break() {
     let x_sym = ctx.var("x", int_type);
 
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types)))),
+        BlockItem::Statement(Box::new(Stmt::Case(Expr::int(1, &ctx.types), None))),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
@@ -5926,9 +5926,45 @@ fn test_bitfield_storage_type() {
     assert_eq!(linearizer.bitfield_storage_type(2), types.ushort_id);
     assert_eq!(linearizer.bitfield_storage_type(4), types.uint_id);
     assert_eq!(linearizer.bitfield_storage_type(8), types.ulong_id);
+    // A 16-byte unit carries an `__int128` bit-field wider than 64 bits. Its
+    // *kind* is what matters downstream: `identify_int128_pseudos` routes on
+    // `TypeKind::Int128`, and that is what puts the value in a 16-byte stack
+    // slot instead of a GP register the backend cannot address as a pair.
+    assert_eq!(linearizer.bitfield_storage_type(16), types.uint128_id);
+    assert_eq!(types.kind(types.uint128_id), crate::types::TypeKind::Int128);
     // Fallback for unexpected sizes
     assert_eq!(linearizer.bitfield_storage_type(3), types.uint_id);
-    assert_eq!(linearizer.bitfield_storage_type(16), types.uint_id);
+}
+
+/// The 128-bit mask is exact at both ends, including the full width where the
+/// `(1 << n) - 1` spelling collapses to zero.
+#[test]
+fn test_bitfield_value_mask_128_covers_the_wide_carrier() {
+    use crate::ir::linearize_emit::bitfield_value_mask_128;
+
+    assert_eq!(bitfield_value_mask_128(0), 0);
+    assert_eq!(bitfield_value_mask_128(1), 0x1);
+    assert_eq!(bitfield_value_mask_128(64), u64::MAX as u128);
+    assert_eq!(
+        bitfield_value_mask_128(65),
+        (u64::MAX as u128) | (1u128 << 64)
+    );
+    assert_eq!(bitfield_value_mask_128(127), u128::MAX >> 1);
+    assert_eq!(bitfield_value_mask_128(128), u128::MAX);
+
+    // Agrees with the 64-bit twin everywhere the twin is defined, so the two
+    // cannot drift apart.
+    for w in 1..=64u32 {
+        assert_eq!(
+            bitfield_value_mask_128(w),
+            crate::ir::linearize_emit::bitfield_value_mask(w) as u128,
+            "masks disagree at width {w}"
+        );
+    }
+    // Every width sets exactly that many bits.
+    for w in 0..=128u32 {
+        assert_eq!(bitfield_value_mask_128(w).count_ones(), w);
+    }
 }
 
 /// `emit_bitfield_load` extends only for a signed field, and decides that by

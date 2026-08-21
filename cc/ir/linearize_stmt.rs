@@ -165,6 +165,40 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
+            // GNU computed goto. The target address is not statically known,
+            // so every label whose address was taken in this function is
+            // linked as a successor -- the same conservative edge set `asm
+            // goto` uses, and the reason DCE does not delete those blocks.
+            Stmt::GotoIndirect { target, pos } => {
+                // 6.5.3.2: the operand of a computed goto is an address.
+                // Anything else -- `goto *3;` -- would branch to a number.
+                let target_typ = self.expr_type(target);
+                // GCC: "computed goto must be pointer type". An integer is
+                // scalar, so testing scalarity accepted `goto *3;` -- and the
+                // 64-bit store of a 32-bit value then branched through a
+                // half-initialised address.
+                if self.types.kind(target_typ) != crate::types::TypeKind::Pointer {
+                    let named = self.types.format_type(target_typ, Some(self.strings));
+                    crate::diag::error_args(
+                        *pos,
+                        "computed goto must be a pointer, not '{0}'",
+                        &[&named],
+                    );
+                }
+                let addr = self.linearize_expr(target);
+                let (dispatch_bb, slot) = self.indirect_dispatch_block();
+                // Hand the address over in the hidden local and branch to the
+                // one dispatch block, which is the only place that fans out to
+                // the labels. See `Linearizer::indirect_dispatch`.
+                let void_ptr = self.types.void_ptr_id;
+                self.emit(Instruction::store(addr, slot, 0, void_ptr, 64));
+                self.emit(Instruction::br(dispatch_bb));
+                if let Some(current) = self.current_bb {
+                    self.link_bb(current, dispatch_bb);
+                }
+                self.current_bb = None;
+            }
+
             Stmt::Goto { name: label, .. } => {
                 let label_str = self.str(*label).to_string();
                 let target = self.get_or_create_label(&label_str);
@@ -180,6 +214,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             Stmt::Label { name, stmt, .. } => {
                 let name_str = self.str(*name).to_string();
+                self.defined_labels.insert(name_str.clone());
                 let label_bb = self.get_or_create_label(&name_str);
 
                 // If current block is not terminated, branch to label
@@ -198,7 +233,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.linearize_switch(expr, body);
             }
 
-            Stmt::Case(_) | Stmt::Default(_) => {
+            Stmt::Case(..) | Stmt::Default(_) => {
                 // Case/Default labels are handled by linearize_switch
                 // If we encounter them outside a switch, ignore them
             }
@@ -1288,7 +1323,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.break_targets.push(exit_bb);
 
         // Collect case labels and create basic blocks for each
-        let (case_values, has_default) = self.collect_switch_cases(body);
+        let switch_unsigned = self.types.is_unsigned(expr_type);
+        let (case_values, has_default) = self.collect_switch_cases(body, switch_unsigned);
         let case_bbs: Vec<BasicBlockId> = case_values.iter().map(|_| self.alloc_bb()).collect();
         let default_bb = if has_default {
             Some(self.alloc_bb())
@@ -1297,10 +1333,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
 
         // Build switch instruction with case -> block mapping
-        let switch_cases: Vec<(i64, BasicBlockId)> = case_values
+        let switch_cases: Vec<(i64, i64, BasicBlockId)> = case_values
             .iter()
             .zip(case_bbs.iter())
-            .map(|(val, bb)| (*val, *bb))
+            .map(|((lo, hi), bb)| (*lo, *hi, *bb))
             .collect();
 
         // Default goes to default_bb if present, otherwise exit_bb
@@ -1316,7 +1352,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Link CFG edges from current block to all case/default/exit blocks
         if let Some(current) = self.current_bb {
-            for &(_, bb) in &switch_cases {
+            for &(_, _, bb) in &switch_cases {
                 self.link_bb(current, bb);
             }
             self.link_bb(current, default_target);
@@ -1359,7 +1395,11 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// only `Stmt::Block` here collected no cases from it -- so the switch was
     /// emitted with an empty table and every value took the default edge.
     /// A non-compound body is one statement, so it is walked as one.
-    pub(crate) fn collect_switch_cases(&self, body: &Stmt) -> (Vec<i64>, bool) {
+    pub(crate) fn collect_switch_cases(
+        &self,
+        body: &Stmt,
+        unsigned: bool,
+    ) -> (Vec<(i64, i64)>, bool) {
         let mut case_values = Vec::new();
         let mut has_default = false;
 
@@ -1367,14 +1407,82 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Block(items) => {
                 for item in items {
                     if let BlockItem::Statement(stmt) = item {
-                        self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default);
+                        self.collect_cases_from_stmt(
+                            stmt,
+                            &mut case_values,
+                            &mut has_default,
+                            unsigned,
+                        );
                     }
                 }
             }
-            stmt => self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default),
+            stmt => {
+                self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default, unsigned)
+            }
         }
 
         (case_values, has_default)
+    }
+
+    /// The block every computed `goto` in this function branches through,
+    /// creating it on first use along with the hidden local that carries the
+    /// target address to it.
+    ///
+    /// Its successors are the address-taken labels, and they are linked once
+    /// the whole function has been walked -- the set is not complete until
+    /// then, since `&&label` may appear after the `goto *` that reaches it.
+    fn indirect_dispatch_block(&mut self) -> (BasicBlockId, PseudoId) {
+        if let Some(existing) = self.indirect_dispatch {
+            return existing;
+        }
+        let void_ptr = self.types.void_ptr_id;
+        let slot = self.alloc_pseudo();
+        let name = format!("__goto_target.{}", slot.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(crate::ir::Pseudo::sym(slot, name.clone()));
+            func.add_local(&name, slot, void_ptr, false, false, None, None);
+        }
+
+        let dispatch_bb = self.alloc_bb();
+        let saved = self.current_bb;
+        self.switch_bb(dispatch_bb);
+        let loaded = self.alloc_pseudo();
+        self.emit(Instruction::load(loaded, slot, 0, void_ptr, 64));
+        self.emit(Instruction::indirect_br(loaded));
+        self.current_bb = saved;
+
+        self.indirect_dispatch = Some((dispatch_bb, slot));
+        (dispatch_bb, slot)
+    }
+
+    /// Link the dispatch block to every label whose address was taken.
+    ///
+    /// Called once the function body is walked, because `&&label` may appear
+    /// after the `goto *` that can reach it.
+    pub(crate) fn finish_indirect_dispatch(&mut self) {
+        // `&&label` naming a label the function never defines. The block
+        // `get_or_create_label` minted stays empty and unterminated, so
+        // branching to it ran off the end of the function -- the program hung.
+        // Checked here because a forward reference is legal.
+        for (name, pos) in std::mem::take(&mut self.label_addr_refs) {
+            if !self.defined_labels.contains(&name) {
+                crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
+            }
+        }
+
+        let Some((dispatch_bb, _)) = self.indirect_dispatch else {
+            // The address was taken but this function never branches on it --
+            // it was stored for someone else, or only compared. The blocks
+            // still have to survive DCE, or the symbol the address refers to
+            // is never emitted and the link fails on an undefined `.L` label.
+            for bb in self.addr_taken_labels.clone() {
+                self.get_or_create_bb(bb).addr_taken = true;
+            }
+            return;
+        };
+        for bb in self.addr_taken_labels.clone() {
+            self.link_bb(dispatch_bb, bb);
+        }
     }
 
     /// C17 6.8.6.1p1: a `goto` shall not jump from outside the scope of an
@@ -1455,28 +1563,88 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
     }
 
+    /// Report a case endpoint the constant folder could not reduce.
+    ///
+    /// Split out because a range has two of them and both need the same
+    /// distinction: a non-constant label is the program's error, while a
+    /// constant this partial evaluator cannot fold is ours.
+    fn report_unfoldable_case(&self, expr: &Expr) {
+        if self.expr_is_runtime(expr) {
+            error(expr.pos, "case label is not an integer constant expression");
+        } else {
+            error(
+                expr.pos,
+                "case label is a constant expression this compiler cannot evaluate",
+            );
+        }
+    }
+
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
-        case_values: &mut Vec<i64>,
+        case_values: &mut Vec<(i64, i64)>,
         has_default: &mut bool,
+        unsigned: bool,
     ) {
         match stmt {
-            Stmt::Case(expr) => {
+            Stmt::Case(expr, high) => {
                 // Extract constant value from case expression
                 if let Some(val) = self.eval_const_expr(expr) {
                     let val = val as i64; // switch cases truncated to i64
-                                          // C99 6.8.4.2p3: no two case constants may be equal.
-                                          // Consumption looks the value up with `.position()`, which
-                                          // finds the first match, so a duplicate silently re-entered
-                                          // the earlier case's block and merged the two bodies.
-                    if case_values.contains(&val) {
-                        error(
-                            expr.pos,
-                            &format!("duplicate case value '{}' in switch", val),
-                        );
+
+                    // A GNU range `case lo ... hi:`. An absent high endpoint
+                    // is the ordinary label, held as the degenerate range
+                    // `(v, v)` so that everything downstream has one shape.
+                    let hi = match high {
+                        None => Some(val),
+                        Some(hi_expr) => match self.eval_const_expr(hi_expr) {
+                            Some(h) => Some(h as i64),
+                            None => {
+                                self.report_unfoldable_case(hi_expr);
+                                None
+                            }
+                        },
+                    };
+                    let Some(hi) = hi else { return };
+
+                    // 6.8.4.2p3 forbids two equal case constants, and GCC
+                    // extends that to overlapping ranges -- an overlap would
+                    // otherwise make one arm silently unreachable, since the
+                    // body walk resolves a label by finding the first match.
+                    // Order by the switch type's own signedness. The endpoints
+                    // are carried as `i64`, so an unsigned 64-bit bound above
+                    // `i64::MAX` looks negative: `case 0ul ... ULONG_MAX:` read
+                    // as an empty range and never matched.
+                    let below = |a: i64, b: i64| {
+                        if unsigned {
+                            (a as u64) < (b as u64)
+                        } else {
+                            a < b
+                        }
+                    };
+                    let at_most = |a: i64, b: i64| !below(b, a);
+                    if below(hi, val) {
+                        // GCC accepts an empty range, warns, and never matches
+                        // it. Nothing is recorded, so nothing can overlap it.
+                        crate::diag::warning(expr.pos, "empty range specified");
+                        return;
                     }
-                    case_values.push(val);
+                    if let Some((lo2, hi2)) = case_values
+                        .iter()
+                        .find(|(lo2, hi2)| at_most(val, *hi2) && at_most(*lo2, hi))
+                        .copied()
+                    {
+                        let what = if val == hi && lo2 == hi2 {
+                            format!("duplicate case value '{}' in switch", val)
+                        } else {
+                            format!(
+                                "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
+                                val, hi, lo2, hi2
+                            )
+                        };
+                        error(expr.pos, &what);
+                    }
+                    case_values.push((val, hi));
                 } else if self.expr_is_runtime(expr) {
                     // A non-constant label can never match; it used to be
                     // dropped without a word.
@@ -1506,28 +1674,28 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             // Recursively check labeled statements
             Stmt::Label { stmt, .. } => {
-                self.collect_cases_from_stmt(stmt, case_values, has_default);
+                self.collect_cases_from_stmt(stmt, case_values, has_default, unsigned);
             }
             // Recurse into nested statements for Duff's device pattern
             // (case labels inside loops/blocks within a switch)
             Stmt::Block(items) => {
                 for item in items {
                     if let BlockItem::Statement(s) = item {
-                        self.collect_cases_from_stmt(s, case_values, has_default);
+                        self.collect_cases_from_stmt(s, case_values, has_default, unsigned);
                     }
                 }
             }
             Stmt::DoWhile { body, .. } | Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                self.collect_cases_from_stmt(body, case_values, has_default);
+                self.collect_cases_from_stmt(body, case_values, has_default, unsigned);
             }
             Stmt::If {
                 then_stmt,
                 else_stmt,
                 ..
             } => {
-                self.collect_cases_from_stmt(then_stmt, case_values, has_default);
+                self.collect_cases_from_stmt(then_stmt, case_values, has_default, unsigned);
                 if let Some(e) = else_stmt {
-                    self.collect_cases_from_stmt(e, case_values, has_default);
+                    self.collect_cases_from_stmt(e, case_values, has_default, unsigned);
                 }
             }
             // Stop at inner switch — its case labels belong to it
@@ -1940,7 +2108,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_body(
         &mut self,
         body: &Stmt,
-        case_values: &[i64],
+        case_values: &[(i64, i64)],
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
     ) {
@@ -1975,16 +2143,26 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn linearize_switch_stmt(
         &mut self,
         stmt: &Stmt,
-        case_values: &[i64],
+        case_values: &[(i64, i64)],
         case_bbs: &[BasicBlockId],
         default_bb: Option<BasicBlockId>,
         case_idx: &mut usize,
     ) {
         match stmt {
-            Stmt::Case(expr) => {
-                // Find the matching case block
+            Stmt::Case(expr, high) => {
+                // Find the matching case block. A label is identified by its
+                // whole range, so that `case 1 ... 3:` and a later `case 1:`
+                // could not resolve to the same block -- the overlap check
+                // rejects that pair anyway, but matching on the low endpoint
+                // alone would have made the two indistinguishable here.
                 if let Some(val) = self.eval_const_expr(expr) {
-                    if let Some(idx) = case_values.iter().position(|v| *v as i128 == val) {
+                    let lo = val as i64;
+                    let hi = match high {
+                        None => Some(lo),
+                        Some(hi_expr) => self.eval_const_expr(hi_expr).map(|h| h as i64),
+                    };
+                    let Some(hi) = hi else { return };
+                    if let Some(idx) = case_values.iter().position(|r| *r == (lo, hi)) {
                         let case_bb = case_bbs[idx];
 
                         // Fall through from previous case if not terminated
@@ -2665,11 +2843,11 @@ impl VmScopeWalk {
                 }
             }
 
-            Stmt::Case(_) | Stmt::Default(_) => {
+            Stmt::Case(..) | Stmt::Default(_) => {
                 // 6.8.1p2: a `case` or `default` belongs to a `switch`.
                 if self.switch_depth == 0 {
                     let (pos, what) = match stmt {
-                        Stmt::Case(expr) => (expr.pos, "case"),
+                        Stmt::Case(expr, _) => (expr.pos, "case"),
                         Stmt::Default(pos) => (*pos, "default"),
                         _ => unreachable!(),
                     };
@@ -2681,7 +2859,7 @@ impl VmScopeWalk {
                 // its declaration running.
                 if let Some(outer) = switch_scopes {
                     let label_pos = match stmt {
-                        Stmt::Case(expr) => expr.pos,
+                        Stmt::Case(expr, _) => expr.pos,
                         Stmt::Default(pos) => *pos,
                         _ => unreachable!("only a case or default reaches this arm"),
                     };

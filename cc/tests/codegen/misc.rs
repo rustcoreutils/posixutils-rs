@@ -9697,3 +9697,53 @@ int main(void)
         0
     );
 }
+
+/// A wide switch keeps its width through inlining.
+///
+/// The inliner builds a fresh `Switch` instruction rather than cloning one, so
+/// everything it needs has to be carried over by hand — and the operation
+/// width was not. Once inlined, a 64-bit switch was compared in 32 bits, so
+/// `case 4294967296ul:` matched 0.
+///
+/// Pre-existing, and invisible for a long time because an equality compare on
+/// the low half agrees with the full compare unless the constants collide
+/// there. A `case lo ... hi` range made it plain: its subtraction exposes the
+/// top half every time.
+#[test]
+fn codegen_wide_switch_survives_inlining() {
+    let code = r#"
+static int hit(unsigned long x)
+{
+    switch (x) { case 4294967296ul: return 1; default: return 0; }
+}
+
+static int upper(unsigned long x)
+{
+    switch (x) {
+    case 9223372036854775808ul ... 18446744073709551615ul: return 1;
+    default: return 0;
+    }
+}
+
+static int wide_label(long x)
+{
+    switch (x) { case -4294967296L: return 1; default: return 0; }
+}
+
+int main(void)
+{
+    /* The low 32 bits of 2^32 are zero, so a 32-bit compare says these match. */
+    if (!hit(4294967296ul)) return 1;
+    if (hit(0)) return 2;
+
+    if (!upper(9223372036854775808ul)) return 3;
+    if (upper(0) || upper(9223372036854775807ul)) return 4;
+
+    if (!wide_label(-4294967296L)) return 5;
+    if (wide_label(0)) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("wide_switch_inline", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("wide_switch_inline_opt", code), 0);
+}

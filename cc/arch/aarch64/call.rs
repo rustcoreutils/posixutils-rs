@@ -108,7 +108,7 @@ impl Aarch64CodeGen {
             } else if gp_pair {
                 if int_arg_idx + 1 < int_arg_regs.len() {
                     let mem = match self.get_location(arg) {
-                        Loc::Stack(offset) => self.stack_mem(offset),
+                        ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => self.loc_mem(l).unwrap(),
                         Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
                         _ => MemAddr::BaseOffset {
                             base: Reg::X9,
@@ -165,11 +165,15 @@ impl Aarch64CodeGen {
                     // slot. Moving it as a scalar wrote the pointer instead.
                     let src = match self.get_location(arg) {
                         Loc::Reg(r) => r,
-                        Loc::Stack(off) => {
+                        ref loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
+                            // Both frames reach here: an aggregate argument
+                            // may be a local or may itself have arrived on the
+                            // stack. `_ => continue` below would skip it.
+                            let (base, disp) = self.loc_addr_parts(loc).unwrap();
                             self.push_lir(Aarch64Inst::Add {
                                 size: OperandSize::B64,
-                                src1: self.stack_base_reg(off),
-                                src2: GpOperand::Imm(self.stack_offset(off) as i64),
+                                src1: base,
+                                src2: GpOperand::Imm(disp as i64),
                                 dst: Reg::X9,
                             });
                             Reg::X9
@@ -439,7 +443,7 @@ impl Aarch64CodeGen {
                 if int_arg_idx + 1 < int_arg_regs.len() {
                     let mem = match self.get_location(arg) {
                         // The slot holds the aggregate's own bytes.
-                        Loc::Stack(offset) => self.stack_mem(offset),
+                        ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => self.loc_mem(l).unwrap(),
                         // The register holds its address.
                         Loc::Reg(r) => MemAddr::BaseOffset { base: r, offset: 0 },
                         _ => MemAddr::BaseOffset {
@@ -513,9 +517,12 @@ impl Aarch64CodeGen {
                     int_arg_idx = start;
                     let loc = self.get_location(arg);
                     match loc {
-                        Loc::Stack(offset) => {
-                            // Load lo/hi from int128 stack slot into two consecutive regs
-                            let mem = self.stack_mem(offset);
+                        ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
+                            // Load lo/hi from the int128 slot into two
+                            // consecutive regs. Either frame: a `__int128`
+                            // parameter being forwarded may have arrived on
+                            // the stack itself.
+                            let mem = self.loc_mem(l).unwrap();
                             self.emit_ldp_legalized(
                                 OperandSize::B64,
                                 mem,
@@ -599,8 +606,8 @@ impl Aarch64CodeGen {
                 // Int128: store both 64-bit halves
                 let loc = self.get_location(stack_arg.pseudo);
                 match loc {
-                    Loc::Stack(src_off) => {
-                        let mem = self.stack_mem(src_off);
+                    ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
+                        let mem = self.loc_mem(l).unwrap();
                         self.emit_ldp_legalized(OperandSize::B64, mem, Reg::X9, Reg::X10);
                     }
                     Loc::Imm(v) => {
@@ -672,11 +679,14 @@ impl Aarch64CodeGen {
                 // The pseudo locates the aggregate; its bytes go into the slot.
                 let src = match self.get_location(stack_arg.pseudo) {
                     Loc::Reg(r) => r,
-                    Loc::Stack(off) => {
+                    ref loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
+                        // As above: the aggregate may live in either frame,
+                        // and `_ => continue` would silently drop it.
+                        let (base, disp) = self.loc_addr_parts(loc).unwrap();
                         self.push_lir(Aarch64Inst::Add {
                             size: OperandSize::B64,
-                            src1: self.stack_base_reg(off),
-                            src2: GpOperand::Imm(self.stack_offset(off) as i64),
+                            src1: base,
+                            src2: GpOperand::Imm(disp as i64),
                             dst: Reg::X9,
                         });
                         Reg::X9
@@ -782,11 +792,11 @@ impl Aarch64CodeGen {
     fn load_complex_arg_address(&mut self, arg: PseudoId) -> Reg {
         match self.get_location(arg) {
             Loc::Reg(r) => r,
-            Loc::Stack(offset) => {
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     dst: Reg::X9,
-                    addr: self.stack_mem(offset),
+                    addr: self.loc_mem(l).unwrap(),
                 });
                 Reg::X9
             }
@@ -809,7 +819,7 @@ impl Aarch64CodeGen {
         let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, arg_type.unwrap());
 
         match arg_loc {
-            Loc::Stack(offset) => {
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 // The argument pseudo holds the *address* of the complex value
                 // (`Linearizer::complex_operand_addr`), so the slot has to be
                 // loaded and then dereferenced. Reading the slot as though it
@@ -818,7 +828,7 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     dst: Reg::X9,
-                    addr: self.stack_mem(offset),
+                    addr: self.loc_mem(l).unwrap(),
                 });
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
@@ -888,10 +898,10 @@ impl Aarch64CodeGen {
         let holds_value = types.size_bits(typ) <= 64;
 
         match arg_loc {
-            Loc::Stack(offset) => self.push_lir(Aarch64Inst::LdrFp {
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size,
                 dst,
-                addr: self.stack_mem_plus(offset, delta),
+                addr: self.loc_mem_plus(l, delta).unwrap(),
             }),
             Loc::Reg(r) if !holds_value => self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size,

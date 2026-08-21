@@ -889,8 +889,14 @@ impl Walker {
                 self.extract_from_c_expr(expr, strings, symbols, streams, path);
                 self.extract_from_c_stmt(body, strings, symbols, streams, path);
             }
-            Stmt::Case(expr) => {
+            Stmt::GotoIndirect { target, .. } => {
+                self.extract_from_c_expr(target, strings, symbols, streams, path);
+            }
+            Stmt::Case(expr, high) => {
                 self.extract_from_c_expr(expr, strings, symbols, streams, path);
+                if let Some(high) = high {
+                    self.extract_from_c_expr(high, strings, symbols, streams, path);
+                }
             }
             Stmt::Default(_) => {}
             Stmt::Return(Some(expr)) => {

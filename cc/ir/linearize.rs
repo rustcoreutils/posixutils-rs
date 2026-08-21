@@ -232,6 +232,32 @@ pub struct Linearizer<'a> {
     pub(crate) two_reg_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
     pub(crate) current_func_name: String,
+
+    /// Blocks whose address is taken by `&&label` in the function being
+    /// linearized. Every indirect `goto` may reach any of them, so each is
+    /// linked as a successor -- the CFG is explicit `children`/`parents`, and
+    /// without the edges DCE would delete blocks nothing appears to reach.
+    pub(crate) addr_taken_labels: Vec<BasicBlockId>,
+
+    /// `&&label` references in this function, with where each was written.
+    /// Checked against `defined_labels` once the body is walked, because a
+    /// forward reference is legal and only the end of the function settles it.
+    pub(crate) label_addr_refs: Vec<(String, crate::diag::Position)>,
+
+    /// Labels this function actually defines.
+    pub(crate) defined_labels: std::collections::HashSet<String>,
+
+    /// The one block every computed `goto` in this function branches through,
+    /// and the hidden local carrying the target address to it.
+    ///
+    /// A `goto *p` can reach any address-taken label, and recording that
+    /// directly gives one edge per (goto, label) pair -- N² for an interpreter
+    /// dispatch loop, where every handler ends in a `goto *`. CPython's
+    /// `ceval.c` has over two hundred of each, and the iterative dataflow over
+    /// that CFG did not finish in twenty minutes. Funnelling every indirect
+    /// branch through a single block makes it 2N: each `goto` has one
+    /// successor, and only the dispatch block fans out.
+    pub(crate) indirect_dispatch: Option<(BasicBlockId, PseudoId)>,
     /// Counter for generating unique static local names
     pub(crate) static_local_counter: u32,
     /// Counter for generating unique compound literal names (for file-scope compound literals)
@@ -284,6 +310,10 @@ impl<'a> Linearizer<'a> {
             struct_return_size: 0,
             two_reg_return_type: None,
             current_func_name: String::new(),
+            addr_taken_labels: Vec::new(),
+            label_addr_refs: Vec::new(),
+            defined_labels: std::collections::HashSet::new(),
+            indirect_dispatch: None,
             static_local_counter: 0,
             compound_literal_counter: 0,
             static_locals: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
@@ -430,12 +460,19 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Map a bitfield storage unit byte-size to the corresponding unsigned type.
+    ///
+    /// The 16-byte arm carries `__int128` bit-fields wider than 64 bits. It
+    /// must name a type whose kind is `Int128`, because that is what routes
+    /// the pseudos to 16-byte stack slots in the register allocator -- a
+    /// 128-bit value the allocator hands a single GP register instead panics
+    /// the backend in `int128_lo_mem_loc`.
     pub(crate) fn bitfield_storage_type(&self, storage_size: u32) -> TypeId {
         match storage_size {
             1 => self.types.uchar_id,
             2 => self.types.ushort_id,
             4 => self.types.uint_id,
             8 => self.types.ulong_id,
+            16 => self.types.uint128_id,
             _ => self.types.uint_id,
         }
     }
@@ -739,6 +776,10 @@ impl<'a> Linearizer<'a> {
         self.struct_return_size = 0;
         self.two_reg_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
+        self.addr_taken_labels.clear();
+        self.label_addr_refs.clear();
+        self.defined_labels.clear();
+        self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
@@ -1223,6 +1264,10 @@ impl<'a> Linearizer<'a> {
         // Linearize body
         self.linearize_stmt(&func.body);
 
+        // The address-taken set is complete only now, so the dispatch block's
+        // successors are linked here rather than at each computed goto.
+        self.finish_indirect_dispatch();
+
         // Ensure function ends with a return
         if !self.is_terminated() {
             if ret_kind == TypeKind::Void {
@@ -1398,6 +1443,8 @@ impl<'a> Linearizer<'a> {
             // Reads a hidden local the typedef already stored: no side
             // effect, and re-reading it is what makes the extent stable.
             ExprKind::VmTypedefExtent(..) => true,
+            // A label's address is a constant of the function.
+            ExprKind::LabelAddr(_) => true,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -4730,6 +4777,42 @@ impl<'a> Linearizer<'a> {
         }
 
         match &expr.kind {
+            // GNU `&&label`. The block already emits an assembly label of
+            // exactly this spelling -- `Label::name()` -- and both backends
+            // already lower a leading-`.` global to a pc-relative address, so
+            // this needs no opcode of its own.
+            ExprKind::LabelAddr(name) => {
+                let label = self.str(*name).to_string();
+                // Outside a function there is no block to name, and
+                // `get_or_create_label` would unwrap a `None` current
+                // function -- an ICE on `void *g = &&L;` at file scope.
+                if self.current_func.is_none() {
+                    crate::diag::error_args(
+                        expr.pos,
+                        "label '{0}' referenced outside of any function",
+                        &[&label],
+                    );
+                    return self.emit_const(0, self.types.void_ptr_id);
+                }
+                let bb = self.get_or_create_label(&label);
+                let sym = format!(".L{}_{}", self.current_func_name, bb.0);
+                let sym_pseudo = self.alloc_pseudo();
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(Pseudo::sym(sym_pseudo, sym));
+                }
+                // The label is a branch target for every indirect goto in this
+                // function, and the CFG has to say so or DCE deletes the block.
+                self.addr_taken_labels.push(bb);
+                self.label_addr_refs.push((label.clone(), expr.pos));
+                if let Some(func) = &mut self.current_func {
+                    func.takes_label_addr = true;
+                }
+                let dst = self.alloc_pseudo();
+                let void_ptr = self.types.void_ptr_id;
+                self.emit(Instruction::sym_addr(dst, sym_pseudo, void_ptr));
+                dst
+            }
+
             // One extent of a variably modified `typedef`, evaluated when the
             // typedef's declaration was reached and stored in a hidden local
             // since (C17 6.7.7p3). Reading it back here is what keeps

@@ -32,18 +32,23 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // Apple, and this list cannot tell them apart.
         // char is unsigned on ARM by default
         ("__CHAR_UNSIGNED__", Some("1")),
-        // SIMD
+        // Advanced SIMD is mandatory in the AArch64 base architecture, so
+        // this is a fact about the target and gcc defines it unconditionally
+        // here. It says nothing about whether <arm_neon.h> is available --
+        // that is a fact about the *compiler*, and c17 does not ship one.
+        // Guarded code that treats the first as implying the second will
+        // still fail on the missing header; withdrawing a true statement
+        // about the target is not the fix for that.
         ("__ARM_NEON", Some("1")),
-        ("__ARM_NEON__", Some("1")),
+        // __ARM_NEON__ is the AArch32 spelling, and gcc does *not* define it
+        // on aarch64. c17 did, which was simply wrong.
         // FP support
         ("__ARM_FP", Some("14")), // VFPv3 compatible
         ("__ARM_FP16_FORMAT_IEEE", Some("1")),
         ("__ARM_FEATURE_FMA", Some("1")),
-        // Atomic primitives
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", Some("1")),
+        // __GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8} is deliberately absent;
+        // see the note on the x86-64 list. c17 implements no `__sync_*`
+        // builtin, so advertising them only sent guarded code into a wall.
         // Lock-free atomics
         ("__GCC_ATOMIC_BOOL_LOCK_FREE", Some("2")),
         ("__GCC_ATOMIC_CHAR_LOCK_FREE", Some("2")),

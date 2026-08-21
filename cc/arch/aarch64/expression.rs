@@ -467,8 +467,12 @@ impl Aarch64CodeGen {
     fn load_int128(&mut self, src: PseudoId, lo_reg: Reg, hi_reg: Reg) {
         let loc = self.get_location(src);
         match loc {
-            Loc::Stack(offset) => {
-                let mem = self.stack_mem(offset);
+            ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
+                // Either frame: a `__int128` parameter that overflowed the
+                // register file arrives in the caller's. Without its arm this
+                // fell to the fallback below, which loads 64 bits and zeroes
+                // the top half -- a silent wrong answer, not a crash.
+                let mem = self.loc_mem(l).unwrap();
                 self.emit_ldp_legalized(OperandSize::B64, mem, lo_reg, hi_reg);
             }
             Loc::Imm(v) => {

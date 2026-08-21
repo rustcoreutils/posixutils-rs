@@ -2,21 +2,25 @@
 
 ## Table of Contents
 
-- [Deferred indefinitely](#deferred-indefinitely)
+- [Settled — do not re-open](#settled--do-not-re-open)
 - [Technical Debt](#technical-debt)
 - [Known Divergences](#known-divergences)
+- [GNU extensions not implemented](#gnu-extensions-not-implemented)
 - [Future Features](#future-features)
 - [Optimization Passes](#optimization-passes)
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
 - [External Test Suites](#external-test-suites)
 
-## Deferred indefinitely
+## Settled — do not re-open
 
-These are open by maintainer decision (2026-08-19), not by oversight. Neither
-is scheduled; both are recorded so a future reader knows the reasoning rather
-than rediscovering it.
+Recorded so a future reader knows the reasoning rather than rediscovering it,
+and so neither is raised again as a question.
 
 ### `_FORTIFY_SOURCE` compiles but checks nothing
+
+Not a conformance item. `_FORTIFY_SOURCE`, `__builtin_object_size` and the
+`_chk` family appear nowhere in POSIX.1-2024 — this is a security-hardening
+gap in a glibc extension, deferred by decision rather than scheduled.
 
 Peeling this apart one layer at a time has been the only way to see it: each
 fix exposes the next blocker, and three of the layers are invisible until the
@@ -48,15 +52,18 @@ implemented and reverted three times, most recently after measuring the
 duplicate-symbol failure that turned out to be layer 5. `__OPTIMIZE__` and
 layer 6 must land together.
 
-### Trigraphs are off by default
+### Trigraphs are off by default — decided, not deferred
+
+**Settled. Not a to-do, not an open conformance item, not awaiting a
+decision.** It is recorded here only so it stops being rediscovered.
 
 POSIX APPLICATION USAGE 88224 says outright that a compiler doing this is "not
-conforming to POSIX.1-2024". `--trigraphs` implements translation phase 1
+conforming to POSIX.1-2024", which is why it keeps reading like an open item to
+anyone coming to the spec fresh. `--trigraphs` implements translation phase 1
 exactly. The default is off because replacement reaches inside string
 literals — `"What??!"` becomes `"What|"` — and `??` is far likelier to appear
-by accident than by intent; gcc and clang default them off for the same
-reason. Flipping the default and offering an opt-out is the whole fix, and is
-a decision rather than a piece of work. See #C55 in `cc/audit.md`.
+by accident than by intent; gcc and clang default them off for the same reason.
+See #C55 in `cc/audit.md`.
 
 ## Technical Debt
 
@@ -93,9 +100,12 @@ does or claims.
 _The `__int128` and `long double` argument-passing bugs, the universal-character-name
 encoding, and the silently-dropped attributes used to belong here; all are closed, see
 #C42, #C43, #C57, #C58 and #C59 in `cc/audit.md`. What remains of that family: `used` is
-satisfied only because nothing is pruned, `vector_size` is unimplemented and refused,
-while `mode` is implemented as of #C85 except for the vector modes, which warn, and #C38 -- an inlined stacked float HFA on aarch64 --
-is fixed, this note having outlived it (re-probed 2026-08-18 at -O0 and -O2 under qemu)._
+satisfied only because nothing is pruned -- re-probed 2026-08-20, an unreferenced static
+survives `-O2` whether or not it is marked. `vector_size` is implemented as storage and
+`mode` as of #C85, the latter also binding to a struct member's and a parameter's
+declarator as of #C149; only the vector modes still warn. #C38 -- an inlined stacked
+float HFA on aarch64 -- is fixed, this note having outlived it (re-probed 2026-08-18 at
+-O0 and -O2 under qemu)._
 
 _Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
 -- 21 constraint violations and 14 accept-side controls -- agrees with
@@ -115,6 +125,101 @@ byte, as gcc does on both targets._
 | Area | Divergence |
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
+
+## GNU extensions: what c17 will and will not grow
+
+This is a **decision table, not a backlog**. Frequency in real source is the
+tie-breaker, never the justification — "the kernel uses it 116 times" argues
+that the kernel is GCC-specific, not that c17 should be. Each row had to clear
+the project's own filter before earning a verdict:
+
+1. Is there a POSIX or C17 basis? (None of these have one — GNU extensions
+   start at a disadvantage, they do not start neutral.)
+2. Does refusing it actually block a real build, or does the guarded code
+   already have a portable path c17 can take?
+3. Is it an *alternate spelling* of machinery c17 already has, or genuinely
+   new subsystems?
+4. Is it a de-facto standard both GCC and Clang accept, or a GCC quirk?
+
+| Extension | Verdict | Why |
+|-----------|---------|-----|
+| SIMD intrinsic headers | **No — fix the predefines** | See below; the blocking is self-inflicted |
+| `__atomic_*` / `__sync_*` | **Not implemented; macro withdrawn** | Alternate spellings of complete C11 atomics — see below |
+| `__auto_type` | **No** | 6 files across four trees; fails minimalism on its own numbers |
+| nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines |
+
+### SIMD headers — the blocking is ours
+
+c17 predefines `__SSE__`, `__SSE2__` and `__MMX__`, matching GCC's x86-64
+baseline. But GCC defines those *and* ships `<emmintrin.h>`; c17 defines them
+and does not. So a project's `#ifdef __SSE2__` guard opens the door to a header
+that isn't there, when the same file's `#else` branch would have compiled:
+
+```c
+#ifdef __SSE2__
+#include <emmintrin.h>      /* c17: 'emmintrin.h': file not found */
+#else
+... portable fallback ...   /* builds clean; -U__SSE2__ proves it */
+#endif
+```
+
+The choice is to bundle the intrinsic headers — thousands of functions, plus
+element-wise vector arithmetic in the IR and both backends — or to stop
+claiming the capability. The second is a few lines in the predefines and costs
+those projects only the speed of their own fallback path. Advertising what we
+cannot deliver is the actual defect here; adding SIMD to make the advertisement
+true would be the tail wagging the dog.
+
+Vector *arithmetic* is the related non-goal. `vector_size` gives a type a
+vector's storage, which is what makes glibc's `<link.h>` compile, and that is
+deliberately where it stops.
+
+### Atomics — the macro went, the builtins did not come
+
+`__atomic_*` and `__sync_*` were the only rows to survive the filter on merit:
+c17's C11 atomics are complete — type system, parser, IR, linearizer, both
+backends, `<stdatomic.h>` — so these builtins would map onto machinery that
+already exists rather than adding a subsystem, and would inherit the same
+lock-free width ceiling (#X1).
+
+They are still not implemented. What changed is that c17 no longer *claims*
+them: it predefined `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}` on both
+targets while `__sync_bool_compare_and_swap` was an undeclared identifier, so a
+guarded `#ifdef` opened a door onto a wall when the `#else` beside it would have
+compiled. The macro is gone, which is what makes the guard tell the truth.
+
+### Which macros may be withdrawn, and which may not
+
+The distinction is what the macro is a statement *about*, and getting it wrong
+once cost a correct macro:
+
+- **Compiler capability** — `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_N` means "I
+  provide the `__sync_*` builtins". c17 does not, so the macro was false and
+  withdrawing it is the fix.
+- **Target capability** — `__SSE2__` means "this target has SSE2". That is
+  architectural baseline for x86-64 (32-bit x86 does *not* define it, which is
+  the proof it describes the target rather than the compiler), and gcc defines
+  it unconditionally. `__ARM_NEON` is the same: Advanced SIMD is mandatory in
+  the AArch64 base architecture. Both are **true**, both stay.
+
+Code that writes `#ifdef __SSE2__` around `#include <emmintrin.h>` is treating
+a target fact as though it implied a compiler fact. That inference holds for
+gcc and clang because they ship the intrinsic headers; c17 does not, so such a
+file still fails on the missing header. **The honest gap is the header, not the
+macro** — withdrawing a true statement about the target would not make the
+header appear, and would break the far more common code that tests `__SSE2__`
+to pick an algorithm rather than to reach for an intrinsic.
+
+`__ARM_NEON__` was withdrawn on aarch64 for a third reason again: it is the
+AArch32 spelling, and gcc does not define it there. c17 did, which was simply
+wrong.
+
+Implemented since this list was first measured: case ranges, designated
+initializer ranges, and computed goto. Those three passed the same filter for a
+reason worth recording — each is a *syntax* over control flow and initializers
+c17 already had, none added a subsystem, and all three block outright with no
+fallback path. CPython's configure now detects computed gotos, so it builds its
+indirect-branch interpreter rather than the switch fallback.
 
 ## Future Features
 

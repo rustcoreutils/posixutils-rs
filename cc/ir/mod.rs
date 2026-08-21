@@ -104,6 +104,12 @@ pub enum Opcode {
     Br,     // Unconditional branch
     Cbr,    // Conditional branch
     Switch, // Multi-way branch
+    /// GNU computed goto: branch to the address in `src[0]`.
+    ///
+    /// The reachable blocks are not derivable from the instruction -- any
+    /// label whose address was taken in this function may be the target -- so
+    /// the CFG edges are recorded on the block, exactly as `asm goto` does.
+    IndirectBr,
 
     // Integer arithmetic binary ops
     Add,
@@ -271,6 +277,7 @@ impl Opcode {
                 | Opcode::Br
                 | Opcode::Cbr
                 | Opcode::Switch
+                | Opcode::IndirectBr
                 | Opcode::Unreachable
                 | Opcode::Longjmp
         )
@@ -285,6 +292,7 @@ impl Opcode {
                 | Opcode::Br
                 | Opcode::Cbr
                 | Opcode::Switch
+                | Opcode::IndirectBr
                 | Opcode::Unreachable
                 | Opcode::Store
                 | Opcode::Call
@@ -341,6 +349,7 @@ impl Opcode {
             Opcode::Br => "br",
             Opcode::Cbr => "cbr",
             Opcode::Switch => "switch",
+            Opcode::IndirectBr => "indirectbr",
             Opcode::Add => "add",
             Opcode::Sub => "sub",
             Opcode::Mul => "mul",
@@ -763,8 +772,13 @@ pub struct Instruction {
     pub src_size: u32,
     /// Source type for conversion operations (interned TypeId)
     pub src_typ: Option<TypeId>,
-    /// For switch: case value to target block mapping
-    pub switch_cases: Vec<(i64, BasicBlockId)>,
+    /// For switch: case range to target block mapping, as `(lo, hi, block)`.
+    ///
+    /// An ordinary `case v:` is the degenerate range `(v, v, block)`. Ranges
+    /// are held rather than expanded because the GNU `case lo ... hi:` form
+    /// admits `case 0 ... 1000000:`, and each entry costs a basic block and a
+    /// compare in both backends.
+    pub switch_cases: Vec<(i64, i64, BasicBlockId)>,
     /// For switch: default block (if no case matches)
     pub switch_default: Option<BasicBlockId>,
     /// For calls: argument types (parallel to src for Call instructions, interned TypeIds)
@@ -991,9 +1005,14 @@ impl Instruction {
     }
 
     /// Create a switch instruction
+    /// GNU computed goto: branch to the address held in `target`.
+    pub fn indirect_br(target: PseudoId) -> Self {
+        Self::new(Opcode::IndirectBr).with_src(target)
+    }
+
     pub fn switch_insn(
         value: PseudoId,
-        cases: Vec<(i64, BasicBlockId)>,
+        cases: Vec<(i64, i64, BasicBlockId)>,
         default: Option<BasicBlockId>,
         size: u32,
     ) -> Self {
@@ -1290,8 +1309,12 @@ impl fmt::Display for Instruction {
                 if let Some(val) = self.src.first() {
                     write!(f, " {}", val)?;
                 }
-                for (case_val, bb) in &self.switch_cases {
-                    write!(f, ", {} => {}", case_val, bb)?;
+                for (lo, hi, bb) in &self.switch_cases {
+                    if lo == hi {
+                        write!(f, ", {} => {}", lo, bb)?;
+                    } else {
+                        write!(f, ", {}..={} => {}", lo, hi, bb)?;
+                    }
                 }
                 if let Some(default_bb) = &self.switch_default {
                     write!(f, ", default => {}", default_bb)?;
@@ -1343,6 +1366,11 @@ pub struct BasicBlock {
     pub children: Vec<BasicBlockId>,
     /// Optional label name
     pub label: Option<String>,
+    /// This block's address is taken by `&&label`, so it must be emitted even
+    /// when no edge reaches it. Without this a function that stores a label
+    /// address without branching on it -- legal GNU C -- lost the block to
+    /// DCE, and the link failed on an undefined `.L` symbol.
+    pub addr_taken: bool,
 
     // ========================================================================
     // Dominator tree fields (computed by dominate.rs)
@@ -1372,6 +1400,7 @@ impl Default for BasicBlock {
             parents: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
             children: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
             label: None,
+            addr_taken: false,
             idom: None,
             dom_level: 0,
             dom_children: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
@@ -1542,6 +1571,15 @@ pub struct Function {
     /// `__attribute__((noinline))`: the inliner must leave this function
     /// alone, whatever its size says.
     pub is_noinline: bool,
+    /// Whether this function takes the address of one of its own labels.
+    ///
+    /// Such a function cannot be inlined: the address is a symbol naming a
+    /// block of *this* function, and inlining renumbers blocks into the
+    /// caller, leaving a reference nothing defines. Recorded here rather than
+    /// recovered from symbol names, because a string literal's symbol is also
+    /// spelled `.L...` and matching on the prefix silently stopped every
+    /// function containing a string literal from being inlined.
+    pub takes_label_addr: bool,
     /// `__attribute__((always_inline))`: inline at every call site regardless
     /// of size, and at `-O0` too. `is_noinline` wins if both are present.
     pub is_always_inline: bool,
@@ -1585,6 +1623,7 @@ impl Default for Function {
         Self {
             name: String::new(),
             symbol_attrs: Default::default(),
+            takes_label_addr: false,
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             blocks: Vec::with_capacity(DEFAULT_BLOCK_CAPACITY),
@@ -2598,7 +2637,7 @@ mod tests {
     fn test_switch_insn_uses_src() {
         let insn = Instruction::switch_insn(
             PseudoId(5),
-            vec![(0, BasicBlockId(1)), (1, BasicBlockId(2))],
+            vec![(0, 0, BasicBlockId(1)), (1, 1, BasicBlockId(2))],
             Some(BasicBlockId(3)),
             32,
         );

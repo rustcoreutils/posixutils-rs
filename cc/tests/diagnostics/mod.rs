@@ -3132,37 +3132,66 @@ fn diagnostics_string_literals_matching_their_array_are_accepted() {
     }
 }
 
-/// A bit-field wider than 64 bits has no carrier here: the value mask is a
-/// `u64` and `bitfield_storage_type` has no arm for a sixteen-byte unit.
+/// A bit-field wider than 64 bits is carried, provided it gets a whole
+/// 16-byte storage unit.
 ///
+/// It used to be refused outright at any width above 64: the value mask was a
+/// `u64` and `bitfield_storage_type` had no arm for a sixteen-byte unit, so
 /// `unsigned __int128 a:100` read back a wrong value in a release build and
-/// **panicked the compiler** in a debug one. gcc supports it, so refusing is a
-/// divergence -- but a diagnostic naming the limit beats a panic, and
-/// `__int128` is a GNU extension. Widths up to 64 of such a type still work
-/// and still agree with gcc, so the cap is on the width, not the type.
+/// **panicked the compiler** in a debug one. Both halves exist now, and the
+/// carrier's *kind* is `Int128`, which is what routes it to a 16-byte stack
+/// slot rather than a GP register the backend cannot address as a pair.
+///
+/// What remains refused is the packed case, and only that. Packing gives a
+/// field an access span of just the bytes its own bits touch, which sends it
+/// to the byte-wise path -- and that assembles into a 64-bit carrier, so it
+/// cannot hold the value. gcc packs these; c17 says so instead of guessing.
 #[test]
-fn diagnostics_bitfield_wider_than_its_carrier_is_rejected() {
+fn diagnostics_wide_bitfield_without_a_carrier_is_rejected() {
     for (name, src) in [
+        (
+            "bf_packed_attr",
+            "struct __attribute__((packed)) S { char c; __int128 a:100; };\n",
+        ),
+        (
+            "bf_packed_pragma",
+            "#pragma pack(1)\nstruct S { char c; __int128 a:100; };\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "needs an unpacked 16-byte storage unit");
+    }
+
+    // Wider than the declared type is a different fault, and keeps its own
+    // message -- 6.7.2.1p4 is a constraint, not a c17 limitation.
+    compile_expect_error(
+        "bf_over_type",
+        "struct S { __int128 a:129; };\n",
+        "exceeds type size",
+    );
+}
+
+/// The accept side: every width up to the type's own now compiles.
+#[test]
+fn diagnostics_bitfields_within_the_carrier_are_accepted() {
+    for (name, src) in [
+        // The widths this used to refuse.
         ("bf_i128_65", "struct S { unsigned __int128 a:65; };\n"),
         ("bf_i128_100", "struct S { unsigned __int128 a:100; };\n"),
         ("bf_i128_128", "struct S { unsigned __int128 a:128; };\n"),
         ("bf_i128_signed", "struct S { __int128 a:96; };\n"),
         ("bf_i128_unnamed", "struct S { unsigned __int128 : 96; };\n"),
-    ] {
-        compile_expect_error(name, src, "c17 carries at most 64 bits");
-    }
-}
-
-/// ...and everything at or below the carrier's width still compiles, including
-/// a 64-bit field of a 128-bit type.
-#[test]
-fn diagnostics_bitfields_within_the_carrier_are_accepted() {
-    for (name, src) in [
+        // ...and the ones that always worked, which must not regress.
         ("bf_i128_64", "struct S { unsigned __int128 a:64; };\n"),
         ("bf_i128_32", "struct S { unsigned __int128 a:32; };\n"),
         ("bf_i128_1", "struct S { unsigned __int128 a:1; };\n"),
         ("bf_ull_64", "struct S { unsigned long long a:64; };\n"),
         ("bf_int_32", "struct S { int a:32; };\n"),
+        // A packed field at or below 64 bits still takes the byte-wise path
+        // and is fine there, so the new refusal must not catch it.
+        (
+            "bf_packed_narrow",
+            "struct __attribute__((packed)) S { char c; __int128 a:64; };\n",
+        ),
     ] {
         compile_expect_ok(name, src);
     }
@@ -4347,5 +4376,297 @@ fn diagnostics_vector_size_is_bounded() {
         "vector_size_not_multiple",
         "typedef double V __attribute__((vector_size(12)));\nint main(void){ return 0; }\n",
         "not a multiple",
+    );
+}
+
+/// Case ranges are checked for overlap, not just equality.
+///
+/// 6.8.4.2p3 forbids two equal case constants, and GCC extends that to
+/// overlapping ranges. The check here was `Vec::contains` over individual
+/// values; a range needs an interval test. Without it an overlapping arm
+/// becomes silently unreachable, because the body walk resolves a label by
+/// finding the first match.
+#[test]
+fn diagnostics_overlapping_case_ranges_are_rejected() {
+    compile_expect_error(
+        "case_range_overlap",
+        "int f(int x){ switch(x){ case 1 ... 5: return 0; case 4 ... 9: return 1; } return 2; }\n\
+         int main(void){ return f(0); }\n",
+        "overlapping",
+    );
+    // A range that swallows a plain label is the same fault.
+    compile_expect_error(
+        "case_range_covers_single",
+        "int f(int x){ switch(x){ case 1 ... 5: return 0; case 3: return 1; } return 2; }\n\
+         int main(void){ return f(0); }\n",
+        "case value",
+    );
+    // Adjacent ranges do not overlap and must be accepted.
+    compile_expect_ok(
+        "case_ranges_adjacent",
+        "int f(int x){ switch(x){ case 1 ... 5: return 0; case 6 ... 9: return 1; } return 2; }\n\
+         int main(void){ return f(0); }\n",
+    );
+}
+
+/// An empty case range warns and never matches, as in GCC.
+#[test]
+fn diagnostics_empty_case_range_warns() {
+    compile_expect_warning(
+        "case_range_empty",
+        "int f(int x){ switch(x){ case 9 ... 1: return 0; default: return 1; } }\n\
+         int main(void){ return f(5); }\n",
+        "empty range",
+    );
+}
+
+/// Both endpoints of a range must be integer constant expressions.
+#[test]
+fn diagnostics_case_range_endpoints_must_be_constant() {
+    compile_expect_error(
+        "case_range_runtime_high",
+        "int f(int x, int n){ switch(x){ case 1 ... n: return 0; } return 2; }\n\
+         int main(void){ return f(0, 1); }\n",
+        "constant expression",
+    );
+}
+
+/// An array designator that addresses past the end of its array is rejected.
+///
+/// Nothing checked this anywhere: `int a[4] = {[10] = 7};` compiled and wrote
+/// past the array, statically and at run time alike. GCC rejects it. Ranges
+/// make it easy to write by accident, so the bound is checked where the array
+/// size is known.
+#[test]
+fn diagnostics_designator_out_of_bounds() {
+    compile_expect_error(
+        "designator_past_end",
+        "int a[4] = {[10] = 7};\nint main(void){ return a[0]; }\n",
+        "exceeds array bounds",
+    );
+    compile_expect_error(
+        "designator_range_past_end",
+        "int a[4] = {[2 ... 9] = 7};\nint main(void){ return a[0]; }\n",
+        "exceeds array bounds",
+    );
+    // An array sized *by* its initializer cannot overflow it.
+    compile_expect_ok(
+        "designator_infers_size",
+        "int a[] = {[10] = 7};\nint main(void){ return a[10] == 7 ? 0 : 1; }\n",
+    );
+    // The last valid index is still valid.
+    compile_expect_ok(
+        "designator_last_index",
+        "int a[4] = {[3] = 7};\nint main(void){ return a[3] == 7 ? 0 : 1; }\n",
+    );
+}
+
+/// A reversed or negative index range is rejected, as in GCC.
+#[test]
+fn diagnostics_designator_range_is_well_formed() {
+    compile_expect_error(
+        "designator_range_reversed",
+        "int a[4] = {[3 ... 1] = 5};\nint main(void){ return 0; }\n",
+        "empty index range",
+    );
+    compile_expect_error(
+        "designator_negative",
+        "int a[4] = {[-1] = 5};\nint main(void){ return 0; }\n",
+        "negative",
+    );
+    // A single-element range is well formed.
+    compile_expect_ok(
+        "designator_range_single",
+        "int a[4] = {[1 ... 1] = 5};\nint main(void){ return a[1] == 5 ? 0 : 1; }\n",
+    );
+}
+
+/// `&&label` naming a label the function never defines is an error.
+///
+/// The block minted for the reference stayed empty and unterminated, so
+/// branching to it ran off the end of the function and the program hung.
+/// Checked at the end of the function, because a forward reference is legal.
+#[test]
+fn diagnostics_label_address_must_name_a_label() {
+    compile_expect_error(
+        "label_addr_undefined",
+        "int main(void){ void *p = &&nowhere; goto *p; return 1; }\n",
+        "used but not defined",
+    );
+    // A forward reference is fine.
+    compile_expect_ok(
+        "label_addr_forward",
+        "int main(void){ void *p = &&L; goto *p; return 1; L: return 0; }\n",
+    );
+}
+
+/// `&&label` outside any function is an error, not a compiler crash.
+#[test]
+fn diagnostics_label_address_outside_a_function() {
+    compile_expect_error(
+        "label_addr_file_scope",
+        "void *g = &&L;\nint main(void){ L: return 0; }\n",
+        "outside of any function",
+    );
+}
+
+/// The operand of a computed goto must be a pointer.
+///
+/// An integer is scalar, so testing scalarity accepted `goto *3;` — and the
+/// 64-bit store of a 32-bit value then branched through a half-initialised
+/// address.
+#[test]
+fn diagnostics_computed_goto_requires_a_pointer() {
+    compile_expect_error(
+        "computed_goto_int",
+        "int main(void){ int n = 3; goto *n; return 1; }\n",
+        "must be a pointer",
+    );
+    compile_expect_error(
+        "computed_goto_double",
+        "int main(void){ double d = 1.0; goto *d; return 1; }\n",
+        "must be a pointer",
+    );
+}
+
+/// An index range after a field designator is refused, not silently dropped.
+///
+/// `.m[0 ... 3] = v` resolves through the designator chain, which yields one
+/// offset where a range names many, so it initialized nothing at all and said
+/// nothing about it. The nested spelling does the same job.
+#[test]
+fn diagnostics_index_range_after_field_designator() {
+    compile_expect_error(
+        "range_after_field",
+        "struct S { int m[4]; int t; };\nstruct S s = { .m[0 ... 3] = 7, .t = 9 };\n\
+         int main(void){ return s.m[0]; }\n",
+        "index range is not supported after a field designator",
+    );
+    // The nested form works and is what the diagnostic points at.
+    compile_expect_ok(
+        "range_nested_in_field",
+        "struct S { int m[4]; int t; };\nstruct S s = { .m = { [0 ... 3] = 7 }, .t = 9 };\n\
+         int main(void){ return (s.m[3] == 7 && s.t == 9) ? 0 : 1; }\n",
+    );
+}
+
+// ============================================================================
+// #C164 — a declaration that declares nothing (C17 6.7p2)
+// ============================================================================
+
+/// 6.7p2 wants a declarator, a tag, or enumeration members. These have none.
+///
+/// All of them were **accepted silently** except the bare-specifier forms,
+/// which drew "type specifier missing" -- blaming the half that was absent
+/// rather than the declarator that was. gcc errors on `register`/`inline` here
+/// and warns on the rest; c17 errors on all of them, which 6.7p2 permits since
+/// it asks only for a diagnostic.
+#[test]
+fn diagnostics_declaration_that_declares_nothing_is_rejected() {
+    // A storage class or qualifier is named, the way gcc names it.
+    for (name, src, spec) in [
+        ("declnothing_register", "int register;\n", "register"),
+        ("declnothing_inline", "int inline;\n", "inline"),
+        ("declnothing_static", "static;\n", "static"),
+        ("declnothing_extern", "extern;\n", "extern"),
+        ("declnothing_typedef", "int typedef;\n", "typedef"),
+        ("declnothing_const", "const;\n", "const"),
+        ("declnothing_volatile", "volatile;\n", "volatile"),
+    ] {
+        compile_expect_error(name, src, &format!("'{spec}' in empty declaration"));
+    }
+
+    // Nothing to name: just a type that declares no object.
+    compile_expect_error("declnothing_int", "int;\n", "declaration declares nothing");
+    compile_expect_error(
+        "declnothing_unsigned",
+        "unsigned;\n",
+        "declaration declares nothing",
+    );
+
+    // Block scope has the same rule and its own parse path.
+    compile_expect_error(
+        "declnothing_block_static",
+        "void f(void){ static; }\n",
+        "'static' in empty declaration",
+    );
+    compile_expect_error(
+        "declnothing_block_register",
+        "void f(void){ int register; }\n",
+        "'register' in empty declaration",
+    );
+}
+
+/// The accept side, which is the half that can silently break real source.
+///
+/// A tag *is* something declared, so the whole point of this declaration form
+/// keeps working; and a stray `;` stays legal because any function-like macro
+/// expanding to nothing produces one (CPython's `_Py_DECLARE_STR()`).
+#[test]
+fn diagnostics_declarations_that_do_declare_something_are_accepted() {
+    for (name, src) in [
+        (
+            "declok_struct_fwd",
+            "struct S;\nint main(void){return 0;}\n",
+        ),
+        ("declok_union_fwd", "union U;\nint main(void){return 0;}\n"),
+        (
+            "declok_enum_def",
+            "enum E { A };\nint main(void){return A;}\n",
+        ),
+        (
+            "declok_struct_def",
+            "struct S { int a; };\nint main(void){ struct S s = {0}; return s.a; }\n",
+        ),
+        ("declok_stray_semi", ";\nint main(void){return 0;}\n"),
+        ("declok_object", "int x;\nint main(void){return x;}\n"),
+        (
+            "declok_static_object",
+            "static int x;\nint main(void){return x;}\n",
+        ),
+        (
+            "declok_typedef",
+            "typedef int T;\nint main(void){ T t = 0; return t; }\n",
+        ),
+        (
+            "declok_extern_object",
+            "extern int x;\nint main(void){return 0;}\n",
+        ),
+        (
+            "declok_register_local",
+            "int main(void){ register int x = 0; return x; }\n",
+        ),
+        (
+            "declok_inline_fn",
+            "inline int f(void){return 0;}\nint main(void){return 0;}\n",
+        ),
+        (
+            "declok_thread_local",
+            "_Thread_local int x;\nint main(void){return x;}\n",
+        ),
+        (
+            "declok_block_struct",
+            "int main(void){ struct S; return 0; }\n",
+        ),
+        ("declok_block_semi", "int main(void){ ; return 0; }\n"),
+        // A tag declared *with* a storage class still declares the tag.
+        (
+            "declok_typedef_struct",
+            "typedef struct S T;\nint main(void){return 0;}\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// The implicit-int diagnostic must survive: it belongs to declarations that
+/// *do* declare a declarator, which is the case this change routes around.
+#[test]
+fn diagnostics_implicit_int_still_outranks_the_empty_case() {
+    compile_expect_error("stillint_global", "static x;\n", "type specifier missing");
+    compile_expect_error(
+        "stillint_local",
+        "int main(void){ const y = 3; return y-3; }\n",
+        "type specifier missing",
     );
 }

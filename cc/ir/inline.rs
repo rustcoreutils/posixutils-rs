@@ -93,6 +93,14 @@ pub struct InlineCandidate {
     pub uses_varargs: bool,
     /// Whether function uses alloca (dynamic stack)
     pub uses_alloca: bool,
+    /// Whether the function takes a label's address (`&&label`).
+    ///
+    /// Such a function cannot be inlined: the address is a symbol naming a
+    /// block in *this* function -- `.L{fn}_{bb}` -- and inlining renumbers the
+    /// blocks into the caller, leaving the reference pointing at a name
+    /// nothing defines. That linked, with a text relocation against an
+    /// undefined local label, and produced a non-executable binary.
+    pub takes_label_addr: bool,
     /// Number of times this function is called in the module
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
@@ -132,6 +140,10 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 /// Analyze a single function for inlineability
 fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
+        // Recorded by the linearizer. Matching on the symbol name instead
+        // caught `.LC0` and stopped every function containing a string
+        // literal from being inlined.
+        takes_label_addr: func.takes_label_addr,
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
         has_inline_hint: func.is_inline,
@@ -150,6 +162,13 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
                 }
                 Opcode::Alloca => {
                     candidate.uses_alloca = true;
+                }
+                // A label address is a `SymAddr` on a symbol named for a
+                // block of *this* function. An indirect branch is the usual
+                // reason to take one, but a function that merely returns one
+                // has the same problem.
+                Opcode::IndirectBr => {
+                    candidate.takes_label_addr = true;
                 }
                 Opcode::Call => {
                     if let Some(callee) = &insn.func_name {
@@ -185,7 +204,11 @@ fn should_inline(
     caller_is_recursive: bool,
 ) -> bool {
     // Never inline if disqualifying conditions
-    if candidate.uses_varargs || candidate.is_recursive || candidate.uses_alloca {
+    if candidate.uses_varargs
+        || candidate.is_recursive
+        || candidate.uses_alloca
+        || candidate.takes_label_addr
+    {
         return false;
     }
 
@@ -627,7 +650,16 @@ fn clone_instruction(
 
         // Switch: remap value (src[0]) and all branch targets
         Opcode::Switch => {
+            // Built fresh rather than cloned, so everything the switch needs
+            // has to be carried over by hand -- and the operation width was
+            // not. A 64-bit switch became a 32-bit compare once inlined, so
+            // `case 4294967296ul:` matched 0. Pre-existing; a `case lo ... hi`
+            // range made it visible because its subtraction exposes the top
+            // half where an equality compare on the low half often agrees by
+            // accident.
             let mut new_insn = Instruction::new(Opcode::Switch);
+            new_insn.size = insn.size;
+            new_insn.typ = insn.typ;
             new_insn.src = insn
                 .src
                 .iter()
@@ -636,7 +668,7 @@ fn clone_instruction(
             new_insn.switch_cases = insn
                 .switch_cases
                 .iter()
-                .map(|(val, bb)| (*val, ctx.remap_bb(*bb)))
+                .map(|(lo, hi, bb)| (*lo, *hi, ctx.remap_bb(*bb)))
                 .collect();
             new_insn.switch_default = insn.switch_default.map(|bb| ctx.remap_bb(bb));
             vec![new_insn]
@@ -1454,6 +1486,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,
@@ -1472,6 +1505,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: true,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,
@@ -1490,6 +1524,7 @@ mod tests {
             is_recursive: true,
             uses_varargs: false,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,
@@ -1508,6 +1543,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,
@@ -1526,6 +1562,7 @@ mod tests {
             is_recursive: false,
             uses_varargs: false,
             uses_alloca: false,
+            takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
             is_noinline: false,

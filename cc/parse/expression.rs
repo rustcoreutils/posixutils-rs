@@ -235,19 +235,62 @@ impl<'a> Parser<'a> {
                 let name = self.expect_identifier()?;
                 designators.push(Designator::Field(name));
             } else if self.is_special(b'[') {
-                // Array index designator: [constant-expression]
+                // Array index designator: `[constant-expression]`, or the GNU
+                // range `[lo ... hi]`. As with a case range, GCC requires the
+                // spaces: `[0...3]` lexes as one pp-number and it rejects that
+                // too.
                 self.advance();
                 let index_expr = self.parse_conditional_expr()?;
-                self.expect_special(b']')?;
-
-                // Evaluate to constant
                 let index = self.eval_const_expr(&index_expr).ok_or_else(|| {
                     ParseError::new(
                         "array designator index must be constant",
                         self.current_pos(),
                     )
                 })?;
-                designators.push(Designator::Index(index as i64));
+                let high = if self.is_special_token(SpecialToken::Ellipsis) {
+                    let pos = self.current_pos();
+                    self.advance();
+                    let high_expr = self.parse_conditional_expr()?;
+                    let high = self.eval_const_expr(&high_expr).ok_or_else(|| {
+                        ParseError::new("array designator index must be constant", pos)
+                    })?;
+                    Some(high as i64)
+                } else {
+                    None
+                };
+                self.expect_special(b']')?;
+
+                let index = index as i64;
+                if index < 0 {
+                    return Err(ParseError::new(
+                        "array index in initializer is negative",
+                        self.current_pos(),
+                    ));
+                }
+                if let Some(high) = high {
+                    // GCC: "empty index range in initializer".
+                    if high < index {
+                        return Err(ParseError::new(
+                            "empty index range in initializer",
+                            self.current_pos(),
+                        ));
+                    }
+                }
+                // A range that follows a field designator -- `.m[0 ... 3] = v`
+                // -- resolves through `resolve_designator_chain`, which yields
+                // one offset where a range names many. It used to be dropped
+                // there in silence, initializing nothing. The nested spelling
+                // `.m = {[0 ... 3] = v}` does the same job and works.
+                if high.is_some() && !designators.is_empty() {
+                    return Err(ParseError::new(
+                        "an index range is not supported after a field designator;                          write '.field = { [lo ... hi] = value }'",
+                        self.current_pos(),
+                    ));
+                }
+                designators.push(match high {
+                    None => Designator::Index(index),
+                    Some(high) => Designator::IndexRange(index, high),
+                });
             } else {
                 break;
             }
@@ -633,6 +676,20 @@ impl<'a> Parser<'a> {
                     operand: Box::new(operand),
                 },
                 typ,
+                op_pos,
+            ));
+        }
+
+        // GNU label address: `&&label`, of type `void *`. `&&` is one token,
+        // so this has to be tested before the unary `&` below, which
+        // deliberately excludes it.
+        if self.is_special_token(SpecialToken::LogicalAnd) {
+            let op_pos = self.current_pos();
+            self.advance();
+            let name = self.expect_identifier()?;
+            return Ok(Self::typed_expr(
+                ExprKind::LabelAddr(name),
+                self.types.void_ptr_id,
                 op_pos,
             ));
         }

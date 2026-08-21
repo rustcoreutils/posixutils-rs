@@ -838,7 +838,12 @@ impl<'a> Parser<'a> {
                 TokenValue::Ident(id) => {
                     format!("identifier '{}'", self.idents.get_opt(*id).unwrap_or("?"))
                 }
-                TokenValue::Special(v) => format!("'{}'", char::from_u32(*v).unwrap_or('?')),
+                // A multi-character special has a discriminant above the ASCII
+                // range -- `...` is 278 -- so rendering it as a `char` printed
+                // a stray Latin letter. `show_special` spells all of them.
+                TokenValue::Special(v) => {
+                    format!("'{}'", crate::token::lexer::show_special(*v))
+                }
                 other => format!("{:?}", other),
             };
             Err(ParseError::new(
@@ -1859,6 +1864,13 @@ impl Parser<'_> {
                     crate::kw::GOTO => {
                         let pos = self.current_pos();
                         self.advance();
+                        // GNU computed goto: `goto *expr;`
+                        if self.is_special(b'*') {
+                            self.advance();
+                            let target = self.parse_expression()?;
+                            self.expect_special(b';')?;
+                            return Ok(Stmt::GotoIndirect { target, pos });
+                        }
                         let name = self.expect_identifier()?;
                         self.expect_special(b';')?;
                         return Ok(Stmt::Goto { name, pos });
@@ -2091,7 +2103,7 @@ impl Parser<'_> {
         let mut items = Vec::new();
         loop {
             let stmt = self.parse_statement()?;
-            let is_label = matches!(stmt, Stmt::Case(_) | Stmt::Default(_));
+            let is_label = matches!(stmt, Stmt::Case(..) | Stmt::Default(_));
             items.push(BlockItem::Statement(Box::new(stmt)));
             // A label prefixes a statement, so one more must follow it. Anything
             // else ends the body. The `}`/EOF guard keeps a body that is nothing
@@ -2111,12 +2123,22 @@ impl Parser<'_> {
         Ok(Stmt::Block(items))
     }
 
-    /// Parse a case label
+    /// Parse a case label, including the GNU range form `case lo ... hi:`.
+    ///
+    /// GCC requires whitespace around the `...`: `case 1...9:` lexes as one
+    /// pp-number and is rejected there too ("too many decimal points in
+    /// number"), so only the spaced form is accepted here as well.
     fn parse_case_label(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'case'
         let expr = self.parse_conditional_expr()?;
+        let high = if self.is_special_token(SpecialToken::Ellipsis) {
+            self.advance();
+            Some(self.parse_conditional_expr()?)
+        } else {
+            None
+        };
         self.expect_special(b':')?;
-        Ok(Stmt::Case(expr))
+        Ok(Stmt::Case(expr, high))
     }
 
     /// Parse a default label
@@ -2319,6 +2341,38 @@ impl Parser<'_> {
         .then_some(only.value.as_ref())
     }
 
+    /// Report an array designator that addresses past the end of its array.
+    ///
+    /// Only the outermost list is walked, and only when the bound is known: an
+    /// array sized *by* this initializer cannot overflow it, and a designator
+    /// inside a nested list addresses a different object than `typ`.
+    fn check_designator_bounds(&self, typ: TypeId, elements: &[InitElement]) {
+        if self.types.kind(typ) != TypeKind::Array {
+            return;
+        }
+        let Some(capacity) = self.types.array_size(typ).filter(|&n| n > 0) else {
+            return;
+        };
+        for element in elements {
+            let Some(designator) = element.designators.first() else {
+                continue;
+            };
+            let end = match designator {
+                Designator::Index(i) => *i,
+                Designator::IndexRange(_, hi) => *hi,
+                Designator::Field(_) => continue,
+            };
+            if end >= capacity as i64 {
+                diag::error_args(
+                    element.value.pos,
+                    "array index in initializer exceeds array bounds ({0} >= {1})",
+                    &[&end.to_string(), &capacity.to_string()],
+                );
+                return;
+            }
+        }
+    }
+
     /// Report an initializer list with more elements than the object it
     /// initializes can hold (C17 6.7.9p2).
     ///
@@ -2335,6 +2389,13 @@ impl Parser<'_> {
         let ExprKind::InitList { elements } = &init.kind else {
             return;
         };
+        // A designator names its own position, so the *count* of elements says
+        // nothing -- but the position itself can still be out of range, and
+        // nothing checked that anywhere: `int a[4] = {[10] = 7};` compiled and
+        // wrote past the array. GCC rejects it. Ranges make it easy to write by
+        // accident, so the bound is checked here where the array's size is
+        // known; the element-count check below still stands aside.
+        self.check_designator_bounds(typ, elements);
         if elements.iter().any(|e| !e.designators.is_empty()) {
             return;
         }
@@ -2492,15 +2553,32 @@ impl Parser<'_> {
         while idx < elements.len() {
             let element = &elements[idx];
             let mut designator_index = None;
+            let mut designator_high = None;
             for designator in &element.designators {
-                if let Designator::Index(index) = designator {
-                    designator_index = Some(*index);
-                    break;
+                match designator {
+                    Designator::Index(index) => {
+                        designator_index = Some(*index);
+                        break;
+                    }
+                    Designator::IndexRange(lo, hi) => {
+                        designator_index = Some(*lo);
+                        designator_high = Some(*hi);
+                        break;
+                    }
+                    Designator::Field(_) => {}
                 }
             }
 
             let index = if let Some(explicit_index) = designator_index {
-                current_index = explicit_index + 1;
+                // A range advances the cursor past its high endpoint and
+                // extends the inferred bound to it: `int a[] = {[0 ... 3] = 1}`
+                // is four elements. This is a second, independent copy of the
+                // rule in `group_array_init_elements`; both have to know.
+                let end = designator_high.unwrap_or(explicit_index);
+                current_index = end + 1;
+                if end > max_index {
+                    max_index = end;
+                }
                 explicit_index
             } else {
                 let i = current_index;
@@ -2562,7 +2640,13 @@ impl Parser<'_> {
         // Parse type specifiers
         let decl_pos = self.current_pos();
         let base_type = self.parse_type_specifier()?;
-        self.check_implicit_int(decl_pos);
+        // A declaration that stops right here declares nothing, and that --
+        // not a missing type specifier -- is what to report. `static;` used to
+        // draw "type specifier missing", blaming the half that was absent
+        // rather than the declarator that was. The `;` arms below do it.
+        if !self.is_special(b';') {
+            self.check_implicit_int(decl_pos);
+        }
         // Skip __attribute__ between type and declarator (GCC extension)
         self.skip_extensions();
 
@@ -2614,7 +2698,9 @@ impl Parser<'_> {
 
         // Check for struct/union/enum-only declaration (no declarators)
         // e.g., "struct point { int x; int y; };"
-        if !self.is_special(b';') {
+        if self.is_special(b';') {
+            self.check_declares_something(decl_pos, &base_type);
+        } else {
             loop {
                 let decl_pos = self.current_pos();
                 let (name, mut typ, mut vla_sizes, _func_params) =
@@ -3516,6 +3602,55 @@ impl Parser<'_> {
         }
     }
 
+    /// The specifier a declaration led with, for the diagnostic below.
+    ///
+    /// Ordered so the one a reader would blame comes first: a storage class
+    /// is more surprising in an empty declaration than a bare qualifier.
+    fn leading_specifier_name(modifiers: TypeModifiers) -> Option<&'static str> {
+        const SPELLINGS: &[(TypeModifiers, &str)] = &[
+            (TypeModifiers::TYPEDEF, "typedef"),
+            (TypeModifiers::EXTERN, "extern"),
+            (TypeModifiers::STATIC, "static"),
+            (TypeModifiers::REGISTER, "register"),
+            (TypeModifiers::AUTO, "auto"),
+            (TypeModifiers::THREAD_LOCAL, "_Thread_local"),
+            (TypeModifiers::INLINE, "inline"),
+            (TypeModifiers::CONST, "const"),
+            (TypeModifiers::VOLATILE, "volatile"),
+        ];
+        SPELLINGS
+            .iter()
+            .find(|(m, _)| modifiers.contains(*m))
+            .map(|(_, name)| *name)
+    }
+
+    /// Diagnose a declaration that stops at `;` having declared nothing.
+    ///
+    /// C17 6.7p2 requires a declaration to declare a declarator, a tag, or the
+    /// members of an enumeration. `struct S;` and `enum E { A };` declare a
+    /// tag and are the reason this arm exists at all; `int;`, `static;` and
+    /// `int register;` declare nothing whatsoever and were accepted silently.
+    ///
+    /// Reported rather than warned: the constraint is violated, and a
+    /// declaration that declares nothing is always a typo or a stray token.
+    /// (gcc errors on `register`/`inline` here and warns on the rest; both are
+    /// conforming, since 6.7p2 asks only for a diagnostic.)
+    fn check_declares_something(&mut self, pos: Position, base_type: &Type) {
+        // A tag -- declared or defined -- is the thing this declaration form
+        // exists to express, so it always counts.
+        if matches!(
+            base_type.kind,
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
+        ) {
+            return;
+        }
+
+        match Self::leading_specifier_name(base_type.modifiers) {
+            Some(spec) => diag::error_args(pos, "'{0}' in empty declaration", &[spec]),
+            None => diag::error(pos, &gettext("declaration declares nothing")),
+        }
+    }
+
     /// The integer type an enumerated type is compatible with, and its size.
     ///
     /// C17 6.7.2.2p4 requires it to represent every member; the choice among
@@ -4007,6 +4142,7 @@ impl Parser<'_> {
             } else {
                 self.types.compute_struct_layout(&mut members, pack_cap)
             };
+            self.check_wide_bitfields_have_a_carrier(&members);
 
             // Apply struct-level aligned attribute (raises alignment, never lowers)
             if let Some(sa) = struct_align {
@@ -4919,7 +5055,13 @@ impl Parser<'_> {
         let decl_pos = self.current_pos();
         // Parse type specifier
         let base_type = self.parse_type_specifier()?;
-        self.check_implicit_int(decl_pos);
+        // A declaration that stops right here declares nothing, and that --
+        // not a missing type specifier -- is what to report. `static;` used to
+        // draw "type specifier missing", blaming the half that was absent
+        // rather than the declarator that was. The `;` arms below do it.
+        if !self.is_special(b';') {
+            self.check_implicit_int(decl_pos);
+        }
         // Skip __attribute__ between type and declarator (GCC extension)
         self.skip_extensions();
         // Check modifiers before interning (storage class specifiers)
@@ -4944,6 +5086,7 @@ impl Parser<'_> {
         // This happens when a composite type is defined but no variables are declared
         if self.is_special(b';') {
             self.advance();
+            self.check_declares_something(decl_pos, &base_type);
             // Return empty declaration - the type was already registered in parse_*_specifier
             return Ok(ExternalDecl::Declaration(Declaration {
                 declarators: vec![],
@@ -5915,6 +6058,31 @@ impl Parser<'_> {
     /// and `unsized_array_levels` tells them apart. Mid-struct `char d[0]` is
     /// an ordinary member and is everywhere in system headers, so conflating
     /// the two would reject far more than this rejects.
+    /// A bit-field wider than 64 bits needs a whole 16-byte storage unit.
+    ///
+    /// `emit_bitfield_load`/`_store` reach the 128-bit carrier only for an
+    /// access span of exactly one addressable unit. A *packed* field gets a
+    /// span of just the bytes its own bits touch, which sends it to the
+    /// byte-wise path -- and that assembles into a 64-bit carrier, so it
+    /// cannot represent the value. gcc packs these; c17 refuses them, which
+    /// is a narrower divergence than the width cap this replaced.
+    ///
+    /// Checked after layout because packing is what decides the span, and
+    /// packing is applied there.
+    fn check_wide_bitfields_have_a_carrier(&self, members: &[StructMember]) {
+        for m in members {
+            let Some(width) = m.bit_width else { continue };
+            if width <= 64 || m.access_bytes == Some(16) {
+                continue;
+            }
+            diag::error_args(
+                self.current_pos(),
+                "bit-field of width {0} needs an unpacked 16-byte storage unit",
+                &[&width.to_string()],
+            );
+        }
+    }
+
     fn check_flexible_array_members(&self, members: &[StructMember], is_union: bool) {
         let is_flexible =
             |m: &StructMember| m.bit_width.is_none() && self.types.unsized_array_levels(m.typ) > 0;
@@ -5978,24 +6146,12 @@ impl Parser<'_> {
             ));
         }
 
-        // Nothing here carries more than 64 bits of bit-field: the value mask
-        // is a `u64` and `bitfield_storage_type` has no arm for a 16-byte unit.
-        // An `unsigned __int128 a:100` therefore read back a wrong value in a
-        // release build and *panicked* the compiler in a debug one. gcc handles
-        // it, so this is a divergence -- but a diagnostic naming the limit is
-        // better than either of those, and `__int128` is a GNU extension.
-        // Widths up to 64 of such a type keep working and keep agreeing with
-        // gcc, so the cap is on the width rather than on the declared type.
-        const MAX_BITFIELD_WIDTH: u32 = 64;
-        if width > MAX_BITFIELD_WIDTH {
-            return Err(ParseError::new(
-                format!(
-                    "bit-field width {} is not supported; c17 carries at most {} bits",
-                    width, MAX_BITFIELD_WIDTH
-                ),
-                self.current_pos(),
-            ));
-        }
+        // A width above 64 needs a 16-byte carrier, which exists only for a
+        // field the layout gives a whole `__int128` storage unit. Whether it
+        // got one is not knowable here -- packing decides it, and packing is
+        // applied at layout -- so the check lives in
+        // `check_wide_bitfields_have_a_carrier`, once `access_bytes` is known.
+        // The `width > max_width` test above still refuses `__int128 f:129`.
 
         // Warning: one-bit signed bitfield has dubious values
         // (can only hold -1 or 0 in 2's complement, or 0/-0 in other representations).

@@ -35,11 +35,12 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__SSE2_MATH__", Some("1")),
         // MMX is implied by SSE
         ("__MMX__", Some("1")),
-        // FPU type
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", Some("1")),
-        ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", Some("1")),
+        // __GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8} is deliberately absent.
+        // It is what code tests before calling `__sync_bool_compare_and_swap`
+        // and the rest of the `__sync_*` family, none of which c17 implements
+        // -- defining it sent a guarded `#ifdef` down a path that then failed
+        // on an undeclared identifier, when the `#else` beside it would have
+        // compiled. Advertise the capability only alongside the builtins.
         // Atomic primitives
         ("__GCC_ATOMIC_BOOL_LOCK_FREE", Some("2")),
         ("__GCC_ATOMIC_CHAR_LOCK_FREE", Some("2")),

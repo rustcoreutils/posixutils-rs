@@ -11,7 +11,7 @@
 // Consolidates: if/while/for/do-while/switch/goto/break/continue tests from c17/
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C89 control flow (loops, conditionals, jumps)
@@ -717,4 +717,271 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("switch_non_compound_body", code, &[]), 0);
+}
+
+/// GNU case ranges: `case lo ... hi:`.
+///
+/// Measured as the most-used extension c17 rejected — 612 files in the Linux
+/// tree, 18 in mesa, 4 in CPython. GCC requires whitespace around the `...`
+/// (`case 1...9:` lexes as one pp-number and is rejected there too), so only
+/// the spaced form is accepted.
+///
+/// A range is *not* expanded into individual labels: `case 0 ... 1000000:` is
+/// legal, and every label costs a basic block and a comparison. It lowers to
+/// `(x - lo) <=unsigned (hi - lo)`, one subtraction and one compare whatever
+/// the width.
+#[test]
+fn c89_case_ranges() {
+    let code = r#"
+static int basic(int x) { switch (x) { case 1 ... 9: return 0; default: return 1; } }
+
+static int edges(int x) { switch (x) { case 3 ... 7: return 1; default: return 0; } }
+
+static int mixed(int x) {
+    switch (x) {
+    case 0:        return 10;
+    case 1 ... 3:  return 20;
+    case 9:        return 30;
+    default:       return 40;
+    }
+}
+
+/* A range falls through to the next label like any other. */
+static int fallthrough(int x) {
+    int n = 0;
+    switch (x) {
+    case 1 ... 3: n++;
+    case 4:       n += 10; break;
+    default:      n = 99;
+    }
+    return n;
+}
+
+/* Not expanded: a million values must still compile quickly. */
+static int huge(int x) { switch (x) { case 0 ... 1000000: return 0; default: return 1; } }
+
+static int negative(int x) { switch (x) { case -5 ... -1: return 0; default: return 1; } }
+
+/* Wider than 32 bits, so the immediate does not fit a compare. */
+static int wide(long x) {
+    switch (x) { case 100000000000L ... 100000000010L: return 0; default: return 1; }
+}
+
+/* An empty range never matches; GCC warns and compiles. */
+static int empty(int x) { switch (x) { case 9 ... 1: return 0; default: return 1; } }
+
+int main(void)
+{
+    if (basic(5)) return 1;
+    if (basic(0) != 1 || basic(10) != 1) return 2;
+
+    /* Both endpoints are inclusive. */
+    if (!edges(3) || !edges(7) || !edges(5)) return 3;
+    if (edges(2) || edges(8)) return 4;
+
+    if (mixed(0) != 10 || mixed(2) != 20 || mixed(9) != 30 || mixed(5) != 40) return 5;
+    if (fallthrough(2) != 11) return 6;
+
+    if (huge(0) || huge(999999) || huge(1000000)) return 7;
+    if (huge(-1) != 1 || huge(1000001) != 1) return 8;
+
+    if (negative(-3) || negative(-5) || negative(-1)) return 9;
+    if (negative(0) != 1 || negative(-6) != 1) return 10;
+
+    if (wide(100000000005L)) return 11;
+    if (wide(99999999999L) != 1) return 12;
+
+    if (empty(5) != 1 || empty(1) != 1 || empty(9) != 1) return 13;
+
+    /* A single-value range is the ordinary label. */
+    switch (3) { case 3 ... 3: break; default: return 14; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("case_ranges", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("case_ranges_opt", code), 0);
+}
+
+/// GNU computed goto: the label address `&&label` and the indirect `goto *p`.
+///
+/// The reason the extension exists is interpreter dispatch, so that shape is
+/// the centrepiece here. `&&label` needs no opcode of its own — every basic
+/// block already emits an assembly label, and both backends already lower a
+/// leading-`.` symbol to a pc-relative address — but the branch does: the
+/// reachable blocks are not derivable from the instruction, so the CFG edges
+/// to every address-taken label are recorded on the block, exactly as `asm
+/// goto` does. Without them DCE deletes the targets.
+#[test]
+fn c89_computed_goto() {
+    let code = r#"
+/* A bytecode interpreter's dispatch loop: the shape the extension is for.
+   The table is `static`, so the label addresses go through the data-image
+   path rather than through runtime stores. */
+static int run(const int *code, int n)
+{
+    static void *op[] = { &&ADD, &&MUL, &&END };
+    int acc = 1, i = 0;
+    goto *op[code[i]];
+ADD: acc += 2; if (++i < n) goto *op[code[i]]; return acc;
+MUL: acc *= 3; if (++i < n) goto *op[code[i]]; return acc;
+END: return acc;
+}
+
+/* An automatic table: the runtime-store path. */
+static int pick(int i)
+{
+    void *t[] = { &&A, &&B, &&C };
+    goto *t[i];
+A: return 10;
+B: return 20;
+C: return 30;
+}
+
+/* The address may be taken before the label is seen. */
+static int forward(void)
+{
+    void *p = &&L;
+    goto *p;
+    return 1;
+L:  return 0;
+}
+
+/* A label address outlives the block it was taken in. */
+static int across_scope(void)
+{
+    void *p;
+    { p = &&L; }
+    goto *p;
+L:  return 0;
+}
+
+/* And it is an ordinary value: it can live in a struct. */
+static int in_struct(void)
+{
+    struct { void *p; int n; } s = { &&L, 7 };
+    if (s.n != 7) return 1;
+    goto *s.p;
+L:  return 0;
+}
+
+int main(void)
+{
+    int prog[] = { 0, 1, 0, 2 };   /* acc = ((1+2)*3)+2 = 11 */
+    if (run(prog, 4) != 11) return 1;
+
+    int prog2[] = { 1, 1, 2 };     /* acc = ((1*3)*3) = 9 */
+    if (run(prog2, 3) != 9) return 2;
+
+    if (pick(0) != 10 || pick(1) != 20 || pick(2) != 30) return 3;
+    if (forward()) return 4;
+    if (across_scope()) return 5;
+    if (in_struct()) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("computed_goto", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("computed_goto_opt", code), 0);
+}
+
+/// A value live across an indirect branch must survive it.
+///
+/// The companion to `codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge`,
+/// and the same hazard: liveness is computed from the block's recorded
+/// successors, so if the edges to the address-taken labels were missing, a
+/// pseudo live only along one of them would look dead and its register could
+/// be reused before the branch.
+#[test]
+fn c89_computed_goto_value_survives_the_edge() {
+    let code = r#"
+static int dispatch(int which, int a, int b)
+{
+    void *t[] = { &&X, &&Y };
+    /* `a` and `b` are computed here and used only after the branch, so they
+       are live across it along one edge each. */
+    int sum = a + b;
+    int prod = a * b;
+    goto *t[which];
+X:  return sum;
+Y:  return prod;
+}
+
+int main(void)
+{
+    if (dispatch(0, 3, 4) != 7) return 1;
+    if (dispatch(1, 3, 4) != 12) return 2;
+    /* Enough live values to force spilling around the branch. */
+    if (dispatch(0, 100, 200) != 300) return 3;
+    if (dispatch(1, 100, 200) != 20000) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("computed_goto_liveness", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("computed_goto_liveness_opt", code),
+        0
+    );
+}
+
+/// An unsigned switch range whose bound exceeds `i64::MAX`.
+///
+/// Case endpoints are carried as `i64`, so `ULONG_MAX` read as -1 and the
+/// range looked empty: it warned "empty range specified" and never matched.
+/// The ordering has to follow the switch type's own signedness.
+#[test]
+fn c89_case_range_unsigned_bounds() {
+    let code = r#"
+static int whole(unsigned long x)
+{
+    switch (x) { case 0ul ... 18446744073709551615ul: return 1; default: return 0; }
+}
+
+static int upper(unsigned long x)
+{
+    switch (x) {
+    case 9223372036854775808ul ... 18446744073709551615ul: return 1;
+    default: return 0;
+    }
+}
+
+int main(void)
+{
+    if (!whole(0) || !whole(1) || !whole(18446744073709551615ul)) return 1;
+    if (!upper(9223372036854775808ul) || !upper(18446744073709551615ul)) return 2;
+    if (upper(0) || upper(9223372036854775807ul)) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("case_range_unsigned", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("case_range_unsigned_opt", code),
+        0
+    );
+}
+
+/// A label whose address is taken but never branched on must still be emitted.
+///
+/// The blocks were linked to the dispatch block, and a function with no
+/// computed goto has none — so DCE deleted the block and the link failed on an
+/// undefined `.L` symbol. Storing a label address for later use is legal.
+#[test]
+fn c89_label_address_without_a_computed_goto() {
+    let code = r#"
+void *slot;
+
+static void take(int x)
+{
+    slot = &&L;
+    if (x) return;
+    return;
+L:  slot = 0;
+}
+
+int main(void)
+{
+    take(1);
+    return slot != 0 ? 0 : 1;
+}
+"#;
+    assert_eq!(compile_and_run("label_addr_no_goto", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("label_addr_no_goto_opt", code), 0);
 }

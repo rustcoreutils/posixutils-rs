@@ -14,6 +14,7 @@
 
 use clap::Parser;
 use gettextrs::gettext;
+use posixutils_cc::diag::{self, Position};
 use posixutils_cc::parse::ast::{ExprKind, ExternalDecl, Stmt};
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::ppargs;
@@ -118,22 +119,45 @@ impl CrossRef {
         self.current_function = func.to_string();
     }
 
-    fn add_definition(&mut self, name: &str, line: u32) {
+    /// Record a reference at an explicit file and line.
+    ///
+    /// Used by the raw-text macro scan, which has no `Position` to resolve --
+    /// it runs before the tokenizer -- and so tracks line markers itself.
+    fn add_ref_in(&mut self, name: &str, file: &str, line: u32, is_definition: bool) {
         self.symbols.entry(name.to_string()).or_default().add_ref(
-            &self.current_file,
+            file,
             &self.current_function,
             line,
-            true,
+            is_definition,
         );
     }
 
-    fn add_reference(&mut self, name: &str, line: u32) {
+    /// Record a reference where the *linemarkers* say it is, not where the
+    /// operand's own text puts it.
+    ///
+    /// For a `.c` operand the two agree and this resolves to the operand
+    /// itself. For a `.i` they do not: the definitions came from the `.c` a
+    /// `# N "file"`
+    /// marker names, and reporting them against the preprocessed file names a
+    /// place the reader cannot go and look. Since the line numbers already
+    /// come from the marker, leaving the file alone made the two halves of one
+    /// location disagree. This is the fix `cflow` took under #F10.
+    fn add_ref_at(&mut self, name: &str, pos: Position, is_definition: bool) {
+        let (file, line, _) = diag::effective_position(pos);
         self.symbols.entry(name.to_string()).or_default().add_ref(
-            &self.current_file,
+            &file,
             &self.current_function,
             line,
-            false,
+            is_definition,
         );
+    }
+
+    fn add_definition_at(&mut self, name: &str, pos: Position) {
+        self.add_ref_at(name, pos, true);
+    }
+
+    fn add_reference_at(&mut self, name: &str, pos: Position) {
+        self.add_ref_at(name, pos, false);
     }
 }
 
@@ -152,7 +176,7 @@ fn extract_refs_from_expr(
         ExprKind::Ident(symbol_id) => {
             let name_id = symbols.get(*symbol_id).name;
             let sym_name = strings.get(name_id).to_string();
-            xref.add_reference(&sym_name, expr.pos.line);
+            xref.add_reference_at(&sym_name, expr.pos);
         }
         ExprKind::FuncName => {
             // __func__ is a special identifier, not a user-defined symbol
@@ -190,7 +214,7 @@ fn extract_refs_from_expr(
             extract_refs_from_expr(expr, strings, symbols, xref);
             // The member name is a symbol in its own right; without this, `s.x`
             // contributed a reference to `s` but none to `x`.
-            xref.add_reference(strings.get(*member), expr.pos.line);
+            xref.add_reference_at(strings.get(*member), expr.pos);
         }
         ExprKind::Index { array, index } => {
             extract_refs_from_expr(array, strings, symbols, xref);
@@ -270,7 +294,7 @@ fn extract_refs_from_stmt(
                             // The declarator carries its own position, so a local
                             // with no initializer is still recorded (previously
                             // such declarations were skipped entirely).
-                            xref.add_definition(&name, d.pos.line);
+                            xref.add_definition_at(&name, d.pos);
                             if let Some(init) = &d.init {
                                 extract_refs_from_expr(init, strings, symbols, xref);
                             }
@@ -312,7 +336,7 @@ fn extract_refs_from_stmt(
                     posixutils_cc::parse::ast::ForInit::Declaration(d) => {
                         for decl in &d.declarators {
                             let name = strings.get(symbols.get(decl.symbol).name).to_string();
-                            xref.add_definition(&name, decl.pos.line);
+                            xref.add_definition_at(&name, decl.pos);
                             if let Some(init_expr) = &decl.init {
                                 extract_refs_from_expr(init_expr, strings, symbols, xref);
                             }
@@ -335,8 +359,17 @@ fn extract_refs_from_stmt(
             extract_refs_from_expr(expr, strings, symbols, xref);
             extract_refs_from_stmt(body, strings, symbols, xref);
         }
-        Stmt::Case(expr) => {
+        // A computed goto's target references identifiers like any other
+        // expression.
+        Stmt::GotoIndirect { target, .. } => {
+            extract_refs_from_expr(target, strings, symbols, xref);
+        }
+        Stmt::Case(expr, high) => {
             extract_refs_from_expr(expr, strings, symbols, xref);
+            // Both endpoints of a range label can reference identifiers.
+            if let Some(high) = high {
+                extract_refs_from_expr(high, strings, symbols, xref);
+            }
         }
         Stmt::Label { stmt, .. } => {
             extract_refs_from_stmt(stmt, strings, symbols, xref);
@@ -365,9 +398,15 @@ fn identifiers(line: &str) -> Vec<&str> {
 /// identifier occurrence of that name is a use.
 fn extract_macro_refs(content: &str, xref: &mut CrossRef) {
     let lines: Vec<&str> = content.lines().collect();
+    let origin = LineOrigin::over(&lines, &xref.current_file);
 
     // Pass 1: definitions.
-    let mut macros: BTreeMap<String, u32> = BTreeMap::new();
+    //
+    // Keyed by the *effective* location, because that is what pass 2 compares
+    // against to tell a definition from a use. Keying by physical line would
+    // make a `.i` whose markers repeat a line number look like a use of
+    // itself.
+    let mut macros: BTreeMap<String, (String, u32)> = BTreeMap::new();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
         let Some(rest) = t.strip_prefix('#') else {
@@ -389,10 +428,12 @@ fn extract_macro_refs(content: &str, xref: &mut CrossRef) {
         if name.is_empty() {
             continue;
         }
-        let line_no = (i + 1) as u32;
-        macros.entry(name.clone()).or_insert(line_no);
+        let (file, line_no) = origin.at(i);
+        macros
+            .entry(name.clone())
+            .or_insert_with(|| (file.clone(), line_no));
         xref.set_function("");
-        xref.add_definition(&name, line_no);
+        xref.add_ref_in(&name, &file, line_no, true);
     }
 
     if macros.is_empty() {
@@ -401,15 +442,74 @@ fn extract_macro_refs(content: &str, xref: &mut CrossRef) {
 
     // Pass 2: uses.
     for (i, line) in lines.iter().enumerate() {
-        let line_no = (i + 1) as u32;
+        let (file, line_no) = origin.at(i);
         for ident in identifiers(line) {
-            if let Some(&def_line) = macros.get(ident) {
-                if def_line != line_no {
-                    xref.add_reference(ident, line_no);
+            if let Some((def_file, def_line)) = macros.get(ident) {
+                if (def_file.as_str(), *def_line) != (file.as_str(), line_no) {
+                    xref.add_ref_in(ident, &file, line_no, false);
                 }
             }
         }
     }
+}
+
+/// Maps a physical line of the operand onto the file and line its `# N "file"`
+/// markers attribute it to.
+///
+/// The macro scan runs on raw text, before the tokenizer, so it cannot use
+/// `diag::effective_position` the way the AST walk does -- but a `.i` carries
+/// its markers in that very text, so it can read them itself. Without this a
+/// `.i`'s `#define`s were reported against the `.i`, naming a file the reader
+/// cannot go and look at.
+struct LineOrigin {
+    /// `(physical index, file, line at that index)`, ascending. Always starts
+    /// with an entry covering index 0 so lookup never falls off the front.
+    marks: Vec<(usize, String, u32)>,
+}
+
+impl LineOrigin {
+    fn over(lines: &[&str], operand: &str) -> Self {
+        let mut marks = vec![(0usize, operand.to_string(), 1u32)];
+        for (i, line) in lines.iter().enumerate() {
+            let Some((file, line_no)) = parse_line_marker(line) else {
+                continue;
+            };
+            // The marker describes the line that follows it.
+            marks.push((i + 1, file, line_no));
+        }
+        LineOrigin { marks }
+    }
+
+    /// The `(file, line)` a physical index belongs to.
+    fn at(&self, idx: usize) -> (String, u32) {
+        // Linear from the back: the callers walk forward, and a translation
+        // unit has few markers relative to lines.
+        let (start, file, first) = self
+            .marks
+            .iter()
+            .rev()
+            .find(|(start, _, _)| *start <= idx)
+            .expect("marks always covers index 0");
+        (file.clone(), first + (idx - start) as u32)
+    }
+}
+
+/// Recognize a GCC line marker: `# 42 "foo.c"` with optional trailing flags.
+///
+/// A `#line 42 "foo.c"` directive spells the same thing and is accepted too.
+fn parse_line_marker(line: &str) -> Option<(String, u32)> {
+    let rest = line.trim_start().strip_prefix('#')?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("line").map_or(rest, |r| r.trim_start());
+
+    let mut it = rest.splitn(2, '"');
+    let number = it.next()?.trim();
+    let line_no: u32 = number.parse().ok()?;
+    // A marker without a filename keeps whatever file is in effect; the caller
+    // only records one when both halves are present.
+    let name = it.next()?;
+    let end = name.find('"')?;
+    Some((name[..end].to_string(), line_no))
 }
 
 // ============================================================================
@@ -503,14 +603,14 @@ fn process_file(
                 // function", so its defining reference belongs to file scope.
                 // Record it before entering the function's scope.
                 xref.set_function("");
-                xref.add_definition(&name, func.pos.line);
+                xref.add_definition_at(&name, func.pos);
                 xref.set_function(&name);
 
                 // Add parameter references
                 for param in &func.params {
                     if let Some(symbol_id) = param.symbol {
                         let pname = strings.get(symbols.get(symbol_id).name).to_string();
-                        xref.add_definition(&pname, func.pos.line);
+                        xref.add_definition_at(&pname, func.pos);
                     }
                 }
 
@@ -522,7 +622,7 @@ fn process_file(
                 xref.set_function("");
                 for d in &decl.declarators {
                     let name = strings.get(symbols.get(d.symbol).name).to_string();
-                    xref.add_definition(&name, d.pos.line);
+                    xref.add_definition_at(&name, d.pos);
                     if let Some(init) = &d.init {
                         extract_refs_from_expr(init, &strings, &symbols, xref);
                     }

@@ -355,6 +355,13 @@ pub enum ExprKind {
     /// Comma expression: expr1, expr2
     Comma(Vec<Expr>),
 
+    /// GNU label address: `&&label`, of type `void *`.
+    ///
+    /// The label need not be declared yet -- taking its address before the
+    /// labelled statement is the usual shape -- so this holds the name and is
+    /// resolved when the function is linearized.
+    LabelAddr(StringId),
+
     /// Initializer list: {1, 2, 3} or {.x = 1, [0] = 2}
     InitList {
         elements: Vec<InitElement>,
@@ -824,6 +831,11 @@ pub enum Designator {
     Field(StringId),
     /// Index designator: [constant_expr] - evaluated at parse time
     Index(i64),
+    /// GNU index range designator: `[lo ... hi] =`, both ends inclusive and
+    /// evaluated at parse time. Kept apart from `Index` so that every match
+    /// on a designator has to say what it does with a range, rather than
+    /// silently treating one as its low endpoint.
+    IndexRange(i64, i64),
 }
 
 /// A single element in an initializer list
@@ -1076,6 +1088,11 @@ pub enum Stmt {
     /// Goto statement: goto label;
     Goto { name: StringId, pos: Position },
 
+    /// GNU computed goto: `goto *expr;`. The operand is a label address
+    /// produced by [`ExprKind::LabelAddr`], though C says only that it is a
+    /// `void *`, so any pointer expression parses here.
+    GotoIndirect { target: Expr, pos: Position },
+
     /// Labeled statement: label: stmt
     Label {
         name: StringId,
@@ -1086,8 +1103,12 @@ pub enum Stmt {
     /// Switch statement: switch (expr) { cases }
     Switch { expr: Expr, body: Box<Stmt> },
 
-    /// Case label: case expr: (within switch body)
-    Case(Expr),
+    /// Case label: `case expr:`, or the GNU range `case lo ... hi:`.
+    ///
+    /// The second endpoint is `None` for an ordinary label. A range is *not*
+    /// expanded into individual labels: `case 0 ... 1000000:` is legal and
+    /// compiles in GCC, and each label costs a basic block and a compare here.
+    Case(Expr, Option<Expr>),
 
     /// Default label (within switch body)
     Default(Position),

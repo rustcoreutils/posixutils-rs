@@ -371,3 +371,134 @@ fn c17_suppression_does_not_hide_an_unknown_std() {
         assert!(run.stderr.contains("c42"), "got: {}", run.stderr);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Capability macros must not outrun the capability (#C163).
+//
+// A predefined feature macro is a promise to the preprocessor, and guarded
+// code takes it at its word: `#ifdef __GCC_HAVE_SYNC_COMPARE_AND_SWAP_4` opens
+// a branch that calls `__sync_bool_compare_and_swap`, and the `#else` beside
+// it is a portable fallback that would have compiled. Defining the macro
+// without the builtin does not make the feature available -- it makes the
+// fallback unreachable, so the file fails where it would otherwise have built.
+//
+// These tests pin the *relationship*, not the absence: if the builtins are
+// ever implemented, the sync assertions below are meant to fail so the macro
+// gets restored along with them.
+// ---------------------------------------------------------------------------
+
+/// The `__sync_*` family c17 does not implement, and the macros that guard it.
+const SYNC_CAS_MACROS: &[&str] = &[
+    "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1",
+    "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2",
+    "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4",
+    "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8",
+];
+
+#[test]
+fn c17_does_not_advertise_the_sync_builtins_it_lacks() {
+    for macro_name in SYNC_CAS_MACROS {
+        let got = expand_under("sync_cas", None, macro_name);
+        assert!(
+            is_undefined(&got, macro_name),
+            "{macro_name} must not be defined while `__sync_*` is unimplemented, got {got}"
+        );
+    }
+}
+
+/// The other half of the promise: the builtin really is absent. If this starts
+/// failing, implement-and-restore is the fix -- not deleting the test.
+#[test]
+fn c17_sync_builtins_are_genuinely_absent() {
+    // If this stops failing to compile, the feature arrived: restore
+    // __GCC_HAVE_SYNC_COMPARE_AND_SWAP_* alongside it rather than deleting
+    // this test.
+    crate::common::compile_expect_error(
+        "sync_absent",
+        "int main(void){ int x = 1;\n\
+         return __sync_bool_compare_and_swap(&x, 1, 2) ? 0 : 1; }\n",
+        "__sync_bool_compare_and_swap",
+    );
+}
+
+/// A program guarded on the macro must reach its portable `#else` and run.
+#[test]
+fn c17_sync_guarded_code_takes_the_portable_branch() {
+    let src = "#ifdef __GCC_HAVE_SYNC_COMPARE_AND_SWAP_4\n\
+               int main(void){ int x = 1;\n\
+               return __sync_bool_compare_and_swap(&x, 1, 2) ? 0 : 1; }\n\
+               #else\n\
+               int main(void){ return 0; }\n\
+               #endif\n";
+    assert_eq!(
+        crate::common::compile_and_run("sync_guarded", src, &[]),
+        0,
+        "guarded code must fall through to the portable branch and run"
+    );
+}
+
+/// The aarch64 SIMD macros must say what gcc says, no more and no less.
+///
+/// `__ARM_NEON` is a fact about the *target*: Advanced SIMD is mandatory in
+/// the AArch64 base architecture, so gcc defines it unconditionally and so
+/// does c17. It is not a claim that `<arm_neon.h>` exists -- that is a fact
+/// about the *compiler*, and c17 ships no such header. Withdrawing a true
+/// statement about the target would not make the missing header appear.
+///
+/// `__ARM_NEON__` is the AArch32 spelling and gcc does **not** define it on
+/// aarch64. c17 did, which was simply wrong.
+///
+/// Probed through `--target`, so this holds from any host.
+#[test]
+fn c17_aarch64_simd_macros_match_gcc() {
+    let neon = expand_under("neon", Some("--target=aarch64-linux-gnu"), "__ARM_NEON");
+    assert_eq!(
+        neon, "1",
+        "__ARM_NEON is architectural baseline on aarch64 and must be defined"
+    );
+
+    let legacy = expand_under(
+        "neon_legacy",
+        Some("--target=aarch64-linux-gnu"),
+        "__ARM_NEON__",
+    );
+    assert!(
+        is_undefined(&legacy, "__ARM_NEON__"),
+        "__ARM_NEON__ is the AArch32 spelling; gcc does not define it here, got {legacy}"
+    );
+
+    // The sync builtins are a *compiler* capability, and that one really is
+    // absent, so its macro must be too -- on this target as on the host.
+    for macro_name in SYNC_CAS_MACROS {
+        let got = expand_under("neon_sync", Some("--target=aarch64-linux-gnu"), macro_name);
+        assert!(
+            is_undefined(&got, macro_name),
+            "{macro_name} must not be defined on aarch64 either, got {got}"
+        );
+    }
+}
+
+/// Facts about the hardware, not promises about headers: these stay.
+#[test]
+fn c17_keeps_the_capability_macros_it_can_back() {
+    // C11 atomics are complete, so the lock-free advertisement is honest.
+    for macro_name in [
+        "__GCC_ATOMIC_INT_LOCK_FREE",
+        "__GCC_ATOMIC_POINTER_LOCK_FREE",
+    ] {
+        assert_eq!(expand_under("atomic_lockfree", None, macro_name), "2");
+    }
+
+    // __SSE2__ is knowingly still advertised without intrinsic headers -- the
+    // drop is deferred because it is the one change that could flip a
+    // configure decision. Pinned so a later sweep cannot take it silently;
+    // see "GNU extensions" in cc/doc/TODO.md.
+    #[cfg(target_arch = "x86_64")]
+    for macro_name in ["__SSE__", "__SSE2__", "__MMX__"] {
+        assert_eq!(
+            expand_under("sse_baseline", None, macro_name),
+            "1",
+            "{macro_name} is deliberately kept; changing it is a decision, not a sweep"
+        );
+    }
+}

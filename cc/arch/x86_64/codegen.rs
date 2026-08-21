@@ -1827,6 +1827,16 @@ impl X86_64CodeGen {
 
             Opcode::Cbr => if self.emit_cbr(insn, types) {},
 
+            // GNU computed goto: jump through the address in src[0]. The
+            // CFG edges to every address-taken label are recorded on the
+            // block, so liveness and DCE already see the real successors.
+            Opcode::IndirectBr => {
+                if let Some(&val) = insn.src.first() {
+                    self.emit_move(val, Reg::R10, 64);
+                    self.push_lir(X86Inst::JmpIndirect { reg: Reg::R10 });
+                }
+            }
+
             Opcode::Switch => {
                 if let Some(&val) = insn.src.first() {
                     // Derive comparison size from type to handle long/pointer switches
@@ -1841,34 +1851,104 @@ impl X86_64CodeGen {
                         OperandSize::B32
                     };
 
-                    // Generate comparisons for each case
-                    for (case_val, target_bb) in &insn.switch_cases {
-                        // For 64-bit comparisons with values that don't fit in a
-                        // sign-extended 32-bit immediate, load into R11 first
-                        let fits_in_simm32 =
-                            *case_val >= i32::MIN as i64 && *case_val <= i32::MAX as i64;
+                    // Compare against a value, using R11 when a 64-bit
+                    // constant does not fit a sign-extended 32-bit immediate.
+                    let cmp_r10 = |gen: &mut Self, v: i64| {
+                        let fits_in_simm32 = v >= i32::MIN as i64 && v <= i32::MAX as i64;
                         if op_size == OperandSize::B64 && !fits_in_simm32 {
-                            self.push_lir(X86Inst::Mov {
+                            gen.push_lir(X86Inst::Mov {
                                 size: OperandSize::B64,
-                                src: GpOperand::Imm(*case_val),
+                                src: GpOperand::Imm(v),
                                 dst: GpOperand::Reg(Reg::R11),
                             });
-                            self.push_lir(X86Inst::Cmp {
+                            gen.push_lir(X86Inst::Cmp {
                                 size: op_size,
                                 src: GpOperand::Reg(Reg::R11),
                                 dst: GpOperand::Reg(Reg::R10),
                             });
                         } else {
-                            self.push_lir(X86Inst::Cmp {
+                            gen.push_lir(X86Inst::Cmp {
                                 size: op_size,
-                                src: GpOperand::Imm(*case_val),
+                                src: GpOperand::Imm(v),
                                 dst: GpOperand::Reg(Reg::R10),
                             });
                         }
-                        // LIR: conditional jump on equal
+                    };
+
+                    // Generate comparisons for each case
+                    for (lo, hi, target_bb) in insn.switch_cases.clone() {
+                        let target = Label::new(&self.base.current_fn, target_bb.0);
+                        if lo == hi {
+                            cmp_r10(self, lo);
+                            self.push_lir(X86Inst::Jcc {
+                                cc: CondCode::Eq,
+                                target,
+                            });
+                            continue;
+                        }
+
+                        // A GNU range `case lo ... hi:`. Tested as
+                        // `(x - lo) <=unsigned (hi - lo)`: subtracting the low
+                        // endpoint makes everything below it wrap to a large
+                        // unsigned value, so one unsigned comparison decides
+                        // both ends. Expanding the range into one compare per
+                        // value is not an option -- `case 0 ... 1000000:` is
+                        // legal C.
+                        //
+                        // R10 holds the switch value and is reused by later
+                        // cases, so the subtraction goes to R11.
+                        self.emit_move(val, Reg::R11, switch_size);
+                        let span = hi.wrapping_sub(lo);
+                        let fits = |v: i64| v >= i32::MIN as i64 && v <= i32::MAX as i64;
+                        if op_size == OperandSize::B64 && !fits(lo) {
+                            // No scratch left for a wide immediate, so build it
+                            // in R10 and restore R10 afterwards.
+                            self.push_lir(X86Inst::Push {
+                                src: GpOperand::Reg(Reg::R10),
+                            });
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Imm(lo),
+                                dst: GpOperand::Reg(Reg::R10),
+                            });
+                            self.push_lir(X86Inst::Sub {
+                                size: op_size,
+                                src: GpOperand::Reg(Reg::R10),
+                                dst: Reg::R11,
+                            });
+                            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
+                        } else {
+                            self.push_lir(X86Inst::Sub {
+                                size: op_size,
+                                src: GpOperand::Imm(lo),
+                                dst: Reg::R11,
+                            });
+                        }
+                        if op_size == OperandSize::B64 && !fits(span) {
+                            self.push_lir(X86Inst::Push {
+                                src: GpOperand::Reg(Reg::R10),
+                            });
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::B64,
+                                src: GpOperand::Imm(span),
+                                dst: GpOperand::Reg(Reg::R10),
+                            });
+                            self.push_lir(X86Inst::Cmp {
+                                size: op_size,
+                                src: GpOperand::Reg(Reg::R10),
+                                dst: GpOperand::Reg(Reg::R11),
+                            });
+                            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
+                        } else {
+                            self.push_lir(X86Inst::Cmp {
+                                size: op_size,
+                                src: GpOperand::Imm(span),
+                                dst: GpOperand::Reg(Reg::R11),
+                            });
+                        }
                         self.push_lir(X86Inst::Jcc {
-                            cc: CondCode::Eq,
-                            target: Label::new(&self.base.current_fn, target_bb.0),
+                            cc: CondCode::Ule,
+                            target,
                         });
                     }
 

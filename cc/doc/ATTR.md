@@ -65,11 +65,27 @@ One entry, and it is a technicality rather than a gap:
 | `used` | c17 never prunes an unreferenced static, so keeping one alive is already what happens. gcc drops it at `-O2` and c17 does not. If dead-global elimination is ever added, `used` has to be consulted then, or this becomes a real divergence. See #C59 in `cc/audit.md` |
 
 An attribute the compiler does not recognise is no longer dropped in silence:
-it is a warning, suppressible with `-Wno-attributes`. `vector_size` is refused
-outright, because leaving the type scalar cannot produce a correct program, and
-`mode` warns -- it changes the type too, but glibc declares `register_t` with
-it, so refusing would reject nearly every program. `const` is recognised in
-both its bare and underscored spellings, as gcc accepts either.
+it is a warning, suppressible with `-Wno-attributes`.
+
+`mode` and `vector_size` are both implemented, and both had to be: each
+*changes the type*, so accepting one and ignoring it silently computes on the
+wrong thing. `mode` replaces the declared type with the one of the named width
+in the same family (#C85), and binds to the declarator it is written on --
+including a struct member's and a function parameter's, which it did not (#C149).
+Only the vector modes (`V4SF` and friends) still warn, since they need a vector
+type.
+
+`vector_size` gives a type a vector's *storage*: the size, and its width
+rounded to a power of two capped at sixteen, which is the layout GCC produces
+by default on both targets. It used to be refused outright, on the reasoning
+that no C system header used it -- glibc's `<link.h>` does, so that made the
+header uncompilable. What it deliberately does not give is element-wise
+arithmetic, which needs a vector type in the IR and in both backends; an
+operation that would need one is diagnosed rather than quietly run on a single
+element.
+
+`const` is recognised in both its bare and underscored spellings, as gcc
+accepts either.
 
 ### Parsed and accepted (no semantic effect)
 

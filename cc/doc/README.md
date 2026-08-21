@@ -32,9 +32,16 @@ says less than the audit's record of what was actually probed.
 - **Inline Assembly**: See [../README.md](../README.md)
   - GCC extended asm syntax (`__asm__`, `asm`)
   - Constraints (`=r`, `+r`, `r`, `m`, register-specific)
+  - SSE (`x`) and x87 (`t`, `u`) operand classes on x86-64
+  - Vector (`w`) operands and the `b`/`h`/`s`/`d`/`q` width modifiers on AArch64
   - Clobbers (`memory`, `cc`, registers)
   - Named operands, matching constraints
   - `asm goto` with label references
+
+- **GNU control-flow and initializer extensions**: See [../README.md](../README.md)
+  - Case ranges (`case 1 ... 9:`)
+  - Designated-initializer ranges (`[0 ... 3] = value`)
+  - Computed goto (`&&label`, `goto *ptr`)
 
 - **Builtins**: [BUILTIN.md](BUILTIN.md)
   - Variadic functions (`va_start`, `va_arg`, `va_end`, `va_copy`)

@@ -977,8 +977,8 @@ mod tests {
         dispatch.add_insn(Instruction::switch_insn(
             load_result,
             vec![
-                (0, BasicBlockId(2)), // case 0 -> handler0
-                (1, BasicBlockId(3)), // case 1 -> handler1
+                (0, 0, BasicBlockId(2)), // case 0 -> handler0
+                (1, 1, BasicBlockId(3)), // case 1 -> handler1
             ],
             Some(BasicBlockId(4)), // default -> done
             32,

@@ -11,7 +11,7 @@
 // Consolidates: designated initializers, compound literals tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C99 initializers (designated init, compound literals)
@@ -1973,6 +1973,83 @@ int main(void) {
 "#;
     assert_eq!(
         compile_and_run("c99_brace_elision_deduced_bound", code, &[]),
+        0
+    );
+}
+
+/// GNU designated-initializer ranges: `[lo ... hi] = v`.
+///
+/// The second-most-used extension c17 rejected — 357 files in the Linux tree,
+/// 82 in mesa, 5 in CPython. Both endpoints are inclusive; the positional
+/// cursor resumes past the *high* one, so `{[0 ... 2] = 1, 9}` puts 9 at index
+/// 3. A later range overwrites an earlier overlapping one.
+///
+/// The rule lives in two independent places — the initializer grouping and the
+/// array-size inference used for `int a[] = {...}` — and both are exercised
+/// here, because the tree already records a bug born of exactly that split.
+#[test]
+fn c99_designated_init_ranges() {
+    let code = r#"
+/* Static storage: the data-image path. */
+int basic[8]      = {[0 ... 3] = 7};
+int two[8]        = {[0 ... 3] = 1, [4 ... 7] = 2};
+int overlap[8]    = {[0 ... 5] = 1, [3 ... 7] = 2};
+int then_pos[8]   = {[0 ... 2] = 1, 9};
+int single[4]     = {[1 ... 1] = 5};
+int inferred[]    = {[0 ... 3] = 1};
+char chars[8]     = {[0 ... 6] = 65};
+
+struct P { int x, y; };
+struct P structs[4] = {[0 ... 2] = {1, 2}};
+
+struct V { int v[4]; };
+struct V nested = {.v = {[1 ... 2] = 8}};
+
+int main(void)
+{
+    if (basic[0] != 7 || basic[3] != 7) return 1;
+    if (basic[4] != 0 || basic[7] != 0) return 2;
+
+    if (two[0] != 1 || two[3] != 1 || two[4] != 2 || two[7] != 2) return 3;
+
+    /* A later range wins over an earlier one where they overlap. */
+    if (overlap[2] != 1 || overlap[3] != 2 || overlap[7] != 2) return 4;
+
+    /* The cursor resumes past the high endpoint. */
+    if (then_pos[2] != 1 || then_pos[3] != 9 || then_pos[4] != 0) return 5;
+
+    if (single[1] != 5 || single[0] != 0 || single[2] != 0) return 6;
+
+    /* Array size inferred from the range's high endpoint. */
+    if (sizeof inferred / sizeof inferred[0] != 4) return 7;
+    if (inferred[3] != 1) return 8;
+
+    if (chars[0] != 65 || chars[6] != 65 || chars[7] != 0) return 9;
+
+    if (structs[0].x != 1 || structs[2].y != 2) return 10;
+    if (structs[3].x != 0 || structs[3].y != 0) return 11;
+
+    if (nested.v[0] != 0 || nested.v[1] != 8 || nested.v[2] != 8 || nested.v[3] != 0) return 12;
+
+    /* Automatic storage: the runtime-store path, which must agree. */
+    {
+        int a[8] = {[0 ... 3] = 7};
+        int b[8] = {[0 ... 2] = 1, 9};
+        int c[8] = {[0 ... 5] = 1, [3 ... 7] = 2};
+        if (a[0] != 7 || a[3] != 7 || a[4] != 0) return 13;
+        if (b[2] != 1 || b[3] != 9 || b[4] != 0) return 14;
+        if (c[2] != 1 || c[3] != 2 || c[7] != 2) return 15;
+
+        struct P p[4] = {[0 ... 2] = {1, 2}};
+        if (p[2].y != 2 || p[3].y != 0) return 16;
+    }
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("designated_init_ranges", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("designated_init_ranges_opt", code),
         0
     );
 }

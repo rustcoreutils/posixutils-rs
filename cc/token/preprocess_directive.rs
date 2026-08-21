@@ -287,9 +287,26 @@ impl<'a> Preprocessor<'a> {
             }
         };
 
+        // C17 6.10.8p4: `defined` is not available to be defined. Accepting it
+        // put a macro in the table that `#if` can never see, because the
+        // operator is recognised before expansion.
+        if name == "defined" {
+            diag::error(
+                name_token.pos,
+                &gettext("\"defined\" cannot be used as a macro name"),
+            );
+            self.skip_to_eol(iter);
+            return;
+        }
+
         // Check if function-like macro (immediate '(' without whitespace)
         let mut params: Vec<MacroParam> = Vec::new();
         let mut is_function = false;
+        // A parameter list that does not parse defines nothing: continuing
+        // with a guessed list is how `#define F(a,a) a` and
+        // `#define H(x + y) x` came to be accepted.
+        let mut malformed_params = false;
+        let mut closed_params = false;
         let mut is_variadic = false;
         let mut variadic_name = None;
 
@@ -315,7 +332,10 @@ impl<'a> Preprocessor<'a> {
                             }
 
                             match &param_tok.value {
-                                TokenValue::Special(c) if *c == b')' as u32 => break,
+                                TokenValue::Special(c) if *c == b')' as u32 => {
+                                    closed_params = true;
+                                    break;
+                                }
                                 TokenValue::Special(c) if *c == b',' as u32 => {
                                     ident_immediately_before = false;
                                     continue;
@@ -340,6 +360,7 @@ impl<'a> Preprocessor<'a> {
                                         }
                                         if let TokenValue::Special(c) = &t.value {
                                             if *c == b')' as u32 {
+                                                closed_params = true;
                                                 break;
                                             }
                                         }
@@ -348,6 +369,20 @@ impl<'a> Preprocessor<'a> {
                                 }
                                 TokenValue::Ident(id) => {
                                     if let Some(param_name) = idents.get_opt(*id) {
+                                        // C17 6.10.3p6: the parameters have to
+                                        // be distinct. A repeat used to be
+                                        // pushed anyway, and since substitution
+                                        // matches the *first* one by name,
+                                        // `#define F(a,a) a` silently made
+                                        // `F(1,2)` expand to `1`.
+                                        if params.iter().any(|p| p.name == param_name) {
+                                            diag::error_args(
+                                                param_tok.pos,
+                                                "duplicate macro parameter \"{0}\"",
+                                                &[param_name],
+                                            );
+                                            malformed_params = true;
+                                        }
                                         params.push(MacroParam {
                                             name: param_name.to_string(),
                                             index: param_index,
@@ -356,12 +391,32 @@ impl<'a> Preprocessor<'a> {
                                         ident_immediately_before = true;
                                     }
                                 }
-                                _ => {}
+                                // Anything else cannot be a parameter. This was
+                                // a bare `_ => {}`, so `#define H(x + y) x`
+                                // quietly defined a two-parameter macro.
+                                _ => {
+                                    diag::error_args(
+                                        param_tok.pos,
+                                        "expected ',' or ')' in macro parameter list, found \"{0}\"",
+                                        &[&self.token_to_string(&param_tok, idents)],
+                                    );
+                                    malformed_params = true;
+                                }
                             }
+                        }
+                        if !closed_params {
+                            diag::error(
+                                name_token.pos,
+                                &gettext("expected ')' at end of macro parameter list"),
+                            );
+                            malformed_params = true;
                         }
                     }
                 }
             }
+        }
+        if malformed_params {
+            return;
         }
 
         // Collect body tokens

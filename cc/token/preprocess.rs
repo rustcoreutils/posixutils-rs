@@ -19,9 +19,9 @@ use std::time::SystemTime;
 
 use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
-    literal_payload, payload_bytes, payload_text, report_forbidden_ucn, tokens_to_source_bytes,
-    write_token, IdentTable, LexerMode, Position, Punctuator, SpecialToken, Spelling, Token,
-    TokenType, TokenValue, Tokenizer,
+    literal_payload, payload_bytes, payload_text, report_forbidden_ucn, show_token,
+    tokens_to_source_bytes, write_token, IdentTable, LexerMode, Position, Punctuator, SpecialToken,
+    Spelling, Token, TokenType, TokenValue, Tokenizer,
 };
 use super::literal;
 use crate::arch;

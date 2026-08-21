@@ -1566,3 +1566,83 @@ fn preprocessor_empty_macro_does_not_trigger_the_previous_name() {
     assert_has(&r.stdout, "f (3)", "the call must not be formed");
     assert_lacks(&r.stdout, "((3)+1)", "f was expanded across E");
 }
+
+/// C17 6.10.3.3p3 requires `##` to produce a single preprocessing token, and
+/// a diagnostic when it does not. The result used to be whatever re-lexing the
+/// concatenated spelling produced, with no check and no message.
+///
+/// `cat(/,/)` is the one that mattered: `//` is a comment, so both operands
+/// *and* the tokens around them disappeared from the output.
+#[test]
+fn preprocessor_invalid_paste_is_diagnosed() {
+    for (name, call) in [
+        ("two_punctuators", "cat(+,-)"),
+        ("ident_and_string", "cat(x,\"s\")"),
+        ("comment", "cat(/,/)"),
+    ] {
+        let src = format!(
+            "#define cat(a,b) a##b\nint y = 1 {} 2;\nint main(void){{return 0;}}\n",
+            call
+        );
+        let r = preprocess_text(&format!("bad_paste_{}", name), &src, &[]);
+        assert!(!r.success, "{} should be rejected:\n{}", call, r.stdout);
+        assert!(
+            r.stderr
+                .contains("does not give a valid preprocessing token"),
+            "{} should say so, got:\n{}",
+            call,
+            r.stderr
+        );
+    }
+}
+
+/// The pastes that are valid have to stay valid, including the ones that join
+/// two punctuators into a third and the one that puts a `.` in front of a
+/// digit sequence.
+#[test]
+fn preprocessor_valid_pastes_still_work() {
+    let src = "#define cat(a,b) a##b\n\
+               int ab; int x12; int y = 1 cat(<,<) 2; int *p; int q = p cat(-,>) ab;\n\
+               double d = cat(1,.5);\nint z = cat(x,12);\n";
+    let r = preprocess_text("good_pastes", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    for want in ["1 << 2", "p -> ab", "1.5", "x12"] {
+        assert_has(&r.stdout, want, "valid paste");
+    }
+}
+
+/// `#define` accepted three malformed forms in silence. A duplicate parameter
+/// was the worst: substitution matches a parameter by name and takes the first,
+/// so `#define F(a,a) a` made `F(1,2)` expand to `1`.
+#[test]
+fn preprocessor_malformed_define_is_diagnosed() {
+    for (name, src, needle) in [
+        (
+            "duplicate_param",
+            "#define F(a,a) a\n",
+            "duplicate macro parameter",
+        ),
+        (
+            "defined",
+            "#define defined 1\n",
+            "cannot be used as a macro name",
+        ),
+        ("unclosed_params", "#define G(x,y\n", "expected ')'"),
+        (
+            "junk_in_params",
+            "#define H(x + y) x\n",
+            "expected ',' or ')'",
+        ),
+    ] {
+        let full = format!("{}int main(void){{return 0;}}\n", src);
+        let r = preprocess_text(&format!("bad_define_{}", name), &full, &[]);
+        assert!(!r.success, "{:?} should be rejected:\n{}", src, r.stdout);
+        assert!(
+            r.stderr.contains(needle),
+            "{:?} should say {:?}, got:\n{}",
+            src,
+            needle,
+            r.stderr
+        );
+    }
+}

@@ -938,34 +938,132 @@ impl<'a> Preprocessor<'a> {
             return vec![left.clone()];
         }
 
-        let left_str = self.token_to_string(left, idents);
-        let right_str = self.token_to_string(&right[0], idents);
-        let combined = format!("{}{}", left_str, right_str);
+        let mut result = self.paste_one(left, &right[0], pos, idents);
 
-        // Re-tokenize the combined string using the same shared string table
-        // Since we use the same StringTable, all StringIds are consistent
-        // and no ID remapping is needed.
-        let stream_id = self.paste_stream();
-        let tokens = {
-            let mut tokenizer = Tokenizer::new(combined.as_bytes(), stream_id, idents);
-            tokenizer.tokenize()
-        };
-
-        let mut result: Vec<_> = tokens
-            .into_iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .map(|mut t| {
-                t.pos = *pos;
-                t.pos.newline = false;
-                t
-            })
-            .collect();
-
-        // Add remaining right tokens. Only `right[0]` went through the
-        // tokenizer above, so these still carry the file's line flags.
+        // Add remaining right tokens. Only `right[0]` took part in the paste,
+        // so these still carry the file's line flags.
         result.extend(right.iter().skip(1).cloned().map(clear_newline));
 
         result
+    }
+
+    /// Paste exactly two tokens.
+    ///
+    /// C17 6.10.3.3p3: the result has to be a single preprocessing token, and
+    /// a paste that does not produce one is a constraint violation requiring a
+    /// diagnostic. This used to concatenate the two spellings, re-lex, and keep
+    /// every token that fell out -- so `cat(+,-)` quietly produced two tokens,
+    /// and `cat(/,/)` produced `//`, which the lexer read as a comment: both
+    /// operands and the tokens around them vanished from
+    /// `int y = 1 cat(/,/) 2;` with nothing reported.
+    ///
+    /// The operand *types* decide whether a paste can be valid at all, before
+    /// any spelling is built. Only an identifier, a pp-number or a punctuator
+    /// can take part; a string or character literal can only ever be the right
+    /// operand of an encoding prefix.
+    fn paste_one(
+        &self,
+        left: &Token,
+        right: &Token,
+        pos: &Position,
+        idents: &mut IdentTable,
+    ) -> Vec<Token> {
+        // `L ## "x"` and friends: the prefix and the literal are one token.
+        if let Some(token) = Self::paste_encoding_prefix(left, right, pos, idents) {
+            return vec![token];
+        }
+
+        if !Self::pasteable(left) || !Self::pasteable(right) {
+            self.reject_paste(left, right, pos, idents);
+            return vec![clear_newline(left.clone()), clear_newline(right.clone())];
+        }
+
+        let combined = format!("{}{}", show_token(left, idents), show_token(right, idents));
+
+        // The spelling is built from two tokens that are each valid on their
+        // own, so re-lexing it is a way of *constructing* the result, not of
+        // deciding whether there is one. That is what the count below decides.
+        let stream_id = self.paste_stream();
+        let tokens: Vec<_> = {
+            let mut tokenizer = Tokenizer::new(combined.as_bytes(), stream_id, idents);
+            tokenizer.tokenize()
+        }
+        .into_iter()
+        .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+        .map(|mut t| {
+            t.pos = *pos;
+            t.pos.newline = false;
+            t
+        })
+        .collect();
+
+        if tokens.len() == 1 {
+            return tokens;
+        }
+
+        // Zero tokens means the spelling lexed as a comment (`/` ## `/`); more
+        // than one means it never joined.
+        self.reject_paste(left, right, pos, idents);
+        vec![clear_newline(left.clone()), clear_newline(right.clone())]
+    }
+
+    /// Whether a token can be an operand of `##` at all.
+    fn pasteable(token: &Token) -> bool {
+        matches!(
+            token.typ,
+            TokenType::Ident | TokenType::Number | TokenType::Special
+        )
+    }
+
+    /// `L`, `u`, `U` or `u8` pasted onto a literal, which C17 6.4.5 spells as
+    /// one token.
+    fn paste_encoding_prefix(
+        left: &Token,
+        right: &Token,
+        pos: &Position,
+        idents: &IdentTable,
+    ) -> Option<Token> {
+        if left.typ != TokenType::Ident {
+            return None;
+        }
+        let TokenValue::Ident(id) = &left.value else {
+            return None;
+        };
+        let prefix = idents.get_opt(*id)?;
+        let value = match (prefix, &right.value) {
+            ("L", TokenValue::String(s)) => TokenValue::WideString(s.clone()),
+            ("u", TokenValue::String(s)) => TokenValue::Utf16String(s.clone()),
+            ("U", TokenValue::String(s)) => TokenValue::Utf32String(s.clone()),
+            ("u8", TokenValue::String(s)) => TokenValue::String(s.clone()),
+            ("L", TokenValue::Char(c)) => TokenValue::WideChar(c.clone()),
+            ("u", TokenValue::Char(c)) => TokenValue::Utf16Char(c.clone()),
+            ("U", TokenValue::Char(c)) => TokenValue::Utf32Char(c.clone()),
+            _ => return None,
+        };
+        let typ = match &value {
+            TokenValue::WideString(_) => TokenType::WideString,
+            TokenValue::Utf16String(_) => TokenType::Utf16String,
+            TokenValue::Utf32String(_) => TokenType::Utf32String,
+            TokenValue::String(_) => TokenType::String,
+            TokenValue::WideChar(_) => TokenType::WideChar,
+            TokenValue::Utf16Char(_) => TokenType::Utf16Char,
+            _ => TokenType::Utf32Char,
+        };
+        let mut token = Token::with_value(typ, *pos, value);
+        token.pos.newline = false;
+        Some(token)
+    }
+
+    /// Report a `##` whose result is not a single preprocessing token.
+    ///
+    /// The operands are then emitted side by side, unpasted, which is what gcc
+    /// does and keeps the rest of the line meaningful.
+    fn reject_paste(&self, left: &Token, right: &Token, pos: &Position, idents: &IdentTable) {
+        crate::diag::error_args(
+            *pos,
+            "pasting \"{0}\" and \"{1}\" does not give a valid preprocessing token",
+            &[&show_token(left, idents), &show_token(right, idents)],
+        );
     }
 
     /// Expand an object-like macro

@@ -279,6 +279,15 @@ pub enum ExprKind {
         else_expr: Box<Expr>,
     },
 
+    /// GNU `a ?: b` -- a conditional whose middle operand is omitted, so the
+    /// condition is also the value when it is true. Held apart from
+    /// `Conditional` rather than desugared to `a ? a : b` because the
+    /// condition must be evaluated exactly once.
+    CondElvis {
+        cond: Box<Expr>,
+        else_expr: Box<Expr>,
+    },
+
     /// Function call
     Call {
         func: Box<Expr>,
@@ -489,6 +498,24 @@ pub enum ExprKind {
     /// Result is undefined if x is 0
     Clz {
         /// The value to count leading zeros in
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_clrsb(x)
+    /// Number of redundant sign bits: the bits below the sign bit that repeat
+    /// it. Unlike the `clz` family this is defined for every input, zero and
+    /// -1 included, both of which answer one less than the width.
+    Clrsb {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_clrsbl(x)
+    Clrsbl {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_clrsbll(x)
+    Clrsbll {
         arg: Box<Expr>,
     },
 

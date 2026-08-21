@@ -1500,6 +1500,12 @@ impl<'a> Linearizer<'a> {
                     && self.is_pure_expr(else_expr)
             }
 
+            // `a ?: b` evaluates `a` once and `b` only when `a` is false, so
+            // it is pure exactly when both are.
+            ExprKind::CondElvis { cond, else_expr } => {
+                self.is_pure_expr(cond) && self.is_pure_expr(else_expr)
+            }
+
             // Function calls are never pure (may have side effects)
             ExprKind::Call { .. } => false,
 
@@ -1565,6 +1571,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Clz { arg }
             | ExprKind::Clzl { arg }
             | ExprKind::Clzll { arg }
+            | ExprKind::Clrsb { arg }
+            | ExprKind::Clrsbl { arg }
+            | ExprKind::Clrsbll { arg }
             | ExprKind::Popcount { arg }
             | ExprKind::Popcountl { arg }
             | ExprKind::Popcountll { arg }
@@ -3993,6 +4002,209 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Lower GNU `a ?: b`.
+    ///
+    /// The whole point is that `a` is evaluated **once**: it supplies both the
+    /// branch test and the value taken when it is true. Rewriting to
+    /// `a ? a : b` in the parser would have called `f` twice in `f() ?: 0`.
+    pub(crate) fn linearize_elvis(
+        &mut self,
+        expr: &Expr,
+        cond: &Expr,
+        else_expr: &Expr,
+    ) -> PseudoId {
+        let result_typ = self.expr_type(expr);
+        let cond_typ = self.expr_type(cond);
+
+        // A constant condition picks one side outright and never evaluates the
+        // other, for the reason `linearize_ternary` records.
+        if let Some(cond_const) = self.eval_const_expr(cond) {
+            let (taken, taken_typ) = if cond_const != 0 {
+                (cond, cond_typ)
+            } else {
+                (else_expr, self.expr_type(else_expr))
+            };
+            let value = self.linearize_expr(taken);
+            return self.emit_convert(value, taken_typ, result_typ);
+        }
+
+        let size = if self.types.kind(result_typ) == TypeKind::Function {
+            64
+        } else {
+            self.types.size_bits(result_typ)
+        };
+
+        // Evaluated here, before either form below, so there is exactly one
+        // evaluation on every path.
+        let cond_val = self.linearize_expr(cond);
+        let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+
+        // The true value is the condition itself, widened to the result type
+        // the same way the ternary widens its arms.
+        let cond_size = self.types.size_bits(cond_typ);
+        let then_val = if cond_size < size && cond_size <= 32 && self.types.is_integer(cond_typ) {
+            self.emit_convert(cond_val, cond_typ, result_typ)
+        } else {
+            cond_val
+        };
+
+        if self.is_pure_expr(else_expr) && size <= 64 {
+            let mut else_val = self.linearize_expr(else_expr);
+            let else_typ = self.expr_type(else_expr);
+            let else_size = self.types.size_bits(else_typ);
+            if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
+                else_val = self.emit_convert(else_val, else_typ, result_typ);
+            }
+            let result = self.alloc_pseudo();
+            self.emit(Instruction::select(
+                result, cond_bool, then_val, else_val, result_typ, size,
+            ));
+            return result;
+        }
+
+        // Impure right-hand side: it must not be evaluated when the condition
+        // is true, so it needs its own block.
+        let then_bb = self.alloc_bb();
+        let else_bb = self.alloc_bb();
+        let merge_bb = self.alloc_bb();
+        let cond_end_bb = self.current_bb.unwrap();
+
+        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+        self.link_bb(cond_end_bb, then_bb);
+        self.link_bb(cond_end_bb, else_bb);
+
+        // Nothing to compute on the true side; the value is already in hand.
+        self.switch_bb(then_bb);
+        let then_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(then_end_bb, merge_bb);
+
+        self.switch_bb(else_bb);
+        let mut else_val = self.linearize_expr(else_expr);
+        let else_typ = self.expr_type(else_expr);
+        let else_size = self.types.size_bits(else_typ);
+        if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
+            else_val = self.emit_convert(else_val, else_typ, result_typ);
+        }
+        let else_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(else_end_bb, merge_bb);
+
+        self.switch_bb(merge_bb);
+        let result = self.alloc_pseudo();
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
+        let mut phi_insn = Instruction::phi(result, result_typ, size);
+        let phisrc1 =
+            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, result_typ, size);
+        phi_insn.phi_list.push((then_end_bb, phisrc1));
+        let phisrc2 =
+            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, result_typ, size);
+        phi_insn.phi_list.push((else_end_bb, phisrc2));
+        self.emit(phi_insn);
+
+        result
+    }
+
+    /// Lower `__builtin_clrsb` and its wider siblings.
+    ///
+    /// The count of redundant sign bits is `clz` of the value with its sign
+    /// folded away, less one -- but `clz(0)` is undefined, and `x` of 0 or -1
+    /// folds to exactly that. c17 and gcc happen to answer differently there,
+    /// so relying on it would be relying on undefined behaviour agreeing.
+    ///
+    /// Instead the folded value is shifted up one and given a low bit:
+    ///
+    /// ```text
+    /// clrsb(x) = clz(((x ^ (x >> (W-1))) << 1) | 1)
+    /// ```
+    ///
+    /// The shift absorbs the `- 1`, the set bit makes the input nonzero for
+    /// every `x`, and the fold's result always has its top bit clear so the
+    /// shift cannot lose information. `x` is evaluated once, which is why this
+    /// is a node rather than a rewrite over `__builtin_clz`.
+    fn linearize_clrsb(&mut self, arg: &Expr, width: u32) -> PseudoId {
+        let int_id = self.types.int_id;
+        // The sign-extracting shift must be signed; everything after it is bit
+        // manipulation and must be *unsigned*. `folded << 1` overflows a
+        // signed type whenever the top data bit is set -- `clrsb(INT_MIN)`
+        // folds to 0x7fffffff, and shifting that left is undefined -- so at
+        // -O2 the folder was free to answer 30 where -O0 answered 0.
+        let signed_typ = if width == 32 {
+            self.types.int_id
+        } else {
+            self.types.long_id
+        };
+        let val_typ = if width == 32 {
+            self.types.uint_id
+        } else {
+            self.types.ulong_id
+        };
+        let val = self.linearize_expr(arg);
+
+        // x >> (W-1): all ones when negative, zero when not.
+        let shift = self.emit_const((width - 1) as i128, int_id);
+        let sign = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Asr,
+            sign,
+            val,
+            shift,
+            signed_typ,
+            width,
+        ));
+
+        // x ^ sign: x when non-negative, ~x when negative. Top bit is clear.
+        let folded = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Xor,
+            folded,
+            val,
+            sign,
+            val_typ,
+            width,
+        ));
+
+        // (folded << 1) | 1 -- never zero, and one bit shorter to count.
+        let one = self.emit_const(1, int_id);
+        let shifted = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Shl,
+            shifted,
+            folded,
+            one,
+            val_typ,
+            width,
+        ));
+        let one_again = self.emit_const(1, val_typ);
+        let nonzero = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Or,
+            nonzero,
+            shifted,
+            one_again,
+            val_typ,
+            width,
+        ));
+
+        let result = self.alloc_pseudo();
+        let op = if width == 32 {
+            Opcode::Clz32
+        } else {
+            Opcode::Clz64
+        };
+        self.emit(
+            Instruction::new(op)
+                .with_target(result)
+                .with_src(nonzero)
+                .with_size(width)
+                .with_type(int_id),
+        );
+        result
+    }
+
     pub(crate) fn linearize_compound_literal(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
             ExprKind::CompoundLiteral { typ, elements } => {
@@ -4265,6 +4477,9 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             }
+
+            ExprKind::Clrsb { arg } => self.linearize_clrsb(arg, 32),
+            ExprKind::Clrsbl { arg } | ExprKind::Clrsbll { arg } => self.linearize_clrsb(arg, 64),
 
             // ================================================================
             // Population count builtins
@@ -5034,6 +5249,8 @@ impl<'a> Linearizer<'a> {
                 else_expr,
             } => self.linearize_ternary(expr, cond, then_expr, else_expr),
 
+            ExprKind::CondElvis { cond, else_expr } => self.linearize_elvis(expr, cond, else_expr),
+
             ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
 
             ExprKind::Member {
@@ -5166,6 +5383,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Clz { .. }
             | ExprKind::Clzl { .. }
             | ExprKind::Clzll { .. }
+            | ExprKind::Clrsb { .. }
+            | ExprKind::Clrsbl { .. }
+            | ExprKind::Clrsbll { .. }
             | ExprKind::Popcount { .. }
             | ExprKind::Popcountl { .. }
             | ExprKind::Popcountll { .. }

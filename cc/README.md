@@ -119,9 +119,11 @@ Supported:
   `b`/`h`/`s`/`d`/`q` width modifiers on AArch64
 - GNU extensions real code depends on: case ranges (`case 1 ... 9:`),
   designated-initializer ranges (`[0 ... 3] = v`), computed goto (`&&label`
-  and `goto *p`), statement expressions, `typeof`, `__attribute__` including
-  `mode` and `vector_size`, `__builtin_*`, and case-range-style `...` spacing
-  matching gcc's (`case 1...9:` is one pp-number and is rejected there too)
+  and `goto *p`), the omitted middle operand (`a ?: b`, with `a` evaluated
+  once), statement expressions, `typeof`, `__attribute__` including `mode` and
+  `vector_size`, `__builtin_*` (see `doc/BUILTIN.md`), and case-range-style
+  `...` spacing matching gcc's (`case 1...9:` is one pp-number and is rejected
+  there too)
 - Variably modified types everywhere C17 admits them, including a `typedef` of
   one (6.7.7), whose extents are evaluated at the typedef rather than at each use
 - `-fverbose-asm`, annotating each instruction with the source names it came from

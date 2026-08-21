@@ -33,6 +33,10 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_clz",
     "__builtin_clzl",
     "__builtin_clzll",
+    // Bit manipulation - count redundant sign bits
+    "__builtin_clrsb",
+    "__builtin_clrsbl",
+    "__builtin_clrsbll",
     // Bit manipulation - population count
     "__builtin_popcount",
     "__builtin_popcountl",
@@ -51,6 +55,7 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_llabs",
     "__builtin_ffs",
     "__builtin_ffsl",
+    "__builtin_ffsll",
     "__builtin_sqrt",
     "__builtin_copysign",
     "__builtin_trap",

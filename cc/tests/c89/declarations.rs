@@ -786,3 +786,79 @@ int main(void) {
         0
     );
 }
+
+/// A function declarator is an ordinary member of an init-declarator list.
+///
+/// C17 6.7 is *declaration-specifiers init-declarator-list ;* and says nothing
+/// that would exclude a function declarator from the list. c17 rejected every
+/// list whose **first** declarator was a function -- `int f(int), g(int);` gave
+/// "expected ';', found ','" -- because the function-declaration path demanded
+/// a semicolon the moment it had a prototype. An object first was fine, so
+/// `int x, f(int);` already worked, which is why nothing caught it.
+///
+/// Found by building sparse, which opens `dissect.c` with four
+/// pointer-returning function declarators sharing one specifier.
+///
+/// The `*` binds to its own declarator, so this checks derivations differ
+/// across the list rather than only that the line is accepted.
+#[test]
+fn c89_function_declarators_share_an_init_declarator_list() {
+    let code = r#"
+struct S { int v; };
+
+int f(int a), g(int b);
+struct S *mk(int v), **mk2(int v);
+int h(int), obj = 7, arr[3];
+typedef int F(int), G(long);
+/* A `*` on the first declarator must not reach the second. */
+int *pf(int), plain(int);
+
+int f(int a){ return a * 2; }
+int g(int b){ return b + 1; }
+int h(int c){ return c - 1; }
+int plain(int c){ return c + 100; }
+static int cell;
+int *pf(int v){ cell = v; return &cell; }
+
+static struct S storage;
+static struct S *pstorage;
+struct S *mk(int v){ storage.v = v; return &storage; }
+struct S **mk2(int v){ pstorage = mk(v); return &pstorage; }
+
+static F *fp = f;
+static G *gp;
+static int gimpl(long x){ return (int)(x * 10); }
+
+int main(void) {
+    if (f(21) != 42) return 1;
+    if (g(1) != 2) return 2;
+    if (h(5) != 4) return 3;
+    if (obj != 7) return 4;
+    if (sizeof arr / sizeof arr[0] != 3) return 5;
+    if (mk(9)->v != 9) return 6;
+    if ((*mk2(8))->v != 8) return 7;
+
+    /* Each typedef in the list keeps its own signature. */
+    if (fp(3) != 6) return 8;
+    gp = gimpl;
+    if (gp(4) != 40) return 9;
+
+    /* `int *pf(int), plain(int);` -- pf returns int *, plain returns int. */
+    if (*pf(11) != 11) return 10;
+    if (plain(1) != 101) return 11;
+
+    /* Taking each through a correctly-typed pointer proves the derivation
+       rather than just the value. */
+    int *(*ppf)(int) = pf;
+    int (*pplain)(int) = plain;
+    if (*ppf(12) != 12) return 12;
+    if (pplain(2) != 102) return 13;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c89_fn_declarator_list", code, &[]),
+        0,
+        "a function declarator must be usable anywhere in an init-declarator list"
+    );
+}

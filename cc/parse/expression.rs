@@ -399,6 +399,32 @@ impl<'a> Parser<'a> {
 
         if self.is_special(b'?') {
             self.advance();
+
+            // GNU `a ?: b`: the middle operand may be omitted, and then the
+            // condition is also the value when it is true. Kept as its own
+            // node rather than rewritten to `a ? a : b`, because 6.5.15 would
+            // then evaluate `a` twice -- `f() ?: 0` must call `f` once.
+            if self.is_special(b':') {
+                self.advance();
+                let else_expr = self.parse_conditional_expr()?;
+
+                let cond_typ = cond.typ.unwrap_or(self.types.int_id);
+                let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
+                let cond_decayed = self.decayed_type(cond_typ);
+                let else_decayed = self.decayed_type(else_typ);
+                let typ = self.ternary_common_type(cond_decayed, else_decayed);
+
+                let pos = cond.pos;
+                return Ok(Self::typed_expr(
+                    ExprKind::CondElvis {
+                        cond: Box::new(cond),
+                        else_expr: Box::new(else_expr),
+                    },
+                    typ,
+                    pos,
+                ));
+            }
+
             let then_expr = self.parse_expression()?;
             self.expect_special(b':')?;
             // Right-to-left: parse else as another conditional
@@ -3234,6 +3260,45 @@ impl<'a> Parser<'a> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_CLRSB => Some((|| {
+                // __builtin_clrsb(x) - redundant sign bits in a signed int.
+                // Defined for every input, so unlike `clz` there is no
+                // undefined case to document.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::Clrsb { arg: Box::new(arg) },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CLRSBL => Some((|| {
+                // __builtin_clrsbl(x) - redundant sign bits in a signed long.
+                // Defined for every input, so unlike `clz` there is no
+                // undefined case to document.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::Clrsbl { arg: Box::new(arg) },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CLRSBLL => Some((|| {
+                // __builtin_clrsbll(x) - redundant sign bits in a signed long long.
+                // Defined for every input, so unlike `clz` there is no
+                // undefined case to document.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::Clrsbll { arg: Box::new(arg) },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_POPCOUNT => Some((|| {
                 // __builtin_popcount(x) - returns int, counts set bits in unsigned int
                 self.expect_special(b'(')?;
@@ -5139,7 +5204,7 @@ impl<'a> Parser<'a> {
             // The library builtins, for the case where the header that would
             // declare them has not been included.
             "strlen" => Some(self.types.ulong_id),
-            "strcmp" | "abs" | "ffs" | "ffsl" => Some(self.types.int_id),
+            "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" => Some(self.types.int_id),
             "labs" => Some(self.types.long_id),
             "llabs" => Some(self.types.longlong_id),
             "sqrt" | "copysign" => Some(self.types.double_id),
@@ -5163,6 +5228,7 @@ impl<'a> Parser<'a> {
                 | crate::kw::BUILTIN_LLABS
                 | crate::kw::BUILTIN_FFS
                 | crate::kw::BUILTIN_FFSL
+                | crate::kw::BUILTIN_FFSLL
                 | crate::kw::BUILTIN_SQRT
                 | crate::kw::BUILTIN_COPYSIGN
                 | crate::kw::BUILTIN_TRAP
@@ -5273,7 +5339,7 @@ impl<'a> Parser<'a> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
-            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "sqrt" => (1, false),
+            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" | "sqrt" => (1, false),
             "strcmp" | "copysign" => (2, false),
             "abort" => (0, false),
             // An entry point this does not know is left as it was: variadic,
@@ -5283,7 +5349,20 @@ impl<'a> Parser<'a> {
         // The types are not modelled -- only how many arguments are fixed --
         // so each is spelled as the widest integer the ABI passes in one
         // register, which a pointer, a size and a flag all classify as.
-        let params = vec![self.types.ulong_id; fixed];
+        //
+        // A `double` does not. It is passed in an SSE register, so declaring
+        // one of these as an integer sent the argument to the wrong register
+        // file outright: `__builtin_sqrt(4.0)` read whatever was in xmm0 and
+        // came back 0.0, and `__builtin_copysign(1.0, -1.0)` answered 1.0
+        // because the sign argument never arrived. Both are silent wrong
+        // answers -- the call links and runs. The library functions of the
+        // same names are unaffected; this path is only taken when the header
+        // that would declare them was not included.
+        let param_typ = match name {
+            "sqrt" | "copysign" => self.types.double_id,
+            _ => self.types.ulong_id,
+        };
+        let params = vec![param_typ; fixed];
 
         let func_type = self.types.intern(Type {
             kind: TypeKind::Function,

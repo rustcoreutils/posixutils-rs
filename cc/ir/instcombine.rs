@@ -316,6 +316,26 @@ fn simplify_mod(insn: &Instruction, func: &Function) -> Simplification {
 // Shift Simplifications
 // ============================================================================
 
+/// A constant as it actually is at `size` bits.
+///
+/// `const_val` hands back an `i128` holding whatever bit pattern the constant
+/// was built from, which for a narrower operand may be wider than the operand
+/// itself: `(int)0xFFFFFFFFu` is stored as 4294967295, not -1. Every consumer
+/// that only *emits* the value truncates and so never noticed, but folding
+/// arithmetic on it does notice -- `Asr` on 4294967295 shifts in zeros and
+/// answers 2147483647 where the operand is -1 and the answer is -1.
+fn at_width(v: i128, size: u32, signed: bool) -> i128 {
+    if size == 0 || size >= 128 {
+        return v;
+    }
+    let pad = 128 - size;
+    if signed {
+        (v << pad) >> pad
+    } else {
+        (((v as u128) << pad) >> pad) as i128
+    }
+}
+
 fn simplify_shift(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
         return Simplification::None;
@@ -331,10 +351,16 @@ fn simplify_shift(insn: &Instruction, func: &Function) -> Simplification {
     match (val1, val2) {
         // Constant folding (shift amount must be in [0, type_width))
         (Some(a), Some(b)) if (0..max_shift).contains(&b) => {
+            // Each shift is folded at the operand's own width, and the
+            // operand is read with the signedness that shift implies: `Asr`
+            // is the arithmetic one by definition, `Lsr` the logical one.
+            let size = insn.size.max(1);
             let folded = match insn.op {
-                Opcode::Shl => a.wrapping_shl(b as u32),
-                Opcode::Lsr => (a as u128).wrapping_shr(b as u32) as i128,
-                Opcode::Asr => a.wrapping_shr(b as u32),
+                // The result is truncated back, so an overflowing shift wraps
+                // at the operand width rather than growing into the i128.
+                Opcode::Shl => at_width(at_width(a, size, true).wrapping_shl(b as u32), size, true),
+                Opcode::Lsr => at_width(a, size, false).wrapping_shr(b as u32),
+                Opcode::Asr => at_width(a, size, true).wrapping_shr(b as u32),
                 _ => return Simplification::None,
             };
             Simplification::FoldToConst(folded)

@@ -21,14 +21,43 @@ pub use crate::diag::Position;
 // Lexer Mode
 // ============================================================================
 
-/// Lexer mode - controls comment syntax recognition
+/// Lexer mode - controls how a few characters are classified
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LexerMode {
-    /// C mode: // and /* */ comments
+    /// C mode: `'` and `"` both open a literal.
     #[default]
     C,
-    /// Assembly mode: ; comments (no // or /* */)
+    /// Assembly mode, matching GCC's `assembler-with-cpp`.
+    ///
+    /// Only `"` opens a literal here. GNU as spells a character constant `'a`
+    /// with no closing quote, and an apostrophe in a comment is ordinary
+    /// prose -- "don't" is common in real `.S` files -- so lexing `'` as C
+    /// does swallows the rest of the line and mangles the output.
+    ///
+    /// `;` is a statement separator rather than a comment introducer, and is
+    /// passed through for the assembler to interpret. `//` and `/* */` are
+    /// comments in both modes; GCC strips them from assembly too.
     Assembly,
+}
+
+/// Where a header name (C99 6.4.7) may appear.
+///
+/// A header name is one preprocessing token, but only in a `#include`,
+/// `#include_next` or `#import` directive and inside `__has_include(...)`.
+/// Everywhere else `<` and `"` mean what they always mean, so the lexer has
+/// to be told which it is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderNamePos {
+    /// Not in a directive that can contain one.
+    No,
+    /// A `#` has just started a line.
+    AfterHash,
+    /// Inside `#if`/`#elif`, where `__has_include(` can introduce one.
+    InCondition,
+    /// `__has_include` seen inside a condition; a `(` opens the header name.
+    AfterHasInclude,
+    /// The next token is a header name if it opens with `<` or `"`.
+    Expect { in_condition: bool },
 }
 
 // ============================================================================
@@ -123,6 +152,14 @@ pub enum TokenType {
     Utf16String,
     /// `U"..."` — a `char32_t` string literal.
     Utf32String,
+    /// A header name: `<stdio.h>` or `"local.h"` (C99 6.4.7).
+    ///
+    /// One preprocessing token, delimiters and all, and only where a header
+    /// name can appear -- after `#include` and inside `__has_include`. None
+    /// of the ordinary rules apply between the delimiters, so lexing the
+    /// characters as tokens destroyed any header whose name contained `//`
+    /// or an apostrophe.
+    HeaderName,
     Special,
     StreamBegin,
     StreamEnd,
@@ -195,6 +232,71 @@ pub(crate) fn report_forbidden_ucn(pos: Position, val: u32) {
 
 pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
     (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60) || (0xD800..=0xDFFF).contains(&val)
+}
+
+// ============================================================================
+// Translation phase 2 (line splicing)
+// ============================================================================
+
+/// Delete the run of backslash-newline splices starting at `offset`, returning
+/// the offset of the first byte that survives phase 2 and how many source
+/// lines were crossed to reach it.
+///
+/// This is the single definition of what phase 2 deletes. Every scanner below
+/// -- the consuming `nextchar`, the non-consuming `peekchar`, and the UCN
+/// lookahead -- goes through it, because they must agree byte for byte: the
+/// three hand-written copies this replaces disagreed in three separate places,
+/// each of which silently mislexed valid source rather than diagnosing it.
+///
+/// `splice` is false for a `.i` operand, where a surviving backslash-newline
+/// is text rather than a joint and nothing is deleted.
+fn skip_splices(buffer: &[u8], mut offset: usize, splice: bool) -> (usize, u32) {
+    if !splice {
+        return (offset, 0);
+    }
+    let mut lines = 0;
+    // A backslash as the final byte of the buffer has no newline to join to.
+    while offset + 1 < buffer.len() && buffer[offset] == b'\\' {
+        match buffer[offset + 1] {
+            b'\n' => offset += 2,
+            b'\r' => {
+                offset += 2;
+                if buffer.get(offset) == Some(&b'\n') {
+                    offset += 1;
+                }
+            }
+            _ => break,
+        }
+        lines += 1;
+    }
+    (offset, lines)
+}
+
+/// Non-consuming lookahead over the source, yielding exactly the characters
+/// `nextchar` would: splices deleted, every line ending normalised to `\n`.
+///
+/// Lookahead past a single character has to go through this rather than index
+/// the buffer directly, or it sees characters the consumer will not see (and
+/// vice versa) as soon as a splice lands in the middle of a token.
+struct Peek<'a> {
+    buffer: &'a [u8],
+    offset: usize,
+    splice: bool,
+}
+
+impl Peek<'_> {
+    fn next(&mut self) -> Option<u8> {
+        let (offset, _) = skip_splices(self.buffer, self.offset, self.splice);
+        let c = *self.buffer.get(offset)?;
+        self.offset = offset + 1;
+        if c == b'\r' {
+            if self.buffer.get(self.offset) == Some(&b'\n') {
+                self.offset += 1;
+            }
+            return Some(b'\n');
+        }
+        Some(c)
+    }
 }
 
 impl SpecialToken {
@@ -287,10 +389,17 @@ pub type IdentTable = StringTable;
 #[derive(Debug, Clone)]
 pub enum TokenValue {
     None,
-    Number(String),     // Numeric literal as string (pp-number)
-    Ident(StringId),    // Identifier (interned StringId)
-    Special(u32),       // Operator/punctuator
-    String(String),     // String literal content
+    Number(String),  // Numeric literal as string (pp-number)
+    Ident(StringId), // Identifier (interned StringId)
+    Special(u32),    // Operator/punctuator
+    /// String literal content, as written between the quotes.
+    ///
+    /// Holds one `char` per source *byte*, not one per character: the lexer
+    /// reads bytes and the back end needs the byte count. A `char` here is
+    /// therefore always < 0x100, and text from anywhere else has to be put in
+    /// that form with [`literal_payload`] before it can go in a payload.
+    /// [`payload_bytes`] reads it back out.
+    String(String),
     Char(String),       // Character literal content
     WideString(String), // Wide string literal
     WideChar(String),   // Wide character literal
@@ -304,6 +413,10 @@ pub enum TokenValue {
     Utf16Char(String),
     /// `U'x'` content.
     Utf32Char(String),
+    /// A header name (C99 6.4.7), spelling and delimiters included, as in
+    /// `<stdio.h>` or `"local.h"`. A payload like the literals above: one
+    /// `char` per source byte.
+    HeaderName(String),
 }
 
 // ============================================================================
@@ -316,6 +429,16 @@ pub struct Token {
     pub typ: TokenType,
     pub pos: Position,
     pub value: TokenValue,
+    /// Spelled `u8"..."`.
+    ///
+    /// The one thing [`TokenType`] cannot say about a literal. C11 6.4.5p6
+    /// gives a `u8` string type `char[]`, so it *is* a narrow string
+    /// everywhere but in its spelling -- which 6.10.3.2p2 makes `#`
+    /// reproduce, and which `-E` has to round-trip. Kept as a flag beside the
+    /// type rather than as a type of its own so that a path which fails to
+    /// carry it loses the prefix, the way every path did before, instead of
+    /// losing the string.
+    pub utf8_prefix: bool,
     /// Macros that should not expand this token (C preprocessor "blue painting").
     /// When a macro's expansion contains its own name, those tokens are marked.
     /// This prevents re-expansion in nested contexts per C99 6.10.3.4.
@@ -328,6 +451,7 @@ impl Token {
             typ,
             pos,
             value: TokenValue::None,
+            utf8_prefix: false,
             no_expand: None,
         }
     }
@@ -337,7 +461,19 @@ impl Token {
             typ,
             pos,
             value,
+            utf8_prefix: false,
             no_expand: None,
+        }
+    }
+
+    /// The encoding prefix this literal is written with, for the token types
+    /// that do not imply one. Only `u8` qualifies: `L`, `u` and `U` are each
+    /// a token type of their own.
+    pub fn encoding_prefix(&self) -> &'static str {
+        if self.utf8_prefix {
+            "u8"
+        } else {
+            ""
         }
     }
 
@@ -530,98 +666,67 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
     /// Get next character, handling line splicing (backslash-newline)
     fn nextchar(&mut self) -> i32 {
-        loop {
-            if self.offset >= self.buffer.len() {
-                return EOF;
-            }
-
-            let c = self.buffer[self.offset] as i32;
-            self.offset += 1;
-
-            // Handle carriage return
-            if c == b'\r' as i32 {
-                // Check for \r\n
-                if self.offset < self.buffer.len() && self.buffer[self.offset] == b'\n' {
-                    self.offset += 1;
-                }
-                self.line += 1;
-                self.col = 0;
-                self.newline = true;
-                return b'\n' as i32;
-            }
-
-            // Handle newline
-            if c == b'\n' as i32 {
-                self.line += 1;
-                self.col = 0;
-                self.newline = true;
-                return c;
-            }
-
-            // Handle backslash (potential line splice)
-            if self.splice && c == b'\\' as i32 && self.offset < self.buffer.len() {
-                let next = self.buffer[self.offset];
-                if next == b'\n' {
-                    // Line splice: skip backslash-newline
-                    self.offset += 1;
-                    self.line += 1;
-                    self.col = 0;
-                    continue;
-                } else if next == b'\r' {
-                    // Line splice with \r or \r\n
-                    self.offset += 1;
-                    if self.offset < self.buffer.len() && self.buffer[self.offset] == b'\n' {
-                        self.offset += 1;
-                    }
-                    self.line += 1;
-                    self.col = 0;
-                    continue;
-                }
-            }
-
-            // Handle tab
-            if c == b'\t' as i32 {
-                self.col = (self.col + 8) & !7; // Round to next multiple of 8
-            } else {
-                self.col += 1;
-            }
-
-            return c;
+        let (offset, lines) = skip_splices(self.buffer, self.offset, self.splice);
+        if lines > 0 {
+            self.offset = offset;
+            self.line += lines;
+            self.col = 0;
         }
+
+        if self.offset >= self.buffer.len() {
+            return EOF;
+        }
+        let c = self.buffer[self.offset];
+        self.offset += 1;
+
+        // Handle carriage return
+        if c == b'\r' {
+            // Check for \r\n
+            if self.offset < self.buffer.len() && self.buffer[self.offset] == b'\n' {
+                self.offset += 1;
+            }
+            self.line += 1;
+            self.col = 0;
+            self.newline = true;
+            return b'\n' as i32;
+        }
+
+        // Handle newline
+        if c == b'\n' {
+            self.line += 1;
+            self.col = 0;
+            self.newline = true;
+            return c as i32;
+        }
+
+        // Handle tab.
+        //
+        // The column is only ever reported, never computed with, so a line
+        // wider than `col` can hold pins the count at the maximum. Machine-
+        // generated and minified C routinely exceeds 65535 columns, where the
+        // unchecked arithmetic wrapped to a nonsense column in a release build
+        // and panicked outright in a debug one.
+        if c == b'\t' {
+            self.col = self.col.saturating_add(8) & !7; // Round to next multiple of 8
+        } else {
+            self.col = self.col.saturating_add(1);
+        }
+
+        c as i32
     }
 
     /// Peek at next character without consuming (handles line splicing)
     fn peekchar(&self) -> i32 {
-        let mut offset = self.offset;
-        loop {
-            if offset >= self.buffer.len() {
-                return EOF;
-            }
-            let c = self.buffer[offset];
+        self.peek_at(self.offset).next().map_or(EOF, i32::from)
+    }
 
-            // Handle backslash (potential line splice)
-            if self.splice && c == b'\\' && offset + 1 < self.buffer.len() {
-                let next = self.buffer[offset + 1];
-                if next == b'\n' {
-                    // Skip backslash-newline
-                    offset += 2;
-                    continue;
-                } else if next == b'\r' {
-                    // Skip backslash-CR or backslash-CRLF
-                    offset += 2;
-                    if offset < self.buffer.len() && self.buffer[offset] == b'\n' {
-                        offset += 1;
-                    }
-                    continue;
-                }
-            }
-
-            // Handle \r as \n
-            if c == b'\r' {
-                return b'\n' as i32;
-            }
-
-            return c as i32;
+    /// A lookahead reader starting at `offset`, walking the buffer the way
+    /// `nextchar` does.
+    fn peek_at(&self, offset: usize) -> Peek<'a> {
+        Peek {
+            buffer: self.buffer,
+            offset,
+            splice: self.splice,
         }
     }
 
@@ -681,73 +786,36 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Token::with_value(TokenType::Number, pos, TokenValue::Number(num))
     }
 
-    /// Peek at buffer to check if there's a valid UCN sequence starting at current position.
-    /// If the buffer contains \uXXXX or \UXXXXXXXX (where X is hex digit), returns
-    /// Some((decoded_char, bytes_consumed)) where bytes_consumed includes the backslash.
-    /// Returns None if not a valid UCN.
+    /// The character a UCN at the current position denotes, and how many
+    /// `nextchar()` calls consume it.
+    ///
+    /// The count is in characters, not bytes. Phase 2 deletes splices for free
+    /// inside a single `nextchar`, so a byte count over-consumes by the length
+    /// of every splice the UCN spans -- silently eating the source characters
+    /// that follow it.
     fn peek_ucn(&self) -> Option<(char, usize)> {
-        let mut offset = self.offset;
-
-        // Skip any line splices to find the actual backslash. With phase 2
-        // off -- a `.i` operand -- there are none to skip, and a backslash
-        // before a newline is text rather than a joint.
-        loop {
-            if offset >= self.buffer.len() {
-                return None;
-            }
-            let c = self.buffer[offset];
-            if self.splice && c == b'\\' && offset + 1 < self.buffer.len() {
-                let next = self.buffer[offset + 1];
-                if next == b'\n' {
-                    offset += 2;
-                    continue;
-                } else if next == b'\r' {
-                    offset += 2;
-                    if offset < self.buffer.len() && self.buffer[offset] == b'\n' {
-                        offset += 1;
-                    }
-                    continue;
-                }
-                // Found non-splice backslash
-                break;
-            }
-            // Not a backslash at all
+        let mut peek = self.peek_at(self.offset);
+        if peek.next()? != b'\\' {
             return None;
         }
+        let (ch, digits) = self.peek_ucn_after_backslash(&mut peek)?;
+        Some((ch, 2 + digits))
+    }
 
-        // Now offset points to backslash, check for 'u' or 'U'
-        if offset + 1 >= self.buffer.len() {
-            return None;
-        }
-
-        let u_char = self.buffer[offset + 1];
-        let expected_digits = match u_char {
+    /// Shared tail of both UCN entry points, with `peek` positioned just past
+    /// the backslash. Returns the character and how many hex digits spelled it.
+    fn peek_ucn_after_backslash(&self, peek: &mut Peek<'_>) -> Option<(char, usize)> {
+        let digits = match peek.next()? {
             b'u' => 4,
             b'U' => 8,
             _ => return None,
         };
 
-        // Check we have enough hex digits
-        if offset + 2 + expected_digits > self.buffer.len() {
-            return None;
+        let mut val: u32 = 0;
+        for _ in 0..digits {
+            val = val * 16 + (peek.next()? as char).to_digit(16)?;
         }
 
-        let hex_start = offset + 2;
-        let hex_end = hex_start + expected_digits;
-
-        // Validate all characters are hex digits
-        for i in hex_start..hex_end {
-            if !self.buffer[i].is_ascii_hexdigit() {
-                return None;
-            }
-        }
-
-        // Parse the hex value
-        let hex_str: String = self.buffer[hex_start..hex_end]
-            .iter()
-            .map(|&b| b as char)
-            .collect();
-        let val = u32::from_str_radix(&hex_str, 16).ok()?;
         // C17 6.4.3p2. Diagnosed here rather than folded into the `?` below,
         // because a forbidden UCN is a constraint violation and not simply
         // "no UCN here": returning `None` would leave the backslash to be
@@ -756,74 +824,75 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             report_forbidden_ucn(self.pos(), val);
             return None;
         }
-        let ch = char::from_u32(val)?;
 
-        // Calculate bytes consumed from self.offset
-        let bytes_consumed = hex_end - self.offset;
-        Some((ch, bytes_consumed))
+        Some((char::from_u32(val)?, digits))
     }
 
     /// Try to consume a UCN sequence. If successful, returns the decoded character.
     /// Otherwise returns None and leaves position unchanged.
     fn try_consume_ucn(&mut self) -> Option<char> {
-        if let Some((ch, bytes)) = self.peek_ucn() {
-            // Consume the bytes by calling nextchar the right number of times
-            // This properly handles line/col tracking
-            for _ in 0..bytes {
-                self.nextchar();
-            }
-            Some(ch)
-        } else {
-            None
-        }
+        let (ch, chars) = self.peek_ucn()?;
+        self.consume_chars(chars);
+        Some(ch)
     }
 
     /// Try to consume a UCN sequence when the backslash has already been consumed.
     /// Expects the next character to be 'u' or 'U'.
     /// Returns the decoded character if successful, None otherwise.
     fn try_consume_ucn_after_backslash(&mut self) -> Option<char> {
-        let c = self.peekchar();
-        if c == EOF {
-            return None;
+        let mut peek = self.peek_at(self.offset);
+        let (ch, digits) = self.peek_ucn_after_backslash(&mut peek)?;
+        self.consume_chars(1 + digits);
+        Some(ch)
+    }
+
+    /// Consume `count` characters, letting `nextchar` keep line and column in
+    /// step. A lookahead count is always in characters for this reason.
+    fn consume_chars(&mut self, count: usize) {
+        for _ in 0..count {
+            self.nextchar();
         }
+    }
 
-        let expected_digits = match c as u8 {
-            b'u' => 4,
-            b'U' => 8,
-            _ => return None,
-        };
-
-        // Check we have enough hex digits after the u/U
-        // Peek ahead without consuming
-        let mut offset = self.offset;
-        // Skip 'u' or 'U'
-        offset += 1;
-
-        if offset + expected_digits > self.buffer.len() {
-            return None;
-        }
-
-        // Validate all characters are hex digits
-        for i in 0..expected_digits {
-            if !self.buffer[offset + i].is_ascii_hexdigit() {
+    /// Scan the rest of an identifier onto `name`, stopping at the first
+    /// character that cannot continue one.
+    ///
+    /// Returns the character it stopped on, so the caller can decide whether
+    /// it means something there -- an encoding prefix is only a prefix when a
+    /// quote follows it. Shared by both entry points: the duplicate of this
+    /// loop is what let the UCN over-consumption bug reach each of them
+    /// independently.
+    fn scan_identifier_tail(&mut self, name: &mut String) -> Option<u8> {
+        loop {
+            // Use peek to avoid consuming characters that would affect line/col tracking
+            let c = self.peekchar();
+            if c == EOF {
                 return None;
             }
-        }
+            let cu = c as u8;
 
-        // Now consume and parse
-        self.nextchar(); // consume 'u' or 'U'
+            // Check for UCN escape sequence (\uXXXX or \UXXXXXXXX) - C99 6.4.3
+            if cu == b'\\' {
+                match self.try_consume_ucn() {
+                    Some(uc) => name.push(uc),
+                    // Not a valid UCN, end identifier
+                    None => return Some(cu),
+                }
+                continue;
+            }
 
-        let mut hex = String::new();
-        for _ in 0..expected_digits {
-            hex.push(self.nextchar() as u8 as char);
+            if !is_letter_or_digit(cu) {
+                return Some(cu);
+            }
+            self.nextchar(); // Now consume it
+            name.push(cu as char);
         }
+    }
 
-        let val = u32::from_str_radix(&hex, 16).ok()?;
-        if ucn_is_forbidden(val) {
-            report_forbidden_ucn(self.pos(), val);
-            return None;
-        }
-        char::from_u32(val)
+    /// Intern `name` as an identifier token at `pos`.
+    fn ident_token(&mut self, pos: Position, name: &str) -> Token {
+        let id = self.strings.intern(name);
+        Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
     }
 
     /// Get an identifier token
@@ -832,49 +901,26 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         let mut name = String::new();
         name.push(first as char);
 
-        loop {
-            // Use peek to avoid consuming characters that would affect line/col tracking
-            let c = self.peekchar();
-            if c == EOF {
-                break;
-            }
-            let cu = c as u8;
-
-            // Check for UCN escape sequence (\uXXXX or \UXXXXXXXX) - C99 6.4.3
-            if cu == b'\\' {
-                if let Some(uc) = self.try_consume_ucn() {
-                    name.push(uc);
-                    continue;
+        // An encoding prefix directly before a quote: L, u, U, u8
+        // (C11 6.4.4.4 / 6.4.5). `u8` applies to strings only.
+        // Assembly has no such prefixes.
+        if let Some(cu) = self.scan_identifier_tail(&mut name) {
+            if self.mode == LexerMode::C && (cu == b'"' || cu == b'\'') {
+                let enc = match name.as_str() {
+                    "L" => Some(LiteralEncoding::Wide),
+                    "u" => Some(LiteralEncoding::Utf16),
+                    "U" => Some(LiteralEncoding::Utf32),
+                    "u8" if cu == b'"' => Some(LiteralEncoding::Utf8),
+                    _ => None,
+                };
+                if let Some(enc) = enc {
+                    self.nextchar(); // Consume the quote
+                    return self.get_string_or_char(cu, enc);
                 }
-                // Not a valid UCN, end identifier
-                break;
-            }
-
-            if is_letter_or_digit(cu) {
-                self.nextchar(); // Now consume it
-                name.push(cu as char);
-            } else {
-                // An encoding prefix directly before a quote: L, u, U, u8
-                // (C11 6.4.4.4 / 6.4.5). `u8` applies to strings only.
-                if cu == b'"' || cu == b'\'' {
-                    let enc = match name.as_str() {
-                        "L" => Some(LiteralEncoding::Wide),
-                        "u" => Some(LiteralEncoding::Utf16),
-                        "U" => Some(LiteralEncoding::Utf32),
-                        "u8" if cu == b'"' => Some(LiteralEncoding::Utf8),
-                        _ => None,
-                    };
-                    if let Some(enc) = enc {
-                        self.nextchar(); // Consume the quote
-                        return self.get_string_or_char(cu, enc);
-                    }
-                }
-                break;
             }
         }
 
-        let id = self.strings.intern(&name);
-        Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
+        self.ident_token(pos, &name)
     }
 
     /// Get an identifier token starting with a UCN character (already consumed)
@@ -882,33 +928,8 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         let pos = self.pos();
         let mut name = String::new();
         name.push(first_ucn);
-
-        loop {
-            let c = self.peekchar();
-            if c == EOF {
-                break;
-            }
-            let cu = c as u8;
-
-            // Check for UCN escape sequence
-            if cu == b'\\' {
-                if let Some(uc) = self.try_consume_ucn() {
-                    name.push(uc);
-                    continue;
-                }
-                break;
-            }
-
-            if is_letter_or_digit(cu) {
-                self.nextchar();
-                name.push(cu as char);
-            } else {
-                break;
-            }
-        }
-
-        let id = self.strings.intern(&name);
-        Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
+        self.scan_identifier_tail(&mut name);
+        self.ident_token(pos, &name)
     }
 
     /// Get a string or character literal
@@ -1001,7 +1022,11 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         };
 
-        Token::with_value(typ, pos, value)
+        let mut token = Token::with_value(typ, pos, value);
+        // `u8` is folded into the narrow type above; the flag is what keeps
+        // the spelling, which `#` and `-E` both have to reproduce.
+        token.utf8_prefix = enc == LiteralEncoding::Utf8;
+        token
     }
 
     /// Skip a single-line comment (// ...)
@@ -1045,8 +1070,9 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     fn get_special(&mut self, first: u8, class: u8) -> Option<Token> {
         let pos = self.pos();
 
-        // Check for string/char literals
-        if class & QUOTE != 0 {
+        // Check for string/char literals. Assembly mode admits only `"`; see
+        // LexerMode::Assembly for why `'` is an ordinary punctuator there.
+        if class & QUOTE != 0 && (first == b'"' || self.mode == LexerMode::C) {
             return Some(self.get_string_or_char(first, LiteralEncoding::Narrow));
         }
 
@@ -1058,34 +1084,27 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         }
 
-        // Check for comments (mode-dependent)
+        // Check for comments. Both modes strip `//` and `/* */`, as GCC does
+        // for assembler-with-cpp.
+        //
+        // Translation phase 3 replaces each comment with one space, so the
+        // token after a comment is "preceded by whitespace" even when no
+        // actual space is there. That flag is what `#` stringification and -E
+        // spacing read, so without it `S(a/**/b)` stringified as "ab" instead
+        // of "a b".
         if class & COMMENT != 0 {
-            match self.mode {
-                LexerMode::C => {
-                    // C mode: // and /* */ comments.
-                    //
-                    // Translation phase 3 replaces each comment with one space,
-                    // so the token after a comment is "preceded by whitespace"
-                    // even when no actual space is there. That flag is what
-                    // `#` stringification and -E spacing read, so without it
-                    // `S(a/**/b)` stringified as "ab" instead of "a b".
-                    let next = self.peekchar();
-                    if next == b'/' as i32 {
-                        self.nextchar();
-                        self.skip_line_comment();
-                        self.whitespace = true;
-                        return None; // No token, continue tokenizing
-                    }
-                    if next == b'*' as i32 {
-                        self.nextchar();
-                        self.skip_block_comment();
-                        self.whitespace = true;
-                        return None; // No token, continue tokenizing
-                    }
-                }
-                LexerMode::Assembly => {
-                    // Assembly mode: comment handling is left to the assembler.
-                }
+            let next = self.peekchar();
+            if next == b'/' as i32 {
+                self.nextchar();
+                self.skip_line_comment();
+                self.whitespace = true;
+                return None; // No token, continue tokenizing
+            }
+            if next == b'*' as i32 {
+                self.nextchar();
+                self.skip_block_comment();
+                self.whitespace = true;
+                return None; // No token, continue tokenizing
             }
         }
 
@@ -1133,27 +1152,21 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
             if next == b':' as i32 {
                 self.nextchar();
-                // Check for %:%: (digraph for ##)
-                let third = self.peekchar();
-                if third == b'%' as i32 {
-                    // Save position in case we need to back out
-                    let saved_offset = self.offset;
-                    let saved_col = self.col;
-                    self.nextchar(); // consume second %
-                    let fourth = self.peekchar();
-                    if fourth == b':' as i32 {
-                        self.nextchar(); // consume second :
-                        return Some(Token::with_value(
-                            TokenType::Special,
-                            pos,
-                            TokenValue::Special(SpecialToken::HashHash as u32),
-                        ));
-                    }
-                    // Not %:%: — back out the third char (%)
-                    self.offset = saved_offset;
-                    self.col = saved_col;
+                // %:%: is the digraph for ##. Decided by looking two characters
+                // ahead rather than by consuming and backing out: rewinding
+                // `offset` cannot undo the line counting a splice between the
+                // two halves already did, and the double count desynchronised
+                // __LINE__ for the rest of the file.
+                let mut peek = self.peek_at(self.offset);
+                if peek.next() == Some(b'%') && peek.next() == Some(b':') {
+                    self.consume_chars(2);
+                    return Some(Token::with_value(
+                        TokenType::Special,
+                        pos,
+                        TokenValue::Special(SpecialToken::HashHash as u32),
+                    ));
                 }
-                // Just %: → #
+                // Just %: -> #
                 return Some(Token::with_value(
                     TokenType::Special,
                     pos,
@@ -1273,12 +1286,96 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         self.get_special(c, class)
     }
 
+    /// Lex a header name (C99 6.4.7), the opening delimiter already consumed.
+    ///
+    /// Between the delimiters the source is one preprocessing token: `//` is
+    /// not a comment, `'` does not open a character literal, and `\` is not
+    /// an escape. Lexing those as ordinary tokens destroyed the directive --
+    /// `#include <sys//types.h>` lost everything after the `//`, and
+    /// `#include <it's.h>` opened a literal that ate the rest of the file.
+    ///
+    /// Returns `None` when no closing delimiter arrives before the end of the
+    /// line, leaving the characters to be lexed as before. The whole file is
+    /// tokenized up front, including `#if 0` blocks full of prose, so a run
+    /// that is not a header name has to lex the way it always did.
+    fn try_get_header_name(&mut self, open: u8) -> Option<Token> {
+        let close = if open == b'<' { b'>' } else { b'"' };
+
+        let mut peek = self.peek_at(self.offset);
+        let mut len = 0;
+        loop {
+            match peek.next() {
+                None | Some(b'\n') => return None,
+                Some(c) => {
+                    len += 1;
+                    if c == close {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let pos = self.pos();
+        let mut spelling = String::with_capacity(len + 1);
+        spelling.push(open as char);
+        for _ in 0..len {
+            spelling.push(self.nextchar() as u8 as char);
+        }
+        Some(Token::with_value(
+            TokenType::HeaderName,
+            pos,
+            TokenValue::HeaderName(spelling),
+        ))
+    }
+
+    /// Advance the header-name state machine past `token`.
+    fn next_header_name_pos(&self, state: HeaderNamePos, token: &Token) -> HeaderNamePos {
+        use HeaderNamePos::*;
+
+        let ident = match &token.value {
+            TokenValue::Ident(id) => Some(self.strings.get(*id)),
+            _ => None,
+        };
+        let is_punct = |c: u8| matches!(&token.value, TokenValue::Special(v) if *v == c as u32);
+
+        // A `#` starting a line restarts the machine wherever it was.
+        if token.pos.newline && is_punct(b'#') {
+            return AfterHash;
+        }
+
+        match state {
+            No => No,
+            AfterHash => match ident {
+                Some("include" | "include_next" | "import") => Expect {
+                    in_condition: false,
+                },
+                Some("if" | "elif") => InCondition,
+                _ => No,
+            },
+            InCondition | AfterHasInclude => match ident {
+                Some("__has_include" | "__has_include_next") => AfterHasInclude,
+                None if state == AfterHasInclude && is_punct(b'(') => Expect { in_condition: true },
+                _ => InCondition,
+            },
+            // A condition may name more than one header.
+            Expect { in_condition } => {
+                if in_condition {
+                    InCondition
+                } else {
+                    No
+                }
+            }
+        }
+    }
+
     /// Tokenize the entire input, returning all tokens
     pub fn tokenize(&mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
 
         // Add stream begin token
         tokens.push(Token::new(TokenType::StreamBegin, self.pos()));
+
+        let mut header_pos = HeaderNamePos::No;
 
         loop {
             // Skip whitespace - this updates newline/whitespace flags
@@ -1287,15 +1384,39 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 break;
             }
 
-            if let Some(token) = self.get_one_token(c as u8) {
-                tokens.push(token);
-                // Reset flags for next token (only after we've captured position)
-                // Don't reset if comment was skipped - the comment may have consumed
-                // newlines that affect the next token's position flags
-                self.newline = false;
-                self.whitespace = false;
+            // The flags belong to the token about to be lexed, so hand them
+            // over and clear them here rather than afterwards. Lexing can set
+            // `newline` again -- an unterminated literal ends at the newline it
+            // ran into -- and that newline belongs to the *next* token, which
+            // does start a line. Clearing afterwards swallowed it, so a `#` on
+            // the following line stopped introducing a directive and one
+            // diagnostic became a cascade.
+            let newline = std::mem::take(&mut self.newline);
+            let whitespace = std::mem::take(&mut self.whitespace);
+
+            // C99 6.4.7: where a header name can appear, it is one token and
+            // none of the ordinary rules apply inside it.
+            let header = matches!(header_pos, HeaderNamePos::Expect { .. })
+                && (c == b'<' as i32 || c == b'"' as i32);
+            let token = if header {
+                self.try_get_header_name(c as u8)
+            } else {
+                None
+            };
+
+            match token.or_else(|| self.get_one_token(c as u8)) {
+                Some(mut token) => {
+                    token.pos.newline = newline;
+                    token.pos.whitespace = whitespace;
+                    header_pos = self.next_header_name_pos(header_pos, &token);
+                    tokens.push(token);
+                }
+                // A comment produced no token. It is transparent to
+                // start-of-line status, so give back what it inherited; a `//`
+                // comment additionally ran through the newline that starts the
+                // next line, and that one stands.
+                None => self.newline |= newline,
             }
-            // If get_one_token returns None (comment), continue without resetting flags
         }
 
         // Add stream end token
@@ -1316,37 +1437,102 @@ pub fn show_special(value: u32) -> String {
         return (value as u8 as char).to_string();
     }
 
-    match value {
-        x if x == SpecialToken::AddAssign as u32 => "+=".to_string(),
-        x if x == SpecialToken::Increment as u32 => "++".to_string(),
-        x if x == SpecialToken::SubAssign as u32 => "-=".to_string(),
-        x if x == SpecialToken::Decrement as u32 => "--".to_string(),
-        x if x == SpecialToken::Arrow as u32 => "->".to_string(),
-        x if x == SpecialToken::MulAssign as u32 => "*=".to_string(),
-        x if x == SpecialToken::DivAssign as u32 => "/=".to_string(),
-        x if x == SpecialToken::ModAssign as u32 => "%=".to_string(),
-        x if x == SpecialToken::Lte as u32 => "<=".to_string(),
-        x if x == SpecialToken::Gte as u32 => ">=".to_string(),
-        x if x == SpecialToken::Equal as u32 => "==".to_string(),
-        x if x == SpecialToken::NotEqual as u32 => "!=".to_string(),
-        x if x == SpecialToken::LogicalAnd as u32 => "&&".to_string(),
-        x if x == SpecialToken::AndAssign as u32 => "&=".to_string(),
-        x if x == SpecialToken::LogicalOr as u32 => "||".to_string(),
-        x if x == SpecialToken::OrAssign as u32 => "|=".to_string(),
-        x if x == SpecialToken::XorAssign as u32 => "^=".to_string(),
-        x if x == SpecialToken::HashHash as u32 => "##".to_string(),
-        x if x == SpecialToken::LeftShift as u32 => "<<".to_string(),
-        x if x == SpecialToken::RightShift as u32 => ">>".to_string(),
-        x if x == SpecialToken::DotDot as u32 => "..".to_string(),
-        x if x == SpecialToken::ShlAssign as u32 => "<<=".to_string(),
-        x if x == SpecialToken::ShrAssign as u32 => ">>=".to_string(),
-        x if x == SpecialToken::Ellipsis as u32 => "...".to_string(),
-        _ => format!("<special:{}>", value),
+    match SpecialToken::from_code(value) {
+        Some(punct) => punct.spelling().to_string(),
+        None => format!("<special:{}>", value),
     }
 }
 
-/// Format a token for display
+/// The encoding prefix, delimiter and payload of a literal token, or `None`
+/// if the token is not a literal (or its type and value disagree).
+///
+/// One arm per literal type, replacing eight near-identical blocks that each
+/// had to be edited in step.
+fn literal_parts(token: &Token) -> Option<(&'static str, u8, &str)> {
+    let (prefix, delim, payload) = match (token.typ, &token.value) {
+        (TokenType::String, TokenValue::String(s)) => (token.encoding_prefix(), b'"', s),
+        (TokenType::WideString, TokenValue::WideString(s)) => ("L", b'"', s),
+        (TokenType::Utf16String, TokenValue::Utf16String(s)) => ("u", b'"', s),
+        (TokenType::Utf32String, TokenValue::Utf32String(s)) => ("U", b'"', s),
+        (TokenType::Char, TokenValue::Char(s)) => ("", b'\'', s),
+        (TokenType::WideChar, TokenValue::WideChar(s)) => ("L", b'\'', s),
+        (TokenType::Utf16Char, TokenValue::Utf16Char(s)) => ("u", b'\'', s),
+        (TokenType::Utf32Char, TokenValue::Utf32Char(s)) => ("U", b'\'', s),
+        _ => return None,
+    };
+    Some((prefix, delim, payload.as_str()))
+}
+
+/// Encode Rust text as a literal payload: one `char` per UTF-8 byte.
+///
+/// A literal's payload holds the literal's *source bytes*, one per `char`
+/// (see [`TokenValue::String`]). Text arriving from anywhere else -- a file
+/// name for `__FILE__`, an identifier being stringified -- is an ordinary
+/// Rust string and has to be converted, or the two conventions mix inside one
+/// payload and neither its byte count nor its spelling comes out right.
+pub fn literal_payload(text: &str) -> String {
+    text.bytes().map(char::from).collect()
+}
+
+/// The source bytes a literal payload stands for.
+pub fn payload_bytes(payload: &str) -> impl Iterator<Item = u8> + '_ {
+    payload.chars().map(|c| c as u8)
+}
+
+/// The text a literal payload holds, decoded from its source bytes.
+///
+/// The inverse of [`literal_payload`], for the consumers that need Rust text
+/// rather than bytes: a header name to open, a symbol name, a message to
+/// print. Reading a payload as if it were already text instead produced
+/// mojibake -- `#include "café.h"` looked for `cafÃ©.h` and reported it
+/// missing. Lossy when the bytes are not valid UTF-8; where the bytes
+/// themselves matter, use [`payload_bytes`].
+pub fn payload_text(payload: &str) -> String {
+    let bytes: Vec<u8> = payload_bytes(payload).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Append a token's source spelling to `out`, byte for byte.
+///
+/// Literals have to be written a byte at a time. Formatting a payload through
+/// a Rust `String` UTF-8-encodes each of its `char`s, so every source byte of
+/// 0x80 or more became two: a literal holding an accented letter left `c17 -E`
+/// longer than it went in, and preprocessing a file then compiling it changed
+/// what the string held.
+pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
+    match literal_parts(token) {
+        Some((prefix, delim, payload)) => {
+            out.extend_from_slice(prefix.as_bytes());
+            out.push(delim);
+            out.extend(payload_bytes(payload));
+            out.push(delim);
+        }
+        // A header name already carries its own delimiters.
+        None => match &token.value {
+            TokenValue::HeaderName(h) if token.typ == TokenType::HeaderName => {
+                out.extend(payload_bytes(h))
+            }
+            _ => out.extend_from_slice(show_other_token(token, strings).as_bytes()),
+        },
+    }
+}
+
+/// Format a token for display.
+///
+/// Lossy for a literal holding bytes that are not valid UTF-8; use
+/// [`write_token`] wherever the exact source bytes matter.
 pub fn show_token(token: &Token, strings: &StringTable) -> String {
+    if literal_parts(token).is_none() {
+        return show_other_token(token, strings);
+    }
+    let mut out = Vec::new();
+    write_token(&mut out, token, strings);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Everything [`literal_parts`] declines: the non-literal token types, plus a
+/// literal whose type and value disagree.
+fn show_other_token(token: &Token, strings: &StringTable) -> String {
     match token.typ {
         TokenType::StreamBegin => "<STREAM_BEGIN>".to_string(),
         TokenType::StreamEnd => "<STREAM_END>".to_string(),
@@ -1368,62 +1554,6 @@ pub fn show_token(token: &Token, strings: &StringTable) -> String {
                 "<number?>".to_string()
             }
         }
-        TokenType::String => {
-            if let TokenValue::String(s) = &token.value {
-                format!("\"{}\"", s)
-            } else {
-                "<string?>".to_string()
-            }
-        }
-        TokenType::WideString => {
-            if let TokenValue::WideString(s) = &token.value {
-                format!("L\"{}\"", s)
-            } else {
-                "<wstring?>".to_string()
-            }
-        }
-        TokenType::Char => {
-            if let TokenValue::Char(s) = &token.value {
-                format!("'{}'", s)
-            } else {
-                "<char?>".to_string()
-            }
-        }
-        TokenType::WideChar => {
-            if let TokenValue::WideChar(s) = &token.value {
-                format!("L'{}'", s)
-            } else {
-                "<wchar?>".to_string()
-            }
-        }
-        TokenType::Utf16String => {
-            if let TokenValue::Utf16String(s) = &token.value {
-                format!("u\"{}\"", s)
-            } else {
-                "<u16string?>".to_string()
-            }
-        }
-        TokenType::Utf32String => {
-            if let TokenValue::Utf32String(s) = &token.value {
-                format!("U\"{}\"", s)
-            } else {
-                "<u32string?>".to_string()
-            }
-        }
-        TokenType::Utf16Char => {
-            if let TokenValue::Utf16Char(s) = &token.value {
-                format!("u'{}'", s)
-            } else {
-                "<u16char?>".to_string()
-            }
-        }
-        TokenType::Utf32Char => {
-            if let TokenValue::Utf32Char(s) = &token.value {
-                format!("U'{}'", s)
-            } else {
-                "<u32char?>".to_string()
-            }
-        }
         TokenType::Special => {
             if let TokenValue::Special(v) = &token.value {
                 show_special(*v)
@@ -1431,6 +1561,15 @@ pub fn show_token(token: &Token, strings: &StringTable) -> String {
                 "<special?>".to_string()
             }
         }
+        TokenType::HeaderName => {
+            if let TokenValue::HeaderName(h) = &token.value {
+                payload_text(h)
+            } else {
+                "<header?>".to_string()
+            }
+        }
+        // A literal type reaches here only when its value does not match.
+        typ => format!("<{}?>", token_type_name(typ).to_lowercase()),
     }
 }
 
@@ -1448,6 +1587,7 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
         TokenType::Utf32Char => "U32CHAR",
         TokenType::Utf16String => "U16STRING",
         TokenType::Utf32String => "U32STRING",
+        TokenType::HeaderName => "HEADER_NAME",
         TokenType::Special => "SPECIAL",
         TokenType::StreamBegin => "STREAM_BEGIN",
         TokenType::StreamEnd => "STREAM_END",
@@ -1458,15 +1598,19 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
 // Token to Text Conversion (for preprocessing output)
 // ============================================================================
 
-/// Convert preprocessed tokens back to text output.
+/// Convert preprocessed tokens back to source text, byte for byte.
 ///
-/// This function handles whitespace/newline preservation based on token positions.
-/// Used for outputting preprocessed assembly files.
-pub fn tokens_to_text(tokens: &[Token], strings: &StringTable) -> String {
-    let mut result = String::new();
+/// Handles whitespace/newline preservation based on token positions. Used for
+/// outputting preprocessed assembly files. Bytes rather than a `String`
+/// because a literal payload is a byte sequence; see [`write_token`].
+///
+/// Not to be confused with `Preprocessor::tokens_to_message`, which renders
+/// tokens for a human to read in a `#error` diagnostic.
+pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8> {
+    let mut result: Vec<u8> = Vec::new();
     let mut last_stream: u16 = 0;
     let mut last_line: u32 = 1;
-    let mut last_char: Option<char> = None;
+    let mut last_char: Option<u8> = None;
 
     for token in tokens {
         // Skip stream markers
@@ -1483,39 +1627,35 @@ pub fn tokens_to_text(tokens: &[Token], strings: &StringTable) -> String {
             last_line = token.pos.line.saturating_sub(1); // Allow line sync below
         }
 
+        let start = result.len();
+        write_token(&mut result, token, strings);
+        let spelling = &result[start..];
+        let first_char = spelling.first().copied();
+
         // Handle newlines: if token is on a new line, add newline(s)
-        if token.pos.newline && !result.is_empty() {
-            // Output newlines to get to the current line
+        if token.pos.newline && start > 0 {
+            let spelling: Vec<u8> = result.split_off(start);
             while last_line < token.pos.line {
-                result.push('\n');
+                result.push(b'\n');
                 last_line += 1;
             }
-        } else if !result.is_empty() {
-            // Determine if space is needed between tokens on the same line
-            let text = show_token(token, strings);
-            let first_char = text.chars().next();
-
-            // Need space if:
-            // 1. Original had whitespace, OR
-            // 2. Adjacent tokens would merge (both alphanumeric/underscore)
-            let would_merge = last_char.is_some_and(|c| c.is_alphanumeric() || c == '_')
-                && first_char.is_some_and(|c| c.is_alphanumeric() || c == '_');
-
-            if token.pos.whitespace || would_merge {
-                result.push(' ');
+            result.extend_from_slice(&spelling);
+        } else if start > 0 {
+            // Need a space if the original had whitespace, or if the adjacent
+            // tokens would otherwise merge (both alphanumeric/underscore).
+            let merges = |c: Option<u8>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if token.pos.whitespace || (merges(last_char) && merges(first_char)) {
+                result.insert(start, b' ');
             }
         }
 
-        // Output the token content
-        let text = show_token(token, strings);
-        last_char = text.chars().last();
-        result.push_str(&text);
+        last_char = result.last().copied();
         last_line = token.pos.line;
     }
 
     // Ensure file ends with newline
-    if !result.is_empty() && !result.ends_with('\n') {
-        result.push('\n');
+    if !result.is_empty() && !result.ends_with(b"\n") {
+        result.push(b'\n');
     }
 
     result
@@ -1797,13 +1937,70 @@ mod tests {
 
     #[test]
     fn test_preprocessor_tokens() {
+        // C99 6.4.7: the header name is one preprocessing token, delimiters
+        // included. Lexed as `<`, `stdio`, `.`, `h`, `>` it had to be
+        // reassembled afterwards, and anything the ordinary rules touched --
+        // a `//`, an apostrophe -- never survived to be reassembled.
         let (tokens, idents) = tokenize_str("#include <stdio.h>");
         let toks: Vec<_> = tokens[1..tokens.len() - 1]
             .iter()
             .map(|t| show_token(t, &idents))
             .collect();
-        // # include < stdio . h >
-        assert_eq!(toks, vec!["#", "include", "<", "stdio", ".", "h", ">"]);
+        assert_eq!(toks, vec!["#", "include", "<stdio.h>"]);
+        assert_eq!(tokens[3].typ, TokenType::HeaderName);
+    }
+
+    #[test]
+    fn test_header_name_is_opaque() {
+        for src in [
+            "#include <sys//types.h>",
+            "#include <it's.h>",
+            "#include \"it's.h\"",
+            "#include <a\\b.h>",
+            "#include <a /* not a comment */ b.h>",
+        ] {
+            let (tokens, idents) = tokenize_str(src);
+            assert_eq!(
+                tokens[3].typ,
+                TokenType::HeaderName,
+                "not lexed as a header name: {src}"
+            );
+            let spelled = show_token(&tokens[3], &idents);
+            assert_eq!(spelled, &src["#include ".len()..], "wrong spelling: {src}");
+            // Nothing follows it on the line.
+            assert_eq!(
+                tokens[4].typ,
+                TokenType::StreamEnd,
+                "trailing tokens: {src}"
+            );
+        }
+
+        // `__has_include` in a condition takes one too, and more than one.
+        let (tokens, idents) = tokenize_str("#if __has_include(<a//b.h>) && __has_include(<c.h>)");
+        let headers: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.typ == TokenType::HeaderName)
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(headers, vec!["<a//b.h>", "<c.h>"]);
+    }
+
+    #[test]
+    fn test_header_name_only_where_one_can_appear() {
+        // A `<` outside a header-name context is the operator it always was.
+        let (tokens, idents) = tokenize_str("if (a<b.c>d) x;");
+        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
+        assert_eq!(show_token(&tokens[4], &idents), "<");
+
+        // `#define` is not an include, so `<stdio.h>` there is ordinary.
+        let (tokens, _) = tokenize_str("#define H <stdio.h>");
+        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
+
+        // No closing delimiter before end of line: lex it the old way rather
+        // than swallow the line, which `#if 0` blocks full of prose need.
+        let (tokens, idents) = tokenize_str("#include <unterminated\nint x;");
+        assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
+        assert_eq!(show_token(&tokens[3], &idents), "<");
     }
 
     #[test]
@@ -2219,6 +2416,119 @@ mod tests {
         assert_eq!(show_token(&tokens[1], &idents), "café");
     }
 
+    /// Translation phase 2 runs before phase 3, so a splice anywhere in or
+    /// around a UCN is simply not there by the time the UCN is lexed. The
+    /// UCN lookahead used to count *bytes* and the consumer to spend them as
+    /// *characters*, so each splice silently ate that many source characters.
+    #[test]
+    fn test_ucn_across_line_splices() {
+        // Splice immediately before the UCN: the trailing `zz` must survive.
+        let (tokens, idents) = tokenize_str("caf\\\n\\u00e9zz");
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
+        assert_eq!(tokens[2].typ, TokenType::StreamEnd);
+
+        // Splice between the backslash and the `u`.
+        let (tokens, idents) = tokenize_str("caf\\\\\nu00e9zz");
+        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
+
+        // Splice in the middle of the hex digits.
+        let (tokens, idents) = tokenize_str("caf\\u00\\\ne9zz");
+        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
+
+        // Same, for a UCN that *starts* the identifier.
+        let (tokens, idents) = tokenize_str("\\u00\\\ne9tat");
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "\u{e9}tat");
+
+        // The long form spans more digits, so it spans more splices.
+        let (tokens, idents) = tokenize_str("a\\U000\\\n000\\\ne9b");
+        assert_eq!(show_token(&tokens[1], &idents), "a\u{e9}b");
+    }
+
+    /// An unterminated literal ends at the newline it ran into, so the token
+    /// after it starts a line -- GCC recovers the same way and goes on to
+    /// process a directive there. Clearing the flag after lexing every token
+    /// swallowed that newline.
+    #[test]
+    fn test_unterminated_literal_yields_the_newline_it_ate() {
+        let (tokens, idents) = tokenize_str("char *s = \"abc\n#define ZZZ 9\n");
+        let hash = tokens
+            .iter()
+            .position(|t| show_token(t, &idents) == "#")
+            .expect("the `#` must survive as its own token");
+        assert!(tokens[hash].pos.newline);
+    }
+
+    /// A literal payload holds one `char` per source byte, so its spelling has
+    /// to be written a byte at a time. Formatting one through a Rust `String`
+    /// UTF-8-encoded each of those chars and doubled every byte >= 0x80.
+    #[test]
+    fn test_write_token_emits_source_bytes() {
+        let (tokens, idents) = tokenize_str("\"caf\u{e9}\"");
+        assert_eq!(tokens[1].typ, TokenType::String);
+
+        let mut out = Vec::new();
+        write_token(&mut out, &tokens[1], &idents);
+        assert_eq!(out, b"\"caf\xc3\xa9\"");
+
+        // Round-trips through show_token when the bytes are valid UTF-8.
+        assert_eq!(show_token(&tokens[1], &idents), "\"caf\u{e9}\"");
+
+        // literal_payload is the inverse: Rust text into payload form.
+        assert_eq!(literal_payload("caf\u{e9}"), "caf\u{c3}\u{a9}");
+        assert_eq!(
+            payload_bytes(&literal_payload("caf\u{e9}")).collect::<Vec<_>>(),
+            b"caf\xc3\xa9"
+        );
+    }
+
+    #[test]
+    fn test_column_saturates_on_very_long_line() {
+        let mut src = " ".repeat(70000);
+        src.push('x');
+        let (tokens, idents) = tokenize_str(&src);
+        assert_eq!(show_token(&tokens[1], &idents), "x");
+        assert_eq!(tokens[1].pos.col, u16::MAX);
+        assert_eq!(tokens[1].pos.line, 1);
+
+        // Tabs advance to the next multiple of eight, which must saturate too.
+        let mut src = "\t".repeat(70000);
+        src.push('x');
+        let (tokens, idents) = tokenize_str(&src);
+        assert_eq!(show_token(&tokens[1], &idents), "x");
+        assert!(tokens[1].pos.col >= u16::MAX - 8);
+    }
+
+    /// A `%:` whose following `%` does not complete the `%:%:` digraph used to
+    /// be consumed and then rewound by hand. The rewind restored `offset` and
+    /// `col` but not `line`, so a splice between the two halves was counted
+    /// once on the way in and again on the way out.
+    #[test]
+    fn test_digraph_hash_not_hashhash_keeps_line_count() {
+        let (tokens, idents) = tokenize_str("%:\\\n% x\ny");
+        let spelled: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(spelled, vec!["#", "%", "x", "y"]);
+        // Phase 2 deletes the splice but the physical lines still count, so
+        // `x` is on line 2 and `y` on line 3 -- each crossed exactly once.
+        assert_eq!(tokens[3].pos.line, 2);
+        assert_eq!(tokens[4].pos.line, 3);
+    }
+
+    /// With phase 2 off (a `.i` operand) a backslash-newline is text, not a
+    /// joint, so none of the above applies and the UCN does not form.
+    #[test]
+    fn test_ucn_splice_disabled() {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(b"caf\\u00\\\ne9", 0, &mut strings).without_splicing();
+        let tokens = tokenizer.tokenize();
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &strings), "caf");
+    }
+
     // ========================================================================
     // Diagnostic warning tests
     // ========================================================================
@@ -2395,27 +2705,56 @@ mod tests {
     }
 
     #[test]
-    fn test_asm_double_slash_not_comment() {
-        // In assembly mode, `//` is NOT a comment - just two `/` operators
+    fn test_asm_comments_are_stripped() {
+        // GCC's assembler-with-cpp strips `//` and `/* */` from assembly just
+        // as it does from C, so c17 does too.
         let (tokens, idents) = tokenize_asm("a // b");
         let toks: Vec<_> = tokens[1..tokens.len() - 1]
             .iter()
             .map(|t| show_token(t, &idents))
             .collect();
-        // Should tokenize as: a, /, /, b (no comment skipping)
-        assert_eq!(toks, vec!["a", "/", "/", "b"]);
-    }
+        assert_eq!(toks, vec!["a"]);
 
-    #[test]
-    fn test_asm_block_comment_not_comment() {
-        // In assembly mode, `/* */` is NOT a comment
         let (tokens, idents) = tokenize_asm("a /* b */ c");
         let toks: Vec<_> = tokens[1..tokens.len() - 1]
             .iter()
             .map(|t| show_token(t, &idents))
             .collect();
-        // Should tokenize as individual tokens, not as comment
-        assert_eq!(toks, vec!["a", "/", "*", "b", "*", "/", "c"]);
+        assert_eq!(toks, vec!["a", "c"]);
+    }
+
+    /// An apostrophe in assembly is prose or a GNU as character constant, not
+    /// the start of a C literal. Lexing it as one swallowed the rest of the
+    /// line, so a `.S` file whose comment said "don't" assembled to something
+    /// else entirely -- or failed outright.
+    #[test]
+    fn test_asm_apostrophe_is_not_a_literal() {
+        let (tokens, idents) = tokenize_asm("# don't panic\nmovl $7, %eax");
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(
+            toks,
+            vec!["#", "don", "'", "t", "panic", "movl", "$", "7", ",", "%", "eax"]
+        );
+
+        // GNU as writes an unterminated character constant `'a`, and a
+        // terminated one `'b'`; both are just punctuation plus identifiers.
+        let (tokens, idents) = tokenize_asm(".byte 'a\n.byte 'b'");
+        let toks: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(
+            toks,
+            vec![".", "byte", "'", "a", ".", "byte", "'", "b", "'"]
+        );
+
+        // `"` still opens a string, so an apostrophe inside one is content.
+        let (tokens, idents) = tokenize_asm(".ascii \"it's fine\"");
+        assert_eq!(tokens[3].typ, TokenType::String);
+        assert_eq!(show_token(&tokens[3], &idents), "\"it's fine\"");
     }
 
     #[test]
@@ -2451,31 +2790,41 @@ mod tests {
     }
 
     // ========================================================================
-    // tokens_to_text tests
+    // tokens_to_source_bytes tests
     // ========================================================================
 
-    #[test]
-    fn test_tokens_to_text_simple() {
-        let (tokens, strings) = tokenize_str("int x = 42;");
-        let text = tokens_to_text(&tokens, &strings);
-        // Note: semicolon doesn't have whitespace flag set, so no space before it
-        assert_eq!(text.trim(), "int x = 42;");
+    fn source_text(input: &str) -> String {
+        let (tokens, strings) = tokenize_str(input);
+        String::from_utf8(tokens_to_source_bytes(&tokens, &strings)).expect("not UTF-8")
     }
 
     #[test]
-    fn test_tokens_to_text_multiline() {
-        let (tokens, strings) = tokenize_str("int x;\nint y;");
-        let text = tokens_to_text(&tokens, &strings);
+    fn test_tokens_to_source_bytes_simple() {
+        // Note: semicolon doesn't have whitespace flag set, so no space before it
+        assert_eq!(source_text("int x = 42;").trim(), "int x = 42;");
+    }
+
+    #[test]
+    fn test_tokens_to_source_bytes_multiline() {
+        let text = source_text("int x;\nint y;");
         // Should preserve the newline between statements
         assert!(text.contains('\n'));
         assert!(text.contains("int"));
     }
 
     #[test]
-    fn test_tokens_to_text_ends_with_newline() {
-        let (tokens, strings) = tokenize_str("x");
-        let text = tokens_to_text(&tokens, &strings);
-        assert!(text.ends_with('\n'));
+    fn test_tokens_to_source_bytes_ends_with_newline() {
+        assert!(source_text("x").ends_with('\n'));
+    }
+
+    /// The reason this path deals in bytes: a literal payload is one `char`
+    /// per source byte, and rendering it as a Rust string doubles every byte
+    /// of 0x80 or more.
+    #[test]
+    fn test_tokens_to_source_bytes_keeps_literal_bytes() {
+        let (tokens, strings) = tokenize_str(".ascii \"caf\u{e9}\"");
+        let out = tokens_to_source_bytes(&tokens, &strings);
+        assert_eq!(out, b".ascii \"caf\xc3\xa9\"\n");
     }
 
     // ========================================================================

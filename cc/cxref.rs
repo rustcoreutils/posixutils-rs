@@ -210,6 +210,10 @@ fn extract_refs_from_expr(
             extract_refs_from_expr(then_expr, strings, symbols, xref);
             extract_refs_from_expr(else_expr, strings, symbols, xref);
         }
+        ExprKind::CondElvis { cond, else_expr } => {
+            extract_refs_from_expr(cond, strings, symbols, xref);
+            extract_refs_from_expr(else_expr, strings, symbols, xref);
+        }
         ExprKind::Member { expr, member } | ExprKind::Arrow { expr, member } => {
             extract_refs_from_expr(expr, strings, symbols, xref);
             // The member name is a symbol in its own right; without this, `s.x`
@@ -258,6 +262,9 @@ fn extract_refs_from_expr(
         | ExprKind::Clz { arg }
         | ExprKind::Clzl { arg }
         | ExprKind::Clzll { arg }
+        | ExprKind::Clrsb { arg }
+        | ExprKind::Clrsbl { arg }
+        | ExprKind::Clrsbll { arg }
         | ExprKind::Popcount { arg }
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }

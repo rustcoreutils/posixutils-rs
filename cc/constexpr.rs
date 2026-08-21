@@ -150,6 +150,17 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
 
         ExprKind::Binary { op, left, right } => eval_binary(env, scope, *op, left, right),
 
+        // `a ?: b` folds like `a ? a : b`; at constant-evaluation time `a`
+        // has no side effects to duplicate.
+        ExprKind::CondElvis { cond, else_expr } => {
+            let cond_val = eval(env, scope, cond)?;
+            if cond_val != 0 {
+                Some(cond_val)
+            } else {
+                eval(env, scope, else_expr)
+            }
+        }
+
         ExprKind::Conditional {
             cond,
             then_expr,

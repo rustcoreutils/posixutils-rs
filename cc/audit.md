@@ -233,7 +233,7 @@ here so neither gets re-raised as a to-do.
 | Macro expansion (blue paint, rescanning, `##` placemarkers) | CONFORMS |
 | `#if` constant expressions | CONFORMS — #P6, #P14 closed |
 | Predefined macros | CONFORMS — #P1, #P7 and #X8 all closed |
-| C89 core | CONFORMS (declarators, bitfields, storage classes, tentative definitions, promotions) |
+| C89 core | CONFORMS (declarators, bitfields, storage classes, tentative definitions, promotions). **This row was overstated until 2026-08-21:** an init-declarator list whose first declarator was a function -- `int f(int), g(int);` -- was a syntax error, which is ISO C and so a conformance defect, not merely a compatibility one. Found by building sparse, not by re-reading this file |
 | C99 | CONFORMS for everything audited (VLAs, designated initializers, compound literals, flexible array members, `restrict`, `inline`, `_Bool`, `long long`, `_Complex`, `__func__`, UCNs, hex floats) |
 | C11 | CONFORMS for everything audited — #X1, #X3, #X6 and #X7 are all closed, so `_Generic`, `_Atomic` through ordinary operators, the full `<stdatomic.h>` and the `CMPLX` macros join the rest |
 | C17 | CLAIMED — `__STDC_VERSION__` is `201710L`, and it is the only language c17 compiles. C17 is DR-only; DR 412 (`_Static_assert` as a struct member) is honored at `cc/parse/parser.rs`, and DR 423 is live now that `_Generic` exists |
@@ -247,8 +247,10 @@ of strictly-conforming source: `__attribute__`, statement expressions,
 `typeof`, the `__builtin_*` family, `__c11_atomic_*`, GCC extended inline asm
 (incl. `asm goto`), `__int128`, `_Float16`/`_Float32`/`_Float64`,
 `__float128`/`_Float128` (IEEE binary128, with the `q` and `f128` suffixes), nullability
-qualifiers, `#include_next`, `#warning`, digraphs, and the C23 one-argument
-`_Static_assert`. See `cc/doc/ATTR.md` and `cc/doc/BUILTIN.md`.
+qualifiers, `#include_next`, `#warning`, digraphs, the C23 one-argument
+`_Static_assert`, case ranges, designated-initializer ranges, computed goto,
+and the omitted middle operand `a ?: b`. See `cc/doc/ATTR.md` and
+`cc/doc/BUILTIN.md`.
 
 ## Test coverage signal
 

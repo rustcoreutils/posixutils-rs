@@ -38,6 +38,158 @@ fn assert_lacks(out: &str, needle: &str, what: &str) {
 }
 
 // ============================================================================
+// Literal payloads are byte sequences
+// ============================================================================
+
+/// A string literal's payload holds one `char` per source *byte*. Rendering it
+/// through a Rust `String` UTF-8-encoded each of those chars, so every source
+/// byte >= 0x80 came out of `c17 -E` as two: `"café"` gained a byte, and
+/// preprocessing a file then compiling it changed what the string held.
+#[test]
+fn preprocessor_non_ascii_literal_survives_byte_for_byte() {
+    let r = preprocess_text(
+        "utf8_literal",
+        "const char *s = \"café ☕\";\nconst char c = 'é';\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "\"café ☕\"", "utf8 string literal");
+    assert_has(&r.stdout, "'é'", "utf8 char literal");
+    assert_lacks(&r.stdout, "Ã", "double-encoded UTF-8");
+}
+
+/// `__FILE__` and a stringified identifier arrive as Rust text rather than as
+/// source bytes, so they have to be converted into the payload form or the two
+/// conventions mix inside one literal.
+#[test]
+fn preprocessor_synthesized_literals_use_payload_form() {
+    let r = preprocess_text(
+        "utf8_synth",
+        "#define S(x) #x\nconst char *a = __FILE__;\nconst char *b = S(caf\\u00e9);\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "utf8_synth", "__FILE__");
+    assert_has(&r.stdout, "\"café\"", "stringified UCN identifier");
+    assert_lacks(&r.stdout, "Ã", "double-encoded UTF-8");
+}
+
+/// A header name is a literal payload -- source bytes, one per `char` -- and
+/// has to be decoded before it can be opened as a path. Using it as text
+/// looked for `cafÃ©.h` and reported the real file missing.
+#[test]
+fn preprocessor_non_ascii_header_name_opens() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_utf8_include_")
+        .tempdir()
+        .expect("failed to create work dir");
+    std::fs::write(dir.path().join("café.h"), "int seven(void){return 7;}\n").unwrap();
+    let src = dir.path().join("main.c");
+    std::fs::write(
+        &src,
+        "#include \"café.h\"\nint main(void){return seven()-7;}\n",
+    )
+    .unwrap();
+
+    let exe = dir.path().join("prog");
+    let r = run_c17(&[
+        &src.to_string_lossy(),
+        "-o",
+        &exe.to_string_lossy(),
+        "-I",
+        &dir.path().to_string_lossy(),
+    ]);
+    assert!(
+        r.success,
+        "compiling with a UTF-8 header name failed:\n{}",
+        r.stderr
+    );
+    let status = std::process::Command::new(&exe)
+        .status()
+        .expect("failed to run the built program");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "wrong result from the included function"
+    );
+}
+
+/// A `#error` message is the directive's tokens spelled as they were written
+/// -- GCC echoes the line verbatim. The renderer handled four token types and
+/// silently dropped the rest, so quotes vanished from strings and character
+/// and wide-string operands disappeared entirely.
+#[test]
+fn preprocessor_error_message_spells_every_token() {
+    let r = preprocess_text(
+        "error_spelling",
+        "#error \"quoted\" and 'c' and L\"wide\" and 3.5 >> 1\n",
+        &[],
+    );
+    assert!(!r.success, "#error must fail the run");
+    assert_has(
+        &r.stderr,
+        "#error \"quoted\" and 'c' and L\"wide\" and 3.5 >> 1",
+        "#error message",
+    );
+}
+
+/// C99 6.10.3.2p2 asks `#` for "the spelling of the preprocessing token", and
+/// `-E` has to round-trip it. `u8"..."` has type `char[]` (C11 6.4.5p6) so it
+/// folds into the narrow string token, and the prefix was dropped with it.
+#[test]
+fn preprocessor_u8_prefix_survives() {
+    let r = preprocess_text(
+        "u8_prefix",
+        "#define S(x) #x\n#define B u8\"body\"\n\
+         const char *a = S(u8\"hi\");\nconst char *b = B;\nconst char *c = u8\"plain\";\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "\"u8\\\"hi\\\"\"", "stringified u8 literal");
+    assert_has(&r.stdout, "u8\"body\"", "u8 literal from a macro body");
+    assert_has(&r.stdout, "u8\"plain\"", "u8 literal in plain text");
+}
+
+/// C99 6.4.7: a header name is one preprocessing token, and nothing inside it
+/// is reinterpreted. Lexing the characters as ordinary tokens meant `//`
+/// became a comment and an apostrophe opened a character literal, so the
+/// directive was destroyed before it could be reassembled.
+#[test]
+fn preprocessor_header_name_is_one_token() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_header_name_")
+        .tempdir()
+        .expect("failed to create work dir");
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/t.h"), "int seven(void){return 7;}\n").unwrap();
+    std::fs::write(dir.path().join("it's.h"), "int eight(void){return 8;}\n").unwrap();
+
+    for (header, call, want) in [
+        ("<sub//t.h>", "seven()", 7),
+        ("<it's.h>", "eight()", 8),
+        ("\"it's.h\"", "eight()", 8),
+    ] {
+        let src = dir.path().join("main.c");
+        std::fs::write(
+            &src,
+            format!("#include {header}\nint main(void){{return {call}-{want};}}\n"),
+        )
+        .unwrap();
+        let exe = dir.path().join("prog");
+        let r = run_c17(&[
+            &src.to_string_lossy(),
+            "-o",
+            &exe.to_string_lossy(),
+            "-I",
+            &dir.path().to_string_lossy(),
+        ]);
+        assert!(r.success, "#include {header} failed:\n{}", r.stderr);
+        let status = std::process::Command::new(&exe).status().unwrap();
+        assert_eq!(status.code(), Some(0), "wrong result for #include {header}");
+    }
+}
+
+// ============================================================================
 // #P2 — the null directive
 // ============================================================================
 

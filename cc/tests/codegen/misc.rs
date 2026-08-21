@@ -9747,3 +9747,61 @@ int main(void)
     assert_eq!(compile_and_run("wide_switch_inline", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("wide_switch_inline_opt", code), 0);
 }
+
+/// A constant right shift must fold at the operand's width, with the
+/// signedness the opcode implies.
+///
+/// `Function::const_val` hands back an `i128` holding whatever bit pattern the
+/// constant was built from, and for a narrower operand that can be wider than
+/// the operand: `(int)0xFFFFFFFFu` is stored as 4294967295, not -1. Every
+/// consumer that only *emits* the value truncates and never noticed. Folding
+/// arithmetic on it does notice — `Asr` shifted in zeros and answered
+/// 2147483647 where the operand is -1 and the answer is -1.
+///
+/// So this was a silent wrong answer in ordinary C, at `-O` and above only,
+/// for any arithmetic shift of a constant whose value came through a cast from
+/// an unsigned literal. `-1 >> 1` was always right, which is why nothing
+/// caught it: the literal is already negative there, so the stored i128 agrees
+/// with the operand.
+///
+/// Found while lowering `__builtin_clrsb`, which folds a sign bit down and so
+/// feeds the folder exactly this shape.
+#[test]
+fn codegen_constant_shift_folds_at_the_operand_width() {
+    let code = r#"
+int main(void) {
+    /* Arithmetic: the operand is negative at its own width. */
+    if (((int)0x80000000) >> 31 != -1) return 1;
+    if (((int)0x80000000) >> 1 != -1073741824) return 2;
+    if (((int)0xFFFFFFFFu) >> 1 != -1) return 3;
+    if (((int)0xC0000000u) >> 7 != -8388608) return 4;
+    if (((int)2147483648u) >> 31 != -1) return 5;
+    if (((signed char)0x80) >> 3 != -16) return 6;
+    if (((short)0x8000) >> 5 != -1024) return 7;
+    if (((long long)0x8000000000000000LL) >> 1 != -4611686018427387904LL) return 8;
+    if (((long long)0xFFFFFFFFFFFFFFFFULL) >> 40 != -1LL) return 9;
+
+    /* Logical shifts must stay logical. */
+    if ((0xFFFFFFFFu >> 1) != 2147483647u) return 10;
+    if ((0x80000000u >> 31) != 1u) return 11;
+    if ((0xFFFFFFFFFFFFFFFFULL >> 40) != 16777215ULL) return 12;
+
+    /* Left shifts wrap at the operand width rather than growing. */
+    if ((int)(0x7FFFFFFF << 1) != -2) return 13;
+    if ((int)(3 << 30) != -1073741824) return 14;
+    if ((unsigned)(0xFFFFFFFFu << 4) != 0xFFFFFFF0u) return 15;
+
+    /* The shapes that were always correct must stay so. */
+    if ((-1 >> 1) != -1) return 16;
+    if ((-2 >> 1) != -1) return 17;
+    if ((-256 >> 4) != -16) return 18;
+    if ((255 >> 4) != 15) return 19;
+    if ((5 << 3) != 40) return 20;
+    return 0;
+}
+"#;
+    // -O0 evaluates these at run time and was always right; the whole point is
+    // that -O2, which folds them, now agrees.
+    assert_eq!(compile_and_run("codegen_shift_fold", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("codegen_shift_fold_o2", code), 0);
+}

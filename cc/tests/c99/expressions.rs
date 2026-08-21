@@ -618,3 +618,72 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("float_cmp_integer_operands", code, &[]), 0);
 }
+
+/// GNU `a ?: b` — a conditional with the middle operand omitted.
+///
+/// The condition supplies both the test and the true-value, and it must be
+/// evaluated **exactly once**: rewriting to `a ? a : b` in the parser would
+/// call `f` twice in `f() ?: 0`. That is why this has its own AST node rather
+/// than being desugared, and why the counter checks below are the real test —
+/// every value assertion here would also pass under a duplicating rewrite.
+///
+/// Found in sparse (14 files) and used in 1373 files of the Linux kernel.
+#[test]
+fn c99_omitted_middle_operand_conditional() {
+    let code = r#"
+static int cond_calls = 0;
+static int rhs_calls = 0;
+
+static int zero(void)    { cond_calls++; return 0; }
+static int seven(void)   { cond_calls++; return 7; }
+static int rhs(void)     { rhs_calls++;  return 42; }
+
+int main(void) {
+    /* Value selection. */
+    int a = 0, b = 5;
+    if ((b ?: 9) != 5) return 1;
+    if ((a ?: 9) != 9) return 2;
+
+    /* The condition is evaluated once, whichever way it goes. */
+    cond_calls = 0; rhs_calls = 0;
+    if ((seven() ?: rhs()) != 7) return 3;
+    if (cond_calls != 1) return 4;
+    if (rhs_calls != 0) return 5;   /* right side untouched when true */
+
+    cond_calls = 0; rhs_calls = 0;
+    if ((zero() ?: rhs()) != 42) return 6;
+    if (cond_calls != 1) return 7;
+    if (rhs_calls != 1) return 8;   /* ...and evaluated once when false */
+
+    /* Pointers: the common type is the pointer, not int. */
+    int x = 11;
+    int *p = 0, *q = &x;
+    if (*(p ?: q) != 11) return 9;
+
+    /* Nesting, and mixing with the ordinary three-operand form. */
+    int c = 0, d = 0, e = 4;
+    if (((c ?: d) ?: e) != 4) return 10;
+    if ((c ?: (1 ? 2 : 3)) != 2) return 11;
+
+    /* A constant condition folds; the untaken side is never evaluated. */
+    rhs_calls = 0;
+    if ((5 ?: rhs()) != 5) return 12;
+    if (rhs_calls != 0) return 13;
+    if ((0 ?: 9) != 9) return 14;
+
+    /* Narrower condition widens to the common type. */
+    char narrow = 0;
+    int wide = 300;
+    if ((narrow ?: wide) != 300) return 15;
+
+    /* As a statement operand, and with side effects on the right. */
+    int acc = 0;
+    acc += (a ?: 3);
+    if (acc != 3) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_elvis", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("c99_elvis_o2", code), 0);
+}

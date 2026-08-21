@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::lexer::{
-    tokens_to_text, IdentTable, LexerMode, Position, SpecialToken, Token, TokenType, TokenValue,
-    Tokenizer,
+    literal_payload, payload_text, show_token, tokens_to_source_bytes, IdentTable, LexerMode,
+    Position, SpecialToken, Token, TokenType, TokenValue, Tokenizer,
 };
 use crate::arch;
 use crate::builtin_headers;
@@ -144,6 +144,9 @@ pub struct MacroToken {
     pub typ: TokenType,
     pub value: MacroTokenValue,
     pub whitespace: bool,
+    /// Spelled `u8"..."`; see [`Token::utf8_prefix`]. Carried through a macro
+    /// body so that `#define B u8"hi"` still spells the prefix once expanded.
+    pub utf8_prefix: bool,
 }
 
 /// Value of a macro token
@@ -213,12 +216,17 @@ impl Macro {
                             TokenValue::WideChar(c)
                             | TokenValue::Utf16Char(c)
                             | TokenValue::Utf32Char(c) => MacroTokenValue::Char(c.clone()),
+                            // A header name cannot occur in a macro body --
+                            // one is lexed only inside #include -- but the
+                            // type carries it back either way.
+                            TokenValue::HeaderName(h) => MacroTokenValue::String(h.clone()),
                             TokenValue::None => MacroTokenValue::None,
                         };
                         MacroToken {
                             typ: token.typ,
                             value,
                             whitespace: i > 0 && token.pos.whitespace,
+                            utf8_prefix: token.utf8_prefix,
                         }
                     })
                     .collect()
@@ -249,6 +257,7 @@ impl Macro {
                 typ: TokenType::Ident,
                 value: MacroTokenValue::Ident(word.to_string()),
                 whitespace: i > 0, // Add whitespace before all but the first token
+                utf8_prefix: false,
             })
             .collect();
         Self {
@@ -272,6 +281,7 @@ impl Macro {
                 typ: TokenType::Ident,
                 value: MacroTokenValue::Ident(value.to_string()),
                 whitespace: false,
+                utf8_prefix: false,
             }]
         };
         Self {
@@ -1379,8 +1389,14 @@ impl<'a> Preprocessor<'a> {
             // untrue while they fell through to the arm below.
             crate::kw::PP_IDENT | crate::kw::SCCS => self.skip_to_eol(iter),
             _ => {
-                // Unknown directive
-                if !self.is_skipping() {
+                // Unknown directive.
+                //
+                // In assembly, `#` introduces a comment, so a line that names
+                // no directive is prose rather than a mistake -- `# save the
+                // frame pointer` is ordinary in a `.S` file. GCC is silent
+                // about those, and warning on each one buried real
+                // diagnostics.
+                if !self.is_skipping() && self.lexer_mode != LexerMode::Assembly {
                     let name = idents.get_opt(directive_id).unwrap_or("unknown");
                     diag::warning_args(
                         hash_token.pos,
@@ -1433,8 +1449,7 @@ impl<'a> Preprocessor<'a> {
         if let Some(tok) = iter.peek() {
             if !tok.pos.newline && tok.typ == TokenType::String {
                 if let TokenValue::String(name) = &tok.value {
-                    let name = name.clone();
-                    target = diag::find_or_add_stream(&name);
+                    target = diag::find_or_add_stream(&payload_text(name));
                 }
                 iter.next();
             }
@@ -1565,6 +1580,7 @@ impl<'a> Preprocessor<'a> {
                                 "0".to_string()
                             }),
                             pos,
+                            utf8_prefix: false,
                             no_expand: None,
                         });
                         continue;
@@ -1603,6 +1619,7 @@ impl<'a> Preprocessor<'a> {
                             typ: TokenType::Number,
                             value: TokenValue::Number("0".to_string()),
                             pos: token.pos,
+                            utf8_prefix: false,
                             no_expand: None,
                         });
                     }
@@ -1612,6 +1629,7 @@ impl<'a> Preprocessor<'a> {
                         typ: TokenType::Number,
                         value: TokenValue::Number("0".to_string()),
                         pos: token.pos,
+                        utf8_prefix: false,
                         no_expand: None,
                     });
                 }
@@ -1826,6 +1844,7 @@ impl<'a> Preprocessor<'a> {
                                     typ: TokenType::Special,
                                     value: MacroTokenValue::Paste,
                                     whitespace: token.pos.whitespace,
+                                    utf8_prefix: false,
                                 });
                                 i += 2;
                                 continue;
@@ -1845,6 +1864,7 @@ impl<'a> Preprocessor<'a> {
                                             typ: TokenType::Special,
                                             value: MacroTokenValue::Stringify(param.index),
                                             whitespace: token.pos.whitespace,
+                                            utf8_prefix: false,
                                         });
                                         found_param = true;
                                         break;
@@ -1861,6 +1881,7 @@ impl<'a> Preprocessor<'a> {
                                         typ: TokenType::Special,
                                         value: MacroTokenValue::Stringify(params.len()),
                                         whitespace: token.pos.whitespace,
+                                        utf8_prefix: false,
                                     });
                                     i += 2;
                                     continue;
@@ -1886,6 +1907,7 @@ impl<'a> Preprocessor<'a> {
                         typ: TokenType::Special,
                         value: MacroTokenValue::Paste,
                         whitespace: token.pos.whitespace,
+                        utf8_prefix: false,
                     });
                     i += 1;
                     continue;
@@ -1902,6 +1924,7 @@ impl<'a> Preprocessor<'a> {
                             typ: TokenType::Ident,
                             value: MacroTokenValue::VaArgs,
                             whitespace: token.pos.whitespace,
+                            utf8_prefix: false,
                         });
                         i += 1;
                         continue;
@@ -1915,6 +1938,7 @@ impl<'a> Preprocessor<'a> {
                                 typ: TokenType::Ident,
                                 value: MacroTokenValue::Param(param.index),
                                 whitespace: token.pos.whitespace,
+                                utf8_prefix: false,
                             });
                             found_param = true;
                             break;
@@ -1953,6 +1977,7 @@ impl<'a> Preprocessor<'a> {
             TokenValue::WideChar(c) | TokenValue::Utf16Char(c) | TokenValue::Utf32Char(c) => {
                 MacroTokenValue::Char(c.clone())
             }
+            TokenValue::HeaderName(h) => MacroTokenValue::String(h.clone()),
             TokenValue::None => MacroTokenValue::None,
         };
 
@@ -1960,6 +1985,7 @@ impl<'a> Preprocessor<'a> {
             typ: token.typ,
             value,
             whitespace: token.pos.whitespace,
+            utf8_prefix: token.utf8_prefix,
         }
     }
 
@@ -2255,6 +2281,21 @@ impl<'a> Preprocessor<'a> {
             return (String::new(), false);
         }
 
+        // A header name the lexer already recognised (C99 6.4.7): one token,
+        // delimiters included, with nothing inside it reinterpreted.
+        if let TokenValue::HeaderName(h) = &tokens[0].value {
+            let spelled = payload_text(h);
+            let is_system = spelled.starts_with('<');
+            let name = spelled
+                .strip_prefix(['<', '"'])
+                .and_then(|r| r.strip_suffix(['>', '"']))
+                .unwrap_or(&spelled);
+            return (name.to_string(), is_system);
+        }
+
+        // Otherwise the header name came out of a macro expansion, and has to
+        // be reassembled from whatever tokens it expanded to.
+
         // Check for <filename>
         if let TokenValue::Special(code) = &tokens[0].value {
             if *code == b'<' as u32 {
@@ -2276,7 +2317,7 @@ impl<'a> Preprocessor<'a> {
 
         // Check for "filename"
         if let TokenValue::String(s) = &tokens[0].value {
-            return (s.clone(), false);
+            return (payload_text(s), false);
         }
 
         // Fallback: try to reconstruct from tokens
@@ -2292,7 +2333,7 @@ impl<'a> Preprocessor<'a> {
         match &token.value {
             TokenValue::Ident(id) => idents.get_opt(*id).unwrap_or("").to_string(),
             TokenValue::Number(n) => n.clone(),
-            TokenValue::String(s) => s.clone(),
+            TokenValue::String(s) => payload_text(s),
             TokenValue::Special(code) => {
                 if *code < 256 {
                     (*code as u8 as char).to_string()
@@ -3018,7 +3059,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         let tokens = self.collect_to_eol(iter);
-        let msg = self.tokens_to_text(&tokens, idents);
+        let msg = self.tokens_to_message(&tokens, idents);
         diag::error_args(*pos, "#error {0}", &[&msg.to_string()]);
     }
 
@@ -3037,7 +3078,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         let tokens = self.collect_to_eol(iter);
-        let msg = self.tokens_to_text(&tokens, idents);
+        let msg = self.tokens_to_message(&tokens, idents);
         diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
     }
 
@@ -3313,35 +3354,24 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Convert tokens to text for error messages
-    fn tokens_to_text(&self, tokens: &[Token], idents: &IdentTable) -> String {
+    /// Render tokens as the message of a `#error` or `#warning`, spelled the
+    /// way they were written.
+    ///
+    /// Not to be confused with the free `tokens_to_source_bytes`, which
+    /// reproduces a whole translation unit for `-E` with its line structure
+    /// intact. This one produces one line for a human to read.
+    ///
+    /// Built on `show_token` so that every token type is covered: the
+    /// hand-written match this replaces handled four of them and silently
+    /// dropped the rest, so `#error "a" 'b' L"c"` reported `#error a  and`
+    /// -- quotes stripped, two of the three operands gone.
+    fn tokens_to_message(&self, tokens: &[Token], idents: &IdentTable) -> String {
         let mut result = String::new();
         for token in tokens {
             if !result.is_empty() && token.pos.whitespace {
                 result.push(' ');
             }
-            match &token.value {
-                TokenValue::Ident(id) => {
-                    if let Some(name) = idents.get_opt(*id) {
-                        result.push_str(name);
-                    }
-                }
-                TokenValue::Number(n) => result.push_str(n),
-                TokenValue::String(s) => result.push_str(s),
-                TokenValue::Special(code) if *code < SpecialToken::BASE => {
-                    result.push(*code as u8 as char);
-                }
-                // A punctuator of more than one character has a spelling too.
-                // Dropping it turned `a >> b` into `a  b`, in `#x` (6.10.3.2p2
-                // asks for "the spelling of the preprocessing token") and in
-                // the text a `_Pragma` is rebuilt from alike.
-                TokenValue::Special(code) => {
-                    if let Some(punct) = SpecialToken::from_code(*code) {
-                        result.push_str(punct.spelling());
-                    }
-                }
-                _ => {}
-            }
+            result.push_str(&show_token(token, idents));
         }
         result
     }
@@ -3359,7 +3389,10 @@ impl<'a> Preprocessor<'a> {
             match &token.value {
                 TokenValue::Ident(id) => {
                     if let Some(name) = idents.get_opt(*id) {
-                        result.push_str(name);
+                        // An identifier is Rust text -- a UCN in it decoded to
+                        // a real `char` -- while the result is a literal
+                        // payload, one `char` per byte.
+                        result.push_str(&literal_payload(name));
                     }
                 }
                 TokenValue::Number(n) => result.push_str(n),
@@ -3368,12 +3401,14 @@ impl<'a> Preprocessor<'a> {
                 | TokenValue::Utf16String(s)
                 | TokenValue::Utf32String(s) => {
                     // The encoding prefix is part of the spelling, so it must
-                    // survive stringification (C99 6.10.3.2p2).
+                    // survive stringification (C99 6.10.3.2p2). `u8` is not
+                    // one of the token types -- it folds into the narrow one
+                    // -- so it comes off the token's own flag.
                     result.push_str(match &token.value {
                         TokenValue::WideString(_) => "L",
                         TokenValue::Utf16String(_) => "u",
                         TokenValue::Utf32String(_) => "U",
-                        _ => "",
+                        _ => token.encoding_prefix(),
                     });
                     // C99 6.10.3.2p2: insert \ before each " and \ including delimiters
                     result.push('\\');
@@ -3895,6 +3930,7 @@ impl<'a> Preprocessor<'a> {
                 TokenType::WideString => TokenValue::WideString(s.clone()),
                 TokenType::Utf16String => TokenValue::Utf16String(s.clone()),
                 TokenType::Utf32String => TokenValue::Utf32String(s.clone()),
+                TokenType::HeaderName => TokenValue::HeaderName(s.clone()),
                 _ => TokenValue::String(s.clone()),
             },
             MacroTokenValue::Char(c) => match mt.typ {
@@ -3907,7 +3943,9 @@ impl<'a> Preprocessor<'a> {
             _ => TokenValue::None,
         };
 
-        Token::with_value(mt.typ, new_pos, value)
+        let mut token = Token::with_value(mt.typ, new_pos, value);
+        token.utf8_prefix = mt.utf8_prefix;
+        token
     }
 
     /// Expand a builtin macro
@@ -3940,18 +3978,18 @@ impl<'a> Preprocessor<'a> {
                 Some(vec![Token::with_value(
                     TokenType::String,
                     *pos,
-                    TokenValue::String(effective_file),
+                    TokenValue::String(literal_payload(&effective_file)),
                 )])
             }
             BuiltinMacro::Date => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
-                TokenValue::String(self.compile_date.clone()),
+                TokenValue::String(literal_payload(&self.compile_date)),
             )]),
             BuiltinMacro::Time => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
-                TokenValue::String(self.compile_time.clone()),
+                TokenValue::String(literal_payload(&self.compile_time)),
             )]),
             BuiltinMacro::Counter => {
                 let val = self.counter;
@@ -4847,13 +4885,15 @@ pub struct AsmPreprocessConfig<'a> {
 /// * `config` - Preprocessing configuration (defines, undefines, include paths)
 ///
 /// # Returns
-/// The preprocessed assembly text as a string
+/// The preprocessed assembly text, as bytes: a string literal's payload is a
+/// byte sequence, so rendering it through a Rust `String` would re-encode
+/// every byte >= 0x80.
 pub fn preprocess_asm_file(
     content: &[u8],
     target: &Target,
     filename: &str,
     config: &AsmPreprocessConfig<'_>,
-) -> String {
+) -> Vec<u8> {
     // Create string table for tokenization
     let mut strings = IdentTable::new();
 
@@ -4908,7 +4948,7 @@ pub fn preprocess_asm_file(
     let preprocessed = pp.preprocess(tokens, &mut strings);
 
     // Convert tokens back to text
-    tokens_to_text(&preprocessed, &strings)
+    tokens_to_source_bytes(&preprocessed, &strings)
 }
 
 // ============================================================================
@@ -5488,11 +5528,13 @@ second
             typ: TokenType::Number,
             value: MacroTokenValue::Number("2".into()),
             whitespace: false,
+            utf8_prefix: false,
         }];
         let b = vec![MacroToken {
             typ: TokenType::Number,
             value: MacroTokenValue::Number("2".into()),
             whitespace: true,
+            utf8_prefix: false,
         }];
         assert!(replacement_lists_identical(&a, &b));
 
@@ -5503,11 +5545,13 @@ second
                     typ: TokenType::Number,
                     value: MacroTokenValue::Number("1".into()),
                     whitespace: false,
+                    utf8_prefix: false,
                 },
                 MacroToken {
                     typ: TokenType::Number,
                     value: MacroTokenValue::Number("2".into()),
                     whitespace: ws,
+                    utf8_prefix: false,
                 },
             ]
         };

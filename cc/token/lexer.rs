@@ -197,6 +197,71 @@ pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
     (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60) || (0xD800..=0xDFFF).contains(&val)
 }
 
+// ============================================================================
+// Translation phase 2 (line splicing)
+// ============================================================================
+
+/// Delete the run of backslash-newline splices starting at `offset`, returning
+/// the offset of the first byte that survives phase 2 and how many source
+/// lines were crossed to reach it.
+///
+/// This is the single definition of what phase 2 deletes. Every scanner below
+/// -- the consuming `nextchar`, the non-consuming `peekchar`, and the UCN
+/// lookahead -- goes through it, because they must agree byte for byte: the
+/// three hand-written copies this replaces disagreed in three separate places,
+/// each of which silently mislexed valid source rather than diagnosing it.
+///
+/// `splice` is false for a `.i` operand, where a surviving backslash-newline
+/// is text rather than a joint and nothing is deleted.
+fn skip_splices(buffer: &[u8], mut offset: usize, splice: bool) -> (usize, u32) {
+    if !splice {
+        return (offset, 0);
+    }
+    let mut lines = 0;
+    // A backslash as the final byte of the buffer has no newline to join to.
+    while offset + 1 < buffer.len() && buffer[offset] == b'\\' {
+        match buffer[offset + 1] {
+            b'\n' => offset += 2,
+            b'\r' => {
+                offset += 2;
+                if buffer.get(offset) == Some(&b'\n') {
+                    offset += 1;
+                }
+            }
+            _ => break,
+        }
+        lines += 1;
+    }
+    (offset, lines)
+}
+
+/// Non-consuming lookahead over the source, yielding exactly the characters
+/// `nextchar` would: splices deleted, every line ending normalised to `\n`.
+///
+/// Lookahead past a single character has to go through this rather than index
+/// the buffer directly, or it sees characters the consumer will not see (and
+/// vice versa) as soon as a splice lands in the middle of a token.
+struct Peek<'a> {
+    buffer: &'a [u8],
+    offset: usize,
+    splice: bool,
+}
+
+impl Peek<'_> {
+    fn next(&mut self) -> Option<u8> {
+        let (offset, _) = skip_splices(self.buffer, self.offset, self.splice);
+        let c = *self.buffer.get(offset)?;
+        self.offset = offset + 1;
+        if c == b'\r' {
+            if self.buffer.get(self.offset) == Some(&b'\n') {
+                self.offset += 1;
+            }
+            return Some(b'\n');
+        }
+        Some(c)
+    }
+}
+
 impl SpecialToken {
     pub const BASE: u32 = 256;
 
@@ -530,98 +595,61 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
     /// Get next character, handling line splicing (backslash-newline)
     fn nextchar(&mut self) -> i32 {
-        loop {
-            if self.offset >= self.buffer.len() {
-                return EOF;
-            }
-
-            let c = self.buffer[self.offset] as i32;
-            self.offset += 1;
-
-            // Handle carriage return
-            if c == b'\r' as i32 {
-                // Check for \r\n
-                if self.offset < self.buffer.len() && self.buffer[self.offset] == b'\n' {
-                    self.offset += 1;
-                }
-                self.line += 1;
-                self.col = 0;
-                self.newline = true;
-                return b'\n' as i32;
-            }
-
-            // Handle newline
-            if c == b'\n' as i32 {
-                self.line += 1;
-                self.col = 0;
-                self.newline = true;
-                return c;
-            }
-
-            // Handle backslash (potential line splice)
-            if self.splice && c == b'\\' as i32 && self.offset < self.buffer.len() {
-                let next = self.buffer[self.offset];
-                if next == b'\n' {
-                    // Line splice: skip backslash-newline
-                    self.offset += 1;
-                    self.line += 1;
-                    self.col = 0;
-                    continue;
-                } else if next == b'\r' {
-                    // Line splice with \r or \r\n
-                    self.offset += 1;
-                    if self.offset < self.buffer.len() && self.buffer[self.offset] == b'\n' {
-                        self.offset += 1;
-                    }
-                    self.line += 1;
-                    self.col = 0;
-                    continue;
-                }
-            }
-
-            // Handle tab
-            if c == b'\t' as i32 {
-                self.col = (self.col + 8) & !7; // Round to next multiple of 8
-            } else {
-                self.col += 1;
-            }
-
-            return c;
+        let (offset, lines) = skip_splices(self.buffer, self.offset, self.splice);
+        if lines > 0 {
+            self.offset = offset;
+            self.line += lines;
+            self.col = 0;
         }
+
+        if self.offset >= self.buffer.len() {
+            return EOF;
+        }
+        let c = self.buffer[self.offset];
+        self.offset += 1;
+
+        // Handle carriage return
+        if c == b'\r' {
+            // Check for \r\n
+            if self.offset < self.buffer.len() && self.buffer[self.offset] == b'\n' {
+                self.offset += 1;
+            }
+            self.line += 1;
+            self.col = 0;
+            self.newline = true;
+            return b'\n' as i32;
+        }
+
+        // Handle newline
+        if c == b'\n' {
+            self.line += 1;
+            self.col = 0;
+            self.newline = true;
+            return c as i32;
+        }
+
+        // Handle tab
+        if c == b'\t' {
+            self.col = (self.col + 8) & !7; // Round to next multiple of 8
+        } else {
+            self.col += 1;
+        }
+
+        c as i32
     }
 
     /// Peek at next character without consuming (handles line splicing)
     fn peekchar(&self) -> i32 {
-        let mut offset = self.offset;
-        loop {
-            if offset >= self.buffer.len() {
-                return EOF;
-            }
-            let c = self.buffer[offset];
+        self.peek_at(self.offset).next().map_or(EOF, i32::from)
+    }
 
-            // Handle backslash (potential line splice)
-            if self.splice && c == b'\\' && offset + 1 < self.buffer.len() {
-                let next = self.buffer[offset + 1];
-                if next == b'\n' {
-                    // Skip backslash-newline
-                    offset += 2;
-                    continue;
-                } else if next == b'\r' {
-                    // Skip backslash-CR or backslash-CRLF
-                    offset += 2;
-                    if offset < self.buffer.len() && self.buffer[offset] == b'\n' {
-                        offset += 1;
-                    }
-                    continue;
-                }
-            }
-
-            // Handle \r as \n
-            if c == b'\r' {
-                return b'\n' as i32;
-            }
-
-            return c as i32;
+    /// A lookahead reader starting at `offset`, walking the buffer the way
+    /// `nextchar` does.
+    fn peek_at(&self, offset: usize) -> Peek<'a> {
+        Peek {
+            buffer: self.buffer,
+            offset,
+            splice: self.splice,
         }
     }
 
@@ -681,73 +709,36 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Token::with_value(TokenType::Number, pos, TokenValue::Number(num))
     }
 
-    /// Peek at buffer to check if there's a valid UCN sequence starting at current position.
-    /// If the buffer contains \uXXXX or \UXXXXXXXX (where X is hex digit), returns
-    /// Some((decoded_char, bytes_consumed)) where bytes_consumed includes the backslash.
-    /// Returns None if not a valid UCN.
+    /// The character a UCN at the current position denotes, and how many
+    /// `nextchar()` calls consume it.
+    ///
+    /// The count is in characters, not bytes. Phase 2 deletes splices for free
+    /// inside a single `nextchar`, so a byte count over-consumes by the length
+    /// of every splice the UCN spans -- silently eating the source characters
+    /// that follow it.
     fn peek_ucn(&self) -> Option<(char, usize)> {
-        let mut offset = self.offset;
-
-        // Skip any line splices to find the actual backslash. With phase 2
-        // off -- a `.i` operand -- there are none to skip, and a backslash
-        // before a newline is text rather than a joint.
-        loop {
-            if offset >= self.buffer.len() {
-                return None;
-            }
-            let c = self.buffer[offset];
-            if self.splice && c == b'\\' && offset + 1 < self.buffer.len() {
-                let next = self.buffer[offset + 1];
-                if next == b'\n' {
-                    offset += 2;
-                    continue;
-                } else if next == b'\r' {
-                    offset += 2;
-                    if offset < self.buffer.len() && self.buffer[offset] == b'\n' {
-                        offset += 1;
-                    }
-                    continue;
-                }
-                // Found non-splice backslash
-                break;
-            }
-            // Not a backslash at all
+        let mut peek = self.peek_at(self.offset);
+        if peek.next()? != b'\\' {
             return None;
         }
+        let (ch, digits) = self.peek_ucn_after_backslash(&mut peek)?;
+        Some((ch, 2 + digits))
+    }
 
-        // Now offset points to backslash, check for 'u' or 'U'
-        if offset + 1 >= self.buffer.len() {
-            return None;
-        }
-
-        let u_char = self.buffer[offset + 1];
-        let expected_digits = match u_char {
+    /// Shared tail of both UCN entry points, with `peek` positioned just past
+    /// the backslash. Returns the character and how many hex digits spelled it.
+    fn peek_ucn_after_backslash(&self, peek: &mut Peek<'_>) -> Option<(char, usize)> {
+        let digits = match peek.next()? {
             b'u' => 4,
             b'U' => 8,
             _ => return None,
         };
 
-        // Check we have enough hex digits
-        if offset + 2 + expected_digits > self.buffer.len() {
-            return None;
+        let mut val: u32 = 0;
+        for _ in 0..digits {
+            val = val * 16 + (peek.next()? as char).to_digit(16)?;
         }
 
-        let hex_start = offset + 2;
-        let hex_end = hex_start + expected_digits;
-
-        // Validate all characters are hex digits
-        for i in hex_start..hex_end {
-            if !self.buffer[i].is_ascii_hexdigit() {
-                return None;
-            }
-        }
-
-        // Parse the hex value
-        let hex_str: String = self.buffer[hex_start..hex_end]
-            .iter()
-            .map(|&b| b as char)
-            .collect();
-        let val = u32::from_str_radix(&hex_str, 16).ok()?;
         // C17 6.4.3p2. Diagnosed here rather than folded into the `?` below,
         // because a forbidden UCN is a constraint violation and not simply
         // "no UCN here": returning `None` would leave the backslash to be
@@ -756,74 +747,34 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             report_forbidden_ucn(self.pos(), val);
             return None;
         }
-        let ch = char::from_u32(val)?;
 
-        // Calculate bytes consumed from self.offset
-        let bytes_consumed = hex_end - self.offset;
-        Some((ch, bytes_consumed))
+        Some((char::from_u32(val)?, digits))
     }
 
     /// Try to consume a UCN sequence. If successful, returns the decoded character.
     /// Otherwise returns None and leaves position unchanged.
     fn try_consume_ucn(&mut self) -> Option<char> {
-        if let Some((ch, bytes)) = self.peek_ucn() {
-            // Consume the bytes by calling nextchar the right number of times
-            // This properly handles line/col tracking
-            for _ in 0..bytes {
-                self.nextchar();
-            }
-            Some(ch)
-        } else {
-            None
-        }
+        let (ch, chars) = self.peek_ucn()?;
+        self.consume_chars(chars);
+        Some(ch)
     }
 
     /// Try to consume a UCN sequence when the backslash has already been consumed.
     /// Expects the next character to be 'u' or 'U'.
     /// Returns the decoded character if successful, None otherwise.
     fn try_consume_ucn_after_backslash(&mut self) -> Option<char> {
-        let c = self.peekchar();
-        if c == EOF {
-            return None;
+        let mut peek = self.peek_at(self.offset);
+        let (ch, digits) = self.peek_ucn_after_backslash(&mut peek)?;
+        self.consume_chars(1 + digits);
+        Some(ch)
+    }
+
+    /// Consume `count` characters, letting `nextchar` keep line and column in
+    /// step. A lookahead count is always in characters for this reason.
+    fn consume_chars(&mut self, count: usize) {
+        for _ in 0..count {
+            self.nextchar();
         }
-
-        let expected_digits = match c as u8 {
-            b'u' => 4,
-            b'U' => 8,
-            _ => return None,
-        };
-
-        // Check we have enough hex digits after the u/U
-        // Peek ahead without consuming
-        let mut offset = self.offset;
-        // Skip 'u' or 'U'
-        offset += 1;
-
-        if offset + expected_digits > self.buffer.len() {
-            return None;
-        }
-
-        // Validate all characters are hex digits
-        for i in 0..expected_digits {
-            if !self.buffer[offset + i].is_ascii_hexdigit() {
-                return None;
-            }
-        }
-
-        // Now consume and parse
-        self.nextchar(); // consume 'u' or 'U'
-
-        let mut hex = String::new();
-        for _ in 0..expected_digits {
-            hex.push(self.nextchar() as u8 as char);
-        }
-
-        let val = u32::from_str_radix(&hex, 16).ok()?;
-        if ucn_is_forbidden(val) {
-            report_forbidden_ucn(self.pos(), val);
-            return None;
-        }
-        char::from_u32(val)
     }
 
     /// Get an identifier token
@@ -2217,6 +2168,47 @@ mod tests {
         // UCN with lowercase hex digits
         let (tokens, idents) = tokenize_str("caf\\u00e9");
         assert_eq!(show_token(&tokens[1], &idents), "café");
+    }
+
+    /// Translation phase 2 runs before phase 3, so a splice anywhere in or
+    /// around a UCN is simply not there by the time the UCN is lexed. The
+    /// UCN lookahead used to count *bytes* and the consumer to spend them as
+    /// *characters*, so each splice silently ate that many source characters.
+    #[test]
+    fn test_ucn_across_line_splices() {
+        // Splice immediately before the UCN: the trailing `zz` must survive.
+        let (tokens, idents) = tokenize_str("caf\\\n\\u00e9zz");
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
+        assert_eq!(tokens[2].typ, TokenType::StreamEnd);
+
+        // Splice between the backslash and the `u`.
+        let (tokens, idents) = tokenize_str("caf\\\\\nu00e9zz");
+        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
+
+        // Splice in the middle of the hex digits.
+        let (tokens, idents) = tokenize_str("caf\\u00\\\ne9zz");
+        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}zz");
+
+        // Same, for a UCN that *starts* the identifier.
+        let (tokens, idents) = tokenize_str("\\u00\\\ne9tat");
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "\u{e9}tat");
+
+        // The long form spans more digits, so it spans more splices.
+        let (tokens, idents) = tokenize_str("a\\U000\\\n000\\\ne9b");
+        assert_eq!(show_token(&tokens[1], &idents), "a\u{e9}b");
+    }
+
+    /// With phase 2 off (a `.i` operand) a backslash-newline is text, not a
+    /// joint, so none of the above applies and the UCN does not form.
+    #[test]
+    fn test_ucn_splice_disabled() {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(b"caf\\u00\\\ne9", 0, &mut strings).without_splicing();
+        let tokens = tokenizer.tokenize();
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &strings), "caf");
     }
 
     // ========================================================================

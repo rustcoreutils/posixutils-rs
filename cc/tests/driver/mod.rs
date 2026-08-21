@@ -357,6 +357,40 @@ fn driver_preprocess_does_not_assemble() {
     );
 }
 
+/// An apostrophe in an assembly comment is prose, not the start of a literal.
+/// Lexing it as C did swallowed the rest of the line, so a `.S` file whose
+/// comment said "don't" either assembled to the wrong bytes or made `as` fail
+/// with "junk at end of line". `#` there introduces a comment too, and warning
+/// about each one as an unknown directive buried real diagnostics.
+///
+/// Only directives, so the fixture is neither arch- nor object-format-specific.
+#[test]
+fn driver_asm_apostrophe_in_comment() {
+    let w = WorkDir::new("asmquote");
+    let asm = w.write(
+        "quoted.S",
+        "# don't panic, this is a comment\n\
+         /* it's a block comment */\n\
+         \t.data\n\
+         \t.byte 7 // that's seven\n",
+    );
+    let obj = w.join("quoted.o");
+
+    let r = run_c17(&["-c", &s(&asm), "-o", &s(&obj)]);
+    assert!(r.success, "assembling quoted.S failed:\n{}", r.stderr);
+    assert!(obj.exists(), "no object produced for quoted.S");
+    assert!(
+        !r.stderr.contains("missing terminating"),
+        "an apostrophe in a comment opened a literal:\n{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("unknown preprocessor directive"),
+        "a `#` comment was reported as a directive:\n{}",
+        r.stderr
+    );
+}
+
 /// `-o` belongs to the compile or link output in every other mode. `-E` is the
 /// only one that may open it, and opening it eagerly would truncate the
 /// executable a normal compile is about to write.

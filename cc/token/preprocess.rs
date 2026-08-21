@@ -1379,8 +1379,14 @@ impl<'a> Preprocessor<'a> {
             // untrue while they fell through to the arm below.
             crate::kw::PP_IDENT | crate::kw::SCCS => self.skip_to_eol(iter),
             _ => {
-                // Unknown directive
-                if !self.is_skipping() {
+                // Unknown directive.
+                //
+                // In assembly, `#` introduces a comment, so a line that names
+                // no directive is prose rather than a mistake -- `# save the
+                // frame pointer` is ordinary in a `.S` file. GCC is silent
+                // about those, and warning on each one buried real
+                // diagnostics.
+                if !self.is_skipping() && self.lexer_mode != LexerMode::Assembly {
                     let name = idents.get_opt(directive_id).unwrap_or("unknown");
                     diag::warning_args(
                         hash_token.pos,

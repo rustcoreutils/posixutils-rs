@@ -394,6 +394,56 @@ fn driver_asm_label_keeps_source_bytes() {
     assert_eq!(run_exe(&exe), 0, "the label did not resolve to the symbol");
 }
 
+/// Every `-O` spelling GCC and Clang accept must be answered, not crashed on.
+///
+/// `is_valid_opt_level` claimed `s`, `z`, `fast` and `g` and forwarded them to
+/// a `u32` argument, so `-Os` died with clap's "invalid value 's' for '-O
+/// [<level>]': invalid digit found in string" -- a message about an
+/// implementation detail, for a flag every distro build system passes.
+#[test]
+fn driver_accepts_the_optimization_levels_it_claims() {
+    let w = WorkDir::new("optlevel");
+    let src = w.write("t.c", "int main(void){ return 0; }\n");
+
+    for flag in ["-O0", "-O", "-O1", "-O2", "-O3", "-Og", "-Os"] {
+        let r = run_c17(&[flag, "-c", &s(&src), "-o", &s(&w.join("t.o"))]);
+        assert!(r.success, "{flag} should be accepted:\n{}", r.stderr);
+    }
+
+    // Turned down by name, so the message says which flag and why.
+    for (flag, needle) in [("-Ofast", "-Ofast"), ("-Oz", "-Oz")] {
+        let r = run_c17(&[flag, "-c", &s(&src), "-o", &s(&w.join("t.o"))]);
+        assert!(!r.success, "{flag} should be refused");
+        assert!(
+            r.stderr.contains(needle),
+            "{flag}: the message should name the flag, got:\n{}",
+            r.stderr
+        );
+    }
+
+    // A level that is not a level at all.
+    assert!(!run_c17(&["-O9", "-c", &s(&src), "-o", &s(&w.join("t.o"))]).success);
+}
+
+/// POSIX allows the level as a separate operand, and GCC lets the last `-O`
+/// win. Neither may be disturbed by the spellings above.
+#[test]
+fn driver_optimization_level_separate_and_last_wins() {
+    let w = WorkDir::new("optlast");
+    let src = w.write("t.c", "int main(void){ return 0; }\n");
+    let obj = w.join("t.o");
+
+    assert!(run_c17(&["-O", "2", "-c", &s(&src), "-o", &s(&obj)]).success);
+    assert!(run_c17(&["-O", "s", "-c", &s(&src), "-o", &s(&obj)]).success);
+    assert!(run_c17(&["-O2", "-O0", "-c", &s(&src), "-o", &s(&obj)]).success);
+    assert!(run_c17(&["-O0", "-Os", "-c", &s(&src), "-o", &s(&obj)]).success);
+
+    // `-O` with a following operand that is not a level leaves the operand
+    // alone -- it is the source file.
+    let r = run_c17(&["-O", "-c", &s(&src), "-o", &s(&obj)]);
+    assert!(r.success, "bare -O before other flags:\n{}", r.stderr);
+}
+
 /// An apostrophe in an assembly comment is prose, not the start of a literal.
 /// Lexing it as C did swallowed the rest of the line, so a `.S` file whose
 /// comment said "don't" either assembled to the wrong bytes or made `as` fail

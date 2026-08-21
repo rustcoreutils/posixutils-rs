@@ -204,11 +204,13 @@ struct Args {
     #[arg(long = "rtlib", value_name = "library", help = gettext("Runtime library (libgcc, compiler-rt)"))]
     rtlib: Option<String>,
 
-    /// Optimization level (0=none, 1+=basic optimizations)
-    /// -O alone means -O1, -O0 means none, -O2/-O3 mapped to -O1
+    /// Optimization level: `-O0` none, `-O` / `-O1` / `-O2` / `-O3`, plus
+    /// `-Os` (size) and `-Og` (debugging). `-O` alone means `-O1`.
     #[arg(short = 'O', default_value = "0", default_missing_value = "1",
-          num_args = 0..=1, value_name = "level", help = gettext("Optimization level"))]
-    opt_level: u32,
+          num_args = 0..=1, value_name = "level",
+          value_parser = opt::Optimization::from_flag,
+          help = gettext("Optimization level"))]
+    optimization: opt::Optimization,
 
     #[arg(short = 'W', action = clap::ArgAction::Append, value_name = "warning",
           num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
@@ -846,7 +848,7 @@ fn process_file(
     // Optimize IR. Called even at -O0, where the only pass that does anything
     // is inlining of `__attribute__((always_inline))` functions, which gcc
     // honours with optimization off.
-    opt::optimize_module(&mut module, args.opt_level);
+    opt::optimize_module(&mut module, args.optimization);
 
     dump_ir(args, &module, "post-opt");
 
@@ -1080,7 +1082,12 @@ fn link_objects(
     Ok(())
 }
 
-/// Check if a string is a valid optimization level for -O
+/// Whether `s` looks like the argument of `-O`, so that `-O s` is read as a
+/// level rather than as a source file operand.
+///
+/// Wider than [`opt::Optimization::from_flag`] on purpose: `fast` and `z` are
+/// recognised here so they reach the parser and are turned down by name,
+/// instead of being mistaken for a file and producing a confusing error.
 fn is_valid_opt_level(s: &str) -> bool {
     matches!(s, "0" | "1" | "2" | "3" | "s" | "z" | "fast" | "g")
 }
@@ -1125,7 +1132,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 result.push(new_flag);
             }
         } else if arg.starts_with("-O") && arg.len() > 2 {
-            // -O0, -O1, -O2, -O3, -Os, -Oz, -Ofast, -Og — last one wins
+            // -O0, -O1, -O2, -O3, -Os, -Og and the ones we refuse — last wins,
+            // and the refusal happens in the parser so it can name the flag.
             if let Some(idx) = o_flag_idx {
                 result[idx] = arg.clone();
             } else {

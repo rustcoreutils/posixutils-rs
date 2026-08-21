@@ -23,6 +23,7 @@
 use super::{
     BasicBlock, BasicBlockId, Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind,
 };
+use crate::opt::Optimization;
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -199,7 +200,7 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
 /// - Recursive callers get an estimated-stack check (LLVM-style)
 fn should_inline(
     candidate: &InlineCandidate,
-    opt_level: u32,
+    opt: Optimization,
     caller_size: usize,
     caller_is_recursive: bool,
 ) -> bool {
@@ -246,7 +247,7 @@ fn should_inline(
     let forced = candidate.is_always_inline;
 
     // At -O0, inline nothing but the forced functions.
-    if opt_level == 0 && !forced {
+    if !opt.optimizes() && !forced {
         return false;
     }
 
@@ -288,7 +289,7 @@ fn should_inline(
         || (candidate.has_inline_hint && candidate.estimated_size <= HINT_INLINE_SIZE)
     {
         true
-    } else if opt_level >= 2 {
+    } else if opt.inlines_aggressively() {
         if candidate.call_count == 1 && candidate.estimated_size <= MAX_INLINE_SIZE {
             true
         } else {
@@ -1218,8 +1219,8 @@ fn reorder_blocks_topologically(func: &mut Function) {
 /// `__attribute__((always_inline))` functions. gcc honours that attribute with
 /// optimization off, and code that uses it -- inline assembly wrappers,
 /// intrinsics headers -- is usually relying on the body being spliced in.
-pub fn run(module: &mut Module, opt_level: u32) -> bool {
-    if opt_level == 0 && !module.functions.iter().any(|f| f.is_always_inline) {
+pub fn run(module: &mut Module, opt: Optimization) -> bool {
+    if !opt.optimizes() && !module.functions.iter().any(|f| f.is_always_inline) {
         return false;
     }
 
@@ -1261,12 +1262,7 @@ pub fn run(module: &mut Module, opt_level: u32) -> bool {
                     if insn.op == Opcode::Call {
                         if let Some(callee_name) = &insn.func_name {
                             if let Some(candidate) = candidates.get(callee_name) {
-                                if should_inline(
-                                    candidate,
-                                    opt_level,
-                                    caller_size,
-                                    caller_is_recursive,
-                                ) {
+                                if should_inline(candidate, opt, caller_size, caller_is_recursive) {
                                     // Don't inline recursive calls
                                     if *callee_name != caller_name {
                                         call_sites.push((bb_idx, insn_idx, callee_name.clone()));
@@ -1325,7 +1321,7 @@ pub fn run(module: &mut Module, opt_level: u32) -> bool {
     // optimization in its own right, and at -O0 gcc still emits one. Running
     // it here just because an `always_inline` callee brought us into this pass
     // would delete unrelated functions the user asked to keep.
-    if any_changed && opt_level > 0 {
+    if any_changed && opt.optimizes() {
         remove_dead_functions(module);
     }
 
@@ -1430,6 +1426,11 @@ fn remove_dead_functions(module: &mut Module) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-O<level>`, for the decisions `should_inline` reads off it.
+    fn opt_at(level: u8) -> Optimization {
+        Optimization::from_flag(&level.to_string()).expect("valid level")
+    }
     use crate::ir::{GlobalDef, Initializer};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -1494,7 +1495,7 @@ mod tests {
         };
 
         // Small function should always inline at -O1
-        assert!(should_inline(&candidate, 1, 100, false));
+        assert!(should_inline(&candidate, opt_at(1), 100, false));
     }
 
     #[test]
@@ -1513,7 +1514,7 @@ mod tests {
         };
 
         // Varargs functions should never inline
-        assert!(!should_inline(&candidate, 2, 100, false));
+        assert!(!should_inline(&candidate, opt_at(2), 100, false));
     }
 
     #[test]
@@ -1532,7 +1533,7 @@ mod tests {
         };
 
         // Recursive functions should not inline
-        assert!(!should_inline(&candidate, 2, 100, false));
+        assert!(!should_inline(&candidate, opt_at(2), 100, false));
     }
 
     #[test]
@@ -1551,7 +1552,7 @@ mod tests {
         };
 
         // Should not inline at -O0
-        assert!(!should_inline(&candidate, 0, 100, false));
+        assert!(!should_inline(&candidate, opt_at(0), 100, false));
     }
 
     #[test]
@@ -1570,14 +1571,14 @@ mod tests {
         };
 
         // 30 instructions with inline hint should inline
-        assert!(should_inline(&candidate, 1, 100, false));
+        assert!(should_inline(&candidate, opt_at(1), 100, false));
 
         // Without hint, 30 instructions is too large
         let candidate_no_hint = InlineCandidate {
             has_inline_hint: false,
             ..candidate
         };
-        assert!(!should_inline(&candidate_no_hint, 1, 100, false));
+        assert!(!should_inline(&candidate_no_hint, opt_at(1), 100, false));
     }
 
     #[test]

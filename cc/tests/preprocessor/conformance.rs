@@ -1493,3 +1493,76 @@ fn preprocessor_recursive_macros_terminate() {
         assert_has(&r.stdout, want, name);
     }
 }
+
+/// C17 6.10.3.4 EXAMPLE 3 — the standard's own definitive test of rescanning.
+///
+/// `h` expands to `g(~`, an expansion that ends in the middle of a call. The
+/// rest of that call is in the file, not in the replacement list, so a rescan
+/// that only ever saw the replacement list could not finish it: c17 used to
+/// reject this with "unterminated argument list invoking macro f".
+#[test]
+fn preprocessor_c17_example_3() {
+    let src = "#define f(a) f(2 * (a))\n#define g f\n#define h g(~\n\
+               #define m(a) a(w)\n#define w 0,1\nint x = h 5) ;\n";
+    let r = preprocess_text("example3", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "f(2 * (~ 5))", "EXAMPLE 3");
+}
+
+/// An expansion may consume tokens from the rest of the file, and one that
+/// runs out of file has to give them back rather than expand with whatever it
+/// managed to collect. Splicing made the scan run to end of file looking for
+/// the `)`, so expanding anyway substituted the remainder of the translation
+/// unit into the macro and emitted the result in its place.
+#[test]
+fn preprocessor_unterminated_call_keeps_the_rest_of_the_file() {
+    let src = "#define f(x) ((x)+1)\n#define BAD f(\nint before = 1;\nBAD\nint after = 2;\n";
+    let r = preprocess_text("unterminated_call", src, &[]);
+    assert!(
+        !r.success,
+        "an unterminated call is an error:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.contains("unterminated argument list"),
+        "expected the unterminated-call diagnostic, got:\n{}",
+        r.stderr
+    );
+    assert_has(&r.stdout, "int before = 1;", "text before the call");
+    assert_has(&r.stdout, "int after = 2;", "text after the call");
+    assert_lacks(&r.stdout, "((", "the macro must not have expanded");
+}
+
+/// A function-like macro name that only exists after an expansion still finds
+/// its argument list in the file. This worked before only because of a
+/// hand-rolled loop that reached back into the output and re-spliced; deleting
+/// that loop must not lose the behaviour.
+#[test]
+fn preprocessor_pasted_macro_name_takes_arguments_from_the_file() {
+    let src = "#define CONCAT(a,b) a##b\n#define CALL(name) CONCAT(name, _func)\n\
+               #define ADD_func(a,b) ((a)+(b))\nint v = CALL(ADD)(10, 32);\n";
+    let r = preprocess_text("pasted_call", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    // Compared without spacing: c17 puts a space before a substituted
+    // argument that had one at the call site, which gcc does not. That is a
+    // separate, pre-existing divergence and not what this test is about.
+    let squeezed: String = r.stdout.split_whitespace().collect();
+    assert!(
+        squeezed.contains("((10)+(32))"),
+        "expected the arguments to be taken from the file, got:\n{}",
+        r.stdout
+    );
+}
+
+/// The loop that re-spliced from the output also popped tokens that predated
+/// the expansion, so a function-like macro name left legitimately unexpanded
+/// got pulled back in once a *following* macro expanded to nothing. gcc and
+/// clang both leave this alone.
+#[test]
+fn preprocessor_empty_macro_does_not_trigger_the_previous_name() {
+    let src = "#define f(x) ((x)+1)\n#define E\nf E (3)\n";
+    let r = preprocess_text("empty_between", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "f (3)", "the call must not be formed");
+    assert_lacks(&r.stdout, "((3)+1)", "f was expanded across E");
+}

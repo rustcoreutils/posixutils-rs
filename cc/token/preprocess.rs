@@ -391,17 +391,11 @@ pub struct Preprocessor<'a> {
     /// Files that have been included with #pragma once or include guards
     once_files: HashSet<PathBuf>,
 
-    /// Macros currently being expanded (for recursion prevention)
-    expanding: HashSet<String>,
-
     /// Compilation date string for __DATE__ (format: "Mmm dd yyyy")
     compile_date: String,
 
     /// Compilation time string for __TIME__ (format: "hh:mm:ss")
     compile_time: String,
-
-    /// Preprocess call depth (0 = top level, >0 = recursive for macros/includes)
-    preprocess_depth: u32,
 
     /// Whether to use builtin headers (disabled by -nobuiltininc or -nostdinc)
     use_builtin_headers: bool,
@@ -447,6 +441,18 @@ pub struct Preprocessor<'a> {
     /// and every later diagnostic named the wrong file. A translation unit
     /// does far more than 65535 pastes.
     paste_stream: std::cell::Cell<Option<u16>>,
+    /// How many more expansions may be spliced in before the pass gives up.
+    /// Seeded once, at construction: the nested calls for an argument's own
+    /// replacement and for an included file share it, since a runaway in
+    /// either is the same failure, and re-seeding per call would let an
+    /// exhausted budget come back.
+    ///
+    /// Termination rests entirely on the hide set now, and a hole in it is an
+    /// infinite loop rather than a wrong answer -- a hang has no diagnostic and
+    /// no exit status to read. This turns one into an error. It is a backstop,
+    /// not a policy: the bound is far above what any real translation unit
+    /// reaches, so hitting it means a bug here, not an unusual program.
+    expansion_budget: u64,
     /// Set while a `#if`/`#elif` controlling expression is being expanded.
     ///
     /// C17 6.10.1p1 exempts the operand of `defined` from macro expansion, and
@@ -776,10 +782,8 @@ impl<'a> Preprocessor<'a> {
             max_include_depth: 200,
             include_stack: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
-            expanding: HashSet::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             compile_date,
             compile_time,
-            preprocess_depth: 0,
             use_builtin_headers: true,
             trigraphs: false,
             use_system_headers: true,
@@ -791,6 +795,7 @@ impl<'a> Preprocessor<'a> {
             linemarker: None,
             physical_line: 0,
             physical_stream: 0,
+            expansion_budget: EXPANSION_BUDGET,
             paste_stream: std::cell::Cell::new(None),
             in_if_condition: false,
         };
@@ -1104,7 +1109,6 @@ impl<'a> Preprocessor<'a> {
 
     /// Process tokens through the preprocessor
     pub fn preprocess(&mut self, tokens: Vec<Token>, idents: &mut IdentTable) -> Vec<Token> {
-        self.preprocess_depth += 1;
         let mut output = Vec::new();
         // Tracks `defined X` / `defined ( X )` so the operand escapes macro
         // expansion; inert outside a controlling expression.
@@ -1139,8 +1143,19 @@ impl<'a> Preprocessor<'a> {
 
                 TokenType::Special => {
                     if let TokenValue::Special(code) = &token.value {
-                        // Check for # at start of line (preprocessor directive)
-                        if *code == b'#' as u32 && token.pos.newline {
+                        // Check for # at start of line (preprocessor directive).
+                        //
+                        // Only from the file. C17 6.10.3p11 makes a directive
+                        // produced by a macro expansion undefined, and taking
+                        // one would be worse than undefined here: `skip_to_eol`
+                        // and `collect_to_eol` stop at the next token that
+                        // begins a line, so a stray `#` out of an expansion
+                        // would swallow the rest of the file rather than the
+                        // rest of a replacement list.
+                        if *code == b'#' as u32
+                            && token.pos.newline
+                            && cursor.provenance() == Provenance::Main
+                        {
                             self.handle_directive(&mut cursor, &token, &mut output, idents);
                             continue;
                         }
@@ -1202,78 +1217,30 @@ impl<'a> Preprocessor<'a> {
                             if let Some(expanded) =
                                 self.try_expand_macro(&name, &token, &mut cursor, idents)
                             {
-                                output.extend(expanded);
-
-                                // Check if the last expanded token is a function-like macro
-                                // followed by '(' in the remaining input stream.
-                                // This handles cases like: CALL(ADD)(10, 32) where token paste
-                                // creates a function-like macro name and args come from outside.
-                                while let Some(last) = output.last() {
-                                    if last.typ != TokenType::Ident {
-                                        break;
-                                    }
-                                    let TokenValue::Ident(id) = &last.value else {
-                                        break;
-                                    };
-                                    let Some(macro_name) = idents.get_opt(*id) else {
-                                        break;
-                                    };
-                                    let macro_name = macro_name.to_string();
-
-                                    // Check if it's a function-like macro
-                                    let Some(mac) = self.macros.get(&macro_name) else {
-                                        break;
-                                    };
-                                    if !mac.is_function {
-                                        break;
-                                    }
-
-                                    // Check if next token is '('
-                                    let Some(next) = cursor.peek() else { break };
-                                    let TokenValue::Special(code) = &next.value else {
-                                        break;
-                                    };
-                                    if *code != b'(' as u32 {
-                                        break;
-                                    }
-
-                                    // Check for recursion
-                                    if self.expanding.contains(&macro_name) {
-                                        break;
-                                    }
-
-                                    // Pop the identifier and expand as function-like macro
-                                    let last_token = output.pop().unwrap();
-
-                                    // Check blue-painting on the token itself
-                                    if last_token.is_no_expand(&macro_name) {
-                                        output.push(last_token);
-                                        break;
-                                    }
-                                    cursor.next(); // consume '('
-                                    let args = self.collect_macro_args(
-                                        &mut cursor,
-                                        idents,
-                                        &last_token.pos,
-                                        &macro_name,
-                                    );
-                                    let mac = mac.clone();
-                                    if let Some(more_expanded) = self.expand_function_macro(
-                                        &mac,
-                                        &args,
-                                        &last_token.pos,
-                                        last_token.no_expand.as_ref(),
-                                        idents,
-                                    ) {
-                                        output.extend(more_expanded);
-                                        // Loop to handle chained expansions
-                                    } else {
-                                        // Put back the identifier if expansion failed
-                                        output.push(last_token);
-                                        break;
-                                    }
+                                // Put the expansion back in front of the file
+                                // rather than into the output, and do not
+                                // advance. Rescanning is then this same loop
+                                // reading on, and an expansion that ends in
+                                // the middle of a call can finish it from the
+                                // rest of the file -- which is what C17
+                                // 6.10.3.4 EXAMPLE 3 asks for and what the
+                                // recursive rescan could not do, because it
+                                // only ever saw the replacement list.
+                                //
+                                // The invocation's spacing goes with it, to be
+                                // applied to whichever token comes next: an
+                                // expansion may be empty, or may begin with a
+                                // macro that expands to nothing, and stamping
+                                // the first token would lose it in both cases.
+                                if !self.charge_expansion(token.pos) {
+                                    output.push(token);
+                                    continue;
                                 }
-
+                                cursor.push_expansion(
+                                    expanded,
+                                    token.pos.whitespace,
+                                    token.pos.newline,
+                                );
                                 continue;
                             }
                         }
@@ -1292,19 +1259,47 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Check for unterminated conditionals (only at top level)
-        // - preprocess_depth == 1: we're at the outermost preprocess call (not recursive)
-        // - include_depth == 0: we're not inside an included file
-        // Recursive calls happen during macro expansion and include file processing
-        if self.preprocess_depth == 1 && self.include_depth == 0 && !self.cond_stack.is_empty() {
-            // Report location of first unterminated #if directive
-            let first_pos = self.cond_stack.first().map(|c| c.pos).unwrap_or_default();
-            let msg = format!("{} unterminated #if directive(s)", self.cond_stack.len());
-            diag::warning(first_pos, &msg);
-        }
-
-        self.preprocess_depth -= 1;
         output
+    }
+
+    /// Account for one expansion, and say whether it may proceed.
+    ///
+    /// Reports once, then keeps returning false so the rest of the file is
+    /// emitted without expansion rather than producing one error per token.
+    fn charge_expansion(&mut self, pos: Position) -> bool {
+        if self.expansion_budget == 0 {
+            return false;
+        }
+        self.expansion_budget -= 1;
+        if self.expansion_budget == 0 {
+            diag::error(
+                pos,
+                &gettext("macro expansion is not terminating; giving up"),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Warn about `#if` groups the file never closed.
+    ///
+    /// This belongs to the whole pass, not to one call of it: `preprocess` is
+    /// still re-entered for an argument's own macro replacement and for an
+    /// included file, and only the outermost caller knows the run is over. It
+    /// used to be guarded by a recursion depth counter for exactly that
+    /// reason.
+    ///
+    /// An included file's leftover groups are not reported, because
+    /// `include_file` swaps the conditional stack out around it and drops
+    /// whatever is left. gcc does diagnose that; changing it is a separate
+    /// question from this one.
+    fn report_unterminated_conditionals(&self) {
+        if self.cond_stack.is_empty() {
+            return;
+        }
+        let first_pos = self.cond_stack.first().map(|c| c.pos).unwrap_or_default();
+        let msg = format!("{} unterminated #if directive(s)", self.cond_stack.len());
+        diag::warning(first_pos, &msg);
     }
 
     /// Apply the active [`LineMarker`] to a position.
@@ -2225,6 +2220,11 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     }
 }
 
+/// The macro-expansion backstop. Orders of magnitude above what a real
+/// translation unit reaches -- CPython's largest needs a few hundred thousand
+/// -- so exhausting it means a hole in the hide set, not an unusual program.
+const EXPANSION_BUDGET: u64 = 1 << 26;
+
 /// Where a `#if` scan is within a `defined` operator.
 ///
 /// The operand must not be macro-expanded (C17 6.10.1p1), and recognising it
@@ -2441,7 +2441,9 @@ pub fn preprocess_with_defines(
         pp.undef_macro(undef);
     }
 
-    pp.preprocess(tokens, idents)
+    let output = pp.preprocess(tokens, idents);
+    pp.report_unterminated_conditionals();
+    output
 }
 
 // ============================================================================
@@ -2541,6 +2543,7 @@ pub fn preprocess_asm_file(
 
     // Preprocess
     let preprocessed = pp.preprocess(tokens, &mut strings);
+    pp.report_unterminated_conditionals();
 
     // Convert tokens back to text
     tokens_to_source_bytes(&preprocessed, &strings)

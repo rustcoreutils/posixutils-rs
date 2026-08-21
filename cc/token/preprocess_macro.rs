@@ -538,23 +538,6 @@ impl<'a> Preprocessor<'a> {
     ) -> Option<Vec<Token>> {
         let pos = &invoker.pos;
         let invoker_hide = invoker.no_expand.as_ref();
-        // Recursion is prevented twice over while the hide set proves itself.
-        //
-        // `expanding` is the old guard: a set scoped to the rescan call, which
-        // only works because the rescan *is* a call. The hide set carried on
-        // the tokens themselves does not depend on that, which is what lets
-        // the rescan become a splice. Until the splice lands, keep both and
-        // assert they agree -- anything `expanding` catches that the hide set
-        // does not is a hole in the hide set, and a hang once `expanding` goes.
-        if self.expanding.contains(name) {
-            debug_assert!(
-                invoker.is_no_expand(name),
-                "`{}` was stopped only by the `expanding` set; the hide set \
-                 missed it, and will not stop it once the rescan is a splice",
-                name
-            );
-            return None;
-        }
 
         let mac = self.macros.get(name)?.clone();
 
@@ -569,8 +552,10 @@ impl<'a> Preprocessor<'a> {
             if let Some(next) = iter.peek() {
                 if let TokenValue::Special(code) = &next.value {
                     if *code == b'(' as u32 {
-                        iter.next(); // consume '('
-                        let args = self.collect_macro_args(iter, idents, pos, name);
+                        let open_paren = iter.next()?; // consume '('
+                                                       // Returns None having pushed the '(' and everything
+                                                       // after it back, so the macro name is emitted plain.
+                        let args = self.collect_macro_args(iter, idents, pos, name, &open_paren)?;
                         return self.expand_function_macro(&mac, &args, pos, invoker_hide, idents);
                     }
                 }
@@ -590,7 +575,8 @@ impl<'a> Preprocessor<'a> {
         _idents: &IdentTable,
         macro_pos: &Position,
         macro_name: &str,
-    ) -> Vec<Vec<Token>> {
+        open_paren: &Token,
+    ) -> Option<Vec<Vec<Token>>> {
         let mut args = Vec::new();
         let mut current_arg = Vec::new();
         // Start at depth 1 because the opening '(' has already been consumed
@@ -609,7 +595,7 @@ impl<'a> Preprocessor<'a> {
                         if paren_depth == 0 {
                             // End of arguments - closing ')' of macro call
                             if !current_arg.is_empty() || !args.is_empty() {
-                                args.push(current_arg);
+                                args.push(std::mem::take(&mut current_arg));
                             }
                             found_closing_paren = true;
                             break;
@@ -618,8 +604,7 @@ impl<'a> Preprocessor<'a> {
                         current_arg.push(token);
                     } else if *code == b',' as u32 && paren_depth == 1 {
                         // Argument separator at top level (paren_depth == 1 since we're inside the macro call)
-                        args.push(current_arg);
-                        current_arg = Vec::new();
+                        args.push(std::mem::take(&mut current_arg));
                     } else {
                         current_arg.push(token);
                     }
@@ -630,16 +615,34 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Check for unterminated macro call (EOF before closing ')')
+        // Unterminated: the whole file went by without a closing ')'.
+        //
+        // Give the tokens back rather than expanding with whatever was
+        // collected. Since expansion became a splice, the scan runs to end of
+        // file looking for that ')', so expanding anyway would substitute the
+        // rest of the translation unit into the macro and emit the result --
+        // `#define BAD f(` followed by `BAD` produced `(()+1)` and deleted
+        // everything after it. gcc leaves the macro name in place, and so does
+        // this now.
         if !found_closing_paren {
             crate::diag::error_args(
                 *macro_pos,
                 "unterminated argument list invoking macro \"{0}\"",
                 &[macro_name],
             );
+            let mut back = vec![open_paren.clone()];
+            for (i, arg) in args.into_iter().enumerate() {
+                if i > 0 {
+                    back.push(Self::variadic_separator(*macro_pos));
+                }
+                back.extend(arg);
+            }
+            back.extend(current_arg);
+            iter.push_expansion(back, open_paren.pos.whitespace, open_paren.pos.newline);
+            return None;
         }
 
-        args
+        Some(args)
     }
 
     /// Expand a function-like macro
@@ -702,8 +705,10 @@ impl<'a> Preprocessor<'a> {
     ) -> Option<Vec<Token>> {
         self.check_macro_arity(mac, args, pos);
 
-        // Note: Don't add to expanding set yet - arguments need to be fully expanded first.
-        // The expanding set is only used during the rescan phase to prevent infinite recursion.
+        // Arguments are macro-replaced on their own first (C17 6.10.3.1p1:
+        // "as if they formed the rest of the preprocessing file"), and are not
+        // yet hidden by this macro -- so `#define f(x) (x)` expands `f(f(1))`
+        // to `((1))`.
 
         let mut result = Vec::new();
         let mut i = 0;
@@ -866,31 +871,24 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Rescan for more macro expansion
-        // NOTE: Only add to expanding set during rescan to prevent infinite recursion
         // Arguments were already expanded above, so this only affects the replacement list rescan
-        // Hide before the rescan, not after.
+        // Hide before handing the expansion back.
         //
-        // The rescan is where a self-referential macro would recurse, so a
-        // hide set applied afterwards is applied too late to be what stops it
-        // -- `expanding` was. glibc's enum-and-macro idiom, `#define
-        // MSG_DONTROUTE MSG_DONTROUTE`, reaches the rescan with the inner name
-        // still unhidden, and there are five such headers in the test corpus
-        // alone. Hiding first also propagates: a nested expansion inside the
-        // rescan sees an invoking token that already carries this set.
+        // The result is rescanned by the caller's loop, which is where a
+        // self-referential macro would recurse -- so hiding has to happen
+        // before it is handed back, not after. glibc's enum-and-macro idiom,
+        // `#define MSG_DONTROUTE MSG_DONTROUTE`, is the shape that catches
+        // this. Hiding here also propagates: a nested expansion sees an
+        // invoking token that already carries this set.
         //
         // Substitution and pasting are both finished by now, which is the
         // other half of the requirement -- a name that `##` built has to be
         // hidden too.
         hide_in_expansion(&mut result, &mac.name, invoker_hide);
 
-        self.expanding.insert(mac.name.clone());
-        let rescanned = self.preprocess(result, idents);
-        self.expanding.remove(&mac.name);
-
-        let mut filtered: Vec<_> = rescanned
-            .into_iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .collect();
+        // No rescan here: the caller pushes this back in front of the cursor,
+        // so it is rescanned by the same loop that produced it.
+        let mut filtered = result;
 
         // The FIRST token of a macro expansion stands where the invocation
         // stood: it inherits both the spacing before it and whether it begins
@@ -964,8 +962,6 @@ impl<'a> Preprocessor<'a> {
             return Some(vec![]);
         }
 
-        // Note: Don't add to expanding set yet - that happens during rescan phase only.
-
         let mut result = Vec::new();
         let mut i = 0;
 
@@ -999,31 +995,24 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Rescan for more macro expansion
-        // NOTE: Only add to expanding set during rescan to prevent infinite recursion
         // (e.g., when const -> __const and __const -> const both exist)
-        // Hide before the rescan, not after.
+        // Hide before handing the expansion back.
         //
-        // The rescan is where a self-referential macro would recurse, so a
-        // hide set applied afterwards is applied too late to be what stops it
-        // -- `expanding` was. glibc's enum-and-macro idiom, `#define
-        // MSG_DONTROUTE MSG_DONTROUTE`, reaches the rescan with the inner name
-        // still unhidden, and there are five such headers in the test corpus
-        // alone. Hiding first also propagates: a nested expansion inside the
-        // rescan sees an invoking token that already carries this set.
+        // The result is rescanned by the caller's loop, which is where a
+        // self-referential macro would recurse -- so hiding has to happen
+        // before it is handed back, not after. glibc's enum-and-macro idiom,
+        // `#define MSG_DONTROUTE MSG_DONTROUTE`, is the shape that catches
+        // this. Hiding here also propagates: a nested expansion sees an
+        // invoking token that already carries this set.
         //
         // Substitution and pasting are both finished by now, which is the
         // other half of the requirement -- a name that `##` built has to be
         // hidden too.
         hide_in_expansion(&mut result, &mac.name, invoker_hide);
 
-        self.expanding.insert(mac.name.clone());
-        let rescanned = self.preprocess(result, idents);
-        self.expanding.remove(&mac.name);
-
-        let mut filtered: Vec<_> = rescanned
-            .into_iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .collect();
+        // No rescan here: the caller pushes this back in front of the cursor,
+        // so it is rescanned by the same loop that produced it.
+        let mut filtered = result;
 
         // The FIRST token of a macro expansion stands where the invocation
         // stood: it inherits both the spacing before it and whether it begins
@@ -1151,8 +1140,10 @@ impl<'a> Preprocessor<'a> {
                 if let Some(next) = iter.peek() {
                     if let TokenValue::Special(code) = &next.value {
                         if *code == b'(' as u32 {
-                            iter.next();
-                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
+                            let open_paren = iter.next()?;
+                            let args = self
+                                .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
+                                .unwrap_or_default();
                             let result = self.eval_has_builtin(builtin, &args, idents);
                             return Some(vec![Token::with_value(
                                 TokenType::Number,
@@ -1173,8 +1164,10 @@ impl<'a> Preprocessor<'a> {
                 if let Some(next) = iter.peek() {
                     if let TokenValue::Special(code) = &next.value {
                         if *code == b'(' as u32 {
-                            iter.next();
-                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
+                            let open_paren = iter.next()?;
+                            let args = self
+                                .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
+                                .unwrap_or_default();
                             let result = self.eval_has_include(&args, idents);
                             return Some(vec![Token::with_value(
                                 TokenType::Number,

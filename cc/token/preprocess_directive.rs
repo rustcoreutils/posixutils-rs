@@ -63,6 +63,16 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
     ) {
+        // The `#` was read from the file, and the cursor hands back everything
+        // pushed in front of the file before reading from it again -- so
+        // nothing can be pending here. The line-oriented helpers below rely on
+        // that: they stop at the next token flagged as beginning a line, which
+        // is a property of the file's tokens.
+        debug_assert!(
+            iter.pushback_is_empty(),
+            "a directive was recognised with a macro expansion still pending"
+        );
+
         // C17 6.10p7: a `#` alone on a line is the null directive and has no
         // effect. Check before consuming, because the next token belongs to the
         // *next* line — taking it unconditionally treated that line's first

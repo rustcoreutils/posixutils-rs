@@ -47,6 +47,8 @@ pub(super) struct TokenCursor {
     pushback: Vec<Token>,
     /// Where the token most recently returned by `next` came from.
     last: Provenance,
+    /// Spacing an expansion left for whichever token comes next.
+    pending_spacing: Option<(bool, bool)>,
 }
 
 impl TokenCursor {
@@ -55,6 +57,7 @@ impl TokenCursor {
             main: tokens.into_iter(),
             pushback: Vec::new(),
             last: Provenance::Main,
+            pending_spacing: None,
         }
     }
 
@@ -73,13 +76,40 @@ impl TokenCursor {
     pub(super) fn provenance(&self) -> Provenance {
         self.last
     }
+
+    /// Put a macro expansion in front of the file.
+    ///
+    /// The tokens are read next, in the order given, and go through the same
+    /// scanning as anything else. That is what makes rescanning free rather
+    /// than a separate recursive pass over a separate vector, and it is what
+    /// lets an expansion that ends mid-call finish the call from the rest of
+    /// the file.
+    ///
+    /// `whitespace` and `newline` are the invocation's, and are handed to
+    /// whichever token is yielded next -- from this expansion, or from the
+    /// file if the expansion turns out to be empty. Stamping them onto
+    /// `tokens[0]` instead loses them exactly when the expansion is empty or
+    /// begins with a macro that expands to nothing.
+    pub(super) fn push_expansion(&mut self, tokens: Vec<Token>, whitespace: bool, newline: bool) {
+        self.pending_spacing = Some((whitespace, newline));
+        self.pushback.reserve(tokens.len());
+        self.pushback.extend(tokens.into_iter().rev());
+    }
+
+    /// Whether anything is waiting in front of the file.
+    ///
+    /// A directive is only ever recognised on a token read from the file, so
+    /// this holds whenever one is being handled; the handlers assert it.
+    pub(super) fn pushback_is_empty(&self) -> bool {
+        self.pushback.is_empty()
+    }
 }
 
 impl Iterator for TokenCursor {
     type Item = Token;
 
     fn next(&mut self) -> Option<Token> {
-        match self.pushback.pop() {
+        let token = match self.pushback.pop() {
             Some(token) => {
                 self.last = Provenance::Expansion;
                 Some(token)
@@ -88,6 +118,14 @@ impl Iterator for TokenCursor {
                 self.last = Provenance::Main;
                 self.main.next()
             }
+        };
+        match (token, self.pending_spacing.take()) {
+            (Some(mut token), Some((whitespace, newline))) => {
+                token.pos.whitespace = whitespace;
+                token.pos.newline = newline;
+                Some(token)
+            }
+            (token, _) => token,
         }
     }
 }

@@ -189,6 +189,58 @@ fn preprocessor_header_name_is_one_token() {
     }
 }
 
+/// C99 6.4.6p3: the six digraphs "behave the same, respectively, as the six
+/// primary tokens ... **except for their spelling**". 6.10.3.2p2 then asks `#`
+/// for "the spelling of the preprocessing token", and `-E` has to round-trip
+/// it. c17 lexed each digraph straight to its primary token, so the spelling
+/// was gone before either could ask: `S(<:1:>)` stringified to `"[1]"` and
+/// `c17 -E` rewrote every digraph in the output.
+#[test]
+fn preprocessor_digraph_spelling_survives() {
+    let r = preprocess_text(
+        "digraph_spelling",
+        "#define S(x) #x\n\
+         a: S(<:1:>)\n\
+         b: S(%:%:)\n\
+         c: S(<% %>)\n\
+         d: <% %> <: :> %: %:%:\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "\"<:1:>\"", "stringified <: :>");
+    assert_has(&r.stdout, "\"%:%:\"", "stringified %:%:");
+    assert_has(&r.stdout, "\"<% %>\"", "stringified <% %>");
+    assert_has(&r.stdout, "<% %> <: :> %: %:%:", "digraphs in plain text");
+    // The primary spellings must not appear where a digraph was written.
+    assert_lacks(
+        &r.stdout,
+        "\"[1]\"",
+        "digraph rewritten to its primary token",
+    );
+    assert_lacks(
+        &r.stdout,
+        "\"##\"",
+        "digraph rewritten to its primary token",
+    );
+}
+
+/// A digraph still *means* its primary token everywhere else (6.4.6p3), so it
+/// has to keep working as syntax, as a directive introducer, and as `##`.
+#[test]
+fn preprocessor_digraphs_still_mean_their_primary_tokens() {
+    let r = preprocess_text(
+        "digraph_meaning",
+        "%:define CAT(a,b) a%:%:b\n\
+         %:define STR(x) %:x\n\
+         int main(void) <% int v<:2:> = <%7,8%>; return CAT(v,)<:0:> + v<:1:> - 15; %>\n\
+         s: STR(q)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "\"q\"", "%: as the stringify operator");
+    assert_has(&r.stdout, "v<:0:>", "%:%: as ## still pastes");
+}
+
 // ============================================================================
 // #P2 — the null directive
 // ============================================================================

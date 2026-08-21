@@ -40,6 +40,50 @@ pub enum LexerMode {
     Assembly,
 }
 
+/// How a token was written, where its type and value do not say.
+///
+/// Two constructs in C spell a token differently without changing anything
+/// else about it, and C99 6.10.3.2p2 asks `#` for "the spelling of the
+/// preprocessing token" -- so the spelling has to survive to the point where
+/// `#` and `-E` read it. Kept beside the type rather than as types of their
+/// own: a path that fails to carry this loses the spelling, which is what
+/// every path did before, rather than losing the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Spelling {
+    /// Written the one canonical way for this token's type and value.
+    #[default]
+    Canonical,
+    /// A string literal written `u8"..."`. C11 6.4.5p6 gives it type
+    /// `char[]`, so it is a narrow string in every respect but this.
+    Utf8Prefix,
+    /// A punctuator written as one of the six digraphs (C99 6.4.6):
+    /// `<: :> <% %> %: %:%:`. 6.4.6p3 makes them behave exactly as
+    /// `[ ] { } # ##` "except for their spelling".
+    Digraph,
+}
+
+/// A punctuator token that was written as a digraph. The value is the primary
+/// token's, because 6.4.6p3 makes it mean exactly that; only the spelling
+/// differs.
+fn digraph_token(pos: Position, value: TokenValue) -> Token {
+    let mut token = Token::with_value(TokenType::Special, pos, value);
+    token.spelling = Spelling::Digraph;
+    token
+}
+
+/// The digraph that spells the punctuator `code`, for a token written as one.
+fn digraph_spelling(code: u32) -> Option<&'static str> {
+    Some(match code {
+        c if c == b'[' as u32 => "<:",
+        c if c == b']' as u32 => ":>",
+        c if c == b'{' as u32 => "<%",
+        c if c == b'}' as u32 => "%>",
+        c if c == b'#' as u32 => "%:",
+        c if c == SpecialToken::HashHash as u32 => "%:%:",
+        _ => return None,
+    })
+}
+
 /// Where a header name (C99 6.4.7) may appear.
 ///
 /// A header name is one preprocessing token, but only in a `#include`,
@@ -429,16 +473,8 @@ pub struct Token {
     pub typ: TokenType,
     pub pos: Position,
     pub value: TokenValue,
-    /// Spelled `u8"..."`.
-    ///
-    /// The one thing [`TokenType`] cannot say about a literal. C11 6.4.5p6
-    /// gives a `u8` string type `char[]`, so it *is* a narrow string
-    /// everywhere but in its spelling -- which 6.10.3.2p2 makes `#`
-    /// reproduce, and which `-E` has to round-trip. Kept as a flag beside the
-    /// type rather than as a type of its own so that a path which fails to
-    /// carry it loses the prefix, the way every path did before, instead of
-    /// losing the string.
-    pub utf8_prefix: bool,
+    /// How this token was written, where its type and value do not say.
+    pub spelling: Spelling,
     /// Macros that should not expand this token (C preprocessor "blue painting").
     /// When a macro's expansion contains its own name, those tokens are marked.
     /// This prevents re-expansion in nested contexts per C99 6.10.3.4.
@@ -451,7 +487,7 @@ impl Token {
             typ,
             pos,
             value: TokenValue::None,
-            utf8_prefix: false,
+            spelling: Spelling::Canonical,
             no_expand: None,
         }
     }
@@ -461,7 +497,7 @@ impl Token {
             typ,
             pos,
             value,
-            utf8_prefix: false,
+            spelling: Spelling::Canonical,
             no_expand: None,
         }
     }
@@ -470,10 +506,20 @@ impl Token {
     /// that do not imply one. Only `u8` qualifies: `L`, `u` and `U` are each
     /// a token type of their own.
     pub fn encoding_prefix(&self) -> &'static str {
-        if self.utf8_prefix {
+        if self.spelling == Spelling::Utf8Prefix {
             "u8"
         } else {
             ""
+        }
+    }
+
+    /// This token's punctuator spelling, honouring a digraph.
+    pub fn punctuator_spelling(&self, code: u32) -> String {
+        match self.spelling {
+            Spelling::Digraph => digraph_spelling(code)
+                .map(str::to_string)
+                .unwrap_or_else(|| show_special(code)),
+            _ => show_special(code),
         }
     }
 
@@ -1025,7 +1071,9 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         let mut token = Token::with_value(typ, pos, value);
         // `u8` is folded into the narrow type above; the flag is what keeps
         // the spelling, which `#` and `-E` both have to reproduce.
-        token.utf8_prefix = enc == LiteralEncoding::Utf8;
+        if enc == LiteralEncoding::Utf8 {
+            token.spelling = Spelling::Utf8Prefix;
+        }
         token
     }
 
@@ -1114,41 +1162,25 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             let next = self.peekchar();
             if next == b':' as i32 {
                 self.nextchar();
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b'[' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b'[' as u32)));
             }
             if next == b'%' as i32 {
                 self.nextchar();
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b'{' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b'{' as u32)));
             }
         }
         if first == b':' {
             let next = self.peekchar();
             if next == b'>' as i32 {
                 self.nextchar();
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b']' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b']' as u32)));
             }
         }
         if first == b'%' {
             let next = self.peekchar();
             if next == b'>' as i32 {
                 self.nextchar();
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b'}' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b'}' as u32)));
             }
             if next == b':' as i32 {
                 self.nextchar();
@@ -1160,18 +1192,13 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 let mut peek = self.peek_at(self.offset);
                 if peek.next() == Some(b'%') && peek.next() == Some(b':') {
                     self.consume_chars(2);
-                    return Some(Token::with_value(
-                        TokenType::Special,
+                    return Some(digraph_token(
                         pos,
                         TokenValue::Special(SpecialToken::HashHash as u32),
                     ));
                 }
                 // Just %: -> #
-                return Some(Token::with_value(
-                    TokenType::Special,
-                    pos,
-                    TokenValue::Special(b'#' as u32),
-                ));
+                return Some(digraph_token(pos, TokenValue::Special(b'#' as u32)));
             }
         }
 
@@ -1556,7 +1583,7 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
         }
         TokenType::Special => {
             if let TokenValue::Special(v) = &token.value {
-                show_special(*v)
+                token.punctuator_spelling(*v)
             } else {
                 "<special?>".to_string()
             }
@@ -2511,7 +2538,9 @@ mod tests {
             .iter()
             .map(|t| show_token(t, &idents))
             .collect();
-        assert_eq!(spelled, vec!["#", "%", "x", "y"]);
+        // `%:` keeps its own spelling (6.4.6p3) while meaning `#`.
+        assert_eq!(spelled, vec!["%:", "%", "x", "y"]);
+        assert!(matches!(&tokens[1].value, TokenValue::Special(c) if *c == b'#' as u32));
         // Phase 2 deletes the splice but the physical lines still count, so
         // `x` is on line 2 and `y` on line 3 -- each crossed exactly once.
         assert_eq!(tokens[3].pos.line, 2);
@@ -2870,6 +2899,40 @@ mod tests {
         assert!(
             matches!(&tokens[1].value, TokenValue::Special(c) if *c == SpecialToken::HashHash as u32)
         );
+    }
+
+    /// 6.4.6p3: a digraph behaves as its primary token "except for their
+    /// spelling", and 6.10.3.2p2 makes `#` reproduce that spelling. The value
+    /// is therefore the primary token's and the spelling its own.
+    #[test]
+    fn test_digraph_keeps_its_own_spelling() {
+        for (src, primary) in [
+            ("<:", b'[' as u32),
+            (":>", b']' as u32),
+            ("<%", b'{' as u32),
+            ("%>", b'}' as u32),
+            ("%:", b'#' as u32),
+            ("%:%:", SpecialToken::HashHash as u32),
+        ] {
+            let (tokens, idents) = tokenize_str(src);
+            assert!(
+                matches!(&tokens[1].value, TokenValue::Special(c) if *c == primary),
+                "{src} must mean its primary token"
+            );
+            assert_eq!(
+                show_token(&tokens[1], &idents),
+                src,
+                "{src} lost its spelling"
+            );
+        }
+
+        // The primary tokens keep spelling themselves.
+        let (tokens, idents) = tokenize_str("[ ] { } # ##");
+        let spelled: Vec<_> = tokens[1..tokens.len() - 1]
+            .iter()
+            .map(|t| show_token(t, &idents))
+            .collect();
+        assert_eq!(spelled, vec!["[", "]", "{", "}", "#", "##"]);
     }
 
     // ========================================================================

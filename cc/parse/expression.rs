@@ -3260,6 +3260,45 @@ impl<'a> Parser<'a> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_CLRSB => Some((|| {
+                // __builtin_clrsb(x) - redundant sign bits in a signed int.
+                // Defined for every input, so unlike `clz` there is no
+                // undefined case to document.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::Clrsb { arg: Box::new(arg) },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CLRSBL => Some((|| {
+                // __builtin_clrsbl(x) - redundant sign bits in a signed long.
+                // Defined for every input, so unlike `clz` there is no
+                // undefined case to document.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::Clrsbl { arg: Box::new(arg) },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CLRSBLL => Some((|| {
+                // __builtin_clrsbll(x) - redundant sign bits in a signed long long.
+                // Defined for every input, so unlike `clz` there is no
+                // undefined case to document.
+                self.expect_special(b'(')?;
+                let arg = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::Clrsbll { arg: Box::new(arg) },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_POPCOUNT => Some((|| {
                 // __builtin_popcount(x) - returns int, counts set bits in unsigned int
                 self.expect_special(b'(')?;
@@ -5165,7 +5204,7 @@ impl<'a> Parser<'a> {
             // The library builtins, for the case where the header that would
             // declare them has not been included.
             "strlen" => Some(self.types.ulong_id),
-            "strcmp" | "abs" | "ffs" | "ffsl" => Some(self.types.int_id),
+            "strcmp" | "abs" | "ffs" | "ffsl" | "ffsll" => Some(self.types.int_id),
             "labs" => Some(self.types.long_id),
             "llabs" => Some(self.types.longlong_id),
             "sqrt" | "copysign" => Some(self.types.double_id),
@@ -5189,6 +5228,7 @@ impl<'a> Parser<'a> {
                 | crate::kw::BUILTIN_LLABS
                 | crate::kw::BUILTIN_FFS
                 | crate::kw::BUILTIN_FFSL
+                | crate::kw::BUILTIN_FFSLL
                 | crate::kw::BUILTIN_SQRT
                 | crate::kw::BUILTIN_COPYSIGN
                 | crate::kw::BUILTIN_TRAP
@@ -5299,7 +5339,7 @@ impl<'a> Parser<'a> {
             "__memset_chk" | "__strcpy_chk" | "__stpcpy_chk" | "__strcat_chk" => (3, false),
             "__memcpy_chk" | "__memmove_chk" | "__mempcpy_chk" | "__strncpy_chk"
             | "__stpncpy_chk" | "__strncat_chk" => (4, false),
-            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "sqrt" => (1, false),
+            "strlen" | "abs" | "labs" | "llabs" | "ffs" | "ffsl" | "ffsll" | "sqrt" => (1, false),
             "strcmp" | "copysign" => (2, false),
             "abort" => (0, false),
             // An entry point this does not know is left as it was: variadic,

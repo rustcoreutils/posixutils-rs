@@ -501,6 +501,24 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
 
+    /// __builtin_clrsb(x)
+    /// Number of redundant sign bits: the bits below the sign bit that repeat
+    /// it. Unlike the `clz` family this is defined for every input, zero and
+    /// -1 included, both of which answer one less than the width.
+    Clrsb {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_clrsbl(x)
+    Clrsbl {
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_clrsbll(x)
+    Clrsbll {
+        arg: Box<Expr>,
+    },
+
     /// __builtin_clzl(x)
     /// Returns the number of leading 0-bits in x (unsigned long)
     /// Result is undefined if x is 0

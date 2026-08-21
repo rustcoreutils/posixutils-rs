@@ -1571,6 +1571,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Clz { arg }
             | ExprKind::Clzl { arg }
             | ExprKind::Clzll { arg }
+            | ExprKind::Clrsb { arg }
+            | ExprKind::Clrsbl { arg }
+            | ExprKind::Clrsbll { arg }
             | ExprKind::Popcount { arg }
             | ExprKind::Popcountl { arg }
             | ExprKind::Popcountll { arg }
@@ -4105,6 +4108,103 @@ impl<'a> Linearizer<'a> {
         result
     }
 
+    /// Lower `__builtin_clrsb` and its wider siblings.
+    ///
+    /// The count of redundant sign bits is `clz` of the value with its sign
+    /// folded away, less one -- but `clz(0)` is undefined, and `x` of 0 or -1
+    /// folds to exactly that. c17 and gcc happen to answer differently there,
+    /// so relying on it would be relying on undefined behaviour agreeing.
+    ///
+    /// Instead the folded value is shifted up one and given a low bit:
+    ///
+    /// ```text
+    /// clrsb(x) = clz(((x ^ (x >> (W-1))) << 1) | 1)
+    /// ```
+    ///
+    /// The shift absorbs the `- 1`, the set bit makes the input nonzero for
+    /// every `x`, and the fold's result always has its top bit clear so the
+    /// shift cannot lose information. `x` is evaluated once, which is why this
+    /// is a node rather than a rewrite over `__builtin_clz`.
+    fn linearize_clrsb(&mut self, arg: &Expr, width: u32) -> PseudoId {
+        let int_id = self.types.int_id;
+        // The sign-extracting shift must be signed; everything after it is bit
+        // manipulation and must be *unsigned*. `folded << 1` overflows a
+        // signed type whenever the top data bit is set -- `clrsb(INT_MIN)`
+        // folds to 0x7fffffff, and shifting that left is undefined -- so at
+        // -O2 the folder was free to answer 30 where -O0 answered 0.
+        let signed_typ = if width == 32 {
+            self.types.int_id
+        } else {
+            self.types.long_id
+        };
+        let val_typ = if width == 32 {
+            self.types.uint_id
+        } else {
+            self.types.ulong_id
+        };
+        let val = self.linearize_expr(arg);
+
+        // x >> (W-1): all ones when negative, zero when not.
+        let shift = self.emit_const((width - 1) as i128, int_id);
+        let sign = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Asr,
+            sign,
+            val,
+            shift,
+            signed_typ,
+            width,
+        ));
+
+        // x ^ sign: x when non-negative, ~x when negative. Top bit is clear.
+        let folded = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Xor,
+            folded,
+            val,
+            sign,
+            val_typ,
+            width,
+        ));
+
+        // (folded << 1) | 1 -- never zero, and one bit shorter to count.
+        let one = self.emit_const(1, int_id);
+        let shifted = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Shl,
+            shifted,
+            folded,
+            one,
+            val_typ,
+            width,
+        ));
+        let one_again = self.emit_const(1, val_typ);
+        let nonzero = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Or,
+            nonzero,
+            shifted,
+            one_again,
+            val_typ,
+            width,
+        ));
+
+        let result = self.alloc_pseudo();
+        let op = if width == 32 {
+            Opcode::Clz32
+        } else {
+            Opcode::Clz64
+        };
+        self.emit(
+            Instruction::new(op)
+                .with_target(result)
+                .with_src(nonzero)
+                .with_size(width)
+                .with_type(int_id),
+        );
+        result
+    }
+
     pub(crate) fn linearize_compound_literal(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
             ExprKind::CompoundLiteral { typ, elements } => {
@@ -4377,6 +4477,9 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             }
+
+            ExprKind::Clrsb { arg } => self.linearize_clrsb(arg, 32),
+            ExprKind::Clrsbl { arg } | ExprKind::Clrsbll { arg } => self.linearize_clrsb(arg, 64),
 
             // ================================================================
             // Population count builtins
@@ -5280,6 +5383,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Clz { .. }
             | ExprKind::Clzl { .. }
             | ExprKind::Clzll { .. }
+            | ExprKind::Clrsb { .. }
+            | ExprKind::Clrsbl { .. }
+            | ExprKind::Clrsbll { .. }
             | ExprKind::Popcount { .. }
             | ExprKind::Popcountl { .. }
             | ExprKind::Popcountll { .. }

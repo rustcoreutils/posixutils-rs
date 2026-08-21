@@ -262,6 +262,9 @@ fn extract_refs_from_expr(
         | ExprKind::Clz { arg }
         | ExprKind::Clzl { arg }
         | ExprKind::Clzll { arg }
+        | ExprKind::Clrsb { arg }
+        | ExprKind::Clrsbl { arg }
+        | ExprKind::Clrsbll { arg }
         | ExprKind::Popcount { arg }
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }

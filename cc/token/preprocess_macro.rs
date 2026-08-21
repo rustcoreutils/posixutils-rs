@@ -1,0 +1,1192 @@
+//
+// Copyright (c) 2025-2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+// Macro definition, substitution and expansion: turning a `#define` body into
+// a replacement list, and a use of it back into tokens.
+//
+// A child module of `preprocess`, so these still reach `Preprocessor`'s
+// private fields and the parent's helpers exactly as they did inline.
+// `pub(super)` marks only what the parent, a sibling, or the tests call.
+//
+
+use super::*;
+
+/// Compare two replacement lists, ignoring whitespace before the first token.
+pub(super) fn replacement_lists_identical(a: &[MacroToken], b: &[MacroToken]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).enumerate().all(|(i, (x, y))| {
+        x.typ == y.typ && x.value == y.value && (i == 0 || x.whitespace == y.whitespace)
+    })
+}
+
+impl<'a> Preprocessor<'a> {
+    /// Expand macros in #if/#elif condition tokens.
+    /// This follows the C standard: macros are expanded, except for arguments to `defined`.
+    /// Undefined identifiers are replaced with 0.
+    pub(super) fn expand_if_tokens(
+        &mut self,
+        tokens: &[Token],
+        idents: &mut IdentTable,
+    ) -> Vec<Token> {
+        let mut result = Vec::new();
+        let mut i = 0;
+
+        while i < tokens.len() {
+            let token = &tokens[i];
+
+            // Check for `defined` operator
+            if let TokenValue::Ident(id) = &token.value {
+                if let Some(name) = idents.get_opt(*id) {
+                    if name == "defined" {
+                        // Handle defined(X) or defined X
+                        let pos = token.pos;
+                        i += 1;
+
+                        // Skip optional whitespace and check for paren
+                        let has_paren = if i < tokens.len() {
+                            if let TokenValue::Special(code) = &tokens[i].value {
+                                *code == b'(' as u32
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if has_paren {
+                            i += 1; // skip '('
+                        }
+
+                        // Get the identifier to check
+                        let is_defined = if i < tokens.len() {
+                            if let TokenValue::Ident(check_id) = &tokens[i].value {
+                                if let Some(check_name) = idents.get_opt(*check_id) {
+                                    i += 1;
+                                    self.is_defined(check_name)
+                                } else {
+                                    i += 1;
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if has_paren {
+                            // Skip closing ')'
+                            if i < tokens.len() {
+                                if let TokenValue::Special(code) = &tokens[i].value {
+                                    if *code == b')' as u32 {
+                                        i += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Replace with 0 or 1
+                        result.push(Token {
+                            typ: TokenType::Number,
+                            value: TokenValue::Number(if is_defined {
+                                "1".to_string()
+                            } else {
+                                "0".to_string()
+                            }),
+                            pos,
+                            spelling: Spelling::Canonical,
+                            no_expand: None,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Not `defined` - collect this token for expansion
+            result.push(token.clone());
+            i += 1;
+        }
+
+        // Now expand macros in the result (except `defined` which we already handled)
+        // We need to temporarily disable skipping because we're evaluating an expression
+        // that will determine whether to skip. Push a dummy "Active" conditional.
+        self.cond_stack.push(Conditional {
+            state: CondState::Active,
+            had_true: true,
+            pos: Position::default(),
+        });
+        let expanded = self.preprocess(result, idents);
+        self.cond_stack.pop();
+
+        // Replace any remaining undefined identifiers with 0
+        let mut final_result = Vec::new();
+        for token in expanded {
+            if let TokenValue::Ident(id) = &token.value {
+                if let Some(name) = idents.get_opt(*id) {
+                    // Check if it's a defined macro
+                    if self.get_macro(name).is_some() {
+                        // This shouldn't happen after expansion, but keep it
+                        final_result.push(token);
+                    } else {
+                        // Undefined identifier -> 0
+                        final_result.push(Token {
+                            typ: TokenType::Number,
+                            value: TokenValue::Number("0".to_string()),
+                            pos: token.pos,
+                            spelling: Spelling::Canonical,
+                            no_expand: None,
+                        });
+                    }
+                } else {
+                    // Unknown identifier -> 0
+                    final_result.push(Token {
+                        typ: TokenType::Number,
+                        value: TokenValue::Number("0".to_string()),
+                        pos: token.pos,
+                        spelling: Spelling::Canonical,
+                        no_expand: None,
+                    });
+                }
+            } else {
+                final_result.push(token);
+            }
+        }
+
+        final_result
+    }
+
+    /// Convert tokens to macro body
+    pub(super) fn tokens_to_macro_body(
+        &self,
+        tokens: &[Token],
+        params: &[MacroParam],
+        variadic_name: Option<&str>,
+        is_function: bool,
+        idents: &IdentTable,
+    ) -> Vec<MacroToken> {
+        // C17 6.10.3.3p1: `##` shall occur at neither end of a replacement
+        // list. Both used to become a literal `#`/`##` token instead.
+        let is_paste = |t: &Token| {
+            matches!(&t.value, TokenValue::Special(c)
+                if *c == SpecialToken::HashHash as u32)
+        };
+        if let Some(first) = tokens.first() {
+            if is_paste(first) {
+                diag::error(
+                    first.pos,
+                    &gettext("'##' cannot appear at the start of a macro replacement list"),
+                );
+            }
+        }
+        if tokens.len() > 1 {
+            if let Some(last) = tokens.last() {
+                if is_paste(last) {
+                    diag::error(
+                        last.pos,
+                        &gettext("'##' cannot appear at the end of a macro replacement list"),
+                    );
+                }
+            }
+        }
+
+        let mut body = Vec::new();
+        let mut i = 0;
+
+        while i < tokens.len() {
+            let token = &tokens[i];
+
+            // Check for # (stringify)
+            if let TokenValue::Special(code) = &token.value {
+                if *code == b'#' as u32 {
+                    // Check if followed by ##
+                    if i + 1 < tokens.len() {
+                        if let TokenValue::Special(next_code) = &tokens[i + 1].value {
+                            if *next_code == b'#' as u32 {
+                                // ## token paste
+                                body.push(MacroToken {
+                                    typ: TokenType::Special,
+                                    value: MacroTokenValue::Paste,
+                                    whitespace: token.pos.whitespace,
+                                    spelling: Spelling::Canonical,
+                                });
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // # stringify - look for following parameter
+                    if i + 1 < tokens.len() {
+                        if let TokenValue::Ident(id) = &tokens[i + 1].value {
+                            if let Some(name) = idents.get_opt(*id) {
+                                // Check if it's a parameter
+                                let mut found_param = false;
+                                for param in params {
+                                    if param.name == name {
+                                        body.push(MacroToken {
+                                            typ: TokenType::Special,
+                                            value: MacroTokenValue::Stringify(param.index),
+                                            whitespace: token.pos.whitespace,
+                                            spelling: Spelling::Canonical,
+                                        });
+                                        found_param = true;
+                                        break;
+                                    }
+                                }
+                                if found_param {
+                                    i += 2;
+                                    continue;
+                                }
+                                // Check for __VA_ARGS__, or the GNU named
+                                // variadic that stands in for it.
+                                if name == "__VA_ARGS__" || Some(name) == variadic_name {
+                                    body.push(MacroToken {
+                                        typ: TokenType::Special,
+                                        value: MacroTokenValue::Stringify(params.len()),
+                                        whitespace: token.pos.whitespace,
+                                        spelling: Spelling::Canonical,
+                                    });
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // C17 6.10.3.2p1: in a function-like macro each `#` shall
+                    // be followed by a parameter. It used to fall through to a
+                    // literal `#` token with no diagnostic.
+                    if is_function {
+                        diag::error(
+                            token.pos,
+                            &gettext("'#' is not followed by a macro parameter"),
+                        );
+                    }
+                }
+
+                // Check for ## (token paste) - also handle HashHash special token
+                if *code == SpecialToken::HashHash as u32 {
+                    body.push(MacroToken {
+                        typ: TokenType::Special,
+                        value: MacroTokenValue::Paste,
+                        whitespace: token.pos.whitespace,
+                        spelling: Spelling::Canonical,
+                    });
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Check for parameter reference or __VA_ARGS__
+            if let TokenValue::Ident(id) = &token.value {
+                if let Some(name) = idents.get_opt(*id) {
+                    // Check if it's __VA_ARGS__, or the GNU named variadic
+                    // that stands in for it.
+                    if name == "__VA_ARGS__" || Some(name) == variadic_name {
+                        body.push(MacroToken {
+                            typ: TokenType::Ident,
+                            value: MacroTokenValue::VaArgs,
+                            whitespace: token.pos.whitespace,
+                            spelling: Spelling::Canonical,
+                        });
+                        i += 1;
+                        continue;
+                    }
+
+                    // Check if it's a parameter
+                    let mut found_param = false;
+                    for param in params {
+                        if param.name == name {
+                            body.push(MacroToken {
+                                typ: TokenType::Ident,
+                                value: MacroTokenValue::Param(param.index),
+                                whitespace: token.pos.whitespace,
+                                spelling: Spelling::Canonical,
+                            });
+                            found_param = true;
+                            break;
+                        }
+                    }
+                    if found_param {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Regular token
+            let macro_token = self.token_to_macro_token(token, idents);
+            body.push(macro_token);
+            i += 1;
+        }
+
+        body
+    }
+
+    /// Convert a regular token to a macro token
+    fn token_to_macro_token(&self, token: &Token, idents: &IdentTable) -> MacroToken {
+        let value = match &token.value {
+            TokenValue::Number(n) => MacroTokenValue::Number(n.clone()),
+            TokenValue::Ident(id) => {
+                let name = idents.get_opt(*id).unwrap_or("").to_string();
+                MacroTokenValue::Ident(name)
+            }
+            TokenValue::String(s) => MacroTokenValue::String(s.clone()),
+            TokenValue::Char(c) => MacroTokenValue::Char(c.clone()),
+            TokenValue::Special(code) => MacroTokenValue::Special(*code),
+            TokenValue::WideString(s) | TokenValue::Utf16String(s) | TokenValue::Utf32String(s) => {
+                MacroTokenValue::String(s.clone())
+            }
+            TokenValue::WideChar(c) | TokenValue::Utf16Char(c) | TokenValue::Utf32Char(c) => {
+                MacroTokenValue::Char(c.clone())
+            }
+            TokenValue::HeaderName(h) => MacroTokenValue::String(h.clone()),
+            TokenValue::None => MacroTokenValue::None,
+        };
+
+        MacroToken {
+            typ: token.typ,
+            value,
+            whitespace: token.pos.whitespace,
+            spelling: token.spelling,
+        }
+    }
+
+    /// Render tokens as the message of a `#error` or `#warning`, spelled the
+    /// way they were written.
+    ///
+    /// Not to be confused with the free `tokens_to_source_bytes`, which
+    /// reproduces a whole translation unit for `-E` with its line structure
+    /// intact. This one produces one line for a human to read.
+    ///
+    /// Built on `show_token` so that every token type is covered: the
+    /// hand-written match this replaces handled four of them and silently
+    /// dropped the rest, so `#error "a" 'b' L"c"` reported `#error a  and`
+    /// -- quotes stripped, two of the three operands gone.
+    pub(super) fn tokens_to_message(&self, tokens: &[Token], idents: &IdentTable) -> String {
+        let mut bytes: Vec<u8> = Vec::new();
+        for token in tokens {
+            if !bytes.is_empty() && token.pos.whitespace {
+                bytes.push(b' ');
+            }
+            write_token(&mut bytes, token, idents);
+        }
+        // Decoded once at the end, not per token: a multi-byte character
+        // outside a literal is several single-byte punctuators, and neither
+        // half is valid UTF-8 alone. Decoding each separately turned `café`
+        // in a `#error` into two replacement characters.
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Stringify macro argument per C99 6.10.3.2p2
+    /// Unlike tokens_to_text, this properly escapes string/char literals:
+    /// - Inserts delimiting quotes around string/char constants
+    /// - Escapes backslashes and double-quotes within them
+    fn stringify_arg(&self, tokens: &[Token], idents: &IdentTable) -> String {
+        let mut result = String::new();
+        for token in tokens {
+            if !result.is_empty() && token.pos.whitespace {
+                result.push(' ');
+            }
+            match &token.value {
+                TokenValue::Ident(id) => {
+                    if let Some(name) = idents.get_opt(*id) {
+                        // An identifier is Rust text -- a UCN in it decoded to
+                        // a real `char` -- while the result is a literal
+                        // payload, one `char` per byte.
+                        result.push_str(&literal_payload(name));
+                    }
+                }
+                TokenValue::Number(n) => result.push_str(n),
+                TokenValue::String(s)
+                | TokenValue::WideString(s)
+                | TokenValue::Utf16String(s)
+                | TokenValue::Utf32String(s) => {
+                    // The encoding prefix is part of the spelling, so it must
+                    // survive stringification (C99 6.10.3.2p2). `u8` is not
+                    // one of the token types -- it folds into the narrow one
+                    // -- so it comes off the token's own flag.
+                    result.push_str(match &token.value {
+                        TokenValue::WideString(_) => "L",
+                        TokenValue::Utf16String(_) => "u",
+                        TokenValue::Utf32String(_) => "U",
+                        _ => token.encoding_prefix(),
+                    });
+                    // C99 6.10.3.2p2: insert \ before each " and \ including delimiters
+                    result.push('\\');
+                    result.push('"');
+                    for ch in s.chars() {
+                        if ch == '"' || ch == '\\' {
+                            result.push('\\');
+                        }
+                        result.push(ch);
+                    }
+                    result.push('\\');
+                    result.push('"');
+                }
+                TokenValue::Char(c)
+                | TokenValue::WideChar(c)
+                | TokenValue::Utf16Char(c)
+                | TokenValue::Utf32Char(c) => {
+                    result.push_str(match &token.value {
+                        TokenValue::WideChar(_) => "L",
+                        TokenValue::Utf16Char(_) => "u",
+                        TokenValue::Utf32Char(_) => "U",
+                        _ => "",
+                    });
+                    // C99 6.10.3.2p2: insert \ before each " and \ in char constants
+                    result.push('\'');
+                    for ch in c.chars() {
+                        if ch == '\\' || ch == '"' {
+                            result.push('\\');
+                        }
+                        result.push(ch);
+                    }
+                    result.push('\'');
+                }
+                // 6.10.3.2p2 asks for "the spelling of the preprocessing
+                // token", which for a punctuator means its own spelling: a
+                // multi-character one at all (dropping it turned `a >> b`
+                // into `a  b`), and a digraph as the digraph (6.4.6p3 makes
+                // `<:` behave as `[` "except for their spelling").
+                TokenValue::Special(code) => match token.punctuator(*code) {
+                    // The result is a payload -- one `char` per source byte --
+                    // and a single-character punctuator already is a byte, so
+                    // it goes in directly. Rendering it through a String first
+                    // UTF-8-encodes it, which doubled every byte >= 0x80.
+                    Punctuator::Byte(b) => result.push(char::from(b)),
+                    // A digraph or a longer operator spells itself in ASCII,
+                    // where text and payload are the same.
+                    Punctuator::Text(t) => result.push_str(&t),
+                },
+                _ => {}
+            }
+        }
+        result
+    }
+
+    /// The comma that separates two variadic arguments.
+    ///
+    /// It abuts what precedes it: whatever space the source had before it
+    /// belongs to the token that follows, which carries its own flag.
+    fn variadic_separator(pos: Position) -> Token {
+        let mut comma =
+            Token::with_value(TokenType::Special, pos, TokenValue::Special(b',' as u32));
+        comma.pos.whitespace = false;
+        comma.pos.newline = false;
+        comma
+    }
+
+    /// The variadic arguments as the single token sequence `__VA_ARGS__`
+    /// denotes (6.10.3.1p2), with the separating commas restored.
+    fn join_variadic_args(args: &[Vec<Token>], start: usize) -> Vec<Token> {
+        let mut out: Vec<Token> = Vec::new();
+        for (j, arg) in args.iter().enumerate().skip(start) {
+            if j > start {
+                let pos = arg.first().map_or_else(
+                    || out.last().map_or(Position::new(0, 1, 0), |t: &Token| t.pos),
+                    |t| t.pos,
+                );
+                out.push(Self::variadic_separator(pos));
+            }
+            out.extend(arg.iter().cloned());
+        }
+        out
+    }
+
+    /// Try to expand a macro
+    pub(super) fn try_expand_macro<I>(
+        &mut self,
+        name: &str,
+        pos: &Position,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &mut IdentTable,
+    ) -> Option<Vec<Token>>
+    where
+        I: Iterator<Item = Token>,
+    {
+        // Check for recursion
+        if self.expanding.contains(name) {
+            return None;
+        }
+
+        let mac = self.macros.get(name)?.clone();
+
+        // Handle builtin macros
+        if let Some(builtin) = mac.builtin {
+            return self.expand_builtin(builtin, pos, &mac, iter, idents);
+        }
+
+        // Handle function-like macros
+        if mac.is_function {
+            // Check for opening paren
+            if let Some(next) = iter.peek() {
+                if let TokenValue::Special(code) = &next.value {
+                    if *code == b'(' as u32 {
+                        iter.next(); // consume '('
+                        let args = self.collect_macro_args(iter, idents, pos, name);
+                        return self.expand_function_macro(&mac, &args, pos, idents);
+                    }
+                }
+            }
+            // No paren - don't expand
+            return None;
+        }
+
+        // Object-like macro
+        self.expand_object_macro(&mac, pos, idents)
+    }
+
+    /// Collect arguments for a function-like macro call
+    pub(super) fn collect_macro_args<I>(
+        &self,
+        iter: &mut std::iter::Peekable<I>,
+        _idents: &IdentTable,
+        macro_pos: &Position,
+        macro_name: &str,
+    ) -> Vec<Vec<Token>>
+    where
+        I: Iterator<Item = Token>,
+    {
+        let mut args = Vec::new();
+        let mut current_arg = Vec::new();
+        // Start at depth 1 because the opening '(' has already been consumed
+        // by the caller. This is important for handling multiline macro calls.
+        let mut paren_depth = 1;
+        let mut found_closing_paren = false;
+
+        for token in iter.by_ref() {
+            match &token.value {
+                TokenValue::Special(code) => {
+                    if *code == b'(' as u32 {
+                        paren_depth += 1;
+                        current_arg.push(token);
+                    } else if *code == b')' as u32 {
+                        paren_depth -= 1;
+                        if paren_depth == 0 {
+                            // End of arguments - closing ')' of macro call
+                            if !current_arg.is_empty() || !args.is_empty() {
+                                args.push(current_arg);
+                            }
+                            found_closing_paren = true;
+                            break;
+                        }
+                        // Nested ')' - add to current argument
+                        current_arg.push(token);
+                    } else if *code == b',' as u32 && paren_depth == 1 {
+                        // Argument separator at top level (paren_depth == 1 since we're inside the macro call)
+                        args.push(current_arg);
+                        current_arg = Vec::new();
+                    } else {
+                        current_arg.push(token);
+                    }
+                }
+                _ => {
+                    current_arg.push(token);
+                }
+            }
+        }
+
+        // Check for unterminated macro call (EOF before closing ')')
+        if !found_closing_paren {
+            crate::diag::error_args(
+                *macro_pos,
+                "unterminated argument list invoking macro \"{0}\"",
+                &[macro_name],
+            );
+        }
+
+        args
+    }
+
+    /// Expand a function-like macro
+    /// C17 6.10.3p4: a function-like macro invocation must supply as many
+    /// arguments as the definition has parameters (and at least that many for a
+    /// variadic one).
+    ///
+    /// Substitution used `args.get(idx).unwrap_or_default()`, so a missing
+    /// argument silently became empty and an extra one was silently dropped.
+    fn check_macro_arity(&self, mac: &Macro, args: &[Vec<Token>], pos: &Position) {
+        // `collect_macro_args` yields no arguments at all for `F()`. That spells
+        // *one empty argument* unless the macro takes none, so recover the
+        // distinction here rather than in the collector, which cannot see the
+        // definition.
+        let supplied = if args.is_empty() {
+            if mac.params.is_empty() && !mac.is_variadic {
+                0
+            } else {
+                1
+            }
+        } else {
+            args.len()
+        };
+        let required = mac.params.len();
+
+        // The variadic part may be empty; that is a GNU extension C23 adopted,
+        // and rejecting it would break a great deal of existing code.
+        let wrong = if mac.is_variadic {
+            supplied < required
+        } else {
+            supplied != required
+        };
+        if !wrong {
+            return;
+        }
+
+        let expected = if mac.is_variadic {
+            format!("at least {}", required)
+        } else {
+            required.to_string()
+        };
+        // Both forms are msgids: the singular/plural split is part of the
+        // English sentence and cannot be substituted in from outside.
+        diag::error_plural(
+            *pos,
+            "macro '{0}' requires {1} argument, but {2} given",
+            "macro '{0}' requires {1} arguments, but {2} given",
+            required,
+            &[&mac.name, &expected, &supplied.to_string()],
+        );
+    }
+
+    pub(super) fn expand_function_macro(
+        &mut self,
+        mac: &Macro,
+        args: &[Vec<Token>],
+        pos: &Position,
+        idents: &mut IdentTable,
+    ) -> Option<Vec<Token>> {
+        self.check_macro_arity(mac, args, pos);
+
+        // Note: Don't add to expanding set yet - arguments need to be fully expanded first.
+        // The expanding set is only used during the rescan phase to prevent infinite recursion.
+
+        let mut result = Vec::new();
+        let mut i = 0;
+
+        while i < mac.body.len() {
+            let mt = &mac.body[i];
+
+            // Check for token pasting
+            let next_is_paste =
+                i + 1 < mac.body.len() && matches!(mac.body[i + 1].value, MacroTokenValue::Paste);
+            let prev_was_paste = i > 0 && matches!(mac.body[i - 1].value, MacroTokenValue::Paste);
+
+            match &mt.value {
+                MacroTokenValue::Paste => {
+                    // Skip paste markers
+                    i += 1;
+                    continue;
+                }
+                MacroTokenValue::Stringify(idx) => {
+                    // Stringify the argument per C99 6.10.3.2p2.
+                    //
+                    // `#__VA_ARGS__` stringifies the *whole* variadic token
+                    // sequence, commas included -- 6.10.3.1p2 makes
+                    // __VA_ARGS__ that sequence, not its first element.
+                    // Taking args[idx] alone silently dropped everything
+                    // after the first comma, so `V(1,2,3)` came out `"1"`.
+                    let arg = if *idx >= mac.params.len() {
+                        Self::join_variadic_args(args, *idx)
+                    } else {
+                        args.get(*idx).cloned().unwrap_or_default()
+                    };
+                    let text = self.stringify_arg(&arg, idents);
+                    result.push(Token::with_value(
+                        TokenType::String,
+                        *pos,
+                        TokenValue::String(text),
+                    ));
+                }
+                MacroTokenValue::Param(idx) => {
+                    let arg = args.get(*idx).cloned().unwrap_or_default();
+
+                    if next_is_paste || prev_was_paste {
+                        // Don't expand for token pasting
+                        if prev_was_paste && !result.is_empty() {
+                            // Paste with previous token
+                            let prev = result.pop().unwrap();
+                            let pasted = self.paste_tokens(&prev, &arg, pos, idents);
+                            result.extend(pasted);
+                        } else {
+                            result.extend(arg);
+                        }
+                    } else {
+                        // Expand the argument
+                        let expanded = self.preprocess(arg, idents);
+                        for mut tok in expanded {
+                            if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd) {
+                                continue;
+                            }
+                            // Re-point the token at the invocation for
+                            // diagnostics, but keep whether it was preceded by
+                            // white space: that belongs to the argument's own
+                            // spelling, and 6.10.3.2p2 makes `#` reproduce it.
+                            // Taking `whitespace` from the invocation site gave
+                            // every expanded token one, so the two-level
+                            // `XSTR(x)`/`STR(x)` idiom turned `1+2` into
+                            // `"1 + 2"` while the direct `STR(1+2)` was right.
+                            let whitespace = tok.pos.whitespace;
+                            tok.pos = *pos;
+                            tok.pos.newline = false;
+                            tok.pos.whitespace = whitespace;
+                            result.push(tok);
+                        }
+                    }
+                }
+                MacroTokenValue::VaArgs => {
+                    // Variadic arguments
+                    let start = mac.params.len();
+                    let va_args: Vec<_> = args.iter().skip(start).collect();
+                    let va_args_empty =
+                        va_args.is_empty() || (va_args.len() == 1 && va_args[0].is_empty());
+
+                    // GNU extension: ,##__VA_ARGS__ - suppress comma when VA_ARGS is empty
+                    if prev_was_paste && va_args_empty {
+                        // Check if the previous token (before ##) was a comma and remove it
+                        if let Some(last) = result.last() {
+                            if let TokenValue::Special(code) = &last.value {
+                                if *code == b',' as u32 {
+                                    result.pop(); // Remove the comma
+                                }
+                            }
+                        }
+                        // Skip emitting empty VA_ARGS
+                        i += 1;
+                        continue;
+                    }
+
+                    let va_start = result.len();
+                    for (j, arg) in args.iter().enumerate().skip(start) {
+                        if j > start {
+                            result.push(Self::variadic_separator(*pos));
+                        }
+                        if next_is_paste || prev_was_paste {
+                            result.extend(arg.clone());
+                        } else {
+                            let expanded = self.preprocess(arg.clone(), idents);
+                            for mut tok in expanded {
+                                if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd)
+                                {
+                                    continue;
+                                }
+                                // Keep each token's own spacing. Overwriting
+                                // it with the macro body's position gave every
+                                // argument a leading space, so `X(1,2,3)`
+                                // expanded to `1 , 2 , 3`.
+                                let whitespace = tok.pos.whitespace;
+                                tok.pos = *pos;
+                                tok.pos.newline = false;
+                                tok.pos.whitespace = whitespace;
+                                result.push(tok);
+                            }
+                        }
+                    }
+                    // The sequence as a whole is spaced as `__VA_ARGS__` was
+                    // in the macro body -- `mt.whitespace`, the same source
+                    // every other body token uses through
+                    // `macro_token_to_token`. Taking it from `pos` used the
+                    // *invocation's* spacing instead, so `#define F(...) x
+                    // __VA_ARGS__` expanded `F(*p)` to `x*p`.
+                    if let Some(first) = result.get_mut(va_start) {
+                        first.pos.whitespace = mt.whitespace;
+                    }
+                }
+                _ => {
+                    let token = self.macro_token_to_token(mt, pos, idents);
+
+                    if prev_was_paste && !result.is_empty() {
+                        // Paste with previous token
+                        let prev = result.pop().unwrap();
+                        let pasted = self.paste_tokens(&prev, &[token], pos, idents);
+                        result.extend(pasted);
+                    } else {
+                        result.push(token);
+                    }
+                }
+            }
+
+            i += 1;
+        }
+
+        // Rescan for more macro expansion
+        // NOTE: Only add to expanding set during rescan to prevent infinite recursion
+        // Arguments were already expanded above, so this only affects the replacement list rescan
+        self.expanding.insert(mac.name.clone());
+        let rescanned = self.preprocess(result, idents);
+        self.expanding.remove(&mac.name);
+
+        let mut filtered: Vec<_> = rescanned
+            .into_iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .collect();
+
+        // Mark any occurrences of this macro's name in the result as "blue painted"
+        // per C99 6.10.3.4: if the macro name appears in its own expansion, it should
+        // not be re-expanded in subsequent contexts.
+        let mac_name_id = idents.intern(&mac.name);
+        for tok in &mut filtered {
+            if let TokenValue::Ident(id) = &tok.value {
+                if *id == mac_name_id {
+                    tok.mark_no_expand(&mac.name);
+                }
+            }
+        }
+
+        // The FIRST token of a macro expansion should inherit whitespace
+        // from the macro invocation position, not the macro body.
+        // This ensures "MACRO(args)" expands with proper spacing.
+        if let Some(first) = filtered.first_mut() {
+            first.pos.whitespace = pos.whitespace;
+        }
+
+        Some(filtered)
+    }
+
+    /// Paste tokens together
+    fn paste_tokens(
+        &self,
+        left: &Token,
+        right: &[Token],
+        pos: &Position,
+        idents: &mut IdentTable,
+    ) -> Vec<Token> {
+        if right.is_empty() {
+            return vec![left.clone()];
+        }
+
+        let left_str = self.token_to_string(left, idents);
+        let right_str = self.token_to_string(&right[0], idents);
+        let combined = format!("{}{}", left_str, right_str);
+
+        // Re-tokenize the combined string using the same shared string table
+        // Since we use the same StringTable, all StringIds are consistent
+        // and no ID remapping is needed.
+        let stream_id = diag::init_stream("<paste>");
+        let tokens = {
+            let mut tokenizer = Tokenizer::new(combined.as_bytes(), stream_id, idents);
+            tokenizer.tokenize()
+        };
+
+        let mut result: Vec<_> = tokens
+            .into_iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .map(|mut t| {
+                t.pos = *pos;
+                t.pos.newline = false;
+                t
+            })
+            .collect();
+
+        // Add remaining right tokens
+        result.extend(right.iter().skip(1).cloned());
+
+        result
+    }
+
+    /// Expand an object-like macro
+    fn expand_object_macro(
+        &mut self,
+        mac: &Macro,
+        pos: &Position,
+        idents: &mut IdentTable,
+    ) -> Option<Vec<Token>> {
+        if mac.body.is_empty() {
+            return Some(vec![]);
+        }
+
+        // Note: Don't add to expanding set yet - that happens during rescan phase only.
+
+        let mut result = Vec::new();
+        let mut i = 0;
+
+        while i < mac.body.len() {
+            let mt = &mac.body[i];
+
+            // Check for token pasting - prev_was_paste means we need to paste with previous result
+            let prev_was_paste = i > 0 && matches!(mac.body[i - 1].value, MacroTokenValue::Paste);
+
+            match &mt.value {
+                MacroTokenValue::Paste => {
+                    // Skip paste markers
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    let token = self.macro_token_to_token(mt, pos, idents);
+
+                    if prev_was_paste && !result.is_empty() {
+                        // Paste with previous token
+                        let prev = result.pop().unwrap();
+                        let pasted = self.paste_tokens(&prev, &[token], pos, idents);
+                        result.extend(pasted);
+                    } else {
+                        result.push(token);
+                    }
+                }
+            }
+
+            i += 1;
+        }
+
+        // Rescan for more macro expansion
+        // NOTE: Only add to expanding set during rescan to prevent infinite recursion
+        // (e.g., when const -> __const and __const -> const both exist)
+        self.expanding.insert(mac.name.clone());
+        let rescanned = self.preprocess(result, idents);
+        self.expanding.remove(&mac.name);
+
+        let mut filtered: Vec<_> = rescanned
+            .into_iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .collect();
+
+        // Mark any occurrences of this macro's name in the result as "blue painted"
+        // per C99 6.10.3.4: if the macro name appears in its own expansion, it should
+        // not be re-expanded in subsequent contexts.
+        let mac_name_id = idents.intern(&mac.name);
+        for tok in &mut filtered {
+            if let TokenValue::Ident(id) = &tok.value {
+                if *id == mac_name_id {
+                    tok.mark_no_expand(&mac.name);
+                }
+            }
+        }
+
+        // The FIRST token of a macro expansion should inherit whitespace
+        // from the macro invocation position, not the macro body.
+        // This ensures "extern __inline" expands to "extern inline" with space.
+        if let Some(first) = filtered.first_mut() {
+            first.pos.whitespace = pos.whitespace;
+        }
+
+        Some(filtered)
+    }
+
+    /// Convert a macro token to a regular token
+    fn macro_token_to_token(
+        &self,
+        mt: &MacroToken,
+        pos: &Position,
+        idents: &mut IdentTable,
+    ) -> Token {
+        let mut new_pos = *pos;
+        new_pos.whitespace = mt.whitespace;
+        new_pos.newline = false;
+
+        let value = match &mt.value {
+            MacroTokenValue::Number(n) => TokenValue::Number(n.clone()),
+            MacroTokenValue::Ident(name) => {
+                let id = idents.intern(name);
+                TokenValue::Ident(id)
+            }
+            // The macro body collapses every string/char encoding into one
+            // variant, so the original token type is what recovers it.
+            MacroTokenValue::String(s) => match mt.typ {
+                TokenType::WideString => TokenValue::WideString(s.clone()),
+                TokenType::Utf16String => TokenValue::Utf16String(s.clone()),
+                TokenType::Utf32String => TokenValue::Utf32String(s.clone()),
+                TokenType::HeaderName => TokenValue::HeaderName(s.clone()),
+                _ => TokenValue::String(s.clone()),
+            },
+            MacroTokenValue::Char(c) => match mt.typ {
+                TokenType::WideChar => TokenValue::WideChar(c.clone()),
+                TokenType::Utf16Char => TokenValue::Utf16Char(c.clone()),
+                TokenType::Utf32Char => TokenValue::Utf32Char(c.clone()),
+                _ => TokenValue::Char(c.clone()),
+            },
+            MacroTokenValue::Special(code) => TokenValue::Special(*code),
+            _ => TokenValue::None,
+        };
+
+        let mut token = Token::with_value(mt.typ, new_pos, value);
+        token.spelling = mt.spelling;
+        token
+    }
+
+    /// Expand a builtin macro
+    pub(super) fn expand_builtin<I>(
+        &mut self,
+        builtin: BuiltinMacro,
+        pos: &Position,
+        mac: &Macro,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &mut IdentTable,
+    ) -> Option<Vec<Token>>
+    where
+        I: Iterator<Item = Token>,
+    {
+        match builtin {
+            BuiltinMacro::Line => {
+                let effective_line = (pos.line as i32 + self.line_offset) as u32;
+                Some(vec![Token::with_value(
+                    TokenType::Number,
+                    *pos,
+                    TokenValue::Number(effective_line.to_string()),
+                )])
+            }
+            BuiltinMacro::File => {
+                let effective_file = self
+                    .line_file_override
+                    .as_ref()
+                    .unwrap_or(&self.current_file)
+                    .clone();
+                Some(vec![Token::with_value(
+                    TokenType::String,
+                    *pos,
+                    TokenValue::String(literal_payload(&effective_file)),
+                )])
+            }
+            BuiltinMacro::Date => Some(vec![Token::with_value(
+                TokenType::String,
+                *pos,
+                TokenValue::String(literal_payload(&self.compile_date)),
+            )]),
+            BuiltinMacro::Time => Some(vec![Token::with_value(
+                TokenType::String,
+                *pos,
+                TokenValue::String(literal_payload(&self.compile_time)),
+            )]),
+            BuiltinMacro::Counter => {
+                let val = self.counter;
+                self.counter += 1;
+                Some(vec![Token::with_value(
+                    TokenType::Number,
+                    *pos,
+                    TokenValue::Number(val.to_string()),
+                )])
+            }
+            BuiltinMacro::IncludeLevel => Some(vec![Token::with_value(
+                TokenType::Number,
+                *pos,
+                TokenValue::Number(self.include_depth.to_string()),
+            )]),
+            BuiltinMacro::BaseFile => Some(vec![Token::with_value(
+                TokenType::String,
+                *pos,
+                TokenValue::String(self.base_file.clone()),
+            )]),
+            BuiltinMacro::HasAttribute
+            | BuiltinMacro::HasBuiltin
+            | BuiltinMacro::HasFeature
+            | BuiltinMacro::HasExtension => {
+                // Consume the arguments
+                if let Some(next) = iter.peek() {
+                    if let TokenValue::Special(code) = &next.value {
+                        if *code == b'(' as u32 {
+                            iter.next();
+                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
+                            let result = self.eval_has_builtin(builtin, &args, idents);
+                            return Some(vec![Token::with_value(
+                                TokenType::Number,
+                                *pos,
+                                TokenValue::Number(if result { "1" } else { "0" }.to_string()),
+                            )]);
+                        }
+                    }
+                }
+                Some(vec![Token::with_value(
+                    TokenType::Number,
+                    *pos,
+                    TokenValue::Number("0".to_string()),
+                )])
+            }
+            BuiltinMacro::HasInclude | BuiltinMacro::HasIncludeNext => {
+                // Consume the arguments
+                if let Some(next) = iter.peek() {
+                    if let TokenValue::Special(code) = &next.value {
+                        if *code == b'(' as u32 {
+                            iter.next();
+                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
+                            let result = self.eval_has_include(&args, idents);
+                            return Some(vec![Token::with_value(
+                                TokenType::Number,
+                                *pos,
+                                TokenValue::Number(if result { "1" } else { "0" }.to_string()),
+                            )]);
+                        }
+                    }
+                }
+                Some(vec![Token::with_value(
+                    TokenType::Number,
+                    *pos,
+                    TokenValue::Number("0".to_string()),
+                )])
+            }
+        }
+    }
+
+    /// Evaluate __has_attribute, __has_builtin, etc.
+    fn eval_has_builtin(
+        &self,
+        builtin: BuiltinMacro,
+        args: &[Vec<Token>],
+        idents: &IdentTable,
+    ) -> bool {
+        if args.is_empty() {
+            return false;
+        }
+
+        // Try to get the first token from the argument list
+        let first_tok = match args[0].first() {
+            Some(tok) => tok,
+            None => return false,
+        };
+
+        // Try to get StringId directly for O(1) tag-based lookup
+        let arg_id = if let TokenValue::Ident(id) = &first_tok.value {
+            Some(*id)
+        } else {
+            None
+        };
+
+        match builtin {
+            BuiltinMacro::HasAttribute => {
+                if let Some(id) = arg_id {
+                    crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR)
+                } else {
+                    // One table decides this. A second hardcoded list here
+                    // had already drifted from it in both directions.
+                    let name = self.token_to_string(first_tok, idents);
+                    idents
+                        .lookup(&name)
+                        .is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR))
+                }
+            }
+            BuiltinMacro::HasBuiltin => {
+                if let Some(id) = arg_id {
+                    crate::builtins::is_builtin_id(id)
+                } else {
+                    let name = self.token_to_string(first_tok, idents);
+                    crate::builtins::is_builtin(name.as_str())
+                }
+            }
+            BuiltinMacro::HasFeature | BuiltinMacro::HasExtension => {
+                let name = self.token_to_string(first_tok, idents);
+                // Return true for features/extensions we implement
+                matches!(
+                    name.as_str(),
+                    // GNU extensions
+                    "statement_expressions" |
+                    "statement_expressions_in_macros" |
+                    "gnu_asm" |
+                    // C11 features
+                    "c_atomic" |
+                    "c_static_assert" |
+                    "c_alignas" |
+                    "c_alignof" |
+                    "c_thread_local" |
+                    "c_generic_selections"
+                )
+            }
+            _ => false,
+        }
+    }
+}

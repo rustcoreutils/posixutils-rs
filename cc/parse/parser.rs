@@ -4142,6 +4142,7 @@ impl Parser<'_> {
             } else {
                 self.types.compute_struct_layout(&mut members, pack_cap)
             };
+            self.check_wide_bitfields_have_a_carrier(&members);
 
             // Apply struct-level aligned attribute (raises alignment, never lowers)
             if let Some(sa) = struct_align {
@@ -6057,6 +6058,31 @@ impl Parser<'_> {
     /// and `unsized_array_levels` tells them apart. Mid-struct `char d[0]` is
     /// an ordinary member and is everywhere in system headers, so conflating
     /// the two would reject far more than this rejects.
+    /// A bit-field wider than 64 bits needs a whole 16-byte storage unit.
+    ///
+    /// `emit_bitfield_load`/`_store` reach the 128-bit carrier only for an
+    /// access span of exactly one addressable unit. A *packed* field gets a
+    /// span of just the bytes its own bits touch, which sends it to the
+    /// byte-wise path -- and that assembles into a 64-bit carrier, so it
+    /// cannot represent the value. gcc packs these; c17 refuses them, which
+    /// is a narrower divergence than the width cap this replaced.
+    ///
+    /// Checked after layout because packing is what decides the span, and
+    /// packing is applied there.
+    fn check_wide_bitfields_have_a_carrier(&self, members: &[StructMember]) {
+        for m in members {
+            let Some(width) = m.bit_width else { continue };
+            if width <= 64 || m.access_bytes == Some(16) {
+                continue;
+            }
+            diag::error_args(
+                self.current_pos(),
+                "bit-field of width {0} needs an unpacked 16-byte storage unit",
+                &[&width.to_string()],
+            );
+        }
+    }
+
     fn check_flexible_array_members(&self, members: &[StructMember], is_union: bool) {
         let is_flexible =
             |m: &StructMember| m.bit_width.is_none() && self.types.unsized_array_levels(m.typ) > 0;
@@ -6120,24 +6146,12 @@ impl Parser<'_> {
             ));
         }
 
-        // Nothing here carries more than 64 bits of bit-field: the value mask
-        // is a `u64` and `bitfield_storage_type` has no arm for a 16-byte unit.
-        // An `unsigned __int128 a:100` therefore read back a wrong value in a
-        // release build and *panicked* the compiler in a debug one. gcc handles
-        // it, so this is a divergence -- but a diagnostic naming the limit is
-        // better than either of those, and `__int128` is a GNU extension.
-        // Widths up to 64 of such a type keep working and keep agreeing with
-        // gcc, so the cap is on the width rather than on the declared type.
-        const MAX_BITFIELD_WIDTH: u32 = 64;
-        if width > MAX_BITFIELD_WIDTH {
-            return Err(ParseError::new(
-                format!(
-                    "bit-field width {} is not supported; c17 carries at most {} bits",
-                    width, MAX_BITFIELD_WIDTH
-                ),
-                self.current_pos(),
-            ));
-        }
+        // A width above 64 needs a 16-byte carrier, which exists only for a
+        // field the layout gives a whole `__int128` storage unit. Whether it
+        // got one is not knowable here -- packing decides it, and packing is
+        // applied at layout -- so the check lives in
+        // `check_wide_bitfields_have_a_carrier`, once `access_bytes` is known.
+        // The `width > max_width` test above still refuses `__int128 f:129`.
 
         // Warning: one-bit signed bitfield has dubious values
         // (can only hold -1 or 0 in 2's complement, or 0/-0 in other representations).

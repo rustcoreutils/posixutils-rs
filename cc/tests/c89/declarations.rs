@@ -13,7 +13,7 @@
 // enums, typedefs, initializers
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: Declarations (Section 7 of C99)
@@ -713,6 +713,76 @@ int main(void) {
 
     return 0;
 }
+
 "#;
     assert_eq!(compile_and_run("bitfield_full_carrier_width", code, &[]), 0);
+}
+
+/// A `__int128` bit-field wider than 64 bits round-trips, at both -O levels.
+///
+/// These were refused outright until the carrier existed: the value mask was a
+/// `u64` and `bitfield_storage_type` had no 16-byte arm. The subtle half is
+/// that the carrier's *kind* must be `Int128`, because that is what routes the
+/// pseudos to a 16-byte stack slot -- an earlier attempt typed them otherwise,
+/// and the backend panicked in `int128_lo_mem_loc` with a value the allocator
+/// had placed in a single GP register.
+///
+/// Widths sit either side of 64 so a mask computed in the wrong width shows
+/// up, and ordinary members bracket the field so an over-wide mask corrupts a
+/// neighbour rather than passing silently.
+#[test]
+fn c89_int128_bitfield_wider_than_64_round_trips() {
+    let code = r#"
+struct W65  { __int128 a:65; };
+struct W100 { __int128 a:100; };
+struct W128 { __int128 a:128; };
+struct U100 { unsigned __int128 a:100; };
+struct Pad  { int pre; __int128 a:100; int post; };
+struct Two  { __int128 a:100; __int128 b:100; };
+struct Mix  { __int128 a:100; unsigned b:3; };
+
+int main(void) {
+    /* Sign must reach past bit 64, which is what a 64-bit carrier could not do. */
+    struct W65 x; x.a = -1;
+    if (x.a != -1 || !(x.a < 0)) return 1;
+
+    struct W100 y; y.a = -1;
+    if (y.a != -1 || !(y.a < 0)) return 2;
+    y.a = 5;
+    if (y.a != 5) return 3;
+
+    /* Full width: the (1 << n) - 1 spelling collapses to zero here. */
+    struct W128 z; z.a = -1;
+    if (z.a != -1) return 4;
+
+    /* A bit above the 64-bit half must survive unsigned. */
+    struct U100 u; u.a = (unsigned __int128)1 << 99;
+    if (u.a != ((unsigned __int128)1 << 99)) return 5;
+    u.a = (unsigned __int128)1 << 64;
+    if (u.a != ((unsigned __int128)1 << 64)) return 6;
+
+    /* An over-wide mask would write through the neighbours. */
+    struct Pad p; p.pre = 0x11111111; p.post = 0x22222222; p.a = -1;
+    if (p.pre != 0x11111111) return 7;
+    if (p.post != 0x22222222) return 8;
+    if (p.a != -1) return 9;
+
+    /* Two wide fields do not share a unit, so neither may disturb the other. */
+    struct Two t; t.a = -1; t.b = 5;
+    if (t.a != -1) return 10;
+    if (t.b != 5) return 11;
+
+    /* A narrow field beside a wide one keeps its own carrier. */
+    struct Mix m; m.a = -1; m.b = 5;
+    if (m.a != -1) return 12;
+    if (m.b != 5) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c89_int128_bitfield_wide", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c89_int128_bitfield_wide_o2", code),
+        0
+    );
 }

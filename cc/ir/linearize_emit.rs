@@ -35,6 +35,26 @@ pub(crate) fn bitfield_value_mask(bit_width: u32) -> u64 {
     }
 }
 
+/// The same mask, for a carrier that may be 128 bits wide.
+///
+/// A separate function rather than a widened return type, because the
+/// narrow callers rely on `!mask` being bounded by the carrier: at 128 bits
+/// a complement carries ones the storage unit does not have, and the byte-wise
+/// paths would then write them. Callers that do complement a mask intersect it
+/// with the storage width explicitly.
+///
+/// Shifts `u128::MAX` down for the reason the 64-bit twin does -- `1u128 <<
+/// 128` is `1`, so the subtraction spelling yields a zero mask at exactly the
+/// full width.
+pub(crate) fn bitfield_value_mask_128(bit_width: u32) -> u128 {
+    debug_assert!(bit_width <= 128, "bit-field wider than any carrier");
+    if bit_width == 0 {
+        0
+    } else {
+        u128::MAX >> (128 - bit_width)
+    }
+}
+
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn emit_const(&mut self, val: i128, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
@@ -240,7 +260,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         // span exceed eight bytes -- `packed { char c:1; unsigned long long
         // a:64; }` needs nine, in a nine-byte object, so no power-of-two window
         // covers the field without reading past the end of it.
-        if !matches!(storage_size, 1 | 2 | 4 | 8) {
+        // 16 joins the list for `__int128` bit-fields wider than 64 bits: the
+        // byte-wise fallback assembles into a 64-bit carrier and cannot hold
+        // them. A packed field still lands there -- its span is not an
+        // addressable unit -- and packing plus a >64-bit width is refused in
+        // `validate_bitfield` for that reason.
+        if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
             return self.emit_bitfield_load_bytewise(
                 base,
                 byte_offset,
@@ -283,7 +308,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
 
         // 3. Mask to bit_width bits
-        let mask = bitfield_value_mask(bit_width);
+        let mask = bitfield_value_mask_128(bit_width);
         let mask_val = self.emit_const(mask as i128, storage_type);
         let masked = self.alloc_pseudo();
         self.emit(Instruction::binop(
@@ -527,7 +552,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         storage_size: u32,
         new_value: PseudoId,
     ) {
-        if !matches!(storage_size, 1 | 2 | 4 | 8) {
+        if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
             return self.emit_bitfield_store_bytewise(
                 base,
                 byte_offset,
@@ -553,8 +578,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
-        let field_mask = bitfield_value_mask(bit_width) << bit_offset;
-        let clear_mask = !field_mask;
+        //
+        // Complemented inside the storage unit rather than inside the widest
+        // carrier: `!field_mask` alone sets every bit above the unit, which is
+        // harmless for a 64-bit unit only because the old mask was a `u64`.
+        let unit_mask = bitfield_value_mask_128(storage_bits);
+        let field_mask = bitfield_value_mask_128(bit_width) << bit_offset;
+        let clear_mask = !field_mask & unit_mask;
         let clear_mask_val = self.emit_const(clear_mask as i128, storage_type);
 
         // 3. Clear the bitfield bits in old value
@@ -569,7 +599,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // 4. Mask new value to bit_width and shift to position
-        let value_mask = bitfield_value_mask(bit_width);
+        let value_mask = bitfield_value_mask_128(bit_width);
         let value_mask_val = self.emit_const(value_mask as i128, storage_type);
         let masked_new = self.alloc_pseudo();
         self.emit(Instruction::binop(

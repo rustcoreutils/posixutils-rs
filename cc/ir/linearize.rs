@@ -460,12 +460,19 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Map a bitfield storage unit byte-size to the corresponding unsigned type.
+    ///
+    /// The 16-byte arm carries `__int128` bit-fields wider than 64 bits. It
+    /// must name a type whose kind is `Int128`, because that is what routes
+    /// the pseudos to 16-byte stack slots in the register allocator -- a
+    /// 128-bit value the allocator hands a single GP register instead panics
+    /// the backend in `int128_lo_mem_loc`.
     pub(crate) fn bitfield_storage_type(&self, storage_size: u32) -> TypeId {
         match storage_size {
             1 => self.types.uchar_id,
             2 => self.types.ushort_id,
             4 => self.types.uint_id,
             8 => self.types.ulong_id,
+            16 => self.types.uint128_id,
             _ => self.types.uint_id,
         }
     }

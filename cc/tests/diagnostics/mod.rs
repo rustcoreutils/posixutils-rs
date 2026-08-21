@@ -3132,37 +3132,66 @@ fn diagnostics_string_literals_matching_their_array_are_accepted() {
     }
 }
 
-/// A bit-field wider than 64 bits has no carrier here: the value mask is a
-/// `u64` and `bitfield_storage_type` has no arm for a sixteen-byte unit.
+/// A bit-field wider than 64 bits is carried, provided it gets a whole
+/// 16-byte storage unit.
 ///
+/// It used to be refused outright at any width above 64: the value mask was a
+/// `u64` and `bitfield_storage_type` had no arm for a sixteen-byte unit, so
 /// `unsigned __int128 a:100` read back a wrong value in a release build and
-/// **panicked the compiler** in a debug one. gcc supports it, so refusing is a
-/// divergence -- but a diagnostic naming the limit beats a panic, and
-/// `__int128` is a GNU extension. Widths up to 64 of such a type still work
-/// and still agree with gcc, so the cap is on the width, not the type.
+/// **panicked the compiler** in a debug one. Both halves exist now, and the
+/// carrier's *kind* is `Int128`, which is what routes it to a 16-byte stack
+/// slot rather than a GP register the backend cannot address as a pair.
+///
+/// What remains refused is the packed case, and only that. Packing gives a
+/// field an access span of just the bytes its own bits touch, which sends it
+/// to the byte-wise path -- and that assembles into a 64-bit carrier, so it
+/// cannot hold the value. gcc packs these; c17 says so instead of guessing.
 #[test]
-fn diagnostics_bitfield_wider_than_its_carrier_is_rejected() {
+fn diagnostics_wide_bitfield_without_a_carrier_is_rejected() {
     for (name, src) in [
+        (
+            "bf_packed_attr",
+            "struct __attribute__((packed)) S { char c; __int128 a:100; };\n",
+        ),
+        (
+            "bf_packed_pragma",
+            "#pragma pack(1)\nstruct S { char c; __int128 a:100; };\n",
+        ),
+    ] {
+        compile_expect_error(name, src, "needs an unpacked 16-byte storage unit");
+    }
+
+    // Wider than the declared type is a different fault, and keeps its own
+    // message -- 6.7.2.1p4 is a constraint, not a c17 limitation.
+    compile_expect_error(
+        "bf_over_type",
+        "struct S { __int128 a:129; };\n",
+        "exceeds type size",
+    );
+}
+
+/// The accept side: every width up to the type's own now compiles.
+#[test]
+fn diagnostics_bitfields_within_the_carrier_are_accepted() {
+    for (name, src) in [
+        // The widths this used to refuse.
         ("bf_i128_65", "struct S { unsigned __int128 a:65; };\n"),
         ("bf_i128_100", "struct S { unsigned __int128 a:100; };\n"),
         ("bf_i128_128", "struct S { unsigned __int128 a:128; };\n"),
         ("bf_i128_signed", "struct S { __int128 a:96; };\n"),
         ("bf_i128_unnamed", "struct S { unsigned __int128 : 96; };\n"),
-    ] {
-        compile_expect_error(name, src, "c17 carries at most 64 bits");
-    }
-}
-
-/// ...and everything at or below the carrier's width still compiles, including
-/// a 64-bit field of a 128-bit type.
-#[test]
-fn diagnostics_bitfields_within_the_carrier_are_accepted() {
-    for (name, src) in [
+        // ...and the ones that always worked, which must not regress.
         ("bf_i128_64", "struct S { unsigned __int128 a:64; };\n"),
         ("bf_i128_32", "struct S { unsigned __int128 a:32; };\n"),
         ("bf_i128_1", "struct S { unsigned __int128 a:1; };\n"),
         ("bf_ull_64", "struct S { unsigned long long a:64; };\n"),
         ("bf_int_32", "struct S { int a:32; };\n"),
+        // A packed field at or below 64 bits still takes the byte-wise path
+        // and is fine there, so the new refusal must not catch it.
+        (
+            "bf_packed_narrow",
+            "struct __attribute__((packed)) S { char c; __int128 a:64; };\n",
+        ),
     ] {
         compile_expect_ok(name, src);
     }

@@ -47,7 +47,7 @@ use target::Os;
 use target::{classify_std, StdRequest, Target};
 use token::{
     preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
-    AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType, Tokenizer,
+    write_token, AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType, Tokenizer,
 };
 
 // ============================================================================
@@ -595,6 +595,7 @@ fn process_file(
         // `x.c` at the wrong line -- c17 read *gcc's* `.i` correctly, which is
         // what showed the producer was at fault rather than the consumer.
         let mut current_line: u32 = 1;
+        let mut spelling: Vec<u8> = Vec::new();
 
         let mut iter = preprocessed.iter().peekable();
         while let Some(token) = iter.next() {
@@ -696,7 +697,12 @@ fn process_file(
                     continue;
                 }
 
-                write!(out.preprocessed, "{}", text)?;
+                // Byte for byte: a literal's payload holds one `char` per
+                // source byte, so writing `text` re-encoded every byte >= 0x80
+                // as two and `c17 -E` changed what the string held.
+                spelling.clear();
+                write_token(&mut spelling, token, &strings);
+                out.preprocessed.write_all(&spelling)?;
                 at_line_start = false;
                 // Check next token to determine separator
                 if let Some(next) = iter.peek() {

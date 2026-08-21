@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::lexer::{
-    tokens_to_text, IdentTable, LexerMode, Position, SpecialToken, Token, TokenType, TokenValue,
-    Tokenizer,
+    literal_payload, tokens_to_source_bytes, IdentTable, LexerMode, Position, SpecialToken, Token,
+    TokenType, TokenValue, Tokenizer,
 };
 use crate::arch;
 use crate::builtin_headers;
@@ -3365,7 +3365,10 @@ impl<'a> Preprocessor<'a> {
             match &token.value {
                 TokenValue::Ident(id) => {
                     if let Some(name) = idents.get_opt(*id) {
-                        result.push_str(name);
+                        // An identifier is Rust text -- a UCN in it decoded to
+                        // a real `char` -- while the result is a literal
+                        // payload, one `char` per byte.
+                        result.push_str(&literal_payload(name));
                     }
                 }
                 TokenValue::Number(n) => result.push_str(n),
@@ -3946,18 +3949,18 @@ impl<'a> Preprocessor<'a> {
                 Some(vec![Token::with_value(
                     TokenType::String,
                     *pos,
-                    TokenValue::String(effective_file),
+                    TokenValue::String(literal_payload(&effective_file)),
                 )])
             }
             BuiltinMacro::Date => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
-                TokenValue::String(self.compile_date.clone()),
+                TokenValue::String(literal_payload(&self.compile_date)),
             )]),
             BuiltinMacro::Time => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
-                TokenValue::String(self.compile_time.clone()),
+                TokenValue::String(literal_payload(&self.compile_time)),
             )]),
             BuiltinMacro::Counter => {
                 let val = self.counter;
@@ -4853,13 +4856,15 @@ pub struct AsmPreprocessConfig<'a> {
 /// * `config` - Preprocessing configuration (defines, undefines, include paths)
 ///
 /// # Returns
-/// The preprocessed assembly text as a string
+/// The preprocessed assembly text, as bytes: a string literal's payload is a
+/// byte sequence, so rendering it through a Rust `String` would re-encode
+/// every byte >= 0x80.
 pub fn preprocess_asm_file(
     content: &[u8],
     target: &Target,
     filename: &str,
     config: &AsmPreprocessConfig<'_>,
-) -> String {
+) -> Vec<u8> {
     // Create string table for tokenization
     let mut strings = IdentTable::new();
 
@@ -4914,7 +4919,7 @@ pub fn preprocess_asm_file(
     let preprocessed = pp.preprocess(tokens, &mut strings);
 
     // Convert tokens back to text
-    tokens_to_text(&preprocessed, &strings)
+    tokens_to_source_bytes(&preprocessed, &strings)
 }
 
 // ============================================================================

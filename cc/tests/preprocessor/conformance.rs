@@ -38,6 +38,43 @@ fn assert_lacks(out: &str, needle: &str, what: &str) {
 }
 
 // ============================================================================
+// Literal payloads are byte sequences
+// ============================================================================
+
+/// A string literal's payload holds one `char` per source *byte*. Rendering it
+/// through a Rust `String` UTF-8-encoded each of those chars, so every source
+/// byte >= 0x80 came out of `c17 -E` as two: `"café"` gained a byte, and
+/// preprocessing a file then compiling it changed what the string held.
+#[test]
+fn preprocessor_non_ascii_literal_survives_byte_for_byte() {
+    let r = preprocess_text(
+        "utf8_literal",
+        "const char *s = \"café ☕\";\nconst char c = 'é';\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "\"café ☕\"", "utf8 string literal");
+    assert_has(&r.stdout, "'é'", "utf8 char literal");
+    assert_lacks(&r.stdout, "Ã", "double-encoded UTF-8");
+}
+
+/// `__FILE__` and a stringified identifier arrive as Rust text rather than as
+/// source bytes, so they have to be converted into the payload form or the two
+/// conventions mix inside one literal.
+#[test]
+fn preprocessor_synthesized_literals_use_payload_form() {
+    let r = preprocess_text(
+        "utf8_synth",
+        "#define S(x) #x\nconst char *a = __FILE__;\nconst char *b = S(caf\\u00e9);\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "utf8_synth", "__FILE__");
+    assert_has(&r.stdout, "\"café\"", "stringified UCN identifier");
+    assert_lacks(&r.stdout, "Ã", "double-encoded UTF-8");
+}
+
+// ============================================================================
 // #P2 — the null directive
 // ============================================================================
 

@@ -361,10 +361,17 @@ pub type IdentTable = StringTable;
 #[derive(Debug, Clone)]
 pub enum TokenValue {
     None,
-    Number(String),     // Numeric literal as string (pp-number)
-    Ident(StringId),    // Identifier (interned StringId)
-    Special(u32),       // Operator/punctuator
-    String(String),     // String literal content
+    Number(String),  // Numeric literal as string (pp-number)
+    Ident(StringId), // Identifier (interned StringId)
+    Special(u32),    // Operator/punctuator
+    /// String literal content, as written between the quotes.
+    ///
+    /// Holds one `char` per source *byte*, not one per character: the lexer
+    /// reads bytes and the back end needs the byte count. A `char` here is
+    /// therefore always < 0x100, and text from anywhere else has to be put in
+    /// that form with [`literal_payload`] before it can go in a payload.
+    /// [`payload_bytes`] reads it back out.
+    String(String),
     Char(String),       // Character literal content
     WideString(String), // Wide string literal
     WideChar(String),   // Wide character literal
@@ -1313,8 +1320,77 @@ pub fn show_special(value: u32) -> String {
     }
 }
 
-/// Format a token for display
+/// The encoding prefix, delimiter and payload of a literal token, or `None`
+/// if the token is not a literal (or its type and value disagree).
+///
+/// One arm per literal type, replacing eight near-identical blocks that each
+/// had to be edited in step.
+fn literal_parts(token: &Token) -> Option<(&'static str, u8, &str)> {
+    let (prefix, delim, payload) = match (token.typ, &token.value) {
+        (TokenType::String, TokenValue::String(s)) => ("", b'"', s),
+        (TokenType::WideString, TokenValue::WideString(s)) => ("L", b'"', s),
+        (TokenType::Utf16String, TokenValue::Utf16String(s)) => ("u", b'"', s),
+        (TokenType::Utf32String, TokenValue::Utf32String(s)) => ("U", b'"', s),
+        (TokenType::Char, TokenValue::Char(s)) => ("", b'\'', s),
+        (TokenType::WideChar, TokenValue::WideChar(s)) => ("L", b'\'', s),
+        (TokenType::Utf16Char, TokenValue::Utf16Char(s)) => ("u", b'\'', s),
+        (TokenType::Utf32Char, TokenValue::Utf32Char(s)) => ("U", b'\'', s),
+        _ => return None,
+    };
+    Some((prefix, delim, payload.as_str()))
+}
+
+/// Encode Rust text as a literal payload: one `char` per UTF-8 byte.
+///
+/// A literal's payload holds the literal's *source bytes*, one per `char`
+/// (see [`TokenValue::String`]). Text arriving from anywhere else -- a file
+/// name for `__FILE__`, an identifier being stringified -- is an ordinary
+/// Rust string and has to be converted, or the two conventions mix inside one
+/// payload and neither its byte count nor its spelling comes out right.
+pub fn literal_payload(text: &str) -> String {
+    text.bytes().map(char::from).collect()
+}
+
+/// The source bytes a literal payload stands for.
+pub fn payload_bytes(payload: &str) -> impl Iterator<Item = u8> + '_ {
+    payload.chars().map(|c| c as u8)
+}
+
+/// Append a token's source spelling to `out`, byte for byte.
+///
+/// Literals have to be written a byte at a time. Formatting a payload through
+/// a Rust `String` UTF-8-encodes each of its `char`s, so every source byte of
+/// 0x80 or more became two: a literal holding an accented letter left `c17 -E`
+/// longer than it went in, and preprocessing a file then compiling it changed
+/// what the string held.
+pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
+    match literal_parts(token) {
+        Some((prefix, delim, payload)) => {
+            out.extend_from_slice(prefix.as_bytes());
+            out.push(delim);
+            out.extend(payload_bytes(payload));
+            out.push(delim);
+        }
+        None => out.extend_from_slice(show_other_token(token, strings).as_bytes()),
+    }
+}
+
+/// Format a token for display.
+///
+/// Lossy for a literal holding bytes that are not valid UTF-8; use
+/// [`write_token`] wherever the exact source bytes matter.
 pub fn show_token(token: &Token, strings: &StringTable) -> String {
+    if literal_parts(token).is_none() {
+        return show_other_token(token, strings);
+    }
+    let mut out = Vec::new();
+    write_token(&mut out, token, strings);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Everything [`literal_parts`] declines: the non-literal token types, plus a
+/// literal whose type and value disagree.
+fn show_other_token(token: &Token, strings: &StringTable) -> String {
     match token.typ {
         TokenType::StreamBegin => "<STREAM_BEGIN>".to_string(),
         TokenType::StreamEnd => "<STREAM_END>".to_string(),
@@ -1336,62 +1412,6 @@ pub fn show_token(token: &Token, strings: &StringTable) -> String {
                 "<number?>".to_string()
             }
         }
-        TokenType::String => {
-            if let TokenValue::String(s) = &token.value {
-                format!("\"{}\"", s)
-            } else {
-                "<string?>".to_string()
-            }
-        }
-        TokenType::WideString => {
-            if let TokenValue::WideString(s) = &token.value {
-                format!("L\"{}\"", s)
-            } else {
-                "<wstring?>".to_string()
-            }
-        }
-        TokenType::Char => {
-            if let TokenValue::Char(s) = &token.value {
-                format!("'{}'", s)
-            } else {
-                "<char?>".to_string()
-            }
-        }
-        TokenType::WideChar => {
-            if let TokenValue::WideChar(s) = &token.value {
-                format!("L'{}'", s)
-            } else {
-                "<wchar?>".to_string()
-            }
-        }
-        TokenType::Utf16String => {
-            if let TokenValue::Utf16String(s) = &token.value {
-                format!("u\"{}\"", s)
-            } else {
-                "<u16string?>".to_string()
-            }
-        }
-        TokenType::Utf32String => {
-            if let TokenValue::Utf32String(s) = &token.value {
-                format!("U\"{}\"", s)
-            } else {
-                "<u32string?>".to_string()
-            }
-        }
-        TokenType::Utf16Char => {
-            if let TokenValue::Utf16Char(s) = &token.value {
-                format!("u'{}'", s)
-            } else {
-                "<u16char?>".to_string()
-            }
-        }
-        TokenType::Utf32Char => {
-            if let TokenValue::Utf32Char(s) = &token.value {
-                format!("U'{}'", s)
-            } else {
-                "<u32char?>".to_string()
-            }
-        }
         TokenType::Special => {
             if let TokenValue::Special(v) = &token.value {
                 show_special(*v)
@@ -1399,6 +1419,8 @@ pub fn show_token(token: &Token, strings: &StringTable) -> String {
                 "<special?>".to_string()
             }
         }
+        // A literal type reaches here only when its value does not match.
+        typ => format!("<{}?>", token_type_name(typ).to_lowercase()),
     }
 }
 
@@ -1426,15 +1448,19 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
 // Token to Text Conversion (for preprocessing output)
 // ============================================================================
 
-/// Convert preprocessed tokens back to text output.
+/// Convert preprocessed tokens back to source text, byte for byte.
 ///
-/// This function handles whitespace/newline preservation based on token positions.
-/// Used for outputting preprocessed assembly files.
-pub fn tokens_to_text(tokens: &[Token], strings: &StringTable) -> String {
-    let mut result = String::new();
+/// Handles whitespace/newline preservation based on token positions. Used for
+/// outputting preprocessed assembly files. Bytes rather than a `String`
+/// because a literal payload is a byte sequence; see [`write_token`].
+///
+/// Not to be confused with `Preprocessor::tokens_to_message`, which renders
+/// tokens for a human to read in a `#error` diagnostic.
+pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8> {
+    let mut result: Vec<u8> = Vec::new();
     let mut last_stream: u16 = 0;
     let mut last_line: u32 = 1;
-    let mut last_char: Option<char> = None;
+    let mut last_char: Option<u8> = None;
 
     for token in tokens {
         // Skip stream markers
@@ -1451,39 +1477,35 @@ pub fn tokens_to_text(tokens: &[Token], strings: &StringTable) -> String {
             last_line = token.pos.line.saturating_sub(1); // Allow line sync below
         }
 
+        let start = result.len();
+        write_token(&mut result, token, strings);
+        let spelling = &result[start..];
+        let first_char = spelling.first().copied();
+
         // Handle newlines: if token is on a new line, add newline(s)
-        if token.pos.newline && !result.is_empty() {
-            // Output newlines to get to the current line
+        if token.pos.newline && start > 0 {
+            let spelling: Vec<u8> = result.split_off(start);
             while last_line < token.pos.line {
-                result.push('\n');
+                result.push(b'\n');
                 last_line += 1;
             }
-        } else if !result.is_empty() {
-            // Determine if space is needed between tokens on the same line
-            let text = show_token(token, strings);
-            let first_char = text.chars().next();
-
-            // Need space if:
-            // 1. Original had whitespace, OR
-            // 2. Adjacent tokens would merge (both alphanumeric/underscore)
-            let would_merge = last_char.is_some_and(|c| c.is_alphanumeric() || c == '_')
-                && first_char.is_some_and(|c| c.is_alphanumeric() || c == '_');
-
-            if token.pos.whitespace || would_merge {
-                result.push(' ');
+            result.extend_from_slice(&spelling);
+        } else if start > 0 {
+            // Need a space if the original had whitespace, or if the adjacent
+            // tokens would otherwise merge (both alphanumeric/underscore).
+            let merges = |c: Option<u8>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if token.pos.whitespace || (merges(last_char) && merges(first_char)) {
+                result.insert(start, b' ');
             }
         }
 
-        // Output the token content
-        let text = show_token(token, strings);
-        last_char = text.chars().last();
-        result.push_str(&text);
+        last_char = result.last().copied();
         last_line = token.pos.line;
     }
 
     // Ensure file ends with newline
-    if !result.is_empty() && !result.ends_with('\n') {
-        result.push('\n');
+    if !result.is_empty() && !result.ends_with(b"\n") {
+        result.push(b'\n');
     }
 
     result
@@ -2231,6 +2253,29 @@ mod tests {
         assert!(tokens[hash].pos.newline);
     }
 
+    /// A literal payload holds one `char` per source byte, so its spelling has
+    /// to be written a byte at a time. Formatting one through a Rust `String`
+    /// UTF-8-encoded each of those chars and doubled every byte >= 0x80.
+    #[test]
+    fn test_write_token_emits_source_bytes() {
+        let (tokens, idents) = tokenize_str("\"caf\u{e9}\"");
+        assert_eq!(tokens[1].typ, TokenType::String);
+
+        let mut out = Vec::new();
+        write_token(&mut out, &tokens[1], &idents);
+        assert_eq!(out, b"\"caf\xc3\xa9\"");
+
+        // Round-trips through show_token when the bytes are valid UTF-8.
+        assert_eq!(show_token(&tokens[1], &idents), "\"caf\u{e9}\"");
+
+        // literal_payload is the inverse: Rust text into payload form.
+        assert_eq!(literal_payload("caf\u{e9}"), "caf\u{c3}\u{a9}");
+        assert_eq!(
+            payload_bytes(&literal_payload("caf\u{e9}")).collect::<Vec<_>>(),
+            b"caf\xc3\xa9"
+        );
+    }
+
     #[test]
     fn test_column_saturates_on_very_long_line() {
         let mut src = " ".repeat(70000);
@@ -2538,31 +2583,41 @@ mod tests {
     }
 
     // ========================================================================
-    // tokens_to_text tests
+    // tokens_to_source_bytes tests
     // ========================================================================
 
-    #[test]
-    fn test_tokens_to_text_simple() {
-        let (tokens, strings) = tokenize_str("int x = 42;");
-        let text = tokens_to_text(&tokens, &strings);
-        // Note: semicolon doesn't have whitespace flag set, so no space before it
-        assert_eq!(text.trim(), "int x = 42;");
+    fn source_text(input: &str) -> String {
+        let (tokens, strings) = tokenize_str(input);
+        String::from_utf8(tokens_to_source_bytes(&tokens, &strings)).expect("not UTF-8")
     }
 
     #[test]
-    fn test_tokens_to_text_multiline() {
-        let (tokens, strings) = tokenize_str("int x;\nint y;");
-        let text = tokens_to_text(&tokens, &strings);
+    fn test_tokens_to_source_bytes_simple() {
+        // Note: semicolon doesn't have whitespace flag set, so no space before it
+        assert_eq!(source_text("int x = 42;").trim(), "int x = 42;");
+    }
+
+    #[test]
+    fn test_tokens_to_source_bytes_multiline() {
+        let text = source_text("int x;\nint y;");
         // Should preserve the newline between statements
         assert!(text.contains('\n'));
         assert!(text.contains("int"));
     }
 
     #[test]
-    fn test_tokens_to_text_ends_with_newline() {
-        let (tokens, strings) = tokenize_str("x");
-        let text = tokens_to_text(&tokens, &strings);
-        assert!(text.ends_with('\n'));
+    fn test_tokens_to_source_bytes_ends_with_newline() {
+        assert!(source_text("x").ends_with('\n'));
+    }
+
+    /// The reason this path deals in bytes: a literal payload is one `char`
+    /// per source byte, and rendering it as a Rust string doubles every byte
+    /// of 0x80 or more.
+    #[test]
+    fn test_tokens_to_source_bytes_keeps_literal_bytes() {
+        let (tokens, strings) = tokenize_str(".ascii \"caf\u{e9}\"");
+        let out = tokens_to_source_bytes(&tokens, &strings);
+        assert_eq!(out, b".ascii \"caf\xc3\xa9\"\n");
     }
 
     // ========================================================================

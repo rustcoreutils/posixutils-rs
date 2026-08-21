@@ -922,3 +922,59 @@ int main(void) {
         "deref of a pointer to a variably-modified array"
     );
 }
+
+/// Every way of stepping a pointer to a variably-modified array has to use
+/// the run-time stride, not just the two that were fixed first.
+///
+/// `++p` and `p + 1` took it; `p++`, `p += 1` and `p - q` did not. So the
+/// pointer silently did not move for two of the five spellings, and a
+/// difference whose left operand was not a bare identifier divided by a
+/// compile-time size of zero and trapped.
+#[test]
+fn c99_vm_pointer_arithmetic_every_spelling() {
+    let code = r#"
+int main(void) {
+    int n = 3, m = 5;
+    long row = (long)m * (long)sizeof(int);
+    int a[n][m];
+    int (*p)[m] = a;
+    int (*r)[m];
+
+    /* All five spellings step exactly one row. */
+    r = p; r++;        if ((char *)r - (char *)p != row) return 1;
+    r = p; ++r;        if ((char *)r - (char *)p != row) return 2;
+    r = p; r += 1;     if ((char *)r - (char *)p != row) return 3;
+    r = p; r = r + 1;  if ((char *)r - (char *)p != row) return 4;
+    r = p; r = 1 + r;  if ((char *)r - (char *)p != row) return 5;
+
+    /* And backwards. */
+    r = p + 2; r--;    if ((char *)r - (char *)p != row) return 6;
+    r = p + 2; --r;    if ((char *)r - (char *)p != row) return 7;
+    r = p + 2; r -= 1; if ((char *)r - (char *)p != row) return 8;
+    r = p + 2; r = r - 1; if ((char *)r - (char *)p != row) return 9;
+
+    /* Difference, including operands that are not bare identifiers. */
+    r = p + 2;
+    if (r - p != 2) return 10;
+    if ((p + 2) - p != 2) return 11;
+    if (r - (p + 1) != 1) return 12;
+    if ((p + 2) - (p + 1) != 1) return 13;
+
+    /* The post forms yield the old value and still move. */
+    r = p;
+    if ((char *)(r++) - (char *)p != 0) return 14;
+    if ((char *)r - (char *)p != row) return 15;
+
+    /* A two-dimensional VM pointee steps the whole array. */
+    int (*w)[n][m] = &a;
+    if ((char *)(w + 1) - (char *)w != (long)(n * m) * (long)sizeof(int)) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_vm_pointer_arith", code, &[]),
+        0,
+        "pointer arithmetic on a variably-modified pointee"
+    );
+}

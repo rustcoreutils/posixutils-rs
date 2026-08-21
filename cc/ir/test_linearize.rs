@@ -6499,4 +6499,47 @@ fn test_vm_index_base_counts_a_deref_as_an_index_step() {
         pos: test_pos(),
     };
     assert_eq!(Linearizer::vm_index_base(&addr_of), None);
+
+    // Adding to a pointer does not change what it points at, so `p + 2` sits
+    // at the same depth as `p` -- from either side, and for `-` as well.
+    // Without this, `(p + 2) - p` found no extents and divided by a
+    // compile-time size of zero, which traps.
+    let two = || {
+        Box::new(Expr {
+            kind: ExprKind::IntLit(2),
+            typ: Some(int_t),
+            pos: test_pos(),
+        })
+    };
+    let arith = |op, left: Expr, swap: bool| Expr {
+        kind: ExprKind::Binary {
+            op,
+            left: if swap { two() } else { Box::new(left.clone()) },
+            right: if swap { Box::new(left) } else { two() },
+        },
+        typ: Some(int_t),
+        pos: test_pos(),
+    };
+    assert_eq!(
+        Linearizer::vm_index_base(&arith(BinaryOp::Add, ident(), false)),
+        Some((sym, 0))
+    );
+    assert_eq!(
+        Linearizer::vm_index_base(&arith(BinaryOp::Add, ident(), true)),
+        Some((sym, 0))
+    );
+    assert_eq!(
+        Linearizer::vm_index_base(&arith(BinaryOp::Sub, ident(), false)),
+        Some((sym, 0))
+    );
+    // And the steps compose: `(*p + 2)[0]` is two steps from `p`.
+    assert_eq!(
+        Linearizer::vm_index_base(&index(arith(BinaryOp::Add, deref(ident()), false))),
+        Some((sym, 2))
+    );
+    // An arithmetic operator that is not `+`/`-` reaches no object.
+    assert_eq!(
+        Linearizer::vm_index_base(&arith(BinaryOp::Mul, ident(), false)),
+        None
+    );
 }

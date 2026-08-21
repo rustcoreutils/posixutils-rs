@@ -2322,9 +2322,45 @@ impl<'a> Linearizer<'a> {
                     depth += 1;
                     cur = operand;
                 }
+                // `p + i` and `i + p` denote the same kind of object as `p`,
+                // at the same depth: adding to a pointer does not change what
+                // it points at. Whichever side reaches an object is the
+                // pointer, which needs no type information to decide.
+                // Without this, `(p + 2) - p` found no extents and divided by
+                // a compile-time size of zero, which traps at run time.
+                ExprKind::Binary {
+                    op: BinaryOp::Add | BinaryOp::Sub,
+                    left,
+                    right,
+                } => {
+                    if let Some((sym, extra)) = Self::vm_index_base(left) {
+                        return Some((sym, depth + extra));
+                    }
+                    if let Some((sym, extra)) = Self::vm_index_base(right) {
+                        return Some((sym, depth + extra));
+                    }
+                    return None;
+                }
                 _ => return None,
             }
         }
+    }
+
+    /// Bytes that one step of `ptr_expr` spans, as a run-time value.
+    ///
+    /// A variably-modified pointee reports a compile-time size of 0, so the
+    /// stride has to come from the object's recorded extents. Every place
+    /// that scales by a pointee's size goes through here -- `p[i]`, `p + i`,
+    /// `p - q`, `++p`, `p++`, `p += i` -- because each of them used to work it
+    /// out separately, and fixing three of the six left the other three
+    /// stepping nowhere.
+    pub(crate) fn pointer_step_bytes(&mut self, ptr_expr: &Expr, ptr_typ: TypeId) -> PseudoId {
+        if let Some(stride) = self.vm_index_stride(ptr_expr) {
+            return stride;
+        }
+        let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
+        let elem_size = self.types.size_bits(elem_type) / 8;
+        self.emit_const(elem_size as i128, self.types.long_id)
     }
 
     /// Record the extents of a variably-modified `array_type`, evaluating each
@@ -3221,9 +3257,7 @@ impl<'a> Linearizer<'a> {
 
         // For pointers, increment/decrement by element size; for others, by 1
         let delta = if is_ptr {
-            let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-            let elem_size = self.types.size_bits(elem_type) / 8;
-            self.emit_const(elem_size as i128, self.types.long_id)
+            self.pointer_step_bytes(operand, typ)
         } else if is_float {
             self.emit_fconst(FloatVal::from_f64(1.0), typ)
         } else {
@@ -3404,14 +3438,7 @@ impl<'a> Linearizer<'a> {
                 64,
             ));
 
-            // Divide by element size. A variably-modified pointee reports a
-            // compile-time size of 0, so the stride comes from the object's
-            // recorded extents, exactly as indexing takes it.
-            let scale = self.vm_index_stride(left).unwrap_or_else(|| {
-                let elem_type = self.types.base_type(left_typ).unwrap_or(self.types.char_id);
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                self.emit_const(elem_size as i128, self.types.long_id)
-            });
+            let scale = self.pointer_step_bytes(left, left_typ);
             let result = self.alloc_pseudo();
             self.emit(Instruction::binop(
                 Opcode::DivS,
@@ -3435,16 +3462,8 @@ impl<'a> Linearizer<'a> {
                 (ptr, right_typ, int)
             };
 
-            // Scale the integer by element size. A variably-modified pointee
-            // reports a compile-time size of 0, so the stride comes from the
-            // object's recorded extents, exactly as indexing takes it --
-            // without which `p + 1` on `int (*p)[n][m]` moved nowhere.
             let ptr_expr = if left_is_ptr_or_arr { left } else { right };
-            let scale = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
-                let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                self.emit_const(elem_size as i128, self.types.long_id)
-            });
+            let scale = self.pointer_step_bytes(ptr_expr, ptr_typ);
             let scaled_offset = self.alloc_pseudo();
             // Extend int_val to 64-bit for proper address arithmetic
             let actual_int_type = if left_is_ptr_or_arr {
@@ -3597,11 +3616,7 @@ impl<'a> Linearizer<'a> {
 
             // Compute new value - for pointers, scale by element size
             let increment = if is_ptr {
-                self.vm_index_stride(operand).unwrap_or_else(|| {
-                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i128, self.types.long_id)
-                })
+                self.pointer_step_bytes(operand, typ)
             } else if is_float {
                 self.emit_fconst(FloatVal::from_f64(1.0), typ)
             } else {

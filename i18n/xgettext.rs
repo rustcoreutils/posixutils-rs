@@ -654,6 +654,8 @@ impl Walker {
                 no_builtin_inc: true,
                 trigraphs: false,
                 preprocessed: false,
+                // Extracting strings, not compiling: nothing optimizes.
+                optimization: Default::default(),
             },
         );
 

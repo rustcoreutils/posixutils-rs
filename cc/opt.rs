@@ -94,6 +94,11 @@ impl Optimization {
         self.level >= 2
     }
 
+    /// Whether code size is preferred over speed. Drives `__OPTIMIZE_SIZE__`.
+    pub fn for_size(&self) -> bool {
+        self.for_size
+    }
+
     /// Whether functions are inlined on their merits.
     ///
     /// False at `-O0` and under `-fno-inline`. `__attribute__((always_inline))`

@@ -69,13 +69,18 @@ fn accepted() -> Vec<&'static str> {
 /// The marker keeps the interesting line findable in `-E` output, which also
 /// carries line markers and blank lines.
 fn expand_under(name: &str, std_flag: Option<&str>, macro_name: &str) -> String {
-    let src = format!("MARKER {} MARKER\n", macro_name);
     let opts: Vec<&str> = std_flag.into_iter().collect();
-    let run = preprocess_text(name, &src, &opts);
+    expand_with(name, &opts, macro_name)
+}
+
+/// As [`expand_under`], for a case that needs more than one flag.
+fn expand_with(name: &str, opts: &[&str], macro_name: &str) -> String {
+    let src = format!("MARKER {} MARKER\n", macro_name);
+    let run = preprocess_text(name, &src, opts);
     assert!(
         run.success,
         "preprocessing failed for {:?}: {}",
-        std_flag, run.stderr
+        opts, run.stderr
     );
 
     let line = run
@@ -501,4 +506,81 @@ fn c17_keeps_the_capability_macros_it_can_back() {
             "{macro_name} is deliberately kept; changing it is a decision, not a sweep"
         );
     }
+}
+
+// ============================================================================
+// The optimization macros
+// ============================================================================
+
+/// `__OPTIMIZE__`, `__OPTIMIZE_SIZE__` and `__NO_INLINE__`, against the table
+/// GCC and Clang both implement.
+///
+/// The rules: `__OPTIMIZE__` when the level is not zero; `__OPTIMIZE_SIZE__`
+/// when optimizing for size; `__NO_INLINE__` when functions are not inlined on
+/// their merits -- at `-O0`, or under `-fno-inline` at any level. Clang tests
+/// exactly these three conditions in `InitPreprocessor.cpp`.
+///
+/// Every row here was checked against the installed gcc with `-dM -E` before
+/// being written down.
+#[test]
+fn c17_optimization_macros_match_gcc() {
+    // (flags, __OPTIMIZE__, __OPTIMIZE_SIZE__, __NO_INLINE__)
+    let table: &[(&[&str], bool, bool, bool)] = &[
+        (&[], false, false, true),
+        (&["-O0"], false, false, true),
+        (&["-O"], true, false, false),
+        (&["-O1"], true, false, false),
+        (&["-O2"], true, false, false),
+        (&["-O3"], true, false, false),
+        // -Og optimizes, but not for size.
+        (&["-Og"], true, false, false),
+        // -Os is the only spelling that sets the size macro.
+        (&["-Os"], true, true, false),
+        // -fno-inline is orthogonal to the level: still optimizing.
+        (&["-O2", "-fno-inline"], true, false, true),
+        (&["-Os", "-fno-inline"], true, true, true),
+        (&["-O3", "-fno-inline"], true, false, true),
+        // Last one wins.
+        (&["-O2", "-fno-inline", "-finline"], true, false, false),
+        // At -O0 the level wins: -finline does not turn inlining on.
+        (&["-O0", "-finline"], false, false, true),
+        // A *different* flag, which governs functions not declared `inline`
+        // and does not claim inlining is off.
+        (&["-O2", "-fno-inline-functions"], true, false, false),
+    ];
+
+    for (flags, optimize, size, no_inline) in table {
+        for (macro_name, expected) in [
+            ("__OPTIMIZE__", *optimize),
+            ("__OPTIMIZE_SIZE__", *size),
+            ("__NO_INLINE__", *no_inline),
+        ] {
+            let got = expand_with("optmacros", flags, macro_name);
+            let defined = !is_undefined(&got, macro_name);
+            assert_eq!(
+                defined,
+                expected,
+                "{flags:?}: {macro_name} should {} be defined, got {got:?}",
+                if expected { "" } else { "not" }
+            );
+            if expected {
+                assert_eq!(got, "1", "{flags:?}: {macro_name} should expand to 1");
+            }
+        }
+    }
+}
+
+/// `-D` and `-U` are applied after the optimization macros, so a program can
+/// still override them -- which is what GCC allows.
+#[test]
+fn c17_optimization_macros_can_be_overridden() {
+    assert_eq!(
+        expand_with("optover", &["-O2", "-D__OPTIMIZE__=7"], "__OPTIMIZE__"),
+        "7"
+    );
+    let got = expand_with("optundef", &["-O2", "-U__OPTIMIZE__"], "__OPTIMIZE__");
+    assert!(
+        is_undefined(&got, "__OPTIMIZE__"),
+        "-U should remove it, got {got}"
+    );
 }

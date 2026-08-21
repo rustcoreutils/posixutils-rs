@@ -571,6 +571,7 @@ fn process_file(
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
             preprocessed,
+            optimization: args.optimization(),
         },
     );
 
@@ -1511,6 +1512,7 @@ fn assemble_operand(
         let temp_s = scratch_path(scratch, operand_id, stem, "s");
         let content = std::fs::read(path)?;
         let asm_config = AsmPreprocessConfig {
+            optimization: args.optimization(),
             defines: &args.defines,
             undefines: &args.undefines,
             include_paths: &args.include_paths,

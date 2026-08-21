@@ -4859,6 +4859,39 @@ pub struct PreprocessConfig<'a> {
     /// If true, the input is a `.i` operand -- already the output of `c17 -E`
     /// -- and the processing that produced it must not be repeated.
     pub preprocessed: bool,
+    /// What optimization was asked for.
+    ///
+    /// The same value the optimizer is given, so `__OPTIMIZE__`,
+    /// `__OPTIMIZE_SIZE__` and `__NO_INLINE__` are derived from what the
+    /// compiler will actually do rather than from a copy of it. A capability
+    /// macro that can disagree with the capability is the failure this
+    /// arrangement exists to prevent.
+    pub optimization: crate::opt::Optimization,
+}
+
+/// Define the macros that say what optimization is being done.
+///
+/// GCC and Clang agree on all three: `__OPTIMIZE__` whenever the level is not
+/// zero, `__OPTIMIZE_SIZE__` when optimizing for size, and `__NO_INLINE__`
+/// when functions are not inlined on their merits -- at `-O0`, or under
+/// `-fno-inline` at any level.
+///
+/// `__NO_INLINE__` does not mean `always_inline` stops working. GCC defines it
+/// and still honours the attribute, and glibc's `__fortify_function` depends
+/// on exactly that combination.
+///
+/// Defined before `-D` and `-U` are applied, so a user can still override any
+/// of them, which is also what GCC allows.
+fn define_optimization_macros(pp: &mut Preprocessor, opt: crate::opt::Optimization) {
+    if opt.optimizes() {
+        pp.define_macro(Macro::predefined("__OPTIMIZE__", Some("1")));
+    }
+    if opt.for_size() {
+        pp.define_macro(Macro::predefined("__OPTIMIZE_SIZE__", Some("1")));
+    }
+    if !opt.inlines_generally() {
+        pp.define_macro(Macro::predefined("__NO_INLINE__", Some("1")));
+    }
 }
 
 /// Preprocess tokens with command-line defines and undefines
@@ -4895,6 +4928,8 @@ pub fn preprocess_with_defines(
     pp.trigraphs = config.trigraphs;
     pp.preprocessed = config.preprocessed;
 
+    define_optimization_macros(&mut pp, config.optimization);
+
     // Add -I include paths
     for path in config.include_paths {
         pp.quote_include_paths.push(path.clone());
@@ -4930,6 +4965,9 @@ pub struct AsmPreprocessConfig<'a> {
     pub search: SystemSearch<'a>,
     /// If true, disable system include paths (-nostdinc)
     pub no_std_inc: bool,
+    /// What optimization was asked for; see [`PreprocessConfig::optimization`].
+    /// GCC defines these for `.S` files too.
+    pub optimization: crate::opt::Optimization,
 }
 
 /// Preprocess an assembly file (.S) and return the preprocessed text.
@@ -4981,6 +5019,8 @@ pub fn preprocess_asm_file(
 
     // Define __ASSEMBLER__ (GCC-compatible, indicates assembly preprocessing)
     pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
+
+    define_optimization_macros(&mut pp, config.optimization);
 
     // Handle -nostdinc flag
     if config.no_std_inc {

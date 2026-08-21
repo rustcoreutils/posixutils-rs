@@ -2292,12 +2292,19 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Peel `Index` nodes off `expr` to reach the object being indexed,
-    /// returning it with the number of index steps that separate them.
+    /// Peel index steps off `expr` to reach the object being indexed,
+    /// returning it with the number of steps that separate them.
     ///
-    /// `b` gives depth 0, `b[i]` gives 1, `b[i][j]` gives 2. Anything that is
-    /// not an identifier under a chain of indexes has no recorded extents, so
-    /// it yields None and the caller falls back to the compile-time size.
+    /// `b` gives depth 0, `b[i]` gives 1, `b[i][j]` gives 2. A dereference is
+    /// an index step too -- 6.5.2.1p2 defines `E1[E2]` as `(*((E1)+(E2)))`,
+    /// so `*p` and `p[0]` are the same expression. Counting only `Index`
+    /// meant the extents were carried on the way in and dropped on the way
+    /// out: `p[0][i][j]` indexed correctly while `(*p)[i][j]` used a stride
+    /// of zero, and `sizeof(*p)` answered 0.
+    ///
+    /// Anything that is not an identifier under such a chain has no recorded
+    /// extents, so it yields None and the caller falls back to the
+    /// compile-time size.
     fn vm_index_base(expr: &Expr) -> Option<(SymbolId, usize)> {
         let mut depth = 0usize;
         let mut cur = expr;
@@ -2307,6 +2314,13 @@ impl<'a> Linearizer<'a> {
                 ExprKind::Index { array, .. } => {
                     depth += 1;
                     cur = array;
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand,
+                } => {
+                    depth += 1;
+                    cur = operand;
                 }
                 _ => return None,
             }
@@ -3390,12 +3404,14 @@ impl<'a> Linearizer<'a> {
                 64,
             ));
 
-            // Get element size from the pointer type
-            let elem_type = self.types.base_type(left_typ).unwrap_or(self.types.char_id);
-            let elem_size = self.types.size_bits(elem_type) / 8;
-
-            // Divide by element size
-            let scale = self.emit_const(elem_size as i128, self.types.long_id);
+            // Divide by element size. A variably-modified pointee reports a
+            // compile-time size of 0, so the stride comes from the object's
+            // recorded extents, exactly as indexing takes it.
+            let scale = self.vm_index_stride(left).unwrap_or_else(|| {
+                let elem_type = self.types.base_type(left_typ).unwrap_or(self.types.char_id);
+                let elem_size = self.types.size_bits(elem_type) / 8;
+                self.emit_const(elem_size as i128, self.types.long_id)
+            });
             let result = self.alloc_pseudo();
             self.emit(Instruction::binop(
                 Opcode::DivS,
@@ -3419,12 +3435,16 @@ impl<'a> Linearizer<'a> {
                 (ptr, right_typ, int)
             };
 
-            // Get element size
-            let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
-            let elem_size = self.types.size_bits(elem_type) / 8;
-
-            // Scale the integer by element size
-            let scale = self.emit_const(elem_size as i128, self.types.long_id);
+            // Scale the integer by element size. A variably-modified pointee
+            // reports a compile-time size of 0, so the stride comes from the
+            // object's recorded extents, exactly as indexing takes it --
+            // without which `p + 1` on `int (*p)[n][m]` moved nowhere.
+            let ptr_expr = if left_is_ptr_or_arr { left } else { right };
+            let scale = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
+                let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
+                let elem_size = self.types.size_bits(elem_type) / 8;
+                self.emit_const(elem_size as i128, self.types.long_id)
+            });
             let scaled_offset = self.alloc_pseudo();
             // Extend int_val to 64-bit for proper address arithmetic
             let actual_int_type = if left_is_ptr_or_arr {
@@ -3577,9 +3597,11 @@ impl<'a> Linearizer<'a> {
 
             // Compute new value - for pointers, scale by element size
             let increment = if is_ptr {
-                let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                self.emit_const(elem_size as i128, self.types.long_id)
+                self.vm_index_stride(operand).unwrap_or_else(|| {
+                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    self.emit_const(elem_size as i128, self.types.long_id)
+                })
             } else if is_float {
                 self.emit_fconst(FloatVal::from_f64(1.0), typ)
             } else {

@@ -857,3 +857,68 @@ int main(void) {
         "&vla must be the array's address"
     );
 }
+
+/// Dereferencing a pointer to a variably-modified array has to keep the
+/// array's run-time extents: `(*p)[i]` steps a whole row, and `sizeof(*p)` is
+/// the run-time size (C99 6.5.3.4p2 -- "if the type is variable length, the
+/// size is computed at execution time").
+///
+/// The extents were carried only on the way *in*: `p[0][i][j]` indexed
+/// correctly while `(*p)[i][j]` -- the same address, spelled with a deref --
+/// used a stride of zero, and every `sizeof(*p)` answered 0.
+#[test]
+fn c99_deref_of_a_pointer_to_a_vm_array() {
+    let code = r#"
+int main(void) {
+    int n = 4, m = 5;
+    unsigned long isz = sizeof(int);
+
+    int a[n][m];
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < m; j++) a[i][j] = i * m + j;
+    int b[n];
+    for (int i = 0; i < n; i++) b[i] = i + 100;
+
+    /* Pointer to a one-dimensional VM array. */
+    int (*pb)[n] = &b;
+    if ((*pb)[2] != 102) return 1;
+    if (sizeof(*pb) != (unsigned long)n * isz) return 2;
+
+    /* Pointer to a two-dimensional VM array: the deref must step rows. */
+    int (*pa)[n][m] = &a;
+    if ((*pa)[0][0] != 0) return 3;
+    if ((*pa)[1][0] != 5) return 4;
+    if ((*pa)[3][4] != 19) return 5;
+    if (sizeof(*pa) != (unsigned long)(n * m) * isz) return 6;
+    if (sizeof((*pa)[0]) != (unsigned long)m * isz) return 7;
+
+    /* The same through a variably modified typedef (6.7.7). */
+    typedef int T[n][m];
+    T *pt = &a;
+    if ((*pt)[1][0] != 5) return 8;
+    if ((*pt)[3][4] != 19) return 9;
+    if (sizeof(*pt) != (unsigned long)(n * m) * isz) return 10;
+
+    /* Indexing without the deref must keep working. */
+    if (pa[0][3][4] != 19) return 11;
+    int (*q)[m] = a;
+    if (q[3][4] != 19) return 12;
+    if (sizeof(*q) != (unsigned long)m * isz) return 13;
+
+    /* Writing through the deref lands in the original array. */
+    (*pa)[2][1] = 777;
+    if (a[2][1] != 777) return 14;
+
+    /* Pointer arithmetic steps whole arrays. */
+    if ((char *)(pa + 1) - (char *)pa != (long)(n * m) * (long)isz) return 15;
+    if ((char *)(pb + 1) - (char *)pb != (long)n * (long)isz) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_deref_vm_pointer", code, &[]),
+        0,
+        "deref of a pointer to a variably-modified array"
+    );
+}

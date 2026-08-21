@@ -18,7 +18,9 @@ use crate::constexpr::ConstScope;
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind, SymbolTable};
-use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
+use crate::token::lexer::{
+    payload_text, IdentTable, Position, SpecialToken, Token, TokenType, TokenValue,
+};
 use crate::token::preprocess::PackAction;
 use crate::types::{
     CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers, TypeTable,
@@ -1078,7 +1080,7 @@ impl<'a> Parser<'a> {
             }
             TokenType::String => {
                 if let TokenValue::String(s) = &self.current().value {
-                    let s = s.clone();
+                    let s = payload_text(s);
                     self.advance();
                     Some(AttributeArg::String(s))
                 } else {
@@ -1300,7 +1302,7 @@ impl<'a> Parser<'a> {
                     }
                 } else if depth == 1 {
                     if let TokenValue::String(s) = &self.current().value {
-                        label.push_str(s);
+                        label.push_str(&payload_text(s));
                     }
                 }
                 self.advance();
@@ -4953,7 +4955,7 @@ impl Parser<'_> {
                 ));
             }
             let msg = if let TokenValue::String(s) = &self.current().value {
-                s.clone()
+                payload_text(s)
             } else {
                 String::new()
             };

@@ -74,6 +74,46 @@ fn preprocessor_synthesized_literals_use_payload_form() {
     assert_lacks(&r.stdout, "Ã", "double-encoded UTF-8");
 }
 
+/// A header name is a literal payload -- source bytes, one per `char` -- and
+/// has to be decoded before it can be opened as a path. Using it as text
+/// looked for `cafÃ©.h` and reported the real file missing.
+#[test]
+fn preprocessor_non_ascii_header_name_opens() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_utf8_include_")
+        .tempdir()
+        .expect("failed to create work dir");
+    std::fs::write(dir.path().join("café.h"), "int seven(void){return 7;}\n").unwrap();
+    let src = dir.path().join("main.c");
+    std::fs::write(
+        &src,
+        "#include \"café.h\"\nint main(void){return seven()-7;}\n",
+    )
+    .unwrap();
+
+    let exe = dir.path().join("prog");
+    let r = run_c17(&[
+        &src.to_string_lossy(),
+        "-o",
+        &exe.to_string_lossy(),
+        "-I",
+        &dir.path().to_string_lossy(),
+    ]);
+    assert!(
+        r.success,
+        "compiling with a UTF-8 header name failed:\n{}",
+        r.stderr
+    );
+    let status = std::process::Command::new(&exe)
+        .status()
+        .expect("failed to run the built program");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "wrong result from the included function"
+    );
+}
+
 // ============================================================================
 // #P2 — the null directive
 // ============================================================================

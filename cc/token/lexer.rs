@@ -1356,6 +1356,19 @@ pub fn payload_bytes(payload: &str) -> impl Iterator<Item = u8> + '_ {
     payload.chars().map(|c| c as u8)
 }
 
+/// The text a literal payload holds, decoded from its source bytes.
+///
+/// The inverse of [`literal_payload`], for the consumers that need Rust text
+/// rather than bytes: a header name to open, a symbol name, a message to
+/// print. Reading a payload as if it were already text instead produced
+/// mojibake -- `#include "café.h"` looked for `cafÃ©.h` and reported it
+/// missing. Lossy when the bytes are not valid UTF-8; where the bytes
+/// themselves matter, use [`payload_bytes`].
+pub fn payload_text(payload: &str) -> String {
+    let bytes: Vec<u8> = payload_bytes(payload).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Append a token's source spelling to `out`, byte for byte.
 ///
 /// Literals have to be written a byte at a time. Formatting a payload through

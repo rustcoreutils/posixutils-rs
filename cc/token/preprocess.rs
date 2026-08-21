@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::lexer::{
-    literal_payload, tokens_to_source_bytes, IdentTable, LexerMode, Position, SpecialToken, Token,
-    TokenType, TokenValue, Tokenizer,
+    literal_payload, payload_text, tokens_to_source_bytes, IdentTable, LexerMode, Position,
+    SpecialToken, Token, TokenType, TokenValue, Tokenizer,
 };
 use crate::arch;
 use crate::builtin_headers;
@@ -1439,8 +1439,7 @@ impl<'a> Preprocessor<'a> {
         if let Some(tok) = iter.peek() {
             if !tok.pos.newline && tok.typ == TokenType::String {
                 if let TokenValue::String(name) = &tok.value {
-                    let name = name.clone();
-                    target = diag::find_or_add_stream(&name);
+                    target = diag::find_or_add_stream(&payload_text(name));
                 }
                 iter.next();
             }
@@ -2282,7 +2281,7 @@ impl<'a> Preprocessor<'a> {
 
         // Check for "filename"
         if let TokenValue::String(s) = &tokens[0].value {
-            return (s.clone(), false);
+            return (payload_text(s), false);
         }
 
         // Fallback: try to reconstruct from tokens
@@ -2298,7 +2297,7 @@ impl<'a> Preprocessor<'a> {
         match &token.value {
             TokenValue::Ident(id) => idents.get_opt(*id).unwrap_or("").to_string(),
             TokenValue::Number(n) => n.clone(),
-            TokenValue::String(s) => s.clone(),
+            TokenValue::String(s) => payload_text(s),
             TokenValue::Special(code) => {
                 if *code < 256 {
                     (*code as u8 as char).to_string()

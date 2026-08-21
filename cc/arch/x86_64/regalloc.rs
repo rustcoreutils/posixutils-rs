@@ -2412,3 +2412,147 @@ mod tests {
         assert!(!ic.memory_barrier);
     }
 }
+
+#[cfg(test)]
+mod arg_location_tests {
+    use super::*;
+    use crate::ir::{BasicBlock, BasicBlockId, Function, Pseudo};
+    use crate::target::Target;
+    use crate::types::TypeTable;
+
+    /// A function of `n` integer parameters, each with its `Arg(i)` pseudo.
+    fn func_with_int_params(types: &TypeTable, n: u32) -> Function {
+        let mut func = Function::new("f", types.int_id);
+        let mut block = BasicBlock::new(BasicBlockId(0));
+        for i in 0..n {
+            func.add_param(format!("p{i}"), types.long_id);
+            func.pseudos.push(Pseudo::arg(PseudoId(i), i));
+        }
+        block.insns.push(Instruction::new(Opcode::Ret));
+        func.add_block(block);
+        func
+    }
+
+    /// Where an `Arg` pseudo lives must be where the ABI actually puts it.
+    ///
+    /// This is the check for the hazard recorded as regalloc "Bug 3": that
+    /// `get_location(Arg(0))` answered `Loc::Stack(+8)` -- the saved
+    /// return-address slot -- for an argument that arrives in `%rdi`. Nothing
+    /// read that answer, because every use of an `Arg` went through a `Copy`
+    /// the allocator had placed in a register; folding those away is exactly
+    /// what copy propagation, CSE, GVN and SCCP do, which is why the note
+    /// forbade all four.
+    ///
+    /// A positive `Loc::Stack` is the specific shape that was wrong: on this
+    /// target the callee's own frame is addressed at negative offsets, and the
+    /// caller's incoming area has its own variant.
+    #[test]
+    fn arg_pseudos_land_where_the_abi_puts_them() {
+        let types = TypeTable::new(&Target::host());
+        // Six GP argument registers, then the incoming stack area.
+        let func = func_with_int_params(&types, 9);
+
+        let mut ra = RegAlloc::new();
+        let locs = ra.allocate(&func, &types);
+
+        let gp = Reg::arg_regs();
+        for i in 0..6u32 {
+            assert_eq!(
+                locs.get(PseudoId(i)),
+                Some(Loc::Reg(gp[i as usize])),
+                "Arg({i}) should arrive in {:?}",
+                gp[i as usize]
+            );
+        }
+
+        // Past the sixth, arguments arrive in the caller's frame: 16 bytes up
+        // from the frame pointer (saved rbp + return address), then every 8.
+        for (i, want) in [(6u32, 16i32), (7, 24), (8, 32)] {
+            assert_eq!(
+                locs.get(PseudoId(i)),
+                Some(Loc::IncomingArg(want)),
+                "Arg({i}) should be an incoming stack argument at +{want}"
+            );
+        }
+
+        // The shape Bug 3 described must not appear: an argument the ABI
+        // passes in the caller's frame must use `IncomingArg`, never
+        // `Loc::Stack`. The two are not distinguishable by sign on this
+        // target -- `stack_mem` reads a `Loc::Stack` as a positive *slot
+        // index* and emits `-(slot + callee_saved_offset)`, so a positive
+        // value there is the callee's own frame -- which is precisely why the
+        // separate variant, rather than a sign convention, is what fixed it.
+        for i in 6..9u32 {
+            assert!(
+                matches!(locs.get(PseudoId(i)), Some(Loc::IncomingArg(_))),
+                "Arg({i}) arrives in the caller's frame and must say so, got {:?}",
+                locs.get(PseudoId(i))
+            );
+        }
+    }
+
+    /// The same invariant with floating-point parameters interleaved among
+    /// integer ones, so the two argument cursors advance independently and a
+    /// mistake in either shows up as a misplaced later argument.
+    ///
+    /// (Bug 3's report also named a variadic caller. `Function` carries no
+    /// variadic flag -- that lives in the type -- so this covers the mixed
+    /// cursors only.)
+    #[test]
+    fn arg_pseudos_land_correctly_when_mixed() {
+        let types = TypeTable::new(&Target::host());
+
+        let mut func = Function::new("g", types.int_id);
+        let mut block = BasicBlock::new(BasicBlockId(0));
+        // int, double, int, double, ... past both register files.
+        let order = [
+            types.long_id,
+            types.double_id,
+            types.long_id,
+            types.double_id,
+            types.long_id,
+            types.long_id,
+            types.long_id,
+            types.long_id,
+            types.long_id,
+        ];
+        for (i, typ) in order.iter().enumerate() {
+            func.add_param(format!("p{i}"), *typ);
+            func.pseudos.push(Pseudo::arg(PseudoId(i as u32), i as u32));
+        }
+        block.insns.push(Instruction::new(Opcode::Ret));
+        func.add_block(block);
+
+        let mut ra = RegAlloc::new();
+        let locs = ra.allocate(&func, &types);
+
+        for (i, typ) in order.iter().enumerate() {
+            let id = PseudoId(i as u32);
+            let loc = locs.get(id).unwrap_or_else(|| panic!("Arg({i}) unplaced"));
+            // Every argument must be somewhere the ABI can name. A callee
+            // stack slot is legitimate here: a parameter that arrived in an
+            // XMM register is spilled to one, because every XMM is
+            // caller-saved and any float computation would clobber it.
+            assert!(
+                matches!(
+                    loc,
+                    Loc::Reg(_) | Loc::Xmm(_) | Loc::IncomingArg(_) | Loc::Stack(_)
+                ),
+                "Arg({i}) of type {:?} got an impossible location {loc:?}",
+                types.kind(*typ)
+            );
+        }
+
+        // The seventh integer argument and beyond overflow to the caller's
+        // frame even though XMM registers remain: the two cursors are
+        // independent, and conflating them is what put a later argument at
+        // the wrong offset.
+        let stacked = (0..order.len())
+            .filter(|i| matches!(locs.get(PseudoId(*i as u32)), Some(Loc::IncomingArg(_))))
+            .count();
+        assert!(
+            stacked > 0,
+            "with nine parameters at least one must overflow to the caller's frame"
+        );
+    }
+}

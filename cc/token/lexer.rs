@@ -1238,15 +1238,28 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 break;
             }
 
-            if let Some(token) = self.get_one_token(c as u8) {
-                tokens.push(token);
-                // Reset flags for next token (only after we've captured position)
-                // Don't reset if comment was skipped - the comment may have consumed
-                // newlines that affect the next token's position flags
-                self.newline = false;
-                self.whitespace = false;
+            // The flags belong to the token about to be lexed, so hand them
+            // over and clear them here rather than afterwards. Lexing can set
+            // `newline` again -- an unterminated literal ends at the newline it
+            // ran into -- and that newline belongs to the *next* token, which
+            // does start a line. Clearing afterwards swallowed it, so a `#` on
+            // the following line stopped introducing a directive and one
+            // diagnostic became a cascade.
+            let newline = std::mem::take(&mut self.newline);
+            let whitespace = std::mem::take(&mut self.whitespace);
+
+            match self.get_one_token(c as u8) {
+                Some(mut token) => {
+                    token.pos.newline = newline;
+                    token.pos.whitespace = whitespace;
+                    tokens.push(token);
+                }
+                // A comment produced no token. It is transparent to
+                // start-of-line status, so give back what it inherited; a `//`
+                // comment additionally ran through the newline that starts the
+                // next line, and that one stands.
+                None => self.newline |= newline,
             }
-            // If get_one_token returns None (comment), continue without resetting flags
         }
 
         // Add stream end token
@@ -2198,6 +2211,20 @@ mod tests {
         // The long form spans more digits, so it spans more splices.
         let (tokens, idents) = tokenize_str("a\\U000\\\n000\\\ne9b");
         assert_eq!(show_token(&tokens[1], &idents), "a\u{e9}b");
+    }
+
+    /// An unterminated literal ends at the newline it ran into, so the token
+    /// after it starts a line -- GCC recovers the same way and goes on to
+    /// process a directive there. Clearing the flag after lexing every token
+    /// swallowed that newline.
+    #[test]
+    fn test_unterminated_literal_yields_the_newline_it_ate() {
+        let (tokens, idents) = tokenize_str("char *s = \"abc\n#define ZZZ 9\n");
+        let hash = tokens
+            .iter()
+            .position(|t| show_token(t, &idents) == "#")
+            .expect("the `#` must survive as its own token");
+        assert!(tokens[hash].pos.newline);
     }
 
     #[test]

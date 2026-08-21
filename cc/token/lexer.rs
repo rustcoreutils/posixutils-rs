@@ -293,6 +293,153 @@ pub(crate) fn report_forbidden_ucn(pos: Position, val: u32) {
     );
 }
 
+// ============================================================================
+// Identifier characters (C17 Annex D)
+// ============================================================================
+
+/// Annex D.1: the characters an identifier may contain beyond the basic
+/// source character set.
+///
+/// Transcribed from GCC's `libcpp/ucnid.tab` (`[C11]` + `[C11NOSTART]`),
+/// which states that it reproduces the table in ISO/IEC 9899 Annex D, itself
+/// a reproduction of ISO/IEC TR 10176. Clang's independent transcription in
+/// `clang/lib/Lex/UnicodeCharSets.h` agrees with it on every code point, and
+/// so does this one.
+///
+/// Deliberately *not* Unicode's XID_Start/XID_Continue, which C23 moved to
+/// and which differs here in over ten thousand code points.
+static IDENT_ALLOWED: &[(u32, u32)] = &[
+    (0x00A8, 0x00A8),
+    (0x00AA, 0x00AA),
+    (0x00AD, 0x00AD),
+    (0x00AF, 0x00AF),
+    (0x00B2, 0x00B5),
+    (0x00B7, 0x00BA),
+    (0x00BC, 0x00BE),
+    (0x00C0, 0x00D6),
+    (0x00D8, 0x00F6),
+    (0x00F8, 0x167F),
+    (0x1681, 0x180D),
+    (0x180F, 0x1FFF),
+    (0x200B, 0x200D),
+    (0x202A, 0x202E),
+    (0x203F, 0x2040),
+    (0x2054, 0x2054),
+    (0x2060, 0x218F),
+    (0x2460, 0x24FF),
+    (0x2776, 0x2793),
+    (0x2C00, 0x2DFF),
+    (0x2E80, 0x2FFF),
+    (0x3004, 0x3007),
+    (0x3021, 0x302F),
+    (0x3031, 0xD7FF),
+    (0xF900, 0xFD3D),
+    (0xFD40, 0xFDCF),
+    (0xFDF0, 0xFE44),
+    (0xFE47, 0xFFFD),
+    (0x10000, 0x1FFFD),
+    (0x20000, 0x2FFFD),
+    (0x30000, 0x3FFFD),
+    (0x40000, 0x4FFFD),
+    (0x50000, 0x5FFFD),
+    (0x60000, 0x6FFFD),
+    (0x70000, 0x7FFFD),
+    (0x80000, 0x8FFFD),
+    (0x90000, 0x9FFFD),
+    (0xA0000, 0xAFFFD),
+    (0xB0000, 0xBFFFD),
+    (0xC0000, 0xCFFFD),
+    (0xD0000, 0xDFFFD),
+    (0xE0000, 0xEFFFD),
+];
+
+/// Annex D.2: of the characters above, those that may not appear first.
+///
+/// All combining marks -- an identifier beginning with one would render as
+/// though it modified whatever preceded it. GCC's `[C11NOSTART]` and Clang's
+/// `C11DisallowedInitialIDCharRanges` are both exactly these four ranges.
+static IDENT_NOT_INITIAL: &[(u32, u32)] = &[
+    (0x0300, 0x036F),
+    (0x1DC0, 0x1DFF),
+    (0x20D0, 0x20FF),
+    (0xFE20, 0xFE2F),
+];
+
+fn in_ranges(ranges: &[(u32, u32)], val: u32) -> bool {
+    ranges
+        .binary_search_by(|&(lo, hi)| {
+            if val < lo {
+                std::cmp::Ordering::Greater
+            } else if val > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// Where in an identifier a character is being used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentPos {
+    /// The first character, which C17 Annex D.2 restricts further.
+    Initial,
+    /// Any later character.
+    Continue,
+}
+
+/// Whether `ch` may appear in an identifier at `pos` (C17 Annex D).
+///
+/// Distinct from [`ucn_is_forbidden`], which is 6.4.3p2's rule about what a
+/// universal character name may *name* -- a question that applies to string
+/// literals too, and that admits characters no identifier may contain.
+/// A UCN in an identifier has to satisfy both; a character written directly
+/// satisfies only this one. Conflating them let `int \u00A0x;` through, which
+/// gcc rejects, and let a combining mark start an identifier.
+pub(crate) fn identifier_char(ch: char, pos: IdentPos) -> bool {
+    let val = ch as u32;
+    // The basic source character set, which the byte-level table already
+    // answers for; spelled here so one predicate covers every caller.
+    if val < 0x80 {
+        return is_letter_or_digit(val as u8)
+            && (pos == IdentPos::Continue || !is_digit(val as u8));
+    }
+    if !in_ranges(IDENT_ALLOWED, val) {
+        return false;
+    }
+    pos == IdentPos::Continue || !in_ranges(IDENT_NOT_INITIAL, val)
+}
+
+/// The length in bytes of the UTF-8 character `lead` begins, or `None` if
+/// `lead` is ASCII, a continuation byte, or an over-long form's lead.
+fn utf8_len(lead: u8) -> Option<usize> {
+    match lead {
+        0xC2..=0xDF => Some(2),
+        0xE0..=0xEF => Some(3),
+        0xF0..=0xF4 => Some(4),
+        _ => None,
+    }
+}
+
+/// Decode the UTF-8 character that `lead` begins, taking its continuation
+/// bytes from `peek`. Returns the character and its total length in bytes.
+///
+/// `std::str::from_utf8` does the validation, so over-long forms and
+/// surrogates are rejected by construction rather than by hand.
+fn decode_utf8(lead: u8, peek: &mut Peek<'_>) -> Option<(char, usize)> {
+    let len = utf8_len(lead)?;
+    let mut buf = [lead, 0, 0, 0];
+    for byte in buf.iter_mut().take(len).skip(1) {
+        let c = peek.next()?;
+        if c & 0xC0 != 0x80 {
+            return None;
+        }
+        *byte = c;
+    }
+    let ch = std::str::from_utf8(&buf[..len]).ok()?.chars().next()?;
+    Some((ch, len))
+}
+
 pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
     (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60) || (0xD800..=0xDFFF).contains(&val)
 }
@@ -857,6 +1004,18 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Token::with_value(TokenType::Number, pos, TokenValue::Number(num))
     }
 
+    /// The UTF-8 character at the current position and how many `nextchar()`
+    /// calls consume it, or `None` if the bytes there do not form one.
+    ///
+    /// Splice-aware, like every other lookahead here: phase 2 runs before
+    /// phase 3, so a backslash-newline between two bytes of a character is
+    /// deleted and the bytes join.
+    fn peek_utf8(&self) -> Option<(char, usize)> {
+        let mut peek = self.peek_at(self.offset);
+        let lead = peek.next()?;
+        decode_utf8(lead, &mut peek)
+    }
+
     /// The character a UCN at the current position denotes, and how many
     /// `nextchar()` calls consume it.
     ///
@@ -875,6 +1034,11 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
     /// Shared tail of both UCN entry points, with `peek` positioned just past
     /// the backslash. Returns the character and how many hex digits spelled it.
+    ///
+    /// Only 6.4.3p2 is checked here -- whether the UCN may name the character
+    /// at all. Whether an *identifier* may contain it is Annex D's question,
+    /// which the callers ask, because they are the ones that know the
+    /// position.
     fn peek_ucn_after_backslash(&self, peek: &mut Peek<'_>) -> Option<(char, usize)> {
         let digits = match peek.next()? {
             b'u' => 4,
@@ -899,10 +1063,14 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Some((char::from_u32(val)?, digits))
     }
 
-    /// Try to consume a UCN sequence. If successful, returns the decoded character.
-    /// Otherwise returns None and leaves position unchanged.
-    fn try_consume_ucn(&mut self) -> Option<char> {
+    /// Try to consume a UCN sequence naming a character an identifier may
+    /// contain at `pos`. If successful, returns the decoded character;
+    /// otherwise returns None and leaves the position unchanged.
+    fn try_consume_ucn(&mut self, pos: IdentPos) -> Option<char> {
         let (ch, chars) = self.peek_ucn()?;
+        if !identifier_char(ch, pos) {
+            return None;
+        }
         self.consume_chars(chars);
         Some(ch)
     }
@@ -913,6 +1081,9 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     fn try_consume_ucn_after_backslash(&mut self) -> Option<char> {
         let mut peek = self.peek_at(self.offset);
         let (ch, digits) = self.peek_ucn_after_backslash(&mut peek)?;
+        if !identifier_char(ch, IdentPos::Initial) {
+            return None;
+        }
         self.consume_chars(1 + digits);
         Some(ch)
     }
@@ -944,12 +1115,28 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
             // Check for UCN escape sequence (\uXXXX or \UXXXXXXXX) - C99 6.4.3
             if cu == b'\\' {
-                match self.try_consume_ucn() {
+                match self.try_consume_ucn(IdentPos::Continue) {
                     Some(uc) => name.push(uc),
                     // Not a valid UCN, end identifier
                     None => return Some(cu),
                 }
                 continue;
+            }
+
+            // A character written directly rather than as a UCN (C23, and a
+            // GCC extension long before it). Annex D admits the same set
+            // either way.
+            if cu >= 0x80 {
+                match self.peek_utf8() {
+                    Some((ch, len)) if identifier_char(ch, IdentPos::Continue) => {
+                        self.consume_chars(len);
+                        name.push(ch);
+                        continue;
+                    }
+                    // Not a character, or not one an identifier may contain:
+                    // the identifier ends here and the bytes lex as before.
+                    _ => return Some(cu),
+                }
             }
 
             if !is_letter_or_digit(cu) {
@@ -1332,6 +1519,19 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         if c == b'\\' {
             if let Some(uc) = self.try_consume_ucn_after_backslash() {
                 return Some(self.get_identifier_from_ucn(uc));
+            }
+        }
+
+        // An extended character written directly, starting an identifier.
+        // The lead byte is already consumed, so only the continuation bytes
+        // remain to be taken.
+        if c >= 0x80 {
+            let mut peek = self.peek_at(self.offset);
+            if let Some((ch, len)) = decode_utf8(c, &mut peek) {
+                if identifier_char(ch, IdentPos::Initial) {
+                    self.consume_chars(len - 1);
+                    return Some(self.get_identifier_from_ucn(ch));
+                }
             }
         }
 
@@ -2543,6 +2743,128 @@ mod tests {
         // tokens_to_source_bytes keeps the spacing and the bytes alike.
         let out = tokens_to_source_bytes(&tokens, &idents);
         assert_eq!(out, b".globl caf\xc3\xa9\n");
+    }
+
+    /// C17 Annex D says which characters an identifier may contain, and D.2
+    /// which of those may not come first. Checked exhaustively against
+    /// `gcc -std=c17` when the table was built; these are the boundaries that
+    /// prove the table is the right one and not merely a plausible one.
+    #[test]
+    fn test_identifier_char_annex_d() {
+        use IdentPos::{Continue, Initial};
+
+        // D.1 admits these; the code points on either side of each range are
+        // what distinguish Annex D from Unicode's XID, which admits far more.
+        for ch in [
+            '\u{a8}',
+            '\u{aa}',
+            '\u{b5}',
+            '\u{b7}',
+            '\u{c0}',
+            '\u{d6}',
+            '\u{e9}',
+            '\u{ff}',
+            '\u{100}',
+            '\u{3b1}',
+            '\u{430}',
+            '\u{4e2d}',
+            '\u{1f600}',
+        ] {
+            assert!(identifier_char(ch, Initial), "{ch:?} (U+{:04X})", ch as u32);
+            assert!(
+                identifier_char(ch, Continue),
+                "{ch:?} (U+{:04X})",
+                ch as u32
+            );
+        }
+
+        // Not in D.1 at all, though every one is a perfectly good character
+        // and `ucn_is_forbidden` permits it.
+        for ch in [
+            '\u{a0}', '\u{a1}', '\u{d7}', '\u{f7}', '\u{e000}', '\u{fffe}',
+        ] {
+            assert!(!identifier_char(ch, Initial), "U+{:04X}", ch as u32);
+            assert!(!identifier_char(ch, Continue), "U+{:04X}", ch as u32);
+            assert!(
+                !ucn_is_forbidden(ch as u32),
+                "U+{:04X}: the two rules are different questions",
+                ch as u32
+            );
+        }
+
+        // U+FD3E/U+FD3F are ornate parentheses, which Annex D excludes between
+        // the F900-FD3D and FD40-FDCF ranges. GCC's *binary* accepts them
+        // anyway, though its own ucnid.tab does not list them and Clang's
+        // table does not either; the two ranges either side are accepted by
+        // everyone. Following the table is the deliberate choice here.
+        assert!(identifier_char('\u{fd3d}', Continue));
+        assert!(identifier_char('\u{fd40}', Continue));
+        assert!(
+            !identifier_char('\u{fd3e}', Continue),
+            "Annex D excludes it"
+        );
+        assert!(
+            !identifier_char('\u{fd3f}', Continue),
+            "Annex D excludes it"
+        );
+
+        // D.2: a combining mark continues an identifier but cannot start one.
+        for ch in ['\u{300}', '\u{36f}', '\u{1dc0}', '\u{20d0}', '\u{fe20}'] {
+            assert!(!identifier_char(ch, Initial), "U+{:04X}", ch as u32);
+            assert!(identifier_char(ch, Continue), "U+{:04X}", ch as u32);
+        }
+
+        // The basic source character set answers through the same predicate.
+        for ch in ['a', 'Z', '_'] {
+            assert!(identifier_char(ch, Initial));
+            assert!(identifier_char(ch, Continue));
+        }
+        assert!(!identifier_char('0', Initial), "a digit cannot start one");
+        assert!(identifier_char('0', Continue));
+        for ch in ['$', '@', '`', '+', ' '] {
+            assert!(!identifier_char(ch, Initial), "{ch:?}");
+            assert!(!identifier_char(ch, Continue), "{ch:?}");
+        }
+    }
+
+    /// An extended character written directly is the same identifier as the
+    /// same character written as a UCN, and both stop at a character Annex D
+    /// does not admit rather than swallowing it.
+    #[test]
+    fn test_raw_extended_identifier() {
+        let (tokens, idents) = tokenize_str("caf\u{e9}z");
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "caf\u{e9}z");
+        assert_eq!(tokens[2].typ, TokenType::StreamEnd);
+
+        // Same identifier through either spelling.
+        let (raw, raw_idents) = tokenize_str("\u{4e2d}\u{6587}");
+        let (ucn, ucn_idents) = tokenize_str("\\u4e2d\\u6587");
+        assert_eq!(
+            show_token(&raw[1], &raw_idents),
+            show_token(&ucn[1], &ucn_idents)
+        );
+
+        // A combining mark may continue but not start.
+        let (tokens, idents) = tokenize_str("a\u{300}");
+        assert_eq!(show_token(&tokens[1], &idents), "a\u{300}");
+        let (tokens, _) = tokenize_str("\u{300}a");
+        assert_ne!(tokens[1].typ, TokenType::Ident);
+
+        // A character outside Annex D ends the identifier and lexes as it did
+        // before -- as its own bytes, which `write_token` puts back verbatim.
+        let (tokens, idents) = tokenize_str("a\u{d7}b");
+        assert_eq!(show_token(&tokens[1], &idents), "a");
+        let mut out = Vec::new();
+        for t in &tokens[1..tokens.len() - 1] {
+            write_token(&mut out, t, &idents);
+        }
+        assert_eq!(out, "a\u{d7}b".as_bytes());
+
+        // A UCN naming a character no identifier may contain is not one
+        // either, though 6.4.3p2 permits the escape itself.
+        let (tokens, idents) = tokenize_str("a\\u00d7b");
+        assert_eq!(show_token(&tokens[1], &idents), "a");
     }
 
     /// A literal payload holds one `char` per source byte, so its spelling has

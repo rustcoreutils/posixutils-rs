@@ -1255,8 +1255,17 @@ fn cxref_preprocessed_operand_names_the_original_file() {
 
     // No `-s`: that flag suppresses the filename column, which is the very
     // thing under test here.
-    let (from_c, _, _) = run("cxref", &[&c]);
-    let (from_i, e, code) = run("cxref", &[i.to_str().unwrap()]);
+    //
+    // `-w` is not decoration. The file column is truncated to fit the output
+    // width, which defaults to 80, and a temp path is long enough to lose the
+    // basename: on macOS `TempDir` lives under
+    // `/var/folders/<hash>/T/`, so the column came back as `.../T/.tmpRDDKxI/o`
+    // and the assertion below failed on CI while passing on Linux, where the
+    // path is `/tmp/...`. The truncation is correct behaviour; the test was
+    // simply reading a column it had not left room for.
+    let wide = ["-w", "200"];
+    let (from_c, _, _) = run("cxref", &[wide[0], wide[1], &c]);
+    let (from_i, e, code) = run("cxref", &[wide[0], wide[1], i.to_str().unwrap()]);
     assert_eq!(code, 0, "{}", e);
 
     let row_i = cxref_rows(&from_i, "counter").join(" ");

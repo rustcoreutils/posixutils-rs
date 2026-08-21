@@ -1441,3 +1441,55 @@ fn preprocessor_multiline_argument_does_not_begin_a_line() {
     assert!(r.success, "-E failed: {}", r.stderr);
     assert_has(&r.stdout, "int v = xy_z;", "pasted across a line break");
 }
+
+/// Recursion is stopped by the hide set carried on the expansion's tokens, so
+/// each of these has to terminate on that alone. They are here rather than in
+/// the unit tests because a failure is a hang, and the integration harness
+/// runs `c17` as a subprocess where a hang is visible as one.
+#[test]
+fn preprocessor_recursive_macros_terminate() {
+    for (name, src, want) in [
+        // The classic: the macro's own name in its own body.
+        ("self", "#define f(x) f(x)\nf(1)\n", "f(1)"),
+        // Indirect, through a second name.
+        ("mutual_object", "#define a b\n#define b a\na\n", "a"),
+        // Indirect, function-like, so the hide set has to survive argument
+        // collection as well as substitution.
+        (
+            "mutual_function",
+            "#define F(x) G(x)\n#define G(x) F(x)\nF(1)\n",
+            "F(1)",
+        ),
+        // The argument is the macro, and the body calls whatever it is given.
+        // If argument-derived tokens were exempt from hiding, each round would
+        // produce another unhidden `f`.
+        ("arg_is_the_macro", "#define f(x) x(x)\nf(f)\n", "f(f)"),
+        // A macro name built by `##`. The pasted token is new and so is
+        // eligible for expansion, but it must still inherit the hiding of the
+        // expansion it was built in, or this never settles.
+        (
+            "pasted_name",
+            "#define CAT(a,b) a##b\n#define X CAT(A,B)\n#define AB X\nX\n",
+            "X",
+        ),
+        // expat's portability shim, and the case that proves a token has to
+        // carry the *whole* hide set rather than only names matching its own
+        // spelling: the chain runs `__inline` -> `inline` -> `__inline`, and
+        // neither name matches the other.
+        (
+            "chain_through_another_name",
+            "#define __inline inline\n#define inline __inline\n__inline int f(void);\n",
+            "inline int f(void);",
+        ),
+        // glibc's enum-and-macro idiom, where the body is the name itself.
+        (
+            "body_is_the_name",
+            "#define MSG_DONTROUTE MSG_DONTROUTE\nint x = MSG_DONTROUTE;\n",
+            "int x = MSG_DONTROUTE;",
+        ),
+    ] {
+        let r = preprocess_text(&format!("recursive_{}", name), src, &[]);
+        assert!(r.success, "{}: -E failed: {}", name, r.stderr);
+        assert_has(&r.stdout, want, name);
+    }
+}

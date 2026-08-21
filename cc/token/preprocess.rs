@@ -1200,7 +1200,7 @@ impl<'a> Preprocessor<'a> {
                             }
 
                             if let Some(expanded) =
-                                self.try_expand_macro(&name, &token.pos, &mut cursor, idents)
+                                self.try_expand_macro(&name, &token, &mut cursor, idents)
                             {
                                 output.extend(expanded);
 
@@ -1262,6 +1262,7 @@ impl<'a> Preprocessor<'a> {
                                         &mac,
                                         &args,
                                         &last_token.pos,
+                                        last_token.no_expand.as_ref(),
                                         idents,
                                     ) {
                                         output.extend(more_expanded);

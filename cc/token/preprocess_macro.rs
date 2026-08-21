@@ -38,6 +38,52 @@ fn clear_newline(mut token: Token) -> Token {
     token
 }
 
+/// Hide, on every token an expansion produced, each name the invocation was
+/// already hiding plus the macro's own (C17 6.10.3.4p2).
+///
+/// Two things about this are load-bearing.
+///
+/// It is applied to the *final* list, after pasting. `paste_tokens` re-lexes
+/// its operands and returns fresh tokens with no hide set at all, which is
+/// right -- a pasted token is a new token and is eligible for expansion -- but
+/// it means a macro name that `##` synthesises would otherwise escape with
+/// nothing hiding it. `#define X A##B` with `#define AB X` then never
+/// terminates.
+///
+/// Argument-derived tokens are included, never exempt. `#define f(x) x(x)`
+/// with `f(f)` substitutes `f` into a body that immediately calls it; if the
+/// substituted `f` kept only its own hide set, each round would produce
+/// another unhidden `f` and the expansion would not terminate either.
+///
+/// The whole set rides on each identifier token, not just names matching that
+/// token's own spelling. Recording only self-names looks equivalent -- a hide
+/// set is read in exactly one place, when that token is the identifier about
+/// to be expanded -- but it breaks the moment a chain runs through a *different*
+/// name. `#define __inline inline` with `#define inline __inline`, which is
+/// expat's portability shim, expands `__inline` to an `inline` that hides
+/// nothing, which expands back to an unhidden `__inline`, forever. The set has
+/// to reach the token that will carry it into the next expansion.
+///
+/// Non-identifier tokens get nothing: they can never be the invoker of an
+/// expansion, so a set on them could not be read.
+fn hide_in_expansion(
+    tokens: &mut [Token],
+    macro_name: &str,
+    invoker_hide: Option<&std::collections::HashSet<String>>,
+) {
+    for tok in tokens.iter_mut() {
+        if !matches!(tok.value, TokenValue::Ident(_)) {
+            continue;
+        }
+        if let Some(hide) = invoker_hide {
+            for name in hide {
+                tok.mark_no_expand(name);
+            }
+        }
+        tok.mark_no_expand(macro_name);
+    }
+}
+
 impl<'a> Preprocessor<'a> {
     /// Resolve one `defined` operator: `defined X` or `defined ( X )`.
     ///
@@ -486,12 +532,27 @@ impl<'a> Preprocessor<'a> {
     pub(super) fn try_expand_macro(
         &mut self,
         name: &str,
-        pos: &Position,
+        invoker: &Token,
         iter: &mut TokenCursor,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
-        // Check for recursion
+        let pos = &invoker.pos;
+        let invoker_hide = invoker.no_expand.as_ref();
+        // Recursion is prevented twice over while the hide set proves itself.
+        //
+        // `expanding` is the old guard: a set scoped to the rescan call, which
+        // only works because the rescan *is* a call. The hide set carried on
+        // the tokens themselves does not depend on that, which is what lets
+        // the rescan become a splice. Until the splice lands, keep both and
+        // assert they agree -- anything `expanding` catches that the hide set
+        // does not is a hole in the hide set, and a hang once `expanding` goes.
         if self.expanding.contains(name) {
+            debug_assert!(
+                invoker.is_no_expand(name),
+                "`{}` was stopped only by the `expanding` set; the hide set \
+                 missed it, and will not stop it once the rescan is a splice",
+                name
+            );
             return None;
         }
 
@@ -510,7 +571,7 @@ impl<'a> Preprocessor<'a> {
                     if *code == b'(' as u32 {
                         iter.next(); // consume '('
                         let args = self.collect_macro_args(iter, idents, pos, name);
-                        return self.expand_function_macro(&mac, &args, pos, idents);
+                        return self.expand_function_macro(&mac, &args, pos, invoker_hide, idents);
                     }
                 }
             }
@@ -519,7 +580,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Object-like macro
-        self.expand_object_macro(&mac, pos, idents)
+        self.expand_object_macro(&mac, pos, invoker_hide, idents)
     }
 
     /// Collect arguments for a function-like macro call
@@ -636,6 +697,7 @@ impl<'a> Preprocessor<'a> {
         mac: &Macro,
         args: &[Vec<Token>],
         pos: &Position,
+        invoker_hide: Option<&std::collections::HashSet<String>>,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
         self.check_macro_arity(mac, args, pos);
@@ -806,6 +868,21 @@ impl<'a> Preprocessor<'a> {
         // Rescan for more macro expansion
         // NOTE: Only add to expanding set during rescan to prevent infinite recursion
         // Arguments were already expanded above, so this only affects the replacement list rescan
+        // Hide before the rescan, not after.
+        //
+        // The rescan is where a self-referential macro would recurse, so a
+        // hide set applied afterwards is applied too late to be what stops it
+        // -- `expanding` was. glibc's enum-and-macro idiom, `#define
+        // MSG_DONTROUTE MSG_DONTROUTE`, reaches the rescan with the inner name
+        // still unhidden, and there are five such headers in the test corpus
+        // alone. Hiding first also propagates: a nested expansion inside the
+        // rescan sees an invoking token that already carries this set.
+        //
+        // Substitution and pasting are both finished by now, which is the
+        // other half of the requirement -- a name that `##` built has to be
+        // hidden too.
+        hide_in_expansion(&mut result, &mac.name, invoker_hide);
+
         self.expanding.insert(mac.name.clone());
         let rescanned = self.preprocess(result, idents);
         self.expanding.remove(&mac.name);
@@ -814,18 +891,6 @@ impl<'a> Preprocessor<'a> {
             .into_iter()
             .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
             .collect();
-
-        // Mark any occurrences of this macro's name in the result as "blue painted"
-        // per C99 6.10.3.4: if the macro name appears in its own expansion, it should
-        // not be re-expanded in subsequent contexts.
-        let mac_name_id = idents.intern(&mac.name);
-        for tok in &mut filtered {
-            if let TokenValue::Ident(id) = &tok.value {
-                if *id == mac_name_id {
-                    tok.mark_no_expand(&mac.name);
-                }
-            }
-        }
 
         // The FIRST token of a macro expansion stands where the invocation
         // stood: it inherits both the spacing before it and whether it begins
@@ -892,6 +957,7 @@ impl<'a> Preprocessor<'a> {
         &mut self,
         mac: &Macro,
         pos: &Position,
+        invoker_hide: Option<&std::collections::HashSet<String>>,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
         if mac.body.is_empty() {
@@ -935,6 +1001,21 @@ impl<'a> Preprocessor<'a> {
         // Rescan for more macro expansion
         // NOTE: Only add to expanding set during rescan to prevent infinite recursion
         // (e.g., when const -> __const and __const -> const both exist)
+        // Hide before the rescan, not after.
+        //
+        // The rescan is where a self-referential macro would recurse, so a
+        // hide set applied afterwards is applied too late to be what stops it
+        // -- `expanding` was. glibc's enum-and-macro idiom, `#define
+        // MSG_DONTROUTE MSG_DONTROUTE`, reaches the rescan with the inner name
+        // still unhidden, and there are five such headers in the test corpus
+        // alone. Hiding first also propagates: a nested expansion inside the
+        // rescan sees an invoking token that already carries this set.
+        //
+        // Substitution and pasting are both finished by now, which is the
+        // other half of the requirement -- a name that `##` built has to be
+        // hidden too.
+        hide_in_expansion(&mut result, &mac.name, invoker_hide);
+
         self.expanding.insert(mac.name.clone());
         let rescanned = self.preprocess(result, idents);
         self.expanding.remove(&mac.name);
@@ -943,18 +1024,6 @@ impl<'a> Preprocessor<'a> {
             .into_iter()
             .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
             .collect();
-
-        // Mark any occurrences of this macro's name in the result as "blue painted"
-        // per C99 6.10.3.4: if the macro name appears in its own expansion, it should
-        // not be re-expanded in subsequent contexts.
-        let mac_name_id = idents.intern(&mac.name);
-        for tok in &mut filtered {
-            if let TokenValue::Ident(id) = &tok.value {
-                if *id == mac_name_id {
-                    tok.mark_no_expand(&mac.name);
-                }
-            }
-        }
 
         // The FIRST token of a macro expansion stands where the invocation
         // stood: it inherits both the spacing before it and whether it begins

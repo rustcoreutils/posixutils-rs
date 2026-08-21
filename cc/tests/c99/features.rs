@@ -794,3 +794,66 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("c99_extreme_float_literals", code, &[]), 0);
 }
+
+/// A VLA's local slot holds a *pointer* to the storage, not the storage, so
+/// `&a` has to yield the pointer's value -- the same address the array decays
+/// to (C99 6.5.3.2p3, and 6.3.2.1p3 for the decay). c17 took the slot's
+/// address instead, so `&a` differed from `a` for every VLA and
+/// `int (*p)[n] = &a` pointed at the pointer.
+#[test]
+fn c99_address_of_a_vla_is_the_array_address() {
+    let code = r#"
+int main(void) {
+    int n = 4, m = 5;
+
+    /* One dimension. */
+    int b[n];
+    for (int i = 0; i < n; i++) b[i] = i + 100;
+    if ((void *)&b != (void *)b) return 1;
+    if ((void *)&b[0] != (void *)b) return 2;
+    int (*pb)[n] = &b;
+    if ((*pb)[2] != 102) return 3;
+
+    /* Two dimensions. */
+    int a[n][m];
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < m; j++) a[i][j] = i * m + j;
+    if ((void *)&a != (void *)a) return 4;
+    if ((void *)&a[0] != (void *)a) return 5;
+    int (*pa)[n][m] = &a;
+    if ((void *)pa != (void *)a) return 6;
+    if (pa[0][3][4] != 19) return 7;
+
+    /* Through a variably modified typedef (6.7.7). */
+    typedef int T[n][m];
+    T *pt = &a;
+    if ((void *)pt != (void *)a) return 8;
+    if (pt[0][1][0] != 5) return 9;
+
+    /* The row type still decays the ordinary way. */
+    int (*q)[m] = a;
+    if (q[3][4] != 19) return 10;
+
+    /* A VLA in an inner scope, so the slot is reused. */
+    {
+        int c[n];
+        for (int i = 0; i < n; i++) c[i] = i * 7;
+        if ((void *)&c != (void *)c) return 11;
+        int (*pc)[n] = &c;
+        if ((*pc)[3] != 21) return 12;
+    }
+
+    /* And a VLA whose extent is itself an expression. */
+    int d[n * 2 + 1];
+    for (int i = 0; i < n * 2 + 1; i++) d[i] = i;
+    if ((void *)&d != (void *)d) return 13;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_address_of_a_vla", code, &[]),
+        0,
+        "&vla must be the array's address"
+    );
+}

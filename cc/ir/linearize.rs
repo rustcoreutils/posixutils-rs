@@ -70,9 +70,26 @@ pub(crate) struct LocalVarInfo {
     /// sizeof(vla_elem_type)` -- a variably-modified type reports a
     /// compile-time size of 0, so without this every such stride would be 0.
     pub(crate) vm_row_dims: Vec<VmDim>,
-    /// True if this local holds a pointer to the actual data (e.g., va_list parameters).
-    /// When true, linearize_lvalue loads the pointer instead of taking the address.
-    pub(crate) is_indirect: bool,
+    /// Where the object lives relative to this local's stack slot.
+    pub(crate) storage: Storage,
+}
+
+/// Where a local's object lives relative to its stack slot.
+#[derive(Clone, Copy)]
+pub(crate) enum Storage {
+    /// The slot *is* the object, so `&x` is the slot's address.
+    InSlot,
+    /// The slot holds a *pointer* to the object, which lives elsewhere: a
+    /// VLA's `alloca`d storage, or the caller's `va_list`. `&x` is that
+    /// pointer's value and has to be loaded; taking the slot's address
+    /// yields a pointer to the pointer, which is what made `&vla` differ
+    /// from the same array decayed.
+    ///
+    /// The [`TypeId`] is the type of the pointer *in the slot*. The two
+    /// producers spell [`LocalVarInfo::typ`] differently -- a `va_list`
+    /// parameter records the pointee there, a VLA records the pointer --
+    /// so deriving it from `typ` cannot be right for both.
+    Indirect(TypeId),
 }
 
 pub(crate) struct ResolvedDesignator {
@@ -1047,7 +1064,10 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vm_row_dims: vec![],
-                        is_indirect: true, // va_list param: local holds a pointer
+                        // va_list param: the slot holds a pointer to the
+                        // caller's va_list, array decay having happened at
+                        // the call site.
+                        storage: Storage::Indirect(ptr_type),
                     },
                 );
             }
@@ -1147,7 +1167,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vm_row_dims: vec![],
-                        is_indirect: false,
+                        storage: Storage::InSlot,
                     },
                 );
             }
@@ -1190,7 +1210,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vm_row_dims: vec![],
-                        is_indirect: false,
+                        storage: Storage::InSlot,
                     },
                 );
             }
@@ -1225,7 +1245,7 @@ impl<'a> Linearizer<'a> {
                         vla_size_sym: None,
                         vla_elem_type: None,
                         vm_row_dims: vec![],
-                        is_indirect: false,
+                        storage: Storage::InSlot,
                     },
                 );
             }
@@ -1746,12 +1766,13 @@ impl<'a> Linearizer<'a> {
                             unreachable!("static local sentinel without static_locals entry");
                         }
                     }
-                    // Check if this local holds a pointer to the actual data
-                    // (e.g., va_list parameters due to array-to-pointer decay at call site).
-                    // If so, load the pointer instead of taking the address.
-                    if local.is_indirect {
-                        // The local stores a pointer; load and return it
-                        let ptr_type = self.types.pointer_to(local.typ);
+                    // When the slot holds a pointer to the object -- a VLA's
+                    // `alloca`d storage, or a `va_list` parameter -- the
+                    // object's address is that pointer's value, not the
+                    // slot's. Taking the slot's address made `&a` differ from
+                    // `a` for every VLA, so `int (*p)[n] = &a` pointed at the
+                    // pointer and read back garbage.
+                    if let Storage::Indirect(ptr_type) = local.storage {
                         let result = self.alloc_pseudo();
                         let size = self.types.size_bits(ptr_type);
                         self.emit(Instruction::load(result, local.sym, 0, ptr_type, size));
@@ -1818,7 +1839,7 @@ impl<'a> Linearizer<'a> {
                             vla_size_sym: None,
                             vla_elem_type: None,
                             vm_row_dims: vec![],
-                            is_indirect: false,
+                            storage: Storage::InSlot,
                         },
                     );
 
@@ -3803,10 +3824,9 @@ impl<'a> Linearizer<'a> {
                 // va_list is defined as __va_list_tag[1] (an array type), so it decays to
                 // a pointer when used in expressions (C99 6.3.2.1, 7.15.1). A target
                 // whose va_list is itself a pointer falls through to the scalar load.
-                if local.is_indirect {
+                if let Storage::Indirect(ptr_type) = local.storage {
                     // va_list parameter: local holds a pointer to the va_list struct
                     // Load the pointer value (array decay already happened at call site)
-                    let ptr_type = self.types.pointer_to(local.typ);
                     let ptr_size = self.types.size_bits(ptr_type);
                     self.emit(Instruction::load(result, local.sym, 0, ptr_type, ptr_size));
                 } else {

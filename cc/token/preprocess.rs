@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::lexer::{
-    literal_payload, payload_text, show_token, tokens_to_source_bytes, IdentTable, LexerMode,
-    Position, SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
+    literal_payload, payload_text, tokens_to_source_bytes, write_token, IdentTable, LexerMode,
+    Position, Punctuator, SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
 };
 use crate::arch;
 use crate::builtin_headers;
@@ -3367,14 +3367,18 @@ impl<'a> Preprocessor<'a> {
     /// dropped the rest, so `#error "a" 'b' L"c"` reported `#error a  and`
     /// -- quotes stripped, two of the three operands gone.
     fn tokens_to_message(&self, tokens: &[Token], idents: &IdentTable) -> String {
-        let mut result = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
         for token in tokens {
-            if !result.is_empty() && token.pos.whitespace {
-                result.push(' ');
+            if !bytes.is_empty() && token.pos.whitespace {
+                bytes.push(b' ');
             }
-            result.push_str(&show_token(token, idents));
+            write_token(&mut bytes, token, idents);
         }
-        result
+        // Decoded once at the end, not per token: a multi-byte character
+        // outside a literal is several single-byte punctuators, and neither
+        // half is valid UTF-8 alone. Decoding each separately turned `café`
+        // in a `#error` into two replacement characters.
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Stringify macro argument per C99 6.10.3.2p2
@@ -3448,9 +3452,16 @@ impl<'a> Preprocessor<'a> {
                 // multi-character one at all (dropping it turned `a >> b`
                 // into `a  b`), and a digraph as the digraph (6.4.6p3 makes
                 // `<:` behave as `[` "except for their spelling").
-                TokenValue::Special(code) => {
-                    result.push_str(&literal_payload(&token.punctuator_spelling(*code)));
-                }
+                TokenValue::Special(code) => match token.punctuator(*code) {
+                    // The result is a payload -- one `char` per source byte --
+                    // and a single-character punctuator already is a byte, so
+                    // it goes in directly. Rendering it through a String first
+                    // UTF-8-encodes it, which doubled every byte >= 0x80.
+                    Punctuator::Byte(b) => result.push(char::from(b)),
+                    // A digraph or a longer operator spells itself in ASCII,
+                    // where text and payload are the same.
+                    Punctuator::Text(t) => result.push_str(&t),
+                },
                 _ => {}
             }
         }

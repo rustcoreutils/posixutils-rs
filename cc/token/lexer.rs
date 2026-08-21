@@ -71,6 +71,25 @@ fn digraph_token(pos: Position, value: TokenValue) -> Token {
     token
 }
 
+/// How a punctuator token is written.
+///
+/// A single-character punctuator's value **is** a source byte -- a non-ASCII
+/// byte outside a literal lexes as its own punctuator -- while a digraph or a
+/// multi-character operator has a spelling that is text. Everything that
+/// builds a byte stream or a literal payload has to keep the two apart:
+/// rendering the byte through a Rust `String` UTF-8-encodes it, which doubled
+/// it in `-E` output, in preprocessed assembly, and in `#` stringification.
+///
+/// The distinction is in this type rather than in a comment because all three
+/// of those were separate bugs with one cause.
+pub enum Punctuator {
+    /// One source byte, verbatim.
+    Byte(u8),
+    /// An ASCII spelling: a digraph, a multi-character operator, or the
+    /// `<special:N>` placeholder for a code with neither.
+    Text(String),
+}
+
 /// The digraph that spells the punctuator `code`, for a token written as one.
 fn digraph_spelling(code: u32) -> Option<&'static str> {
     Some(match code {
@@ -513,14 +532,20 @@ impl Token {
         }
     }
 
-    /// This token's punctuator spelling, honouring a digraph.
-    pub fn punctuator_spelling(&self, code: u32) -> String {
-        match self.spelling {
+    /// How this token's punctuator is written.
+    ///
+    /// See [`Punctuator`]: a single-character one is a source *byte*, and
+    /// only a digraph or a longer operator has a spelling that is text.
+    pub fn punctuator(&self, code: u32) -> Punctuator {
+        if code < SpecialToken::BASE && self.spelling == Spelling::Canonical {
+            return Punctuator::Byte(code as u8);
+        }
+        Punctuator::Text(match self.spelling {
             Spelling::Digraph => digraph_spelling(code)
                 .map(str::to_string)
                 .unwrap_or_else(|| show_special(code)),
             _ => show_special(code),
-        }
+        })
     }
 
     /// Mark this token as not expandable for the given macro name
@@ -1539,18 +1564,11 @@ pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
             TokenValue::HeaderName(h) if token.typ == TokenType::HeaderName => {
                 out.extend(payload_bytes(h))
             }
-            // A single-character punctuator *is* a source byte. Rendering it
-            // through a Rust `String` UTF-8-encodes anything >= 0x80 and so
-            // doubles it -- which corrupted preprocessed assembly, where such
-            // a byte is ordinary: a `.S` symbol named `café` assembled as
-            // `cafÃ©` and no longer linked. Digraphs are excluded because
-            // their spelling is not their value.
-            TokenValue::Special(v)
-                if token.typ == TokenType::Special
-                    && *v < SpecialToken::BASE
-                    && token.spelling == Spelling::Canonical =>
-            {
-                out.push(*v as u8)
+            TokenValue::Special(v) if token.typ == TokenType::Special => {
+                match token.punctuator(*v) {
+                    Punctuator::Byte(b) => out.push(b),
+                    Punctuator::Text(t) => out.extend_from_slice(t.as_bytes()),
+                }
             }
             _ => out.extend_from_slice(show_other_token(token, strings).as_bytes()),
         },
@@ -1600,7 +1618,10 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
         }
         TokenType::Special => {
             if let TokenValue::Special(v) = &token.value {
-                token.punctuator_spelling(*v)
+                match token.punctuator(*v) {
+                    Punctuator::Byte(b) => (b as char).to_string(),
+                    Punctuator::Text(t) => t,
+                }
             } else {
                 "<special?>".to_string()
             }

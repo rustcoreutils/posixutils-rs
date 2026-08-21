@@ -304,6 +304,50 @@ fn preprocessor_va_args_loses_space_before_a_separator() {
     assert_has(&r.stdout, "C \"a,b\"", "no space around a separator");
 }
 
+/// A non-ASCII byte outside a literal lexes as its own single-character
+/// punctuator, so its value is a source *byte*. Both consumers of a
+/// punctuator's spelling have to keep that apart from text: `#`
+/// stringification builds a payload (one `char` per byte), and a `#error`
+/// message is assembled from bytes and decoded once at the end.
+///
+/// Rendering the byte through a Rust `String` UTF-8-encodes it. Doing that
+/// inside stringification doubled it; doing it per-token in the message
+/// renderer left a replacement character, because one byte of a multi-byte
+/// character is not valid UTF-8 on its own.
+#[test]
+fn preprocessor_non_ascii_punctuator_bytes_survive() {
+    let r = preprocess_text(
+        "punct_bytes",
+        "#define S(x) #x\nA S(café)\nB S(a<:1:>b)\nC S(a >> b)\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "A \"café\"", "stringified non-ASCII bytes");
+    assert_lacks(&r.stdout, "Ã", "double-encoded UTF-8");
+    assert_lacks(&r.stdout, "\u{fffd}", "a byte lost to lossy decoding");
+    // The text spellings still work.
+    assert_has(&r.stdout, "B \"a<:1:>b\"", "digraph spelling");
+    assert_has(&r.stdout, "C \"a >> b\"", "multi-character operator");
+}
+
+/// The same bytes in a `#error` message, which is assembled by a different
+/// renderer and so needs the same care.
+#[test]
+fn preprocessor_error_message_keeps_non_ascii_bytes() {
+    let r = preprocess_text("err_bytes", "#error café is bad\n", &[]);
+    assert!(!r.success, "#error must fail the run");
+    assert!(
+        r.stderr.contains("café is bad"),
+        "expected the message verbatim, got:\n{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains('\u{fffd}'),
+        "a byte was lost to lossy decoding:\n{}",
+        r.stderr
+    );
+}
+
 // ============================================================================
 // #P2 — the null directive
 // ============================================================================

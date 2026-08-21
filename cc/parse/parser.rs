@@ -5567,7 +5567,16 @@ impl Parser<'_> {
                 // Function declaration
                 // Skip __asm("...") symbol aliasing which can appear after function declarator
                 self.skip_extensions();
-                self.expect_special(b';')?;
+                // ...but not necessarily the end of the declaration. C17 6.7
+                // lets an init-declarator-list hold any declarators, function
+                // ones included, so `int f(int), g(int);` and sparse's
+                // `static struct symbol *base_type(...), *do_expression(...);`
+                // are ordinary declarations. Demanding `;` here rejected every
+                // list whose first declarator was a function.
+                let more_declarators = self.is_special(b',');
+                if !more_declarators {
+                    self.expect_special(b';')?;
+                }
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
                 let func_type = if prototyped {
                     Type::function(typ_id, param_type_ids, variadic, is_noreturn)
@@ -5596,17 +5605,33 @@ impl Parser<'_> {
                 };
                 let symbol = symbol_id.expect("function declaration must have symbol");
                 self.settle_declaration_facts(name, storage_class);
-                return Ok(ExternalDecl::Declaration(Declaration {
-                    declarators: vec![InitDeclarator {
-                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                        symbol,
-                        typ: func_type_id,
+                let mut first_declarator = vec![InitDeclarator {
+                    symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+                    symbol,
+                    typ: func_type_id,
+                    storage_class,
+                    init: None,
+                    vla_sizes: vec![],
+                    explicit_align: None, // Functions don't have _Alignas
+                    pos: decl_pos,
+                }];
+                if more_declarators {
+                    self.parse_remaining_declarators(
+                        &base_type,
+                        base_type_id,
+                        is_typedef,
                         storage_class,
-                        init: None,
-                        vla_sizes: vec![],
-                        explicit_align: None, // Functions don't have _Alignas
-                        pos: decl_pos,
-                    }],
+                        decl_pos,
+                        &mut first_declarator,
+                    )?;
+                    self.expect_special(b';')?;
+                    self.pending_alignas = None;
+                    self.pending_vm_typedef_dims = None;
+                    self.pending_mode = None;
+                    self.pending_transparent_union = None;
+                }
+                return Ok(ExternalDecl::Declaration(Declaration {
+                    declarators: first_declarator,
                 }));
             }
         }
@@ -5850,6 +5875,51 @@ impl Parser<'_> {
         });
 
         // Handle additional declarators
+        self.parse_remaining_declarators(
+            &base_type,
+            base_type_id,
+            is_typedef,
+            storage_class,
+            decl_pos,
+            &mut declarators,
+        )?;
+
+        self.expect_special(b';')?;
+
+        // Clear pending alignment after declaration
+        self.pending_alignas = None;
+        // Belongs to the declaration whose specifiers named the typedef, and
+        // to no later one.
+        self.pending_vm_typedef_dims = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
+        self.pending_transparent_union = None;
+
+        Ok(ExternalDecl::Declaration(Declaration { declarators }))
+    }
+
+    /// Parse the declarators after the first in a file-scope declaration.
+    ///
+    /// `int a, b;` and `int f(int), g(int);` are the same grammar -- C17 6.7's
+    /// *declaration-specifiers init-declarator-list* -- and a function
+    /// declarator is an ordinary member of that list. This used to live inline
+    /// in the variable path only, so a declaration whose *first* declarator
+    /// was a function ended at the function-declaration branch, which demanded
+    /// a `;` and rejected the comma.
+    ///
+    /// Takes `base_type_id` rather than the running `typ_id`: any `*` before
+    /// the first declarator belongs to that declarator alone, so in
+    /// `int *f(int), g(int)` the `g` is an `int`, not an `int *`.
+    fn parse_remaining_declarators(
+        &mut self,
+        base_type: &Type,
+        base_type_id: TypeId,
+        is_typedef: bool,
+        storage_class: TypeModifiers,
+        decl_pos: Position,
+        declarators: &mut Vec<InitDeclarator>,
+    ) -> ParseResult<()> {
         while self.is_special(b',') {
             self.advance();
             let next_decl_pos = self.current_pos();
@@ -5954,20 +6024,7 @@ impl Parser<'_> {
                 pos: next_decl_pos,
             });
         }
-
-        self.expect_special(b';')?;
-
-        // Clear pending alignment after declaration
-        self.pending_alignas = None;
-        // Belongs to the declaration whose specifiers named the typedef, and
-        // to no later one.
-        self.pending_vm_typedef_dims = None;
-        // A mode that no declarator consumed belongs to no later declaration:
-        // leaving it set applied it to whatever came next.
-        self.pending_mode = None;
-        self.pending_transparent_union = None;
-
-        Ok(ExternalDecl::Declaration(Declaration { declarators }))
+        Ok(())
     }
 
     /// The `f64` value of a constant floating subexpression.

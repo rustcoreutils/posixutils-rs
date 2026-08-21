@@ -125,6 +125,10 @@ byte, as gcc does on both targets._
 | Area | Divergence |
 |------|-----------|
 | `_FORTIFY_SOURCE` | Still checks nothing. Five of six layers are done; the one that remains is described above, and is an ordinary compiler feature rather than fortify-specific work |
+| Raw UTF-8 in identifiers | `int café = 1;` is rejected; C17 6.4.2.1 admits an extended character only through a UCN, and `int caf\u00e9 = 1;` works. gcc and clang take the raw spelling as an extension. See #C158 |
+| `<stddef.h>` and `__need_*` | The builtin header defines every typedef unconditionally instead of honouring glibc's one-at-a-time protocol, so `<string.h>` leaks `wchar_t`. See #C157 |
+| `#__VA_ARGS__` spacing | `V(a , b)` stringifies as `"a, b"`; gcc gives `"a , b"`. The separating comma's own spacing is discarded by the argument splitter. Pinned by `preprocessor_va_args_loses_space_before_a_separator` |
+| `max_align_t` | `long double` here (16 bytes), a struct of `long long` + `long double` under gcc (32). Both meet the alignment requirement; `sizeof` differs. Implementation-defined (C17 7.19) |
 
 ## GNU extensions: what c17 will and will not grow
 
@@ -428,3 +432,11 @@ work, and were never a claim about the language.
 |-------|------|
 | GCC torture tests (C99 subset) | Not run against c17 |
 | clang test suite (C99 subset) | Not run against c17 |
+
+**Reclassified 2026-08-21.** These are no longer only test-coverage work. A
+hand-written differential probe of nine ordinary constructs against
+`gcc -std=c17`, at `-O0` and `-O2`, found a silent miscompile in its first
+hour (#C155, `&vla`), in a mandated C99 feature that CPython's 40,817 passing
+tests never reach. `gcc.c-torture/execute` is a few thousand self-checking
+programs needing no reference compiler, and is the highest-yield item on this
+page.

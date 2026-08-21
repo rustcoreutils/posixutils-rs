@@ -362,7 +362,18 @@ enum CondState {
 struct Conditional {
     state: CondState,
     /// Has this conditional had a true branch?
+    ///
+    /// Not quite what it says: `push_conditional` also sets it when the whole
+    /// group is inside a skipped parent, so that no branch of a dead group can
+    /// activate. It therefore cannot answer "was there an `#else`", which is
+    /// why that is a separate flag.
     had_true: bool,
+    /// Whether this group's `#else` has been seen.
+    ///
+    /// Without it a second `#else` is a legal state transition rather than an
+    /// error, and a silently destructive one: it turns the group `Done`, so the
+    /// first `#else` body is truncated and the second is dropped.
+    seen_else: bool,
     /// Position of the #if/#ifdef/#ifndef directive
     pos: Position,
 }
@@ -1336,13 +1347,10 @@ impl<'a> Preprocessor<'a> {
     /// `include_file` swaps the conditional stack out around it and drops
     /// whatever is left. gcc does diagnose that; changing it is a separate
     /// question from this one.
-    fn report_unterminated_conditionals(&self) {
-        if self.cond_stack.is_empty() {
-            return;
+    fn report_unterminated_conditionals(&mut self) {
+        for cond in std::mem::take(&mut self.cond_stack) {
+            diag::error(cond.pos, &gettext("unterminated #if"));
         }
-        let first_pos = self.cond_stack.first().map(|c| c.pos).unwrap_or_default();
-        let msg = format!("{} unterminated #if directive(s)", self.cond_stack.len());
-        diag::warning(first_pos, &msg);
     }
 
     /// Apply the active [`LineMarker`] to a position.
@@ -1386,6 +1394,7 @@ impl<'a> Preprocessor<'a> {
             state,
             // When parent is skipping, mark had_true so #else/#elif won't activate
             had_true: parent_skipping || condition,
+            seen_else: false,
             pos,
         });
     }

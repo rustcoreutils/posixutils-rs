@@ -153,6 +153,7 @@ impl<'a> Preprocessor<'a> {
         self.cond_stack.push(Conditional {
             state: CondState::Active,
             had_true: true,
+            seen_else: false,
             pos: Position::default(),
         });
         let saved_in_if = std::mem::replace(&mut self.in_if_condition, true);

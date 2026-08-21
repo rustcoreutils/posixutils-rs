@@ -11,7 +11,7 @@
 // Tests for #line and other preprocessor directives.
 //
 
-use crate::common::{compile_and_run, preprocess_text};
+use crate::common::{compile_and_run, preprocess_text, run_c17};
 
 #[test]
 fn preprocessor_line_directive() {
@@ -229,6 +229,87 @@ fn preprocessor_command_line_defines_still_work() {
             "expected {:?} in:\n{}",
             want,
             r.stdout
+        );
+    }
+}
+
+/// C17 6.10.1: a conditional group runs `#if`, then any `#elif`s, then at most
+/// one `#else`, and it must be closed. None of that was checked.
+///
+/// The two duplicate cases are the destructive ones: a second `#else` was a
+/// legal state transition that turned the group `Done`, truncating the first
+/// `#else` body and dropping the second, with nothing on stderr.
+#[test]
+fn preprocessor_conditional_nesting_is_validated() {
+    for (name, src, needle) in [
+        ("stray_endif", "#endif\nint v;\n", "#endif without #if"),
+        ("stray_else", "#else\nint v;\n", "#else without #if"),
+        ("stray_elif", "#elif 1\nint v;\n", "#elif without #if"),
+        (
+            "double_else",
+            "#if 1\nint a;\n#else\nint b;\n#else\nint c;\n#endif\n",
+            "#else after #else",
+        ),
+        (
+            "elif_after_else",
+            "#if 0\nint a;\n#else\nint b;\n#elif 1\nint c;\n#endif\n",
+            "#elif after #else",
+        ),
+        ("unterminated", "#if 1\nint a;\n", "unterminated #if"),
+    ] {
+        let r = preprocess_text(&format!("cond_{}", name), src, &[]);
+        assert!(!r.success, "{} should be rejected:\n{}", name, r.stdout);
+        assert!(
+            r.stderr.contains(needle),
+            "{} should say {:?}, got:\n{}",
+            name,
+            needle,
+            r.stderr
+        );
+    }
+}
+
+/// The conditional stack is swapped out around an inclusion so a header cannot
+/// close one of the includer's groups. That also meant an unterminated `#if`
+/// in a header was discarded rather than reported.
+#[test]
+fn preprocessor_unterminated_conditional_in_a_header_is_diagnosed() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_unterm_hdr_")
+        .tempdir()
+        .unwrap();
+    std::fs::write(dir.path().join("u.h"), "#if 1\nint never_closed;\n").unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "#include \"u.h\"\nint after;\n").unwrap();
+
+    let r = run_c17(&["-E", &src.to_string_lossy()]);
+    assert!(!r.success, "the header leaves a group open:\n{}", r.stdout);
+    assert!(
+        r.stderr.contains("unterminated #if"),
+        "expected the unterminated-#if error, got:\n{}",
+        r.stderr
+    );
+}
+
+/// gcc warns about anything after `#else` or `#endif`, which take no operands.
+/// These were eaten in silence.
+#[test]
+fn preprocessor_extra_tokens_after_a_conditional_warn() {
+    let r = preprocess_text(
+        "extra_after_cond",
+        "#if 1\nint a;\n#else JUNK\nint b;\n#endif TRAILING\n",
+        &[],
+    );
+    assert!(r.success, "these are warnings, not errors:\n{}", r.stderr);
+    for want in [
+        "extra tokens at end of #else directive",
+        "extra tokens at end of #endif directive",
+    ] {
+        assert!(
+            r.stderr.contains(want),
+            "expected {:?}, got:\n{}",
+            want,
+            r.stderr
         );
     }
 }

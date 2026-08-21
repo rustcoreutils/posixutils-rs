@@ -148,8 +148,8 @@ impl<'a> Preprocessor<'a> {
             crate::kw::IFNDEF => self.handle_ifndef(iter, idents, hash_token.pos),
             crate::kw::IF => self.handle_if(iter, idents, hash_token.pos),
             crate::kw::ELIF => self.handle_elif(iter, idents, hash_token.pos),
-            crate::kw::ELSE => self.handle_else(iter),
-            crate::kw::ENDIF => self.handle_endif(iter),
+            crate::kw::ELSE => self.handle_else(iter, hash_token.pos),
+            crate::kw::ENDIF => self.handle_endif(iter, hash_token.pos),
             crate::kw::INCLUDE => self.handle_include(iter, output, idents, hash_token, false),
             crate::kw::INCLUDE_NEXT => self.handle_include(iter, output, idents, hash_token, true),
             crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
@@ -282,6 +282,19 @@ impl<'a> Preprocessor<'a> {
                 None
             }
         }
+    }
+
+    /// Drain the rest of the directive's line, warning if there was any.
+    ///
+    /// C17 6.10p1 gives `#else` and `#endif` no operands at all, and gcc warns
+    /// about anything after them -- usually a stale `#endif MACRO` left from
+    /// before comments were the convention. These used to be eaten in silence.
+    fn warn_extra_tokens(&self, iter: &mut TokenCursor, directive: &str) {
+        if iter.peek().is_some_and(|t| !t.pos.newline) {
+            let pos = iter.peek().map(|t| t.pos).unwrap_or_default();
+            diag::warning_args(pos, "extra tokens at end of #{0} directive", &[directive]);
+        }
+        self.skip_to_eol(iter);
     }
 
     fn skip_to_eol(&self, iter: &mut TokenCursor) {
@@ -541,11 +554,20 @@ impl<'a> Preprocessor<'a> {
     fn handle_elif(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
 
-        // Check if we should evaluate this branch
-        let should_eval = if let Some(cond) = self.cond_stack.last() {
-            cond.state == CondState::Skipping && !cond.had_true
-        } else {
-            false
+        // C17 6.10.1: a group runs `#if`, then any `#elif`s, then at most one
+        // `#else`. Neither of these was checked, so a stray `#elif` did nothing
+        // and an `#elif` after `#else` silently turned the group `Done`,
+        // truncating the `#else` body it had already started emitting.
+        let should_eval = match self.cond_stack.last() {
+            None => {
+                diag::error(pos, &gettext("#elif without #if"));
+                return;
+            }
+            Some(cond) if cond.seen_else => {
+                diag::error(pos, &gettext("#elif after #else"));
+                return;
+            }
+            Some(cond) => cond.state == CondState::Skipping && !cond.had_true,
         };
 
         let expr_value = if should_eval {
@@ -578,10 +600,19 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #else
-    fn handle_else(&mut self, iter: &mut TokenCursor) {
-        self.skip_to_eol(iter);
+    fn handle_else(&mut self, iter: &mut TokenCursor, pos: Position) {
+        self.warn_extra_tokens(iter, "else");
 
-        if let Some(cond) = self.cond_stack.last_mut() {
+        let Some(cond) = self.cond_stack.last_mut() else {
+            diag::error(pos, &gettext("#else without #if"));
+            return;
+        };
+        if cond.seen_else {
+            diag::error(pos, &gettext("#else after #else"));
+            return;
+        }
+        cond.seen_else = true;
+        {
             match cond.state {
                 CondState::Active => {
                     cond.state = CondState::Done;
@@ -601,9 +632,11 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #endif
-    fn handle_endif(&mut self, iter: &mut TokenCursor) {
-        self.skip_to_eol(iter);
-        self.cond_stack.pop();
+    fn handle_endif(&mut self, iter: &mut TokenCursor, pos: Position) {
+        self.warn_extra_tokens(iter, "endif");
+        if self.cond_stack.pop().is_none() {
+            diag::error(pos, &gettext("#endif without #if"));
+        }
     }
 
     /// Handle #include
@@ -641,6 +674,7 @@ impl<'a> Preprocessor<'a> {
             self.cond_stack.push(Conditional {
                 state: CondState::Active,
                 had_true: true,
+                seen_else: false,
                 pos: Position::default(),
             });
             let expanded = self.preprocess(path_tokens, idents);
@@ -1373,6 +1407,11 @@ impl<'a> Preprocessor<'a> {
         self.include_stack.remove(&canonical);
         self.current_file = saved_file;
         self.current_dir = saved_dir;
+        // Whatever the file left open, it left open. The stack is swapped out
+        // around an inclusion so a header cannot close one of the includer's
+        // groups, which also meant an unterminated `#if` in a header was
+        // discarded here rather than reported.
+        self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
         self.current_include_path_index = saved_include_path_index;
     }
@@ -1428,6 +1467,11 @@ impl<'a> Preprocessor<'a> {
         self.include_depth -= 1;
         self.current_file = saved_file;
         self.current_dir = saved_dir;
+        // Whatever the file left open, it left open. The stack is swapped out
+        // around an inclusion so a header cannot close one of the includer's
+        // groups, which also meant an unterminated `#if` in a header was
+        // discarded here rather than reported.
+        self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
     }
 

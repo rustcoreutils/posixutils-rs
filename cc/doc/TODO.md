@@ -144,7 +144,7 @@ the project's own filter before earning a verdict:
 | Extension | Verdict | Why |
 |-----------|---------|-----|
 | SIMD intrinsic headers | **No — fix the predefines** | See below; the blocking is self-inflicted |
-| `__atomic_*` / `__sync_*` | **Yes, when it blocks** | Alternate spellings of complete C11 atomics |
+| `__atomic_*` / `__sync_*` | **Not implemented; macro withdrawn** | Alternate spellings of complete C11 atomics — see below |
 | `__auto_type` | **No** | 6 files across four trees; fails minimalism on its own numbers |
 | nested functions / `__label__` | **Never** | GCC-only, Clang refuses it, needs executable-stack trampolines |
 
@@ -174,13 +174,45 @@ Vector *arithmetic* is the related non-goal. `vector_size` gives a type a
 vector's storage, which is what makes glibc's `<link.h>` compile, and that is
 deliberately where it stops.
 
-### Atomics — spelling, not substance
+### Atomics — the macro went, the builtins did not come
 
-`__atomic_*` and `__sync_*` are the only rows that survive on merit. c17's C11
-atomics are complete — type system, parser, IR, linearizer, both backends,
-`<stdatomic.h>` — so these builtins map onto machinery that already exists
-rather than adding a subsystem, and they inherit the same lock-free width
-ceiling (#X1). They earn their place by being cheap, not by being frequent.
+`__atomic_*` and `__sync_*` were the only rows to survive the filter on merit:
+c17's C11 atomics are complete — type system, parser, IR, linearizer, both
+backends, `<stdatomic.h>` — so these builtins would map onto machinery that
+already exists rather than adding a subsystem, and would inherit the same
+lock-free width ceiling (#X1).
+
+They are still not implemented. What changed is that c17 no longer *claims*
+them: it predefined `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}` on both
+targets while `__sync_bool_compare_and_swap` was an undeclared identifier, so a
+guarded `#ifdef` opened a door onto a wall when the `#else` beside it would have
+compiled. The macro is gone, which is what makes the guard tell the truth.
+
+### Which macros may be withdrawn, and which may not
+
+The distinction is what the macro is a statement *about*, and getting it wrong
+once cost a correct macro:
+
+- **Compiler capability** — `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_N` means "I
+  provide the `__sync_*` builtins". c17 does not, so the macro was false and
+  withdrawing it is the fix.
+- **Target capability** — `__SSE2__` means "this target has SSE2". That is
+  architectural baseline for x86-64 (32-bit x86 does *not* define it, which is
+  the proof it describes the target rather than the compiler), and gcc defines
+  it unconditionally. `__ARM_NEON` is the same: Advanced SIMD is mandatory in
+  the AArch64 base architecture. Both are **true**, both stay.
+
+Code that writes `#ifdef __SSE2__` around `#include <emmintrin.h>` is treating
+a target fact as though it implied a compiler fact. That inference holds for
+gcc and clang because they ship the intrinsic headers; c17 does not, so such a
+file still fails on the missing header. **The honest gap is the header, not the
+macro** — withdrawing a true statement about the target would not make the
+header appear, and would break the far more common code that tests `__SSE2__`
+to pick an algorithm rather than to reach for an intrinsic.
+
+`__ARM_NEON__` was withdrawn on aarch64 for a third reason again: it is the
+AArch32 spelling, and gcc does not define it there. c17 did, which was simply
+wrong.
 
 Implemented since this list was first measured: case ranges, designated
 initializer ranges, and computed goto. Those three passed the same filter for a

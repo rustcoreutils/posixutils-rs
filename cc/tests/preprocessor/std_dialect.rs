@@ -437,19 +437,38 @@ fn c17_sync_guarded_code_takes_the_portable_branch() {
     );
 }
 
-/// aarch64 advertised NEON with no `<arm_neon.h>` behind it. Probed through
-/// `--target`, so the assertion holds from any host.
+/// The aarch64 SIMD macros must say what gcc says, no more and no less.
+///
+/// `__ARM_NEON` is a fact about the *target*: Advanced SIMD is mandatory in
+/// the AArch64 base architecture, so gcc defines it unconditionally and so
+/// does c17. It is not a claim that `<arm_neon.h>` exists -- that is a fact
+/// about the *compiler*, and c17 ships no such header. Withdrawing a true
+/// statement about the target would not make the missing header appear.
+///
+/// `__ARM_NEON__` is the AArch32 spelling and gcc does **not** define it on
+/// aarch64. c17 did, which was simply wrong.
+///
+/// Probed through `--target`, so this holds from any host.
 #[test]
-fn c17_does_not_advertise_neon_without_the_header() {
-    for macro_name in ["__ARM_NEON", "__ARM_NEON__"] {
-        let got = expand_under("neon", Some("--target=aarch64-linux-gnu"), macro_name);
-        assert!(
-            is_undefined(&got, macro_name),
-            "{macro_name} must not be defined while <arm_neon.h> is not shipped, got {got}"
-        );
-    }
+fn c17_aarch64_simd_macros_match_gcc() {
+    let neon = expand_under("neon", Some("--target=aarch64-linux-gnu"), "__ARM_NEON");
+    assert_eq!(
+        neon, "1",
+        "__ARM_NEON is architectural baseline on aarch64 and must be defined"
+    );
 
-    // Same target, same reason, other family.
+    let legacy = expand_under(
+        "neon_legacy",
+        Some("--target=aarch64-linux-gnu"),
+        "__ARM_NEON__",
+    );
+    assert!(
+        is_undefined(&legacy, "__ARM_NEON__"),
+        "__ARM_NEON__ is the AArch32 spelling; gcc does not define it here, got {legacy}"
+    );
+
+    // The sync builtins are a *compiler* capability, and that one really is
+    // absent, so its macro must be too -- on this target as on the host.
     for macro_name in SYNC_CAS_MACROS {
         let got = expand_under("neon_sync", Some("--target=aarch64-linux-gnu"), macro_name);
         assert!(

@@ -133,7 +133,9 @@ Not yet implemented:
 - assembly peephole optimizations
 - the GCC atomic builtins `__sync_*` and `__atomic_*`. C11 `<stdatomic.h>` is
   complete; these are the older spellings of machinery c17 already has, which
-  is why they are on this list rather than the one below
+  is why they are on this list rather than the one below. c17 no longer
+  predefines `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_*`, so code guarded on it takes
+  its portable branch instead of failing on an undeclared identifier
 
 Will not implement:
 - vector *arithmetic*. `vector_size` gives a type a vector's storage — the size
@@ -141,9 +143,10 @@ Will not implement:
   is deliberately where it stops. Element-wise `+`, `*` and the rest need a
   vector type in the IR and in both backends, so they are diagnosed rather than
   silently computed on one element
-- SIMD intrinsic headers (`immintrin.h` and friends). c17 predefines `__SSE2__`
-  and friends without shipping the headers those guards then reach for; the fix
-  is to stop advertising the capability, not to grow one. See `doc/TODO.md`
+- SIMD intrinsic headers (`immintrin.h` and friends). Code guarded on
+  `#ifdef __SSE2__` reaches for one and fails. The macro is not the fault:
+  SSE2 is architectural baseline for x86-64 and gcc defines it unconditionally,
+  as c17 does — it describes the target, not the header set. See `doc/TODO.md`
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested
   functions too, and they need executable-stack trampolines
 - `_Imaginary` types. Optional in C99, C11 and C17 alike -- never removed,

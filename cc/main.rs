@@ -585,6 +585,16 @@ fn process_file(
         let mut emitted_marker_for: Vec<u16> = vec![stream_id];
         let mut current_stream: Option<u16> = Some(stream_id);
         let mut at_line_start = true;
+        // The source line the next output line stands for.
+        //
+        // Directives and blank lines produce no tokens, so without this the
+        // output closed up the gaps they left and every line after the first
+        // `#define` claimed a number several too low. That is not cosmetic:
+        // the markers are the only record of where the text came from, so
+        // `c17 -E x.c -o x.i` followed by `c17 -c x.i` reported an error in
+        // `x.c` at the wrong line -- c17 read *gcc's* `.i` correctly, which is
+        // what showed the producer was at fault rather than the consumer.
+        let mut current_line: u32 = 1;
 
         let mut iter = preprocessed.iter().peekable();
         while let Some(token) = iter.next() {
@@ -648,7 +658,29 @@ fn process_file(
                         if returning { 2 } else { 1 }
                     )?;
                     current_stream = Some(token.pos.stream);
+                    current_line = line;
                     at_line_start = true;
+                }
+
+                // Put the token back on the line it came from. Every consumed
+                // directive and every blank line is a gap the token stream
+                // does not carry, so it has to be reopened here or the count
+                // drifts for the rest of the file.
+                if at_line_start {
+                    let (name, line, _) = diag::effective_position(token.pos);
+                    if line > current_line {
+                        // GCC's threshold: a handful of blank lines is smaller
+                        // than a marker, past that a marker is smaller.
+                        const MAX_BLANK_RUN: u32 = 8;
+                        if line - current_line <= MAX_BLANK_RUN {
+                            for _ in 0..(line - current_line) {
+                                writeln!(out.preprocessed)?;
+                            }
+                        } else {
+                            writeln!(out.preprocessed, "# {} \"{}\"", line, name)?;
+                        }
+                        current_line = line;
+                    }
                 }
 
                 // A directive owns its line: it has to start one, and the text
@@ -656,8 +688,10 @@ fn process_file(
                 if pragma.is_some() {
                     if !at_line_start {
                         writeln!(out.preprocessed)?;
+                        current_line += 1;
                     }
                     writeln!(out.preprocessed, "{}", text)?;
+                    current_line += 1;
                     at_line_start = true;
                     continue;
                 }
@@ -668,6 +702,7 @@ fn process_file(
                 if let Some(next) = iter.peek() {
                     if next.pos.newline {
                         writeln!(out.preprocessed)?;
+                        current_line += 1;
                         at_line_start = true;
                     } else {
                         // Need a space if:

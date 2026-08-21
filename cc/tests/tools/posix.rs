@@ -23,6 +23,9 @@ fn exe_for(bin: &str) -> &'static str {
         "cflow" => env!("CARGO_BIN_EXE_cflow"),
         "ctags" => env!("CARGO_BIN_EXE_ctags"),
         "cxref" => env!("CARGO_BIN_EXE_cxref"),
+        // The `.i` tests drive the compiler to produce the operand they then
+        // feed to a tool, so the round trip is exercised end to end.
+        "c17" => env!("CARGO_BIN_EXE_c17"),
         _ => unreachable!(),
     }
 }
@@ -1227,4 +1230,114 @@ fn tools_io_errors_carry_no_rust_os_error_suffix() {
         "c17 lost the strerror text entirely:\n{}",
         stderr
     );
+}
+
+/// #R12: a `.i` operand must be attributed to the file its line markers name.
+///
+/// `cxref foo.i` reported every symbol against `foo.i`, though the markers say
+/// the definitions are in `foo.c` -- and since the line numbers already came
+/// from the markers, the two halves of one location disagreed. This is the
+/// defect `cflow` closed under #F10; cxref's own page defines its operand only
+/// as "a pathname of a C-language source file", so there is no `.i` form to
+/// conform to, but naming a file the reader cannot open is still wrong.
+#[test]
+fn cxref_preprocessed_operand_names_the_original_file() {
+    let dir = TempDir::new().unwrap();
+    let c = src(
+        &dir,
+        "orig.c",
+        "#define LIMIT 10\nint counter;\nint total(int n) { return n + counter; }\n",
+    );
+    let i = dir.path().join("orig.i");
+
+    let (_, stderr, code) = run("c17", &["-E", &c, "-o", i.to_str().unwrap()]);
+    assert_eq!(code, 0, "preprocessing failed: {}", stderr);
+
+    // No `-s`: that flag suppresses the filename column, which is the very
+    // thing under test here.
+    let (from_c, _, _) = run("cxref", &[&c]);
+    let (from_i, e, code) = run("cxref", &[i.to_str().unwrap()]);
+    assert_eq!(code, 0, "{}", e);
+
+    let row_i = cxref_rows(&from_i, "counter").join(" ");
+    assert!(
+        row_i.contains("orig.c"),
+        "the .i must be attributed to orig.c, got: {:?}",
+        row_i
+    );
+    assert!(
+        !row_i.split_whitespace().any(|w| w == "orig.i"),
+        "orig.i must not appear in the file column: {:?}",
+        row_i
+    );
+
+    // File *and* line agree with what the .c itself produces -- the halves
+    // disagreeing is what made this visible in the first place.
+    assert_eq!(
+        cxref_rows(&from_c, "counter").join(" "),
+        row_i,
+        "the .i and the .c should produce the same row"
+    );
+}
+
+/// `-E` must keep each token on the source line it came from.
+///
+/// Directives and blank lines yield no tokens, so the writer closed up the
+/// gaps they left and every line after the first `#define` was reported
+/// several too low. The markers are the only record of provenance, so this
+/// corrupted anything downstream: `c17 -E x.c -o x.i && c17 -c x.i` blamed the
+/// wrong line of x.c. c17 read *gcc's* `.i` correctly throughout, which is
+/// what identified the producer rather than the consumer as the culprit.
+#[test]
+fn preprocessed_output_preserves_source_line_numbers() {
+    let dir = TempDir::new().unwrap();
+
+    // Each case puts the error on a known line, behind a different kind of gap.
+    for (name, body, want_line) in [
+        (
+            "one_define.c",
+            "#define A 1\nint f(void){return zz;}\n",
+            2u32,
+        ),
+        (
+            "three_defines.c",
+            "#define A 1\n#define B 2\n#define C 3\nint f(void){return zz;}\n",
+            4,
+        ),
+        ("blank_lines.c", "int a;\n\n\nint f(void){return zz;}\n", 4),
+        (
+            "dead_if.c",
+            "#if 0\nint dead;\nint gone;\n#endif\nint f(void){return zz;}\n",
+            5,
+        ),
+        // Past the blank-run threshold the writer must emit a fresh marker
+        // instead, which is the branch a short case never reaches.
+        (
+            "big_gap.c",
+            "#define A 1\n#define B 2\n#define C 3\n#define D 4\n#define E 5\n\
+             #define F 6\n#define G 7\n#define H 8\n#define I 9\n#define J 10\n\
+             int f(void){return zz;}\n",
+            11,
+        ),
+    ] {
+        let c = src(&dir, name, body);
+        let i = dir.path().join(format!("{name}.i"));
+
+        // The line the compiler reports straight from the source.
+        let (_, direct, _) = run("c17", &["-c", &c, "-o", "/dev/null"]);
+        assert!(
+            direct.contains(&format!(":{want_line}:")),
+            "{name}: direct diagnostic should name line {want_line}, got: {direct}"
+        );
+
+        let (_, e, code) = run("c17", &["-E", &c, "-o", i.to_str().unwrap()]);
+        assert_eq!(code, 0, "{name}: -E failed: {e}");
+
+        // ...must survive the round trip through -E.
+        let (_, via, _) = run("c17", &["-c", i.to_str().unwrap(), "-o", "/dev/null"]);
+        assert!(
+            via.contains(&format!(":{want_line}:")),
+            "{name}: after -E the diagnostic should still name line {want_line}, got: {via}"
+        );
+    }
 }

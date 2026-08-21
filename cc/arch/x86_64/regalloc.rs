@@ -1308,7 +1308,27 @@ impl RegAlloc {
                 // a location; the pseudo gets a stack slot from normal
                 // allocation. Two doubles take two registers; a lone binary128
                 // takes one, for all sixteen bytes.
-                fp_arg_idx += sse_regs;
+                //
+                // ...but only when there are that many registers left. System
+                // V 3.2.3 step 5 sends an argument that does not fit to memory
+                // *whole*, consuming none of the registers it did not fit in.
+                // Advancing unconditionally left the pseudo with no location
+                // at all, so the callee read an untouched local: `struct
+                // {double,double}` after eight doubles came back as zero,
+                // while c17's own *caller* passed it correctly. The two
+                // neighbouring arms below already do this; this one did not.
+                if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
+                    fp_arg_idx += sse_regs;
+                } else {
+                    self.locations.insert(
+                        pseudo_id,
+                        Loc::IncomingArg(IncomingOff::take(
+                            &mut stack_arg_offset,
+                            (types.size_bits(*typ) / 8) as i32,
+                            types.alignment(*typ) as i32,
+                        )),
+                    );
+                }
             } else if let Some(classes) = crate::abi::struct_param_classes(*typ, types) {
                 // Two eightbytes in two registers -- both general, or one of
                 // each. Like the all-SSE case above, no location is assigned

@@ -18,9 +18,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::lexer::{
-    literal_payload, payload_text, tokens_to_source_bytes, write_token, IdentTable, LexerMode,
-    Position, Punctuator, SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
+    literal_payload, payload_bytes, payload_text, report_forbidden_ucn, tokens_to_source_bytes,
+    write_token, IdentTable, LexerMode, Position, Punctuator, SpecialToken, Spelling, Token,
+    TokenType, TokenValue, Tokenizer,
 };
+use super::literal;
 use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
@@ -436,6 +438,14 @@ pub struct Preprocessor<'a> {
     /// applied to its own `#` token.
     physical_line: u32,
     physical_stream: u16,
+    /// Set while a `#if`/`#elif` controlling expression is being expanded.
+    ///
+    /// C17 6.10.1p1 exempts the operand of `defined` from macro expansion, and
+    /// the operand can only be recognised in the same walk that does the
+    /// expanding: rewriting `defined X` in a pass *beforehand* misses a
+    /// `defined` that an expansion produces, and expanding first destroys the
+    /// operand. `#define D defined(FOO)` / `#if D` used to evaluate `0 (1)`.
+    in_if_condition: bool,
 }
 
 /// Where a linemarker says the text after it really came from.
@@ -772,6 +782,7 @@ impl<'a> Preprocessor<'a> {
             linemarker: None,
             physical_line: 0,
             physical_stream: 0,
+            in_if_condition: false,
         };
 
         // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
@@ -1059,11 +1070,6 @@ impl<'a> Preprocessor<'a> {
         self.macros.contains_key(name)
     }
 
-    /// Get a macro definition
-    pub fn get_macro(&self, name: &str) -> Option<&Macro> {
-        self.macros.get(name)
-    }
-
     /// Check if we're currently skipping tokens
     fn is_skipping(&self) -> bool {
         self.cond_stack
@@ -1076,6 +1082,9 @@ impl<'a> Preprocessor<'a> {
     pub fn preprocess(&mut self, tokens: Vec<Token>, idents: &mut IdentTable) -> Vec<Token> {
         self.preprocess_depth += 1;
         let mut output = Vec::new();
+        // Tracks `defined X` / `defined ( X )` so the operand escapes macro
+        // expansion; inert outside a controlling expression.
+        let mut defined_scan = DefinedScan::Idle;
         let mut iter = tokens.into_iter().peekable();
 
         while let Some(mut token) = iter.next() {
@@ -1102,6 +1111,9 @@ impl<'a> Preprocessor<'a> {
                         }
                     }
                     if !self.is_skipping() {
+                        if self.in_if_condition {
+                            defined_scan = defined_scan.punctuator(&token);
+                        }
                         output.push(token);
                     }
                 }
@@ -1109,6 +1121,15 @@ impl<'a> Preprocessor<'a> {
                 TokenType::Ident => {
                     if self.is_skipping() {
                         continue;
+                    }
+                    // The operand of `defined` is not expanded (C17 6.10.1p1).
+                    if self.in_if_condition {
+                        let (next, protect) = defined_scan.identifier(&token, idents);
+                        defined_scan = next;
+                        if protect {
+                            output.push(token);
+                            continue;
+                        }
                     }
                     // In an already-preprocessed file every macro has already
                     // been expanded, so nothing here is a macro name: not a
@@ -1226,6 +1247,9 @@ impl<'a> Preprocessor<'a> {
 
                 _ => {
                     if !self.is_skipping() {
+                        if self.in_if_condition {
+                            defined_scan = DefinedScan::Idle;
+                        }
                         output.push(token);
                     }
                 }
@@ -1295,10 +1319,27 @@ impl<'a> Preprocessor<'a> {
         });
     }
 
-    /// Evaluate a preprocessor expression
-    fn evaluate_expression(&self, tokens: &[Token], idents: &IdentTable) -> bool {
+    /// Evaluate a controlling expression (C17 6.10.1).
+    ///
+    /// `directive_pos` is where to blame an expression that is missing
+    /// altogether. A rejected expression is false, so the group is skipped and
+    /// the error is what the user acts on; recovering to "whatever the parser
+    /// happened to compute" is how a typo used to compile the wrong half of a
+    /// file in silence.
+    fn evaluate_expression(
+        &self,
+        tokens: &[Token],
+        idents: &IdentTable,
+        directive_pos: Position,
+    ) -> bool {
+        if tokens.is_empty() {
+            diag::error(directive_pos, &gettext("#if with no expression"));
+            return false;
+        }
         let mut evaluator = ExprEvaluator::new(self, idents);
-        evaluator.evaluate(tokens).is_true()
+        let value = evaluator.evaluate(tokens);
+        evaluator.check_fully_consumed();
+        !evaluator.had_error && value.is_true()
     }
 
     /// Convert token to string
@@ -1424,6 +1465,12 @@ struct ExprEvaluator<'a, 'b> {
     /// Set while parsing a short-circuited operand, whose diagnostics must not
     /// fire — the whole point of `&&`/`||` not evaluating that side.
     suppressed: bool,
+    /// Set once anything in the expression was rejected. The controlling
+    /// expression then counts as false rather than as whatever the recovery
+    /// path happened to compute: every `expr_*` used to fall through to zero
+    /// in silence, so `#if (1`, `#if X = 2` and `#if 1.5` each picked a branch
+    /// with no diagnostic at all.
+    had_error: bool,
 }
 
 impl<'a, 'b> ExprEvaluator<'a, 'b> {
@@ -1434,6 +1481,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             tokens: Vec::new(),
             pos: 0,
             suppressed: false,
+            had_error: false,
         }
     }
 
@@ -1441,6 +1489,66 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         self.tokens = tokens.to_vec();
         self.pos = 0;
         self.expr_ternary()
+    }
+
+    /// Reject the expression, unless this operand is being skipped by a
+    /// short-circuit — `#if 0 && (1` must stay quiet for the same reason
+    /// `#if 0 && 1/0` does.
+    fn err(&mut self, pos: Position, msg: &str) {
+        if self.suppressed {
+            return;
+        }
+        self.had_error = true;
+        diag::error(pos, msg);
+    }
+
+    /// Same, for a diagnostic that names the offending token.
+    fn err_token(&mut self, pos: Position, template: &str, arg: &str) {
+        if self.suppressed {
+            return;
+        }
+        self.had_error = true;
+        diag::error_args(pos, template, &[arg]);
+    }
+
+    /// C17 6.10.1p4: the line is *one* controlling expression. Anything left
+    /// over is a typo the user wants to hear about — `#if 1 2 3` used to be
+    /// simply true.
+    fn check_fully_consumed(&mut self) {
+        if self.had_error || self.pos >= self.tokens.len() {
+            return;
+        }
+        let tok = self.tokens[self.pos].clone();
+        let spelling = self.spell(&tok);
+        // Two different mistakes, as gcc distinguishes them: an operand with
+        // no operator joining it on (`#if 1 2`), versus a token that has no
+        // meaning in a controlling expression at all (`#if X = 2`).
+        if matches!(tok.typ, TokenType::Special) {
+            self.err_token(
+                tok.pos,
+                "token \"{0}\" is not valid in preprocessor expressions",
+                &spelling,
+            );
+        } else {
+            self.err_token(
+                tok.pos,
+                "missing binary operator before token \"{0}\"",
+                &spelling,
+            );
+        }
+    }
+
+    /// How a token should be named in a diagnostic.
+    fn spell(&self, tok: &Token) -> String {
+        self.pp.token_to_string(tok, self.idents)
+    }
+
+    /// The position to blame when the expression ran out of tokens.
+    fn here(&self) -> Position {
+        match self.current() {
+            Some(tok) => tok.pos,
+            None => self.tokens.last().map(|t| t.pos).unwrap_or_default(),
+        }
     }
 
     fn current(&self) -> Option<&Token> {
@@ -1643,11 +1751,21 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             if !is_left && !self.is_special(SpecialToken::RightShift as u32) {
                 break;
             }
+            let op_pos = self.here();
             self.advance();
             let right = self.expr_additive();
             // A shift does not apply the usual arithmetic conversions: the
             // result takes the left operand's type (C17 6.5.7p3). A count
-            // outside [0, 64) is undefined; clamp rather than panic.
+            // outside [0, 64) is undefined; clamp rather than panic, but say
+            // so -- clamping in silence made `#if (1 << 64) == 0` false with
+            // nothing to explain it. gcc warns here rather than erroring, so
+            // the expression still evaluates.
+            if !self.suppressed && !(0..64).contains(&right.v) {
+                diag::warning(
+                    op_pos,
+                    &gettext("integer overflow in preprocessor expression"),
+                );
+            }
             let count = right.v.clamp(0, 63) as u32;
             let v = if is_left {
                 left.raw() << count
@@ -1774,6 +1892,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             let val = self.expr_ternary();
             if self.is_special(b')' as u32) {
                 self.advance();
+            } else {
+                let pos = self.here();
+                self.err(pos, &gettext("missing ')' in expression"));
             }
             return val;
         }
@@ -1782,13 +1903,18 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         if let Some(tok) = self.current() {
             if let TokenValue::Number(n) = &tok.value {
                 let num_str = n.clone();
+                let pos = tok.pos;
                 self.advance();
-                return self.parse_number(&num_str);
+                return self.parse_number(&num_str, pos);
             }
         }
 
         // Handle character literal (any encoding prefix: L'x', u'x', U'x')
         if let Some(tok) = self.current() {
+            let wide = matches!(
+                &tok.value,
+                TokenValue::WideChar(_) | TokenValue::Utf16Char(_) | TokenValue::Utf32Char(_)
+            );
             let char_str = match &tok.value {
                 TokenValue::Char(c)
                 | TokenValue::WideChar(c)
@@ -1797,16 +1923,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 _ => None,
             };
             if let Some(char_str) = char_str {
+                let pos = tok.pos;
                 self.advance();
-                if char_str.is_empty() {
-                    return PpValue::signed(0);
-                }
-                // Pack all chars big-endian (GCC-compatible)
-                let mut val: i64 = 0;
-                for c in char_str.chars() {
-                    val = (val << 8) | (c as i64);
-                }
-                return PpValue::signed(val as i128);
+                return self.char_constant(&char_str, wide, pos);
             }
         }
 
@@ -1819,7 +1938,78 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             }
         }
 
+        // Nothing here can start an operand. Reaching this used to return zero
+        // in silence, which is why a string literal, a stray punctuator or a
+        // missing operand all quietly chose a branch.
+        match self.current().cloned() {
+            None => {
+                let pos = self.here();
+                self.err(pos, &gettext("expression expected"));
+            }
+            Some(tok) => {
+                let spelling = self.spell(&tok);
+                // Do not advance: the caller's operator loop stops on this
+                // token, and consuming it here would hide the rest of the line.
+                self.err_token(
+                    tok.pos,
+                    "token \"{0}\" is not valid in preprocessor expressions",
+                    &spelling,
+                );
+            }
+        }
         PpValue::signed(0)
+    }
+
+    /// The value of a character constant in a controlling expression.
+    ///
+    /// The token payload is the source spelling between the quotes, so the
+    /// escapes are still in it: `'\n'` arrives as the two characters `\` and
+    /// `n`. Packing that verbatim is how `#if '\n'` came to be 23662 and
+    /// `#if '\0'` came to be *true*. Decoding goes through the same
+    /// [`literal`] module the parser uses, so `#if 'c' == V` and the compiled
+    /// `'c' == V` cannot disagree.
+    fn char_constant(&mut self, payload: &str, wide: bool, pos: Position) -> PpValue {
+        let elements = literal::parse_string_literal(payload);
+        for e in &elements {
+            if let literal::Escaped::ForbiddenUcn(val) = e {
+                if !self.suppressed {
+                    report_forbidden_ucn(pos, *val);
+                }
+            }
+        }
+        if elements.is_empty() {
+            self.err(pos, "empty character constant");
+            return PpValue::signed(0);
+        }
+
+        // A prefixed constant holds characters, not bytes: `L'\n'` is the one
+        // wide character 10, never the two bytes of a UTF-8 encoding.
+        if wide {
+            let units = literal::literal_wide_chars(&elements);
+            return PpValue::signed(units.first().copied().unwrap_or(0) as i128);
+        }
+
+        // C17 6.4.4.4p10: an ordinary character constant has type `int`. One
+        // character takes plain `char`'s signedness, so `'\xff'` is negative
+        // where `char` is signed and positive where it is not -- which is the
+        // whole reason `Target::char_signed` exists.
+        let bytes: Vec<u8> = payload_bytes(&literal::literal_bytes(&elements)).collect();
+        if bytes.len() == 1 {
+            let b = bytes[0];
+            return PpValue::signed(if self.pp.target.char_signed {
+                b as i8 as i128
+            } else {
+                b as i128
+            });
+        }
+
+        // More than one: gcc packs big-endian and lets the value wrap in
+        // `int`, so `'abcde'` keeps only its last four bytes.
+        let mut val: u32 = 0;
+        for b in bytes {
+            val = (val << 8) | b as u32;
+        }
+        PpValue::signed(val as i32 as i128)
     }
 
     fn eval_defined(&mut self) -> i64 {
@@ -1937,29 +2127,56 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     /// into `u64` first is what makes `#if 0xFFFFFFFFFFFFFFFF` work; the old
     /// `i64::from_str_radix(...).unwrap_or(0)` turned every such constant into
     /// a silent zero.
-    fn parse_number(&self, s: &str) -> PpValue {
-        let digits = s.trim_end_matches(['u', 'U', 'l', 'L']);
-        let suffix = &s[digits.len()..];
-        let suffix_unsigned = suffix.contains('u') || suffix.contains('U');
+    fn parse_number(&mut self, s: &str, pos: Position) -> PpValue {
+        // C17 6.10.1p4: the operands are integer constants. A pp-number that
+        // is not one used to evaluate to zero in silence, so `#if 1.5` picked
+        // the else branch and `#if 1zz` picked it too.
+        if s.contains('.')
+            || ((s.contains('e') || s.contains('E'))
+                && !s.starts_with("0x")
+                && !s.starts_with("0X"))
+            || ((s.contains('p') || s.contains('P'))
+                && (s.starts_with("0x") || s.starts_with("0X")))
+        {
+            self.err_token(
+                pos,
+                "floating constant \"{0}\" in preprocessor expression",
+                s,
+            );
+            return PpValue::signed(0);
+        }
 
-        let (body, radix) = if let Some(hex) = digits
-            .strip_prefix("0x")
-            .or_else(|| digits.strip_prefix("0X"))
-        {
-            (hex, 16)
-        } else if let Some(bin) = digits
-            .strip_prefix("0b")
-            .or_else(|| digits.strip_prefix("0B"))
-        {
-            (bin, 2)
-        } else if digits.len() > 1
-            && digits.starts_with('0')
-            && digits[1..].starts_with(|c: char| c.is_ascii_digit())
-        {
-            (&digits[1..], 8)
-        } else {
-            (digits, 10)
-        };
+        // Split at the first character the radix cannot spell, rather than
+        // trimming a suffix off the end: `1zz` has no valid suffix to trim, so
+        // the old trim left `1zz` as the body and the parse failure went
+        // unreported.
+        let (prefix, radix) =
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                (hex, 16)
+            } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+                (bin, 2)
+            } else if s.len() > 1
+                && s.starts_with('0')
+                && s[1..].starts_with(|c: char| c.is_ascii_digit())
+            {
+                (&s[1..], 8)
+            } else {
+                (s, 10)
+            };
+        let digit_len = prefix
+            .find(|c: char| !c.is_digit(radix))
+            .unwrap_or(prefix.len());
+        let (body, suffix) = prefix.split_at(digit_len);
+
+        if body.is_empty() {
+            self.err_token(pos, "invalid integer constant \"{0}\"", s);
+            return PpValue::signed(0);
+        }
+        if !suffix_is_valid(suffix) {
+            self.err_token(pos, "invalid suffix \"{0}\" on integer constant", suffix);
+            return PpValue::signed(0);
+        }
+        let suffix_unsigned = suffix.contains('u') || suffix.contains('U');
 
         match u64::from_str_radix(body, radix) {
             Ok(v) => {
@@ -1968,9 +2185,106 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 let unsigned = suffix_unsigned || v > i64::MAX as u64;
                 PpValue::from_parts(v as i128, unsigned)
             }
-            Err(_) => PpValue::signed(0),
+            // The body is all digits of the radix, so the only way to fail is
+            // to be wider than `uintmax_t`.
+            Err(_) => {
+                self.err_token(pos, "integer constant \"{0}\" is too large", s);
+                PpValue::signed(0)
+            }
         }
     }
+}
+
+/// Where a `#if` scan is within a `defined` operator.
+///
+/// The operand must not be macro-expanded (C17 6.10.1p1), and recognising it
+/// requires walking the condition in the same pass that expands the rest: a
+/// pass beforehand cannot see a `defined` that an expansion produces, and a
+/// pass afterwards finds the operand already expanded away. This is the four
+/// states that walk needs -- the same shape as sparse's `expression_value`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefinedScan {
+    /// Not in a `defined` operator.
+    Idle,
+    /// Just past `defined`; the next token is either `(` or the operand.
+    SawOperator,
+    /// Just past `defined (`; the next identifier is the operand.
+    SawParen,
+    /// Past `defined ( X`; expecting the `)`.
+    NeedClose,
+}
+
+impl DefinedScan {
+    /// Step over an identifier. The `bool` says whether this identifier is a
+    /// `defined` operand and must therefore be emitted unexpanded.
+    fn identifier(self, token: &Token, idents: &IdentTable) -> (Self, bool) {
+        let is_operator = match &token.value {
+            TokenValue::Ident(id) => idents.get_opt(*id) == Some("defined"),
+            _ => false,
+        };
+        match self {
+            // `defined defined` -- the operand is the identifier, whatever it
+            // is spelled, so it is protected rather than treated as a second
+            // operator.
+            Self::SawOperator | Self::SawParen => {
+                let next = if self == Self::SawParen {
+                    Self::NeedClose
+                } else {
+                    Self::Idle
+                };
+                (next, true)
+            }
+            _ if is_operator => (Self::SawOperator, false),
+            _ => (Self::Idle, false),
+        }
+    }
+
+    /// Step over a punctuator.
+    fn punctuator(self, token: &Token) -> Self {
+        let TokenValue::Special(code) = &token.value else {
+            return Self::Idle;
+        };
+        match self {
+            Self::SawOperator if *code == b'(' as u32 => Self::SawParen,
+            Self::NeedClose if *code == b')' as u32 => Self::Idle,
+            _ => Self::Idle,
+        }
+    }
+}
+
+/// A synthetic decimal pp-number token, for the `0`/`1` a `defined` operator
+/// stands for and the `0` an unresolved identifier becomes.
+fn pp_number(text: &str, pos: Position) -> Token {
+    Token {
+        typ: TokenType::Number,
+        value: TokenValue::Number(text.to_string()),
+        pos,
+        spelling: Spelling::Canonical,
+        no_expand: None,
+    }
+}
+
+/// The integer-suffix grammar of C17 6.4.4.1: `u`/`U` at most once, and `l`,
+/// `L`, `ll` or `LL` at most once, in either order.
+fn suffix_is_valid(suffix: &str) -> bool {
+    let mut rest = suffix;
+    let mut seen_unsigned = false;
+    let mut seen_long = false;
+    while !rest.is_empty() {
+        if !seen_unsigned && (rest.starts_with('u') || rest.starts_with('U')) {
+            seen_unsigned = true;
+            rest = &rest[1..];
+        } else if !seen_long && (rest.starts_with("ll") || rest.starts_with("LL")) {
+            seen_long = true;
+            rest = &rest[2..];
+        } else if !seen_long && (rest.starts_with('l') || rest.starts_with('L')) {
+            seen_long = true;
+            rest = &rest[1..];
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 // ============================================================================

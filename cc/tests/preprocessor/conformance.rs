@@ -1263,3 +1263,143 @@ fn preprocessor_diagnostic_outside_a_header_has_no_include_chain() {
         r.stderr
     );
 }
+
+/// Every one of these used to evaluate to zero in silence and pick a branch.
+/// A typo in a feature test compiled the wrong half of the file with nothing
+/// on stderr to say so, which is the worst failure a preprocessor has.
+///
+/// The message text is asserted, not just the rejection: a check that only
+/// looks at the exit status passes when the wrong diagnostic fires.
+#[test]
+fn preprocessor_malformed_if_is_diagnosed() {
+    for (name, cond, needle) in [
+        ("empty", "", "#if with no expression"),
+        ("unclosed_paren", "(1", "missing ')' in expression"),
+        ("garbage_tail", "1 2 3", "missing binary operator"),
+        (
+            "assignment",
+            "X = 2",
+            "not valid in preprocessor expressions",
+        ),
+        ("float", "1.5", "floating constant"),
+        ("hex_float", "0x1p3", "floating constant"),
+        ("string", "\"abc\"", "not valid in preprocessor expressions"),
+        ("bad_suffix", "1zz", "invalid suffix"),
+        ("bad_octal", "07778", "invalid suffix"),
+        ("defined_nonident", "defined(1)", "requires an identifier"),
+        (
+            "defined_unclosed",
+            "defined(X",
+            "missing ')' after \"defined\"",
+        ),
+    ] {
+        let src = format!(
+            "#if {}\nint taken = 1;\n#endif\nint main(void){{return 0;}}\n",
+            cond
+        );
+        let r = preprocess_text(&format!("bad_if_{}", name), &src, &[]);
+        assert!(
+            !r.success,
+            "#if {:?} should be rejected, but -E succeeded:\n{}",
+            cond, r.stdout
+        );
+        assert!(
+            r.stderr.contains(needle),
+            "#if {:?} should say {:?}, got:\n{}",
+            cond,
+            needle,
+            r.stderr
+        );
+    }
+}
+
+/// A shift count outside [0, 64) is undefined. c17 clamps it, which is a fine
+/// answer, but clamping in silence made `#if (1 << 64) == 0` false with
+/// nothing to explain it. gcc warns rather than erroring, so the expression
+/// still evaluates and the file still compiles.
+#[test]
+fn preprocessor_out_of_range_shift_warns() {
+    let src = "#if (1 << 64) == 0\nint taken = 1;\n#endif\nint main(void){return 0;}\n";
+    let r = preprocess_text("shift_overflow", src, &[]);
+    assert!(
+        r.success,
+        "a shift overflow is a warning, not an error:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr
+            .contains("integer overflow in preprocessor expression"),
+        "expected an overflow warning, got:\n{}",
+        r.stderr
+    );
+}
+
+/// A short-circuited operand is not evaluated, so nothing in it may be
+/// diagnosed — the same rule that already keeps `#if 0 && 1/0` quiet.
+#[test]
+fn preprocessor_short_circuit_suppresses_if_diagnostics() {
+    let src = "#if 0 && (1\nint taken = 1;\n#endif\nint main(void){return 0;}\n";
+    let r = preprocess_text("short_circuit_quiet", src, &[]);
+    assert!(
+        r.success,
+        "the skipped operand must not be diagnosed:\n{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("missing ')'"),
+        "the skipped operand must not be diagnosed:\n{}",
+        r.stderr
+    );
+}
+
+/// `#if 'c'` and the compiled `'c'` must agree. They did not: the evaluator
+/// packed the source spelling, so `'\n'` was 23662 and `'\0'` was true.
+#[test]
+fn preprocessor_if_character_constants_match_the_compiler() {
+    let src = r#"
+#if '\n' != 10
+#error newline
+#endif
+#if '\0' != 0
+#error nul
+#endif
+#if '\x41' != 65
+#error hex
+#endif
+#if '\101' != 65
+#error octal
+#endif
+#if L'\n' != 10
+#error wide
+#endif
+int main(void) {
+    // The same expressions, compiled. A disagreement here is the bug.
+    if ('\n' != 10) return 1;
+    if ('\0' != 0) return 2;
+    if ('\x41' != 65) return 3;
+    if ('\101' != 65) return 4;
+    if (L'\n' != 10) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(
+        crate::common::compile_and_run("if_char_agrees", src, &[]),
+        0
+    );
+}
+
+/// C17 6.4.4.4p10: an ordinary character constant carries plain `char`'s
+/// signedness, which differs by target. `compile_and_run` only ever exercises
+/// the host, so the other answer is only visible through `--target`.
+#[test]
+fn preprocessor_if_char_signedness_is_per_target() {
+    let src = "#if '\\xff' < 0\nSIGNED_CHAR\n#else\nUNSIGNED_CHAR\n#endif\n";
+    for (target, want) in [
+        ("x86_64-unknown-linux-gnu", "SIGNED_CHAR"),
+        ("aarch64-unknown-linux-gnu", "UNSIGNED_CHAR"),
+    ] {
+        let r = preprocess_text("char_sign", src, &["--target", target]);
+        assert!(r.success, "-E failed for {}: {}", target, r.stderr);
+        assert_has(&r.stdout, want, target);
+    }
+}

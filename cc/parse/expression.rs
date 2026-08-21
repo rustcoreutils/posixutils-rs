@@ -19,43 +19,12 @@ use crate::float::FloatVal;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
+use crate::token::literal;
 use crate::types::{AssignFault, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
 const DEFAULT_INIT_CAPACITY: usize = 8;
-
-/// What one escape sequence contributes to a literal.
-///
-/// The distinction is the whole point: every escape but a universal character
-/// name denotes a single byte of the execution character set, while a UCN
-/// denotes a *code point* that the execution character set then encodes. c17
-/// stores a narrow literal as one `char` per byte, and returning a UCN's code
-/// point as if it were a byte is how `"caf\u00e9"` became the single byte
-/// 0xE9 -- five bytes and Latin-1, where gcc gives six and UTF-8.
-pub(crate) enum Escaped {
-    /// One byte named by an escape: `\n`, `\x41`, `\101`. It is one element
-    /// of a wide literal whatever its value -- `L"\xc3\xa9"` is two wide
-    /// characters, not one, because the program asked for two byte values.
-    Byte(u8),
-    /// One byte of the source text itself. The lexer hands over a source
-    /// character one byte at a time, so a run of these is the UTF-8 of a
-    /// character the programmer typed, and a wide literal wants that character
-    /// rather than its bytes.
-    ///
-    /// Kept apart from `Byte` because after escape processing the two look
-    /// identical, and collapsing them makes `L"café"` and `L"caf\xc3\xa9"`
-    /// the same literal when C says they differ.
-    SourceByte(u8),
-    /// A code point named by a universal character name, which the execution
-    /// character set encodes.
-    CodePoint(char),
-    /// A universal character name that names a character C17 6.4.3p2 forbids:
-    /// below 00A0 other than `$`, `@` and `` ` ``, or a UTF-16 surrogate.
-    /// Carries the scalar so the diagnostic can name it -- a surrogate has no
-    /// `char` to carry.
-    ForbiddenUcn(u32),
-}
 
 impl<'a> Parser<'a> {
     // ========================================================================
@@ -1856,7 +1825,7 @@ impl<'a> Parser<'a> {
         let start_pos = self.current_pos();
         // Elements of the concatenated literal, still distinguishing a byte
         // from a named character so each encoding can ask for what it needs.
-        let mut elements: Vec<Escaped> = Vec::new();
+        let mut elements: Vec<literal::Escaped> = Vec::new();
         let mut encoding: Option<TokenType> = None;
         let mut mixed_reported = false;
 
@@ -1873,12 +1842,12 @@ impl<'a> Parser<'a> {
                         | TokenValue::WideString(s)
                         | TokenValue::Utf16String(s)
                         | TokenValue::Utf32String(s) => {
-                            let piece = Self::parse_string_literal(s);
+                            let piece = literal::parse_string_literal(s);
                             // `parse_string_literal` has no position to report
                             // from, so the constraint is raised here, where the
                             // token still does.
                             for e in &piece {
-                                if let Escaped::ForbiddenUcn(val) = e {
+                                if let literal::Escaped::ForbiddenUcn(val) = e {
                                     self.report_forbidden_ucn_at(token.pos, *val);
                                 }
                             }
@@ -1912,7 +1881,7 @@ impl<'a> Parser<'a> {
             // char[N]. Each element is a byte, and `bytes` already holds one
             // char per byte, so the count is exact for non-ASCII too.
             None => {
-                let bytes = Self::literal_bytes(&elements);
+                let bytes = literal::literal_bytes(&elements);
                 let array_size = bytes.chars().count() + 1;
                 let str_type = self
                     .types
@@ -1929,7 +1898,7 @@ impl<'a> Parser<'a> {
             // straight through instead gave `L"café"` five elements, the first
             // two being the halves of the UTF-8 pair.
             Some(TokenType::WideString) => {
-                let units = Self::literal_wide_chars(&elements);
+                let units = literal::literal_wide_chars(&elements);
                 let wstr_type = self
                     .types
                     .intern(Type::array(self.types.int_id, units.len() + 1));
@@ -1949,7 +1918,7 @@ impl<'a> Parser<'a> {
             // code point outside the BMP becomes a surrogate pair in the
             // char16_t case.
             Some(kind @ (TokenType::Utf16String | TokenType::Utf32String)) => {
-                let text: String = Self::literal_wide_chars(&elements)
+                let text: String = literal::literal_wide_chars(&elements)
                     .into_iter()
                     .map(|u| char::from_u32(u).unwrap_or('\u{fffd}'))
                     .collect();
@@ -4397,7 +4366,7 @@ impl<'a> Parser<'a> {
                     // character, converted to `int` -- so its signedness is
                     // plain `char`'s, which is the target's. `'\x80'` is -128
                     // where `char` is signed and 128 where it is not.
-                    let (v, is_code_point) = self.parse_char_literal_value(s);
+                    let (v, is_code_point) = literal::char_literal_value(s, self.current_pos());
                     let value = if is_code_point {
                         // Not a byte, so plain `char`'s signedness does not
                         // reach it.
@@ -4431,7 +4400,7 @@ impl<'a> Parser<'a> {
                         // A prefixed constant takes the code point in its own
                         // type, with no reference to plain `char`'s
                         // signedness: `L'\x80'` is 128, not -128.
-                        let (code_point, _) = self.parse_char_literal_value(s);
+                        let (code_point, _) = literal::char_literal_value(s, self.current_pos());
                         let (typ, value) = match kind {
                             // wchar_t is int on the targets here.
                             TokenType::WideChar => (self.types.int_id, code_point as i32 as i64),
@@ -4856,135 +4825,6 @@ impl<'a> Parser<'a> {
         Ok((mantissa, exp2))
     }
 
-    /// Parse an escape sequence starting at position i (after the backslash).
-    ///
-    /// Returns what it denotes -- a byte, or a code point for a universal
-    /// character name -- and how many characters after the backslash it
-    /// consumed. See [`Escaped`] for why the two are not the same thing.
-    fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize) {
-        if i >= chars.len() {
-            return (Escaped::Byte(b'\\'), 0);
-        }
-
-        match chars[i] {
-            'n' => (Escaped::Byte(b'\n'), 1),
-            't' => (Escaped::Byte(b'\t'), 1),
-            'r' => (Escaped::Byte(b'\r'), 1),
-            '\\' => (Escaped::Byte(b'\\'), 1),
-            '\'' => (Escaped::Byte(b'\''), 1),
-            '"' => (Escaped::Byte(b'"'), 1),
-            'a' => (Escaped::Byte(0x07), 1), // bell
-            'b' => (Escaped::Byte(0x08), 1), // backspace
-            'f' => (Escaped::Byte(0x0C), 1), // form feed
-            'v' => (Escaped::Byte(0x0B), 1), // vertical tab
-            'x' => {
-                // Hex escape \xHH - consume all hex digits
-                let mut hex_chars = 0;
-                while i + 1 + hex_chars < chars.len()
-                    && chars[i + 1 + hex_chars].is_ascii_hexdigit()
-                {
-                    hex_chars += 1;
-                }
-                if hex_chars > 0 {
-                    let hex: String = chars[i + 1..i + 1 + hex_chars].iter().collect();
-                    // C allows arbitrary-length hex escapes, but only low 8 bits matter
-                    let val = u64::from_str_radix(&hex, 16).unwrap_or(0) as u8;
-                    (Escaped::Byte(val), 1 + hex_chars)
-                } else {
-                    (Escaped::Byte(b'x'), 1) // \x with no hex digits - just 'x'
-                }
-            }
-            'u' => {
-                // UCN \uXXXX - exactly 4 hex digits (C99 6.4.3)
-                if i + 4 < chars.len() && chars[i + 1..i + 5].iter().all(|c| c.is_ascii_hexdigit())
-                {
-                    let hex: String = chars[i + 1..i + 5].iter().collect();
-                    let val = u32::from_str_radix(&hex, 16).unwrap_or(0);
-                    if crate::token::lexer::ucn_is_forbidden(val) {
-                        (Escaped::ForbiddenUcn(val), 5)
-                    } else if let Some(c) = char::from_u32(val) {
-                        (Escaped::CodePoint(c), 5)
-                    } else {
-                        (Escaped::Byte(b'u'), 1) // Invalid code point
-                    }
-                } else {
-                    (Escaped::Byte(b'u'), 1) // Not enough hex digits
-                }
-            }
-            'U' => {
-                // UCN \UXXXXXXXX - exactly 8 hex digits (C99 6.4.3)
-                if i + 8 < chars.len() && chars[i + 1..i + 9].iter().all(|c| c.is_ascii_hexdigit())
-                {
-                    let hex: String = chars[i + 1..i + 9].iter().collect();
-                    let val = u32::from_str_radix(&hex, 16).unwrap_or(0);
-                    if crate::token::lexer::ucn_is_forbidden(val) {
-                        (Escaped::ForbiddenUcn(val), 9)
-                    } else if let Some(c) = char::from_u32(val) {
-                        (Escaped::CodePoint(c), 9)
-                    } else {
-                        (Escaped::Byte(b'U'), 1) // Invalid code point
-                    }
-                } else {
-                    (Escaped::Byte(b'U'), 1) // Not enough hex digits
-                }
-            }
-            c if c.is_ascii_digit() && c != '8' && c != '9' => {
-                // Octal escape \NNN (up to 3 digits)
-                let mut oct_chars = 1;
-                while oct_chars < 3
-                    && i + oct_chars < chars.len()
-                    && chars[i + oct_chars].is_ascii_digit()
-                    && chars[i + oct_chars] != '8'
-                    && chars[i + oct_chars] != '9'
-                {
-                    oct_chars += 1;
-                }
-                let oct: String = chars[i..i + oct_chars].iter().collect();
-                let val = u8::from_str_radix(&oct, 8).unwrap_or(0);
-                (Escaped::Byte(val), oct_chars)
-            }
-            // An unknown escape stands for the character itself. In a narrow
-            // literal that character came from the source one byte at a time,
-            // so it is already a byte.
-            c => (Escaped::Byte(c as u32 as u8), 1),
-        }
-    }
-
-    /// Parse a character literal into its scalar value, and say whether that
-    /// value is a single *byte* or a *code point*.
-    ///
-    /// The distinction decides whether plain `char`'s signedness applies: a
-    /// byte is what a `char` object would hold, so `'\x80'` is subject to it
-    /// (C17 6.4.4.4p10), while a code point is not a byte at all and is
-    /// carried through unchanged.
-    fn parse_char_literal_value(&self, s: &str) -> (u32, bool) {
-        if s.is_empty() {
-            return (0, false);
-        }
-
-        let chars: Vec<char> = s.chars().collect();
-        if chars[0] == '\\' && chars.len() > 1 {
-            match Self::parse_escape_sequence(&chars, 1).0 {
-                Escaped::Byte(b) | Escaped::SourceByte(b) => (b as u32, false),
-                Escaped::ForbiddenUcn(val) => {
-                    self.report_forbidden_ucn(val);
-                    (val, true)
-                }
-                // `'\u00e9'` names a code point. gcc makes it a multi-character
-                // constant of its UTF-8 bytes, with a warning; c17 keeps the
-                // code point, which is the more useful answer for the one place
-                // this is used and costs nothing elsewhere. Truncating it to a
-                // byte here would lose that, and would flatten `'\U0001F600'`
-                // to zero.
-                Escaped::CodePoint(c) => (c as u32, true),
-            }
-        } else {
-            // The lexer stores one `char` per source byte, so an ordinary
-            // character is a byte even when the source is UTF-8.
-            (chars[0] as u32, false)
-        }
-    }
-
     /// C17 6.4.3p2: a universal character name may not name a character below
     /// 00A0 other than `$`, `@` and `` ` ``, nor a UTF-16 surrogate.
     ///
@@ -4993,95 +4833,8 @@ impl<'a> Parser<'a> {
     /// reads the source as text. Both were accepted silently -- a surrogate
     /// even degraded to the letter `u`, because `char::from_u32` rejects it
     /// and the caller took that for "not an escape".
-    fn report_forbidden_ucn(&self, val: u32) {
-        self.report_forbidden_ucn_at(self.current_pos(), val);
-    }
-
     fn report_forbidden_ucn_at(&self, pos: Position, val: u32) {
         crate::token::lexer::report_forbidden_ucn(pos, val);
-    }
-
-    /// Parse a string literal, converting escape sequences to their actual values.
-    /// This implements C99 translation phase 5 for string literals.
-    pub(crate) fn parse_string_literal(s: &str) -> Vec<Escaped> {
-        let chars: Vec<char> = s.chars().collect();
-        let mut result = Vec::with_capacity(chars.len());
-        let mut i = 0;
-
-        while i < chars.len() {
-            if chars[i] == '\\' && i + 1 < chars.len() {
-                let (escaped, consumed) = Self::parse_escape_sequence(&chars, i + 1);
-                result.push(escaped);
-                i += 1 + consumed;
-            } else {
-                // The lexer hands over one `char` per source *byte*, so a
-                // character written directly in the source arrives as the
-                // bytes of its UTF-8 -- marked as such, since a wide literal
-                // has to put them back together.
-                result.push(Escaped::SourceByte(chars[i] as u32 as u8));
-                i += 1;
-            }
-        }
-
-        result
-    }
-
-    /// The bytes a literal's elements make in the execution character set.
-    pub(crate) fn literal_bytes(elements: &[Escaped]) -> String {
-        let mut out = String::with_capacity(elements.len());
-        for e in elements {
-            match e {
-                Escaped::Byte(b) | Escaped::SourceByte(b) => out.push(*b as char),
-                // Already diagnosed where the literal was parsed; encoded as
-                // written so the rest of the literal still makes sense.
-                Escaped::ForbiddenUcn(v) => out.push(*v as u8 as char),
-                Escaped::CodePoint(c) => {
-                    let mut buf = [0u8; 4];
-                    for b in c.encode_utf8(&mut buf).as_bytes() {
-                        out.push(*b as char);
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// The wide elements a literal's elements make: one per character.
-    ///
-    /// A universal character name already names one. A run of source bytes is
-    /// the UTF-8 of one, and is decoded. A byte named by an escape is one
-    /// element on its own, whatever its value.
-    fn literal_wide_chars(elements: &[Escaped]) -> Vec<u32> {
-        let mut out = Vec::with_capacity(elements.len());
-        let mut run = Vec::new();
-        let flush = |run: &mut Vec<u8>, out: &mut Vec<u32>| {
-            if !run.is_empty() {
-                for c in String::from_utf8_lossy(run).chars() {
-                    out.push(c as u32);
-                }
-                run.clear();
-            }
-        };
-        for e in elements {
-            match e {
-                Escaped::SourceByte(b) => run.push(*b),
-                Escaped::Byte(b) => {
-                    flush(&mut run, &mut out);
-                    out.push(*b as u32);
-                }
-                // Already diagnosed where the literal was parsed.
-                Escaped::ForbiddenUcn(v) => {
-                    flush(&mut run, &mut out);
-                    out.push(*v);
-                }
-                Escaped::CodePoint(c) => {
-                    flush(&mut run, &mut out);
-                    out.push(*c as u32);
-                }
-            }
-        }
-        flush(&mut run, &mut out);
-        out
     }
 
     /// What is statically known about the object a pointer expression

@@ -143,7 +143,7 @@ impl<'a> Preprocessor<'a> {
             crate::kw::IFDEF => self.handle_ifdef(iter, idents, hash_token.pos),
             crate::kw::IFNDEF => self.handle_ifndef(iter, idents, hash_token.pos),
             crate::kw::IF => self.handle_if(iter, idents, hash_token.pos),
-            crate::kw::ELIF => self.handle_elif(iter, idents),
+            crate::kw::ELIF => self.handle_elif(iter, idents, hash_token.pos),
             crate::kw::ELSE => self.handle_else(iter),
             crate::kw::ENDIF => self.handle_endif(iter),
             crate::kw::INCLUDE => self.handle_include(iter, output, idents, hash_token, false),
@@ -507,15 +507,19 @@ impl<'a> Preprocessor<'a> {
         } else {
             // Expand macros before evaluation (per C standard)
             let expanded = self.expand_if_tokens(&tokens, idents);
-            self.evaluate_expression(&expanded, idents)
+            self.evaluate_expression(&expanded, idents, pos)
         };
 
         self.push_conditional(value, pos);
     }
 
     /// Handle #elif
-    fn handle_elif<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &mut IdentTable)
-    where
+    fn handle_elif<I>(
+        &mut self,
+        iter: &mut std::iter::Peekable<I>,
+        idents: &mut IdentTable,
+        pos: Position,
+    ) where
         I: Iterator<Item = Token>,
     {
         let tokens = self.collect_to_eol(iter);
@@ -530,7 +534,7 @@ impl<'a> Preprocessor<'a> {
         let expr_value = if should_eval {
             // Expand macros before evaluation (per C standard)
             let expanded = self.expand_if_tokens(&tokens, idents);
-            self.evaluate_expression(&expanded, idents)
+            self.evaluate_expression(&expanded, idents, pos)
         } else {
             false
         };

@@ -27,135 +27,104 @@ pub(super) fn replacement_lists_identical(a: &[MacroToken], b: &[MacroToken]) ->
 }
 
 impl<'a> Preprocessor<'a> {
-    /// Expand macros in #if/#elif condition tokens.
-    /// This follows the C standard: macros are expanded, except for arguments to `defined`.
-    /// Undefined identifiers are replaced with 0.
+    /// Resolve one `defined` operator: `defined X` or `defined ( X )`.
+    ///
+    /// `i` indexes the token just after `defined`. Returns the `0`/`1` it
+    /// stands for and the index past the operand.
+    fn resolve_defined(
+        &self,
+        tokens: &[Token],
+        mut i: usize,
+        pos: Position,
+        idents: &IdentTable,
+    ) -> (Token, usize) {
+        let has_paren = matches!(
+            tokens.get(i).map(|t| &t.value),
+            Some(TokenValue::Special(code)) if *code == b'(' as u32
+        );
+        if has_paren {
+            i += 1;
+        }
+
+        let is_defined = match tokens.get(i).map(|t| &t.value) {
+            Some(TokenValue::Ident(id)) => {
+                let defined = idents.get_opt(*id).is_some_and(|n| self.is_defined(n));
+                i += 1;
+                defined
+            }
+            _ => {
+                diag::error(pos, &gettext("operator \"defined\" requires an identifier"));
+                false
+            }
+        };
+
+        if has_paren {
+            let closed = matches!(
+                tokens.get(i).map(|t| &t.value),
+                Some(TokenValue::Special(code)) if *code == b')' as u32
+            );
+            if closed {
+                i += 1;
+            } else {
+                diag::error(pos, &gettext("missing ')' after \"defined\""));
+            }
+        }
+
+        (pp_number(if is_defined { "1" } else { "0" }, pos), i)
+    }
+
+    /// Expand macros in `#if`/`#elif` condition tokens.
+    ///
+    /// C17 6.10.1p1: macros are expanded, except for the operand of `defined`,
+    /// and every identifier that survives becomes `0`.
+    ///
+    /// `defined` is recognised on both sides of expansion. Doing it only
+    /// beforehand -- which is what the standard's wording literally describes
+    /// -- left a `defined` that came *out* of an expansion to be zeroed along
+    /// with everything else, so `#define D defined(FOO)` / `#if D` evaluated
+    /// `0 (1)`. That form is undefined behaviour, but gcc, clang and MSVC all
+    /// agree on the answer and the `IS_ENABLED(x)` idiom depends on it.
     pub(super) fn expand_if_tokens(
         &mut self,
         tokens: &[Token],
         idents: &mut IdentTable,
     ) -> Vec<Token> {
-        let mut result = Vec::new();
-        let mut i = 0;
-
-        while i < tokens.len() {
-            let token = &tokens[i];
-
-            // Check for `defined` operator
-            if let TokenValue::Ident(id) = &token.value {
-                if let Some(name) = idents.get_opt(*id) {
-                    if name == "defined" {
-                        // Handle defined(X) or defined X
-                        let pos = token.pos;
-                        i += 1;
-
-                        // Skip optional whitespace and check for paren
-                        let has_paren = if i < tokens.len() {
-                            if let TokenValue::Special(code) = &tokens[i].value {
-                                *code == b'(' as u32
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if has_paren {
-                            i += 1; // skip '('
-                        }
-
-                        // Get the identifier to check
-                        let is_defined = if i < tokens.len() {
-                            if let TokenValue::Ident(check_id) = &tokens[i].value {
-                                if let Some(check_name) = idents.get_opt(*check_id) {
-                                    i += 1;
-                                    self.is_defined(check_name)
-                                } else {
-                                    i += 1;
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if has_paren {
-                            // Skip closing ')'
-                            if i < tokens.len() {
-                                if let TokenValue::Special(code) = &tokens[i].value {
-                                    if *code == b')' as u32 {
-                                        i += 1;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Replace with 0 or 1
-                        result.push(Token {
-                            typ: TokenType::Number,
-                            value: TokenValue::Number(if is_defined {
-                                "1".to_string()
-                            } else {
-                                "0".to_string()
-                            }),
-                            pos,
-                            spelling: Spelling::Canonical,
-                            no_expand: None,
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            // Not `defined` - collect this token for expansion
-            result.push(token.clone());
-            i += 1;
-        }
-
-        // Now expand macros in the result (except `defined` which we already handled)
-        // We need to temporarily disable skipping because we're evaluating an expression
-        // that will determine whether to skip. Push a dummy "Active" conditional.
+        // Expand, with `defined` operands protected on the way through. The
+        // condition decides whether to skip, so the expansion itself must not
+        // be skipped: push a dummy active group.
         self.cond_stack.push(Conditional {
             state: CondState::Active,
             had_true: true,
             pos: Position::default(),
         });
-        let expanded = self.preprocess(result, idents);
+        let saved_in_if = std::mem::replace(&mut self.in_if_condition, true);
+        let expanded = self.preprocess(tokens.to_vec(), idents);
+        self.in_if_condition = saved_in_if;
         self.cond_stack.pop();
 
-        // Replace any remaining undefined identifiers with 0
+        // Now resolve the operators, then zero whatever identifiers remain.
         let mut final_result = Vec::new();
-        for token in expanded {
-            if let TokenValue::Ident(id) = &token.value {
-                if let Some(name) = idents.get_opt(*id) {
-                    // Check if it's a defined macro
-                    if self.get_macro(name).is_some() {
-                        // This shouldn't happen after expansion, but keep it
-                        final_result.push(token);
-                    } else {
-                        // Undefined identifier -> 0
-                        final_result.push(Token {
-                            typ: TokenType::Number,
-                            value: TokenValue::Number("0".to_string()),
-                            pos: token.pos,
-                            spelling: Spelling::Canonical,
-                            no_expand: None,
-                        });
-                    }
-                } else {
-                    // Unknown identifier -> 0
-                    final_result.push(Token {
-                        typ: TokenType::Number,
-                        value: TokenValue::Number("0".to_string()),
-                        pos: token.pos,
-                        spelling: Spelling::Canonical,
-                        no_expand: None,
-                    });
+        let mut i = 0;
+        while i < expanded.len() {
+            let token = &expanded[i];
+            let TokenValue::Ident(id) = &token.value else {
+                final_result.push(token.clone());
+                i += 1;
+                continue;
+            };
+            match idents.get_opt(*id) {
+                Some("defined") => {
+                    let (tok, next) = self.resolve_defined(&expanded, i + 1, token.pos, idents);
+                    final_result.push(tok);
+                    i = next;
                 }
-            } else {
-                final_result.push(token);
+                // Still a macro name after expansion means it was blue-painted
+                // by its own expansion; it is not defined *here*, so it is 0
+                // like any other identifier.
+                _ => {
+                    final_result.push(pp_number("0", token.pos));
+                    i += 1;
+                }
             }
         }
 

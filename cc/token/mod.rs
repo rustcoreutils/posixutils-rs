@@ -10,6 +10,7 @@
 //
 
 pub mod lexer;
+pub mod literal;
 pub mod preprocess;
 
 // Re-export items used by main.rs

@@ -1419,6 +1419,134 @@ fn test_if_multichar_constant() {
     );
 }
 
+/// `#if` runs one branch of a conditional; picking the wrong one is silent.
+/// Every case here used to pick the wrong one, because the evaluator packed
+/// the *source spelling* between the quotes: `'\n'` was the two characters
+/// `\` and `n`, so it evaluated to 23662, and `'\0'` evaluated to 23600 --
+/// which is to say `#if '\0'` was true.
+#[test]
+fn test_if_character_escapes() {
+    for (expr, want_yes) in [
+        ("'\\n' == 10", true),
+        ("'\\0' == 0", true),
+        ("'\\0'", false),
+        ("'\\t' == 9", true),
+        ("'\\x41' == 65", true),
+        ("'\\101' == 65", true),
+        ("'\\\\' == 92", true),
+        ("'\\'' == 39", true),
+        ("'A' == 65", true),
+    ] {
+        let code = format!(
+            "#if {}
+yes
+#else
+no
+#endif",
+            expr
+        );
+        let (tokens, idents) = preprocess_str(&code);
+        let strs = get_token_strings(&tokens, &idents);
+        let want = if want_yes { "yes" } else { "no" };
+        assert!(
+            strs.contains(&want.to_string()),
+            "#if {} should take the {} branch, got: {:?}",
+            expr,
+            want,
+            strs
+        );
+    }
+}
+
+/// C17 6.4.4.4p10: an ordinary character constant has plain `char`'s
+/// signedness, so the answer differs by target and `#if` must agree with what
+/// the compiled program would compute.
+#[test]
+fn test_if_char_signedness_follows_target() {
+    let code = "#if '\\xff' < 0
+signed
+#else
+unsigned
+#endif";
+    let (tokens, idents) = preprocess_str(code);
+    let strs = get_token_strings(&tokens, &idents);
+    let want = if Target::host().char_signed {
+        "signed"
+    } else {
+        "unsigned"
+    };
+    assert!(
+        strs.contains(&want.to_string()),
+        "expected {:?} for '\\xff' < 0 on this target, got: {:?}",
+        want,
+        strs
+    );
+}
+
+/// A prefixed constant holds one wide character, not the bytes of an
+/// encoding: `L'\n'` is 10, never a packed pair.
+#[test]
+fn test_if_prefixed_character_constants() {
+    for expr in ["L'\\n' == 10", "u'\\x41' == 65", "U'A' == 65", "L'A' == 65"] {
+        let code = format!(
+            "#if {}
+yes
+#else
+no
+#endif",
+            expr
+        );
+        let (tokens, idents) = preprocess_str(&code);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"yes".to_string()),
+            "#if {} should be true, got: {:?}",
+            expr,
+            strs
+        );
+    }
+}
+
+/// gcc packs a multi-character constant big-endian into `int` and lets it
+/// wrap, so a five-byte constant keeps only its last four bytes.
+#[test]
+fn test_if_multichar_constant_wraps_at_int() {
+    for expr in ["'abcd' == 0x61626364", "'abcde' == 0x62636465"] {
+        let code = format!(
+            "#if {}
+yes
+#else
+no
+#endif",
+            expr
+        );
+        let (tokens, idents) = preprocess_str(&code);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"yes".to_string()),
+            "#if {} should be true, got: {:?}",
+            expr,
+            strs
+        );
+    }
+}
+
+/// A `defined` that comes *out* of an expansion, with an operand that is
+/// itself a macro. The operand must not be expanded on the way through, or
+/// the evaluator sees `defined(1)`.
+#[test]
+fn test_if_defined_from_macro_expansion() {
+    let code =
+        "#define FOO 1\n#define D defined(FOO)\n#if D\nyes\n#else\nno\n#endif".replace("\\n", "\n");
+    let (tokens, idents) = preprocess_str(&code);
+    let strs = get_token_strings(&tokens, &idents);
+    assert!(
+        strs.contains(&"yes".to_string()),
+        "expected 'yes' for defined() produced by expansion, got: {:?}",
+        strs
+    );
+}
+
 #[test]
 fn test_paste_empty_arg() {
     // When the first argument is empty, a##b should produce just "hello".

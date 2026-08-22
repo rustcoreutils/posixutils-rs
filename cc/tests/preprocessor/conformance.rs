@@ -1838,3 +1838,74 @@ fn preprocessor_empty_expansion_keeps_the_next_line_break() {
     assert!(r.success, "-E failed: {}", r.stderr);
     assert_eq!(r.stdout, "A\nB c\n", "the lines must stay separate");
 }
+
+/// A call with fewer arguments than parameters is diagnosed and then expanded
+/// anyway, so the rest of the file still makes sense. The per-parameter
+/// expansion memo is indexed by parameter, so sizing it by the *argument*
+/// count made this panic the compiler rather than diagnose anything.
+#[test]
+fn preprocessor_too_few_arguments_does_not_crash() {
+    for (name, src, want) in [
+        ("one_none", "#define ONE(x) [x]\nA ONE()\n", "[]"),
+        ("two_one", "#define TWO(a,b) [a|b]\nA TWO(1)\n", "[1|]"),
+        ("variadic_none", "#define V(a,...) [a]\nA V()\n", "[]"),
+    ] {
+        let r = preprocess_text(&format!("too_few_{}", name), src, &["-P"]);
+        assert!(
+            !r.stderr.contains("panicked"),
+            "{}: the compiler crashed:\n{}",
+            name,
+            r.stderr
+        );
+        assert!(
+            r.stdout.contains(want),
+            "{}: expected {:?} in:\n{}",
+            name,
+            want,
+            r.stdout
+        );
+    }
+}
+
+/// C17 6.10.3.4, Prosser's rule: a function-like invocation's result hides
+/// `(HS(name) ∩ HS(rparen)) ∪ {name}` — what *both* ends of the call were
+/// hiding, not what the name alone was.
+///
+/// Propagating the name's set whole over-hides, because the `)` is usually a
+/// token of the file hiding nothing: `f(2)(9)` stopped at `2*f(9)`.
+#[test]
+fn preprocessor_hide_set_intersects_at_the_closing_paren() {
+    let r = preprocess_text(
+        "hide_intersect",
+        "#define f(a) a*g\n#define g(a) f(a)\nX f(2)(9)\n",
+        &["-P"],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("2*9*g"),
+        "expected 2*9*g, got:\n{}",
+        r.stdout
+    );
+}
+
+/// `#ifdef`/`#ifndef` track nesting inside a dead branch but must not examine
+/// their operand there. gcc skips it entirely, and junk inside an `#if 0` is
+/// common enough that diagnosing it would reject working code.
+#[test]
+fn preprocessor_malformed_conditional_operand_in_a_dead_branch_is_quiet() {
+    let r = preprocess_text(
+        "dead_branch_junk",
+        "#if 0\n#ifdef\n#ifndef 42\n#endif\n#endif\n#endif\nint v;\n",
+        &["-P"],
+    );
+    assert!(
+        r.success,
+        "junk in a dead branch must not fail:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stdout.contains("int v;"),
+        "the live text survives:\n{}",
+        r.stdout
+    );
+}

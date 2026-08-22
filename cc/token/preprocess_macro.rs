@@ -64,15 +64,23 @@ fn clear_newline(mut token: Token) -> Token {
 /// nothing, which expands back to an unhidden `__inline`, forever. The set has
 /// to reach the token that will carry it into the next expansion.
 ///
-/// Non-identifier tokens get nothing: they can never be the invoker of an
-/// expansion, so a set on them could not be read.
+/// Only the tokens whose set can ever be read carry one: identifiers, which
+/// may be the next thing expanded, and closing parentheses, which decide half
+/// of a function-like invocation's hide set.
 fn hide_in_expansion(
     tokens: &mut [Token],
     macro_name: &str,
     invoker_hide: Option<&std::collections::HashSet<String>>,
 ) {
     for tok in tokens.iter_mut() {
-        if !matches!(tok.value, TokenValue::Ident(_)) {
+        // Identifiers, because a hide set is read when the token is the one
+        // about to be expanded -- and closing parentheses, because a
+        // function-like invocation's result hides what *both* ends of the call
+        // were hiding, so `)` is the one punctuator whose set is ever read.
+        // Everything else would be bytes nothing can look at.
+        let readable = matches!(tok.value, TokenValue::Ident(_))
+            || matches!(&tok.value, TokenValue::Special(c) if *c == b')' as u32);
+        if !readable {
             continue;
         }
         if let Some(hide) = invoker_hide {
@@ -83,6 +91,13 @@ fn hide_in_expansion(
         tok.mark_no_expand(macro_name);
     }
 }
+
+/// A function-like macro's arguments, and what its closing `)` was hiding.
+///
+/// The second half decides half of the invocation's own hide set (C17
+/// 6.10.3.4), so it has to travel with the arguments rather than be recovered
+/// afterwards -- by then the `)` has been consumed.
+type MacroCall = (Vec<Vec<Token>>, Option<HashSet<String>>);
 
 impl<'a> Preprocessor<'a> {
     /// Resolve one `defined` operator: `defined X` or `defined ( X )`.
@@ -751,8 +766,17 @@ impl<'a> Preprocessor<'a> {
                         let open_paren = iter.next()?; // consume '('
                                                        // Returns None having pushed the '(' and everything
                                                        // after it back, so the macro name is emitted plain.
-                        let args = self.collect_macro_args(iter, idents, pos, name, &open_paren)?;
-                        return self.expand_function_macro(&mac, &args, pos, invoker_hide, idents);
+                        let (args, close_hide) =
+                            self.collect_macro_args(iter, idents, pos, name, &open_paren)?;
+                        // C17 6.10.3.4 by way of Prosser: a function-like
+                        // invocation hides what *both* ends of the call were
+                        // hiding, not what the name alone was. Propagating the
+                        // name's set whole over-hid, because the `)` usually
+                        // comes from the file with nothing hidden at all:
+                        // `#define f(a) a*g` with `#define g(a) f(a)` made
+                        // `f(2)(9)` stop at `2*f(9)` instead of `2*9*g`.
+                        let hide = Self::intersect_hide(invoker_hide, close_hide.as_ref());
+                        return self.expand_function_macro(&mac, &args, pos, hide.as_ref(), idents);
                     }
                 }
             }
@@ -772,13 +796,16 @@ impl<'a> Preprocessor<'a> {
         macro_pos: &Position,
         macro_name: &str,
         open_paren: &Token,
-    ) -> Option<Vec<Vec<Token>>> {
+    ) -> Option<MacroCall> {
         let mut args = Vec::new();
         let mut current_arg = Vec::new();
         // Start at depth 1 because the opening '(' has already been consumed
         // by the caller. This is important for handling multiline macro calls.
         let mut paren_depth = 1;
         let mut found_closing_paren = false;
+        // The `)` carries a hide set of its own, and the invocation's result
+        // hides only what both ends were hiding.
+        let mut close_hide = None;
 
         for token in iter.by_ref() {
             match &token.value {
@@ -794,6 +821,7 @@ impl<'a> Preprocessor<'a> {
                                 args.push(std::mem::take(&mut current_arg));
                             }
                             found_closing_paren = true;
+                            close_hide = token.no_expand.clone();
                             break;
                         }
                         // Nested ')' - add to current argument
@@ -838,7 +866,21 @@ impl<'a> Preprocessor<'a> {
             return None;
         }
 
-        Some(args)
+        Some((args, close_hide))
+    }
+
+    /// The names hidden at *both* ends of a function-like macro invocation.
+    ///
+    /// `None` where either end hides nothing, which is the common case and the
+    /// reason this is an intersection rather than a union: the closing `)` is
+    /// usually a token of the file, hiding nothing at all.
+    fn intersect_hide(
+        name: Option<&HashSet<String>>,
+        close: Option<&HashSet<String>>,
+    ) -> Option<HashSet<String>> {
+        let (name, close) = (name?, close?);
+        let both: HashSet<String> = name.intersection(close).cloned().collect();
+        (!both.is_empty()).then_some(both)
     }
 
     /// Whether a variadic macro's trailing arguments amount to no tokens.
@@ -973,7 +1015,14 @@ impl<'a> Preprocessor<'a> {
         // One fully-replaced form per argument, filled in on first use. Only
         // the unquoted uses go through it: `#x` needs the argument's original
         // spelling and `a##b` needs its unexpanded tokens.
-        let mut expanded_args: Vec<Option<Vec<Token>>> = vec![None; args.len()];
+        //
+        // Indexed by *parameter*, so it is sized by the parameter list rather
+        // than by however many arguments were supplied. A call with too few --
+        // already diagnosed by `check_macro_arity`, and then expanded anyway so
+        // the rest of the file still makes sense -- otherwise indexed past the
+        // end and panicked the compiler.
+        let mut expanded_args: Vec<Option<Vec<Token>>> =
+            vec![None; args.len().max(mac.params.len())];
 
         // Arguments are macro-replaced on their own first (C17 6.10.3.1p1:
         // "as if they formed the rest of the preprocessing file"), and are not
@@ -1644,6 +1693,7 @@ impl<'a> Preprocessor<'a> {
                             let open_paren = iter.next()?;
                             let args = self
                                 .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
+                                .map(|(args, _)| args)
                                 .unwrap_or_default();
                             let result = self.eval_has_builtin(builtin, &args, idents);
                             return Some(vec![Token::with_value(
@@ -1668,6 +1718,7 @@ impl<'a> Preprocessor<'a> {
                             let open_paren = iter.next()?;
                             let args = self
                                 .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
+                                .map(|(args, _)| args)
                                 .unwrap_or_default();
                             let result = self.eval_has_include(&args, idents);
                             return Some(vec![Token::with_value(

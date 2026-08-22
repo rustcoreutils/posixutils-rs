@@ -1165,7 +1165,7 @@ impl<'a> Preprocessor<'a> {
                 self.include_file(&found, output, idents, &hash, index)
             }
             Some((IncludeSource::Builtin(content), _)) => {
-                self.include_builtin(content, path, output, idents, &hash)
+                self.include_builtin(path, content, output, idents, &hash)
             }
             None => diag::error_args(hash.pos, "'{0}': file not found", &[path]),
         }

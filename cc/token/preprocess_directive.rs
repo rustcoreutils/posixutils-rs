@@ -547,11 +547,20 @@ impl<'a> Preprocessor<'a> {
 
     /// Handle #ifdef
     fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
-        // A malformed operand still pushes a group, so the matching
-        // `#endif` closes something and one bad directive does not cascade
-        // into a run of "#endif without #if". The group is skipped, since
-        // nothing was established about the name.
-        let name = self.macro_name_operand(iter, idents, "ifdef", pos);
+        // Nesting is tracked in a dead branch, but the operand is not
+        // examined there: gcc skips it entirely, and junk inside an `#if 0`
+        // is common enough that diagnosing it would reject working code.
+        //
+        // A malformed operand still pushes a group, so the matching `#endif`
+        // closes something and one bad directive does not cascade into a run
+        // of "#endif without #if". The group is skipped, since nothing was
+        // established about the name.
+        let name = if self.is_skipping() {
+            self.skip_to_eol(iter);
+            None
+        } else {
+            self.macro_name_operand(iter, idents, "ifdef", pos)
+        };
         let take_branch = match &name {
             Some(name) => self.is_defined(name),
             None => false,
@@ -563,11 +572,20 @@ impl<'a> Preprocessor<'a> {
 
     /// Handle #ifndef
     fn handle_ifndef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
-        // A malformed operand still pushes a group, so the matching
-        // `#endif` closes something and one bad directive does not cascade
-        // into a run of "#endif without #if". The group is skipped, since
-        // nothing was established about the name.
-        let name = self.macro_name_operand(iter, idents, "ifndef", pos);
+        // Nesting is tracked in a dead branch, but the operand is not
+        // examined there: gcc skips it entirely, and junk inside an `#if 0`
+        // is common enough that diagnosing it would reject working code.
+        //
+        // A malformed operand still pushes a group, so the matching `#endif`
+        // closes something and one bad directive does not cascade into a run
+        // of "#endif without #if". The group is skipped, since nothing was
+        // established about the name.
+        let name = if self.is_skipping() {
+            self.skip_to_eol(iter);
+            None
+        } else {
+            self.macro_name_operand(iter, idents, "ifndef", pos)
+        };
         let take_branch = match &name {
             Some(name) => !self.is_defined(name),
             None => false,

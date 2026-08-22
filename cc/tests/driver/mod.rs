@@ -1711,3 +1711,16 @@ fn driver_dependency_rule_lists_each_header_once() {
         r.stdout
     );
 }
+
+/// `-include` of a bundled header has to name the header and pass its text,
+/// not the other way round. Reversed, the filename was tokenized as the source
+/// and the header body became the stream's name.
+#[test]
+fn driver_dash_include_finds_a_bundled_header() {
+    let w = WorkDir::new("dash_include_builtin");
+    let src = w.write("m.c", "int main(void) { return (int)true - 1; }\n");
+    let exe = w.join("m.bin");
+    let r = run_c17(&["-include", "stdbool.h", &s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "compile failed: {}", r.stderr);
+    assert_eq!(run_exe(&exe), 0, "`true` should have expanded to 1");
+}

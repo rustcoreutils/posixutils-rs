@@ -24,7 +24,7 @@ use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::token::{preprocess_collecting, PreprocessConfig, StreamTable, Tokenizer};
 use posixutils_cc::types::TypeTable;
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
@@ -640,7 +640,7 @@ impl Walker {
 
         // Preprocess
         let target = Target::host();
-        let preprocessed = preprocess_with_defines(
+        let (preprocessed, _) = preprocess_collecting(
             tokens,
             &target,
             &mut strings,
@@ -656,6 +656,8 @@ impl Walker {
                 preprocessed: false,
                 // Extracting strings, not compiling: nothing optimizes.
                 optimization: Default::default(),
+                // Whatever else the driver grows, this tool wants none of it.
+                ..Default::default()
             },
         );
 

@@ -1674,3 +1674,267 @@ fn preprocessor_recovery_keeps_processing_the_rest_of_the_file() {
         "the later directive is not passed through",
     );
 }
+
+/// C23 6.10.5: `__VA_OPT__(content)` is `content` when the variadic arguments
+/// have at least one token, and nothing when they do not. gcc and clang accept
+/// it in every mode; c17 used to pass it through literally.
+///
+/// Each row was probed against gcc before being written down.
+#[test]
+fn preprocessor_va_opt() {
+    for (name, def, empty_call, full_call, want_empty, want_full) in [
+        // The idiom it exists for: a separator that appears only when there is
+        // something to separate.
+        (
+            "separator",
+            "#define P(f,...) g(f __VA_OPT__(,) __VA_ARGS__)",
+            "P(a)",
+            "P(a,b)",
+            "g(a)",
+            "g(a, b)",
+        ),
+        // `##` reaches into the group: the markers are not tokens, so paste
+        // adjacency has to look past them.
+        (
+            "paste_into",
+            "#define Q(...) a ## __VA_OPT__(b)",
+            "Q()",
+            "Q(1)",
+            "a",
+            "ab",
+        ),
+        // The content may contain parentheses of its own.
+        (
+            "nested_parens",
+            "#define N(...) __VA_OPT__(f(a,b))",
+            "N()",
+            "N(1)",
+            "",
+            "f(a,b)",
+        ),
+        // A group that produces nothing still separates its neighbours.
+        (
+            "adjacent",
+            "#define R(...) __VA_OPT__(x)y",
+            "R()",
+            "R(1)",
+            "y",
+            "x y",
+        ),
+        // `#` against the group gives its spelling, or the empty string.
+        (
+            "stringify",
+            "#define S(...) #__VA_OPT__(x)",
+            "S()",
+            "S(1)",
+            "\"\"",
+            "\"x\"",
+        ),
+        // `##` inside the group works like `##` anywhere.
+        (
+            "paste_inside",
+            "#define D(...) __VA_OPT__(a ## b)",
+            "D()",
+            "D(1)",
+            "",
+            "ab",
+        ),
+    ] {
+        let src = format!("{}\nA {}\nB {}\n", def, empty_call, full_call);
+        let r = preprocess_text(&format!("va_opt_{}", name), &src, &["-P"]);
+        assert!(r.success, "{}: -E failed: {}", name, r.stderr);
+
+        let line = |prefix: &str| -> String {
+            r.stdout
+                .lines()
+                .find(|l| l.trim_start().starts_with(prefix))
+                .unwrap_or_default()
+                .trim()
+                .strip_prefix(prefix)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            line("A"),
+            want_empty,
+            "{}: empty variadic\n{}",
+            name,
+            r.stdout
+        );
+        assert_eq!(
+            line("B"),
+            want_full,
+            "{}: non-empty variadic\n{}",
+            name,
+            r.stdout
+        );
+    }
+}
+
+/// An empty *argument* is not the same as no arguments: C23 asks the question
+/// of the argument tokens before expansion, so `F(a,)` is empty and `F(a,,)`
+/// — which denotes a comma — is not.
+#[test]
+fn preprocessor_va_opt_emptiness_is_about_tokens() {
+    let src = "#define P(f,...) g(f __VA_OPT__(!) __VA_ARGS__)\n\
+               #define EMPTY\nA P(a)\nB P(a,)\nC P(a,,)\nD P(a,EMPTY)\n";
+    let r = preprocess_text("va_opt_empty", src, &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let has = |prefix: &str| -> bool {
+        r.stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with(prefix))
+            .is_some_and(|l| l.contains('!'))
+    };
+    assert!(!has("A"), "no arguments at all is empty:\n{}", r.stdout);
+    assert!(!has("B"), "one empty argument is empty:\n{}", r.stdout);
+    assert!(
+        has("C"),
+        "two empty arguments denote a comma:\n{}",
+        r.stdout
+    );
+    assert!(
+        has("D"),
+        "an argument that expands to nothing is still a token:\n{}",
+        r.stdout
+    );
+}
+
+/// In a non-variadic macro `__VA_OPT__` means nothing. gcc warns and leaves it
+/// alone rather than rejecting the definition.
+#[test]
+fn preprocessor_va_opt_in_a_non_variadic_macro_warns() {
+    let r = preprocess_text(
+        "va_opt_nonvariadic",
+        "#define E(a) __VA_OPT__(x)\nA E(1)\n",
+        &["-P"],
+    );
+    assert!(r.success, "it is a warning, not an error:\n{}", r.stderr);
+    assert!(
+        r.stderr.contains("__VA_OPT__"),
+        "expected a diagnostic naming it, got:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stdout.contains("__VA_OPT__(x)"),
+        "and it is left alone:\n{}",
+        r.stdout
+    );
+}
+
+/// An expansion that produces nothing must not take the *next* token's line
+/// break with it.
+///
+/// The invocation's spacing is handed to whichever token comes next, so that
+/// an expansion beginning with a macro that expands to nothing still lands
+/// where the invocation stood. When the expansion is empty the token it lands
+/// on is the next one from the *file*, which already knows where it stands —
+/// so the flags are added to, never taken away. Overwriting merged the lines:
+/// `#define E` with `A E` and `B c` came out as `A B c`.
+#[test]
+fn preprocessor_empty_expansion_keeps_the_next_line_break() {
+    let r = preprocess_text("empty_expansion_break", "#define E\nA E\nB c\n", &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(r.stdout, "A\nB c\n", "the lines must stay separate");
+}
+
+/// A call with fewer arguments than parameters is diagnosed and then expanded
+/// anyway, so the rest of the file still makes sense. The per-parameter
+/// expansion memo is indexed by parameter, so sizing it by the *argument*
+/// count made this panic the compiler rather than diagnose anything.
+#[test]
+fn preprocessor_too_few_arguments_does_not_crash() {
+    for (name, src, want) in [
+        ("one_none", "#define ONE(x) [x]\nA ONE()\n", "[]"),
+        ("two_one", "#define TWO(a,b) [a|b]\nA TWO(1)\n", "[1|]"),
+        ("variadic_none", "#define V(a,...) [a]\nA V()\n", "[]"),
+    ] {
+        let r = preprocess_text(&format!("too_few_{}", name), src, &["-P"]);
+        assert!(
+            !r.stderr.contains("panicked"),
+            "{}: the compiler crashed:\n{}",
+            name,
+            r.stderr
+        );
+        assert!(
+            r.stdout.contains(want),
+            "{}: expected {:?} in:\n{}",
+            name,
+            want,
+            r.stdout
+        );
+    }
+}
+
+/// C17 6.10.3.4, Prosser's rule: a function-like invocation's result hides
+/// `(HS(name) ∩ HS(rparen)) ∪ {name}` — what *both* ends of the call were
+/// hiding, not what the name alone was.
+///
+/// Propagating the name's set whole over-hides, because the `)` is usually a
+/// token of the file hiding nothing: `f(2)(9)` stopped at `2*f(9)`.
+#[test]
+fn preprocessor_hide_set_intersects_at_the_closing_paren() {
+    let r = preprocess_text(
+        "hide_intersect",
+        "#define f(a) a*g\n#define g(a) f(a)\nX f(2)(9)\n",
+        &["-P"],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("2*9*g"),
+        "expected 2*9*g, got:\n{}",
+        r.stdout
+    );
+}
+
+/// `#ifdef`/`#ifndef` track nesting inside a dead branch but must not examine
+/// their operand there. gcc skips it entirely, and junk inside an `#if 0` is
+/// common enough that diagnosing it would reject working code.
+#[test]
+fn preprocessor_malformed_conditional_operand_in_a_dead_branch_is_quiet() {
+    let r = preprocess_text(
+        "dead_branch_junk",
+        "#if 0\n#ifdef\n#ifndef 42\n#endif\n#endif\n#endif\nint v;\n",
+        &["-P"],
+    );
+    assert!(
+        r.success,
+        "junk in a dead branch must not fail:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stdout.contains("int v;"),
+        "the live text survives:\n{}",
+        r.stdout
+    );
+}
+
+/// The parser and the `#if` evaluator decode the same token, so they must
+/// agree about it. They stopped agreeing when only the evaluator learned to
+/// pack a multi-character constant: `'ab'` compiled to 97 while `#if 'ab' ==
+/// 24930` took the true branch.
+#[test]
+fn preprocessor_character_constants_agree_with_the_compiler() {
+    let src = r#"
+#if 'ab' != 24930
+#error preprocessor disagrees about a multi-character constant
+#endif
+#if '\777' != -1 && '\777' != 255
+#error preprocessor disagrees about an over-wide octal escape
+#endif
+int main(void) {
+    // The same constants, compiled. A disagreement here is the bug.
+    if ('ab' != 24930) return 1;
+    // `\777` is 511, which is not a byte; the low eight bits survive, and
+    // plain `char`'s signedness decides the sign.
+    if ((unsigned char)'\777' != 255) return 2;
+    if (L'é' != 233) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        crate::common::compile_and_run("char_agreement", src, &[]),
+        0
+    );
+}

@@ -19,7 +19,7 @@ use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::token::{preprocess_collecting, PreprocessConfig, StreamTable, Tokenizer};
 use posixutils_cc::types::TypeTable;
 use std::collections::BTreeMap;
 use std::fs;
@@ -150,7 +150,7 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
 
     // Preprocess to handle #define, #include, etc.
     let target = Target::host();
-    let preprocessed = preprocess_with_defines(
+    let (preprocessed, _) = preprocess_collecting(
         tokens,
         &target,
         &mut strings,

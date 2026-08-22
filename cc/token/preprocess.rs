@@ -167,8 +167,24 @@ pub enum MacroTokenValue {
     Stringify(usize),
     /// Token paste marker (##)
     Paste,
-    /// __VA_ARGS__ (index of variadic params start)
+    /// `__VA_ARGS__`, or the GNU name standing in for it. The variadic
+    /// arguments begin at `params.len()`; nothing is carried here.
     VaArgs,
+    /// The start of a `__VA_OPT__(...)` group.
+    ///
+    /// Flat markers rather than a nested list, because the substitution loop's
+    /// paste lookbehind indexes `body[i-1]` and `body[i+1]` directly -- a
+    /// nested group would put a list where a token has to be, and
+    /// `x ## __VA_OPT__(y)` would stop pasting.
+    VaOptStart {
+        /// The index just past the matching [`MacroTokenValue::VaOptEnd`].
+        end: usize,
+        /// Whether a `#` was written against the group, making the result the
+        /// spelling of what it produces rather than the tokens themselves.
+        stringify: bool,
+    },
+    /// The end of a `__VA_OPT__(...)` group.
+    VaOptEnd,
 }
 
 /// Built-in macro types
@@ -417,6 +433,17 @@ pub struct Preprocessor<'a> {
 
     /// Maximum include depth
     max_include_depth: u32,
+
+    /// Every header opened, in the order first opened, and whether it came
+    /// from a system directory. Collected only when asked for (the `-M` family).
+    ///
+    /// Recorded where the file is *resolved* rather than where it is read, so a
+    /// header that the `#pragma once` or include-guard fast path skips is still
+    /// listed -- gcc lists it, and a makefile that omitted it would not rebuild
+    /// when it changed.
+    dependencies: Vec<(PathBuf, bool)>,
+    /// Whether to collect the above.
+    collect_dependencies: bool,
 
     /// Files named by a `#pragma once`.
     once_files: HashSet<PathBuf>,
@@ -847,6 +874,8 @@ impl<'a> Preprocessor<'a> {
             counter: 0,
             include_depth: 0,
             max_include_depth: 200,
+            dependencies: Vec::new(),
+            collect_dependencies: false,
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             guarded_files: HashMap::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             compile_date,
@@ -1111,6 +1140,35 @@ impl<'a> Preprocessor<'a> {
     /// Define a macro
     pub fn define_macro(&mut self, mac: Macro) {
         self.macros.insert(mac.name.clone(), std::rc::Rc::new(mac));
+    }
+
+    /// Process a `-include` file, as if the source began with `#include`.
+    ///
+    /// Named on the command line rather than written in the source, so there is
+    /// no `#` to attribute it to; a `<command-line>` position stands in, the
+    /// same one `-D` uses.
+    pub fn include_from_cmdline(
+        &mut self,
+        path: &str,
+        output: &mut Vec<Token>,
+        idents: &mut IdentTable,
+    ) {
+        let stream_id = diag::init_stream("<command-line>");
+        let hash = Token::new(TokenType::Special, Position::new(stream_id, 1, 1));
+
+        // Searched like `#include "..."`: the working directory first, then
+        // `-I`, then the system paths.
+        match self.find_include_file(path, false, false) {
+            Some((IncludeSource::File(found), index)) => {
+                // A `-include` is a dependency exactly as a `#include` is.
+                self.record_dependency(&found, index.is_some());
+                self.include_file(&found, output, idents, &hash, index)
+            }
+            Some((IncludeSource::Builtin(content), _)) => {
+                self.include_builtin(path, content, output, idents, &hash)
+            }
+            None => diag::error_args(hash.pos, "'{0}': file not found", &[path]),
+        }
     }
 
     /// Apply one command-line `-D` specification.
@@ -2442,6 +2500,13 @@ pub struct PreprocessConfig<'a> {
     /// If true, the input is a `.i` operand -- already the output of `c17 -E`
     /// -- and the processing that produced it must not be repeated.
     pub preprocessed: bool,
+    /// Files to process as if each were a `#include "..."` on the line before
+    /// the source, in the order given (`-include`).
+    pub pre_includes: &'a [String],
+    /// Collect every macro definition for `-dM` instead of only the tokens.
+    pub dump_macros: bool,
+    /// Collect the headers this translation unit depends on (the `-M` family).
+    pub collect_dependencies: bool,
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2477,10 +2542,25 @@ fn define_optimization_macros(pp: &mut Preprocessor, opt: crate::opt::Optimizati
     }
 }
 
-/// Preprocess tokens with command-line defines and undefines
+/// What preprocessing found, beyond the tokens.
 ///
-/// This is the main entry point for preprocessing.
-/// Takes lexer output and returns preprocessed tokens.
+/// The `Preprocessor` is a local of the function below and is dropped when it
+/// returns, so anything a caller wants to *collect* has to leave through here.
+#[derive(Debug, Default)]
+pub struct PreprocessOutcome {
+    /// Every macro in force at the end, as `#define` lines, sorted (`-dM`).
+    /// Empty unless asked for: rendering them is not free.
+    pub macro_definitions: Vec<String>,
+    /// Every header opened, in the order first opened, with whether it came
+    /// from a system directory (the `-M` family). Empty unless asked for.
+    pub dependencies: Vec<(PathBuf, bool)>,
+}
+
+/// Preprocess tokens with command-line defines and undefines, collecting
+/// whatever [`PreprocessConfig`] asked to be collected.
+///
+/// This is the entry point for preprocessing: lexer output in, preprocessed
+/// tokens out. A caller that wants only the tokens ignores the outcome.
 ///
 /// # Arguments
 /// * `tokens` - Lexer output tokens
@@ -2488,13 +2568,13 @@ fn define_optimization_macros(pp: &mut Preprocessor, opt: crate::opt::Optimizati
 /// * `idents` - Identifier table for string interning
 /// * `filename` - Name of the source file
 /// * `config` - Preprocessing configuration (defines, undefines, include paths, flags)
-pub fn preprocess_with_defines(
+pub fn preprocess_collecting(
     tokens: Vec<Token>,
     target: &Target,
     idents: &mut IdentTable,
     filename: &str,
     config: &PreprocessConfig<'_>,
-) -> Vec<Token> {
+) -> (Vec<Token>, PreprocessOutcome) {
     let mut pp = Preprocessor::new(target, filename, &config.search);
 
     // -nostdinc drops the bundled headers as well as the system directories,
@@ -2510,6 +2590,7 @@ pub fn preprocess_with_defines(
     }
     pp.trigraphs = config.trigraphs;
     pp.preprocessed = config.preprocessed;
+    pp.collect_dependencies = config.collect_dependencies;
 
     define_optimization_macros(&mut pp, config.optimization);
 
@@ -2528,9 +2609,38 @@ pub fn preprocess_with_defines(
         pp.undef_macro(undef);
     }
 
-    let output = pp.preprocess(tokens, idents);
+    // `-include` runs after `-D`/`-U`, because a header may well test what
+    // they defined, and before the source, because that is what "as if it were
+    // the first line" means.
+    let mut included = Vec::new();
+    for path in config.pre_includes {
+        pp.include_from_cmdline(path, &mut included, idents);
+    }
+
+    let mut output = pp.preprocess(tokens, idents);
     pp.report_unterminated_conditionals();
-    output
+
+    if !included.is_empty() {
+        // After the source's own `StreamBegin`, not before it. The marker says
+        // where the translation unit starts, and everything downstream reads
+        // the stream structure -- a `StreamBegin` arriving partway through the
+        // token vector is not something any consumer expects.
+        let at = usize::from(matches!(
+            output.first().map(|t| t.typ),
+            Some(TokenType::StreamBegin)
+        ));
+        output.splice(at..at, included);
+    }
+
+    let outcome = PreprocessOutcome {
+        macro_definitions: if config.dump_macros {
+            pp.macro_definitions(idents)
+        } else {
+            Vec::new()
+        },
+        dependencies: std::mem::take(&mut pp.dependencies),
+    };
+    (output, outcome)
 }
 
 // ============================================================================

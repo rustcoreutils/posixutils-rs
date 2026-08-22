@@ -20,7 +20,7 @@ use posixutils_cc::ppargs;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::token::{preprocess_collecting, PreprocessConfig, StreamTable, Tokenizer};
 use posixutils_cc::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -898,7 +898,7 @@ fn process_file(
     };
 
     let target = Target::host();
-    let preprocessed = preprocess_with_defines(
+    let (preprocessed, _) = preprocess_collecting(
         tokens,
         &target,
         &mut strings,
@@ -914,6 +914,8 @@ fn process_file(
             preprocessed: already_preprocessed,
             // Not a compiler: nothing here optimizes, so nothing claims to.
             optimization: Default::default(),
+            // Whatever else the driver grows, this tool wants none of it.
+            ..Default::default()
         },
     );
 

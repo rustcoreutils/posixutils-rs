@@ -132,8 +132,15 @@ impl Iterator for TokenCursor {
         };
         match (token, self.pending_spacing.take()) {
             (Some(mut token), Some((whitespace, newline))) => {
-                token.pos.whitespace = whitespace;
-                token.pos.newline = newline;
+                // Added to, never taken away. The flags describe where the
+                // invocation stood, and the token they land on is the
+                // expansion's first -- unless the expansion was empty, in
+                // which case it is the next token of the *file*, which already
+                // knows where it stands. Overwriting made an empty expansion
+                // swallow the following line break: `#define E` with `A E` on
+                // one line and `B c` on the next came out as `A B c`.
+                token.pos.whitespace |= whitespace;
+                token.pos.newline |= newline;
                 Some(token)
             }
             (token, _) => token,

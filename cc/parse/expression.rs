@@ -4366,7 +4366,8 @@ impl<'a> Parser<'a> {
                     // character, converted to `int` -- so its signedness is
                     // plain `char`'s, which is the target's. `'\x80'` is -128
                     // where `char` is signed and 128 where it is not.
-                    let (v, is_code_point) = literal::char_literal_value(s, self.current_pos());
+                    let (v, is_code_point) =
+                        literal::char_literal_value(s, false, self.current_pos());
                     let value = if is_code_point {
                         // Not a byte, so plain `char`'s signedness does not
                         // reach it.
@@ -4400,7 +4401,8 @@ impl<'a> Parser<'a> {
                         // A prefixed constant takes the code point in its own
                         // type, with no reference to plain `char`'s
                         // signedness: `L'\x80'` is 128, not -128.
-                        let (code_point, _) = literal::char_literal_value(s, self.current_pos());
+                        let (code_point, _) =
+                            literal::char_literal_value(s, true, self.current_pos());
                         let (typ, value) = match kind {
                             // wchar_t is int on the targets here.
                             TokenType::WideChar => (self.types.int_id, code_point as i32 as i64),

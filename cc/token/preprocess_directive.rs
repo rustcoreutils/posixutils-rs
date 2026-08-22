@@ -502,6 +502,7 @@ impl<'a> Preprocessor<'a> {
             &params,
             variadic_name.as_deref(),
             is_function,
+            is_variadic,
             idents,
         );
 
@@ -546,11 +547,20 @@ impl<'a> Preprocessor<'a> {
 
     /// Handle #ifdef
     fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
-        // A malformed operand still pushes a group, so the matching
-        // `#endif` closes something and one bad directive does not cascade
-        // into a run of "#endif without #if". The group is skipped, since
-        // nothing was established about the name.
-        let name = self.macro_name_operand(iter, idents, "ifdef", pos);
+        // Nesting is tracked in a dead branch, but the operand is not
+        // examined there: gcc skips it entirely, and junk inside an `#if 0`
+        // is common enough that diagnosing it would reject working code.
+        //
+        // A malformed operand still pushes a group, so the matching `#endif`
+        // closes something and one bad directive does not cascade into a run
+        // of "#endif without #if". The group is skipped, since nothing was
+        // established about the name.
+        let name = if self.is_skipping() {
+            self.skip_to_eol(iter);
+            None
+        } else {
+            self.macro_name_operand(iter, idents, "ifdef", pos)
+        };
         let take_branch = match &name {
             Some(name) => self.is_defined(name),
             None => false,
@@ -562,11 +572,20 @@ impl<'a> Preprocessor<'a> {
 
     /// Handle #ifndef
     fn handle_ifndef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
-        // A malformed operand still pushes a group, so the matching
-        // `#endif` closes something and one bad directive does not cascade
-        // into a run of "#endif without #if". The group is skipped, since
-        // nothing was established about the name.
-        let name = self.macro_name_operand(iter, idents, "ifndef", pos);
+        // Nesting is tracked in a dead branch, but the operand is not
+        // examined there: gcc skips it entirely, and junk inside an `#if 0`
+        // is common enough that diagnosing it would reject working code.
+        //
+        // A malformed operand still pushes a group, so the matching `#endif`
+        // closes something and one bad directive does not cascade into a run
+        // of "#endif without #if". The group is skipped, since nothing was
+        // established about the name.
+        let name = if self.is_skipping() {
+            self.skip_to_eol(iter);
+            None
+        } else {
+            self.macro_name_operand(iter, idents, "ifndef", pos)
+        };
         let take_branch = match &name {
             Some(name) => !self.is_defined(name),
             None => false,
@@ -738,6 +757,11 @@ impl<'a> Preprocessor<'a> {
         {
             match source {
                 IncludeSource::File(path) => {
+                    // `path_index` is `Some` only for a file found on a system
+                    // path, which is what `-MM` filters on. The `<>` vs `""`
+                    // spelling is not the same question: a `"..."` include can
+                    // resolve out of a system directory and often does.
+                    self.record_dependency(&path, path_index.is_some());
                     self.include_file(&path, output, idents, hash_token, path_index);
                 }
                 IncludeSource::Builtin(content) => {
@@ -808,7 +832,19 @@ impl<'a> Preprocessor<'a> {
 
     /// Find an include file
     /// Returns (IncludeSource, Option<system_include_path_index>)
-    fn find_include_file(
+    /// Note a header this translation unit depends on.
+    pub(super) fn record_dependency(&mut self, path: &Path, is_system: bool) {
+        if !self.collect_dependencies {
+            return;
+        }
+        // Listed once however many times it is included. Linear because the
+        // list is short and its order is the output's order.
+        if !self.dependencies.iter().any(|(p, _)| p == path) {
+            self.dependencies.push((path.to_path_buf(), is_system));
+        }
+    }
+
+    pub(super) fn find_include_file(
         &self,
         filename: &str,
         is_system: bool,
@@ -998,7 +1034,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Include a file
-    fn include_file(
+    pub(super) fn include_file(
         &mut self,
         path: &Path,
         output: &mut Vec<Token>,
@@ -1132,7 +1168,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Include a builtin (embedded) header
-    fn include_builtin(
+    pub(super) fn include_builtin(
         &mut self,
         name: &str,
         content: &str,

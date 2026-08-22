@@ -46,7 +46,7 @@ use symbol::SymbolTable;
 use target::Os;
 use target::{classify_std, StdRequest, Target};
 use token::{
-    preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
+    preprocess_asm_file, preprocess_collecting, replace_trigraphs, show_token, token_type_name,
     write_token, AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType, Tokenizer,
 };
 
@@ -94,6 +94,59 @@ struct Args {
     /// Run preprocessor and dump result
     #[arg(short = 'E', help = gettext("Preprocess only, output to stdout"))]
     preprocess_only: bool,
+
+    /// Inhibit the `# <line> "<file>"` markers in `-E` output.
+    ///
+    /// Wanted whenever the result is read by something that is not a C
+    /// compiler -- a linker script, an assembler, a kernel build's generated
+    /// headers.
+    #[arg(short = 'P', help = gettext("Do not emit line markers in preprocessed output"))]
+    no_line_markers: bool,
+
+    /// Dump every macro definition instead of the preprocessed text (`-dM`).
+    #[arg(long = "dM", help = gettext("Dump macro definitions instead of output"))]
+    dump_macros: bool,
+
+    /// Write a make rule naming every header the source depends on, instead of
+    /// compiling it (`-M`).
+    #[arg(short = 'M', help = gettext("Write a make dependency rule instead of compiling"))]
+    deps_only: bool,
+
+    /// As `-M`, but leave out headers found on a system path (`-MM`).
+    #[arg(long = "MM", help = gettext("Like -M, but omit system headers"))]
+    deps_only_user: bool,
+
+    /// Write the dependency rule *as well as* compiling (`-MD`).
+    #[arg(long = "MD", help = gettext("Write a dependency rule and still compile"))]
+    deps_side: bool,
+
+    /// As `-MD`, but leave out system headers (`-MMD`).
+    #[arg(long = "MMD", help = gettext("Like -MD, but omit system headers"))]
+    deps_side_user: bool,
+
+    /// Where the dependency rule goes (`-MF`). Defaults to stdout for `-M`
+    /// and `-MM`, and to the source renamed `.d` for `-MD` and `-MMD`.
+    #[arg(long = "MF", value_name = "file", help = gettext("Write dependencies to <file>"))]
+    deps_file: Option<String>,
+
+    /// The rule's target (`-MT`), in place of the source renamed `.o`.
+    #[arg(long = "MT", value_name = "target", help = gettext("Name the dependency rule's target"))]
+    deps_target: Option<String>,
+
+    /// Add a bare rule for each header, so removing one does not break the
+    /// build until the makefile is regenerated (`-MP`).
+    #[arg(long = "MP", help = gettext("Add a phony target for each dependency"))]
+    deps_phony: bool,
+
+    /// Process a file as if `#include "<file>"` were the first line
+    /// (`-include`). Repeatable, applied in order.
+    #[arg(
+        long = "include",
+        value_name = "file",
+        action = clap::ArgAction::Append,
+        help = gettext("Process <file> as if it were the first #include")
+    )]
+    pre_includes: Vec<String>,
 
     /// Dump AST (for debugging parser)
     #[arg(long = "dump-ast", help = gettext("Parse and dump AST to stdout"))]
@@ -477,6 +530,98 @@ struct Outputs<'a> {
     preprocessed: &'a mut dyn Write,
 }
 
+impl Args {
+    /// Whether any of the `-M` family was asked for.
+    fn wants_dependencies(&self) -> bool {
+        self.deps_only || self.deps_only_user || self.deps_side || self.deps_side_user
+    }
+
+    /// Whether the dependency rule *replaces* the compile (`-M`, `-MM`) rather
+    /// than accompanying it (`-MD`, `-MMD`).
+    fn dependencies_replace_output(&self) -> bool {
+        self.deps_only || self.deps_only_user
+    }
+
+    /// Whether headers found on a system path are left out.
+    fn dependencies_omit_system(&self) -> bool {
+        self.deps_only_user || self.deps_side_user
+    }
+}
+
+/// Write the make rule for one translation unit.
+///
+/// The shape is gcc's, which is what a makefile's `include` expects:
+/// `target: source header...`, wrapped at a sensible width with a trailing
+/// backslash, and -- under `-MP` -- a bare `header:` rule for each
+/// prerequisite so that deleting a header does not break the build before the
+/// makefile is regenerated.
+fn write_dependency_rule(
+    args: &Args,
+    source: &str,
+    dependencies: &[(std::path::PathBuf, bool)],
+) -> io::Result<()> {
+    let target = match &args.deps_target {
+        Some(t) => t.clone(),
+        None => {
+            let stem = Path::new(source).file_stem().unwrap_or_default();
+            format!("{}.o", stem.to_string_lossy())
+        }
+    };
+
+    let mut prerequisites = vec![source.to_string()];
+    for (path, is_system) in dependencies {
+        if *is_system && args.dependencies_omit_system() {
+            continue;
+        }
+        prerequisites.push(path.to_string_lossy().to_string());
+    }
+
+    // gcc wraps near 80 columns; the exact column is cosmetic, the
+    // backslash-newline is not.
+    const WRAP: usize = 72;
+    let mut rule = format!("{}:", target);
+    let mut column = rule.len();
+    for prereq in &prerequisites {
+        if column + prereq.len() + 1 > WRAP {
+            rule.push_str(" \\\n ");
+            column = 1;
+        }
+        rule.push(' ');
+        rule.push_str(prereq);
+        column += prereq.len() + 1;
+    }
+    rule.push('\n');
+
+    if args.deps_phony {
+        // Not for the source itself: it is not a header, and a rule for it
+        // would shadow the real one.
+        for prereq in prerequisites.iter().skip(1) {
+            rule.push_str(prereq);
+            rule.push_str(":\n");
+        }
+    }
+
+    match dependency_sink(args, source) {
+        Some(path) => std::fs::write(path, rule),
+        None => {
+            io::stdout().write_all(rule.as_bytes())?;
+            io::stdout().flush()
+        }
+    }
+}
+
+/// Where the rule goes: `-MF` if given, a `.d` beside the source for the
+/// side-output forms, and stdout for `-M`/`-MM`.
+fn dependency_sink(args: &Args, source: &str) -> Option<std::path::PathBuf> {
+    if let Some(file) = &args.deps_file {
+        return Some(std::path::PathBuf::from(file));
+    }
+    if args.dependencies_replace_output() {
+        return None;
+    }
+    Some(Path::new(source).with_extension("d"))
+}
+
 fn process_file(
     path: &str,
     streams: &mut StreamTable,
@@ -557,7 +702,7 @@ fn process_file(
     }
 
     // Preprocess (may add new identifiers from included files)
-    let mut preprocessed = preprocess_with_defines(
+    let (mut preprocessed, outcome) = preprocess_collecting(
         tokens,
         target,
         &mut strings,
@@ -571,9 +716,32 @@ fn process_file(
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
             preprocessed,
+            pre_includes: &args.pre_includes,
+            dump_macros: args.dump_macros,
+            collect_dependencies: args.wants_dependencies(),
             optimization: args.optimization(),
         },
     );
+
+    // The dependency rule is a property of preprocessing, so it is written
+    // here whichever form asked for it -- before `-E` decides what to print,
+    // and before compilation, which `-MD`/`-MMD` do not suppress.
+    if args.wants_dependencies() {
+        write_dependency_rule(args, display_path, &outcome.dependencies)?;
+        if args.dependencies_replace_output() {
+            // `-M` and `-MM` produce the rule *instead of* anything else --
+            // but a rule built from a translation unit that did not
+            // preprocess is incomplete, and exiting 0 would have a makefile
+            // record it as authoritative.
+            if diag::has_error() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "preprocessing failed",
+                ));
+            }
+            return Ok(Compiled::Nothing);
+        }
+    }
 
     if args.preprocess_only {
         // Output preprocessed tokens.
@@ -594,7 +762,29 @@ fn process_file(
         // state on the preprocessor and is never recorded in the stream
         // registry, so `effective_position` cannot see it either — the same
         // pre-existing gap that keeps parser diagnostics on physical lines.
-        writeln!(out.preprocessed, "# 1 \"{}\"", display_path)?;
+        // `-dM` asks what the macros are, not what the source becomes, so it
+        // replaces the output rather than adding to it.
+        if args.dump_macros {
+            for line in &outcome.macro_definitions {
+                writeln!(out.preprocessed, "{}", line)?;
+            }
+            out.preprocessed.flush()?;
+            if diag::has_error() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "preprocessing failed",
+                ));
+            }
+            return Ok(Compiled::Nothing);
+        }
+
+        // `-P` asks for the text alone. Everything that would emit a marker
+        // below checks this; a marker is never merely cosmetic, so each site
+        // has to say what it does instead.
+        let markers = !args.no_line_markers;
+        if markers {
+            writeln!(out.preprocessed, "# 1 \"{}\"", display_path)?;
+        }
         let mut emitted_marker_for: Vec<u16> = vec![stream_id];
         let mut current_stream: Option<u16> = Some(stream_id);
         let mut at_line_start = true;
@@ -671,17 +861,19 @@ fn process_file(
                     }
                     if !at_line_start {
                         writeln!(out.preprocessed)?;
+                        at_line_start = true;
                     }
-                    writeln!(
-                        out.preprocessed,
-                        "# {} \"{}\" {}",
-                        line,
-                        name,
-                        if returning { 2 } else { 1 }
-                    )?;
+                    if markers {
+                        writeln!(
+                            out.preprocessed,
+                            "# {} \"{}\" {}",
+                            line,
+                            name,
+                            if returning { 2 } else { 1 }
+                        )?;
+                    }
                     current_stream = Some(token.pos.stream);
                     current_line = line;
-                    at_line_start = true;
                 }
 
                 // Put the token back on the line it came from. Every consumed
@@ -694,7 +886,12 @@ fn process_file(
                         // GCC's threshold: a handful of blank lines is smaller
                         // than a marker, past that a marker is smaller.
                         const MAX_BLANK_RUN: u32 = 8;
-                        if line - current_line <= MAX_BLANK_RUN {
+                        if !markers {
+                            // `-P` is asked for by things that are not C
+                            // compilers, which want the text and nothing
+                            // standing in for the lines that produced it. gcc
+                            // collapses the run rather than padding it out.
+                        } else if line - current_line <= MAX_BLANK_RUN {
                             for _ in 0..(line - current_line) {
                                 writeln!(out.preprocessed)?;
                             }
@@ -752,7 +949,10 @@ fn process_file(
                 }
             }
         }
-        if !args.verbose {
+        // The output ends with a newline, but the last token already wrote one
+        // unless it was mid-line. Writing unconditionally left a trailing blank
+        // line that gcc does not produce.
+        if !args.verbose && !at_line_start {
             writeln!(out.preprocessed)?;
         }
         // The sink may be a file, and a BufWriter's Drop discards errors.
@@ -1306,6 +1506,33 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // so they used to reach it unrewritten and be rejected outright.
             result.push(format!("-{}", arg));
             i += 1;
+        } else if matches!(arg.as_str(), "-MM" | "-MD" | "-MMD" | "-MP") {
+            // gcc spells these with one dash; clap would read them as short
+            // clusters.
+            result.push(format!("-{}", arg));
+            i += 1;
+        } else if arg == "-MF" || arg == "-MT" {
+            result.push(format!("-{}", arg));
+            if let Some(v) = raw_args.get(i + 1) {
+                result.push(v.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if arg == "-dM" {
+            // One dash in gcc; clap would read it as the short cluster `-d -M`.
+            result.push("--dM".to_string());
+            i += 1;
+        } else if arg == "-include" {
+            // gcc spells it with one dash; clap would read that as the short
+            // cluster `-i -n -c ...` and reject it.
+            result.push("--include".to_string());
+            if let Some(v) = raw_args.get(i + 1) {
+                result.push(v.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
         } else if arg == "-isystem" || arg == "-idirafter" || arg == "--sysroot" {
             // Value options gcc spells with one dash. `--sysroot` is already
             // two, but takes its value as a separate word here either way.

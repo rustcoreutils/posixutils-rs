@@ -1381,3 +1381,365 @@ fn driver_ident_and_sccs_are_accepted_quietly() {
         }
     }
 }
+
+/// `-P` asks for the preprocessed text with no `# <line> "<file>"` markers.
+/// It is what things that are not C compilers want — linker scripts, generated
+/// headers, assembler input.
+#[test]
+fn driver_dash_p_suppresses_line_markers() {
+    let w = WorkDir::new("dash_p");
+    let src = w.write("p.c", "#define X 1\n\n\nint v = X;\n");
+    let r = run_c17(&["-E", "-P", &s(&src)]);
+    assert!(r.success, "-E -P failed: {}", r.stderr);
+    assert!(
+        !r.stdout.contains('#'),
+        "-P output must carry no markers:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("int v = 1;"),
+        "the text survives:\n{}",
+        r.stdout
+    );
+    // Byte-for-byte what gcc produces for this input.
+    assert_eq!(
+        r.stdout, "int v = 1;\n",
+        "unexpected layout: {:?}",
+        r.stdout
+    );
+}
+
+/// Without `-P` the markers are still mandated, so the two must not have been
+/// conflated.
+#[test]
+fn driver_without_dash_p_line_markers_remain() {
+    let w = WorkDir::new("no_dash_p");
+    let src = w.write("q.c", "int v = 1;\n");
+    let r = run_c17(&["-E", &s(&src)]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("# 1 \""),
+        "expected a marker:\n{}",
+        r.stdout
+    );
+}
+
+/// `-include <file>` processes the file as if `#include "<file>"` were the
+/// first line of the source: after `-D`/`-U`, before the source, in order.
+#[test]
+fn driver_dash_include_injects_a_header() {
+    let w = WorkDir::new("dash_include");
+    w.write("one.h", "int one_thing = 1;\n");
+    w.write("two.h", "int two_thing = 2;\n");
+    let src = w.write("m.c", "int main(void) { return one_thing + two_thing; }\n");
+
+    let r = run_c17(&[
+        "-E",
+        "-P",
+        "-include",
+        &s(&w.join("one.h")),
+        "-include",
+        &s(&w.join("two.h")),
+        &s(&src),
+    ]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let one = r
+        .stdout
+        .find("one_thing = 1")
+        .expect("first -include missing");
+    let two = r
+        .stdout
+        .find("two_thing = 2")
+        .expect("second -include missing");
+    let main = r
+        .stdout
+        .find("int main")
+        .expect("the source itself missing");
+    assert!(one < two && two < main, "wrong order:\n{}", r.stdout);
+}
+
+/// The injected header has to reach the compiler, not just `-E` — the two
+/// paths share a token vector, and getting the stream markers wrong breaks
+/// only the one that parses.
+#[test]
+fn driver_dash_include_reaches_the_compiler() {
+    let w = WorkDir::new("dash_include_compile");
+    w.write("pre.h", "int from_header = 7;\n");
+    let src = w.write("m.c", "int main(void) { return from_header; }\n");
+    let exe = w.join("m.bin");
+
+    let r = run_c17(&["-include", &s(&w.join("pre.h")), &s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "compile failed: {}", r.stderr);
+    assert_eq!(run_exe(&exe), 7, "the injected header did not take effect");
+}
+
+/// A `-include` naming a file that is not there is an error, not silence.
+#[test]
+fn driver_dash_include_missing_file_is_an_error() {
+    let w = WorkDir::new("dash_include_missing");
+    let src = w.write("m.c", "int main(void) { return 0; }\n");
+    let r = run_c17(&["-E", "-include", "no_such_header.h", &s(&src)]);
+    assert!(!r.success, "a missing -include must fail:\n{}", r.stdout);
+    assert!(
+        r.stderr.contains("file not found"),
+        "expected a not-found diagnostic, got:\n{}",
+        r.stderr
+    );
+}
+
+/// `-dM` dumps every macro in force as the `#define` that would make it,
+/// instead of the preprocessed text.
+#[test]
+fn driver_dash_dm_dumps_macro_definitions() {
+    let w = WorkDir::new("dash_dm");
+    let src = w.write(
+        "m.c",
+        "#define OBJ 1\n#define FN(a,b) ((a)+(b))\n#define EMPTY\n\
+         #define VAR(...) f(__VA_ARGS__)\n#define STR(x) #x\n#define CAT(a,b) a##b\n\
+         #define GNU(a, rest...) g(rest)\nint v;\n",
+    );
+    let r = run_c17(&["-dM", "-E", &s(&src)]);
+    assert!(r.success, "-dM failed: {}", r.stderr);
+
+    for want in [
+        "#define OBJ 1",
+        "#define FN(a,b) ((a)+(b))",
+        "#define VAR(...) f(__VA_ARGS__)",
+        // The `#` and `##` operators are put back, and parameters are named
+        // rather than shown as the indices the body actually stores.
+        "#define STR(x) #x",
+        "#define CAT(a,b) a##b",
+        // The GNU named-variadic spelling round-trips as itself.
+        "#define GNU(a,rest...) g(rest)",
+    ] {
+        assert!(
+            r.stdout.contains(want),
+            "expected {:?} in:\n{}",
+            want,
+            r.stdout
+        );
+    }
+    assert!(
+        r.stdout.lines().any(|l| l.trim_end() == "#define EMPTY"),
+        "an empty replacement list still gets a line:\n{}",
+        r.stdout
+    );
+
+    // The source's own text is not the output.
+    assert!(
+        !r.stdout.contains("int v;"),
+        "-dM replaces the text:\n{}",
+        r.stdout
+    );
+
+    // Predefines are in there too, which is what `-dM` is usually asked for.
+    assert!(
+        r.stdout.contains("#define __STDC__ 1"),
+        "missing predefines"
+    );
+
+    // The dynamic builtins have no replacement list to print; gcc omits them.
+    for absent in [
+        "#define __FILE__",
+        "#define __LINE__",
+        "#define __COUNTER__",
+    ] {
+        assert!(!r.stdout.contains(absent), "{} should be omitted", absent);
+    }
+}
+
+/// The macro table is a `HashMap`, whose iteration order differs per process.
+/// `-dM` sorts, or its output would differ run to run.
+#[test]
+fn driver_dash_dm_output_is_deterministic() {
+    let w = WorkDir::new("dash_dm_det");
+    let src = w.write("m.c", "#define B 2\n#define A 1\n#define C 3\nint v;\n");
+    let first = run_c17(&["-dM", "-E", &s(&src)]);
+    let second = run_c17(&["-dM", "-E", &s(&src)]);
+    assert!(first.success && second.success);
+    assert_eq!(first.stdout, second.stdout, "-dM output must not vary");
+
+    let names: Vec<&str> = first
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("#define "))
+        .map(|l| l.split(['(', ' ']).next().unwrap_or(""))
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "-dM output must be sorted by name");
+}
+
+/// `-M` and `-MM` write a make rule naming what the source depends on, instead
+/// of compiling it. This is how a make-based build tracks header changes, and
+/// c17 had no way to produce one.
+#[test]
+fn driver_dash_mm_writes_a_dependency_rule() {
+    let w = WorkDir::new("dash_mm");
+    w.write("local.h", "int local_thing;\n");
+    let src = w.write(
+        "d.c",
+        "#include \"local.h\"\n#include <stdio.h>\nint main(void){return 0;}\n",
+    );
+
+    let r = run_c17(&["-MM", &s(&src)]);
+    assert!(r.success, "-MM failed: {}", r.stderr);
+    let rule = r.stdout.trim_end();
+    assert!(
+        rule.starts_with("d.o:"),
+        "target should be the source renamed .o: {:?}",
+        rule
+    );
+    assert!(
+        rule.contains("local.h"),
+        "the user header is a prerequisite: {:?}",
+        rule
+    );
+    // `-MM` leaves out headers found on a system path. The `<>` vs `""`
+    // spelling is not the test — where it resolved is.
+    assert!(
+        !rule.contains("stdio.h"),
+        "-MM omits system headers: {:?}",
+        rule
+    );
+
+    // Nothing was compiled.
+    assert!(!w.join("d.o").exists(), "-MM must not produce an object");
+}
+
+/// `-M` keeps the system headers `-MM` drops.
+#[test]
+fn driver_dash_m_includes_system_headers() {
+    let w = WorkDir::new("dash_m");
+    let src = w.write("d.c", "#include <stdio.h>\nint main(void){return 0;}\n");
+    let r = run_c17(&["-M", &s(&src)]);
+    assert!(r.success, "-M failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("stdio.h"),
+        "-M lists system headers:\n{}",
+        r.stdout
+    );
+}
+
+/// `-MT` names the target; `-MP` adds a bare rule per header so that deleting
+/// one does not break the build before the makefile is regenerated.
+#[test]
+fn driver_dependency_rule_target_and_phony() {
+    let w = WorkDir::new("dash_mt");
+    w.write("local.h", "int local_thing;\n");
+    let src = w.write("d.c", "#include \"local.h\"\nint main(void){return 0;}\n");
+
+    let r = run_c17(&["-MM", "-MT", "obj/d.o", &s(&src)]);
+    assert!(r.success, "-MT failed: {}", r.stderr);
+    assert!(
+        r.stdout.starts_with("obj/d.o:"),
+        "-MT names the target:\n{}",
+        r.stdout
+    );
+
+    let r = run_c17(&["-MM", "-MP", &s(&src)]);
+    assert!(r.success, "-MP failed: {}", r.stderr);
+    let phony: Vec<&str> = r.stdout.lines().filter(|l| l.ends_with(':')).collect();
+    assert_eq!(
+        phony.len(),
+        1,
+        "one bare rule, for the header only:\n{}",
+        r.stdout
+    );
+    assert!(
+        phony[0].contains("local.h"),
+        "the bare rule names the header:\n{}",
+        r.stdout
+    );
+}
+
+/// `-MD` and `-MMD` are side outputs: the rule goes to a file *and* the source
+/// is still compiled. Putting them in the `-E` branch would have lost that.
+#[test]
+fn driver_dash_mmd_writes_the_rule_and_still_compiles() {
+    let w = WorkDir::new("dash_mmd");
+    w.write("local.h", "int local_thing;\n");
+    let src = w.write("d.c", "#include \"local.h\"\nint main(void){return 0;}\n");
+    let obj = w.join("d.o");
+
+    let r = run_c17(&["-MMD", "-c", &s(&src), "-o", &s(&obj)]);
+    assert!(r.success, "-MMD failed: {}", r.stderr);
+    assert!(obj.exists(), "-MMD must still compile");
+
+    // The rule defaults to the source renamed `.d`.
+    let dep = w.join("d.d");
+    assert!(dep.exists(), "-MMD writes a .d beside the source");
+    let rule = std::fs::read_to_string(&dep).unwrap();
+    assert!(rule.contains("local.h"), "unexpected rule: {:?}", rule);
+}
+
+/// `-MF` says where the rule goes, and then nothing goes to stdout.
+#[test]
+fn driver_dash_mf_redirects_the_rule() {
+    let w = WorkDir::new("dash_mf");
+    w.write("local.h", "int local_thing;\n");
+    let src = w.write("d.c", "#include \"local.h\"\nint main(void){return 0;}\n");
+    let out = w.join("custom.d");
+
+    let r = run_c17(&["-MM", "-MF", &s(&out), &s(&src)]);
+    assert!(r.success, "-MF failed: {}", r.stderr);
+    assert!(
+        r.stdout.is_empty(),
+        "-MF means nothing on stdout: {:?}",
+        r.stdout
+    );
+    let rule = std::fs::read_to_string(&out).unwrap();
+    assert!(rule.contains("local.h"), "unexpected rule: {:?}", rule);
+}
+
+/// A header reached twice is one prerequisite, not two — and an include guard
+/// skipping the second read must not lose it either.
+#[test]
+fn driver_dependency_rule_lists_each_header_once() {
+    let w = WorkDir::new("dash_mm_once");
+    w.write("g.h", "#ifndef G_H\n#define G_H\nint g;\n#endif\n");
+    let src = w.write(
+        "d.c",
+        "#include \"g.h\"\n#include \"g.h\"\nint main(void){return 0;}\n",
+    );
+    let r = run_c17(&["-MM", &s(&src)]);
+    assert!(r.success, "-MM failed: {}", r.stderr);
+    assert_eq!(
+        r.stdout.matches("g.h").count(),
+        1,
+        "a header included twice is one prerequisite:\n{}",
+        r.stdout
+    );
+}
+
+/// `-include` of a bundled header has to name the header and pass its text,
+/// not the other way round. Reversed, the filename was tokenized as the source
+/// and the header body became the stream's name.
+#[test]
+fn driver_dash_include_finds_a_bundled_header() {
+    let w = WorkDir::new("dash_include_builtin");
+    let src = w.write("m.c", "int main(void) { return (int)true - 1; }\n");
+    let exe = w.join("m.bin");
+    let r = run_c17(&["-include", "stdbool.h", &s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "compile failed: {}", r.stderr);
+    assert_eq!(run_exe(&exe), 0, "`true` should have expanded to 1");
+}
+
+/// A dependency rule built from a translation unit that did not preprocess is
+/// incomplete, and exiting 0 would have a makefile record it as authoritative.
+#[test]
+fn driver_dependency_rule_fails_when_preprocessing_did() {
+    let w = WorkDir::new("dep_exit");
+    let src = w.write("d.c", "#include \"no_such_header.h\"\nint v;\n");
+    let r = run_c17(&["-MM", &s(&src)]);
+    assert!(
+        !r.success,
+        "a missing header must fail the rule:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.contains("file not found"),
+        "expected the not-found diagnostic, got:\n{}",
+        r.stderr
+    );
+}

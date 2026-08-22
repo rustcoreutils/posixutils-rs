@@ -783,3 +783,34 @@ int main(void) {
     assert_eq!(compile_and_run("cond_uac", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("cond_uac_opt", code), 0);
 }
+
+/// A function declared as a trailing declarator, or inside a block, is still a
+/// function: it decays, it can be addressed, and it can be called. Only the
+/// *lvalue* half was wrong, so these are the uses the fix must not break.
+#[test]
+fn c99_non_defining_function_declarations_still_work() {
+    let code = r#"
+int f(int x), g(int x);
+int f(int x) { return x + 1; }
+int g(int x) { return x * 2; }
+typedef int fn_t(int);
+
+int use(void) {
+    int k(int);            /* a block-scope declaration of an outer function */
+    int (*p)(int) = g;     /* decays to a pointer */
+    int (*q)(int) = &f;    /* and can be addressed explicitly */
+    fn_t *r = f;           /* through a function typedef */
+    if (k(1) != 4) return 1;
+    if (p(3) != 6) return 2;
+    if (q(3) != 4) return 3;
+    if (r(3) != 4) return 4;
+    if (sizeof(&f) != sizeof(void *)) return 5;
+    return 0;
+}
+
+int k(int x) { return x + 3; }
+int main(void) { return use(); }
+"#;
+    assert_eq!(compile_and_run("fn_designator", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("fn_designator_opt", code), 0);
+}

@@ -2745,8 +2745,8 @@ impl Parser<'_> {
                 let mut symbol_id: Option<SymbolId> = None;
                 if has_name && !is_typedef {
                     self.check_redeclaration(name, typ, decl_pos);
-                    let sym = Symbol::variable(name, typ, self.symbols.depth())
-                        .with_align(validated_align)
+                    let sym = self
+                        .declared_symbol(name, typ, validated_align)
                         .with_variably_modified_array(!vla_sizes.is_empty());
                     if let Ok(id) = self.symbols.declare(sym) {
                         symbol_id = Some(id);
@@ -5986,8 +5986,7 @@ impl Parser<'_> {
                 None // Will be bound after initializer parsing
             } else {
                 self.check_redeclaration(decl_name, decl_type, decl_pos);
-                let var_sym = Symbol::variable(decl_name, decl_type, self.symbols.depth())
-                    .with_align(decl_validated_align);
+                let var_sym = self.declared_symbol(decl_name, decl_type, decl_validated_align);
                 Some(match self.symbols.declare(var_sym) {
                     Ok(id) => id,
                     Err(_) => self
@@ -6258,6 +6257,25 @@ impl Parser<'_> {
         }
 
         Ok(())
+    }
+
+    /// Build the symbol for a declared name, choosing its kind from its type.
+    ///
+    /// A declarator whose type is a function declares a *function*, whatever
+    /// company it keeps -- `int f(int), g(int);` at file scope, or
+    /// `void h(void) { int g(int); }` inside a block. Both of those binders
+    /// took "not a function definition" to mean "variable", and `is_lvalue`
+    /// asks the symbol's *kind* rather than its type, so a function bound as a
+    /// variable was assignable: `g = 0;` compiled and stored through the
+    /// function's own address.
+    ///
+    /// `_Alignas` does not apply to a function, so an alignment is dropped
+    /// here rather than recorded against one.
+    fn declared_symbol(&self, name: StringId, typ: TypeId, align: Option<u32>) -> Symbol {
+        if self.types.kind(typ) == TypeKind::Function {
+            return Symbol::function(name, typ, self.symbols.depth());
+        }
+        Symbol::variable(name, typ, self.symbols.depth()).with_align(align)
     }
 
     /// Validate explicit alignment against natural alignment (C11 6.7.5)

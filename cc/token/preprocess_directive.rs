@@ -868,13 +868,29 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Then -I, for both forms.
-        if !is_include_next {
-            for dir in &self.quote_include_paths {
-                let path = Path::new(dir).join(filename);
-                if path.exists() {
-                    return Some((IncludeSource::File(path), None));
-                }
+        // `-I` and the system directories are one ordered search path, indexed
+        // as one. They are stored separately, and `#include_next` used to
+        // resume in `system_include_paths` only -- so a header found through
+        // `-I` had no index to resume from, fell back to index 0 of the system
+        // list, and never saw the rest of the `-I` directories. gcc finds
+        // `ib/n.h` for an `#include_next <n.h>` written in `ia/n.h` under
+        // `-Iia -Iib`; this reported "file not found".
+        let start_index = if is_include_next {
+            self.current_include_path_index.map(|i| i + 1).unwrap_or(0)
+        } else {
+            0
+        };
+        let quote_count = self.quote_include_paths.len();
+
+        for (idx, dir) in self
+            .quote_include_paths
+            .iter()
+            .enumerate()
+            .skip(start_index)
+        {
+            let path = Path::new(dir).join(filename);
+            if path.exists() {
+                return Some((IncludeSource::File(path), Some(idx)));
             }
         }
 
@@ -889,24 +905,19 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Check system include paths (unless -nostdinc)
+        // Check system include paths (unless -nostdinc). Their indices continue
+        // the same numbering, so a resume point means the same thing whichever
+        // half of the path the current file came from.
         if self.use_system_headers {
-            // For #include_next, start from the path AFTER the current file's path
-            let start_index = if is_include_next {
-                self.current_include_path_index.map(|i| i + 1).unwrap_or(0)
-            } else {
-                0
-            };
-
             for (idx, dir) in self
                 .system_include_paths
                 .iter()
                 .enumerate()
-                .skip(start_index)
+                .skip(start_index.saturating_sub(quote_count))
             {
                 let path = Path::new(dir).join(filename);
                 if path.exists() {
-                    return Some((IncludeSource::File(path), Some(idx)));
+                    return Some((IncludeSource::File(path), Some(quote_count + idx)));
                 }
             }
         }

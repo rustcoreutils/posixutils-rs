@@ -1383,6 +1383,12 @@ impl<'a> Preprocessor<'a> {
         };
         let mut token = Token::with_value(typ, *pos, value);
         token.pos.newline = false;
+        // `u8"..."` is a narrow string in every respect but its spelling, so
+        // the prefix lives on the spelling flag rather than in the token type.
+        // Without it the paste produced a plain `"y"` and the `u8` vanished.
+        if prefix == "u8" {
+            token.spelling = Spelling::Utf8Prefix;
+        }
         Some(token)
     }
 
@@ -1573,6 +1579,18 @@ impl<'a> Preprocessor<'a> {
             ),
             MacroTokenValue::Paste => "##".to_string(),
             MacroTokenValue::VaArgs => variadic(),
+            // The group markers are flat, so the opening one carries the `(`
+            // and the closing one the `)`. Without these arms both fell to the
+            // catch-all below, where `macro_token_to_token` has nothing to
+            // build from and `-dM` printed `a <ident?>, __VA_ARGS__<ident?>`.
+            MacroTokenValue::VaOptStart { stringify, .. } => {
+                if *stringify {
+                    "#__VA_OPT__(".to_string()
+                } else {
+                    "__VA_OPT__(".to_string()
+                }
+            }
+            MacroTokenValue::VaOptEnd => ")".to_string(),
             // An ordinary body token: round-trip it through a real token so the
             // spelling is the lexer's, not a second guess at one.
             _ => {

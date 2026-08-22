@@ -120,6 +120,7 @@ pub fn get_type_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
     } else {
         ("long int", "long unsigned int")
     };
+    let wint = wint_type(target);
     vec![
         // Fixed-width integer types
         ("__INT8_TYPE__", "signed char"),
@@ -155,9 +156,9 @@ pub fn get_type_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
         ("__UINTPTR_TYPE__", "long unsigned int"),
         ("__INTMAX_TYPE__", "long int"),
         ("__UINTMAX_TYPE__", "long unsigned int"),
-        // Character types
+        // Character types.
         ("__WCHAR_TYPE__", "int"),
-        ("__WINT_TYPE__", "int"),
+        ("__WINT_TYPE__", wint),
         ("__CHAR16_TYPE__", "unsigned short"),
         ("__CHAR32_TYPE__", "unsigned int"),
         // sig_atomic_t
@@ -166,7 +167,13 @@ pub fn get_type_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
 }
 
 /// Get fixed-width integer limit macros (for <stdint.h> compatibility)
-pub fn get_stdint_limit_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_stdint_limit_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+    // The bounds follow `wint_t`'s own signedness; see `wint_type`.
+    let (wint_min, wint_max) = if wint_type(target) == "unsigned int" {
+        ("0U", "0xffffffffU")
+    } else {
+        ("(-2147483647 - 1)", "2147483647")
+    };
     vec![
         // Signed fixed-width limits
         ("__INT8_MAX__", "127"),
@@ -217,7 +224,8 @@ pub fn get_stdint_limit_macros(_target: &Target) -> Vec<(&'static str, &'static 
         // wchar_t and wint_t limits
         ("__WCHAR_MAX__", "2147483647"),
         ("__WCHAR_WIDTH__", "32"),
-        ("__WINT_MAX__", "2147483647"),
+        ("__WINT_MAX__", wint_max),
+        ("__WINT_MIN__", wint_min),
         ("__WINT_WIDTH__", "32"),
         // sig_atomic_t limits
         ("__SIG_ATOMIC_MAX__", "2147483647"),
@@ -521,6 +529,26 @@ pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static st
     }
 
     macros
+}
+
+/// The type behind `wint_t`, which is not the same on every target.
+///
+/// `wint_t` has to hold every `wchar_t` value *plus* `WEOF`, and the two
+/// platforms solve that differently. glibc makes it `unsigned int`, so `WEOF`
+/// -- `(wint_t)-1` -- is `0xffffffff`, a value no `wchar_t` reaches. Darwin
+/// makes it `int`, following `__darwin_ct_rune_t`, and spends the negative
+/// half of the range instead.
+///
+/// It has to be the platform's choice rather than ours: the C library's own
+/// headers typedef `wint_t` from their own definition, and `__mbstate_t` holds
+/// one. Predefining the other signedness puts the compiler and the library in
+/// disagreement about a type they share -- which is how this was wrong in the
+/// first place, as plain `int` on both.
+fn wint_type(target: &Target) -> &'static str {
+    match target.os {
+        Os::MacOS => "int",
+        Os::Linux | Os::FreeBSD => "unsigned int",
+    }
 }
 
 /// Whether `__float128` exists on this target; see `TypeTable::has_float128`,

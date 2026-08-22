@@ -507,3 +507,159 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("pack_two_step", src, &[]), 0);
 }
+
+/// `#include_next` resumes the search *after* the directory the current file
+/// came from -- and `-I` directories are part of that search.
+///
+/// The `-I` list and the system list are stored separately, and the resume
+/// index only ever indexed the system list. A header found through `-I` had no
+/// index to resume from, so it restarted at the system list's first entry and
+/// never saw the remaining `-I` directories: `#include_next <n.h>` written in
+/// `ia/n.h` under `-Iia -Iib` reported "file not found" where gcc finds
+/// `ib/n.h`.
+#[test]
+fn preprocessor_include_next_walks_the_dash_i_path() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_include_next_")
+        .tempdir()
+        .unwrap();
+    let (a, b, c) = (
+        dir.path().join("a"),
+        dir.path().join("b"),
+        dir.path().join("c"),
+    );
+    for d in [&a, &b, &c] {
+        std::fs::create_dir(d).unwrap();
+    }
+    // Three levels, so the resume point has to advance each time rather than
+    // merely leave the first directory.
+    std::fs::write(a.join("n.h"), "#include_next <n.h>\n#define L1 1\n").unwrap();
+    std::fs::write(b.join("n.h"), "#include_next <n.h>\n#define L2 2\n").unwrap();
+    std::fs::write(c.join("n.h"), "#define L3 3\n").unwrap();
+
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "#include <n.h>\nint x = L1 + L2 + L3;\n").unwrap();
+
+    let r = run_c17(&[
+        "-E",
+        &format!("-I{}", a.display()),
+        &format!("-I{}", b.display()),
+        &format!("-I{}", c.display()),
+        &src.to_string_lossy(),
+    ]);
+    assert!(r.success, "include_next failed:\n{}", r.stderr);
+    let text: String = r.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        text.contains("int x = 1 + 2 + 3;"),
+        "every level should have been reached:\n{}",
+        r.stdout
+    );
+}
+
+/// The other half of the same index space: a file found on a *system* path
+/// still resumes after that path, not from the front of it. `-I` directories
+/// come first in the numbering, so the system entries had to be renumbered
+/// past them -- getting that offset wrong would make `#include_next` from a
+/// system header re-find the very file it was written in, and loop.
+#[test]
+fn preprocessor_include_next_from_a_system_path_still_advances() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_include_next_sys_")
+        .tempdir()
+        .unwrap();
+    let (q, s1, s2) = (
+        dir.path().join("q"),
+        dir.path().join("s1"),
+        dir.path().join("s2"),
+    );
+    for d in [&q, &s1, &s2] {
+        std::fs::create_dir(d).unwrap();
+    }
+    // A -I directory that is *not* on the chain, so it only contributes to the
+    // numbering.
+    std::fs::write(q.join("unrelated.h"), "#define UNUSED 0\n").unwrap();
+    std::fs::write(s1.join("n.h"), "#include_next <n.h>\n#define S1 1\n").unwrap();
+    std::fs::write(s2.join("n.h"), "#define S2 2\n").unwrap();
+
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "#include <n.h>\nint y = S1 + S2;\n").unwrap();
+
+    let r = run_c17(&[
+        "-E",
+        &format!("-I{}", q.display()),
+        "--isystem",
+        &s1.to_string_lossy(),
+        "--isystem",
+        &s2.to_string_lossy(),
+        &src.to_string_lossy(),
+    ]);
+    assert!(
+        r.success,
+        "include_next from a system path failed:\n{}",
+        r.stderr
+    );
+    let text: String = r.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        text.contains("int y = 1 + 2;"),
+        "expected both system levels:\n{}",
+        r.stdout
+    );
+}
+
+/// `-nostdinc` drops the *target's own* header directories. It does not drop
+/// the ones the caller named with `-isystem` or `-idirafter`: those were asked
+/// for explicitly, and gcc keeps searching them.
+///
+/// c17 held one flag for "use system paths", cleared it for `-nostdinc`, and
+/// so lost all three at once -- `-nostdinc -isystem d` could not find a header
+/// sitting in `d`.
+#[test]
+fn preprocessor_nostdinc_keeps_the_caller_s_system_paths() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_nostdinc_")
+        .tempdir()
+        .unwrap();
+    let (sys, quote) = (dir.path().join("sys"), dir.path().join("q"));
+    for d in [&sys, &quote] {
+        std::fs::create_dir(d).unwrap();
+    }
+    std::fs::write(sys.join("h.h"), "#define FROM_SYSTEM 1\n").unwrap();
+    std::fs::write(quote.join("qh.h"), "#define FROM_QUOTE 2\n").unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(
+        &src,
+        "#include <h.h>\n#include \"qh.h\"\nint a = FROM_SYSTEM;\nint b = FROM_QUOTE;\n",
+    )
+    .unwrap();
+
+    for flag in ["--isystem", "--idirafter"] {
+        let r = run_c17(&[
+            "-E",
+            "-nostdinc",
+            flag,
+            &sys.to_string_lossy(),
+            &format!("-I{}", quote.display()),
+            &src.to_string_lossy(),
+        ]);
+        assert!(r.success, "{} under -nostdinc failed:\n{}", flag, r.stderr);
+        let text: String = r.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("int a = 1;") && text.contains("int b = 2;"),
+            "{} should still be searched under -nostdinc:\n{}",
+            flag,
+            r.stdout
+        );
+    }
+
+    // The half that must keep working: `-nostdinc` on its own really does drop
+    // the standard directories, the bundled headers among them -- `gcc
+    // -nostdinc` cannot find <stddef.h> either.
+    let bare = dir.path().join("bare.c");
+    std::fs::write(&bare, "#include <stddef.h>\n").unwrap();
+    let r = run_c17(&["-E", "-nostdinc", &bare.to_string_lossy()]);
+    assert!(
+        !r.success,
+        "-nostdinc should drop the standard directories:\n{}",
+        r.stdout
+    );
+}

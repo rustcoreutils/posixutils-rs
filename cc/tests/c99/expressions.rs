@@ -687,3 +687,245 @@ int main(void) {
     assert_eq!(compile_and_run("c99_elvis", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("c99_elvis_o2", code), 0);
 }
+
+/// C17 6.5.15p5: the conditional expression has the arms' common type, so an
+/// arm whose own type differs is converted.
+///
+/// The conversion used to be attempted only for a *narrower integer* arm, so a
+/// `float` arm feeding a `double` result was left alone and a 32-bit pattern
+/// reached a 64-bit select: `pick() ? f() : d0()` evaluated to 0.0. Both the
+/// ternary and the GNU elvis form were affected, at every one of the seven
+/// places the test was written out.
+#[test]
+fn c99_conditional_arms_are_converted_to_the_common_type() {
+    let code = r#"
+float ff(void) { return 2.5f; }
+double dd(void) { return 7.5; }
+int pick(void) { return 1; }
+int zero(void) { return 0; }
+float g_f = 1.25f;
+
+int main(void) {
+    // Impure arms: the value is produced in a branch and merged.
+    if ((pick() ? ff() : dd()) != 2.5) return 1;
+    if ((zero() ? ff() : dd()) != 7.5) return 2;
+
+    // Pure arms: the value is produced with a select.
+    double one = 1.0;
+    if ((pick() ? g_f : one) != 1.25) return 3;
+
+    // The elvis form: the condition is also the true value.
+    if ((ff() ?: dd()) != 2.5) return 4;
+    float zf = 0.0f;
+    if ((zf ?: dd()) != 7.5) return 5;
+
+    // A narrowing arm is converted too -- `double` arm, `float` result.
+    float narrowed = pick() ? dd() : ff();
+    if (narrowed != 7.5f) return 6;
+
+    // The integer widening the old test did handle must still work.
+    char c = 3;
+    long wide = 1;
+    if ((pick() ? c : wide) != 3) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cond_arm_conversion", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("cond_arm_conversion_opt", code),
+        0
+    );
+}
+
+/// C17 6.3.1.8: the arms of a conditional expression go through the usual
+/// arithmetic conversions, so at equal rank an unsigned operand wins.
+///
+/// Every 32-bit pair was collapsed to `int` instead, which made
+/// `(long)(u ?: -1)` with `unsigned u = 0` give -1 where C gives 4294967295;
+/// at 64 bits the type was whichever arm happened to be written first.
+///
+/// Each case picks the arm whose *own* type is not the common one, since that
+/// is the only arm a conversion has anything to do to.
+#[test]
+fn c99_conditional_usual_arithmetic_conversions() {
+    let code = r#"
+int t(void) { return 1; }
+int f(void) { return 0; }
+int main(void) {
+    unsigned u = 0;
+    long sl = -1;
+    unsigned long ul = 1;
+
+    // Equal rank, one unsigned: the unsigned type wins, so the -1 arm is
+    // converted to UINT_MAX before the result widens to long.
+    if ((long)(f() ? u : -1) != 4294967295L) return 1;
+    if ((long)(f() ? -1 : u) != 0L) return 2;
+    if ((long)(u ?: -1) != 4294967295L) return 3;
+
+    // Equal rank at 64 bits: still the unsigned one, whichever arm it is.
+    if ((f() ? ul : sl) != 18446744073709551615UL) return 4;
+    if ((f() ? sl : ul) != 1UL) return 5;
+
+    // Unequal rank: the wider type, which being signed represents every value
+    // of the narrower unsigned one.
+    if ((t() ? sl : u) != -1L) return 6;
+
+    // A type narrower than `int` promotes to `int`, so its own signedness does
+    // not survive to decide anything.
+    unsigned char uc = 200;
+    if ((long)(t() ? (signed char)-1 : 1) != -1L) return 7;
+    if ((long)(f() ? uc : -1) != -1L) return 8;
+    if ((long)(f() ? (unsigned short)1 : -1) != -1L) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cond_uac", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("cond_uac_opt", code), 0);
+}
+
+/// A function declared as a trailing declarator, or inside a block, is still a
+/// function: it decays, it can be addressed, and it can be called. Only the
+/// *lvalue* half was wrong, so these are the uses the fix must not break.
+#[test]
+fn c99_non_defining_function_declarations_still_work() {
+    let code = r#"
+int f(int x), g(int x);
+int f(int x) { return x + 1; }
+int g(int x) { return x * 2; }
+typedef int fn_t(int);
+
+int use(void) {
+    int k(int);            /* a block-scope declaration of an outer function */
+    int (*p)(int) = g;     /* decays to a pointer */
+    int (*q)(int) = &f;    /* and can be addressed explicitly */
+    fn_t *r = f;           /* through a function typedef */
+    if (k(1) != 4) return 1;
+    if (p(3) != 6) return 2;
+    if (q(3) != 4) return 3;
+    if (r(3) != 4) return 4;
+    if (sizeof(&f) != sizeof(void *)) return 5;
+    return 0;
+}
+
+int k(int x) { return x + 3; }
+int main(void) { return use(); }
+"#;
+    assert_eq!(compile_and_run("fn_designator", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("fn_designator_opt", code), 0);
+}
+
+/// The conditional's common type is decided by conversion *rank*, not by bit
+/// width (C17 6.3.1.8). On LP64 `long` and `long long` are both 64 bits, and
+/// the copy of the rules that used to live in `ternary_common_type` compared
+/// widths -- so it returned whichever arm was written first, and `c ? l : ll`
+/// and `c ? ll : l` disagreed about their own type.
+///
+/// Checked with `_Generic`, which asks the type directly; the two types share
+/// a representation, so no arithmetic result can tell them apart.
+#[test]
+fn c99_conditional_common_type_follows_rank() {
+    let code = r#"
+#define TY(e) _Generic((e), \
+    int: 1, unsigned int: 2, \
+    long: 3, unsigned long: 4, \
+    long long: 5, unsigned long long: 6, \
+    float: 7, double: 8, long double: 9, \
+    default: 0)
+int c(void) { return 1; }
+int main(void) {
+    long l = 1; long long ll = 1;
+    unsigned long ul = 1; unsigned long long ull = 1;
+    unsigned u = 1; int i = 1;
+
+    /* Equal width, unequal rank: long long wins, written either way round. */
+    if (TY(c() ? l : ll) != 5) return 1;
+    if (TY(c() ? ll : l) != 5) return 2;
+    if (TY(c() ? ul : ull) != 6) return 3;
+    if (TY(c() ? ull : ul) != 6) return 4;
+
+    /* Mixed signedness at unequal rank: the unsigned counterpart of the
+       higher-ranked type, since neither can represent all of the other. */
+    if (TY(c() ? ul : ll) != 6) return 5;
+    if (TY(c() ? ll : ul) != 6) return 6;
+
+    /* The equal-rank case, which is where the unsigned operand wins. */
+    if (TY(c() ? u : i) != 2) return 7;
+    if (TY(c() ? l : ul) != 4) return 8;
+
+    /* Unequal rank, same signedness: the higher rank. */
+    if (TY(c() ? i : ll) != 5) return 9;
+    if (TY(c() ? u : ull) != 6) return 10;
+
+    /* Reals rank the same way, and `_Float16` is a type of its own rather
+       than being flattened to `float`. */
+    float f = 1; double d = 1;
+    if (TY(c() ? f : d) != 8) return 11;
+    if (TY(c() ? d : f) != 8) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cond_rank", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("cond_rank_opt", code), 0);
+}
+
+/// The usual arithmetic conversions now have one implementation, on the type
+/// table, and the binary operators and the conditional both reach it. They
+/// used to have two, which had drifted: the table compared `size_bits` where
+/// the parser ranked by kind, so they disagreed about `long` against
+/// `long long`.
+///
+/// C17 6.3.1.8 needs rank *and* width, which are different questions -- `long`
+/// and `long long` rank apart at the same width. Each of the standard's three
+/// mixed-signedness steps gets a case here.
+#[test]
+fn c99_usual_arithmetic_conversions_rank_and_width() {
+    let code = r#"
+#define TY(e) _Generic((e), \
+    int: 1, unsigned int: 2, long: 3, unsigned long: 4, \
+    long long: 5, unsigned long long: 6, default: 0)
+int c(void) { return 1; }
+int main(void) {
+    int i = 1; unsigned u = 1;
+    long l = 1; unsigned long ul = 1;
+    long long ll = 1; unsigned long long ull = 1;
+    unsigned char uc = 1; short sh = 1;
+
+    /* Same signedness: the higher rank wins, at equal width too. */
+    if (TY(l + ll) != 5) return 1;
+    if (TY(ll + l) != 5) return 2;
+    if (TY(ul + ull) != 6) return 3;
+    if (TY(i + ll) != 5) return 4;
+
+    /* Mixed, unsigned ranks at least as high: the unsigned type. */
+    if (TY(l + ul) != 4) return 5;
+    if (TY(i + u) != 2) return 6;
+
+    /* Mixed, signed ranks higher AND is wider, so it holds every value of the
+       unsigned one and keeps its sign. This is the case a rank-only rule gets
+       wrong -- `-1L / 2u` really is negative, so it truncates to 0. */
+    if (TY(l + u) != 3) return 7;
+    if (TY(u + l) != 3) return 8;
+    if (-1L / 2u != 0) return 9;
+
+    /* Mixed, signed ranks higher but has no room to spare: neither represents
+       the other, so the unsigned counterpart of the signed type. */
+    if (TY(ul + ll) != 6) return 10;
+    if (TY(ll + ul) != 6) return 11;
+
+    /* Both narrower than int: promotion strips the signedness first. */
+    if (TY(uc + sh) != 1) return 12;
+    if ((unsigned char)200 / -1 != -200) return 13;
+
+    /* And the conditional gives the same answers, since it is the same code. */
+    if (TY(c() ? l : ll) != 5) return 14;
+    if (TY(c() ? ul : ll) != 6) return 15;
+    if (TY(c() ? l : u) != 3) return 16;
+    if (TY(c() ? uc : sh) != 1) return 17;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("uac_rank_width", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("uac_rank_width_opt", code), 0);
+}

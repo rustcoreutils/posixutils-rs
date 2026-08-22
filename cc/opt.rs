@@ -147,18 +147,48 @@ fn suppress_forwarding_bodies(module: &mut Module) {
 
 /// Diagnose a pack the inliner could not resolve.
 ///
-/// Reachable when `always_inline` is refused for a reason of its own -- the
-/// caller-size and recursion caps in `ir::inline` outrank the attribute -- and
-/// the call would otherwise be emitted with its forwarded arguments missing.
-/// GCC diagnoses the same situation rather than miscompiling it.
+/// Reachable when `always_inline` is refused for a reason of its own -- a
+/// callee that also uses `va_start`, or `alloca`, is turned down in
+/// `ir::inline` before the attribute is consulted. The body was already
+/// suppressed, so the surviving call has nothing to reach.
+///
+/// The test used to be `func.emit && forwards_caller_arguments(func)`, which
+/// no function can satisfy: `suppress_forwarding_bodies` clears `emit` on
+/// exactly the set `forwards_caller_arguments` accepts, and nothing sets it
+/// back. So the guard never fired, and a forwarder the inliner had refused
+/// came out as `undefined reference to 'wrap'` from the linker with no
+/// diagnostic of its own. What is actually wrong is a surviving *call site*,
+/// so that is what this looks for. GCC reports the same situation as an error.
 fn check_forwarding_resolved(module: &Module) {
-    for func in &module.functions {
-        if func.emit && forwards_caller_arguments(func) {
-            crate::diag::error_args(
-                crate::diag::Position::default(),
-                "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
-                &[&func.name],
-            );
+    let suppressed: std::collections::BTreeSet<&str> = module
+        .functions
+        .iter()
+        .filter(|f| !f.emit && forwards_caller_arguments(f))
+        .map(|f| f.name.as_str())
+        .collect();
+    if suppressed.is_empty() {
+        return;
+    }
+
+    // One report per unresolved callee, however many times it is called.
+    let mut reported = std::collections::BTreeSet::new();
+    for func in module.functions.iter().filter(|f| f.emit) {
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            if insn.op != crate::ir::Opcode::Call {
+                continue;
+            }
+            let Some(callee) = insn.func_name.as_deref() else {
+                continue;
+            };
+            if suppressed.contains(callee) && reported.insert(callee) {
+                // The call site, not line 0: it is the thing that cannot be
+                // resolved, and the only position either function still has.
+                crate::diag::error_args(
+                    insn.pos.unwrap_or_default(),
+                    "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
+                    &[callee],
+                );
+            }
         }
     }
 }

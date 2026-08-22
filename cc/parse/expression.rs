@@ -297,7 +297,28 @@ impl<'a> Parser<'a> {
             return self.types.void_id;
         }
 
-        // Both arithmetic: apply usual arithmetic conversions
+        // Both arithmetic: the usual arithmetic conversions, which C17 6.5.15p5
+        // sends the arms through -- the same ones the binary operators use.
+        //
+        // Delegated rather than restated. The copy that lived here compared
+        // bit *width* where C compares conversion *rank*, so `c ? (long)0 :
+        // (long long)0` came out `long` and, worse, depended on which arm was
+        // written first: the same pair spelled the other way round gave
+        // `long long`.
+        //
+        // Complex is held back deliberately. The shared version answers it
+        // correctly -- `c ? z : 1.0` really is `double _Complex` -- but a
+        // complex conditional does not survive codegen today: the arms carry a
+        // two-register value while the merge dereferences the pseudo as an
+        // address, which segfaults, and does so at this commit with or without
+        // this change. Widening the type here would turn "quietly drops the
+        // imaginary part" into "crashes", so complex keeps the answer it had
+        // until that is fixed.
+        let complex = self.types.is_complex(then_typ) || self.types.is_complex(else_typ);
+        if !complex && self.types.is_arithmetic(then_typ) && self.types.is_arithmetic(else_typ) {
+            return self.usual_arithmetic_conversions(then_typ, else_typ);
+        }
+
         // Float types take precedence
         if self.types.is_float(then_typ) || self.types.is_float(else_typ) {
             if then_kind == TypeKind::Float128 || else_kind == TypeKind::Float128 {
@@ -312,24 +333,10 @@ impl<'a> Parser<'a> {
             return self.types.float_id;
         }
 
-        // Integer types: promote both, then pick the wider/unsigned
-        let then_size = self.types.size_bits(then_typ).max(32); // integer promotion
-        let else_size = self.types.size_bits(else_typ).max(32);
-
-        // Pick the wider type, or int if both are narrow
-        if then_size >= else_size && then_size >= 32 {
-            if then_size == 32 {
-                return self.types.int_id;
-            }
-            return then_typ;
-        }
-        if else_size >= then_size && else_size >= 32 {
-            if else_size == 32 {
-                return self.types.int_id;
-            }
-            return else_typ;
-        }
-        self.types.int_id
+        // Neither arithmetic nor a pointer: a struct or union, where C17
+        // 6.5.15p3 has already required both arms to have the same type and
+        // there is nothing to convert.
+        then_typ
     }
 
     /// Apply the array-to-pointer and function-to-pointer decays of C17
@@ -2728,97 +2735,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Compute usual arithmetic conversions (C99 6.3.1.8)
+    /// The usual arithmetic conversions (C17 6.3.1.8).
+    ///
+    /// The rules themselves live on the type table, because the linearizer and
+    /// the constant folder need the same answer and reach nothing else. This
+    /// was a second implementation of them, and the two had drifted: the table
+    /// compared widths where this one ranked by kind, so they disagreed about
+    /// `long` against `long long`. One of them had to go.
     fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
-        // C99 6.3.1.8: Usual arithmetic conversions
-        // For complex types: if either operand is complex, result is complex
-        // The underlying type follows the same rules as real types
-
-        let left_kind = self.types.kind(left);
-        let right_kind = self.types.kind(right);
-        let left_complex = self.types.is_complex(left);
-        let right_complex = self.types.is_complex(right);
-        let is_complex = left_complex || right_complex;
-
-        // Determine the underlying floating-point type
-        // 1. If either is long double, result is long double
-        // 2. If either is double, result is double
-        // 3. If either is float, result is float
-        // 4. Otherwise, integer promotions apply
-
-        if left_kind == TypeKind::Float128 || right_kind == TypeKind::Float128 {
-            // binary128 outranks every other real type: it is wider than x87
-            // extended in the significand, and equal to it in range.
-            if is_complex {
-                self.types.complex_float128_id
-            } else {
-                self.types.float128_id
-            }
-        } else if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
-            if is_complex {
-                self.types.complex_longdouble_id
-            } else {
-                self.types.longdouble_id
-            }
-        } else if left_kind == TypeKind::Double || right_kind == TypeKind::Double {
-            if is_complex {
-                self.types.complex_double_id
-            } else {
-                self.types.double_id
-            }
-        } else if left_kind == TypeKind::Float || right_kind == TypeKind::Float {
-            if is_complex {
-                self.types.complex_float_id
-            } else {
-                self.types.float_id
-            }
-        } else if left_kind == TypeKind::Float16 || right_kind == TypeKind::Float16 {
-            // C23 _Float16: stays as _Float16 for arithmetic
-            if is_complex {
-                self.types.complex_float16_id
-            } else {
-                self.types.float16_id
-            }
-        } else {
-            // No operand is floating, so the integer promotions apply to both
-            // *before* the ranks below are compared (C17 6.3.1.8p1). Without
-            // this, two sub-`int` operands matched none of the Long/LongLong/
-            // Int128 arms and fell to the final `is_unsigned` fallback, so
-            // `unsigned char` and `unsigned short` arithmetic came out
-            // unsigned -- `(a - b) / 2` divided 0xFFFFFFFF by two. After
-            // promotion no operand narrower than `int` can reach that
-            // fallback at all.
-            let left = self.types.integer_promote(left);
-            let right = self.types.integer_promote(right);
-            let left_kind = self.types.kind(left);
-            let right_kind = self.types.kind(right);
-
-            if left_kind == TypeKind::Int128 || right_kind == TypeKind::Int128 {
-                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                    self.types.uint128_id
-                } else {
-                    self.types.int128_id
-                }
-            } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
-                // If either is unsigned long long, result is unsigned long long
-                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                    self.types.ulonglong_id
-                } else {
-                    self.types.longlong_id
-                }
-            } else if left_kind == TypeKind::Long || right_kind == TypeKind::Long {
-                // If either is unsigned long, result is unsigned long
-                if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                    self.types.ulong_id
-                } else {
-                    self.types.long_id
-                }
-            } else if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
-                self.types.uint_id
-            } else {
-                self.types.int_id
-            }
-        }
+        self.types.common_type(left, right)
     }
 
     /// Parse a C11 generic selection (C17 6.5.1.1):

@@ -468,48 +468,28 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            // Compile-time ternary: cond ? then_expr : else_expr
-            // Used in CPython's _Py_LATIN1_CHR() macro for static initializers
-            // `a ?: b` in a static initializer: the condition is constant or
-            // this is an error either way, so folding it needs no temporary.
+            // `a ?: b` in a static initializer. The condition is also the
+            // value of the true arm, so folding it needs no temporary.
             ExprKind::CondElvis { cond, else_expr } => {
-                if let Some(cond_val) = self.eval_const_init_expr(cond) {
-                    if cond_val != 0 {
-                        return self.ast_init_to_ir(cond, typ);
-                    } else {
-                        return self.ast_init_to_ir(else_expr, typ);
-                    }
+                match self.const_condition(cond) {
+                    Some(true) => return self.ast_init_to_ir(cond, typ),
+                    Some(false) => return self.ast_init_to_ir(else_expr, typ),
+                    None => self.reject_initializer(cond),
                 }
-                error(
-                    self.current_pos.unwrap_or_default(),
-                    &format!(
-                        "non-constant condition in global initializer ternary: {:?}",
-                        cond.kind
-                    ),
-                );
                 Initializer::None
             }
 
+            // `cond ? a : b`, as CPython's _Py_LATIN1_CHR() writes it.
             ExprKind::Conditional {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                if let Some(cond_val) = self.eval_const_init_expr(cond) {
-                    if cond_val != 0 {
-                        return self.ast_init_to_ir(then_expr, typ);
-                    } else {
-                        return self.ast_init_to_ir(else_expr, typ);
-                    }
+                match self.const_condition(cond) {
+                    Some(true) => return self.ast_init_to_ir(then_expr, typ),
+                    Some(false) => return self.ast_init_to_ir(else_expr, typ),
+                    None => self.reject_initializer(cond),
                 }
-                // If condition isn't constant, fall through to error
-                error(
-                    self.current_pos.unwrap_or_default(),
-                    &format!(
-                        "non-constant condition in global initializer ternary: {:?}",
-                        cond.kind
-                    ),
-                );
                 Initializer::None
             }
 
@@ -711,12 +691,51 @@ impl<'a> super::linearize::Linearizer<'a> {
         })
     }
 
+    /// Which way a constant controlling expression goes, or None if it is not
+    /// a constant this compiler can fold.
+    ///
+    /// A conditional in a static initializer is folded rather than emitted, so
+    /// its condition has to be decided here. Asking `eval_const_init_expr`
+    /// alone made that test i128-only, which rejected
+    /// `static double d = 1.5 ?: 2.5;` and `static const char *g = "a" ?: "b";`
+    /// -- neither of which is an integer, and both of which C17 6.6 makes
+    /// perfectly constant.
+    fn const_condition(&self, cond: &Expr) -> Option<bool> {
+        if let Some(val) = self.eval_const_init_expr(cond) {
+            return Some(val != 0);
+        }
+        if let Some(val) = self.eval_const_float_init_expr(cond) {
+            return Some(!val.is_zero());
+        }
+        // An address constant. A string literal has storage of its own and the
+        // address of an object or a function is never null, so all of these are
+        // true without needing a value.
+        match &cond.kind {
+            ExprKind::StringLit(_)
+            | ExprKind::WideStringLit(_)
+            | ExprKind::Utf16StringLit(_)
+            | ExprKind::Utf32StringLit(_) => Some(true),
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                ..
+            } => Some(true),
+            // A bare identifier is an address constant only when it decays --
+            // an array or a function. Anything else is an object's *value*,
+            // which is not a constant expression at file scope.
+            ExprKind::Ident(_) => {
+                let kind = self.types.kind(cond.typ?);
+                matches!(kind, TypeKind::Array | TypeKind::Function).then_some(true)
+            }
+            _ => None,
+        }
+    }
+
     /// Report an initializer that is not a constant expression we can fold.
     ///
-    /// Named rather than inlined because three arms need it and they used to
-    /// disagree: two printed a raw Rust `{:?}` dump of the AST -- internal
-    /// representation in a user-facing message -- and the third said nothing
-    /// at all, which silently zeroed the object.
+    /// Named rather than inlined because several arms need it and they used to
+    /// disagree: some printed a raw Rust `{:?}` dump of the AST -- internal
+    /// representation in a user-facing message, at position 0 -- and one said
+    /// nothing at all, which silently zeroed the object.
     fn reject_initializer(&self, expr: &Expr) {
         error(
             self.expr_pos(expr),

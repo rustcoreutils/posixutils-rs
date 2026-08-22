@@ -356,3 +356,62 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_stddef_alone", code, &[]), 0);
 }
+
+/// `wint_t` has to hold every `wchar_t` value plus `WEOF`, and the two
+/// platforms solve that differently: glibc makes it `unsigned int` so `WEOF`
+/// is `0xffffffff`, Darwin makes it `int` and spends the negative half of the
+/// range instead. `__WINT_TYPE__` was plain `int` on both, so it agreed with
+/// neither C library about a type they share -- `__mbstate_t` holds one.
+///
+/// The claim under test is agreement with the platform, not a particular
+/// signedness, so that is what this asserts. Hard-coding glibc's answers is
+/// what made the first version of this test fail on macOS, where `mbstate_t`
+/// is 128 bytes rather than 8.
+#[test]
+fn c99_wint_t_matches_the_platform() {
+    let code = r#"
+#include <wchar.h>
+#include <wctype.h>
+#include <stdint.h>
+#include <stddef.h>
+
+int main(void) {
+    /* The predefine and the C library's own typedef must be the same type.
+       This is the whole point: they are two spellings of one type, and the
+       library's headers build `mbstate_t` out of theirs. */
+    if (!_Generic((wint_t)0, __WINT_TYPE__: 1, default: 0)) return 1;
+
+    /* True on both platforms. */
+    if (sizeof(wint_t) != 4) return 2;
+    if (sizeof(wint_t) != __SIZEOF_WINT_T__) return 3;
+    if (WEOF != (wint_t)-1) return 4;
+
+    /* The bounds follow the signedness rather than contradicting it. */
+    if ((wint_t)-1 > 0) {
+        /* Unsigned, as on glibc: WEOF is the largest value, not a negative. */
+        if (WINT_MIN != 0) return 5;
+        if (WINT_MAX != 4294967295u) return 6;
+    } else {
+        /* Signed, as on Darwin. */
+        if (WINT_MIN >= 0) return 7;
+        if (WINT_MAX != 2147483647) return 8;
+    }
+    if (WINT_MIN != __WINT_MIN__) return 9;
+    if (WINT_MAX != __WINT_MAX__) return 10;
+
+    /* The library agrees about the type it hands back to us. */
+    if (towlower(L'A') != (wint_t)L'a') return 11;
+    if (iswalpha(L'x') == 0) return 12;
+
+    /* mbstate_t holds a wint_t, so it is at least that big. Its actual size
+       is the platform's business -- 8 on glibc, 128 on Darwin. */
+    if (sizeof(mbstate_t) < sizeof(wint_t)) return 13;
+
+    /* A read loop ends on WEOF, not on an ordinary wide character. */
+    wint_t w = (wint_t)L'q';
+    if (w == WEOF) return 14;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("wint_platform", code, &[]), 0);
+}

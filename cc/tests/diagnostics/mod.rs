@@ -1066,6 +1066,20 @@ fn diagnostics_non_lvalue_targets_are_rejected() {
             "int main(void){ int v[3],w[3]; v = w; return 0; }\n",
             "assignment to expression with array type",
         ),
+        // A function designator is not an lvalue either. Both binders that
+        // reach a non-defining declarator used `Symbol::variable`, and
+        // `is_lvalue` asks the symbol's kind rather than its type -- so these
+        // compiled and stored through the function's own address.
+        (
+            "assign_to_trailing_declarator_function",
+            "int f(int), g(int);\nint main(void){ g = 0; return 0; }\n",
+            "lvalue required as left operand of assignment",
+        ),
+        (
+            "assign_to_block_scope_function",
+            "int main(void){ int g(int); g = 0; return 0; }\n",
+            "lvalue required as left operand of assignment",
+        ),
         (
             "preinc_non_lvalue",
             "int main(void){ int a=1; ++(a+1); return 0; }\n",

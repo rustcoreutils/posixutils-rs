@@ -1654,101 +1654,136 @@ impl TypeTable {
     /// The common type of two operands under the usual arithmetic conversions
     /// (C17 6.3.1.8) -- the type C converts both to before operating.
     ///
-    /// It lives on the table rather than on one of its callers because three
-    /// of them need it and only this one has no other state: the linearizer
-    /// lowering an arithmetic expression, and the constant folder, which
+    /// It lives on the table rather than on one of its callers because four of
+    /// them need it and only this one has no other state: the parser typing an
+    /// expression, the linearizer lowering one, and the constant folder, which
     /// reaches a `&TypeTable` and nothing else.
+    ///
+    /// The ladder is by conversion **rank**, not by width. Those are not the
+    /// same thing: on LP64 `long` and `long long` are both 64 bits, and this
+    /// used to compare `size_bits`, so it returned whichever operand happened
+    /// to be on the left and `l + ll` could disagree with `ll + l`.
     pub fn common_type(&self, left: TypeId, right: TypeId) -> TypeId {
-        // C99 6.3.1.8 usual arithmetic conversions:
-        // 1. If either is long double, convert to long double
-        // 2. Else if either is double, convert to double
-        // 3. Else if either is float, convert to float
-        // 4. Otherwise apply integer promotions, then:
-        //    a. If both have same type after promotion, done
-        //    b. If both signed or both unsigned, convert narrower to wider
-        //    c. If unsigned has rank >= signed, convert signed to unsigned
-        //    d. If signed can represent all unsigned values, convert to signed
-        //    e. Otherwise convert both to unsigned version of signed type
-
-        // Check for floating point types
-        let left_float = self.is_float(left);
-        let right_float = self.is_float(right);
-
-        let left_kind = self.kind(left);
-        let right_kind = self.kind(right);
-
-        if left_float || right_float {
-            // At least one operand is floating point
-            // Use the wider floating point type
-            if left_kind == TypeKind::Float128 || right_kind == TypeKind::Float128 {
-                return self.float128_id;
-            }
-            if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
-                return self.longdouble_id;
-            }
-            if left_kind == TypeKind::Double || right_kind == TypeKind::Double {
-                return self.double_id;
-            }
-            if left_kind == TypeKind::Float || right_kind == TypeKind::Float {
-                return self.float_id;
-            }
-            // Both are Float16 (C23: _Float16 stays as _Float16)
-            if left_kind == TypeKind::Float16 || right_kind == TypeKind::Float16 {
-                return self.float16_id;
-            }
-            // Fallback to float for any remaining float cases
-            return self.float_id;
-        }
-
-        // Apply integer promotions first (C99 6.3.1.1)
-        let left_promoted = self.integer_promote(left);
-        let right_promoted = self.integer_promote(right);
-
-        let left_size = self.size_bits(left_promoted);
-        let right_size = self.size_bits(right_promoted);
-        let left_unsigned = self.is_unsigned(left_promoted);
-        let right_unsigned = self.is_unsigned(right_promoted);
-        let left_kind = self.kind(left_promoted);
-        let right_kind = self.kind(right_promoted);
-
-        // If both have same type after promotion, use that type
-        if left_kind == right_kind && left_unsigned == right_unsigned && left_size == right_size {
-            return left_promoted;
-        }
-
-        // If both signed or both unsigned, convert narrower to wider
-        if left_unsigned == right_unsigned {
-            return if left_size >= right_size {
-                left_promoted
+        // Pointers and the like reach here from comparisons, where there is
+        // nothing to convert: the operands already have a common type. The
+        // rules below are about arithmetic operands only.
+        if !self.is_arithmetic(left) || !self.is_arithmetic(right) {
+            return if self.size_bits(left) >= self.size_bits(right) {
+                left
             } else {
-                right_promoted
+                right
             };
         }
 
-        // Mixed signedness case
-        let (signed_id, unsigned_id) = if left_unsigned {
-            (right_promoted, left_promoted)
+        // Complex is contagious: if either operand is complex the result is,
+        // at the common type of the two real parts (C17 6.3.1.8p1).
+        let complex = self.is_complex(left) || self.is_complex(right);
+
+        let left_float = self.is_float(left) || self.is_complex(left);
+        let right_float = self.is_float(right) || self.is_complex(right);
+        if left_float || right_float {
+            let (l, r) = (self.kind(left), self.kind(right));
+            let either = |k| l == k || r == k;
+            // Widest first. binary128 outranks x87 extended: equal in range,
+            // wider in the significand.
+            return if either(TypeKind::Float128) {
+                self.pick_complex(complex, self.float128_id, self.complex_float128_id)
+            } else if either(TypeKind::LongDouble) {
+                self.pick_complex(complex, self.longdouble_id, self.complex_longdouble_id)
+            } else if either(TypeKind::Double) {
+                self.pick_complex(complex, self.double_id, self.complex_double_id)
+            } else if either(TypeKind::Float) {
+                self.pick_complex(complex, self.float_id, self.complex_float_id)
+            } else {
+                // Both are _Float16, which C23 keeps as itself.
+                self.pick_complex(complex, self.float16_id, self.complex_float16_id)
+            };
+        }
+
+        // Integers. The promotions run first (C17 6.3.1.8p1) -- without them
+        // two sub-`int` operands match none of the rules below and fall to the
+        // unsigned case, so `unsigned char` arithmetic came out unsigned.
+        let left = self.integer_promote(left);
+        let right = self.integer_promote(right);
+        let (left_unsigned, right_unsigned) = (self.is_unsigned(left), self.is_unsigned(right));
+
+        // Same signedness: the higher rank, and nothing else to decide.
+        if left_unsigned == right_unsigned {
+            return if self.integer_rank(left) >= self.integer_rank(right) {
+                left
+            } else {
+                right
+            };
+        }
+
+        // Mixed. C17 6.3.1.8 takes three more steps, and they need rank *and*
+        // width, which are different questions: `long` and `long long` rank
+        // apart at the same width, and that is what decides `unsigned long`
+        // against `long long`.
+        let (signed, unsigned) = if left_unsigned {
+            (right, left)
         } else {
-            (left_promoted, right_promoted)
+            (left, right)
         };
-
-        let signed_size = self.size_bits(signed_id);
-        let unsigned_size = self.size_bits(unsigned_id);
-
-        // If unsigned has rank >= signed, convert to unsigned
-        if unsigned_size >= signed_size {
-            return unsigned_id;
+        if self.integer_rank(unsigned) >= self.integer_rank(signed) {
+            // The unsigned type ranks at least as high, so everything converts
+            // to it: `unsigned long` against `long` is `unsigned long`.
+            return unsigned;
         }
-
-        // If signed type can represent all values of unsigned type, use signed
-        // (This is true when signed_size > unsigned_size on our platforms)
-        if signed_size > unsigned_size {
-            return signed_id;
+        if self.size_bits(signed) > self.size_bits(unsigned) {
+            // The signed type holds every value of the unsigned one, so it
+            // survives with its sign: `-1L / 2u` is `long`, not `unsigned
+            // long`, and really is negative.
+            return signed;
         }
+        // Lower rank but no room to spare -- `unsigned long` against `long
+        // long`, both 64 bits. Neither can represent the other, so the answer
+        // is the unsigned counterpart of the signed type.
+        self.unsigned_version(signed)
+    }
 
-        // Otherwise convert both to unsigned version of signed type
-        // (This case shouldn't happen on LP64 since we already handled size comparisons)
-        self.unsigned_version(signed_id)
+    /// The integer conversion rank (C17 6.3.1.1p1), as an ordinal.
+    ///
+    /// Rank is not width. `long` and `long long` are both 64 bits on every
+    /// target here and yet rank apart, which is exactly the case that made
+    /// comparing `size_bits` return whichever operand came first.
+    fn integer_rank(&self, id: TypeId) -> u8 {
+        match self.kind(id) {
+            TypeKind::Bool => 0,
+            TypeKind::Char => 1,
+            TypeKind::Short => 2,
+            // An enumerated type has the rank of its compatible type, which
+            // here is always `int`.
+            TypeKind::Int | TypeKind::Enum => 3,
+            TypeKind::Long => 4,
+            TypeKind::LongLong => 5,
+            TypeKind::Int128 => 6,
+            _ => 3,
+        }
+    }
+
+    /// The unsigned type corresponding to a signed integer type.
+    #[inline]
+    fn unsigned_version(&self, id: TypeId) -> TypeId {
+        match self.kind(id) {
+            TypeKind::Char => self.uchar_id,
+            TypeKind::Short => self.ushort_id,
+            TypeKind::Int => self.uint_id,
+            TypeKind::Long => self.ulong_id,
+            TypeKind::LongLong => self.ulonglong_id,
+            TypeKind::Int128 => self.uint128_id,
+            _ => id,
+        }
+    }
+
+    /// One of a real/complex pair, by whether the result is complex.
+    #[inline]
+    fn pick_complex(&self, complex: bool, real: TypeId, cplx: TypeId) -> TypeId {
+        if complex {
+            cplx
+        } else {
+            real
+        }
     }
 
     /// Apply the integer promotions (C17 6.3.1.1p2).
@@ -1767,20 +1802,6 @@ impl TypeTable {
         match self.kind(id) {
             TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.int_id,
             _ => id,
-        }
-    }
-
-    /// Get the unsigned version of a type
-    #[inline]
-    pub fn unsigned_version(&self, id: TypeId) -> TypeId {
-        match self.get(id).kind {
-            TypeKind::Char => self.uchar_id,
-            TypeKind::Short => self.ushort_id,
-            TypeKind::Int => self.uint_id,
-            TypeKind::Long => self.ulong_id,
-            TypeKind::LongLong => self.ulonglong_id,
-            TypeKind::Int128 => self.uint128_id,
-            _ => id, // For non-integer types, just return the original
         }
     }
 

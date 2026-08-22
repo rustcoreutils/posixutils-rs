@@ -223,6 +223,17 @@ pub enum Opcode {
 
     // Stack allocation builtin
     Alloca, // Dynamic stack allocation
+    /// Capture the stack pointer, so a later [`Opcode::StackRestore`] can put
+    /// it back. Defines a pointer-sized pseudo and reads nothing.
+    ///
+    /// Exists for inlining. A call to a function that `alloca`s releases that
+    /// memory when it returns; splicing the body into the caller would instead
+    /// hold it until the *caller* returns, so `for (...) use(n)` with an
+    /// `alloca` in `use` would grow the stack every iteration until it
+    /// overflowed. Bracketing the inlined body restores the call's lifetime.
+    StackSave,
+    /// Put the stack pointer back to what a [`Opcode::StackSave`] captured.
+    StackRestore,
 
     // Memory builtins - generate calls to C library functions
     Memset,  // memset(dest, c, n) - set memory
@@ -306,6 +317,8 @@ impl Opcode {
                 | Opcode::VaCopy
                 | Opcode::VaArg
                 | Opcode::Alloca
+                | Opcode::StackSave
+                | Opcode::StackRestore
                 | Opcode::Memset
                 | Opcode::Memcpy
                 | Opcode::Memmove
@@ -424,6 +437,8 @@ impl Opcode {
             Opcode::Popcount32 => "popcount32",
             Opcode::Popcount64 => "popcount64",
             Opcode::Alloca => "alloca",
+            Opcode::StackSave => "stacksave",
+            Opcode::StackRestore => "stackrestore",
             Opcode::Memset => "memset",
             Opcode::Memcpy => "memcpy",
             Opcode::Memmove => "memmove",

@@ -433,9 +433,18 @@ impl Label {
         }
     }
 
-    /// Format as assembly label name
+    /// The label's assembly spelling, quoted when it has to be.
+    ///
+    /// A label carries the function's name, so a function whose identifier
+    /// holds an extended character produces `.Lmüller_0`. Only the *definition*
+    /// went out raw: `&&label` builds this same spelling as a local
+    /// [`Symbol`], which is quoted downstream, so one label reached the
+    /// assembler spelled two different ways -- `.Lmüller_1:` defined,
+    /// `".Lmüller_1"(%rip)` referenced. GNU as resolves both to one symbol;
+    /// Mach-O's assembler rejects the raw bytes, which is what the quoting is
+    /// for.
     pub fn name(&self) -> String {
-        format!(".L{}_{}", self.func_name, self.block_id)
+        quote_symbol_if_needed(&format!(".L{}_{}", self.func_name, self.block_id))
     }
 }
 

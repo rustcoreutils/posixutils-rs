@@ -2053,3 +2053,74 @@ int main(void)
         0
     );
 }
+
+/// A conditional in a static initializer is folded rather than emitted, so its
+/// condition is decided at compile time -- and that test used to be
+/// integer-only, which rejected every constant condition that is not an
+/// integer.
+#[test]
+fn c99_global_initializer_folds_non_integer_conditions() {
+    let code = r#"
+int arr[4];
+int fn(void) { return 9; }
+int obj;
+
+/* A string literal has storage of its own, so its address is never null. */
+static const char *g = "a" ?: "b";
+/* A floating constant is a constant condition too, and 1.5 is not zero. */
+static double d = 1.5 ?: 2.5;
+static double dz = 0.0 ? 1.5 : 2.5;
+/* An array and a function decay to addresses, which are never null. */
+static int *pa = arr ?: 0;
+static int (*pf)(void) = fn ?: 0;
+static int *po = &obj ?: 0;
+/* The integer path that already worked, kept as the control. */
+static int i = 0 ?: 7;
+
+int main(void) {
+    if (g[0] != 'a') return 1;
+    if (d != 1.5) return 2;
+    if (dz != 2.5) return 3;
+    if (pa != arr) return 4;
+    if (pf != fn) return 5;
+    if (po != &obj) return 6;
+    if (i != 7) return 7;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("global_init_cond", code, &[]), 0);
+}
+
+/// The same path's rejection: a condition that really is not constant is an
+/// error, reported at the expression rather than at line 0, and naming the
+/// mistake rather than dumping the AST.
+#[test]
+fn c99_global_initializer_rejects_non_constant_condition() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("nc.c");
+    std::fs::write(&src, "int obj;\nstatic int bad = obj ?: 1;\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
+        .args(["-c", src.to_str().unwrap(), "-o"])
+        .arg(dir.path().join("nc.o"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success(), "expected a rejection: {}", stderr);
+    assert!(
+        stderr.contains("is not a constant expression"),
+        "expected the shared wording: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("nc.c:2:"),
+        "expected the expression's own line, not line 0: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("ExprKind") && !stderr.contains("Ident("),
+        "expected no AST dump: {}",
+        stderr
+    );
+}

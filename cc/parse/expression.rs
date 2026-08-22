@@ -1026,20 +1026,32 @@ impl<'a> Parser<'a> {
             // Not a type, parse as expression
             let expr = self.parse_expression()?;
             self.expect_special(b')')?;
-            Ok(Expr::typed(
-                ExprKind::AlignofExpr(Box::new(expr)),
-                size_t,
-                alignof_pos,
-            ))
+            Ok(self.alignof_expr(expr, size_t, alignof_pos))
         } else {
             // _Alignof without parens - must be expression
             let expr = self.parse_unary_expr()?;
-            Ok(Expr::typed(
-                ExprKind::AlignofExpr(Box::new(expr)),
-                size_t,
-                alignof_pos,
-            ))
+            Ok(self.alignof_expr(expr, size_t, alignof_pos))
         }
+    }
+
+    /// `_Alignof` applied to an expression rather than a type name.
+    ///
+    /// C17 6.5.3.4p1 takes a parenthesised type name; applying the operator to
+    /// an expression is the GNU `__alignof__` extension, and there gcc answers
+    /// the *object's* declared alignment, not its type's. So an object carrying
+    /// `_Alignas(64)` or `__attribute__((aligned(64)))` answers 64 even though
+    /// its type is still plain `int`.
+    ///
+    /// Resolved here, where the symbol is in hand, so that the one rule has one
+    /// implementation: the constant evaluator and the linearizer each computed
+    /// this from `expr.typ` alone and so disagreed with gcc identically.
+    fn alignof_expr(&mut self, expr: Expr, size_t: TypeId, pos: Position) -> Expr {
+        if let ExprKind::Ident(symbol_id) = &expr.kind {
+            if let Some(align) = self.symbols.get(*symbol_id).explicit_align {
+                return Expr::typed(ExprKind::IntLit(align as i64), size_t, pos);
+            }
+        }
+        Expr::typed(ExprKind::AlignofExpr(Box::new(expr)), size_t, pos)
     }
 
     /// Parse postfix expression: x++, x--, x[i], x.member, x->member, x(args)

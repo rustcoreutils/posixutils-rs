@@ -351,6 +351,15 @@ pub struct Parser<'a> {
     /// Explicit alignment from _Alignas in current declaration
     /// Cleared after each declaration is parsed.
     pub(super) pending_alignas: Option<u32>,
+    /// Where the `_Alignas` *keyword* was written, when that is what set
+    /// `pending_alignas`.
+    ///
+    /// Kept apart from the value because C11 6.7.5p2 constrains the keyword and
+    /// not the GNU `aligned` attribute, which shares the same slot: `aligned`
+    /// is legal on a typedef and is the only way to align one, so a check that
+    /// could not tell them apart would either miss the constraint or break
+    /// every aligned typedef.
+    pub(super) pending_alignas_kw: Option<Position>,
     /// The machine mode named by `__attribute__((mode(M)))` on the declaration
     /// being parsed, and where it was written. Held like `pending_alignas`
     /// because the attribute is seen while the declarator is being consumed and
@@ -498,6 +507,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_alignas_kw: None,
             pending_mode: None,
             pending_vector_size: None,
             pending_attr_align: None,
@@ -2121,6 +2131,47 @@ impl Parser<'_> {
     /// Returns the validated explicit alignment, or error if alignment is weaker than natural.
     /// Returns None if no explicit alignment was specified.
     /// Also propagates alignment from typedef's explicit_align.
+    /// C11 6.7.5p2: an alignment specifier shall not appear in the declaration
+    /// of a typedef, a bit-field, a function, a parameter, or an object with
+    /// `register` storage.
+    ///
+    /// Only the `_Alignas` keyword is constrained. The GNU `aligned` attribute
+    /// shares `pending_alignas` but is legal in several of these places -- on a
+    /// typedef it is the only way to align one at all -- which is why the
+    /// provenance is tracked separately and tested here.
+    pub(super) fn reject_alignas_in(&mut self, context: &str) {
+        if let Some(pos) = self.pending_alignas_kw.take() {
+            crate::diag::error_args(pos, "_Alignas cannot be applied to {0}", &[context]);
+            self.pending_alignas = None;
+        }
+    }
+
+    /// Fold a declaration's alignment into the type a typedef names.
+    ///
+    /// C11 6.7.5 and the GNU `aligned` attribute both raise the alignment of
+    /// the type itself, so every object later declared through the typedef
+    /// inherits it.
+    ///
+    /// `declared_align` must be what [`Self::validated_explicit_align`]
+    /// returned: that is the only value that has seen *both* channels an
+    /// alignment can arrive on -- `pending_alignas` for a specifier-position
+    /// spelling, and `pending_declarator_align` for one written after the
+    /// declarator. All three typedef binding sites used to read
+    /// `pending_alignas` directly, which silently dropped every trailing
+    /// `__attribute__((aligned(N)))`.
+    pub(super) fn align_typedef_type(
+        &mut self,
+        typ: TypeId,
+        declared_align: Option<u32>,
+    ) -> TypeId {
+        let Some(align) = declared_align else {
+            return typ;
+        };
+        let mut aligned = self.types.get(typ).clone();
+        aligned.explicit_align = Some(aligned.explicit_align.map_or(align, |e| e.max(align)));
+        self.types.intern(aligned)
+    }
+
     pub(super) fn validated_explicit_align(&mut self, typ: TypeId) -> ParseResult<Option<u32>> {
         // Combine pending_alignas (from _Alignas / __attribute__) with type's explicit_align
         let type_align = self.types.get(typ).explicit_align;

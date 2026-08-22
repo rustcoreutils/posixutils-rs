@@ -185,18 +185,10 @@ impl Parser<'_> {
     /// Returns `Ok(None)`, with the parser position restored, when what follows
     /// is not one.
     ///
-    /// `merge_alignas_into_typedef` records an asymmetry that predates this
-    /// helper and is preserved rather than levelled: the call before the
-    /// pointer loop merged `pending_alignas` into a typedef's type and the call
-    /// after it did not, so `typedef int *(name)(void)` carrying an
-    /// `_Alignas`/`aligned` attribute dropped the alignment where
-    /// `typedef int (name)(void)` kept it. Which of the two is right is a
-    /// separate question from moving the code.
     fn parse_grouped_declarator_decl(
         &mut self,
         specs: &DeclSpecs,
         base: TypeId,
-        merge_alignas_into_typedef: bool,
     ) -> ParseResult<Option<ExternalDecl>> {
         if self.is_special(b'(') {
             let saved_pos = self.pos;
@@ -316,15 +308,7 @@ impl Parser<'_> {
                     // A mode replaces the type; alignment then attaches to
                     // whatever the type ended up being.
                     typ = self.apply_pending_type_attrs(typ);
-                    // Apply __attribute__((aligned(N))) to typedef type
-                    if merge_alignas_into_typedef {
-                        if let Some(align) = self.pending_alignas {
-                            let mut aligned_type = self.types.get(typ).clone();
-                            aligned_type.explicit_align =
-                                Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
-                            typ = self.types.intern(aligned_type);
-                        }
-                    }
+                    typ = self.align_typedef_type(typ, validated_align);
                     self.check_typedef_redefinition(name, typ, specs.pos);
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     self.symbols
@@ -378,6 +362,7 @@ impl Parser<'_> {
     fn reset_pending_declaration_state(&mut self) {
         // Clear pending alignment from previous declaration
         self.pending_alignas = None;
+        self.pending_alignas_kw = None;
         // A mode that no declarator consumed belongs to no later declaration:
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;
@@ -418,6 +403,10 @@ impl Parser<'_> {
         typ_id: TypeId,
     ) -> ParseResult<Option<ExternalDecl>> {
         if self.is_special(b'(') {
+            // C11 6.7.5p2: not on a function. Reached only when the name is
+            // followed by `(`, which is what makes this a function declarator
+            // rather than a pointer-to-function object.
+            self.reject_alignas_in("a function");
             // Could be function definition or declaration
             self.advance();
             let param_list = self.parse_parameter_list()?;
@@ -599,6 +588,7 @@ impl Parser<'_> {
                     )?;
                     self.expect_special(b';')?;
                     self.pending_alignas = None;
+                    self.pending_alignas_kw = None;
                     self.pending_vm_typedef_dims = None;
                     self.pending_mode = None;
                     self.pending_transparent_union = None;
@@ -649,6 +639,12 @@ impl Parser<'_> {
         self.skip_extensions();
         // Check modifiers before interning (storage class specifiers)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
+        // C11 6.7.5p2 -- both facts are already in the specifier modifiers.
+        if is_typedef {
+            self.reject_alignas_in("a typedef");
+        } else if base_type.modifiers.contains(TypeModifiers::REGISTER) {
+            self.reject_alignas_in("an object with register storage");
+        }
         // Extract storage class specifiers (not stored in type system)
         let storage_class_mask = TypeModifiers::EXTERN
             | TypeModifiers::STATIC
@@ -683,7 +679,7 @@ impl Parser<'_> {
         }
 
         // Check for grouped declarator: void (*fp)(int), int (*arr)[10], or typedef int (name)(params)
-        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, base_type_id, true)? {
+        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, base_type_id)? {
             return Ok(decl);
         }
 
@@ -731,7 +727,7 @@ impl Parser<'_> {
 
         // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
         // Also handles: char *(name)(params) for function type
-        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, typ_id, false)? {
+        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, typ_id)? {
             return Ok(decl);
         }
 
@@ -952,13 +948,7 @@ impl Parser<'_> {
         // Bind typedef to symbol table (after parsing initializer, which is forbidden anyway)
         if is_typedef {
             var_type_id = self.apply_pending_type_attrs(var_type_id);
-            // Apply __attribute__((aligned(N))) to typedef type
-            if let Some(align) = self.pending_alignas {
-                let mut aligned_type = self.types.get(var_type_id).clone();
-                aligned_type.explicit_align =
-                    Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
-                var_type_id = self.types.intern(aligned_type);
-            }
+            var_type_id = self.align_typedef_type(var_type_id, validated_align);
             self.check_typedef_redefinition(name, var_type_id, self.current_pos());
             let sym = Symbol::typedef(name, var_type_id, self.symbols.depth());
             symbol = Some(match self.symbols.declare(sym) {
@@ -997,6 +987,7 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        self.pending_alignas_kw = None;
         // Belongs to the declaration whose specifiers named the typedef, and
         // to no later one.
         self.pending_vm_typedef_dims = None;

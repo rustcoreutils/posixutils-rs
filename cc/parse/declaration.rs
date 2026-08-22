@@ -570,6 +570,12 @@ impl Parser<'_> {
 
         // Check modifiers from the specifier before interning (storage class is not part of type)
         let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
+        // C11 6.7.5p2 -- both facts are already in the specifier modifiers.
+        if is_typedef {
+            self.reject_alignas_in("a typedef");
+        } else if base_type.modifiers.contains(TypeModifiers::REGISTER) {
+            self.reject_alignas_in("an object with register storage");
+        }
         // For struct/union types with tags, use existing TypeId to preserve forward declarations
         let base_type_id = self.intern_type_with_tag(&base_type);
 
@@ -585,6 +591,11 @@ impl Parser<'_> {
                 let decl_pos = self.current_pos();
                 let (name, mut typ, mut vla_sizes, _func_params) =
                     self.parse_declarator(base_type_id, DeclaratorName::Required)?;
+                // C11 6.7.5p2: not on a function. A pointer to function is an
+                // object and stays legal, so this asks the finished type.
+                if self.types.kind(typ) == TypeKind::Function {
+                    self.reject_alignas_in("a function");
+                }
                 // A variably modified typedef supplies the extents of the
                 // levels it contributed. The declarator's own `[n]` levels, if
                 // it wrote any, are innermost-of-the-outer and come first --
@@ -690,13 +701,7 @@ impl Parser<'_> {
                     // A mode replaces the type; alignment then attaches to
                     // whatever the type ended up being.
                     typ = self.apply_pending_type_attrs(typ);
-                    // Apply __attribute__((aligned(N))) to typedef type
-                    if let Some(align) = self.pending_alignas {
-                        let mut aligned_type = self.types.get(typ).clone();
-                        aligned_type.explicit_align =
-                            Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
-                        typ = self.types.intern(aligned_type);
-                    }
+                    typ = self.align_typedef_type(typ, validated_align);
                     self.check_typedef_redefinition(name, typ, decl_pos);
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     if let Ok(id) = self.symbols.declare(sym) {
@@ -744,6 +749,7 @@ impl Parser<'_> {
 
         // Clear pending alignment after declaration
         self.pending_alignas = None;
+        self.pending_alignas_kw = None;
         // Belongs to the declaration whose specifiers named the typedef, and
         // to no later one.
         self.pending_vm_typedef_dims = None;
@@ -931,6 +937,9 @@ impl Parser<'_> {
                         } else {
                             self.pending_alignas = Some(align);
                         }
+                        // Record the spelling: 6.7.5p2 constrains the keyword,
+                        // not the `aligned` attribute that shares the slot.
+                        self.pending_alignas_kw.get_or_insert(alignas_pos);
                     }
                 }
                 crate::kw::SHORT => {

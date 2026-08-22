@@ -9,14 +9,18 @@
 // AArch64 architecture support
 //
 
+mod atomic;
 mod call;
 pub mod codegen;
 mod expression;
 mod features;
 mod float;
+mod frame;
+mod inline_asm;
 pub mod lir;
 pub mod macros;
 pub(crate) mod mapping;
+mod memory;
 pub mod regalloc;
 
 pub use macros::get_macros;

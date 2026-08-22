@@ -4518,8 +4518,9 @@ impl X86_64CodeGen {
             .goto_labels
             .iter()
             .map(|(bb_id, name)| {
-                // Format label as .Lfunc_bbid (same format as Label::name())
-                let label_str = format!(".L{}_{}", self.base.current_fn, bb_id.0);
+                // Through `Label` rather than a second spelling of the same
+                // format, so the quoting cannot be missed here.
+                let label_str = crate::arch::lir::Label::new(&self.base.current_fn, bb_id.0).name();
                 (label_str, name.clone())
             })
             .collect();

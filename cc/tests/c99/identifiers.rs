@@ -110,3 +110,55 @@ fn c99_extended_identifier_across_a_line_splice() {
         "the spliced identifiers did not join"
     );
 }
+
+/// A block label carries its function's name, so an extended character in the
+/// identifier reaches the assembler inside a `.L` label too.
+///
+/// Only the *definition* went out raw. `&&label` builds the same spelling as a
+/// local symbol, which is quoted downstream, so one label was spelled two ways
+/// in one file: `.Lmüller_1:` where it was defined, `".Lmüller_1"(%rip)` where
+/// it was referenced. GNU as resolves both to the same symbol, which is why
+/// this ran; Mach-O's assembler rejects the raw bytes.
+#[test]
+fn c99_extended_identifier_in_block_labels_is_quoted() {
+    let code = r#"
+int müller(int x) {
+    void *targets[] = { &&lab0, &&lab1 };
+    goto *targets[x & 1];
+lab0: return 1;
+lab1: return 2;
+}
+int main(void) { return (müller(0) == 1 && müller(1) == 2) ? 0 : 1; }
+"#;
+    // It has to assemble, link and run, on whichever target the host is.
+    assert_eq!(compile_and_run("label_quoting", code, &[]), 0);
+
+    // And every mention of the label has to be spelled the same way. Checked
+    // on the text because that is where the two spellings diverged.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("lbl.c");
+    std::fs::write(&src, code).unwrap();
+    let asm = dir.path().join("lbl.s");
+    let r = run_c17(&["-S", src.to_str().unwrap(), "-o", asm.to_str().unwrap()]);
+    assert!(r.success, "-S failed: {}", r.stderr);
+    let text = std::fs::read_to_string(&asm).unwrap();
+
+    let mentions: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("müller_"))
+        .map(|l| l.trim())
+        .collect();
+    assert!(
+        !mentions.is_empty(),
+        "expected the function's labels in:\n{}",
+        text
+    );
+    for line in &mentions {
+        assert!(
+            !line.contains(".Lmüller_") || line.contains("\".Lmüller_"),
+            "an unquoted label reached the assembler: {:?}\nin:\n{}",
+            line,
+            text
+        );
+    }
+}

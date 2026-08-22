@@ -21,6 +21,17 @@ use crate::token::lexer::{payload_text, Position, TokenType, TokenValue};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
+/// The declaration specifiers shared by every declarator in one declaration.
+///
+/// `parse_remaining_declarators` already took these as five positional
+/// parameters; naming them keeps the grouped-declarator helper to four.
+struct DeclSpecs {
+    pos: Position,
+    modifiers: TypeModifiers,
+    storage_class: TypeModifiers,
+    is_typedef: bool,
+}
+
 impl Parser<'_> {
     pub fn parse_translation_unit(&mut self) -> ParseResult<TranslationUnit> {
         let mut tu = TranslationUnit::default();
@@ -168,96 +179,25 @@ impl Parser<'_> {
     }
 
     /// Parse an external declaration (function definition or declaration)
-    pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
-        // Clear pending alignment from previous declaration
-        self.pending_alignas = None;
-        // A mode that no declarator consumed belongs to no later declaration:
-        // leaving it set applied it to whatever came next.
-        self.pending_mode = None;
-        self.pending_transparent_union = None;
-        self.pending_fn_attrs = Default::default();
-        // And any asm label the previous declaration left behind.
-        //
-        // `skip_extensions` collects one wherever it runs, which is most
-        // places a type specifier can appear, but only a file-scope declarator
-        // claims one -- so a label written on a block-scope declaration, on a
-        // struct definition, or in a shape this parser does not model at all
-        // stays pending and is claimed by whatever is declared next. The
-        // symptom is an unrelated global emitted under someone else's
-        // assembler name.
-        self.pending_asm_label = None;
-        // Likewise the symbol attributes. A function *definition* takes its
-        // attributes through `pending_fn_attrs` and leaves these behind, so the
-        // next declaration to build an `InitDeclarator` claimed them: the
-        // variable after a `section(...)` function was emitted into that
-        // function's section, and the conflicting "ax"/"aw" flags made the
-        // assembler reject the file outright.
-        self.pending_symbol_attrs = Default::default();
-
-        // Check for _Static_assert first (C11)
-        if self.is_static_assert() {
-            self.parse_static_assert()?;
-            // Return empty declaration - static_assert produces nothing
-            return Ok(ExternalDecl::Declaration(Declaration {
-                declarators: vec![],
-            }));
-        }
-
-        // A stray `;` at file scope is an empty declaration. C17 6.7p2 makes it
-        // a constraint violation, but GCC and Clang accept it by default (they
-        // warn only under -pedantic) and it is common in real source: any
-        // function-like macro that expands to nothing and is invoked with a
-        // trailing semicolon produces one. CPython's `_Py_DECLARE_STR()` is
-        // exactly that. Consume it before reaching the type specifier, which
-        // would otherwise report a spurious "type specifier missing".
-        if self.is_special(b';') {
-            self.advance();
-            return Ok(ExternalDecl::Declaration(Declaration {
-                declarators: vec![],
-            }));
-        }
-
-        let decl_pos = self.current_pos();
-        // Parse type specifier
-        let base_type = self.parse_type_specifier()?;
-        // A declaration that stops right here declares nothing, and that --
-        // not a missing type specifier -- is what to report. The `;` arms
-        // below do it.
-        if !self.is_special(b';') {
-            self.check_implicit_int(decl_pos);
-        }
-        // Skip __attribute__ between type and declarator (GCC extension)
-        self.skip_extensions();
-        // Check modifiers before interning (storage class specifiers)
-        let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
-        // Extract storage class specifiers (not stored in type system)
-        let storage_class_mask = TypeModifiers::EXTERN
-            | TypeModifiers::STATIC
-            | TypeModifiers::THREAD_LOCAL
-            | TypeModifiers::TYPEDEF
-            | TypeModifiers::AUTO
-            | TypeModifiers::REGISTER
-            // `inline` is a function specifier rather than a storage class,
-            // but it travels with them here: leaving it out made
-            // `FunctionDef::is_inline` false for every ordinary definition,
-            // and with it every consumer downstream.
-            | TypeModifiers::INLINE;
-        let storage_class = base_type.modifiers & storage_class_mask;
-        // For struct/union types with tags, use existing TypeId to preserve forward declarations
-        let base_type_id = self.intern_type_with_tag(&base_type);
-
-        // Check for standalone type definition (e.g., "enum Color { ... };")
-        // This happens when a composite type is defined but no variables are declared
-        if self.is_special(b';') {
-            self.advance();
-            self.check_declares_something(decl_pos, &base_type);
-            // Return empty declaration - the type was already registered in parse_*_specifier
-            return Ok(ExternalDecl::Declaration(Declaration {
-                declarators: vec![],
-            }));
-        }
-
-        // Check for grouped declarator: void (*fp)(int), int (*arr)[10], or typedef int (name)(params)
+    /// A grouped declarator at file scope: `void (*fp)(int)`, `int (*arr)[10]`,
+    /// or `typedef int (name)(params)`.
+    ///
+    /// Returns `Ok(None)`, with the parser position restored, when what follows
+    /// is not one.
+    ///
+    /// `merge_alignas_into_typedef` records an asymmetry that predates this
+    /// helper and is preserved rather than levelled: the call before the
+    /// pointer loop merged `pending_alignas` into a typedef's type and the call
+    /// after it did not, so `typedef int *(name)(void)` carrying an
+    /// `_Alignas`/`aligned` attribute dropped the alignment where
+    /// `typedef int (name)(void)` kept it. Which of the two is right is a
+    /// separate question from moving the code.
+    fn parse_grouped_declarator_decl(
+        &mut self,
+        specs: &DeclSpecs,
+        base: TypeId,
+        merge_alignas_into_typedef: bool,
+    ) -> ParseResult<Option<ExternalDecl>> {
         if self.is_special(b'(') {
             let saved_pos = self.pos;
             self.advance(); // consume '('
@@ -265,7 +205,7 @@ impl Parser<'_> {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
                 let (name, mut typ, vla_sizes, decl_func_params) =
-                    self.parse_declarator(base_type_id, DeclaratorName::Required)?;
+                    self.parse_declarator(base, DeclaratorName::Required)?;
 
                 // C99 6.7.5.2: VLAs must have block scope
                 if !vla_sizes.is_empty() {
@@ -299,11 +239,11 @@ impl Parser<'_> {
                     let func_type = self.types.get(typ);
                     let return_type = func_type.base.unwrap();
                     let is_variadic_fn = func_type.variadic;
-                    let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
-                    let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
+                    let is_static = specs.modifiers.contains(TypeModifiers::STATIC);
+                    let is_inline = specs.modifiers.contains(TypeModifiers::INLINE);
 
                     // Add function to symbol table
-                    self.check_redeclaration(name, typ, decl_pos);
+                    self.check_redeclaration(name, typ, specs.pos);
                     let func_sym = Symbol::function(name, typ, self.symbols.depth());
                     let _ = self.symbols.declare(func_sym);
                     // Definitions bind a fresh symbol, so this path needs the
@@ -311,7 +251,7 @@ impl Parser<'_> {
                     // two function-definition paths do -- without it, this
                     // definition's C99 6.7.4p6 inline classification is
                     // computed from declarations it never saw.
-                    self.settle_declaration_facts(name, storage_class);
+                    self.settle_declaration_facts(name, specs.storage_class);
 
                     // Get raw parameters - use decl_func_params which has names
                     let raw_params = decl_func_params.unwrap_or_default();
@@ -336,22 +276,22 @@ impl Parser<'_> {
                     // Leave function scope
                     self.symbols.leave_scope();
 
-                    return Ok(ExternalDecl::FunctionDef(FunctionDef {
+                    return Ok(Some(ExternalDecl::FunctionDef(FunctionDef {
                         return_type,
                         name,
                         params,
                         body,
-                        pos: decl_pos,
+                        pos: specs.pos,
                         is_static,
                         is_inline,
                         calling_conv,
                         attrs: all_fn_attrs,
-                    }));
+                    })));
                 }
 
                 // Handle initializer (for declarations, not function definitions)
                 let init = if self.is_special(b'=') {
-                    if is_typedef {
+                    if specs.is_typedef {
                         return Err(ParseError::new(
                             "typedef cannot have initializer",
                             self.current_pos(),
@@ -372,25 +312,27 @@ impl Parser<'_> {
 
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same variable at file scope
-                let symbol_id = if is_typedef {
+                let symbol_id = if specs.is_typedef {
                     // A mode replaces the type; alignment then attaches to
                     // whatever the type ended up being.
                     typ = self.apply_pending_type_attrs(typ);
                     // Apply __attribute__((aligned(N))) to typedef type
-                    if let Some(align) = self.pending_alignas {
-                        let mut aligned_type = self.types.get(typ).clone();
-                        aligned_type.explicit_align =
-                            Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
-                        typ = self.types.intern(aligned_type);
+                    if merge_alignas_into_typedef {
+                        if let Some(align) = self.pending_alignas {
+                            let mut aligned_type = self.types.get(typ).clone();
+                            aligned_type.explicit_align =
+                                Some(aligned_type.explicit_align.map_or(align, |e| e.max(align)));
+                            typ = self.types.intern(aligned_type);
+                        }
                     }
-                    self.check_typedef_redefinition(name, typ, decl_pos);
+                    self.check_typedef_redefinition(name, typ, specs.pos);
                     let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     self.symbols
                         .declare(sym)
                         .ok()
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
-                    self.check_redeclaration(name, typ, decl_pos);
+                    self.check_redeclaration(name, typ, specs.pos);
                     let var_sym = Symbol::variable(name, typ, self.symbols.depth())
                         .with_align(validated_align);
                     self.symbols
@@ -400,217 +342,81 @@ impl Parser<'_> {
                 };
 
                 let symbol = symbol_id.expect("declaration must have symbol");
-                self.settle_declaration_facts(name, storage_class);
-                return Ok(ExternalDecl::Declaration(Declaration {
+                self.settle_declaration_facts(name, specs.storage_class);
+                return Ok(Some(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
                         symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                         symbol,
                         typ,
-                        storage_class,
+                        storage_class: specs.storage_class,
                         init,
                         vla_sizes: vec![],
                         explicit_align: validated_align,
-                        pos: decl_pos,
+                        pos: specs.pos,
                     }],
-                }));
+                })));
             }
             // Not a grouped declarator, restore position
             self.pos = saved_pos;
         }
+        Ok(None)
+    }
 
-        // Handle pointer with qualifiers (const, volatile, restrict)
-        let mut typ_id = base_type_id;
-        while self.is_special(b'*') {
-            self.advance();
-            let mut ptr_modifiers = TypeModifiers::empty();
+    /// Clear the `pending_*` state a previous declaration may have left
+    /// behind.
+    ///
+    /// `skip_extensions` collects an asm label wherever it runs, which is most
+    /// places a type specifier can appear, but only a file-scope declarator
+    /// claims one -- so a label written on a block-scope declaration, on a
+    /// struct definition, or in a shape this parser does not model stays
+    /// pending and would be claimed by whatever is declared next. The symptom
+    /// is an unrelated global emitted under someone else's assembler name.
+    /// The symbol and function attributes carry the same hazard: a variable
+    /// after a `section(...)` function was emitted into that function's
+    /// section, and the conflicting "ax"/"aw" flags made the assembler reject
+    /// the file outright.
+    fn reset_pending_declaration_state(&mut self) {
+        // Clear pending alignment from previous declaration
+        self.pending_alignas = None;
+        // A mode that no declarator consumed belongs to no later declaration:
+        // leaving it set applied it to whatever came next.
+        self.pending_mode = None;
+        self.pending_transparent_union = None;
+        self.pending_fn_attrs = Default::default();
+        // And any asm label the previous declaration left behind.
+        //
+        // `skip_extensions` collects one wherever it runs, which is most
+        // places a type specifier can appear, but only a file-scope declarator
+        // claims one -- so a label written on a block-scope declaration, on a
+        // struct definition, or in a shape this parser does not model at all
+        // stays pending and is claimed by whatever is declared next. The
+        // symptom is an unrelated global emitted under someone else's
+        // assembler name.
+        self.pending_asm_label = None;
+        // Likewise the symbol attributes. A function *definition* takes its
+        // attributes through `pending_fn_attrs` and leaves these behind, so the
+        // next declaration to build an `InitDeclarator` claimed them: the
+        // variable after a `section(...)` function was emitted into that
+        // function's section, and the conflicting "ax"/"aw" flags made the
+        // assembler reject the file outright.
+        self.pending_symbol_attrs = Default::default();
 
-            ptr_modifiers |= self.parse_pointer_qualifiers();
+        // Check for _Static_assert first (C11)
+    }
 
-            let ptr_type = Type {
-                kind: TypeKind::Pointer,
-                modifiers: ptr_modifiers,
-                base: Some(typ_id),
-                ..Default::default()
-            };
-            typ_id = self.types.intern(ptr_type);
-        }
-
-        // Propagate storage class modifiers from base type to derived pointer type
-        // For "extern int *p", the EXTERN should be on the pointer type, not just int
-        if typ_id != base_type_id {
-            let storage_class_mask = TypeModifiers::EXTERN
-                | TypeModifiers::STATIC
-                | TypeModifiers::TYPEDEF
-                | TypeModifiers::REGISTER
-                | TypeModifiers::AUTO
-                | TypeModifiers::THREAD_LOCAL
-                // Without this a pointer-returning `inline` function loses the
-                // bit twice over -- `memcpy` returning `void *` is exactly the
-                // shape glibc uses.
-                | TypeModifiers::INLINE;
-            let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
-            if !base_storage_class.is_empty() {
-                let mut typ = self.types.get(typ_id).clone();
-                typ.modifiers |= base_storage_class;
-                typ_id = self.types.intern(typ);
-            }
-        }
-
-        // Skip __attribute__ after pointer declarator (GCC extension)
-        // Handles: void * __attribute__((malloc)) func(...)
-        self.skip_extensions();
-
-        // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
-        // Also handles: char *(name)(params) for function type
-        if self.is_special(b'(') {
-            let saved_pos = self.pos;
-            self.advance(); // consume '('
-            if self.is_grouped_declarator() {
-                // This is a grouped declarator - use parse_declarator
-                self.pos = saved_pos; // restore position before '('
-                let (name, mut full_typ, vla_sizes, decl_func_params) =
-                    self.parse_declarator(typ_id, DeclaratorName::Required)?;
-
-                // C99 6.7.5.2: VLAs must have block scope
-                if !vla_sizes.is_empty() {
-                    return Err(ParseError::new(
-                        "variable length arrays cannot have file scope".to_string(),
-                        self.current_pos(),
-                    ));
-                }
-
-                // Parse any __attribute__ after declarator
-                let attrs = self.parse_attributes();
-                let calling_conv = attrs.calling_conv().unwrap_or_default();
-                let fn_attrs = attrs.function_attrs();
-                self.pending_fn_attrs.merge(&fn_attrs);
-                // Symbol attributes too. Only the function half was collected
-                // here, so `weak` written after a function declarator was
-                // dropped -- and a weak *declaration* is the whole point of
-                // the attribute.
-                self.merge_symbol_attrs(&attrs);
-                let all_fn_attrs = if self.types.kind(full_typ) == TypeKind::Function {
-                    self.accumulate_fn_attrs(name)
-                } else {
-                    Default::default()
-                };
-
-                // Check if this is a function definition (function type followed by '{')
-                // This handles cases like: char *(*get_op(int which))(int, int) { ... }
-                if self.types.kind(full_typ) == TypeKind::Function && self.is_special(b'{') {
-                    // Get the function's return type
-                    // Storage class (static, inline) comes from base_type, not the function type
-                    let func_type = self.types.get(full_typ);
-                    let return_type = func_type.base.unwrap();
-                    let is_variadic_fn = func_type.variadic;
-                    let is_static = base_type.modifiers.contains(TypeModifiers::STATIC);
-                    let is_inline = base_type.modifiers.contains(TypeModifiers::INLINE);
-
-                    // Add function to symbol table
-                    self.check_redeclaration(name, full_typ, decl_pos);
-                    let func_sym = Symbol::function(name, full_typ, self.symbols.depth());
-                    let _ = self.symbols.declare(func_sym);
-                    self.settle_declaration_facts(name, storage_class);
-
-                    // Get raw parameters - use decl_func_params which has names
-                    let raw_params = decl_func_params.unwrap_or_default();
-
-                    // Enter function scope for parameters
-                    self.symbols.enter_scope();
-
-                    // Bind parameters in function scope and create Parameter structs
-                    let mut params = Vec::with_capacity(raw_params.len());
-                    for raw in &raw_params {
-                        let symbol_id = raw.symbol.map(|id| self.symbols.redeclare(id, raw.typ));
-                        params.push(Parameter {
-                            symbol: symbol_id,
-                            typ: raw.typ,
-                            vm_dims: raw.vm_dims.clone(),
-                        });
-                    }
-
-                    // Parse body without creating another scope
-                    let body = self.parse_forwarding_body(&all_fn_attrs, is_variadic_fn)?;
-
-                    // Leave function scope
-                    self.symbols.leave_scope();
-
-                    return Ok(ExternalDecl::FunctionDef(FunctionDef {
-                        return_type,
-                        name,
-                        params,
-                        body,
-                        pos: decl_pos,
-                        is_static,
-                        is_inline,
-                        calling_conv,
-                        attrs: all_fn_attrs,
-                    }));
-                }
-
-                // Handle initializer (for declarations, not function definitions)
-                let init = if self.is_special(b'=') {
-                    if is_typedef {
-                        return Err(ParseError::new(
-                            "typedef cannot have initializer",
-                            self.current_pos(),
-                        ));
-                    }
-                    self.advance();
-                    Some(self.parse_initializer()?)
-                } else {
-                    None
-                };
-
-                self.skip_extensions();
-                self.expect_special(b';')?;
-
-                // Validate explicit alignment (C11 6.7.5: >= natural alignment)
-                full_typ = self.apply_pending_type_attrs(full_typ);
-                let validated_align = self.validated_explicit_align(full_typ)?;
-
-                // Add to symbol table and capture SymbolId
-                // C allows multiple declarations of the same variable at file scope
-                let symbol_id = if is_typedef {
-                    self.check_typedef_redefinition(name, full_typ, decl_pos);
-                    let sym = Symbol::typedef(name, full_typ, self.symbols.depth());
-                    self.symbols
-                        .declare(sym)
-                        .ok()
-                        .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
-                } else {
-                    self.check_redeclaration(name, full_typ, decl_pos);
-                    let var_sym = Symbol::variable(name, full_typ, self.symbols.depth())
-                        .with_align(validated_align);
-                    self.symbols
-                        .declare(var_sym)
-                        .ok()
-                        .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
-                };
-
-                let symbol = symbol_id.expect("declaration must have symbol");
-                self.settle_declaration_facts(name, storage_class);
-                return Ok(ExternalDecl::Declaration(Declaration {
-                    declarators: vec![InitDeclarator {
-                        symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
-                        symbol,
-                        typ: full_typ,
-                        storage_class,
-                        init,
-                        vla_sizes: vec![],
-                        explicit_align: validated_align,
-                        pos: decl_pos,
-                    }],
-                }));
-            }
-            // Not a grouped declarator, restore position
-            self.pos = saved_pos;
-        }
-
-        // Parse name
-        let name = self.expect_declarator_name()?;
-
-        // Check for function definition vs declaration
+    /// A file-scope function declarator: `int f(int)` as a declaration, a
+    /// definition with a body, or a K&R definition whose parameter
+    /// declarations follow the parenthesised identifier list.
+    ///
+    /// Returns `Ok(None)` when the name is not followed by `(`.
+    fn parse_function_declarator_decl(
+        &mut self,
+        specs: &DeclSpecs,
+        base_type: &Type,
+        base_type_id: TypeId,
+        name: StringId,
+        typ_id: TypeId,
+    ) -> ParseResult<Option<ExternalDecl>> {
         if self.is_special(b'(') {
             // Could be function definition or declaration
             self.advance();
@@ -679,10 +485,10 @@ impl Parser<'_> {
 
             if self.is_special(b'{') {
                 // Function definition
-                // Use storage_class extracted from original base_type at line 5926,
+                // Use specs.storage_class extracted from original base_type at line 5926,
                 // not from typ_id which may have lost storage class for tagged structs
-                let is_static = storage_class.contains(TypeModifiers::STATIC);
-                let is_inline = storage_class.contains(TypeModifiers::INLINE);
+                let is_static = specs.storage_class.contains(TypeModifiers::STATIC);
+                let is_inline = specs.storage_class.contains(TypeModifiers::INLINE);
 
                 // Add function to symbol table so it can be called by other functions
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
@@ -694,10 +500,10 @@ impl Parser<'_> {
                 // An old-style declarator has no `...` to be variadic with.
                 let is_variadic_fn = prototyped && variadic;
                 let func_type_id = self.types.intern(func_type);
-                self.check_redeclaration(name, func_type_id, decl_pos);
+                self.check_redeclaration(name, func_type_id, specs.pos);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
-                self.settle_declaration_facts(name, storage_class);
+                self.settle_declaration_facts(name, specs.storage_class);
 
                 // Enter function scope for parameters
                 self.symbols.enter_scope();
@@ -719,17 +525,17 @@ impl Parser<'_> {
                 // Leave function scope
                 self.symbols.leave_scope();
 
-                return Ok(ExternalDecl::FunctionDef(FunctionDef {
+                return Ok(Some(ExternalDecl::FunctionDef(FunctionDef {
                     return_type: typ_id,
                     name,
                     params: final_params,
                     body,
-                    pos: decl_pos,
+                    pos: specs.pos,
                     is_static,
                     is_inline,
                     calling_conv,
                     attrs: all_fn_attrs,
-                }));
+                })));
             } else {
                 // Function declaration
                 // Skip __asm("...") symbol aliasing which can appear after function declarator
@@ -753,9 +559,9 @@ impl Parser<'_> {
                 let func_type_id = self.types.intern(func_type);
                 // Add to symbol table and capture SymbolId
                 // C allows multiple declarations of the same function
-                let symbol_id = if is_typedef {
+                let symbol_id = if specs.is_typedef {
                     // Function type typedef: typedef void my_func(void);
-                    self.check_typedef_redefinition(name, func_type_id, decl_pos);
+                    self.check_typedef_redefinition(name, func_type_id, specs.pos);
                     let sym = Symbol::typedef(name, func_type_id, self.symbols.depth());
                     self.symbols
                         .declare(sym)
@@ -763,7 +569,7 @@ impl Parser<'_> {
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 } else {
                     // Function declaration: add so the variadic flag is available when called
-                    self.check_redeclaration(name, func_type_id, decl_pos);
+                    self.check_redeclaration(name, func_type_id, specs.pos);
                     let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                     self.symbols
                         .declare(func_sym)
@@ -771,24 +577,24 @@ impl Parser<'_> {
                         .or_else(|| self.symbols.lookup_id(name, Namespace::Ordinary))
                 };
                 let symbol = symbol_id.expect("function declaration must have symbol");
-                self.settle_declaration_facts(name, storage_class);
+                self.settle_declaration_facts(name, specs.storage_class);
                 let mut first_declarator = vec![InitDeclarator {
                     symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
                     symbol,
                     typ: func_type_id,
-                    storage_class,
+                    storage_class: specs.storage_class,
                     init: None,
                     vla_sizes: vec![],
                     explicit_align: None, // Functions don't have _Alignas
-                    pos: decl_pos,
+                    pos: specs.pos,
                 }];
                 if more_declarators {
                     self.parse_remaining_declarators(
-                        &base_type,
+                        base_type,
                         base_type_id,
-                        is_typedef,
-                        storage_class,
-                        decl_pos,
+                        specs.is_typedef,
+                        specs.storage_class,
+                        specs.pos,
                         &mut first_declarator,
                     )?;
                     self.expect_special(b';')?;
@@ -797,10 +603,146 @@ impl Parser<'_> {
                     self.pending_mode = None;
                     self.pending_transparent_union = None;
                 }
-                return Ok(ExternalDecl::Declaration(Declaration {
+                return Ok(Some(ExternalDecl::Declaration(Declaration {
                     declarators: first_declarator,
-                }));
+                })));
             }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+        self.reset_pending_declaration_state();
+
+        if self.is_static_assert() {
+            self.parse_static_assert()?;
+            // Return empty declaration - static_assert produces nothing
+            return Ok(ExternalDecl::Declaration(Declaration {
+                declarators: vec![],
+            }));
+        }
+
+        // A stray `;` at file scope is an empty declaration. C17 6.7p2 makes it
+        // a constraint violation, but GCC and Clang accept it by default (they
+        // warn only under -pedantic) and it is common in real source: any
+        // function-like macro that expands to nothing and is invoked with a
+        // trailing semicolon produces one. CPython's `_Py_DECLARE_STR()` is
+        // exactly that. Consume it before reaching the type specifier, which
+        // would otherwise report a spurious "type specifier missing".
+        if self.is_special(b';') {
+            self.advance();
+            return Ok(ExternalDecl::Declaration(Declaration {
+                declarators: vec![],
+            }));
+        }
+
+        let decl_pos = self.current_pos();
+        // Parse type specifier
+        let base_type = self.parse_type_specifier()?;
+        // A declaration that stops right here declares nothing, and that --
+        // not a missing type specifier -- is what to report. The `;` arms
+        // below do it.
+        if !self.is_special(b';') {
+            self.check_implicit_int(decl_pos);
+        }
+        // Skip __attribute__ between type and declarator (GCC extension)
+        self.skip_extensions();
+        // Check modifiers before interning (storage class specifiers)
+        let is_typedef = base_type.modifiers.contains(TypeModifiers::TYPEDEF);
+        // Extract storage class specifiers (not stored in type system)
+        let storage_class_mask = TypeModifiers::EXTERN
+            | TypeModifiers::STATIC
+            | TypeModifiers::THREAD_LOCAL
+            | TypeModifiers::TYPEDEF
+            | TypeModifiers::AUTO
+            | TypeModifiers::REGISTER
+            // `inline` is a function specifier rather than a storage class,
+            // but it travels with them here: leaving it out made
+            // `FunctionDef::is_inline` false for every ordinary definition,
+            // and with it every consumer downstream.
+            | TypeModifiers::INLINE;
+        let storage_class = base_type.modifiers & storage_class_mask;
+        // For struct/union types with tags, use existing TypeId to preserve forward declarations
+        let base_type_id = self.intern_type_with_tag(&base_type);
+        let specs = DeclSpecs {
+            pos: decl_pos,
+            modifiers: base_type.modifiers,
+            storage_class,
+            is_typedef,
+        };
+
+        // Check for standalone type definition (e.g., "enum Color { ... };")
+        // This happens when a composite type is defined but no variables are declared
+        if self.is_special(b';') {
+            self.advance();
+            self.check_declares_something(decl_pos, &base_type);
+            // Return empty declaration - the type was already registered in parse_*_specifier
+            return Ok(ExternalDecl::Declaration(Declaration {
+                declarators: vec![],
+            }));
+        }
+
+        // Check for grouped declarator: void (*fp)(int), int (*arr)[10], or typedef int (name)(params)
+        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, base_type_id, true)? {
+            return Ok(decl);
+        }
+
+        // Handle pointer with qualifiers (const, volatile, restrict)
+        let mut typ_id = base_type_id;
+        while self.is_special(b'*') {
+            self.advance();
+            let mut ptr_modifiers = TypeModifiers::empty();
+
+            ptr_modifiers |= self.parse_pointer_qualifiers();
+
+            let ptr_type = Type {
+                kind: TypeKind::Pointer,
+                modifiers: ptr_modifiers,
+                base: Some(typ_id),
+                ..Default::default()
+            };
+            typ_id = self.types.intern(ptr_type);
+        }
+
+        // Propagate storage class modifiers from base type to derived pointer type
+        // For "extern int *p", the EXTERN should be on the pointer type, not just int
+        if typ_id != base_type_id {
+            let storage_class_mask = TypeModifiers::EXTERN
+                | TypeModifiers::STATIC
+                | TypeModifiers::TYPEDEF
+                | TypeModifiers::REGISTER
+                | TypeModifiers::AUTO
+                | TypeModifiers::THREAD_LOCAL
+                // Without this a pointer-returning `inline` function loses the
+                // bit twice over -- `memcpy` returning `void *` is exactly the
+                // shape glibc uses.
+                | TypeModifiers::INLINE;
+            let base_storage_class = self.types.modifiers(base_type_id) & storage_class_mask;
+            if !base_storage_class.is_empty() {
+                let mut typ = self.types.get(typ_id).clone();
+                typ.modifiers |= base_storage_class;
+                typ_id = self.types.intern(typ);
+            }
+        }
+
+        // Skip __attribute__ after pointer declarator (GCC extension)
+        // Handles: void * __attribute__((malloc)) func(...)
+        self.skip_extensions();
+
+        // Check again for grouped declarator after pointer modifiers: char *(*fp)(int)
+        // Also handles: char *(name)(params) for function type
+        if let Some(decl) = self.parse_grouped_declarator_decl(&specs, typ_id, false)? {
+            return Ok(decl);
+        }
+
+        // Parse name
+        let name = self.expect_declarator_name()?;
+
+        // Check for function definition vs declaration
+        if let Some(decl) =
+            self.parse_function_declarator_decl(&specs, &base_type, base_type_id, name, typ_id)?
+        {
+            return Ok(decl);
         }
 
         // Variable/typedef declaration

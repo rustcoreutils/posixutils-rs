@@ -1903,6 +1903,57 @@ fn test_pointer_return() {
     assert_eq!(types.kind(func.return_type), TypeKind::Pointer);
 }
 
+/// Both file-scope grouped-declarator call sites go through one helper
+/// (`parse_grouped_declarator_decl`), reached before the pointer loop for
+/// `void (*fp)(int)` and after it for `char *(*fp)(int)`. They were two
+/// near-identical 140-line blocks; these pin the shapes each one owned.
+#[test]
+fn test_grouped_declarator_before_and_after_pointers() {
+    // Before the pointer loop: the declarator starts from the specifier type.
+    let (decl, types, strings, symbols) = parse_decl("void (*fp)(int);").unwrap();
+    assert_eq!(decl.declarators.len(), 1);
+    check_name(&strings, symbols.get(decl.declarators[0].symbol).name, "fp");
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
+
+    // After it: the declarator starts from the pointer-derived type.
+    let (decl, types, strings, symbols) = parse_decl("char *(*fp)(int);").unwrap();
+    assert_eq!(decl.declarators.len(), 1);
+    check_name(&strings, symbols.get(decl.declarators[0].symbol).name, "fp");
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
+
+    // An array through a grouped declarator, and a grouped function typedef.
+    let (decl, types, _strings, _symbols) = parse_decl("int (*arr)[10];").unwrap();
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
+    let (decl, _types, strings, symbols) = parse_decl("typedef int (cmp)(int, int);").unwrap();
+    check_name(
+        &strings,
+        symbols.get(decl.declarators[0].symbol).name,
+        "cmp",
+    );
+}
+
+/// A grouped declarator that turns out to be a function *definition* still
+/// takes the definition path: `int (*get_op(int which))(int, int) { .. }`
+/// returns a pointer to function and has a body.
+#[test]
+fn test_grouped_declarator_function_definition() {
+    let (func, types, strings, _symbols) =
+        parse_func("int (*get_op(int which))(int, int) { return 0; }").unwrap();
+    check_name(&strings, func.name, "get_op");
+    assert_eq!(types.kind(func.return_type), TypeKind::Pointer);
+    assert_eq!(func.params.len(), 1);
+}
+
+/// A plain file-scope declaration must not be routed down the
+/// function-declarator path just because that block moved into a helper: the
+/// `(` guard travels with it.
+#[test]
+fn test_plain_declaration_is_not_a_function_declarator() {
+    let (decl, types, strings, symbols) = parse_decl("int x;").unwrap();
+    check_name(&strings, symbols.get(decl.declarators[0].symbol).name, "x");
+    assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int);
+}
+
 // Translation unit tests
 
 fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {

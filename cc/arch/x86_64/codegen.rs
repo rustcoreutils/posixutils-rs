@@ -536,6 +536,264 @@ impl X86_64CodeGen {
         false
     }
 
+    /// Lower a `switch` to a chain of compare-and-branch.
+    ///
+    /// The aarch64 backend has the same method; keeping the two the same shape
+    /// is deliberate.
+    fn emit_switch(&mut self, insn: &Instruction, types: &TypeTable) {
+        let Some(&val) = insn.src.first() else {
+            return;
+        };
+        // Derive comparison size from type to handle long/pointer switches
+        let switch_size = insn
+            .typ
+            .map(|t| types.size_bits(t).max(32))
+            .unwrap_or(insn.size.max(32));
+        self.emit_move(val, Reg::R10, switch_size);
+        let op_size = if switch_size > 32 {
+            OperandSize::B64
+        } else {
+            OperandSize::B32
+        };
+
+        for (lo, hi, target_bb) in insn.switch_cases.clone() {
+            let target = Label::new(&self.base.current_fn, target_bb.0);
+            if lo == hi {
+                self.emit_switch_cmp(op_size, lo);
+                self.push_lir(X86Inst::Jcc {
+                    cc: CondCode::Eq,
+                    target,
+                });
+                continue;
+            }
+            self.emit_switch_range(val, switch_size, op_size, lo, hi, target);
+        }
+
+        // Jump to default (or fall through if no default)
+        if let Some(default_bb) = insn.switch_default {
+            // LIR: unconditional jump to default
+            self.push_lir(X86Inst::Jmp {
+                target: Label::new(&self.base.current_fn, default_bb.0),
+            });
+        }
+    }
+
+    /// Compare the switch value in R10 against `v`, using R11 when a 64-bit
+    /// constant does not fit a sign-extended 32-bit immediate.
+    fn emit_switch_cmp(&mut self, op_size: OperandSize, v: i64) {
+        let fits_in_simm32 = v >= i32::MIN as i64 && v <= i32::MAX as i64;
+        if op_size == OperandSize::B64 && !fits_in_simm32 {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(v),
+                dst: GpOperand::Reg(Reg::R11),
+            });
+            self.push_lir(X86Inst::Cmp {
+                size: op_size,
+                src: GpOperand::Reg(Reg::R11),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+        } else {
+            self.push_lir(X86Inst::Cmp {
+                size: op_size,
+                src: GpOperand::Imm(v),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+        }
+    }
+
+    /// A GNU range `case lo ... hi:`. Tested as
+    /// `(x - lo) <=unsigned (hi - lo)`: subtracting the low endpoint makes
+    /// everything below it wrap to a large unsigned value, so one unsigned
+    /// comparison decides both ends. Expanding the range into one compare per
+    /// value is not an option -- `case 0 ... 1000000:` is legal C.
+    ///
+    /// R10 holds the switch value and is reused by later cases, so the
+    /// subtraction goes to R11.
+    fn emit_switch_range(
+        &mut self,
+        val: PseudoId,
+        switch_size: u32,
+        op_size: OperandSize,
+        lo: i64,
+        hi: i64,
+        target: Label,
+    ) {
+        self.emit_move(val, Reg::R11, switch_size);
+        let span = hi.wrapping_sub(lo);
+        let fits = |v: i64| v >= i32::MIN as i64 && v <= i32::MAX as i64;
+        if op_size == OperandSize::B64 && !fits(lo) {
+            // No scratch left for a wide immediate, so build it
+            // in R10 and restore R10 afterwards.
+            self.push_lir(X86Inst::Push {
+                src: GpOperand::Reg(Reg::R10),
+            });
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(lo),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            self.push_lir(X86Inst::Sub {
+                size: op_size,
+                src: GpOperand::Reg(Reg::R10),
+                dst: Reg::R11,
+            });
+            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
+        } else {
+            self.push_lir(X86Inst::Sub {
+                size: op_size,
+                src: GpOperand::Imm(lo),
+                dst: Reg::R11,
+            });
+        }
+        if op_size == OperandSize::B64 && !fits(span) {
+            self.push_lir(X86Inst::Push {
+                src: GpOperand::Reg(Reg::R10),
+            });
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(span),
+                dst: GpOperand::Reg(Reg::R10),
+            });
+            self.push_lir(X86Inst::Cmp {
+                size: op_size,
+                src: GpOperand::Reg(Reg::R10),
+                dst: GpOperand::Reg(Reg::R11),
+            });
+            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
+        } else {
+            self.push_lir(X86Inst::Cmp {
+                size: op_size,
+                src: GpOperand::Imm(span),
+                dst: GpOperand::Reg(Reg::R11),
+            });
+        }
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ule,
+            target,
+        });
+    }
+
+    fn emit_set_val(&mut self, insn: &Instruction, types: &TypeTable) {
+        if let Some(target) = insn.target {
+            if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
+                let target_loc = self.locations.get(target);
+                match &pseudo.kind {
+                    PseudoKind::Val(v) => match target_loc {
+                        Some(Loc::Reg(r)) => {
+                            self.push_lir(X86Inst::Mov {
+                                size: OperandSize::from_bits(insn.size),
+                                src: GpOperand::Imm(*v as i64),
+                                dst: GpOperand::Reg(r),
+                            });
+                        }
+                        // A 128-bit constant lives in a sixteen-byte
+                        // slot, since that is the only place its
+                        // consumers can address it. Without this the
+                        // slot was allocated and never written, so the
+                        // constant read back as zero.
+                        Some(loc @ (Loc::Stack(_) | Loc::IncomingArg(_))) => {
+                            let (v, loc) = (*v, loc.clone());
+                            self.store_int128_imm(v, &loc);
+                        }
+                        _ => {}
+                    },
+                    PseudoKind::FVal(v) => {
+                        // Only emit code if the target is in an XMM register
+                        // FImm locations are materialized inline at use sites
+                        if let Some(Loc::Xmm(_)) = target_loc {
+                            let fmt = self.fp_format(insn.typ, insn.size, types);
+                            self.emit_fp_const_load(target, *v, fmt);
+                        }
+                        // For FImm locations, do nothing - the value will be
+                        // loaded inline when used in operations
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn emit_sym_addr(&mut self, insn: &Instruction) {
+        if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+            let dst_loc = self.get_location(target);
+            // Use R10 as scratch to avoid clobbering live values in Rax
+            let dst_reg = match &dst_loc {
+                Loc::Reg(r) => *r,
+                _ => Reg::R10,
+            };
+            let src_loc = self.get_location(src);
+            match src_loc {
+                Loc::Global(name) if self.is_tls_symbol(&name) => {
+                    self.emit_tls_addr(&name, dst_reg);
+                }
+                Loc::Global(name) => {
+                    // Check if it's a local label (starts with '.') or global symbol
+                    let is_local_label = name.starts_with('.');
+                    if self.needs_got_access(&name) {
+                        // External symbols on macOS need GOT access
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(
+                                name.clone(),
+                            ))),
+                            dst: GpOperand::Reg(dst_reg),
+                        });
+                    } else {
+                        self.push_lir(X86Inst::Lea {
+                            addr: MemAddr::RipRelative(Symbol {
+                                name: name.clone(),
+                                is_local: is_local_label,
+                                is_extern: false,
+                            }),
+                            dst: dst_reg,
+                        });
+                    }
+                }
+                Loc::Stack(offset) => {
+                    // Get address of stack location
+                    self.push_lir(X86Inst::Lea {
+                        addr: self.stack_mem(offset),
+                        dst: dst_reg,
+                    });
+                }
+                Loc::IncomingArg(offset) => {
+                    // Get address of incoming stack argument (e.g., large struct param)
+                    self.push_lir(X86Inst::Lea {
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset,
+                        },
+                        dst: dst_reg,
+                    });
+                }
+                _ => {}
+            }
+            // Move to final destination if needed
+            if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
+                self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+            }
+        }
+    }
+
+    fn emit_tls_addr_insn(&mut self, insn: &Instruction) {
+        if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
+            let dst_loc = self.get_location(target);
+            // R10 is reserved scratch, so it is safe when the result
+            // lives on the stack.
+            let dst_reg = match &dst_loc {
+                Loc::Reg(r) => *r,
+                _ => Reg::R10,
+            };
+            if let Loc::Global(name) = self.get_location(src) {
+                self.emit_tls_addr(&name, dst_reg);
+                if !matches!(dst_loc, Loc::Reg(_)) {
+                    self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                }
+            }
+        }
+    }
+
     fn emit_insn(&mut self, insn: &Instruction, types: &TypeTable) {
         // Emit .loc directive for debug info
         self.emit_loc(insn);
@@ -577,130 +835,7 @@ impl X86_64CodeGen {
                 }
             }
 
-            Opcode::Switch => {
-                if let Some(&val) = insn.src.first() {
-                    // Derive comparison size from type to handle long/pointer switches
-                    let switch_size = insn
-                        .typ
-                        .map(|t| types.size_bits(t).max(32))
-                        .unwrap_or(insn.size.max(32));
-                    self.emit_move(val, Reg::R10, switch_size);
-                    let op_size = if switch_size > 32 {
-                        OperandSize::B64
-                    } else {
-                        OperandSize::B32
-                    };
-
-                    // Compare against a value, using R11 when a 64-bit
-                    // constant does not fit a sign-extended 32-bit immediate.
-                    let cmp_r10 = |gen: &mut Self, v: i64| {
-                        let fits_in_simm32 = v >= i32::MIN as i64 && v <= i32::MAX as i64;
-                        if op_size == OperandSize::B64 && !fits_in_simm32 {
-                            gen.push_lir(X86Inst::Mov {
-                                size: OperandSize::B64,
-                                src: GpOperand::Imm(v),
-                                dst: GpOperand::Reg(Reg::R11),
-                            });
-                            gen.push_lir(X86Inst::Cmp {
-                                size: op_size,
-                                src: GpOperand::Reg(Reg::R11),
-                                dst: GpOperand::Reg(Reg::R10),
-                            });
-                        } else {
-                            gen.push_lir(X86Inst::Cmp {
-                                size: op_size,
-                                src: GpOperand::Imm(v),
-                                dst: GpOperand::Reg(Reg::R10),
-                            });
-                        }
-                    };
-
-                    // Generate comparisons for each case
-                    for (lo, hi, target_bb) in insn.switch_cases.clone() {
-                        let target = Label::new(&self.base.current_fn, target_bb.0);
-                        if lo == hi {
-                            cmp_r10(self, lo);
-                            self.push_lir(X86Inst::Jcc {
-                                cc: CondCode::Eq,
-                                target,
-                            });
-                            continue;
-                        }
-
-                        // A GNU range `case lo ... hi:`. Tested as
-                        // `(x - lo) <=unsigned (hi - lo)`: subtracting the low
-                        // endpoint makes everything below it wrap to a large
-                        // unsigned value, so one unsigned comparison decides
-                        // both ends. Expanding the range into one compare per
-                        // value is not an option -- `case 0 ... 1000000:` is
-                        // legal C.
-                        //
-                        // R10 holds the switch value and is reused by later
-                        // cases, so the subtraction goes to R11.
-                        self.emit_move(val, Reg::R11, switch_size);
-                        let span = hi.wrapping_sub(lo);
-                        let fits = |v: i64| v >= i32::MIN as i64 && v <= i32::MAX as i64;
-                        if op_size == OperandSize::B64 && !fits(lo) {
-                            // No scratch left for a wide immediate, so build it
-                            // in R10 and restore R10 afterwards.
-                            self.push_lir(X86Inst::Push {
-                                src: GpOperand::Reg(Reg::R10),
-                            });
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B64,
-                                src: GpOperand::Imm(lo),
-                                dst: GpOperand::Reg(Reg::R10),
-                            });
-                            self.push_lir(X86Inst::Sub {
-                                size: op_size,
-                                src: GpOperand::Reg(Reg::R10),
-                                dst: Reg::R11,
-                            });
-                            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
-                        } else {
-                            self.push_lir(X86Inst::Sub {
-                                size: op_size,
-                                src: GpOperand::Imm(lo),
-                                dst: Reg::R11,
-                            });
-                        }
-                        if op_size == OperandSize::B64 && !fits(span) {
-                            self.push_lir(X86Inst::Push {
-                                src: GpOperand::Reg(Reg::R10),
-                            });
-                            self.push_lir(X86Inst::Mov {
-                                size: OperandSize::B64,
-                                src: GpOperand::Imm(span),
-                                dst: GpOperand::Reg(Reg::R10),
-                            });
-                            self.push_lir(X86Inst::Cmp {
-                                size: op_size,
-                                src: GpOperand::Reg(Reg::R10),
-                                dst: GpOperand::Reg(Reg::R11),
-                            });
-                            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
-                        } else {
-                            self.push_lir(X86Inst::Cmp {
-                                size: op_size,
-                                src: GpOperand::Imm(span),
-                                dst: GpOperand::Reg(Reg::R11),
-                            });
-                        }
-                        self.push_lir(X86Inst::Jcc {
-                            cc: CondCode::Ule,
-                            target,
-                        });
-                    }
-
-                    // Jump to default (or fall through if no default)
-                    if let Some(default_bb) = insn.switch_default {
-                        // LIR: unconditional jump to default
-                        self.push_lir(X86Inst::Jmp {
-                            target: Label::new(&self.base.current_fn, default_bb.0),
-                        });
-                    }
-                }
-            }
+            Opcode::Switch => self.emit_switch(insn, types),
 
             Opcode::Add
             | Opcode::Sub
@@ -822,45 +957,7 @@ impl X86_64CodeGen {
                 self.emit_call(insn, types);
             }
 
-            Opcode::SetVal => {
-                if let Some(target) = insn.target {
-                    if let Some(pseudo) = self.pseudos.iter().find(|p| p.id == target) {
-                        let target_loc = self.locations.get(target);
-                        match &pseudo.kind {
-                            PseudoKind::Val(v) => match target_loc {
-                                Some(Loc::Reg(r)) => {
-                                    self.push_lir(X86Inst::Mov {
-                                        size: OperandSize::from_bits(insn.size),
-                                        src: GpOperand::Imm(*v as i64),
-                                        dst: GpOperand::Reg(r),
-                                    });
-                                }
-                                // A 128-bit constant lives in a sixteen-byte
-                                // slot, since that is the only place its
-                                // consumers can address it. Without this the
-                                // slot was allocated and never written, so the
-                                // constant read back as zero.
-                                Some(loc @ (Loc::Stack(_) | Loc::IncomingArg(_))) => {
-                                    let (v, loc) = (*v, loc.clone());
-                                    self.store_int128_imm(v, &loc);
-                                }
-                                _ => {}
-                            },
-                            PseudoKind::FVal(v) => {
-                                // Only emit code if the target is in an XMM register
-                                // FImm locations are materialized inline at use sites
-                                if let Some(Loc::Xmm(_)) = target_loc {
-                                    let fmt = self.fp_format(insn.typ, insn.size, types);
-                                    self.emit_fp_const_load(target, *v, fmt);
-                                }
-                                // For FImm locations, do nothing - the value will be
-                                // loaded inline when used in operations
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
+            Opcode::SetVal => self.emit_set_val(insn, types),
 
             Opcode::Copy => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
@@ -869,85 +966,9 @@ impl X86_64CodeGen {
                 }
             }
 
-            Opcode::TlsAddr => {
-                if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
-                    let dst_loc = self.get_location(target);
-                    // R10 is reserved scratch, so it is safe when the result
-                    // lives on the stack.
-                    let dst_reg = match &dst_loc {
-                        Loc::Reg(r) => *r,
-                        _ => Reg::R10,
-                    };
-                    if let Loc::Global(name) = self.get_location(src) {
-                        self.emit_tls_addr(&name, dst_reg);
-                        if !matches!(dst_loc, Loc::Reg(_)) {
-                            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
-                        }
-                    }
-                }
-            }
+            Opcode::TlsAddr => self.emit_tls_addr_insn(insn),
 
-            Opcode::SymAddr => {
-                if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
-                    let dst_loc = self.get_location(target);
-                    // Use R10 as scratch to avoid clobbering live values in Rax
-                    let dst_reg = match &dst_loc {
-                        Loc::Reg(r) => *r,
-                        _ => Reg::R10,
-                    };
-                    let src_loc = self.get_location(src);
-                    match src_loc {
-                        Loc::Global(name) if self.is_tls_symbol(&name) => {
-                            self.emit_tls_addr(&name, dst_reg);
-                        }
-                        Loc::Global(name) => {
-                            // Check if it's a local label (starts with '.') or global symbol
-                            let is_local_label = name.starts_with('.');
-                            if self.needs_got_access(&name) {
-                                // External symbols on macOS need GOT access
-                                self.push_lir(X86Inst::Mov {
-                                    size: OperandSize::B64,
-                                    src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(
-                                        name.clone(),
-                                    ))),
-                                    dst: GpOperand::Reg(dst_reg),
-                                });
-                            } else {
-                                self.push_lir(X86Inst::Lea {
-                                    addr: MemAddr::RipRelative(Symbol {
-                                        name: name.clone(),
-                                        is_local: is_local_label,
-                                        is_extern: false,
-                                    }),
-                                    dst: dst_reg,
-                                });
-                            }
-                        }
-                        Loc::Stack(offset) => {
-                            // Get address of stack location
-                            self.push_lir(X86Inst::Lea {
-                                addr: self.stack_mem(offset),
-                                dst: dst_reg,
-                            });
-                        }
-                        Loc::IncomingArg(offset) => {
-                            // Get address of incoming stack argument (e.g., large struct param)
-                            self.push_lir(X86Inst::Lea {
-                                addr: MemAddr::BaseOffset {
-                                    base: Reg::Rbp,
-                                    offset,
-                                },
-                                dst: dst_reg,
-                            });
-                        }
-                        _ => {}
-                    }
-                    // Move to final destination if needed
-                    if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                        self.emit_move_to_loc(dst_reg, &dst_loc, 64);
-                    }
-                }
-            }
+            Opcode::SymAddr => self.emit_sym_addr(insn),
 
             Opcode::Select => {
                 self.emit_select(insn, types);

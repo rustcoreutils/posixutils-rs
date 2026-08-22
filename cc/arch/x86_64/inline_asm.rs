@@ -14,8 +14,95 @@ use crate::arch::lir::{Directive, FpSize};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::X86Inst;
 use crate::arch::x86_64::regalloc::{Loc, Reg, XmmReg};
-use crate::ir::{Instruction, PseudoId};
+use crate::ir::{AsmData, Instruction, PseudoId};
 use crate::target::Os;
+
+/// Everything the two operand-building passes accumulate before any code is
+/// emitted, bundled because both passes touch nearly all of it: as separate
+/// locals they were fourteen of them, and threading those through a helper
+/// meant a fourteen-parameter signature.
+struct AsmOperandBuild {
+    slots: Vec<crate::arch::AsmOperandSlot<Reg>>,
+    /// Outputs to move out of a specific register once the template has run:
+    /// (output index, specific register, actual location, size in bits).
+    output_moves: Vec<(usize, Reg, Loc, u32)>,
+    /// Inputs to move into a specific register before the template runs:
+    /// (specific register, actual location, size in bits).
+    input_moves: Vec<(Reg, Loc, u32)>,
+    /// Allocated registers that collided with a reserved one, and the temp
+    /// standing in for them: (original, temp, location to restore, size).
+    remap_setup: Vec<(Reg, Reg, Loc, u32)>,
+    remap_restore: Vec<(Reg, Reg, Loc, u32)>,
+    /// Pseudos already given a temp register, so a `"+r"` operand whose input
+    /// and output share a pseudo reuses one rather than taking two.
+    pseudo_to_temp: std::collections::HashMap<PseudoId, Reg>,
+    used_regs: std::collections::HashSet<Reg>,
+    /// The XMM registers this statement may spend on SSE-class operands,
+    /// most-preferred last so `pop` hands them out in order.  Shared by both
+    /// passes so an in-and-out pair cannot hand the same register to both.
+    sse_scratch: Vec<XmmReg>,
+    /// SSE outputs to copy back once the template has run:
+    /// (scratch register, destination, operand size in bits).
+    sse_output_moves: Vec<(XmmReg, Loc, u32)>,
+    /// SSE read-write (`"+x"`) operands whose current value must reach the
+    /// scratch before the template runs: (scratch, source pseudo, size).
+    sse_input_moves: Vec<(XmmReg, PseudoId, u32)>,
+    /// Pseudos already given an SSE scratch, so a tied `"+x"` input reuses its
+    /// output's register rather than taking a second one.
+    pseudo_to_xmm: std::collections::HashMap<PseudoId, XmmReg>,
+    /// x87 operands live on the FP stack rather than in a register, so they
+    /// are not given one: each is pushed with `fldt` before the template and
+    /// the result popped back with `fstpt` after, and the template names them
+    /// `%st` and `%st(1)`.
+    ///
+    /// `t` is st(0) and `u` is st(1), so `u` has to be pushed first for `t` to
+    /// end up on top.  Collected in operand order and reversed at emit time.
+    x87_pushes: Vec<(PseudoId, u32)>,
+    /// Set only when there is an output to write back to, so a template that
+    /// consumes its operand (`fistpl` on a `"t"` input) leaves nothing to
+    /// store.  A pure `"=t"` output is not pushed -- the template supplies the
+    /// value, as `fldz` does.
+    x87_store: Option<(PseudoId, u32)>,
+    x87_slots: usize,
+}
+
+impl AsmOperandBuild {
+    fn new(asm_data: &AsmData, reserved_regs: &std::collections::HashSet<Reg>) -> Self {
+        let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
+        Self {
+            slots: Vec::with_capacity(operand_count),
+            output_moves: Vec::with_capacity(asm_data.outputs.len()),
+            input_moves: Vec::with_capacity(asm_data.inputs.len()),
+            remap_setup: Vec::with_capacity(operand_count),
+            remap_restore: Vec::with_capacity(operand_count),
+            pseudo_to_temp: std::collections::HashMap::new(),
+            used_regs: reserved_regs.clone(),
+            // Xmm15 is the primary scratch and Xmm14 the secondary, the same
+            // pair `float.rs` uses for its own scratch needs.
+            sse_scratch: vec![XmmReg::Xmm14, XmmReg::Xmm15],
+            sse_output_moves: Vec::new(),
+            sse_input_moves: Vec::new(),
+            pseudo_to_xmm: std::collections::HashMap::new(),
+            x87_pushes: Vec::new(),
+            x87_store: None,
+            x87_slots: 0,
+        }
+    }
+}
+
+/// A temp register that is neither reserved by a constraint nor already spent.
+/// R10 and R11 come first: caller-saved, and rarely used for arguments.
+fn find_temp_reg(
+    reserved: &std::collections::HashSet<Reg>,
+    used: &std::collections::HashSet<Reg>,
+) -> Reg {
+    for r in [Reg::R10, Reg::R11, Reg::R8, Reg::R9, Reg::Rsi, Reg::Rdi] {
+        if !reserved.contains(&r) && !used.contains(&r) {
+            return r;
+        }
+    }
+    Reg::R10 // Fallback
+}
 
 impl X86_64CodeGen {
     /// Emit inline assembly
@@ -25,8 +112,18 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        // First pass: collect all specific register constraints to build reserved set
-        // This prevents non-specific operands from using registers needed by specific constraints
+        let reserved_regs = Self::collect_reserved_regs(asm_data);
+        let mut build = AsmOperandBuild::new(asm_data, &reserved_regs);
+        self.build_output_slots(insn, asm_data, &reserved_regs, &mut build);
+        self.build_input_slots(insn, asm_data, &reserved_regs, &mut build);
+        self.emit_asm_prologue_moves(&mut build);
+        self.emit_asm_template(asm_data, &build);
+        self.emit_asm_epilogue_moves(insn, asm_data, &build);
+    }
+
+    /// Collect the registers named by specific constraints (a, b, c, d, S, D).
+    /// Nothing else may be allocated to them for the duration of the statement.
+    fn collect_reserved_regs(asm_data: &AsmData) -> std::collections::HashSet<Reg> {
         let mut reserved_regs: std::collections::HashSet<Reg> = std::collections::HashSet::new();
         for output in &asm_data.outputs {
             if let Some(r) = Self::constraint_to_specific_reg(&output.constraint) {
@@ -38,88 +135,32 @@ impl X86_64CodeGen {
                 reserved_regs.insert(r);
             }
         }
+        reserved_regs
+    }
 
-        // Build operand slots for asm substitution. Each `AsmOperandSlot`
-        // bundles (reg, mem, size, name) so we can never push only part
-        // of an operand's substitution data and run a stale parallel-
-        // array bug. For constraints requiring specific registers
-        // (a, b, c, d, S, D) we use those registers and emit mov
-        // instructions to/from the actual locations.
-        let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
-        let mut slots: Vec<crate::arch::AsmOperandSlot<Reg>> = Vec::with_capacity(operand_count);
-
-        // Track which outputs need to be moved from specific registers after asm
-        // (output_idx, specific_reg, actual_loc, size_bits)
-        let mut output_moves: Vec<(usize, Reg, Loc, u32)> =
-            Vec::with_capacity(asm_data.outputs.len());
-
-        // Track which inputs need to be moved to specific registers before asm
-        // (specific_reg, actual_loc, size_bits)
-        let mut input_moves: Vec<(Reg, Loc, u32)> = Vec::with_capacity(asm_data.inputs.len());
-
-        // Track register remaps: if an allocated reg conflicts with reserved, use temp
-        // (original_reg, temp_reg, actual_loc for restore, size_bits)
-        let mut remap_setup: Vec<(Reg, Reg, Loc, u32)> = Vec::with_capacity(operand_count);
-        let mut remap_restore: Vec<(Reg, Reg, Loc, u32)> = Vec::with_capacity(operand_count);
-
-        // Track which pseudos have been assigned temp registers (for +r where input/output share pseudo)
-        let mut pseudo_to_temp: std::collections::HashMap<PseudoId, Reg> =
-            std::collections::HashMap::new();
-
-        // Helper to find a temp register not in reserved or already used
-        let find_temp_reg = |reserved: &std::collections::HashSet<Reg>,
-                             used: &std::collections::HashSet<Reg>|
-         -> Reg {
-            // Try R10, R11 first (caller-saved, rarely used for args)
-            for r in [Reg::R10, Reg::R11, Reg::R8, Reg::R9, Reg::Rsi, Reg::Rdi] {
-                if !reserved.contains(&r) && !used.contains(&r) {
-                    return r;
-                }
-            }
-            Reg::R10 // Fallback
-        };
-
-        let mut used_regs: std::collections::HashSet<Reg> = reserved_regs.clone();
-
-        // The XMM registers this statement may spend on SSE-class operands,
-        // most-preferred last so `pop` hands them out in order.
-        //
-        // A constant given `"x"`, or an output whose pseudo was allocated a
-        // general register, has to be *put* in an XMM somewhere, and only the
-        // reserved scratches are free across the asm body. Xmm15 is the
-        // primary and Xmm14 the secondary, the same pair `float.rs` uses for
-        // its own scratch needs. Shared by the output and input loops so an
-        // in-and-out pair cannot hand the same register to both.
-        let mut sse_scratch: Vec<XmmReg> = vec![XmmReg::Xmm14, XmmReg::Xmm15];
-
-        // SSE outputs to copy back once the template has run:
-        // (scratch register, destination, operand size in bits).
-        let mut sse_output_moves: Vec<(XmmReg, Loc, u32)> = Vec::new();
-        // x87 operands live on the FP stack rather than in a register, so they
-        // are not given one: each is pushed with `fldt` before the template and
-        // the result popped back with `fstpt` after, and the template names
-        // them `%st` and `%st(1)`.
-        //
-        // `t` is st(0) and `u` is st(1), so `u` has to be pushed first for `t`
-        // to end up on top. `x87_pushes` is collected in operand order and
-        // reversed at emit time. A pure `"=t"` output is *not* pushed -- the
-        // template supplies the value, as `fldz` does -- and `x87_store` is set
-        // only when there is an output to write back to, so a template that
-        // consumes its operand (`fistpl` on a `"t"` input) leaves nothing to
-        // store.
-        let mut x87_pushes: Vec<(crate::ir::PseudoId, u32)> = Vec::new();
-        let mut x87_store: Option<(crate::ir::PseudoId, u32)> = None;
-        let mut x87_slots = 0usize;
-
-        // SSE read-write (`"+x"`) operands whose current value must reach the
-        // scratch before the template runs: (scratch, source pseudo, size).
-        let mut sse_input_moves: Vec<(XmmReg, PseudoId, u32)> = Vec::new();
-
-        // Pseudos already given an SSE scratch, so a tied `"+x"` input reuses
-        // its output's register rather than taking a second one.
-        let mut pseudo_to_xmm: std::collections::HashMap<PseudoId, XmmReg> =
-            std::collections::HashMap::new();
-
+    /// Build the substitution slot for each output operand, recording the
+    /// moves that have to run after the template.
+    fn build_output_slots(
+        &mut self,
+        insn: &Instruction,
+        asm_data: &AsmData,
+        reserved_regs: &std::collections::HashSet<Reg>,
+        build: &mut AsmOperandBuild,
+    ) {
+        let AsmOperandBuild {
+            slots,
+            output_moves,
+            remap_restore,
+            pseudo_to_temp,
+            used_regs,
+            sse_scratch,
+            sse_output_moves,
+            x87_pushes,
+            x87_store,
+            x87_slots,
+            pseudo_to_xmm,
+            ..
+        } = build;
         // Process output operands (they go first: %0, %1, etc.)
         for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
@@ -166,8 +207,8 @@ impl X86_64CodeGen {
                     // before it, while a pure `"=t"` takes its value from the
                     // template.
                     _ if Self::constraint_requires_x87(&output.constraint) => {
-                        let name = Self::x87_slot_name(x87_slots);
-                        x87_slots += 1;
+                        let name = Self::x87_slot_name(*x87_slots);
+                        *x87_slots += 1;
                         // The result is written back through the operand's
                         // own stack slot. A pseudo the allocator gave no slot
                         // -- which is what a bare `"=t"` local gets, since
@@ -189,7 +230,7 @@ impl X86_64CodeGen {
                             if output.constraint.contains('+') {
                                 x87_pushes.push((output.pseudo, op_size));
                             }
-                            x87_store = Some((output.pseudo, op_size));
+                            *x87_store = Some((output.pseudo, op_size));
                         } else {
                             crate::diag::error(
                                 insn.pos.unwrap_or_default(),
@@ -227,7 +268,7 @@ impl X86_64CodeGen {
                         // Check if allocated reg conflicts with reserved
                         if reserved_regs.contains(&r) {
                             // Use a temp register instead
-                            let temp = find_temp_reg(&reserved_regs, &used_regs);
+                            let temp = find_temp_reg(reserved_regs, used_regs);
                             used_regs.insert(temp);
                             slots.push(mk(Some(temp), None));
                             // For outputs, move from temp to actual loc after asm
@@ -243,7 +284,7 @@ impl X86_64CodeGen {
                         // Constant-propagated value used as asm output.
                         // Allocate temp register; after asm, the register holds the
                         // modified value — update the location map directly.
-                        let temp = find_temp_reg(&reserved_regs, &used_regs);
+                        let temp = find_temp_reg(reserved_regs, used_regs);
                         used_regs.insert(temp);
                         slots.push(mk(Some(temp), None));
                         // Don't add to output_moves (can't store to Imm).
@@ -254,7 +295,7 @@ impl X86_64CodeGen {
                     _ if requires_reg => {
                         // Constraint requires register but value is on stack/memory.
                         // Allocate a temp register; move from temp to actual loc after asm.
-                        let temp = find_temp_reg(&reserved_regs, &used_regs);
+                        let temp = find_temp_reg(reserved_regs, used_regs);
                         used_regs.insert(temp);
                         slots.push(mk(Some(temp), None));
                         output_moves.push((idx, temp, loc.clone(), op_size));
@@ -268,9 +309,31 @@ impl X86_64CodeGen {
                 }
             }
         }
+    }
 
+    /// Build the substitution slot for each input operand, recording the moves
+    /// that have to run before the template.
+    fn build_input_slots(
+        &mut self,
+        insn: &Instruction,
+        asm_data: &AsmData,
+        reserved_regs: &std::collections::HashSet<Reg>,
+        build: &mut AsmOperandBuild,
+    ) {
+        let AsmOperandBuild {
+            slots,
+            input_moves,
+            remap_setup,
+            pseudo_to_temp,
+            used_regs,
+            sse_scratch,
+            sse_input_moves,
+            x87_pushes,
+            x87_slots,
+            pseudo_to_xmm,
+            ..
+        } = build;
         let num_outputs = asm_data.outputs.len();
-
         // Process input operands
         for input in &asm_data.inputs {
             let op_size = input.size;
@@ -348,8 +411,8 @@ impl X86_64CodeGen {
                         // stack -- `__asm__("fmulp" : "+t"(a) : "u"(b))` answered
                         // -nan.
                         _ if Self::constraint_requires_x87(constraint_for_reg) => {
-                            let name = Self::x87_slot_name(x87_slots);
-                            x87_slots += 1;
+                            let name = Self::x87_slot_name(*x87_slots);
+                            *x87_slots += 1;
                             if Self::x87_addressable(&loc) {
                                 x87_pushes.push((input.pseudo, input.size));
                             } else {
@@ -402,7 +465,7 @@ impl X86_64CodeGen {
                             // Memory constraint with constant address (may be dead code
                             // from unoptimized switch on constant ORDER in atomic macros).
                             // Load address into temp reg and emit as indirect memory ref.
-                            let temp = find_temp_reg(&reserved_regs, &used_regs);
+                            let temp = find_temp_reg(reserved_regs, used_regs);
                             used_regs.insert(temp);
                             input_moves.push((temp, loc.clone(), op_size));
                             let mem_str = format!("(%{})", self.reg_name_64(temp));
@@ -417,7 +480,7 @@ impl X86_64CodeGen {
                             // Check if allocated reg conflicts with reserved
                             if reserved_regs.contains(&r) {
                                 // Use a temp register instead
-                                let temp = find_temp_reg(&reserved_regs, &used_regs);
+                                let temp = find_temp_reg(reserved_regs, used_regs);
                                 used_regs.insert(temp);
                                 slots.push(mk(Some(temp), None));
                                 // For inputs, move from actual loc to temp before asm
@@ -434,7 +497,7 @@ impl X86_64CodeGen {
                         _ if requires_reg => {
                             // Constraint requires register but value is on stack/memory.
                             // Allocate a temp register and load value before asm.
-                            let temp = find_temp_reg(&reserved_regs, &used_regs);
+                            let temp = find_temp_reg(reserved_regs, used_regs);
                             used_regs.insert(temp);
                             slots.push(mk(Some(temp), None));
                             input_moves.push((temp, loc.clone(), op_size));
@@ -448,20 +511,31 @@ impl X86_64CodeGen {
                 }
             }
         }
+    }
 
+    /// Everything that must be in place before the template runs.
+    fn emit_asm_prologue_moves(&mut self, build: &mut AsmOperandBuild) {
+        let AsmOperandBuild {
+            input_moves,
+            remap_setup,
+            sse_input_moves,
+            x87_pushes,
+            ..
+        } = build;
+        let x87_pushes = std::mem::take(x87_pushes);
         // Emit remap setup moves (for inputs that conflicted with reserved regs)
-        for (_orig, temp, actual_loc, size) in &remap_setup {
+        for (_orig, temp, actual_loc, size) in remap_setup.iter() {
             self.emit_raw_mov_from_loc(actual_loc, *temp, *size);
         }
 
         // Emit moves from actual locations to specific registers (for inputs)
         // Load `"+x"` operands into their scratch before the template runs.
-        for (xmm, pseudo, size) in &sse_input_moves {
+        for (xmm, pseudo, size) in sse_input_moves.iter() {
             let fp_size = FpSize::from_bits(*size, &self.base.target);
             self.emit_fp_move(*pseudo, *xmm, fp_size);
         }
 
-        for (specific_reg, actual_loc, size) in &input_moves {
+        for (specific_reg, actual_loc, size) in input_moves.iter() {
             self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
         }
 
@@ -478,7 +552,11 @@ impl X86_64CodeGen {
                 "{mnemonic} {addr}"
             ))));
         }
+    }
 
+    /// Substitute the operands into the template and emit it as raw text.
+    fn emit_asm_template(&mut self, asm_data: &AsmData, build: &AsmOperandBuild) {
+        let slots = &build.slots;
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
         let goto_labels_formatted: Vec<(String, String)> = asm_data
             .goto_labels
@@ -493,7 +571,7 @@ impl X86_64CodeGen {
 
         // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
         let asm_output =
-            self.substitute_asm_operands(&asm_data.template, &slots, &goto_labels_formatted);
+            self.substitute_asm_operands(&asm_data.template, slots, &goto_labels_formatted);
 
         // Emit the inline assembly as raw text
         // Split by newlines and emit each line
@@ -503,12 +581,28 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Directive(Directive::Raw(trimmed.to_string())));
             }
         }
+    }
 
+    /// Everything that must run once the template has finished: results copied
+    /// out of the registers the constraints forced them into.
+    fn emit_asm_epilogue_moves(
+        &mut self,
+        insn: &Instruction,
+        asm_data: &AsmData,
+        build: &AsmOperandBuild,
+    ) {
+        let AsmOperandBuild {
+            output_moves,
+            remap_restore,
+            sse_output_moves,
+            x87_store,
+            ..
+        } = build;
         // Pop the x87 result back into the operand's own storage. Only an
         // output has somewhere to go; a template that consumed its input --
         // `fistpl` on a `"t"` operand -- leaves nothing here.
         if let Some((pseudo, size)) = x87_store {
-            let addr = self.get_x87_mem_addr(pseudo).format(&self.base.target);
+            let addr = self.get_x87_mem_addr(*pseudo).format(&self.base.target);
             let mnemonic = match size {
                 32 => "fstps",
                 64 => "fstpl",
@@ -522,7 +616,7 @@ impl X86_64CodeGen {
         // Copy SSE outputs out of the scratch register into where the
         // operand actually lives. `emit_raw_mov_to_loc` below cannot do this
         // -- its source is a general register.
-        for (xmm, actual_loc, size) in &sse_output_moves {
+        for (xmm, actual_loc, size) in sse_output_moves.iter() {
             // `emit_fp_move_from_xmm` silently does nothing for a destination
             // it does not handle, which would lose the value. Say so instead.
             if matches!(actual_loc, Loc::Global(_) | Loc::IncomingArg(_)) {
@@ -537,12 +631,12 @@ impl X86_64CodeGen {
         }
 
         // Emit moves from specific registers to actual locations (for outputs)
-        for (_idx, specific_reg, actual_loc, size) in &output_moves {
+        for (_idx, specific_reg, actual_loc, size) in output_moves.iter() {
             self.emit_raw_mov_to_loc(*specific_reg, actual_loc, *size);
         }
 
         // Emit remap restore moves (for outputs that conflicted with reserved regs)
-        for (temp, _orig, actual_loc, size) in &remap_restore {
+        for (temp, _orig, actual_loc, size) in remap_restore.iter() {
             self.emit_raw_mov_to_loc(*temp, actual_loc, *size);
         }
 

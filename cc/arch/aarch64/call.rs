@@ -18,6 +18,75 @@ use crate::ir::{Instruction, PseudoId};
 use crate::target::Target;
 use crate::types::{TypeId, TypeKind, TypeTable};
 
+/// What a stacked argument is made of, which decides both how many
+/// bytes it reserves and how its bytes are produced.
+///
+/// This was a `complex_pair: bool`. Every multi-element argument that
+/// did not fit in the V registers took the `_Complex` path -- a fixed
+/// two-element loop at the complex element stride -- so a stacked
+/// three- or four-element HFA wrote the wrong number of elements at
+/// the wrong stride, and reserved the wrong slot besides.
+#[derive(Clone, Copy)]
+enum StackKind {
+    /// An ordinary value; the pseudo holds it.
+    Scalar,
+    /// A `_Complex`: the pseudo holds the value's *address*, and both
+    /// elements must be dereferenced out of it into one two-element
+    /// slot. Pushing the pseudo twice as if it were two scalars wrote
+    /// the pointer's bit pattern into both halves.
+    Complex,
+    /// An HFA: `count` elements of `base`, at that base's stride.
+    Hfa { base: HfaBase, count: u8 },
+    /// A composite laid on the stack by value. The pseudo carries its
+    /// address; `bytes` of it are copied into the outgoing slot.
+    /// Pushing it as a scalar wrote the *pointer* there instead.
+    Composite { bytes: i32 },
+}
+
+struct StackArg {
+    pseudo: PseudoId,
+    is_fp: bool,
+    size: u32,
+    typ: Option<TypeId>,
+    kind: StackKind,
+}
+
+impl StackArg {
+    /// Where this argument starts, relative to the outgoing area.
+    ///
+    /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address
+    /// up to `max(8, alignof(type))` *before* placing it. Advancing by
+    /// the rounded size alone put a sixteen-byte-aligned argument eight
+    /// bytes low whenever an odd number of eight-byte slots came first,
+    /// and the callee made the same mistake, so it showed only against
+    /// another compiler.
+    fn slot_start(&self, at: i32, types: &TypeTable) -> i32 {
+        let align = self.typ.map_or(8, |t| types.alignment(t) as i32).max(8);
+        (at + align - 1) & !(align - 1)
+    }
+
+    fn slot_bytes(&self, types: &TypeTable, target: &Target) -> i32 {
+        match self.kind {
+            StackKind::Complex => {
+                let elem = self
+                    .typ
+                    .map(|t| complex_fp_info(types, target, t).1)
+                    .unwrap_or(8);
+                ((2 * elem) + 7) & !7
+            }
+            StackKind::Hfa { base, count } => ((count as i32 * HfaElem::of(base).bytes) + 7) & !7,
+            StackKind::Composite { bytes } => (bytes + 7) & !7,
+            StackKind::Scalar => {
+                if self.size == 128 {
+                    16
+                } else {
+                    8
+                }
+            }
+        }
+    }
+}
+
 impl Aarch64CodeGen {
     /// Handle sret (hidden struct return pointer) argument
     pub(super) fn setup_sret_arg(&mut self, insn: &Instruction) -> usize {
@@ -250,81 +319,44 @@ impl Aarch64CodeGen {
         args_start: usize,
         types: &TypeTable,
     ) -> i32 {
+        let stack_args_info = self.assign_arg_registers(insn, args_start, types);
+
+        // If no stack args, we're done
+        if stack_args_info.is_empty() {
+            return 0;
+        }
+
+        // Pre-allocate stack space for all stack args, 16-byte aligned.
+        // Walked, not summed: alignment padding between arguments is part of
+        // the area, and summing the sizes alone under-reserved it.
+        let stack_bytes: i32 = stack_args_info.iter().fold(0, |at, a| {
+            a.slot_start(at, types) + a.slot_bytes(types, &self.base.target)
+        });
+        let aligned_bytes = (stack_bytes + 15) & !15;
+
+        self.push_lir(Aarch64Inst::Sub {
+            size: OperandSize::B64,
+            src1: Reg::sp(),
+            src2: GpOperand::Imm(aligned_bytes as i64),
+            dst: Reg::sp(),
+        });
+
+        self.store_stack_args(stack_args_info, types);
+
+        // Return number of 16-byte units allocated (for cleanup)
+        (aligned_bytes + 15) / 16
+    }
+
+    /// Assign each argument to its AAPCS64 register, returning the ones that
+    /// did not fit and must travel on the stack, in parameter order.
+    fn assign_arg_registers(
+        &mut self,
+        insn: &Instruction,
+        args_start: usize,
+        types: &TypeTable,
+    ) -> Vec<StackArg> {
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
-
-        // First pass: identify which args go to registers vs stack
-        // Collect stack args with their info for the second pass
-        /// What a stacked argument is made of, which decides both how many
-        /// bytes it reserves and how its bytes are produced.
-        ///
-        /// This was a `complex_pair: bool`. Every multi-element argument that
-        /// did not fit in the V registers took the `_Complex` path -- a fixed
-        /// two-element loop at the complex element stride -- so a stacked
-        /// three- or four-element HFA wrote the wrong number of elements at
-        /// the wrong stride, and reserved the wrong slot besides.
-        #[derive(Clone, Copy)]
-        enum StackKind {
-            /// An ordinary value; the pseudo holds it.
-            Scalar,
-            /// A `_Complex`: the pseudo holds the value's *address*, and both
-            /// elements must be dereferenced out of it into one two-element
-            /// slot. Pushing the pseudo twice as if it were two scalars wrote
-            /// the pointer's bit pattern into both halves.
-            Complex,
-            /// An HFA: `count` elements of `base`, at that base's stride.
-            Hfa { base: HfaBase, count: u8 },
-            /// A composite laid on the stack by value. The pseudo carries its
-            /// address; `bytes` of it are copied into the outgoing slot.
-            /// Pushing it as a scalar wrote the *pointer* there instead.
-            Composite { bytes: i32 },
-        }
-
-        struct StackArg {
-            pseudo: PseudoId,
-            is_fp: bool,
-            size: u32,
-            typ: Option<TypeId>,
-            kind: StackKind,
-        }
-
-        impl StackArg {
-            /// Where this argument starts, relative to the outgoing area.
-            ///
-            /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address
-            /// up to `max(8, alignof(type))` *before* placing it. Advancing by
-            /// the rounded size alone put a sixteen-byte-aligned argument eight
-            /// bytes low whenever an odd number of eight-byte slots came first,
-            /// and the callee made the same mistake, so it showed only against
-            /// another compiler.
-            fn slot_start(&self, at: i32, types: &TypeTable) -> i32 {
-                let align = self.typ.map_or(8, |t| types.alignment(t) as i32).max(8);
-                (at + align - 1) & !(align - 1)
-            }
-
-            fn slot_bytes(&self, types: &TypeTable, target: &Target) -> i32 {
-                match self.kind {
-                    StackKind::Complex => {
-                        let elem = self
-                            .typ
-                            .map(|t| complex_fp_info(types, target, t).1)
-                            .unwrap_or(8);
-                        ((2 * elem) + 7) & !7
-                    }
-                    StackKind::Hfa { base, count } => {
-                        ((count as i32 * HfaElem::of(base).bytes) + 7) & !7
-                    }
-                    StackKind::Composite { bytes } => (bytes + 7) & !7,
-                    StackKind::Scalar => {
-                        if self.size == 128 {
-                            16
-                        } else {
-                            8
-                        }
-                    }
-                }
-            }
-        }
         let mut stack_args_info: Vec<StackArg> = Vec::new();
         let mut int_arg_idx = 0;
         let mut fp_arg_idx = 0;
@@ -562,26 +594,11 @@ impl Aarch64CodeGen {
             }
         }
 
-        // If no stack args, we're done
-        if stack_args_info.is_empty() {
-            return 0;
-        }
+        stack_args_info
+    }
 
-        // Pre-allocate stack space for all stack args, 16-byte aligned.
-        // Walked, not summed: alignment padding between arguments is part of
-        // the area, and summing the sizes alone under-reserved it.
-        let stack_bytes: i32 = stack_args_info.iter().fold(0, |at, a| {
-            a.slot_start(at, types) + a.slot_bytes(types, &self.base.target)
-        });
-        let aligned_bytes = (stack_bytes + 15) & !15;
-
-        self.push_lir(Aarch64Inst::Sub {
-            size: OperandSize::B64,
-            src1: Reg::sp(),
-            src2: GpOperand::Imm(aligned_bytes as i64),
-            dst: Reg::sp(),
-        });
-
+    /// Store each stacked argument at its offset from SP, in parameter order.
+    fn store_stack_args(&mut self, stack_args_info: Vec<StackArg>, types: &TypeTable) {
         // Store each stack arg at its proper offset from SP (in parameter order)
         let mut offset: i32 = 0;
         for stack_arg in stack_args_info.into_iter() {
@@ -762,9 +779,6 @@ impl Aarch64CodeGen {
             }
             offset += stack_arg.slot_bytes(types, &self.base.target);
         }
-
-        // Return number of 16-byte units allocated (for cleanup)
-        (aligned_bytes + 15) / 16
     }
 
     /// Set up a complex number argument (real + imaginary in two V registers)

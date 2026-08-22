@@ -297,7 +297,28 @@ impl<'a> Parser<'a> {
             return self.types.void_id;
         }
 
-        // Both arithmetic: apply usual arithmetic conversions
+        // Both arithmetic: the usual arithmetic conversions, which C17 6.5.15p5
+        // sends the arms through -- the same ones the binary operators use.
+        //
+        // Delegated rather than restated. The copy that lived here compared
+        // bit *width* where C compares conversion *rank*, so `c ? (long)0 :
+        // (long long)0` came out `long` and, worse, depended on which arm was
+        // written first: the same pair spelled the other way round gave
+        // `long long`.
+        //
+        // Complex is held back deliberately. The shared version answers it
+        // correctly -- `c ? z : 1.0` really is `double _Complex` -- but a
+        // complex conditional does not survive codegen today: the arms carry a
+        // two-register value while the merge dereferences the pseudo as an
+        // address, which segfaults, and does so at this commit with or without
+        // this change. Widening the type here would turn "quietly drops the
+        // imaginary part" into "crashes", so complex keeps the answer it had
+        // until that is fixed.
+        let complex = self.types.is_complex(then_typ) || self.types.is_complex(else_typ);
+        if !complex && self.types.is_arithmetic(then_typ) && self.types.is_arithmetic(else_typ) {
+            return self.usual_arithmetic_conversions(then_typ, else_typ);
+        }
+
         // Float types take precedence
         if self.types.is_float(then_typ) || self.types.is_float(else_typ) {
             if then_kind == TypeKind::Float128 || else_kind == TypeKind::Float128 {
@@ -312,37 +333,10 @@ impl<'a> Parser<'a> {
             return self.types.float_id;
         }
 
-        // Integers: C17 6.3.1.8, the usual arithmetic conversions.
-        //
-        // Promotion first -- anything narrower than `int` becomes `int`, since
-        // `int` holds all its values whether it was signed or not, so a narrow
-        // type's own signedness does not survive.
-        let then_size = self.types.size_bits(then_typ).max(32);
-        let else_size = self.types.size_bits(else_typ).max(32);
-        let promoted_unsigned = |t| self.types.size_bits(t) >= 32 && self.types.is_unsigned(t);
-
-        if then_size != else_size {
-            // A strictly wider signed type represents every value of the
-            // narrower one, so rank alone decides.
-            return if then_size > else_size {
-                then_typ
-            } else {
-                else_typ
-            };
-        }
-
-        // Equal rank, and this is where it went wrong: an unsigned operand
-        // wins. Collapsing every 32-bit pair to `int` made `(long)(u ?: -1)`
-        // with `unsigned u = 0` give -1 where C gives 4294967295, and at 64
-        // bits it kept whichever arm was written first.
-        match (promoted_unsigned(then_typ), promoted_unsigned(else_typ)) {
-            (true, _) => then_typ,
-            (_, true) => else_typ,
-            // Both signed. A promoted narrow type is `int`; anything already
-            // at least that wide keeps its own type.
-            _ if then_size == 32 => self.types.int_id,
-            _ => then_typ,
-        }
+        // Neither arithmetic nor a pointer: a struct or union, where C17
+        // 6.5.15p3 has already required both arms to have the same type and
+        // there is nothing to convert.
+        then_typ
     }
 
     /// Apply the array-to-pointer and function-to-pointer decays of C17

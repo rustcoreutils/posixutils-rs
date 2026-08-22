@@ -814,3 +814,58 @@ int main(void) { return use(); }
     assert_eq!(compile_and_run("fn_designator", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("fn_designator_opt", code), 0);
 }
+
+/// The conditional's common type is decided by conversion *rank*, not by bit
+/// width (C17 6.3.1.8). On LP64 `long` and `long long` are both 64 bits, and
+/// the copy of the rules that used to live in `ternary_common_type` compared
+/// widths -- so it returned whichever arm was written first, and `c ? l : ll`
+/// and `c ? ll : l` disagreed about their own type.
+///
+/// Checked with `_Generic`, which asks the type directly; the two types share
+/// a representation, so no arithmetic result can tell them apart.
+#[test]
+fn c99_conditional_common_type_follows_rank() {
+    let code = r#"
+#define TY(e) _Generic((e), \
+    int: 1, unsigned int: 2, \
+    long: 3, unsigned long: 4, \
+    long long: 5, unsigned long long: 6, \
+    float: 7, double: 8, long double: 9, \
+    default: 0)
+int c(void) { return 1; }
+int main(void) {
+    long l = 1; long long ll = 1;
+    unsigned long ul = 1; unsigned long long ull = 1;
+    unsigned u = 1; int i = 1;
+
+    /* Equal width, unequal rank: long long wins, written either way round. */
+    if (TY(c() ? l : ll) != 5) return 1;
+    if (TY(c() ? ll : l) != 5) return 2;
+    if (TY(c() ? ul : ull) != 6) return 3;
+    if (TY(c() ? ull : ul) != 6) return 4;
+
+    /* Mixed signedness at unequal rank: the unsigned counterpart of the
+       higher-ranked type, since neither can represent all of the other. */
+    if (TY(c() ? ul : ll) != 6) return 5;
+    if (TY(c() ? ll : ul) != 6) return 6;
+
+    /* The equal-rank case, which is where the unsigned operand wins. */
+    if (TY(c() ? u : i) != 2) return 7;
+    if (TY(c() ? l : ul) != 4) return 8;
+
+    /* Unequal rank, same signedness: the higher rank. */
+    if (TY(c() ? i : ll) != 5) return 9;
+    if (TY(c() ? u : ull) != 6) return 10;
+
+    /* Reals rank the same way, and `_Float16` is a type of its own rather
+       than being flattened to `float`. */
+    float f = 1; double d = 1;
+    if (TY(c() ? f : d) != 8) return 11;
+    if (TY(c() ? d : f) != 8) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cond_rank", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("cond_rank_opt", code), 0);
+}

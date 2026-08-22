@@ -138,3 +138,41 @@ fn builtins_va_arg_pack_outside_a_forwarding_function_is_rejected() {
         "va_arg_pack",
     );
 }
+
+/// When the inliner refuses an `always_inline` forwarder for a reason of its
+/// own -- the callee also uses `va_start`, or `alloca` -- the pack has nothing
+/// to be resolved against and the body has already been suppressed.
+///
+/// The guard that was supposed to catch this asked `func.emit &&
+/// forwards_caller_arguments(func)`, which no function can satisfy:
+/// `suppress_forwarding_bodies` clears `emit` on exactly the set the predicate
+/// accepts, and nothing sets it back. So it never fired, and the program
+/// failed at *link* time with `undefined reference to 'wrap'` and no
+/// diagnostic. What is wrong is a surviving call site, so that is what the
+/// check looks at now.
+#[test]
+fn builtins_unresolvable_va_arg_pack_is_diagnosed() {
+    // Refused because the callee uses a va_list of its own. gcc reports this
+    // one too: "can never be inlined because it uses variable argument lists".
+    compile_expect_error(
+        "va_arg_pack_with_va_start",
+        "#include <stdarg.h>\n\
+         extern int printf(const char *, ...);\n\
+         __attribute__((always_inline)) static inline int wrap(const char *f, ...) {\n\
+         va_list ap; va_start(ap, f); (void)va_arg(ap, int); va_end(ap);\n\
+         return printf(f, __builtin_va_arg_pack()); }\n\
+         int main(void) { return wrap(\"%d\\n\", 1); }\n",
+        "could not be forwarded",
+    );
+    // Refused because of alloca. gcc inlines this one; c17 does not, and an
+    // error naming the reason is the honest outcome of that.
+    compile_expect_error(
+        "va_arg_pack_with_alloca",
+        "extern int printf(const char *, ...);\n\
+         __attribute__((always_inline)) static inline int wrap(const char *f, ...) {\n\
+         char *p = __builtin_alloca(16); (void)p;\n\
+         return printf(f, __builtin_va_arg_pack()); }\n\
+         int main(void) { return wrap(\"%d\\n\", 1); }\n",
+        "could not be forwarded",
+    );
+}

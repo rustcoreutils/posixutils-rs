@@ -411,17 +411,33 @@ pub struct Preprocessor<'a> {
     /// Counter for __COUNTER__
     counter: u32,
 
-    /// Include depth (for cycle detection)
+    /// How many `#include`s deep the pass currently is. This is what bounds a
+    /// cycle; there is no set of open files.
     include_depth: u32,
 
     /// Maximum include depth
     max_include_depth: u32,
 
-    /// Set of files currently being included (cycle detection)
-    include_stack: HashSet<PathBuf>,
-
-    /// Files that have been included with #pragma once or include guards
+    /// Files named by a `#pragma once`.
     once_files: HashSet<PathBuf>,
+
+    /// Files whose whole contents are one `#ifndef`/`#endif` group, and the
+    /// macro that guards them.
+    ///
+    /// Only a file that has been read *through to the end* gets an entry, and
+    /// only if its group closed with nothing outside it. That is what makes
+    /// the entry mean "including this again would produce nothing", which is
+    /// the only thing that justifies skipping it.
+    ///
+    /// Guessing instead -- scanning the text for an `#ifndef` and skipping
+    /// whenever that name happened to be defined -- deleted source three ways:
+    /// a header with anything after its `#endif` lost it on every include but
+    /// the first; `-D<guard>` on the command line deleted the file entire,
+    /// having never read it; and a header that includes itself under a counter
+    /// guard lost its `#else` arm.
+    ///
+    /// Pure lookup, never iterated, so a `HashMap` cannot leak its order.
+    guarded_files: HashMap<PathBuf, String>,
 
     /// Compilation date string for __DATE__ (format: "Mmm dd yyyy")
     compile_date: String,
@@ -812,8 +828,8 @@ impl<'a> Preprocessor<'a> {
             counter: 0,
             include_depth: 0,
             max_include_depth: 200,
-            include_stack: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
+            guarded_files: HashMap::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             compile_date,
             compile_time,
             use_builtin_headers: true,

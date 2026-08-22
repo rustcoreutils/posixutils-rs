@@ -1100,80 +1100,117 @@ fn test_pragma_operator_multiple() {
 // Include guard detection tests
 // ========================================================================
 
+/// Tokenize a header and ask whether it is exactly one guarded group.
+///
+/// The scan reads tokens rather than raw bytes, so comments and whitespace are
+/// already gone by the time it looks -- the cases that used to need their own
+/// comment lexer are now free.
+fn guard_of(content: &str) -> Option<String> {
+    let mut strings = IdentTable::new();
+    let tokens = Tokenizer::new(content.as_bytes(), 0, &mut strings).tokenize();
+    Preprocessor::guard_of(&tokens, &strings)
+}
+
 #[test]
-fn test_detect_include_guard_ifndef_define() {
+fn test_guard_ifndef_define() {
     // Standard include guard pattern: #ifndef X / #define X
-    let content = b"#ifndef FOO_H\n#define FOO_H\n// content\n#endif\n";
     assert_eq!(
-        Preprocessor::detect_include_guard(content),
+        guard_of("#ifndef FOO_H\n#define FOO_H\nint content;\n#endif\n"),
         Some("FOO_H".to_string())
     );
 }
 
 #[test]
-fn test_detect_include_guard_with_leading_comment() {
-    // Include guard with leading block comment
-    let content = b"/* Header file */\n#ifndef MY_HEADER_H\n#define MY_HEADER_H\n#endif\n";
+fn test_guard_with_leading_comment() {
     assert_eq!(
-        Preprocessor::detect_include_guard(content),
+        guard_of("/* Header file */\n#ifndef MY_HEADER_H\n#define MY_HEADER_H\n#endif\n"),
         Some("MY_HEADER_H".to_string())
     );
-}
-
-#[test]
-fn test_detect_include_guard_with_line_comment() {
-    // Include guard with leading line comment
-    let content = b"// Header file\n#ifndef GUARD_H\n#define GUARD_H\n#endif\n";
     assert_eq!(
-        Preprocessor::detect_include_guard(content),
+        guard_of("// Header file\n#ifndef GUARD_H\n#define GUARD_H\n#endif\n"),
         Some("GUARD_H".to_string())
     );
 }
 
 #[test]
-fn test_detect_include_guard_no_define() {
-    // Not a guard - #ifndef without matching #define
-    let content = b"#ifndef FOO_H\n#error \"Use other header\"\n#endif\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
-}
-
-#[test]
-fn test_detect_include_guard_different_macro() {
-    // Not a guard - #define defines different macro
-    let content = b"#ifndef FOO_H\n#define BAR_H\n#endif\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
-}
-
-#[test]
-fn test_detect_include_guard_if_not_defined() {
-    // Alternative pattern: #if !defined(X)
-    let content = b"#if !defined(MYGUARD)\n#define MYGUARD\n#endif\n";
+fn test_guard_no_define() {
+    // Not a guard -- #ifndef without a matching #define. This is the
+    // <sys/cdefs.h> sentinel shape, which must keep being re-read.
     assert_eq!(
-        Preprocessor::detect_include_guard(content),
+        guard_of("#ifndef FOO_H\n#error \"Use other header\"\n#endif\n"),
+        None
+    );
+}
+
+#[test]
+fn test_guard_different_macro() {
+    // Not a guard -- the #define names something else.
+    assert_eq!(guard_of("#ifndef FOO_H\n#define BAR_H\n#endif\n"), None);
+}
+
+#[test]
+fn test_guard_if_not_defined() {
+    // The `#if !defined(X)` spelling, with and without parentheses.
+    assert_eq!(
+        guard_of("#if !defined(MYGUARD)\n#define MYGUARD\n#endif\n"),
+        Some("MYGUARD".to_string())
+    );
+    assert_eq!(
+        guard_of("#if !defined MYGUARD\n#define MYGUARD\n#endif\n"),
         Some("MYGUARD".to_string())
     );
 }
 
 #[test]
-fn test_detect_include_guard_no_guard() {
-    // Not a guard - just regular code
-    let content = b"int x = 1;\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
+fn test_guard_no_guard() {
+    assert_eq!(guard_of("int x = 1;\n"), None);
+    assert_eq!(guard_of(""), None);
 }
 
 #[test]
-fn test_detect_include_guard_conditional_default_with_content() {
-    // NOT a guard - conditional default definition followed by more content
-    // This pattern: #ifndef X / #define X default / #endif / more macros
-    let content = b"#ifndef FOO\n#define FOO 1\n#endif\n#define BAR 2\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
+fn test_guard_conditional_default_with_content() {
+    // NOT a guard: the conditional-default idiom, where something follows the
+    // #endif. Treating it as one would delete that something.
+    assert_eq!(
+        guard_of("#ifndef FOO\n#define FOO 1\n#endif\n#define BAR 2\n"),
+        None
+    );
+    assert_eq!(
+        guard_of("#if !defined(DEFAULT_VAL)\n#define DEFAULT_VAL 42\n#endif\n#define OTHER 1\n"),
+        None
+    );
 }
 
+/// The case the byte scanner could not see: it stopped at the first token of
+/// the body, so it never found the closing `#endif` and never noticed that a
+/// header had code after it. Such a header is not guarded, and skipping it on
+/// re-inclusion deleted that code.
 #[test]
-fn test_detect_include_guard_if_defined_conditional_default() {
-    // NOT a guard - #if !defined() pattern with content after #endif
-    let content = b"#if !defined(DEFAULT_VAL)\n#define DEFAULT_VAL 42\n#endif\n#define OTHER 1\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
+fn test_guard_rejects_code_after_endif() {
+    assert_eq!(
+        guard_of("#ifndef G\n#define G\nint body;\n#endif\nint outside;\n"),
+        None
+    );
+}
+
+/// Nesting has to be counted, or an inner `#endif` looks like the guard's.
+#[test]
+fn test_guard_counts_nesting() {
+    assert_eq!(
+        guard_of("#ifndef G\n#define G\n#if 1\nint a;\n#endif\nint b;\n#endif\n"),
+        Some("G".to_string())
+    );
+    // Same shape, but with something after the *outer* #endif.
+    assert_eq!(
+        guard_of("#ifndef G\n#define G\n#if 1\nint a;\n#endif\n#endif\nint after;\n"),
+        None
+    );
+}
+
+/// A guard whose group never closes is not a guard.
+#[test]
+fn test_guard_rejects_unterminated() {
+    assert_eq!(guard_of("#ifndef G\n#define G\nint body;\n"), None);
 }
 
 // ========================================================================

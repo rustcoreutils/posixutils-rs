@@ -313,3 +313,123 @@ fn preprocessor_extra_tokens_after_a_conditional_warn() {
         );
     }
 }
+
+/// A header is only skipped on re-inclusion once it has been read through to
+/// the end and found to be exactly one guarded group.
+///
+/// Guessing instead — scanning for an `#ifndef` and skipping whenever that
+/// name happened to be defined — deleted source three ways, all of them here.
+#[test]
+fn preprocessor_include_guard_never_deletes_source() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_guard_")
+        .tempdir()
+        .unwrap();
+    let write = |name: &str, body: &str| {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    };
+    let run = |name: &str, extra: &[&str]| {
+        let src = dir.path().join(name).to_string_lossy().to_string();
+        let mut args: Vec<&str> = vec!["-E"];
+        args.extend_from_slice(extra);
+        args.push(&src);
+        run_c17(&args)
+    };
+
+    // 1. Code after the closing `#endif` is not guarded, so it appears on
+    //    every include. The old scan stopped at the first body token and never
+    //    saw the `#endif`, let alone what followed it.
+    write(
+        "g1.h",
+        "#ifndef G1_H\n#define G1_H\nint inside;\n#endif\nint outside;\n",
+    );
+    write("g1.c", "#include \"g1.h\"\n#include \"g1.h\"\n");
+    let r = run("g1.c", &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(
+        r.stdout.matches("int outside;").count(),
+        2,
+        "code outside the guard belongs to every include:\n{}",
+        r.stdout
+    );
+    assert_eq!(
+        r.stdout.matches("int inside;").count(),
+        1,
+        "the guarded body belongs to the first include only:\n{}",
+        r.stdout
+    );
+
+    // 2. Defining the guard name on the command line must not delete the file.
+    //    It was never read, so nothing was known about it.
+    write(
+        "g2.h",
+        "#ifndef G2_H\n#define G2_H\nint guarded;\n#endif\nint outside;\n",
+    );
+    write("g2.c", "#include \"g2.h\"\n");
+    let r = run("g2.c", &["-DG2_H"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("int outside;"),
+        "-D<guard> must not delete code outside the guard:\n{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("int guarded;"),
+        "the guarded body is still skipped:\n{}",
+        r.stdout
+    );
+
+    // 3. A header including itself under a counter guard. The recursion is
+    //    bounded by the guard, and both arms belong in the output.
+    write(
+        "g3.h",
+        "#ifndef DEPTH\n#define DEPTH 1\n#include \"g3.h\"\nint outer_arm;\n\
+         #else\nint inner_arm;\n#endif\n",
+    );
+    write("g3.c", "#include \"g3.h\"\n");
+    let r = run("g3.c", &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let inner = r.stdout.find("int inner_arm;");
+    let outer = r.stdout.find("int outer_arm;");
+    assert!(
+        inner.is_some() && outer.is_some() && inner < outer,
+        "expected the inner arm then the outer, got:\n{}",
+        r.stdout
+    );
+
+    // 4. The optimization still works: a properly guarded header contributes
+    //    nothing the second time.
+    write("g4.h", "#ifndef G4_H\n#define G4_H\nint once;\n#endif\n");
+    write("g4.c", "#include \"g4.h\"\n#include \"g4.h\"\n");
+    let r = run("g4.c", &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(
+        r.stdout.matches("int once;").count(),
+        1,
+        "a guarded header is included once:\n{}",
+        r.stdout
+    );
+}
+
+/// A genuine cycle is bounded by include depth rather than by an immediate
+/// error, which is what gcc does and what lets a counter-guarded self-include
+/// work at all.
+#[test]
+fn preprocessor_unguarded_include_cycle_is_bounded() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_cycle_")
+        .tempdir()
+        .unwrap();
+    std::fs::write(dir.path().join("a.h"), "#include \"b.h\"\n").unwrap();
+    std::fs::write(dir.path().join("b.h"), "#include \"a.h\"\n").unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "#include \"a.h\"\nint x;\n").unwrap();
+
+    let r = run_c17(&["-E", &src.to_string_lossy()]);
+    assert!(!r.success, "a cycle must not succeed:\n{}", r.stdout);
+    assert!(
+        r.stderr.contains("nested too deeply"),
+        "expected the depth limit to catch it, got:\n{}",
+        r.stderr
+    );
+}

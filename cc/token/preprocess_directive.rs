@@ -838,454 +838,123 @@ impl<'a> Preprocessor<'a> {
         None
     }
 
-    /// Detect include guard macro from file content.
-    /// Returns Some(macro_name) if the file starts with `#ifndef MACRO` followed by `#define MACRO`.
-    /// This ensures we only detect true include guards, not conditional includes like:
-    ///   #ifndef _CDEFS_H_
-    ///   # error "Use <sys/cdefs.h> instead"
-    ///   #endif
-    pub(super) fn detect_include_guard(content: &[u8]) -> Option<String> {
-        // Convert to string for simple parsing
-        let text = match std::str::from_utf8(content) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
+    /// The macro guarding this file, if the file is exactly one guarded group.
+    ///
+    /// Requires all of: nothing before the opening directive; `#ifndef X` or
+    /// `#if !defined X` immediately followed by `#define X`; and the `#endif`
+    /// that closes *that* group being the last token in the file. The last of
+    /// those is what the previous implementation could not check -- it stopped
+    /// scanning at the first token of the body -- so a header with code after
+    /// its `#endif` was treated as fully guarded and lost that code.
+    ///
+    /// It also rejects the conditional-default idiom, `#ifndef FOO / #define
+    /// FOO 1 / #endif / #define BAR 2`, for the same reason: something follows
+    /// the `#endif`.
+    ///
+    /// This reads the token stream the file was tokenized into anyway, rather
+    /// than re-scanning the raw bytes with a second, ad-hoc lexer.
+    pub(super) fn guard_of(tokens: &[Token], idents: &IdentTable) -> Option<String> {
+        let mut it = tokens
+            .iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .peekable();
 
-        // Skip leading whitespace and find the first preprocessor directive
-        let mut chars = text.chars().peekable();
+        let guard = Self::opening_guard(&mut it, idents)?;
 
-        // Helper to skip whitespace and comments
-        let skip_ws_and_comments = |chars: &mut std::iter::Peekable<std::str::Chars>| {
-            loop {
-                // Skip whitespace
-                while chars.peek().map(|c| c.is_whitespace()).unwrap_or(false) {
-                    chars.next();
-                }
-
-                // Check for comment
-                if chars.peek() == Some(&'/') {
-                    chars.next();
-                    match chars.peek() {
-                        Some(&'/') => {
-                            // Line comment - skip to end of line
-                            while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                                chars.next();
-                            }
-                            continue;
-                        }
-                        Some(&'*') => {
-                            // Block comment - skip to */
-                            chars.next();
-                            while let Some(c) = chars.next() {
-                                if c == '*' && chars.peek() == Some(&'/') {
-                                    chars.next();
-                                    break;
-                                }
-                            }
-                            continue;
-                        }
-                        _ => return false, // Unexpected /
-                    }
-                }
-                return true;
+        // Walk the rest, tracking how deeply nested the conditionals are. The
+        // guard's own group is depth 1 on entry.
+        let mut depth = 1usize;
+        while let Some(token) = it.next() {
+            if !Self::is_directive_hash(token) {
+                continue;
             }
-        };
-
-        if !skip_ws_and_comments(&mut chars) {
-            return None;
-        }
-
-        // Now we should be at #
-        if chars.next() != Some('#') {
-            return None;
-        }
-
-        // Skip whitespace after #
-        while chars
-            .peek()
-            .map(|c| *c == ' ' || *c == '\t')
-            .unwrap_or(false)
-        {
-            chars.next();
-        }
-
-        // Collect directive name
-        let mut directive = String::new();
-        while chars
-            .peek()
-            .map(|c| c.is_ascii_alphabetic() || *c == '_')
-            .unwrap_or(false)
-        {
-            directive.push(chars.next().unwrap());
-        }
-
-        match directive.as_str() {
-            "ifndef" => {
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                // Collect macro name
-                let mut macro_name = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    macro_name.push(chars.next().unwrap());
-                }
-                if macro_name.is_empty() {
-                    return None;
-                }
-
-                // Skip to end of line
-                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                    chars.next();
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-
-                // Skip whitespace and comments before next directive
-                if !skip_ws_and_comments(&mut chars) {
-                    return None;
-                }
-
-                // Now check for #define MACRO (the second part of include guard pattern)
-                if chars.next() != Some('#') {
-                    return None;
-                }
-
-                // Skip whitespace after #
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-
-                // Collect directive name
-                let mut next_directive = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphabetic() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    next_directive.push(chars.next().unwrap());
-                }
-
-                if next_directive != "define" {
-                    return None;
-                }
-
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-
-                // Collect the defined macro name
-                let mut define_name = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    define_name.push(chars.next().unwrap());
-                }
-
-                // The #define must define the same macro as the #ifndef
-                if define_name != macro_name {
-                    return None;
-                }
-
-                // Check for conditional default definition pattern:
-                //   #ifndef MACRO
-                //   #define MACRO [value]
-                //   #endif
-                //   ... more content ...  <-- content AFTER #endif = NOT a guard
-                //
-                // vs true include guard:
-                //   #ifndef MACRO
-                //   #define MACRO
-                //   ... guarded content ...
-                //   #endif
-                //   [end of file or just whitespace/comments]
-
-                // Skip to end of #define line
-                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                    chars.next();
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-
-                // Skip whitespace and comments
-                if !skip_ws_and_comments(&mut chars) {
-                    return None;
-                }
-
-                // Check if next thing is #endif followed by more content
-                if chars.peek() == Some(&'#') {
-                    let mut check_chars = chars.clone();
-                    check_chars.next(); // consume #
-                                        // Skip whitespace after #
-                    while check_chars
-                        .peek()
-                        .map(|c| *c == ' ' || *c == '\t')
-                        .unwrap_or(false)
-                    {
-                        check_chars.next();
-                    }
-                    // Collect directive name
-                    let mut next_dir = String::new();
-                    while check_chars
-                        .peek()
-                        .map(|c| c.is_ascii_alphabetic() || *c == '_')
-                        .unwrap_or(false)
-                    {
-                        next_dir.push(check_chars.next().unwrap());
-                    }
-                    if next_dir == "endif" {
-                        // Found #endif immediately after #define
-                        // Now check if there's more content after the #endif
-                        // Skip to end of #endif line
-                        while check_chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                            check_chars.next();
-                        }
-                        if check_chars.peek() == Some(&'\n') {
-                            check_chars.next();
-                        }
-                        // Skip whitespace and comments after #endif
-                        skip_ws_and_comments(&mut check_chars);
-                        // If there's more content after #endif, this is NOT a guard
-                        if check_chars.peek().is_some() {
-                            return None;
-                        }
-                        // Otherwise it's a valid (empty) include guard
+            match it.peek().and_then(|t| Self::directive_name(t, idents)) {
+                Some("if" | "ifdef" | "ifndef") => depth += 1,
+                Some("endif") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // The closing `#endif` of the guard. Everything after
+                        // its own line would be outside the guard, so the file
+                        // is only guarded if there is nothing after it.
+                        it.next();
+                        return it.next().is_none().then_some(guard);
                     }
                 }
-
-                // Looks like a valid include guard
-                return Some(macro_name);
+                _ => {}
             }
-            "if" => {
-                // Check for !defined(MACRO) pattern
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                // Check for !
-                if chars.next() != Some('!') {
-                    return None;
-                }
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                // Collect "defined"
-                let mut keyword = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphabetic())
-                    .unwrap_or(false)
-                {
-                    keyword.push(chars.next().unwrap());
-                }
-                if keyword != "defined" {
-                    return None;
-                }
-                // Skip whitespace and optional (
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                let has_paren = chars.peek() == Some(&'(');
-                if has_paren {
-                    chars.next();
-                }
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                // Collect macro name
-                let mut macro_name = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    macro_name.push(chars.next().unwrap());
-                }
-                if macro_name.is_empty() {
-                    return None;
-                }
-                // Skip optional closing paren
-                if has_paren {
-                    while chars
-                        .peek()
-                        .map(|c| *c == ' ' || *c == '\t')
-                        .unwrap_or(false)
-                    {
-                        chars.next();
-                    }
-                    if chars.peek() == Some(&')') {
-                        chars.next();
-                    }
-                }
-
-                // Skip to end of line
-                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                    chars.next();
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-
-                // Skip whitespace and comments before next directive
-                if !skip_ws_and_comments(&mut chars) {
-                    return None;
-                }
-
-                // Now check for #define MACRO (second part of include guard pattern)
-                if chars.next() != Some('#') {
-                    return None;
-                }
-
-                // Skip whitespace after #
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-
-                // Collect directive name
-                let mut next_directive = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphabetic() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    next_directive.push(chars.next().unwrap());
-                }
-
-                if next_directive != "define" {
-                    return None;
-                }
-
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-
-                // Collect the defined macro name
-                let mut define_name = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    define_name.push(chars.next().unwrap());
-                }
-
-                // The #define must define the same macro as the #if !defined
-                if define_name != macro_name {
-                    return None;
-                }
-
-                // Same check as for #ifndef case:
-                // Check for conditional default definition pattern
-
-                // Skip to end of #define line
-                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                    chars.next();
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-
-                // Skip whitespace and comments
-                if !skip_ws_and_comments(&mut chars) {
-                    return None;
-                }
-
-                // Check if next thing is #endif followed by more content
-                if chars.peek() == Some(&'#') {
-                    let mut check_chars = chars.clone();
-                    check_chars.next(); // consume #
-                                        // Skip whitespace after #
-                    while check_chars
-                        .peek()
-                        .map(|c| *c == ' ' || *c == '\t')
-                        .unwrap_or(false)
-                    {
-                        check_chars.next();
-                    }
-                    // Collect directive name
-                    let mut next_dir = String::new();
-                    while check_chars
-                        .peek()
-                        .map(|c| c.is_ascii_alphabetic() || *c == '_')
-                        .unwrap_or(false)
-                    {
-                        next_dir.push(check_chars.next().unwrap());
-                    }
-                    if next_dir == "endif" {
-                        // Found #endif immediately after #define
-                        // Now check if there's more content after the #endif
-                        // Skip to end of #endif line
-                        while check_chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                            check_chars.next();
-                        }
-                        if check_chars.peek() == Some(&'\n') {
-                            check_chars.next();
-                        }
-                        // Skip whitespace and comments after #endif
-                        skip_ws_and_comments(&mut check_chars);
-                        // If there's more content after #endif, this is NOT a guard
-                        if check_chars.peek().is_some() {
-                            return None;
-                        }
-                        // Otherwise it's a valid (empty) include guard
-                    }
-                }
-
-                // Looks like a valid include guard
-                return Some(macro_name);
-            }
-            _ => {}
         }
-
         None
+    }
+
+    /// `#ifndef X` / `#define X`, or `#if !defined X` / `#define X`, at the
+    /// very start of the file. Returns `X`.
+    fn opening_guard<'t, I>(it: &mut std::iter::Peekable<I>, idents: &IdentTable) -> Option<String>
+    where
+        I: Iterator<Item = &'t Token>,
+    {
+        if !Self::is_directive_hash(it.next()?) {
+            return None;
+        }
+        let guard = match Self::directive_name(it.next()?, idents)? {
+            "ifndef" => Self::ident_text(it.next()?, idents)?,
+            "if" => {
+                // `!` `defined` [`(`] NAME [`)`]
+                if !Self::is_punct(it.next()?, b'!' as u32) {
+                    return None;
+                }
+                if Self::directive_name(it.next()?, idents)? != "defined" {
+                    return None;
+                }
+                let parens = Self::is_punct(it.peek()?, b'(' as u32);
+                if parens {
+                    it.next();
+                }
+                let name = Self::ident_text(it.next()?, idents)?;
+                if parens && !Self::is_punct(it.next()?, b')' as u32) {
+                    return None;
+                }
+                name
+            }
+            _ => return None,
+        };
+
+        // The `#define` has to be the next directive, and name the same macro.
+        if !Self::is_directive_hash(it.next()?) {
+            return None;
+        }
+        if Self::directive_name(it.next()?, idents)? != "define" {
+            return None;
+        }
+        if Self::ident_text(it.next()?, idents)? != guard {
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// A `#` that begins a line, i.e. one that introduces a directive.
+    fn is_directive_hash(token: &Token) -> bool {
+        token.pos.newline && Self::is_punct(token, b'#' as u32)
+    }
+
+    fn is_punct(token: &Token, code: u32) -> bool {
+        matches!(&token.value, TokenValue::Special(c) if *c == code)
+    }
+
+    /// The spelling of an identifier token, whatever it is.
+    fn ident_text(token: &Token, idents: &IdentTable) -> Option<String> {
+        match &token.value {
+            TokenValue::Ident(id) => idents.get_opt(*id).map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
+    /// The spelling of a directive name, which the lexer may have interned as
+    /// a keyword (`if`, `else`) rather than a plain identifier.
+    fn directive_name<'i>(token: &Token, idents: &'i IdentTable) -> Option<&'i str> {
+        match &token.value {
+            TokenValue::Ident(id) => idents.get_opt(*id),
+            _ => None,
+        }
     }
 
     /// Include a file
@@ -1306,6 +975,16 @@ impl<'a> Preprocessor<'a> {
         // Check for #pragma once
         if self.once_files.contains(&canonical) {
             return;
+        }
+
+        // A file already read to the end, found to be one guarded group, and
+        // whose guard is still defined, would contribute nothing. Checked
+        // before the file is even opened, which is where the old text scan
+        // could not be: it had to read and re-scan on every include.
+        if let Some(guard) = self.guarded_files.get(&canonical) {
+            if self.is_defined(guard) {
+                return;
+            }
         }
 
         // Read the file first so we can check for include guards
@@ -1329,24 +1008,11 @@ impl<'a> Preprocessor<'a> {
             content
         };
 
-        // Check for include guard optimization: if file starts with #ifndef MACRO
-        // or #if !defined(MACRO) and that macro is already defined, skip the include.
-        // This allows circular includes protected by guards to work correctly.
-        if let Some(guard_macro) = Self::detect_include_guard(&content) {
-            if self.is_defined(&guard_macro) {
-                return;
-            }
-        }
-
-        // Check for include cycle (only error if no include guard protects it)
-        if self.include_stack.contains(&canonical) {
-            diag::error_args(
-                hash_token.pos,
-                "recursive include of '{0}'",
-                &[&path.display().to_string()],
-            );
-            return;
-        }
+        // No cycle check here. A file that includes itself under a counter
+        // guard is legal and useful, and the only thing that kept it out of a
+        // "recursive include" error before was the guard fast path guessing
+        // that it could skip the file. Depth is what bounds a real cycle, as
+        // it does for gcc.
 
         // Check include depth
         if self.include_depth >= self.max_include_depth {
@@ -1373,7 +1039,6 @@ impl<'a> Preprocessor<'a> {
         let saved_include_path_index =
             std::mem::replace(&mut self.current_include_path_index, include_path_index);
 
-        self.include_stack.insert(canonical.clone());
         self.include_depth += 1;
 
         // Create a new stream for this file, remembering which `#include`
@@ -1391,6 +1056,11 @@ impl<'a> Preprocessor<'a> {
             tokenizer.tokenize()
         };
 
+        // Whether this file is one guarded group is a property of its text, so
+        // read it now; whether that entitles a *later* include to skip the file
+        // is decided after this one finishes, below.
+        let guard = Self::guard_of(&tokens, idents);
+
         // Preprocess the included tokens
         let preprocessed = self.preprocess(tokens, idents);
 
@@ -1402,9 +1072,14 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
+        // The file has now been read through to the end, so what its guard
+        // protects is known rather than guessed.
+        if let Some(guard) = guard {
+            self.guarded_files.insert(canonical, guard);
+        }
+
         // Restore state
         self.include_depth -= 1;
-        self.include_stack.remove(&canonical);
         self.current_file = saved_file;
         self.current_dir = saved_dir;
         // Whatever the file left open, it left open. The stack is swapped out

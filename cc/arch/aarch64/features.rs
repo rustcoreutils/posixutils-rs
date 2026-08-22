@@ -1323,6 +1323,35 @@ impl Aarch64CodeGen {
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
     }
 
+    /// Capture SP so a later restore can put it back.
+    ///
+    /// X9 is the reserved scratch, the same one `emit_alloca` moves SP into.
+    pub(super) fn emit_stack_save(&mut self, insn: &Instruction) {
+        let Some(target) = insn.target else {
+            return;
+        };
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::SP),
+            dst: Reg::X9,
+        });
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
+    }
+
+    /// Put SP back to a saved value, releasing everything alloca'd since.
+    pub(super) fn emit_stack_restore(&mut self, insn: &Instruction) {
+        let Some(&src) = insn.src.first() else {
+            return;
+        };
+        self.emit_move(src, Reg::X9, 64);
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::X9),
+            dst: Reg::SP,
+        });
+    }
+
     /// Emit __builtin_signbitf - test sign bit of float
     pub(super) fn emit_signbit32(&mut self, insn: &Instruction, types: &TypeTable) {
         let arg = match insn.src.first() {

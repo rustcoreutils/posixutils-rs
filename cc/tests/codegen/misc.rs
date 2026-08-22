@@ -9805,3 +9805,57 @@ int main(void) {
     assert_eq!(compile_and_run("codegen_shift_fold", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("codegen_shift_fold_o2", code), 0);
 }
+
+/// Inlining a body that `alloca`s must not extend the allocation's lifetime.
+///
+/// A real call releases the memory when it returns. Splicing the body in would
+/// instead hold it until the *caller* returns, so a loop around the call takes
+/// another bite of the stack every iteration -- half a million of them
+/// overflows it. The splice brackets the body with a stack-pointer save and
+/// restore, which is the lifetime the call had.
+///
+/// `alloca` used to disqualify the callee outright, which hid this; the
+/// refusal was silent, and gcc inlines these.
+#[test]
+fn codegen_inlined_alloca_is_released_per_call() {
+    let code = r#"
+__attribute__((always_inline)) static inline long use(int n) {
+    char *p = __builtin_alloca(n);
+    for (int i = 0; i < n; i++) p[i] = (char)(i & 7);
+    return p[n - 1];
+}
+
+/* Two inlined allocas in one expression, so the brackets have to nest
+   correctly rather than merely balance overall. */
+static long deep(int n) { return use(n) + use(n * 2); }
+
+/* Leaves before the end of the body on half its calls. Both exits have to
+   release the stack, or the loop below overflows. */
+__attribute__((always_inline)) static inline int early(int i) {
+    char *p = __builtin_alloca(512);
+    p[0] = (char)(i & 1);
+    if (p[0]) return 1;
+    p[511] = 0;
+    return 0;
+}
+
+int main(void) {
+    long t = 0;
+    for (int i = 0; i < 500000; i++) t += use(256);
+    if (t != 500000L * 7) return 1;
+    if (deep(8) != 7 + 7) return 2;
+
+    /* An early return out of the inlined body still reaches the restore,
+       since every path leaves through the continuation block. */
+    for (int i = 0; i < 500000; i++) {
+        if (early(i) != (i & 1)) return 3;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("inlined_alloca_lifetime", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("inlined_alloca_lifetime_opt", code),
+        0
+    );
+}

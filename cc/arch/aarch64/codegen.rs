@@ -2434,6 +2434,9 @@ impl Aarch64CodeGen {
                 self.emit_alloca(insn);
             }
 
+            Opcode::StackSave => self.emit_stack_save(insn),
+            Opcode::StackRestore => self.emit_stack_restore(insn),
+
             Opcode::Fabs32 => self.emit_fabs(insn, types, false),
             Opcode::Fabs64 => self.emit_fabs(insn, types, true),
 

@@ -2256,6 +2256,9 @@ impl X86_64CodeGen {
                 self.emit_alloca(insn);
             }
 
+            Opcode::StackSave => self.emit_stack_save(insn),
+            Opcode::StackRestore => self.emit_stack_restore(insn),
+
             Opcode::Memset => {
                 self.emit_memset(insn);
             }

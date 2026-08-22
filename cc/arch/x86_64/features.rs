@@ -1441,6 +1441,36 @@ impl X86_64CodeGen {
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
     }
 
+    /// Capture %rsp so a later restore can put it back.
+    ///
+    /// R10 is the reserved scratch; going through it keeps this the same shape
+    /// as `emit_alloca`, which ends by moving %rsp into R10 as well.
+    pub(super) fn emit_stack_save(&mut self, insn: &Instruction) {
+        let Some(target) = insn.target else {
+            return;
+        };
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rsp),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+    }
+
+    /// Put %rsp back to a saved value, releasing everything alloca'd since.
+    pub(super) fn emit_stack_restore(&mut self, insn: &Instruction) {
+        let Some(&src) = insn.src.first() else {
+            return;
+        };
+        self.emit_move(src, Reg::R10, 64);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R10),
+            dst: GpOperand::Reg(Reg::Rsp),
+        });
+    }
+
     /// Emit __builtin_memset(dest, c, n) - calls memset
     /// System V AMD64 ABI: dest in RDI, c in RSI, n in RDX, returns dest in RAX
     pub(super) fn emit_memset(&mut self, insn: &Instruction) {

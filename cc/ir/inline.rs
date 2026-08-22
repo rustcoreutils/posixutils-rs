@@ -92,8 +92,6 @@ pub struct InlineCandidate {
     pub is_recursive: bool,
     /// Whether function uses va_args (should not inline)
     pub uses_varargs: bool,
-    /// Whether function uses alloca (dynamic stack)
-    pub uses_alloca: bool,
     /// Whether the function takes a label's address (`&&label`).
     ///
     /// Such a function cannot be inlined: the address is a symbol naming a
@@ -161,9 +159,6 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
                 Opcode::VaStart | Opcode::VaArg | Opcode::VaEnd | Opcode::VaCopy => {
                     candidate.uses_varargs = true;
                 }
-                Opcode::Alloca => {
-                    candidate.uses_alloca = true;
-                }
                 // A label address is a `SymAddr` on a symbol named for a
                 // block of *this* function. An indirect branch is the usual
                 // reason to take one, but a function that merely returns one
@@ -204,12 +199,14 @@ fn should_inline(
     caller_size: usize,
     caller_is_recursive: bool,
 ) -> bool {
-    // Never inline if disqualifying conditions
-    if candidate.uses_varargs
-        || candidate.is_recursive
-        || candidate.uses_alloca
-        || candidate.takes_label_addr
-    {
+    // Never inline if disqualifying conditions.
+    //
+    // `alloca` is not among them: the splice brackets the body with a stack
+    // save and restore, so the allocation dies where the call would have
+    // returned. Refusing was silent -- gcc inlines these -- and combined with
+    // a `__builtin_va_arg_pack` forwarder, whose body is suppressed on the
+    // assumption it always inlines, it left an undefined symbol at link.
+    if candidate.uses_varargs || candidate.is_recursive || candidate.takes_label_addr {
         return false;
     }
 
@@ -1082,6 +1079,25 @@ fn inline_call_site(
         }
     }
 
+    // A call to a function that `alloca`s releases that memory when it
+    // returns. Spliced into the caller, the allocation would instead live
+    // until the *caller* returns -- so `for (...) use(n);` with an `alloca`
+    // inside `use` would take another bite of the stack every iteration and
+    // eventually overflow, where the real call reused the same space. Bracket
+    // the inlined body with a stack-pointer save and restore, which is exactly
+    // the lifetime the call had.
+    //
+    // The pointer type comes from the callee's own `Alloca`, which is what a
+    // saved stack pointer is: taking it from there needs no type table, which
+    // this pass does not have.
+    let stack_mark = callee
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .find(|i| i.op == Opcode::Alloca)
+        .and_then(|i| i.typ)
+        .map(|typ| (ctx.alloc_pseudo_id(), typ));
+
     let inlined_entry = ctx.bb_map[&callee.entry];
     let mut continuation_bb = split_caller_at_call(
         caller,
@@ -1091,6 +1107,19 @@ fn inline_call_site(
         continuation_bb_id,
         ctx.inline_id,
     );
+
+    if let Some((mark, typ)) = stack_mark {
+        // Before the branch into the body, which `split_caller_at_call` has
+        // just put where the call was.
+        let call_bb = &mut caller.blocks[call_bb_idx];
+        let at = call_bb.insns.len().saturating_sub(1);
+        call_bb.insns.insert(
+            at,
+            Instruction::new(Opcode::StackSave)
+                .with_target(mark)
+                .with_type_and_size(typ, 64),
+        );
+    }
 
     // Materialize the return-value Phi at the head of the continuation block.
     //
@@ -1108,6 +1137,24 @@ fn inline_call_site(
             phi.phi_list = ctx.ret_arms.clone();
             continuation_bb.insns.insert(0, phi);
         }
+    }
+
+    if let Some((mark, typ)) = stack_mark {
+        // After any Phi, which has to stay at the head of the block, and
+        // before everything that followed the call. Every path out of the
+        // body -- including an early `return` -- arrives here, so one restore
+        // covers them all.
+        let at = continuation_bb
+            .insns
+            .iter()
+            .position(|i| i.op != Opcode::Phi)
+            .unwrap_or(continuation_bb.insns.len());
+        continuation_bb.insns.insert(
+            at,
+            Instruction::new(Opcode::StackRestore)
+                .with_src(mark)
+                .with_type_and_size(typ, 64),
+        );
     }
 
     // Update CFG: set children of call block to just the inlined entry
@@ -1165,6 +1212,10 @@ fn inline_call_site(
     // Add temp pseudos generated for implicit param copies
     for pseudo in implicit_copy_pseudos {
         caller.add_pseudo(pseudo);
+    }
+    // The saved stack pointer, if the body allocates.
+    if let Some((mark, _)) = stack_mark {
+        caller.add_pseudo(Pseudo::undef(mark));
     }
     // Add value pseudos for constants materialized while cloning, replacing
     // the placeholder the clone made for the same id.
@@ -1576,7 +1627,6 @@ mod tests {
             has_inline_hint: false,
             is_recursive: false,
             uses_varargs: false,
-            uses_alloca: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
@@ -1595,7 +1645,6 @@ mod tests {
             has_inline_hint: true,
             is_recursive: false,
             uses_varargs: true,
-            uses_alloca: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
@@ -1614,7 +1663,6 @@ mod tests {
             has_inline_hint: true,
             is_recursive: true,
             uses_varargs: false,
-            uses_alloca: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
@@ -1633,7 +1681,6 @@ mod tests {
             has_inline_hint: true,
             is_recursive: false,
             uses_varargs: false,
-            uses_alloca: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,
@@ -1652,7 +1699,6 @@ mod tests {
             has_inline_hint: true,
             is_recursive: false,
             uses_varargs: false,
-            uses_alloca: false,
             takes_label_addr: false,
             ret_is_address: false,
             call_count: 1,

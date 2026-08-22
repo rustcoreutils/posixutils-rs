@@ -140,7 +140,7 @@ fn builtins_va_arg_pack_outside_a_forwarding_function_is_rejected() {
 }
 
 /// When the inliner refuses an `always_inline` forwarder for a reason of its
-/// own -- the callee also uses `va_start`, or `alloca` -- the pack has nothing
+/// own -- the callee also keeps a `va_list` of its own -- the pack has nothing
 /// to be resolved against and the body has already been suppressed.
 ///
 /// The guard that was supposed to catch this asked `func.emit &&
@@ -153,7 +153,9 @@ fn builtins_va_arg_pack_outside_a_forwarding_function_is_rejected() {
 #[test]
 fn builtins_unresolvable_va_arg_pack_is_diagnosed() {
     // Refused because the callee uses a va_list of its own. gcc reports this
-    // one too: "can never be inlined because it uses variable argument lists".
+    // too: "can never be inlined because it uses variable argument lists".
+    // `alloca` used to land here as well; it now inlines, which is why
+    // `builtins_va_arg_pack_forwarder_may_use_alloca` exists.
     compile_expect_error(
         "va_arg_pack_with_va_start",
         "#include <stdarg.h>\n\
@@ -164,15 +166,27 @@ fn builtins_unresolvable_va_arg_pack_is_diagnosed() {
          int main(void) { return wrap(\"%d\\n\", 1); }\n",
         "could not be forwarded",
     );
-    // Refused because of alloca. gcc inlines this one; c17 does not, and an
-    // error naming the reason is the honest outcome of that.
-    compile_expect_error(
-        "va_arg_pack_with_alloca",
-        "extern int printf(const char *, ...);\n\
-         __attribute__((always_inline)) static inline int wrap(const char *f, ...) {\n\
-         char *p = __builtin_alloca(16); (void)p;\n\
-         return printf(f, __builtin_va_arg_pack()); }\n\
-         int main(void) { return wrap(\"%d\\n\", 1); }\n",
-        "could not be forwarded",
-    );
+}
+
+/// A forwarder that also uses `alloca` now inlines like any other.
+///
+/// `alloca` used to disqualify a callee before `always_inline` was even
+/// consulted, which for a `__builtin_va_arg_pack` forwarder meant the body was
+/// suppressed and nothing was left to call. gcc compiles this.
+#[test]
+fn builtins_va_arg_pack_forwarder_may_use_alloca() {
+    let code = r#"
+#include <stdio.h>
+extern int snprintf(char *, unsigned long, const char *, ...);
+
+__attribute__((always_inline)) static inline int wrap(const char *fmt, ...) {
+    char *buf = __builtin_alloca(64);
+    int n = snprintf(buf, 64, fmt, __builtin_va_arg_pack());
+    return n + (buf[0] == '4' ? 100 : 0);
+}
+
+int main(void) { return wrap("%d-%d", 42, 7) == 104 ? 0 : 1; }
+"#;
+    assert_eq!(compile_and_run("va_pack_alloca", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("va_pack_alloca_opt", code), 0);
 }

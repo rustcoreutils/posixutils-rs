@@ -80,6 +80,8 @@ const VALUE_OPTIONS: &[&str] = &[
     "--isystem",
     "-idirafter",
     "--idirafter",
+    "-include",
+    "--include",
 ];
 
 /// The libraries `-l` is required to find, c17.md 88057-88093.

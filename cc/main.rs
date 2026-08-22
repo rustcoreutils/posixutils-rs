@@ -95,6 +95,24 @@ struct Args {
     #[arg(short = 'E', help = gettext("Preprocess only, output to stdout"))]
     preprocess_only: bool,
 
+    /// Inhibit the `# <line> "<file>"` markers in `-E` output.
+    ///
+    /// Wanted whenever the result is read by something that is not a C
+    /// compiler -- a linker script, an assembler, a kernel build's generated
+    /// headers.
+    #[arg(short = 'P', help = gettext("Do not emit line markers in preprocessed output"))]
+    no_line_markers: bool,
+
+    /// Process a file as if `#include "<file>"` were the first line
+    /// (`-include`). Repeatable, applied in order.
+    #[arg(
+        long = "include",
+        value_name = "file",
+        action = clap::ArgAction::Append,
+        help = gettext("Process <file> as if it were the first #include")
+    )]
+    pre_includes: Vec<String>,
+
     /// Dump AST (for debugging parser)
     #[arg(long = "dump-ast", help = gettext("Parse and dump AST to stdout"))]
     dump_ast: bool,
@@ -571,6 +589,7 @@ fn process_file(
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
             preprocessed,
+            pre_includes: &args.pre_includes,
             optimization: args.optimization(),
         },
     );
@@ -594,7 +613,13 @@ fn process_file(
         // state on the preprocessor and is never recorded in the stream
         // registry, so `effective_position` cannot see it either — the same
         // pre-existing gap that keeps parser diagnostics on physical lines.
-        writeln!(out.preprocessed, "# 1 \"{}\"", display_path)?;
+        // `-P` asks for the text alone. Everything that would emit a marker
+        // below checks this; a marker is never merely cosmetic, so each site
+        // has to say what it does instead.
+        let markers = !args.no_line_markers;
+        if markers {
+            writeln!(out.preprocessed, "# 1 \"{}\"", display_path)?;
+        }
         let mut emitted_marker_for: Vec<u16> = vec![stream_id];
         let mut current_stream: Option<u16> = Some(stream_id);
         let mut at_line_start = true;
@@ -671,17 +696,19 @@ fn process_file(
                     }
                     if !at_line_start {
                         writeln!(out.preprocessed)?;
+                        at_line_start = true;
                     }
-                    writeln!(
-                        out.preprocessed,
-                        "# {} \"{}\" {}",
-                        line,
-                        name,
-                        if returning { 2 } else { 1 }
-                    )?;
+                    if markers {
+                        writeln!(
+                            out.preprocessed,
+                            "# {} \"{}\" {}",
+                            line,
+                            name,
+                            if returning { 2 } else { 1 }
+                        )?;
+                    }
                     current_stream = Some(token.pos.stream);
                     current_line = line;
-                    at_line_start = true;
                 }
 
                 // Put the token back on the line it came from. Every consumed
@@ -694,7 +721,12 @@ fn process_file(
                         // GCC's threshold: a handful of blank lines is smaller
                         // than a marker, past that a marker is smaller.
                         const MAX_BLANK_RUN: u32 = 8;
-                        if line - current_line <= MAX_BLANK_RUN {
+                        if !markers {
+                            // `-P` is asked for by things that are not C
+                            // compilers, which want the text and nothing
+                            // standing in for the lines that produced it. gcc
+                            // collapses the run rather than padding it out.
+                        } else if line - current_line <= MAX_BLANK_RUN {
                             for _ in 0..(line - current_line) {
                                 writeln!(out.preprocessed)?;
                             }
@@ -752,7 +784,10 @@ fn process_file(
                 }
             }
         }
-        if !args.verbose {
+        // The output ends with a newline, but the last token already wrote one
+        // unless it was mid-line. Writing unconditionally left a trailing blank
+        // line that gcc does not produce.
+        if !args.verbose && !at_line_start {
             writeln!(out.preprocessed)?;
         }
         // The sink may be a file, and a BufWriter's Drop discards errors.
@@ -1306,6 +1341,16 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // so they used to reach it unrewritten and be rejected outright.
             result.push(format!("-{}", arg));
             i += 1;
+        } else if arg == "-include" {
+            // gcc spells it with one dash; clap would read that as the short
+            // cluster `-i -n -c ...` and reject it.
+            result.push("--include".to_string());
+            if let Some(v) = raw_args.get(i + 1) {
+                result.push(v.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
         } else if arg == "-isystem" || arg == "-idirafter" || arg == "--sysroot" {
             // Value options gcc spells with one dash. `--sysroot` is already
             // two, but takes its value as a separate word here either way.

@@ -1113,6 +1113,33 @@ impl<'a> Preprocessor<'a> {
         self.macros.insert(mac.name.clone(), std::rc::Rc::new(mac));
     }
 
+    /// Process a `-include` file, as if the source began with `#include`.
+    ///
+    /// Named on the command line rather than written in the source, so there is
+    /// no `#` to attribute it to; a `<command-line>` position stands in, the
+    /// same one `-D` uses.
+    pub fn include_from_cmdline(
+        &mut self,
+        path: &str,
+        output: &mut Vec<Token>,
+        idents: &mut IdentTable,
+    ) {
+        let stream_id = diag::init_stream("<command-line>");
+        let hash = Token::new(TokenType::Special, Position::new(stream_id, 1, 1));
+
+        // Searched like `#include "..."`: the working directory first, then
+        // `-I`, then the system paths.
+        match self.find_include_file(path, false, false) {
+            Some((IncludeSource::File(found), index)) => {
+                self.include_file(&found, output, idents, &hash, index)
+            }
+            Some((IncludeSource::Builtin(content), _)) => {
+                self.include_builtin(content, path, output, idents, &hash)
+            }
+            None => diag::error_args(hash.pos, "'{0}': file not found", &[path]),
+        }
+    }
+
     /// Apply one command-line `-D` specification.
     ///
     /// The spec is rewritten as the equivalent `#define` directive and run
@@ -2442,6 +2469,9 @@ pub struct PreprocessConfig<'a> {
     /// If true, the input is a `.i` operand -- already the output of `c17 -E`
     /// -- and the processing that produced it must not be repeated.
     pub preprocessed: bool,
+    /// Files to process as if each were a `#include "..."` on the line before
+    /// the source, in the order given (`-include`).
+    pub pre_includes: &'a [String],
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2528,8 +2558,28 @@ pub fn preprocess_with_defines(
         pp.undef_macro(undef);
     }
 
-    let output = pp.preprocess(tokens, idents);
+    // `-include` runs after `-D`/`-U`, because a header may well test what
+    // they defined, and before the source, because that is what "as if it were
+    // the first line" means.
+    let mut included = Vec::new();
+    for path in config.pre_includes {
+        pp.include_from_cmdline(path, &mut included, idents);
+    }
+
+    let mut output = pp.preprocess(tokens, idents);
     pp.report_unterminated_conditionals();
+
+    if !included.is_empty() {
+        // After the source's own `StreamBegin`, not before it. The marker says
+        // where the translation unit starts, and everything downstream reads
+        // the stream structure -- a `StreamBegin` arriving partway through the
+        // token vector is not something any consumer expects.
+        let at = usize::from(matches!(
+            output.first().map(|t| t.typ),
+            Some(TokenType::StreamBegin)
+        ));
+        output.splice(at..at, included);
+    }
     output
 }
 

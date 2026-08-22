@@ -656,6 +656,8 @@ impl Walker {
                 preprocessed: false,
                 // Extracting strings, not compiling: nothing optimizes.
                 optimization: Default::default(),
+                // Whatever else the driver grows, this tool wants none of it.
+                ..Default::default()
             },
         );
 

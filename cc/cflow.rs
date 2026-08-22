@@ -914,6 +914,8 @@ fn process_file(
             preprocessed: already_preprocessed,
             // Not a compiler: nothing here optimizes, so nothing claims to.
             optimization: Default::default(),
+            // Whatever else the driver grows, this tool wants none of it.
+            ..Default::default()
         },
     );
 

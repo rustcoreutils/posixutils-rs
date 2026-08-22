@@ -1381,3 +1381,108 @@ fn driver_ident_and_sccs_are_accepted_quietly() {
         }
     }
 }
+
+/// `-P` asks for the preprocessed text with no `# <line> "<file>"` markers.
+/// It is what things that are not C compilers want — linker scripts, generated
+/// headers, assembler input.
+#[test]
+fn driver_dash_p_suppresses_line_markers() {
+    let w = WorkDir::new("dash_p");
+    let src = w.write("p.c", "#define X 1\n\n\nint v = X;\n");
+    let r = run_c17(&["-E", "-P", &s(&src)]);
+    assert!(r.success, "-E -P failed: {}", r.stderr);
+    assert!(
+        !r.stdout.contains('#'),
+        "-P output must carry no markers:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("int v = 1;"),
+        "the text survives:\n{}",
+        r.stdout
+    );
+    // Byte-for-byte what gcc produces for this input.
+    assert_eq!(
+        r.stdout, "int v = 1;\n",
+        "unexpected layout: {:?}",
+        r.stdout
+    );
+}
+
+/// Without `-P` the markers are still mandated, so the two must not have been
+/// conflated.
+#[test]
+fn driver_without_dash_p_line_markers_remain() {
+    let w = WorkDir::new("no_dash_p");
+    let src = w.write("q.c", "int v = 1;\n");
+    let r = run_c17(&["-E", &s(&src)]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("# 1 \""),
+        "expected a marker:\n{}",
+        r.stdout
+    );
+}
+
+/// `-include <file>` processes the file as if `#include "<file>"` were the
+/// first line of the source: after `-D`/`-U`, before the source, in order.
+#[test]
+fn driver_dash_include_injects_a_header() {
+    let w = WorkDir::new("dash_include");
+    w.write("one.h", "int one_thing = 1;\n");
+    w.write("two.h", "int two_thing = 2;\n");
+    let src = w.write("m.c", "int main(void) { return one_thing + two_thing; }\n");
+
+    let r = run_c17(&[
+        "-E",
+        "-P",
+        "-include",
+        &s(&w.join("one.h")),
+        "-include",
+        &s(&w.join("two.h")),
+        &s(&src),
+    ]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let one = r
+        .stdout
+        .find("one_thing = 1")
+        .expect("first -include missing");
+    let two = r
+        .stdout
+        .find("two_thing = 2")
+        .expect("second -include missing");
+    let main = r
+        .stdout
+        .find("int main")
+        .expect("the source itself missing");
+    assert!(one < two && two < main, "wrong order:\n{}", r.stdout);
+}
+
+/// The injected header has to reach the compiler, not just `-E` — the two
+/// paths share a token vector, and getting the stream markers wrong breaks
+/// only the one that parses.
+#[test]
+fn driver_dash_include_reaches_the_compiler() {
+    let w = WorkDir::new("dash_include_compile");
+    w.write("pre.h", "int from_header = 7;\n");
+    let src = w.write("m.c", "int main(void) { return from_header; }\n");
+    let exe = w.join("m.bin");
+
+    let r = run_c17(&["-include", &s(&w.join("pre.h")), &s(&src), "-o", &s(&exe)]);
+    assert!(r.success, "compile failed: {}", r.stderr);
+    assert_eq!(run_exe(&exe), 7, "the injected header did not take effect");
+}
+
+/// A `-include` naming a file that is not there is an error, not silence.
+#[test]
+fn driver_dash_include_missing_file_is_an_error() {
+    let w = WorkDir::new("dash_include_missing");
+    let src = w.write("m.c", "int main(void) { return 0; }\n");
+    let r = run_c17(&["-E", "-include", "no_such_header.h", &s(&src)]);
+    assert!(!r.success, "a missing -include must fail:\n{}", r.stdout);
+    assert!(
+        r.stderr.contains("file not found"),
+        "expected a not-found diagnostic, got:\n{}",
+        r.stderr
+    );
+}

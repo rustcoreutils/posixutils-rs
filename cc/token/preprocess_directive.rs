@@ -808,7 +808,7 @@ impl<'a> Preprocessor<'a> {
 
     /// Find an include file
     /// Returns (IncludeSource, Option<system_include_path_index>)
-    fn find_include_file(
+    pub(super) fn find_include_file(
         &self,
         filename: &str,
         is_system: bool,
@@ -998,7 +998,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Include a file
-    fn include_file(
+    pub(super) fn include_file(
         &mut self,
         path: &Path,
         output: &mut Vec<Token>,
@@ -1132,7 +1132,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Include a builtin (embedded) header
-    fn include_builtin(
+    pub(super) fn include_builtin(
         &mut self,
         name: &str,
         content: &str,

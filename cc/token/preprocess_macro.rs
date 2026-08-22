@@ -1435,8 +1435,9 @@ impl<'a> Preprocessor<'a> {
     /// sorted by name.
     ///
     /// Sorted because `macros` is a `HashMap` and its iteration order differs
-    /// per process: an unsorted dump would make `-dM` output differ run to run,
-    /// which is exactly what the determinism rule exists to stop.
+    /// per process: an unsorted dump would make `-dM` output differ between
+    /// runs on the same input, which is not something a caller can work
+    /// around.
     ///
     /// The dynamic builtins -- `__FILE__`, `__LINE__`, `__COUNTER__`,
     /// `__has_include` and the rest -- are omitted, as gcc omits them. They

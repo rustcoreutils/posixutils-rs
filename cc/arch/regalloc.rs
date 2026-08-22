@@ -827,8 +827,10 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
 // ABI-pinned arg pseudos arrive via `pre_colored`. Physical registers
 // don't need to be modeled as graph vertices.
 //
-// BTreeMap / BTreeSet throughout, so iteration is deterministic per
-// the project's determinism invariant (cc/CLAUDE.md).
+// BTreeMap / BTreeSet throughout: colouring walks these in iteration
+// order and the colour a pseudo gets depends on that order, so a
+// hash-ordered container would make register assignment differ between
+// runs of the same compiler on the same input.
 
 /// Per-pseudo set of interfering pseudos for one register bank.
 #[derive(Debug, Default)]

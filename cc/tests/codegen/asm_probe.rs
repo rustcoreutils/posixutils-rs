@@ -170,8 +170,8 @@ mod verbose_asm {
         );
     }
 
-    /// Plain `-S` is untouched, and the flag does not disturb the
-    /// bit-identical-output invariant `determinism.rs` exists to protect.
+    /// Plain `-S` is untouched, and compiling the same source twice with the
+    /// flag gives the same assembly both times.
     #[test]
     fn verbose_asm_is_deterministic_and_leaves_plain_output_alone() {
         let src = "int f(int x) { int y = x * 3; return y - 1; }\n";

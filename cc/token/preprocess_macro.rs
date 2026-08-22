@@ -1383,6 +1383,12 @@ impl<'a> Preprocessor<'a> {
         };
         let mut token = Token::with_value(typ, *pos, value);
         token.pos.newline = false;
+        // `u8"..."` is a narrow string in every respect but its spelling, so
+        // the prefix lives on the spelling flag rather than in the token type.
+        // Without it the paste produced a plain `"y"` and the `u8` vanished.
+        if prefix == "u8" {
+            token.spelling = Spelling::Utf8Prefix;
+        }
         Some(token)
     }
 

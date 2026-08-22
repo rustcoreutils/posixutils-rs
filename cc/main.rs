@@ -46,8 +46,9 @@ use symbol::SymbolTable;
 use target::Os;
 use target::{classify_std, StdRequest, Target};
 use token::{
-    preprocess_asm_file, preprocess_collecting, replace_trigraphs, show_token, token_type_name,
-    write_token, AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType, Tokenizer,
+    preprocess_asm_file, preprocess_collecting, replace_trigraphs, show_token, strip_bom,
+    token_type_name, write_token, AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType,
+    Tokenizer,
 };
 
 // ============================================================================
@@ -565,7 +566,7 @@ fn preprocess_asm_operand(
     target: &Target,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    let content = std::fs::read(path)?;
+    let content = strip_bom(&std::fs::read(path)?).to_vec();
     let config = AsmPreprocessConfig {
         optimization: args.optimization(),
         defines: &args.defines,
@@ -735,6 +736,11 @@ fn process_file(
         reader.read_to_end(&mut buffer)?;
         path
     };
+
+    // Phase 0, before anything looks at the bytes: a byte order mark is not
+    // part of the program. Left in place it lexes as an identifier character,
+    // so the first line is never a directive.
+    let buffer = strip_bom(&buffer).to_vec();
 
     // POSIX 87981-87983: a `.i` operand is the output of `c17 -E`, and the
     // processing that produced it "shall not be repeated when the file is

@@ -1938,3 +1938,82 @@ int main(void) {
         0
     );
 }
+
+/// A byte order mark is not part of the program. Left in the buffer it lexes
+/// as an identifier character — `U+FEFF` really is inside Annex D.1 — so the
+/// first line was never a directive and `<BOM>int` fused into one identifier.
+#[test]
+fn preprocessor_leading_bom_is_not_part_of_the_program() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_bom_")
+        .tempdir()
+        .unwrap();
+
+    // The directive on the first line has to be seen as one.
+    let src = dir.path().join("d.c");
+    std::fs::write(&src, "\u{feff}#define X 1\nint v = X;\n").unwrap();
+    let r = run_c17(&["-E", "-P", &src.to_string_lossy()]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("int v = 1;"),
+        "X was never defined:\n{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("#define"),
+        "the directive was emitted as text:\n{}",
+        r.stdout
+    );
+
+    // And the first token has to be a token, not part of an identifier.
+    let src2 = dir.path().join("m.c");
+    std::fs::write(&src2, "\u{feff}int main(void) { return 0; }\n").unwrap();
+    let r = run_c17(&["-c", "-o", "/dev/null", &src2.to_string_lossy()]);
+    assert!(r.success, "a BOM'd source should compile: {}", r.stderr);
+
+    // An included file gets the same treatment.
+    std::fs::write(dir.path().join("h.h"), "\u{feff}#define FROM_HEADER 7\n").unwrap();
+    let src3 = dir.path().join("i.c");
+    std::fs::write(&src3, "#include \"h.h\"\nint v = FROM_HEADER;\n").unwrap();
+    let r = run_c17(&[
+        "-E",
+        "-P",
+        "-I",
+        &dir.path().to_string_lossy(),
+        &src3.to_string_lossy(),
+    ]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("int v = 7;"),
+        "the header's BOM was not stripped:\n{}",
+        r.stdout
+    );
+}
+
+/// A forbidden universal character name is reported once. The lookahead that
+/// walks over a backslash and the consumer that takes it both saw the same
+/// escape, so it was diagnosed twice, a column apart.
+#[test]
+fn preprocessor_forbidden_ucn_is_reported_once() {
+    let r = preprocess_text("ucn_once", "int a\\u0041b = 1;\n", &[]);
+    assert_eq!(
+        r.stderr.matches("not a valid universal character").count(),
+        1,
+        "expected exactly one diagnostic, got:\n{}",
+        r.stderr
+    );
+}
+
+/// `u8"..."` is a narrow string in every respect but its spelling, so the
+/// prefix lives on a spelling flag rather than in the token type — and pasting
+/// dropped it, giving a plain `"y"`.
+#[test]
+fn preprocessor_u8_prefix_survives_a_paste() {
+    let r = preprocess_text("u8_paste", "#define C(a,b) a##b\nX C(u8,\"y\")\n", &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("u8\"y\""),
+        "the prefix was dropped:\n{}",
+        r.stdout
+    );
+}

@@ -1075,6 +1075,9 @@ impl<'a> Preprocessor<'a> {
                 return;
             }
         };
+        // A byte order mark is not part of the program, in an included file
+        // any more than in the primary source.
+        let content = crate::token::lexer::strip_bom(&content).to_vec();
 
         // Translation phase 1 applies to an included file just as it does to
         // the primary source, and before the include-guard scan looks at it.

@@ -1511,3 +1511,21 @@ fn test_char_table_zero_for_others() {
         assert_eq!(char_class(c), 0, "zero for byte {:#x}", c);
     }
 }
+
+/// `U+FEFF` is a legal identifier character under Annex D.1, so the tables are
+/// right to admit it and the byte order mark cannot be fixed by rejecting it.
+/// It comes off the buffer instead.
+#[test]
+fn test_strip_bom() {
+    assert_eq!(strip_bom(b"\xEF\xBB\xBF#define X 1"), b"#define X 1");
+    // Only at the very start, and only one.
+    assert_eq!(strip_bom(b"int v;"), b"int v;");
+    assert_eq!(
+        strip_bom(b"\xEF\xBB\xBF\xEF\xBB\xBFx"),
+        b"\xEF\xBB\xBFx".as_slice()
+    );
+    assert_eq!(strip_bom(b"a\xEF\xBB\xBFb"), b"a\xEF\xBB\xBFb".as_slice());
+    assert_eq!(strip_bom(b""), b"");
+    // A prefix of the mark is not the mark.
+    assert_eq!(strip_bom(b"\xEF\xBB"), b"\xEF\xBB".as_slice());
+}

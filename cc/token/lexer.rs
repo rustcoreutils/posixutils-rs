@@ -127,6 +127,23 @@ enum HeaderNamePos {
 // Token Types
 // ============================================================================
 
+/// Drop a leading UTF-8 byte order mark.
+///
+/// `U+FEFF` is inside Annex D.1's `FE47-FFFD`, so the identifier tables are
+/// right to admit it -- which is why gcc special-cases the mark rather than
+/// changing its tables, and why this cannot be fixed by making the character
+/// invalid. Left in the buffer it lexes as an identifier character, so a
+/// BOM'd file's first line is never a directive (`<BOM>#define X 1` comes out
+/// as text, with `X` never defined) and `<BOM>int main` fuses into one
+/// identifier.
+///
+/// Only at the very start, and only one: a mark anywhere else is a zero-width
+/// no-break space, a legal identifier character, and not this function's
+/// business. gcc draws the line in the same place.
+pub fn strip_bom(content: &[u8]) -> &[u8] {
+    content.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(content)
+}
+
 /// Apply translation phase 1 trigraph replacement to a source buffer.
 ///
 /// C17 5.2.1.1 still mandates the nine trigraphs; they were removed in C23,
@@ -1028,7 +1045,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         if peek.next()? != b'\\' {
             return None;
         }
-        let (ch, digits) = self.peek_ucn_after_backslash(&mut peek)?;
+        let (ch, digits) = self.peek_ucn_after_backslash(&mut peek, false)?;
         Some((ch, 2 + digits))
     }
 
@@ -1039,7 +1056,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     /// at all. Whether an *identifier* may contain it is Annex D's question,
     /// which the callers ask, because they are the ones that know the
     /// position.
-    fn peek_ucn_after_backslash(&self, peek: &mut Peek<'_>) -> Option<(char, usize)> {
+    fn peek_ucn_after_backslash(&self, peek: &mut Peek<'_>, report: bool) -> Option<(char, usize)> {
         let digits = match peek.next()? {
             b'u' => 4,
             b'U' => 8,
@@ -1056,7 +1073,13 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         // "no UCN here": returning `None` would leave the backslash to be
         // lexed as some other token and report something unrelated.
         if ucn_is_forbidden(val) {
-            report_forbidden_ucn(self.pos(), val);
+            // Reported by the caller that actually consumes the backslash, not
+            // by the one looking ahead over it: both see the same escape, so
+            // reporting here gave two diagnostics a column apart. The consumer
+            // is also where gcc points.
+            if report {
+                report_forbidden_ucn(self.pos(), val);
+            }
             return None;
         }
 
@@ -1080,7 +1103,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     /// Returns the decoded character if successful, None otherwise.
     fn try_consume_ucn_after_backslash(&mut self) -> Option<char> {
         let mut peek = self.peek_at(self.offset);
-        let (ch, digits) = self.peek_ucn_after_backslash(&mut peek)?;
+        let (ch, digits) = self.peek_ucn_after_backslash(&mut peek, true)?;
         if !identifier_char(ch, IdentPos::Initial) {
             return None;
         }

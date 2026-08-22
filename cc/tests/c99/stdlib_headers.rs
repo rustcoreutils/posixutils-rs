@@ -356,3 +356,40 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c99_stddef_alone", code, &[]), 0);
 }
+
+/// `wint_t` is unsigned, so that `WEOF` -- `(wint_t)-1` -- is distinct from
+/// every value a `wchar_t` can hold. `__WINT_TYPE__` was `int`, where gcc and
+/// glibc both have `unsigned int`; since `__mbstate_t` holds a `wint_t`, that
+/// was a disagreement with the C library about a type they share.
+#[test]
+fn c99_wint_t_is_unsigned() {
+    let code = r#"
+#include <wchar.h>
+#include <wctype.h>
+#include <stdint.h>
+#include <stddef.h>
+
+int main(void) {
+    /* WEOF round-trips, and the type's unsignedness is observable. */
+    wint_t e = WEOF;
+    if ((wint_t)-1 != e) return 1;
+    if (!((wint_t)-1 > 0)) return 2;
+    if (sizeof(wint_t) != 4) return 3;
+
+    /* The bounds follow the signedness rather than contradicting it. */
+    if (WINT_MIN != 0) return 4;
+    if (WINT_MAX != 4294967295u) return 5;
+
+    /* The library agrees about the type it shares with us. */
+    if (towlower(L'A') != (wint_t)L'a') return 6;
+    if (iswalpha(L'x') == 0) return 7;
+    if (sizeof(mbstate_t) != 8) return 8;
+
+    /* A read loop ends on WEOF, not on an ordinary wide character. */
+    wint_t w = (wint_t)L'q';
+    if (w == WEOF) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("wint_unsigned", code, &[]), 0);
+}

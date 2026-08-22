@@ -117,7 +117,9 @@ typedef __UINTMAX_TYPE__ uintmax_t;
 #define WCHAR_MAX      __WCHAR_MAX__
 #define WCHAR_MIN      (-WCHAR_MAX - 1)
 #define WINT_MAX       __WINT_MAX__
-#define WINT_MIN       (-WINT_MAX - 1)
+/* Not `-WINT_MAX - 1`: wint_t is unsigned, so its minimum is its own
+   predefine rather than the two's-complement companion of its maximum. */
+#define WINT_MIN       __WINT_MIN__
 
 /* 7.20.4 Macros for integer constants.
    The suffix for each width is a predefine, so the paste is target-correct:

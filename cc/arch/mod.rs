@@ -155,9 +155,12 @@ pub fn get_type_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
         ("__UINTPTR_TYPE__", "long unsigned int"),
         ("__INTMAX_TYPE__", "long int"),
         ("__UINTMAX_TYPE__", "long unsigned int"),
-        // Character types
+        // Character types. `wint_t` is unsigned so that `WEOF` -- `(wint_t)-1`
+        // -- is distinct from every value a `wchar_t` can hold; gcc and glibc
+        // both have it that way, and `__mbstate_t` holds one, so a signed
+        // `wint_t` disagreed with the C library about a type it shares.
         ("__WCHAR_TYPE__", "int"),
-        ("__WINT_TYPE__", "int"),
+        ("__WINT_TYPE__", "unsigned int"),
         ("__CHAR16_TYPE__", "unsigned short"),
         ("__CHAR32_TYPE__", "unsigned int"),
         // sig_atomic_t
@@ -217,7 +220,8 @@ pub fn get_stdint_limit_macros(_target: &Target) -> Vec<(&'static str, &'static 
         // wchar_t and wint_t limits
         ("__WCHAR_MAX__", "2147483647"),
         ("__WCHAR_WIDTH__", "32"),
-        ("__WINT_MAX__", "2147483647"),
+        ("__WINT_MAX__", "0xffffffffU"),
+        ("__WINT_MIN__", "0U"),
         ("__WINT_WIDTH__", "32"),
         // sig_atomic_t limits
         ("__SIG_ATOMIC_MAX__", "2147483647"),

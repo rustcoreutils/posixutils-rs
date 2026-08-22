@@ -337,8 +337,8 @@ fn test_header_name_only_where_one_can_appear() {
     let (tokens, _) = tokenize_str("#define H <stdio.h>");
     assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
 
-    // No closing delimiter before end of line: lex it the old way rather
-    // than swallow the line, which `#if 0` blocks full of prose need.
+    // No closing delimiter before end of line: lex it as ordinary tokens
+    // rather than swallow the line, which `#if 0` blocks full of prose need.
     let (tokens, idents) = tokenize_str("#include <unterminated\nint x;");
     assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
     assert_eq!(show_token(&tokens[3], &idents), "<");
@@ -357,9 +357,7 @@ fn test_function_declaration() {
     );
 }
 
-// ========================================================================
 // Additional coverage tests for multi-char operators
-// ========================================================================
 
 #[test]
 fn test_hashhash_operator() {
@@ -440,9 +438,7 @@ fn test_three_char_in_context() {
     );
 }
 
-// ========================================================================
 // Multi-line comment tests
-// ========================================================================
 
 #[test]
 fn test_multiline_block_comment() {
@@ -488,9 +484,7 @@ fn test_multiline_comment_position_tracking() {
     assert_eq!(tokens[2].pos.line, 5);
 }
 
-// ========================================================================
 // Additional number format tests
-// ========================================================================
 
 #[test]
 fn test_hex_float_numbers() {
@@ -552,9 +546,7 @@ fn test_dot_starting_number() {
     }
 }
 
-// ========================================================================
 // Edge cases and tricky sequences
-// ========================================================================
 
 #[test]
 fn test_operator_adjacency() {
@@ -670,9 +662,7 @@ fn test_line_comment_at_eof() {
     assert_eq!(show_token(&tokens[1], &idents), "a");
 }
 
-// ========================================================================
 // UCN (Universal Character Name) tests - C99 6.4.3
-// ========================================================================
 
 #[test]
 fn test_ucn_in_identifier() {
@@ -695,12 +685,6 @@ fn test_ucn_identifier_start() {
 #[test]
 fn test_ucn_long_form() {
     // Long UCN form, with a code point it is allowed to name.
-    //
-    // This used to use `\U00000041` and assert the identifier `testAbc`,
-    // which C17 6.4.3p2 forbids: a UCN may not name a character below
-    // 00A0 other than `$`, `@` and `` ` ``, precisely so it cannot spell
-    // an `A` that already has a spelling. gcc rejects that input, and so
-    // does c17 now, so the long form is exercised with `\U000000E9`.
     let (tokens, idents) = tokenize_str("test\\U000000E9bc");
     assert_eq!(tokens[1].typ, TokenType::Ident);
     assert_eq!(show_token(&tokens[1], &idents), "testébc");
@@ -709,8 +693,7 @@ fn test_ucn_long_form() {
 #[test]
 fn test_ucn_forbidden_characters() {
     // C17 6.4.3p2, in both the short and long forms, and at both ends of
-    // the surrogate range -- a surrogate has no `char`, so it used to fail
-    // `char::from_u32` and be taken for "not an escape" entirely.
+    // the surrogate range.
     for src in [
         "test\\u0041bc",
         "test\\U00000041bc",
@@ -758,9 +741,7 @@ fn test_ucn_lowercase_hex() {
 }
 
 /// Translation phase 2 runs before phase 3, so a splice anywhere in or
-/// around a UCN is simply not there by the time the UCN is lexed. The
-/// UCN lookahead used to count *bytes* and the consumer to spend them as
-/// *characters*, so each splice silently ate that many source characters.
+/// around a UCN is simply not there by the time the UCN is lexed.
 #[test]
 fn test_ucn_across_line_splices() {
     // Splice immediately before the UCN: the trailing `zz` must survive.
@@ -1005,10 +986,8 @@ fn test_column_saturates_on_very_long_line() {
     assert!(tokens[1].pos.col >= u16::MAX - 8);
 }
 
-/// A `%:` whose following `%` does not complete the `%:%:` digraph used to
-/// be consumed and then rewound by hand. The rewind restored `offset` and
-/// `col` but not `line`, so a splice between the two halves was counted
-/// once on the way in and again on the way out.
+/// A `%:` whose following `%` does not complete the `%:%:` digraph leaves the
+/// line count intact, a splice between the two halves included.
 #[test]
 fn test_digraph_hash_not_hashhash_keeps_line_count() {
     let (tokens, idents) = tokenize_str("%:\\\n% x\ny");
@@ -1036,9 +1015,7 @@ fn test_ucn_splice_disabled() {
     assert_eq!(show_token(&tokens[1], &strings), "caf");
 }
 
-// ========================================================================
 // Diagnostic warning tests
-// ========================================================================
 
 #[test]
 fn test_unterminated_string() {
@@ -1183,9 +1160,7 @@ fn test_multiline_comment_newline_flag() {
     );
 }
 
-// ========================================================================
 // Assembly mode tests
-// ========================================================================
 
 fn tokenize_asm(input: &str) -> (Vec<Token>, StringTable) {
     let mut strings = StringTable::new();
@@ -1296,9 +1271,7 @@ fn test_c_mode_semicolon_not_comment() {
     assert_eq!(toks, vec!["int", "x", ";", "int", "y"]);
 }
 
-// ========================================================================
 // tokens_to_source_bytes tests
-// ========================================================================
 
 fn source_text(input: &str) -> String {
     let (tokens, strings) = tokenize_str(input);
@@ -1334,9 +1307,7 @@ fn test_tokens_to_source_bytes_keeps_literal_bytes() {
     assert_eq!(out, b".ascii \"caf\xc3\xa9\"\n");
 }
 
-// ========================================================================
 // C99 6.4.6 Digraph tests
-// ========================================================================
 
 #[test]
 fn test_digraph_brackets() {
@@ -1413,9 +1384,7 @@ fn test_digraph_keeps_its_own_spelling() {
     assert_eq!(spelled, vec!["[", "]", "{", "}", "#", "##"]);
 }
 
-// ========================================================================
 // Character classification table tests
-// ========================================================================
 
 #[test]
 fn test_char_table_digits() {

@@ -20,9 +20,7 @@ use crate::arch::lir::{
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
-// ============================================================================
 // Memory Addressing Modes
-// ============================================================================
 
 /// x86-64 memory addressing mode
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +74,6 @@ pub enum MemAddr {
 }
 
 impl MemAddr {
-    /// Format memory operand in AT&T syntax
     pub fn format(&self, target: &Target) -> String {
         match self {
             MemAddr::BaseOffset { base, offset } => {
@@ -119,9 +116,7 @@ impl MemAddr {
     }
 }
 
-// ============================================================================
 // General-Purpose Operands
-// ============================================================================
 
 /// x86-64 general-purpose operand (register, memory, or immediate)
 #[derive(Debug, Clone, PartialEq)]
@@ -145,9 +140,7 @@ impl GpOperand {
     }
 }
 
-// ============================================================================
 // XMM (Floating-Point) Operands
-// ============================================================================
 
 /// x86-64 XMM operand (register or memory)
 #[derive(Debug, Clone, PartialEq)]
@@ -159,7 +152,6 @@ pub enum XmmOperand {
 }
 
 impl XmmOperand {
-    /// Format operand in AT&T syntax
     pub fn format(&self, target: &Target) -> String {
         match self {
             XmmOperand::Reg(r) => r.name().to_string(),
@@ -168,9 +160,7 @@ impl XmmOperand {
     }
 }
 
-// ============================================================================
 // Shift Count
-// ============================================================================
 
 /// Shift/rotate count specifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,9 +171,7 @@ pub enum ShiftCount {
     Cl,
 }
 
-// ============================================================================
 // x87 FPU Binary Operations
-// ============================================================================
 
 /// x87 FPU binary operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,9 +186,7 @@ pub enum X87BinOp {
     Div,
 }
 
-// ============================================================================
 // x86-64 LIR Instructions
-// ============================================================================
 
 /// x86-64 Low-level IR instruction
 #[derive(Debug, Clone)]
@@ -656,9 +642,7 @@ pub enum X86Inst {
     Directive(Directive),
 }
 
-// ============================================================================
 // LirInst Implementation
-// ============================================================================
 
 impl crate::arch::lir::LirInst for X86Inst {
     fn from_directive(dir: Directive) -> Self {
@@ -666,24 +650,15 @@ impl crate::arch::lir::LirInst for X86Inst {
     }
 }
 
-// ============================================================================
 // EmitAsm Implementation
-// ============================================================================
 
 impl EmitAsm for X86Inst {
     fn emit(&self, target: &Target, out: &mut String) {
         match self {
             // Data Movement
             X86Inst::Mov { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    mov{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.format(*size, target)
-                );
+                Self::emit_alu2_to_operand("mov", size, src, dst, target, out)
             }
-
             X86Inst::MovAbs { imm, dst } => {
                 let _ = writeln!(out, "    movabsq ${}, {}", imm, dst.name64());
             }
@@ -693,54 +668,13 @@ impl EmitAsm for X86Inst {
                 dst_size,
                 src,
                 dst,
-            } => {
-                let op = match (src_size, dst_size) {
-                    (OperandSize::B8, OperandSize::B16) => "movzbw",
-                    (OperandSize::B8, OperandSize::B32) => "movzbl",
-                    (OperandSize::B8, OperandSize::B64) => "movzbq",
-                    (OperandSize::B16, OperandSize::B32) => "movzwl",
-                    (OperandSize::B16, OperandSize::B64) => "movzwq",
-                    // `movz` extends from a byte or a word only; a 32-bit
-                    // source is already zero-extended by an ordinary `movl`.
-                    // Anything else is a malformed instruction, and the
-                    // "fallback to movzbl" that used to stand here turned it
-                    // into a silently-narrower load -- a three-byte struct
-                    // argument reached its callee as one byte and two zeros.
-                    (s, d) => panic!("no movz encoding from {s:?} to {d:?}"),
-                };
-                let _ = writeln!(
-                    out,
-                    "    {} {}, {}",
-                    op,
-                    src.format(*src_size, target),
-                    dst.name_for_size(dst_size.bits())
-                );
-            }
-
+            } => Self::emit_movzx(src_size, dst_size, src, dst, target, out),
             X86Inst::Movsx {
                 src_size,
                 dst_size,
                 src,
                 dst,
-            } => {
-                let op = match (src_size, dst_size) {
-                    (OperandSize::B8, OperandSize::B16) => "movsbw",
-                    (OperandSize::B8, OperandSize::B32) => "movsbl",
-                    (OperandSize::B8, OperandSize::B64) => "movsbq",
-                    (OperandSize::B16, OperandSize::B32) => "movswl",
-                    (OperandSize::B16, OperandSize::B64) => "movswq",
-                    (OperandSize::B32, OperandSize::B64) => "movslq",
-                    _ => "movsbl", // fallback
-                };
-                let _ = writeln!(
-                    out,
-                    "    {} {}, {}",
-                    op,
-                    src.format(*src_size, target),
-                    dst.name_for_size(dst_size.bits())
-                );
-            }
-
+            } => Self::emit_movsx(src_size, dst_size, src, dst, target, out),
             X86Inst::Lea { addr, dst } => {
                 let _ = writeln!(out, "    leaq {}, {}", addr.format(target), dst.name64());
             }
@@ -755,53 +689,18 @@ impl EmitAsm for X86Inst {
 
             // Integer Arithmetic
             X86Inst::Add { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    add{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("add", size, src, dst, target, out)
             }
-
             X86Inst::Sub { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    sub{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("sub", size, src, dst, target, out)
             }
-
             X86Inst::IMul2 { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    imul{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("imul", size, src, dst, target, out)
             }
-
             X86Inst::IDiv { size, divisor } => {
-                let _ = writeln!(
-                    out,
-                    "    idiv{} {}",
-                    size.x86_suffix(),
-                    divisor.format(*size, target)
-                );
+                Self::emit_divide("idiv", size, divisor, target, out)
             }
-
-            X86Inst::Div { size, divisor } => {
-                let _ = writeln!(
-                    out,
-                    "    div{} {}",
-                    size.x86_suffix(),
-                    divisor.format(*size, target)
-                );
-            }
-
+            X86Inst::Div { size, divisor } => Self::emit_divide("div", size, divisor, target, out),
             X86Inst::Neg { size, dst } => {
                 let _ = writeln!(
                     out,
@@ -812,25 +711,11 @@ impl EmitAsm for X86Inst {
             }
 
             X86Inst::Adc { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    adc{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("adc", size, src, dst, target, out)
             }
-
             X86Inst::Sbb { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    sbb{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("sbb", size, src, dst, target, out)
             }
-
             X86Inst::Mul1 { size, src } => {
                 let _ = writeln!(
                     out,
@@ -851,152 +736,37 @@ impl EmitAsm for X86Inst {
             }
 
             X86Inst::And { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    and{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("and", size, src, dst, target, out)
             }
-
             X86Inst::Or { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    or{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("or", size, src, dst, target, out)
             }
-
             X86Inst::Xor { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    xor{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("xor", size, src, dst, target, out)
             }
-
-            X86Inst::Shl { size, count, dst } => {
-                let count_str = match count {
-                    ShiftCount::Imm(n) => format!("${}", n),
-                    ShiftCount::Cl => "%cl".to_string(),
-                };
-                let _ = writeln!(
-                    out,
-                    "    shl{} {}, {}",
-                    size.x86_suffix(),
-                    count_str,
-                    dst.name_for_size(size.bits())
-                );
-            }
-
-            X86Inst::Shr { size, count, dst } => {
-                let count_str = match count {
-                    ShiftCount::Imm(n) => format!("${}", n),
-                    ShiftCount::Cl => "%cl".to_string(),
-                };
-                let _ = writeln!(
-                    out,
-                    "    shr{} {}, {}",
-                    size.x86_suffix(),
-                    count_str,
-                    dst.name_for_size(size.bits())
-                );
-            }
-
-            X86Inst::Sar { size, count, dst } => {
-                let count_str = match count {
-                    ShiftCount::Imm(n) => format!("${}", n),
-                    ShiftCount::Cl => "%cl".to_string(),
-                };
-                let _ = writeln!(
-                    out,
-                    "    sar{} {}, {}",
-                    size.x86_suffix(),
-                    count_str,
-                    dst.name_for_size(size.bits())
-                );
-            }
-
+            X86Inst::Shl { size, count, dst } => Self::emit_shift("shl", size, count, dst, out),
+            X86Inst::Shr { size, count, dst } => Self::emit_shift("shr", size, count, dst, out),
+            X86Inst::Sar { size, count, dst } => Self::emit_shift("sar", size, count, dst, out),
             X86Inst::Shld {
                 size,
                 count,
                 src,
                 dst,
-            } => {
-                let count_str = match count {
-                    ShiftCount::Imm(n) => format!("${}", n),
-                    ShiftCount::Cl => "%cl".to_string(),
-                };
-                let _ = writeln!(
-                    out,
-                    "    shld{} {}, {}, {}",
-                    size.x86_suffix(),
-                    count_str,
-                    src.name_for_size(size.bits()),
-                    dst.name_for_size(size.bits())
-                );
-            }
-
+            } => Self::emit_double_shift("shld", size, count, src, dst, out),
             X86Inst::Shrd {
                 size,
                 count,
                 src,
                 dst,
-            } => {
-                let count_str = match count {
-                    ShiftCount::Imm(n) => format!("${}", n),
-                    ShiftCount::Cl => "%cl".to_string(),
-                };
-                let _ = writeln!(
-                    out,
-                    "    shrd{} {}, {}, {}",
-                    size.x86_suffix(),
-                    count_str,
-                    src.name_for_size(size.bits()),
-                    dst.name_for_size(size.bits())
-                );
-            }
-
-            X86Inst::Ror { size, count, dst } => {
-                let count_str = match count {
-                    ShiftCount::Imm(n) => format!("${}", n),
-                    ShiftCount::Cl => "%cl".to_string(),
-                };
-                let _ = writeln!(
-                    out,
-                    "    ror{} {}, {}",
-                    size.x86_suffix(),
-                    count_str,
-                    dst.name_for_size(size.bits())
-                );
-            }
-
+            } => Self::emit_double_shift("shrd", size, count, src, dst, out),
+            X86Inst::Ror { size, count, dst } => Self::emit_shift("ror", size, count, dst, out),
             // Comparison and Conditional
             X86Inst::Cmp { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    cmp{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.format(*size, target)
-                );
+                Self::emit_alu2_to_operand("cmp", size, src, dst, target, out)
             }
-
             X86Inst::Test { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    test{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.format(*size, target)
-                );
+                Self::emit_alu2_to_operand("test", size, src, dst, target, out)
             }
-
             X86Inst::SetCC { cc, dst } => {
                 let _ = writeln!(out, "    set{} {}", cc.x86_suffix(), dst.name8());
             }
@@ -1066,34 +836,7 @@ impl EmitAsm for X86Inst {
             }
 
             // Floating-Point
-            X86Inst::MovFp { size, src, dst } => {
-                // A binary128 occupies the whole register, so it moves as a
-                // packed 16-byte quantity rather than as a scalar: there is no
-                // `movsq`, which is what asking `x86_suffix()` for a suffix
-                // here used to trip over. `movaps` between registers;
-                // `movups` whenever memory is involved, because a 16-byte
-                // stack slot is not guaranteed to be 16-byte aligned.
-                if *size == FpSize::Quad {
-                    let both_regs = matches!((src, dst), (XmmOperand::Reg(_), XmmOperand::Reg(_)));
-                    let op = if both_regs { "movaps" } else { "movups" };
-                    let _ = writeln!(
-                        out,
-                        "    {} {}, {}",
-                        op,
-                        src.format(target),
-                        dst.format(target)
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "    mov{} {}, {}",
-                        size.x86_suffix(),
-                        src.format(target),
-                        dst.format(target)
-                    );
-                }
-            }
-
+            X86Inst::MovFp { size, src, dst } => Self::emit_mov_fp(size, src, dst, target, out),
             X86Inst::MovGpXmm { size, src, dst } => {
                 let op = if size.bits() <= 32 { "movd" } else { "movq" };
                 let _ = writeln!(
@@ -1117,45 +860,17 @@ impl EmitAsm for X86Inst {
             }
 
             X86Inst::AddFp { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    add{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(target),
-                    dst.name()
-                );
+                Self::emit_fp_alu("add", size, src, dst, target, out)
             }
-
             X86Inst::SubFp { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    sub{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(target),
-                    dst.name()
-                );
+                Self::emit_fp_alu("sub", size, src, dst, target, out)
             }
-
             X86Inst::MulFp { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    mul{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(target),
-                    dst.name()
-                );
+                Self::emit_fp_alu("mul", size, src, dst, target, out)
             }
-
             X86Inst::DivFp { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    div{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(target),
-                    dst.name()
-                );
+                Self::emit_fp_alu("div", size, src, dst, target, out)
             }
-
             X86Inst::XorFp { size, src, dst } => {
                 let _ = writeln!(
                     out,
@@ -1167,49 +882,20 @@ impl EmitAsm for X86Inst {
             }
 
             X86Inst::UComiFp { size, src, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    ucomi{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(target),
-                    dst.name()
-                );
+                Self::emit_fp_alu("ucomi", size, src, dst, target, out)
             }
-
             X86Inst::CvtIntToFp {
                 int_size,
                 fp_size,
                 src,
                 dst,
-            } => {
-                let int_suffix = if int_size.bits() <= 32 { "l" } else { "q" };
-                let _ = writeln!(
-                    out,
-                    "    cvtsi2{}{} {}, {}",
-                    fp_size.x86_suffix(),
-                    int_suffix,
-                    src.format(*int_size, target),
-                    dst.name()
-                );
-            }
-
+            } => Self::emit_cvt_int_to_fp(int_size, fp_size, src, dst, target, out),
             X86Inst::CvtFpToInt {
                 fp_size,
                 int_size,
                 src,
                 dst,
-            } => {
-                let int_suffix = if int_size.bits() <= 32 { "l" } else { "q" };
-                let _ = writeln!(
-                    out,
-                    "    cvtt{}2si{} {}, {}",
-                    fp_size.x86_suffix(),
-                    int_suffix,
-                    src.format(target),
-                    dst.name_for_size(int_size.bits())
-                );
-            }
-
+            } => Self::emit_cvt_fp_to_int(fp_size, int_size, src, dst, target, out),
             X86Inst::CvtFpFp {
                 src_size,
                 dst_size,
@@ -1227,14 +913,8 @@ impl EmitAsm for X86Inst {
             }
 
             // x87 FPU Instructions
-            X86Inst::X87Load { addr } => {
-                let _ = writeln!(out, "    fldt {}", addr.format(target));
-            }
-
-            X86Inst::X87Store { addr } => {
-                let _ = writeln!(out, "    fstpt {}", addr.format(target));
-            }
-
+            X86Inst::X87Load { addr } => Self::emit_x87_mem("fldt", addr, target, out),
+            X86Inst::X87Store { addr } => Self::emit_x87_mem("fstpt", addr, target, out),
             X86Inst::X87BinOp { op } => {
                 let mnemonic = match op {
                     X87BinOp::Add => "faddp",
@@ -1260,38 +940,14 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    fstp %st(0)");
             }
 
-            X86Inst::X87LoadFloat { addr } => {
-                let _ = writeln!(out, "    flds {}", addr.format(target));
-            }
-
-            X86Inst::X87LoadDouble { addr } => {
-                let _ = writeln!(out, "    fldl {}", addr.format(target));
-            }
-
-            X86Inst::X87StoreFloat { addr } => {
-                let _ = writeln!(out, "    fstps {}", addr.format(target));
-            }
-
-            X86Inst::X87StoreDouble { addr } => {
-                let _ = writeln!(out, "    fstpl {}", addr.format(target));
-            }
-
-            X86Inst::X87LoadInt32 { addr } => {
-                let _ = writeln!(out, "    fildl {}", addr.format(target));
-            }
-
-            X86Inst::X87LoadInt64 { addr } => {
-                let _ = writeln!(out, "    fildq {}", addr.format(target));
-            }
-
-            X86Inst::X87StoreInt32 { addr } => {
-                let _ = writeln!(out, "    fisttpl {}", addr.format(target));
-            }
-
-            X86Inst::X87StoreInt64 { addr } => {
-                let _ = writeln!(out, "    fisttpq {}", addr.format(target));
-            }
-
+            X86Inst::X87LoadFloat { addr } => Self::emit_x87_mem("flds", addr, target, out),
+            X86Inst::X87LoadDouble { addr } => Self::emit_x87_mem("fldl", addr, target, out),
+            X86Inst::X87StoreFloat { addr } => Self::emit_x87_mem("fstps", addr, target, out),
+            X86Inst::X87StoreDouble { addr } => Self::emit_x87_mem("fstpl", addr, target, out),
+            X86Inst::X87LoadInt32 { addr } => Self::emit_x87_mem("fildl", addr, target, out),
+            X86Inst::X87LoadInt64 { addr } => Self::emit_x87_mem("fildq", addr, target, out),
+            X86Inst::X87StoreInt32 { addr } => Self::emit_x87_mem("fisttpl", addr, target, out),
+            X86Inst::X87StoreInt64 { addr } => Self::emit_x87_mem("fisttpq", addr, target, out),
             // Special Instructions
             X86Inst::Cltd => {
                 let _ = writeln!(out, "    cltd");
@@ -1301,69 +957,21 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    cqto");
             }
 
-            X86Inst::Bswap { size, reg } => {
-                if size.bits() == 16 {
-                    // x86 bswap doesn't work for 16-bit, use xchg or rol
-                    let _ = writeln!(out, "    rolw $8, {}", reg.name16());
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "    bswap{}",
-                        if size.bits() == 32 {
-                            format!(" {}", reg.name32())
-                        } else {
-                            format!(" {}", reg.name64())
-                        }
-                    );
-                }
-            }
-
+            X86Inst::Bswap { size, reg } => Self::emit_bswap(size, reg, out),
             X86Inst::Bsf { size, src, dst } => {
-                // BSF (bit scan forward) finds the index of the least significant set bit
-                // Using "rep bsf" which is TZCNT on BMI1-capable CPUs, BSF on older CPUs
-                // TZCNT has defined behavior for 0 (returns operand size), BSF doesn't
-                // Since __builtin_ctz has undefined behavior for 0, either is fine
-                let _ = writeln!(
-                    out,
-                    "    bsf{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("bsf", size, src, dst, target, out)
             }
-
             X86Inst::Bsr { size, src, dst } => {
-                // BSR (bit scan reverse) finds the index of the most significant set bit
-                // Result is undefined if src is 0
-                // Since __builtin_clz has undefined behavior for 0, this is fine
-                let _ = writeln!(
-                    out,
-                    "    bsr{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("bsr", size, src, dst, target, out)
             }
-
             X86Inst::Popcnt { size, src, dst } => {
-                // POPCNT counts the number of set bits
-                // Requires SSE4.2 or POPCNT feature (AMD ABM)
-                let _ = writeln!(
-                    out,
-                    "    popcnt{} {}, {}",
-                    size.x86_suffix(),
-                    src.format(*size, target),
-                    dst.name_for_size(size.bits())
-                );
+                Self::emit_alu2_to_reg("popcnt", size, src, dst, target, out)
             }
-
             X86Inst::XorpsSelf { reg } => {
                 let _ = writeln!(out, "    xorps {}, {}", reg.name(), reg.name());
             }
 
-            // ================================================================
             // Atomic Instructions
-            // ================================================================
             X86Inst::Xchg { size, reg, mem } => {
                 // XCHG implicitly has LOCK semantics
                 let _ = writeln!(
@@ -1415,9 +1023,264 @@ impl EmitAsm for X86Inst {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+impl X86Inst {
+    /// `op{suffix} src, dst` where either operand may be memory.
+    fn emit_alu2_to_operand(
+        op: &str,
+        size: &OperandSize,
+        src: &GpOperand,
+        dst: &GpOperand,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let _ = writeln!(
+            out,
+            "    {op}{} {}, {}",
+            size.x86_suffix(),
+            src.format(*size, target),
+            dst.format(*size, target)
+        );
+    }
+
+    /// `op{suffix} src, dst` where dst is a register.
+    fn emit_alu2_to_reg(
+        op: &str,
+        size: &OperandSize,
+        src: &GpOperand,
+        dst: &Reg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let _ = writeln!(
+            out,
+            "    {op}{} {}, {}",
+            size.x86_suffix(),
+            src.format(*size, target),
+            dst.name_for_size(size.bits())
+        );
+    }
+
+    /// `op{suffix} divisor` -- unsigned or signed division.
+    fn emit_divide(
+        op: &str,
+        size: &OperandSize,
+        divisor: &GpOperand,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let _ = writeln!(
+            out,
+            "    {op}{} {}",
+            size.x86_suffix(),
+            divisor.format(*size, target)
+        );
+    }
+
+    /// `op{suffix} count, dst` -- a shift or rotate by an immediate or by %cl.
+    fn emit_shift(op: &str, size: &OperandSize, count: &ShiftCount, dst: &Reg, out: &mut String) {
+        let count_str = match count {
+            ShiftCount::Imm(n) => format!("${}", n),
+            ShiftCount::Cl => "%cl".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "    {op}{} {}, {}",
+            size.x86_suffix(),
+            count_str,
+            dst.name_for_size(size.bits())
+        );
+    }
+
+    /// `op{suffix} count, src, dst` -- a double-precision shift.
+    fn emit_double_shift(
+        op: &str,
+        size: &OperandSize,
+        count: &ShiftCount,
+        src: &Reg,
+        dst: &Reg,
+        out: &mut String,
+    ) {
+        let count_str = match count {
+            ShiftCount::Imm(n) => format!("${}", n),
+            ShiftCount::Cl => "%cl".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "    {op}{} {}, {}, {}",
+            size.x86_suffix(),
+            count_str,
+            src.name_for_size(size.bits()),
+            dst.name_for_size(size.bits())
+        );
+    }
+
+    /// `op{suffix} src, xmm_dst` -- a two-operand SSE instruction.
+    fn emit_fp_alu(
+        op: &str,
+        size: &FpSize,
+        src: &XmmOperand,
+        dst: &XmmReg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let _ = writeln!(
+            out,
+            "    {op}{} {}, {}",
+            size.x86_suffix(),
+            src.format(target),
+            dst.name()
+        );
+    }
+
+    /// `op addr` -- an x87 load or store naming its own operand width.
+    fn emit_x87_mem(op: &str, addr: &MemAddr, target: &Target, out: &mut String) {
+        let _ = writeln!(out, "    {op} {}", addr.format(target));
+    }
+
+    fn emit_movzx(
+        src_size: &OperandSize,
+        dst_size: &OperandSize,
+        src: &GpOperand,
+        dst: &Reg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let op = match (src_size, dst_size) {
+            (OperandSize::B8, OperandSize::B16) => "movzbw",
+            (OperandSize::B8, OperandSize::B32) => "movzbl",
+            (OperandSize::B8, OperandSize::B64) => "movzbq",
+            (OperandSize::B16, OperandSize::B32) => "movzwl",
+            (OperandSize::B16, OperandSize::B64) => "movzwq",
+            // `movz` extends from a byte or a word only; a 32-bit
+            // source is already zero-extended by an ordinary `movl`.
+            // Anything else is a malformed instruction, so panic
+            // rather than emit a silently-narrower load.
+            (s, d) => panic!("no movz encoding from {s:?} to {d:?}"),
+        };
+        let _ = writeln!(
+            out,
+            "    {} {}, {}",
+            op,
+            src.format(*src_size, target),
+            dst.name_for_size(dst_size.bits())
+        );
+    }
+
+    fn emit_movsx(
+        src_size: &OperandSize,
+        dst_size: &OperandSize,
+        src: &GpOperand,
+        dst: &Reg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let op = match (src_size, dst_size) {
+            (OperandSize::B8, OperandSize::B16) => "movsbw",
+            (OperandSize::B8, OperandSize::B32) => "movsbl",
+            (OperandSize::B8, OperandSize::B64) => "movsbq",
+            (OperandSize::B16, OperandSize::B32) => "movswl",
+            (OperandSize::B16, OperandSize::B64) => "movswq",
+            (OperandSize::B32, OperandSize::B64) => "movslq",
+            _ => "movsbl", // fallback
+        };
+        let _ = writeln!(
+            out,
+            "    {} {}, {}",
+            op,
+            src.format(*src_size, target),
+            dst.name_for_size(dst_size.bits())
+        );
+    }
+
+    // Floating-Point
+    fn emit_mov_fp(
+        size: &FpSize,
+        src: &XmmOperand,
+        dst: &XmmOperand,
+        target: &Target,
+        out: &mut String,
+    ) {
+        // A binary128 occupies the whole register, so it moves as a
+        // packed 16-byte quantity rather than as a scalar: there is no
+        // `movsq`. `movaps` between registers; `movups` whenever
+        // memory is involved, because a 16-byte stack slot is not
+        // guaranteed to be 16-byte aligned.
+        if *size == FpSize::Quad {
+            let both_regs = matches!((src, dst), (XmmOperand::Reg(_), XmmOperand::Reg(_)));
+            let op = if both_regs { "movaps" } else { "movups" };
+            let _ = writeln!(
+                out,
+                "    {} {}, {}",
+                op,
+                src.format(target),
+                dst.format(target)
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "    mov{} {}, {}",
+                size.x86_suffix(),
+                src.format(target),
+                dst.format(target)
+            );
+        }
+    }
+
+    fn emit_cvt_int_to_fp(
+        int_size: &OperandSize,
+        fp_size: &FpSize,
+        src: &GpOperand,
+        dst: &XmmReg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let int_suffix = if int_size.bits() <= 32 { "l" } else { "q" };
+        let _ = writeln!(
+            out,
+            "    cvtsi2{}{} {}, {}",
+            fp_size.x86_suffix(),
+            int_suffix,
+            src.format(*int_size, target),
+            dst.name()
+        );
+    }
+
+    fn emit_cvt_fp_to_int(
+        fp_size: &FpSize,
+        int_size: &OperandSize,
+        src: &XmmOperand,
+        dst: &Reg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let int_suffix = if int_size.bits() <= 32 { "l" } else { "q" };
+        let _ = writeln!(
+            out,
+            "    cvtt{}2si{} {}, {}",
+            fp_size.x86_suffix(),
+            int_suffix,
+            src.format(target),
+            dst.name_for_size(int_size.bits())
+        );
+    }
+
+    fn emit_bswap(size: &OperandSize, reg: &Reg, out: &mut String) {
+        if size.bits() == 16 {
+            // x86 bswap doesn't work for 16-bit, use xchg or rol
+            let _ = writeln!(out, "    rolw $8, {}", reg.name16());
+        } else {
+            let _ = writeln!(
+                out,
+                "    bswap{}",
+                if size.bits() == 32 {
+                    format!(" {}", reg.name32())
+                } else {
+                    format!(" {}", reg.name64())
+                }
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

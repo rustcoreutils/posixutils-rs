@@ -9,9 +9,16 @@
 // Parse module - AST and parser
 //
 
+mod aggregate;
 pub mod ast;
+mod builtin_expr;
+mod declaration;
+mod declarator;
+mod expr_check;
 mod expression;
 pub mod parser;
+mod toplevel;
+mod typename;
 
 #[cfg(test)]
 mod test_parser;

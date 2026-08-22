@@ -6,12 +6,9 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Intermediate Representation (IR) for c17 C17 compiler
-// SSA-form IR with basic blocks and typed pseudo-registers
-//
-// The IR uses Single Static Assignment (SSA) form where each variable
-// is assigned exactly once. This simplifies dataflow analysis and
-// optimization passes.
+// Intermediate Representation: basic blocks and typed pseudo-registers in
+// Single Static Assignment form, where each variable is assigned exactly
+// once so that dataflow analysis and the optimization passes stay simple.
 //
 
 pub mod dce;
@@ -48,9 +45,7 @@ const DEFAULT_BLOCK_CAPACITY: usize = 512;
 const DEFAULT_PSEUDO_CAPACITY: usize = 2048;
 const DEFAULT_LOCAL_CAPACITY: usize = 64;
 
-// ============================================================================
 // Call ABI Information
-// ============================================================================
 
 /// ABI classification information for a function call.
 ///
@@ -72,9 +67,7 @@ impl CallAbiInfo {
     }
 }
 
-// ============================================================================
 // Instruction Reference - for def-use chains
-// ============================================================================
 
 /// Reference to an instruction by (basic block id, instruction index)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,9 +82,7 @@ impl InsnRef {
     }
 }
 
-// ============================================================================
 // Opcodes
-// ============================================================================
 
 /// IR opcodes for the intermediate representation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,9 +471,7 @@ impl fmt::Display for Opcode {
     }
 }
 
-// ============================================================================
 // Memory Ordering - for atomic operations
-// ============================================================================
 
 /// Memory ordering for atomic operations (C11 memory model)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -516,9 +505,7 @@ impl fmt::Display for MemoryOrder {
     }
 }
 
-// ============================================================================
 // Pseudo - Virtual registers / values in SSA form
-// ============================================================================
 
 /// Unique ID for a pseudo (virtual register)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -568,7 +555,6 @@ impl PartialEq for Pseudo {
 }
 
 impl Pseudo {
-    /// Create an undefined pseudo
     pub fn undef(id: PseudoId) -> Self {
         Self {
             id,
@@ -577,7 +563,6 @@ impl Pseudo {
         }
     }
 
-    /// Create a register pseudo
     pub fn reg(id: PseudoId, nr: u32) -> Self {
         Self {
             id,
@@ -595,7 +580,6 @@ impl Pseudo {
         }
     }
 
-    /// Create a phi pseudo
     pub fn phi(id: PseudoId, nr: u32) -> Self {
         Self {
             id,
@@ -604,7 +588,6 @@ impl Pseudo {
         }
     }
 
-    /// Create a symbol pseudo
     pub fn sym(id: PseudoId, name: String) -> Self {
         Self {
             id,
@@ -671,9 +654,7 @@ impl fmt::Display for Pseudo {
     }
 }
 
-// ============================================================================
 // BasicBlock ID
-// ============================================================================
 
 /// Unique ID for a basic block
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -685,9 +666,7 @@ impl fmt::Display for BasicBlockId {
     }
 }
 
-// ============================================================================
 // Inline Assembly Support
-// ============================================================================
 
 /// Constraint information for an inline asm operand
 #[derive(Debug, Clone)]
@@ -713,10 +692,8 @@ impl AsmConstraint {
     ///
     /// This matters for liveness in a way that is easy to miss: a memory
     /// *output* still **reads** its pseudo, because the pseudo holds the
-    /// address the assembly writes through. Treating `"=m"` as write-only let
-    /// DCE delete the instruction that materialized the address, leaving the
-    /// emitted `fnstcw (%rax)` to fault on whatever happened to be in the
-    /// register. Anything that computes uses must call this.
+    /// address the assembly writes through. Anything that computes uses must
+    /// call this, or DCE deletes what materialized the address.
     ///
     /// A constraint may offer several alternatives (`"rm"`); it is only a
     /// memory operand if no register/immediate alternative is available.
@@ -761,9 +738,7 @@ pub struct AsmData {
     pub goto_labels: Vec<(BasicBlockId, String)>,
 }
 
-// ============================================================================
 // Instruction
-// ============================================================================
 
 /// An IR instruction
 #[derive(Debug, Clone)]
@@ -861,7 +836,6 @@ impl Default for Instruction {
 }
 
 impl Instruction {
-    /// Create a new instruction
     pub fn new(op: Opcode) -> Self {
         Self {
             op,
@@ -1077,7 +1051,6 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    /// Create a load instruction
     pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Load)
             .with_target(target)
@@ -1086,7 +1059,6 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    /// Create a store instruction
     pub fn store(value: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Store)
             .with_src(addr)
@@ -1095,7 +1067,6 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    /// Create a call instruction
     pub fn call(
         target: Option<PseudoId>,
         func: &str,
@@ -1176,7 +1147,6 @@ impl Instruction {
             .with_type_and_size(typ, 64)
     }
 
-    /// Create a phi node
     pub fn phi(target: PseudoId, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Phi)
             .with_target(target)
@@ -1377,9 +1347,7 @@ impl fmt::Display for Instruction {
     }
 }
 
-// ============================================================================
 // BasicBlock
-// ============================================================================
 
 /// A basic block - a sequence of instructions ending with a terminator
 #[derive(Debug, Clone)]
@@ -1439,7 +1407,6 @@ impl Default for BasicBlock {
 }
 
 impl BasicBlock {
-    /// Create a new basic block
     pub fn new(id: BasicBlockId) -> Self {
         Self {
             id,
@@ -1462,7 +1429,6 @@ impl BasicBlock {
         }
     }
 
-    /// Check if the block is terminated
     pub fn is_terminated(&self) -> bool {
         self.insns
             .last()
@@ -1520,9 +1486,7 @@ impl fmt::Display for BasicBlock {
     }
 }
 
-// ============================================================================
 // Function (Entrypoint)
-// ============================================================================
 
 /// Information about a local variable for SSA conversion
 #[derive(Debug, Clone)]
@@ -1632,13 +1596,10 @@ pub struct Function {
     /// that is nothing but a `long double`, which comes back in st(0) and so
     /// is loaded from memory. At a call site the backend stores the returned
     /// registers into the result local, so that pseudo's slot holds the value
-    /// itself. Inlining splices the callee's body in and drops the call, which
-    /// would hand the caller an address where it expects a value -- and the
-    /// difference is invisible, since it reads the first eight bytes of the
-    /// pointer as a float.
-    ///
-    /// Bridging the two needs the base type and stride, and the optimizer has
-    /// no `TypeTable` to ask, so such functions are simply not inlined.
+    /// itself; inlining drops the call and would hand the caller an address
+    /// where it expects a value. Bridging the two needs the base type and
+    /// stride, which the optimizer has no `TypeTable` to ask for, so such
+    /// functions are simply not inlined.
     pub ret_is_address: bool,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
@@ -1677,7 +1638,6 @@ impl Default for Function {
 }
 
 impl Function {
-    /// Create a new function
     pub fn new(name: impl Into<String>, return_type: TypeId) -> Self {
         Self {
             name: name.into(),
@@ -1848,9 +1808,7 @@ impl fmt::Display for Function {
     }
 }
 
-// ============================================================================
 // Global Variable Initializer
-// ============================================================================
 
 /// Initializer for global variables
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1998,9 +1956,7 @@ impl fmt::Display for Initializer {
     }
 }
 
-// ============================================================================
 // Global Variable Definition
-// ============================================================================
 
 /// How a global is stored, as three facts that always travel together.
 ///
@@ -2070,9 +2026,7 @@ impl GlobalDef {
     }
 }
 
-// ============================================================================
 // Module (Translation Unit)
-// ============================================================================
 
 /// A module containing multiple functions
 #[derive(Debug, Clone, Default)]
@@ -2305,10 +2259,6 @@ impl fmt::Display for Module {
         Ok(())
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -2777,9 +2727,7 @@ mod tests {
         assert!(insn.returns_two_regs());
     }
 
-    // ========================================================================
     // Function::create_reg_pseudo
-    // ========================================================================
 
     #[test]
     fn test_create_reg_pseudo() {
@@ -2803,9 +2751,7 @@ mod tests {
         assert_ne!(id1, id2);
     }
 
-    // ========================================================================
     // Instruction::call_with_abi
-    // ========================================================================
 
     #[test]
     fn test_call_with_abi_basic() {
@@ -2877,9 +2823,7 @@ mod tests {
         assert_eq!(insn.size, types.size_bits(types.double_id));
     }
 
-    // ========================================================================
     // is_memory_barrier
-    // ========================================================================
 
     fn make_asm_with_clobbers(clobbers: Vec<&str>) -> Instruction {
         let mut insn = Instruction::new(Opcode::Asm);

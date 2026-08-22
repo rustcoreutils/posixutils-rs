@@ -16,14 +16,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 // ============================================================================
-// LocationMap — single owner for PseudoId → Loc bindings (M2)
+// LocationMap — single owner for PseudoId → Loc bindings
 // ============================================================================
 //
 // Every PseudoId has at most one current Loc, set by the regalloc and
-// observed by the codegen. Bug-class C in the regalloc findings was
-// "two disagreeing location computations" — codegen deriving an alternate
-// Loc from `PseudoKind` instead of asking the allocator. Routing all
-// accesses through this newtype makes that pattern syntactically visible:
+// observed by the codegen. Routing all accesses through this newtype
+// keeps codegen from deriving an alternate Loc from `PseudoKind`
+// instead of asking the allocator:
 //   * `get(p)` returns the single current binding.
 //   * `set(p, loc)` is the only way to write — call sites stand out in
 //     review (the allocator owns most writes; codegen needs the seam
@@ -76,9 +75,7 @@ const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
 const DEFAULT_CALL_POS_CAPACITY: usize = 16;
 const DEFAULT_SMALL_VEC_CAPACITY: usize = 8;
 
-// ============================================================================
 // Common Types
-// ============================================================================
 
 /// Live interval for a pseudo-register
 #[derive(Debug, Clone)]
@@ -161,17 +158,14 @@ impl<R> ConstraintPoint<R> {
     }
 }
 
-// ============================================================================
 // Common Functions
-// ============================================================================
 
 /// Release stack slots whose owning interval ended before `point` back
 /// to the free-slot pool, where future `try_reuse_stack_slot` calls
 /// can find them.
 ///
-/// Linear scan called this on every iteration with the next interval's
-/// `start`. The chordal allocator (M6) calls it twice per bank: once
-/// in Phase 1 sweeping monotonically by interval start, then once with
+/// The chordal allocator calls it twice per bank: once in Phase 1
+/// sweeping monotonically by interval start, then once with
 /// `usize::MAX` just before Phase 3 spill commits to drain everything
 /// so spilled pseudos can reuse any non-interfering slot.
 ///
@@ -225,8 +219,6 @@ pub fn expire_stack_intervals(
 /// x86_64). Without this, chordal coloring will happily put a live
 /// pseudo into a caller-saved register that the codegen helper's
 /// embedded libc call silently overwrites — see `memory/MEMORY.md`
-/// "Variadic float argument promotion" and the M6+M7 era xmm0
-/// clobber bugs for the historical context.
 pub fn find_call_positions(func: &Function, is_call_like: impl Fn(Opcode) -> bool) -> Vec<usize> {
     let mut call_positions = Vec::with_capacity(DEFAULT_CALL_POS_CAPACITY);
     let mut pos = 0usize;
@@ -265,14 +257,6 @@ pub struct LivenessResult<R> {
 ///
 /// This is the shared core of live interval computation used by both x86-64 and AArch64.
 /// The `get_constraint_info` callback allows architecture-specific constraint handling.
-///
-/// # Arguments
-/// * `func` - The function to analyze
-/// * `get_constraint_info` - Callback that returns constraint info for an instruction:
-///   - Returns `Some((clobbers, involved_pseudos))` if the instruction has register constraints
-///   - Returns `None` if no constraints apply
-///
-/// The callback signature: `Fn(&Instruction) -> Option<(Vec<R>, Vec<PseudoId>)>`
 pub fn compute_live_intervals<R, F>(func: &Function, get_constraint_info: F) -> LivenessResult<R>
 where
     R: Clone,
@@ -318,8 +302,7 @@ where
 
     // Phase B: per-block first/last use positions, def-block map, and the
     // set of pseudos written in each block (used to bound liveness via
-    // Phase C's Boissinot Up_and_Mark traversal). Replaces the legacy
-    // gen/kill + backward dataflow fixpoint.
+    // Phase C's Boissinot Up_and_Mark traversal).
     let mut first_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut last_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut defined_in: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
@@ -695,13 +678,10 @@ where
 
             // Type information decides the rest -- except for a comparison,
             // whose *result* is a boolean integer whatever it compared. The
-            // list used to hold only the `FCmpO*` opcodes, but the `Set*`
-            // family is typed by its operands too: `emit_compare_zero` on a
-            // `float` produces a `SetNe` typed `float`, so its boolean landed
-            // in a vector register while the code that computed it wrote a
-            // general one. On aarch64 the branch then compared a vector
-            // register nothing had loaded, and `f() ?: g()` took whichever arm
-            // the previous call's return value happened to select.
+            // `Set*` family is typed by its operands too: `emit_compare_zero`
+            // on a `float` produces a `SetNe` typed `float`, whose boolean
+            // would otherwise land in a vector register while the code that
+            // computed it wrote a general one.
             let is_comparison = matches!(
                 insn.op,
                 Opcode::FCmpOEq
@@ -738,7 +718,7 @@ where
 }
 
 // ============================================================================
-// Backend orchestration helpers (M4)
+// Backend orchestration helpers
 // ============================================================================
 //
 // Both backends contain a few short, structurally identical loops in their
@@ -825,10 +805,6 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
     }
 }
 
-// ============================================================================
-// Chordal coloring on the SSA interference graph (M6)
-// ============================================================================
-//
 // SSA interference graphs are chordal (Pereira/Palsberg 2005, Hack
 // 2005): a perfect elimination ordering exists and greedy coloring on
 // that ordering achieves the chromatic number. The two-step recipe:
@@ -841,18 +817,18 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
 // `lower::eliminate_phi_nodes` introduces multi-def Copy patterns. The
 // interference graph is still well-defined: vertex u interferes with
 // vertex v iff u and v are simultaneously live somewhere in the
-// function. We construct it precisely with a per-instruction backward
-// walk (the textbook "for each def, add edges to currently-live"
-// pattern) rather than the coarser block-level all-pairs that would
-// over-constrain coloring with spurious edges.
+// function. It is built with a per-instruction backward walk (the
+// textbook "for each def, add edges to currently-live" pattern) rather
+// than a coarser block-level all-pairs, which would over-constrain
+// coloring with spurious edges.
 //
 // Constraint pre-coloring (e.g. x86_64 `idiv` clobbers RAX/RDX) is
 // expressed via per-pseudo `forbidden` colors passed to greedy_color.
 // ABI-pinned arg pseudos arrive via `pre_colored`. Physical registers
 // don't need to be modeled as graph vertices.
 //
-// Use BTreeMap / BTreeSet throughout so iteration is deterministic —
-// the project's determinism invariant (cc/CLAUDE.md) covers this.
+// BTreeMap / BTreeSet throughout, so iteration is deterministic per
+// the project's determinism invariant (cc/CLAUDE.md).
 
 /// Per-pseudo set of interfering pseudos for one register bank.
 #[derive(Debug, Default)]
@@ -1005,26 +981,6 @@ pub fn build_interference_graph(
     graph
 }
 
-// ============================================================================
-// M9 — Register Coalescing helpers
-// ============================================================================
-//
-// Coalescing reduces the number of `Opcode::Copy` instructions that
-// emit a real `mov` by giving the source and target pseudos the same
-// physical location. After M9b's post-coloring opportunistic merge
-// reassigns matching `Loc`s, the surviving Copy becomes identity and
-// M9a's codegen short-circuit elides it.
-//
-// c17 uses the simplest viable strategy: walk every Copy after
-// chordal coloring completes, and migrate the target pseudo to the
-// source's location when the migration is safe (no interference, no
-// pre-color conflict, no forbidden-set violation, no neighbor of the
-// target already at the source's register). Naive — no Briggs
-// degree analysis, no global iteration to a fixed point — but it
-// captures most low-hanging copies introduced by phi elimination,
-// matched-asm-constraint initializers, and parameter shuffling, and
-// the CPython smoke test catches any allocator drift.
-
 /// Walk `func` and collect every `Opcode::Copy` instruction's
 /// `(target, src)` pair as a coalescing candidate. Skips Copies
 /// without a target or with `src.len() != 1` (degenerate cases).
@@ -1150,7 +1106,7 @@ where
 }
 
 /// For each pseudo, the sorted positions at which it is used (read).
-/// M7 Belady uses this to compute "next-use distance" — when register
+/// Belady eviction uses this for "next-use distance" — when register
 /// pressure forces a spill, the pseudo with the furthest next use is
 /// the cheapest to evict (reloading later costs less than reloading
 /// sooner).
@@ -1251,22 +1207,12 @@ pub fn try_reuse_stack_slot(
     None
 }
 
-// ============================================================================
-// Allocator–ABI contract layer (M1)
-// ============================================================================
-//
-// Both per-arch register allocators previously re-derived argument
-// classification inline — repeating type-kind checks (`is_float`,
-// `is_complex`, `is_long_double`, `is_int128`, struct-size thresholds)
-// that the `cc/abi/*::classify_param` implementations already perform.
-// Two sources of truth, two opportunities to drift.
-//
-// `AbiLowering` centralizes that contract:
+// `AbiLowering` is the single place the allocator asks the ABI how an
+// argument is passed:
 //
 //   * Build it once per function with the `Function` + `TypeTable`. It
 //     pre-indexes the function's pseudos by `Arg(n)` for O(1) lookup
-//     (the previous code did an O(P) inner scan per argument) and
-//     detects the hidden sret pointer.
+//     and detects the hidden sret pointer.
 //
 //   * For each parameter, `iter_args(abi)` yields an `AbiArg` carrying
 //     the `ArgClass` from `abi.classify_param` plus a handful of type
@@ -1278,7 +1224,7 @@ pub fn try_reuse_stack_slot(
 //
 // Backends still own the actual `Loc` decision because `Loc` is per-arch
 // (each has its own `Reg`/`XmmReg`/`VReg`). They dispatch on `arg.class`
-// and the `is_*` flags, eliminating the duplicated type-kind checks.
+// and the `is_*` flags.
 
 /// Per-argument context yielded by `AbiLowering::iter_args`.
 ///
@@ -1337,8 +1283,7 @@ impl<'a> AbiLowering<'a> {
             .map(|p| p.id);
         let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
 
-        // Index pseudos by Arg(n). The previous backend code did an
-        // O(P) scan per argument; this is O(P) once.
+        // Index pseudos by Arg(n): O(P) once, O(1) per argument.
         let max_arg = func
             .pseudos
             .iter()

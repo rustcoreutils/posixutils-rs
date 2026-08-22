@@ -24,9 +24,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-// ============================================================================
 // StringId - Unique identifier for interned strings
-// ============================================================================
 
 /// A unique identifier for an interned string
 /// Similar to TypeId for types, this provides O(1) equality comparisons
@@ -45,9 +43,7 @@ impl fmt::Display for StringId {
     }
 }
 
-// ============================================================================
 // StringTable - Interned string storage
-// ============================================================================
 
 const DEFAULT_STRING_TABLE_CAPACITY: usize = 65536;
 
@@ -161,10 +157,6 @@ impl fmt::Debug for StringTable {
             .finish()
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

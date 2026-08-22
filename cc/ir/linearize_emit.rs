@@ -19,9 +19,8 @@ use crate::types::{MemberInfo, TypeId, TypeKind};
 ///
 /// Spelled as a shift of `u64::MAX` rather than `(1 << bit_width) - 1` because
 /// the latter overflows at the one width that matters most: Rust masks a shift
-/// amount to the operand's width, so `1u64 << 64` is `1` and the mask comes out
-/// `0`. That made `struct { unsigned long long a:64; }` read back as zero at
-/// every optimization level, on both targets.
+/// amount to the operand's width, so `1u64 << 64` is `1` and the mask for
+/// `struct { unsigned long long a:64; }` would come out `0`.
 ///
 /// A zero width never reaches here -- a named zero-width bit-field is rejected
 /// by `validate_bitfield`, and the unnamed kind allocates nothing -- but the
@@ -368,13 +367,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut acc: Option<PseudoId> = None;
         let (field_lo, field_hi) = (bit_offset, bit_offset + bit_width);
         for i in 0..span {
-            // Only the bytes the field's own bits reach. The store path has
-            // always had this test; the load path did not, so a span wider than
-            // the field -- which is every `__int128` bit-field, whose access
-            // window is sixteen bytes -- read the object's *padding* and
-            // shifted it by more than the carrier's width. x86-64 masks such a
-            // shift and folded the padding into the result; aarch64's assembler
-            // rejects the instruction outright.
+            // Only the bytes the field's own bits reach. A span wider than the
+            // field -- every `__int128` bit-field, whose access window is
+            // sixteen bytes -- would otherwise read the object's *padding* and
+            // shift it by more than the carrier's width, which x86-64 masks
+            // into the result and aarch64's assembler rejects outright.
             let (byte_lo, byte_hi) = (8 * i, 8 * i + 8);
             if field_lo.max(byte_lo) >= field_hi.min(byte_hi) {
                 continue;
@@ -461,15 +458,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         // arithmetic-shifting it back down.
         //
         // The shift is measured against the width the *operation* runs at, not
-        // against the storage unit. A field backed by a one-byte unit is still
-        // extracted in a 32-bit register, so shifting by `8 - width` leaves the
-        // field's top bit at bit 7, where an arithmetic shift sees a positive
-        // value and extends nothing. `int a:4` was correct only because its
-        // storage unit is 32 bits, which happens to be the operation width.
-        //
-        // A field of `__int128` needs the 128-bit tier: capping the operation
-        // at 64 sign-extended only the low half, so `__int128 f:27 = -1` came
-        // back with its top 64 bits clear.
+        // against the storage unit: a field backed by a one-byte unit is still
+        // extracted in a 32-bit register, and shifting by `8 - width` would
+        // leave its top bit at bit 7, where an arithmetic shift sees a positive
+        // value and extends nothing. A field of `__int128` needs the 128-bit
+        // tier for the same reason -- capping at 64 sign-extends only the low
+        // half.
         let (typ, op_bits) = if target_bits <= 32 {
             (self.types.int_id, 32)
         } else if target_bits <= 64 {
@@ -580,8 +574,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
         //
         // Complemented inside the storage unit rather than inside the widest
-        // carrier: `!field_mask` alone sets every bit above the unit, which is
-        // harmless for a 64-bit unit only because the old mask was a `u64`.
+        // carrier: `!field_mask` alone sets every bit above the unit.
         let unit_mask = bitfield_value_mask_128(storage_bits);
         let field_mask = bitfield_value_mask_128(bit_width) << bit_offset;
         let clear_mask = !field_mask & unit_mask;
@@ -850,7 +843,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // For small unions (<= 64 bits), LOAD the value — unions are
                 // accessed as whole values, not via member offsets, and
                 // returning the pointer causes callers to store the pointer
-                // instead of the union value (Bug L).
+                // instead of the union value.
                 if type_kind == TypeKind::Union && size > 64 {
                     return src;
                 }

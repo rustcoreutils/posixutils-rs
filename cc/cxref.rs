@@ -28,9 +28,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::process::ExitCode;
 
-// ============================================================================
 // CLI
-// ============================================================================
 
 #[derive(Parser)]
 #[command(version, about = gettext("cxref - generate a C-language program cross-reference table"))]
@@ -64,9 +62,7 @@ struct Args {
     files: Vec<String>,
 }
 
-// ============================================================================
 // Symbol Reference
-// ============================================================================
 
 /// A reference to a symbol
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -140,8 +136,8 @@ impl CrossRef {
     /// `# N "file"`
     /// marker names, and reporting them against the preprocessed file names a
     /// place the reader cannot go and look. Since the line numbers already
-    /// come from the marker, leaving the file alone made the two halves of one
-    /// location disagree. This is the fix `cflow` took under #F10.
+    /// come from the marker, leaving the file alone would make the two halves
+    /// of one location disagree. `cflow` resolves it the same way.
     fn add_ref_at(&mut self, name: &str, pos: Position, is_definition: bool) {
         let (file, line, _) = diag::effective_position(pos);
         self.symbols.entry(name.to_string()).or_default().add_ref(
@@ -161,9 +157,7 @@ impl CrossRef {
     }
 }
 
-// ============================================================================
 // AST Walking
-// ============================================================================
 
 /// Walk an expression to find symbol references
 fn extract_refs_from_expr(
@@ -298,9 +292,8 @@ fn extract_refs_from_stmt(
                     posixutils_cc::parse::ast::BlockItem::Declaration(decl) => {
                         for d in &decl.declarators {
                             let name = strings.get(symbols.get(d.symbol).name).to_string();
-                            // The declarator carries its own position, so a local
-                            // with no initializer is still recorded (previously
-                            // such declarations were skipped entirely).
+                            // The declarator carries its own position, so a
+                            // local with no initializer is still recorded.
                             xref.add_definition_at(&name, d.pos);
                             if let Some(init) = &d.init {
                                 extract_refs_from_expr(init, strings, symbols, xref);
@@ -385,9 +378,7 @@ fn extract_refs_from_stmt(
     }
 }
 
-// ============================================================================
 // Macro cross-referencing
-// ============================================================================
 
 /// Split a line into identifier-like tokens with their column offsets.
 fn identifiers(line: &str) -> Vec<&str> {
@@ -519,9 +510,7 @@ fn parse_line_marker(line: &str) -> Option<(String, u32)> {
     Some((name[..end].to_string(), line_no))
 }
 
-// ============================================================================
 // File Processing
-// ============================================================================
 
 fn process_file(
     path: &str,
@@ -645,9 +634,7 @@ fn process_file(
     Ok(())
 }
 
-// ============================================================================
 // Output
-// ============================================================================
 
 /// Format and print the cross-reference.
 ///
@@ -746,9 +733,7 @@ fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Writ
     }
 }
 
-// ============================================================================
 // Main
-// ============================================================================
 
 fn main() -> ExitCode {
     plib::diag::init_locale("cxref");

@@ -17,9 +17,7 @@ use gettextrs::gettext;
 // Re-export Position for use by other modules
 pub use crate::diag::Position;
 
-// ============================================================================
 // Lexer Mode
-// ============================================================================
 
 /// Lexer mode - controls how a few characters are classified
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -46,8 +44,7 @@ pub enum LexerMode {
 /// else about it, and C99 6.10.3.2p2 asks `#` for "the spelling of the
 /// preprocessing token" -- so the spelling has to survive to the point where
 /// `#` and `-E` read it. Kept beside the type rather than as types of their
-/// own: a path that fails to carry this loses the spelling, which is what
-/// every path did before, rather than losing the token.
+/// own: a path that fails to carry it loses the spelling, not the token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Spelling {
     /// Written the one canonical way for this token's type and value.
@@ -77,11 +74,9 @@ fn digraph_token(pos: Position, value: TokenValue) -> Token {
 /// byte outside a literal lexes as its own punctuator -- while a digraph or a
 /// multi-character operator has a spelling that is text. Everything that
 /// builds a byte stream or a literal payload has to keep the two apart:
-/// rendering the byte through a Rust `String` UTF-8-encodes it, which doubled
-/// it in `-E` output, in preprocessed assembly, and in `#` stringification.
-///
-/// The distinction is in this type rather than in a comment because all three
-/// of those were separate bugs with one cause.
+/// rendering the byte through a Rust `String` UTF-8-encodes it, which would
+/// double it in `-E` output, in preprocessed assembly, and in `#`
+/// stringification.
 pub enum Punctuator {
     /// One source byte, verbatim.
     Byte(u8),
@@ -123,9 +118,7 @@ enum HeaderNamePos {
     Expect { in_condition: bool },
 }
 
-// ============================================================================
 // Token Types
-// ============================================================================
 
 /// Drop a leading UTF-8 byte order mark.
 ///
@@ -146,18 +139,11 @@ pub fn strip_bom(content: &[u8]) -> &[u8] {
 
 /// Apply translation phase 1 trigraph replacement to a source buffer.
 ///
-/// C17 5.2.1.1 still mandates the nine trigraphs; they were removed in C23,
-/// and POSIX's own RATIONALE (88224) notes that *not* supporting them is the
-/// non-conforming choice. They are nonetheless off by default here, behind
-/// `--trigraphs`, because the replacement applies everywhere including inside
-/// string literals — `"What??!"` silently becomes `"What|"` — and real code is
-/// far more likely to contain `??` by accident than by intent. GCC ships them
-/// off by default for the same reason.
-///
-/// Done as a whole-buffer pre-pass rather than inside `nextchar`, because
-/// phase 1 precedes line splicing (so `??/` at end of line must be able to
-/// become a splice) and because `peekchar` is a separate non-mutating scanner
-/// that would have to mirror the rule exactly.
+/// C17 5.2.1.1 mandates the nine trigraphs, but replacement reaches inside
+/// string literals — `"What??!"` becomes `"What|"` — and `??` is far more
+/// often accidental than a trigraph, so they are off by default behind
+/// `--trigraphs`, as in GCC. A whole-buffer pre-pass, because phase 1 precedes
+/// line splicing: `??/` at end of line must be able to become a splice.
 ///
 /// Returns the original buffer untouched when it contains no trigraph.
 pub fn replace_trigraphs(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
@@ -289,17 +275,6 @@ pub enum SpecialToken {
     Ellipsis,        // ...
 }
 
-/// Does this universal character name name a character C17 6.4.3p2 forbids?
-///
-/// A UCN "shall not specify a character whose short identifier is less than
-/// 00A0 other than 0024 ($), 0040 (@), or 0060 (`), nor one in the range D800
-/// through DFFF inclusive." The first half keeps a UCN from spelling a
-/// character that already has a spelling -- `\u0041` for `A` -- and the second
-/// excludes the UTF-16 surrogate range, which is not a character at all.
-///
-/// Takes the raw scalar rather than a `char` because a surrogate cannot be
-/// represented as one: `char::from_u32` rejects it, and every caller used to
-/// treat that failure as "not an escape" and carry on with the letter `u`.
 /// Report a universal character name C17 6.4.3p2 forbids, spelled as the
 /// source spells it so the message can be matched against what was written.
 pub(crate) fn report_forbidden_ucn(pos: Position, val: u32) {
@@ -310,9 +285,7 @@ pub(crate) fn report_forbidden_ucn(pos: Position, val: u32) {
     );
 }
 
-// ============================================================================
 // Identifier characters (C17 Annex D)
-// ============================================================================
 
 /// Annex D.1: the characters an identifier may contain beyond the basic
 /// source character set.
@@ -411,8 +384,8 @@ pub(crate) enum IdentPos {
 /// universal character name may *name* -- a question that applies to string
 /// literals too, and that admits characters no identifier may contain.
 /// A UCN in an identifier has to satisfy both; a character written directly
-/// satisfies only this one. Conflating them let `int \u00A0x;` through, which
-/// gcc rejects, and let a combining mark start an identifier.
+/// satisfies only this one. Conflating them would accept `int \u00A0x;` and
+/// let a combining mark start an identifier, both of which gcc rejects.
 pub(crate) fn identifier_char(ch: char, pos: IdentPos) -> bool {
     let val = ch as u32;
     // The basic source character set, which the byte-level table already
@@ -457,13 +430,19 @@ fn decode_utf8(lead: u8, peek: &mut Peek<'_>) -> Option<(char, usize)> {
     Some((ch, len))
 }
 
+/// Does this universal character name name a character C17 6.4.3p2 forbids?
+///
+/// A UCN "shall not specify a character whose short identifier is less than
+/// 00A0 other than 0024 ($), 0040 (@), or 0060 (`), nor one in the range D800
+/// through DFFF inclusive."
+///
+/// Takes the raw scalar rather than a `char` because a surrogate cannot be
+/// represented as one: `char::from_u32` rejects it.
 pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
     (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60) || (0xD800..=0xDFFF).contains(&val)
 }
 
-// ============================================================================
 // Translation phase 2 (line splicing)
-// ============================================================================
 
 /// Delete the run of backslash-newline splices starting at `offset`, returning
 /// the offset of the first byte that survives phase 2 and how many source
@@ -471,9 +450,7 @@ pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
 ///
 /// This is the single definition of what phase 2 deletes. Every scanner below
 /// -- the consuming `nextchar`, the non-consuming `peekchar`, and the UCN
-/// lookahead -- goes through it, because they must agree byte for byte: the
-/// three hand-written copies this replaces disagreed in three separate places,
-/// each of which silently mislexed valid source rather than diagnosing it.
+/// lookahead -- goes through it, because they must agree byte for byte.
 ///
 /// `splice` is false for a `.i` operand, where a surviving backslash-newline
 /// is text rather than a joint and nothing is deleted.
@@ -565,8 +542,7 @@ impl SpecialToken {
     /// How this punctuator is written in source.
     ///
     /// `#` stringification needs it (6.10.3.2p2: "the spelling of the
-    /// preprocessing token"). Without one, `#x` dropped every operator of more
-    /// than one character, so `S(a >> b)` came out `"a  b"`.
+    /// preprocessing token"), or `#x` would drop every multi-character operator.
     pub fn spelling(self) -> &'static str {
         use SpecialToken::*;
         match self {
@@ -600,17 +576,12 @@ impl SpecialToken {
 
 // Position is imported from crate::diag
 
-// ============================================================================
 // Identifier Interning
-// ============================================================================
 
-/// Identifier intern table - now a re-export of StringTable
-/// Kept for backward compatibility during transition
+/// Identifier intern table: an alias for [`StringTable`].
 pub type IdentTable = StringTable;
 
-// ============================================================================
 // Token Value
-// ============================================================================
 
 /// Token value - type-specific payload for each token kind
 #[derive(Debug, Clone)]
@@ -646,9 +617,7 @@ pub enum TokenValue {
     HeaderName(String),
 }
 
-// ============================================================================
 // Token
-// ============================================================================
 
 /// A C token
 #[derive(Debug, Clone)]
@@ -731,9 +700,7 @@ impl Token {
     }
 }
 
-// ============================================================================
 // Character Classification
-// ============================================================================
 
 /// Character class flags for lexer character classification
 const LETTER: u8 = 1;
@@ -745,7 +712,7 @@ const VALID_SECOND: u8 = 32; // Can be second char of 2-char operator
 const QUOTE: u8 = 64; // ' "
 const COMMENT: u8 = 128; // /
 
-/// Classify a single byte (mirrors the old match arms exactly, plus QUOTE and COMMENT).
+/// Classify a single byte into the flags above.
 const fn classify_char(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => DIGIT | HEX,
@@ -783,29 +750,23 @@ const fn build_char_table() -> [u8; 256] {
 const CHAR_TABLE: [u8; 256] = build_char_table();
 
 /// Character classification via table lookup.
-#[inline(always)]
 fn char_class(c: u8) -> u8 {
     CHAR_TABLE[c as usize]
 }
 
-#[inline]
 fn is_digit(c: u8) -> bool {
     char_class(c) & DIGIT != 0
 }
 
-#[inline]
 fn is_letter_or_digit(c: u8) -> bool {
     char_class(c) & (LETTER | DIGIT) != 0
 }
 
-// ============================================================================
 // Stream (Input Source)
-// ============================================================================
 
 // Stream management is now in crate::diag
 
-/// Stream table wrapper for backward compatibility
-/// Uses the global thread-local StreamRegistry from diag
+/// Stream table: a handle on the thread-local `StreamRegistry` in `diag`.
 pub struct StreamTable;
 
 impl StreamTable {
@@ -825,9 +786,7 @@ impl Default for StreamTable {
     }
 }
 
-// ============================================================================
 // Tokenizer
-// ============================================================================
 
 const EOF: i32 = -1;
 
@@ -1073,10 +1032,9 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         // "no UCN here": returning `None` would leave the backslash to be
         // lexed as some other token and report something unrelated.
         if ucn_is_forbidden(val) {
-            // Reported by the caller that actually consumes the backslash, not
-            // by the one looking ahead over it: both see the same escape, so
-            // reporting here gave two diagnostics a column apart. The consumer
-            // is also where gcc points.
+            // Reported by the caller that consumes the backslash, not by the
+            // one looking ahead over it: both see the same escape, and the
+            // consumer is where gcc points.
             if report {
                 report_forbidden_ucn(self.pos(), val);
             }
@@ -1176,7 +1134,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
     }
 
-    /// Get an identifier token
     fn get_identifier(&mut self, first: u8) -> Token {
         let pos = self.pos();
         let mut name = String::new();
@@ -1213,7 +1170,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         self.ident_token(pos, &name)
     }
 
-    /// Get a string or character literal
     fn get_string_or_char(&mut self, delim: u8, enc: LiteralEncoding) -> Token {
         let pos = self.pos();
         let mut content = String::new();
@@ -1422,7 +1378,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 // %:%: is the digraph for ##. Decided by looking two characters
                 // ahead rather than by consuming and backing out: rewinding
                 // `offset` cannot undo the line counting a splice between the
-                // two halves already did, and the double count desynchronised
+                // two halves already did, and the double count desynchronises
                 // __LINE__ for the rest of the file.
                 let mut peek = self.peek_at(self.offset);
                 if peek.next() == Some(b'%') && peek.next() == Some(b':') {
@@ -1524,7 +1480,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         ))
     }
 
-    /// Get one token
     fn get_one_token(&mut self, c: u8) -> Option<Token> {
         let class = char_class(c);
 
@@ -1663,9 +1618,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             // over and clear them here rather than afterwards. Lexing can set
             // `newline` again -- an unterminated literal ends at the newline it
             // ran into -- and that newline belongs to the *next* token, which
-            // does start a line. Clearing afterwards swallowed it, so a `#` on
-            // the following line stopped introducing a directive and one
-            // diagnostic became a cascade.
+            // does start a line.
             let newline = std::mem::take(&mut self.newline);
             let whitespace = std::mem::take(&mut self.whitespace);
 
@@ -1701,11 +1654,8 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     }
 }
 
-// ============================================================================
 // Token Display
-// ============================================================================
 
-/// Display a special token
 pub fn show_special(value: u32) -> String {
     if value < SpecialToken::BASE {
         // Single character
@@ -1758,10 +1708,9 @@ pub fn payload_bytes(payload: &str) -> impl Iterator<Item = u8> + '_ {
 ///
 /// The inverse of [`literal_payload`], for the consumers that need Rust text
 /// rather than bytes: a header name to open, a symbol name, a message to
-/// print. Reading a payload as if it were already text instead produced
-/// mojibake -- `#include "café.h"` looked for `cafÃ©.h` and reported it
-/// missing. Lossy when the bytes are not valid UTF-8; where the bytes
-/// themselves matter, use [`payload_bytes`].
+/// print. Reading a payload as if it were already text yields mojibake --
+/// `#include "café.h"` looks for `cafÃ©.h`. Lossy when the bytes are not valid
+/// UTF-8; where the bytes themselves matter, use [`payload_bytes`].
 pub fn payload_text(payload: &str) -> String {
     let bytes: Vec<u8> = payload_bytes(payload).collect();
     String::from_utf8_lossy(&bytes).into_owned()
@@ -1861,7 +1810,6 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
     }
 }
 
-/// Format token type name
 pub fn token_type_name(typ: TokenType) -> &'static str {
     match typ {
         TokenType::Pragma => "PRAGMA",
@@ -1882,9 +1830,7 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
     }
 }
 
-// ============================================================================
 // Token to Text Conversion (for preprocessing output)
-// ============================================================================
 
 /// Convert preprocessed tokens back to source text, byte for byte.
 ///
@@ -1948,10 +1894,6 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
 
     result
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 #[path = "test_lexer.rs"]

@@ -16,9 +16,7 @@ use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 
-// ============================================================================
 // Operators
-// ============================================================================
 
 /// Which operation a checked-arithmetic builtin performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,9 +139,7 @@ pub enum AssignOp {
     ShrAssign,
 }
 
-// ============================================================================
 // Expressions
-// ============================================================================
 
 /// An expression with type annotation
 ///
@@ -212,7 +208,6 @@ pub enum ExprKind {
     /// Floating-point literal
     FloatLit(FloatVal),
 
-    /// Character literal
     /// A character constant, as the integer value it denotes.
     ///
     /// Converted once, in the parser, because the conversion depends on the
@@ -222,10 +217,6 @@ pub enum ExprKind {
     /// `char`'s target signedness, and `'\x80'` is -128 where `char` is signed
     /// and 128 where it is not. A prefixed constant instead takes the code
     /// point in its own type.
-    ///
-    /// Five consumers used to re-derive this from a `char` with a hardcoded
-    /// `as u8 as i8`, which was right only for a narrow constant on a
-    /// signed-`char` target and wrong for every prefixed one.
     CharLit(i64),
 
     /// String literal
@@ -846,9 +837,7 @@ pub enum ExprKind {
     },
 }
 
-// ============================================================================
 // OffsetOf Support (__builtin_offsetof)
-// ============================================================================
 
 /// A path element in __builtin_offsetof(type, path)
 /// Supports member.path[index].field style paths
@@ -860,9 +849,7 @@ pub enum OffsetOfPath {
     Index(i64),
 }
 
-// ============================================================================
 // Initializer List Support (C99)
-// ============================================================================
 
 /// A designator for struct field or array index in an initializer
 #[derive(Debug, Clone)]
@@ -899,10 +886,8 @@ pub struct InitElement {
 /// - a pointer to a variably-modified array. `sizeof(int(*)[n])` is the
 ///   pointer's size, and gcc does not evaluate `n` there either;
 /// - a type whose unsized levels outnumber the expressions supplied, as in
-///   `sizeof(int[][n])`. That is invalid C -- gcc rejects it as an incomplete
-///   type -- and declining leaves it at its previous behaviour rather than
-///   pairing the one expression with the wrong level and inventing a
-///   plausible-looking number.
+///   `sizeof(int[][n])`, which is invalid C anyway -- gcc rejects it as an
+///   incomplete type.
 ///
 /// Five consumers need this same answer, so it is asked in one place: the
 /// linearizer, both constant folders, `is_pure_expr` and `expr_is_runtime`.
@@ -1056,9 +1041,7 @@ impl Expr {
     }
 }
 
-// ============================================================================
 // Inline Assembly Support (GCC Extended Asm)
-// ============================================================================
 
 /// An operand in an inline assembly statement
 /// Format: [name] "constraint" (expr)
@@ -1072,9 +1055,7 @@ pub struct AsmOperand {
     pub expr: Expr,
 }
 
-// ============================================================================
 // Statements
-// ============================================================================
 
 /// A statement in the AST
 #[derive(Debug, Clone)]
@@ -1185,9 +1166,7 @@ pub enum BlockItem {
     Statement(Box<Stmt>),
 }
 
-// ============================================================================
 // Declarations
-// ============================================================================
 
 /// A declaration
 #[derive(Debug, Clone)]
@@ -1272,9 +1251,7 @@ impl Declaration {
     }
 }
 
-// ============================================================================
 // Function Definition
-// ============================================================================
 
 /// A function parameter
 #[derive(Debug, Clone)]
@@ -1383,9 +1360,7 @@ pub struct FunctionDef {
     pub attrs: FunctionAttrs,
 }
 
-// ============================================================================
 // Translation Unit
-// ============================================================================
 
 /// An external declaration (top-level item)
 #[derive(Debug, Clone)]
@@ -1408,10 +1383,6 @@ impl TranslationUnit {
         self.items.push(item);
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1752,8 +1723,8 @@ mod tests {
         }
 
         // There is no `Fabsl` variant: `__builtin_fabsl` lowers to an ordinary
-        // call to `fabsl` (#C121), because the opcode it used to build takes a
-        // `double` and so read only the low eight bytes of an x87 value.
+        // call to `fabsl`, because a `double` opcode would read only the low
+        // eight bytes of an x87 value.
     }
 
     #[test]

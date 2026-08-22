@@ -12,9 +12,7 @@
 use super::codegen::CodeGenBase;
 use super::lir::{Directive, EmitAsm, LirInst, Symbol};
 
-// ============================================================================
 // DWARF Constants (DWARF Version 2)
-// ============================================================================
 
 // DWARF Tags (DW_TAG_*)
 pub const DW_TAG_COMPILE_UNIT: u64 = 0x11;
@@ -39,9 +37,7 @@ pub const DW_LANG_C99: u64 = 0x0c;
 // DWARF Children flag
 pub const DW_CHILDREN_NO: u64 = 0x00;
 
-// ============================================================================
 // DWARF Generation Functions
-// ============================================================================
 
 /// Generate the abbreviation table for a minimal compile unit.
 /// This defines the structure of DIEs (Debug Information Entries).
@@ -92,14 +88,6 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
 }
 
 /// Generate the .debug_info section with compile unit DIE.
-///
-/// # Arguments
-/// * `base` - CodeGenBase to push directives to
-/// * `producer` - Compiler identification string (e.g., "c17 0.7.0")
-/// * `source_name` - Primary source filename
-/// * `comp_dir` - Compilation directory
-/// * `low_pc_label` - Label for start of code (e.g., ".Ltext0"), or None if no code
-/// * `high_pc_label` - Label for end of code (e.g., ".Ltext_end"), or None if no code
 pub fn generate_debug_info<I: LirInst + EmitAsm>(
     base: &mut CodeGenBase<I>,
     producer: &str,

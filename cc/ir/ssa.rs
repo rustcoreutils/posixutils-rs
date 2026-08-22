@@ -6,11 +6,8 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// SSA Conversion for c17 C17 compiler
-//
-// Converts memory-based local variables to SSA form:
-// - Inserts phi nodes at dominance frontiers
-// - Renames variables to complete SSA construction
+// Converts memory-based local variables to SSA form: phi nodes at dominance
+// frontiers, then renaming to complete the construction.
 //
 
 use super::dominate::{compute_dominance_frontiers, domtree_build, idf_compute};
@@ -21,9 +18,7 @@ use std::collections::{HashMap, HashSet};
 const DEFAULT_SSA_RENAME_CAPACITY: usize = 32;
 const DEFAULT_SSA_PHI_CAPACITY: usize = 16;
 
-// ============================================================================
 // SSA Conversion State
-// ============================================================================
 
 /// State for SSA conversion
 struct SsaConverter<'a> {
@@ -103,7 +98,6 @@ impl<'a> SsaConverter<'a> {
         id
     }
 
-    /// Create an undef pseudo
     fn undef_pseudo(&mut self) -> PseudoId {
         let id = PseudoId(self.next_pseudo_id);
         self.next_pseudo_id += 1;
@@ -114,9 +108,7 @@ impl<'a> SsaConverter<'a> {
     }
 }
 
-// ============================================================================
 // Phase 1: Variable Analysis and Phi Placement
-// ============================================================================
 
 /// Information about a local variable during SSA conversion
 #[derive(Default)]
@@ -261,9 +253,7 @@ fn insert_phi_nodes(converter: &mut SsaConverter, var_name: &str, var_info: &Var
     }
 }
 
-// ============================================================================
 // Phase 2: Variable Renaming
-// ============================================================================
 
 /// Definition stack for variable renaming
 struct DefStack {
@@ -589,9 +579,7 @@ fn lookup_var_in_pred(func: &Function, bb_id: BasicBlockId, var: &str) -> Option
     }
 }
 
-// ============================================================================
 // Phase 3: Cleanup
-// ============================================================================
 
 /// Remove dead stores that were converted to SSA.
 fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
@@ -606,26 +594,13 @@ fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
     }
 }
 
-// ============================================================================
 // Main Entry Point
-// ============================================================================
 
 /// Convert a function to SSA form.
 ///
 /// This promotes eligible local variables from memory to SSA registers,
-/// inserting phi nodes at control flow merge points.
-///
-/// # Algorithm
-/// 1. Build dominator tree
-/// 2. For each promotable local variable:
-///    - Compute its iterated dominance frontier (IDF)
-///    - Insert phi nodes at IDF blocks
-/// 3. Rename variables:
-///    - Walk blocks in dominator tree order
-///    - Replace loads with reaching definitions
-///    - Record stores as new definitions
-///    - Fill in phi operands from predecessors
-/// 4. Remove dead stores
+/// inserting phi nodes at each variable's iterated dominance frontier. The
+/// phases are marked in the body.
 pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
     if func.blocks.is_empty() {
         return;
@@ -681,10 +656,6 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
     converter.func.next_pseudo = converter.next_pseudo_id;
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,14 +668,6 @@ mod tests {
         // int x = 1;
         // if (cond) x = 2;
         // return x;
-        //
-        //       entry(0)
-        //       /     \
-        //      v       v
-        //   then(1)  else(2)
-        //       \     /
-        //        v   v
-        //       merge(3)
 
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
@@ -813,16 +776,12 @@ mod tests {
         assert_eq!(merge.idom, Some(BasicBlockId(0)));
     }
 
-    // ========================================================================
-    // Bug fix regression test: pseudo ID tracking from instructions
     // Verifies that SSA conversion correctly finds max pseudo ID from
     // instruction operands, not just func.pseudos
-    // ========================================================================
 
     #[test]
     fn test_max_pseudo_id_from_instructions() {
         // Regression test: pseudo IDs allocated but not in func.pseudos are tracked
-        // This tests the fix in SsaConverter::new() that scans instruction operands
         let types = TypeTable::new(&Target::host());
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
@@ -862,22 +821,9 @@ mod tests {
 
         // The converter should have found PseudoId(100) from scanning instructions
         // and used next_pseudo_id >= 101 for any new IDs
-        // (We can't easily verify the internal counter, but the lack of panic
-        // indicates the fix is working)
     }
 
-    // ========================================================================
     // Regression test: phi insertion in goto-dispatch CFG
-    //
-    // The bug: insert_phi_nodes() had a filter that skipped phi node insertion
-    // at IDF blocks not dominated by the variable's declaration block. This
-    // was too aggressive for function-scope variables used in goto-dispatch
-    // patterns (like CPython's ceval.c), where a variable declared at function
-    // scope is modified in case handlers and read back at a dispatch label
-    // connected by goto back-edges.
-    //
-    // The fix: remove the decl_block dominance filter from insert_phi_nodes().
-    // ========================================================================
 
     fn make_goto_dispatch_cfg(types: &TypeTable) -> Function {
         // Create a CFG mimicking CPython's ceval.c goto-dispatch pattern:
@@ -904,17 +850,6 @@ mod tests {
         //
         // done:
         //   return x;
-        //
-        //       entry(0)
-        //         |
-        //         v
-        //  +-> dispatch(1) --+--+
-        //  |    |    |       |  |
-        //  |    v    |       |  v
-        //  | handler0(2)     | handler1(3)
-        //  |    |            |  |
-        //  +----+            |  v
-        //                    +-> done(4)
 
         let int_id = types.int_id;
         let mut func = Function::new("test_dispatch", int_id);
@@ -1013,14 +948,12 @@ mod tests {
 
     #[test]
     fn test_goto_dispatch_phi_insertion() {
-        // Regression test for the phi insertion bug.
         // In a goto-dispatch CFG, variable 'x' is:
         //   - defined in entry(0), handler0(2), handler1(3)
         //   - read in done(4)
         //   - the dispatch(1) block is a merge point on the back-edge from handler0
         //
         // The IDF of def_blocks {0, 2, 3} should include dispatch(1) and done(4).
-        // The old buggy code would skip dispatch(1) if it wasn't dominated by decl_block.
         let types = TypeTable::new(&Target::host());
         let mut func = make_goto_dispatch_cfg(&types);
 
@@ -1092,9 +1025,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // PhiSource tests: verify SSA conversion emits PhiSource instructions
-    // ========================================================================
 
     #[test]
     fn test_phisource_in_predecessors() {

@@ -20,9 +20,7 @@ use crate::arch::lir::{
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
-// ============================================================================
 // Memory Addressing Modes
-// ============================================================================
 
 /// AArch64 memory addressing mode
 #[derive(Debug, Clone, PartialEq)]
@@ -41,7 +39,6 @@ pub enum MemAddr {
 }
 
 impl MemAddr {
-    /// Format memory operand in AArch64 syntax
     pub fn format(&self) -> String {
         match self {
             MemAddr::Base(base) => format!("[{}]", base.name64()),
@@ -62,9 +59,7 @@ impl MemAddr {
     }
 }
 
-// ============================================================================
 // General-Purpose Operands
-// ============================================================================
 
 /// AArch64 general-purpose operand (register or immediate)
 #[derive(Debug, Clone, PartialEq)]
@@ -85,9 +80,7 @@ impl GpOperand {
     }
 }
 
-// ============================================================================
 // AArch64 LIR Instructions
-// ============================================================================
 
 /// AArch64 Low-level IR instruction
 #[derive(Debug, Clone)]
@@ -801,9 +794,7 @@ pub enum DmbOption {
     Ishld,
 }
 
-// ============================================================================
 // LirInst Implementation
-// ============================================================================
 
 impl crate::arch::lir::LirInst for Aarch64Inst {
     fn from_directive(dir: Directive) -> Self {
@@ -811,130 +802,19 @@ impl crate::arch::lir::LirInst for Aarch64Inst {
     }
 }
 
-// ============================================================================
 // EmitAsm Implementation
-// ============================================================================
 
 impl EmitAsm for Aarch64Inst {
     fn emit(&self, target: &Target, out: &mut String) {
         match self {
             // Data Movement
-            Aarch64Inst::Mov { size, src, dst } => {
-                let sz = size.bits().max(32);
-                match src {
-                    GpOperand::Reg(_) => {
-                        let _ = writeln!(
-                            out,
-                            "    mov {}, {}",
-                            dst.name_for_size(sz),
-                            src.format(OperandSize::from_bits(sz))
-                        );
-                    }
-                    GpOperand::Imm(v) => {
-                        // AArch64 MOV immediate has limited encoding
-                        // For values that don't fit, use MOVZ + MOVK sequence
-                        let v = *v as u64;
-                        if v == 0 {
-                            let _ = writeln!(out, "    mov {}, #0", dst.name_for_size(sz));
-                        } else if sz == 32 {
-                            // 32-bit: up to 2 MOVZ/MOVK instructions
-                            let v32 = v as u32;
-                            let lo = (v32 & 0xFFFF) as u16;
-                            let hi = ((v32 >> 16) & 0xFFFF) as u16;
-                            if hi == 0 {
-                                // Fits in 16 bits
-                                let _ =
-                                    writeln!(out, "    movz {}, #{}", dst.name_for_size(32), lo);
-                            } else if lo == 0 {
-                                // Upper 16 bits only
-                                let _ = writeln!(
-                                    out,
-                                    "    movz {}, #{}, lsl #16",
-                                    dst.name_for_size(32),
-                                    hi
-                                );
-                            } else {
-                                // Need both
-                                let _ =
-                                    writeln!(out, "    movz {}, #{}", dst.name_for_size(32), lo);
-                                let _ = writeln!(
-                                    out,
-                                    "    movk {}, #{}, lsl #16",
-                                    dst.name_for_size(32),
-                                    hi
-                                );
-                            }
-                        } else {
-                            // 64-bit: up to 4 MOVZ/MOVK instructions
-                            let parts = [
-                                (v & 0xFFFF) as u16,
-                                ((v >> 16) & 0xFFFF) as u16,
-                                ((v >> 32) & 0xFFFF) as u16,
-                                ((v >> 48) & 0xFFFF) as u16,
-                            ];
-                            // Find first non-zero part
-                            let mut first = true;
-                            for (i, &part) in parts.iter().enumerate() {
-                                if part != 0 || (first && i == 3) {
-                                    let shift = i * 16;
-                                    if first {
-                                        if shift == 0 {
-                                            let _ = writeln!(
-                                                out,
-                                                "    movz {}, #{}",
-                                                dst.name_for_size(64),
-                                                part
-                                            );
-                                        } else {
-                                            let _ = writeln!(
-                                                out,
-                                                "    movz {}, #{}, lsl #{}",
-                                                dst.name_for_size(64),
-                                                part,
-                                                shift
-                                            );
-                                        }
-                                        first = false;
-                                    } else {
-                                        let _ = writeln!(
-                                            out,
-                                            "    movk {}, #{}, lsl #{}",
-                                            dst.name_for_size(64),
-                                            part,
-                                            shift
-                                        );
-                                    }
-                                }
-                            }
-                            // Handle all-zero case
-                            if first {
-                                let _ = writeln!(out, "    movz {}, #0", dst.name_for_size(64));
-                            }
-                        }
-                    }
-                }
-            }
-
+            Aarch64Inst::Mov { size, src, dst } => Self::emit_mov(size, src, dst, out),
             Aarch64Inst::Movz {
                 size,
                 imm,
                 shift,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                if *shift == 0 {
-                    let _ = writeln!(out, "    movz {}, #{}", dst.name_for_size(sz), imm);
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "    movz {}, #{}, lsl #{}",
-                        dst.name_for_size(sz),
-                        imm,
-                        shift
-                    );
-                }
-            }
-
+            } => Self::emit_movz(size, imm, shift, dst, out),
             Aarch64Inst::Movk {
                 size,
                 imm,
@@ -966,19 +846,7 @@ impl EmitAsm for Aarch64Inst {
                 dst_size,
                 addr,
                 dst,
-            } => {
-                let insn = match (src_size, dst_size) {
-                    (OperandSize::B8, OperandSize::B32) => "ldrsb",
-                    (OperandSize::B8, OperandSize::B64) => "ldrsb",
-                    (OperandSize::B16, OperandSize::B32) => "ldrsh",
-                    (OperandSize::B16, OperandSize::B64) => "ldrsh",
-                    (OperandSize::B32, OperandSize::B64) => "ldrsw",
-                    _ => "ldr",
-                };
-                let reg = dst.name_for_size(dst_size.bits());
-                let _ = writeln!(out, "    {} {}, {}", insn, reg, addr.format());
-            }
-
+            } => Self::emit_ldrs(src_size, dst_size, addr, dst, out),
             Aarch64Inst::Str { size, src, addr } => {
                 let insn = match size {
                     OperandSize::B8 => "strb",
@@ -1021,123 +889,22 @@ impl EmitAsm for Aarch64Inst {
                 );
             }
 
-            Aarch64Inst::Adrp { sym, dst } => {
-                let sym_name = sym.format_for_target(target);
-                match target.os {
-                    Os::MacOS => {
-                        let _ = writeln!(out, "    adrp {}, {}@PAGE", dst.name64(), sym_name);
-                    }
-                    Os::Linux | Os::FreeBSD => {
-                        let _ = writeln!(out, "    adrp {}, {}", dst.name64(), sym_name);
-                    }
-                }
-            }
-
+            Aarch64Inst::Adrp { sym, dst } => Self::emit_adrp(sym, dst, target, out),
             Aarch64Inst::AdrpGotPage { sym, dst } => {
-                let sym_name = sym.format_for_target(target);
-                // The GOT relocation spelling is per object format. `@GOTPAGE`
-                // is Mach-O; ELF writes `:got:`. This emitted the Mach-O form
-                // unconditionally -- its comment even said "macOS only" -- but
-                // needs_got_access fires for every extern symbol on every
-                // target, so GNU as saw `adrp x0, stdout@GOTPAGE` and rejected
-                // it as "unexpected characters following instruction".
-                match target.os {
-                    Os::MacOS => {
-                        let _ = writeln!(out, "    adrp {}, {}@GOTPAGE", dst.name64(), sym_name);
-                    }
-                    _ => {
-                        let _ = writeln!(out, "    adrp {}, :got:{}", dst.name64(), sym_name);
-                    }
-                }
+                Self::emit_adrp_got_page(sym, dst, target, out)
             }
-
             Aarch64Inst::AddSymOffset { sym, base, dst } => {
-                let sym_name = sym.format_for_target(target);
-                match target.os {
-                    Os::MacOS => {
-                        let _ = writeln!(
-                            out,
-                            "    add {}, {}, {}@PAGEOFF",
-                            dst.name64(),
-                            base.name64(),
-                            sym_name
-                        );
-                    }
-                    Os::Linux | Os::FreeBSD => {
-                        let _ = writeln!(
-                            out,
-                            "    add {}, {}, :lo12:{}",
-                            dst.name64(),
-                            base.name64(),
-                            sym_name
-                        );
-                    }
-                }
+                Self::emit_add_sym_offset(sym, base, dst, target, out)
             }
-
             Aarch64Inst::LdrSymOffset {
                 size,
                 sym,
                 base,
                 dst,
-            } => {
-                let sym_name = sym.format_for_target(target);
-                let sz = size.bits().max(32);
-                let ldr_insn = match size {
-                    OperandSize::B8 => "ldrb",
-                    OperandSize::B16 => "ldrh",
-                    OperandSize::B32 => "ldr",
-                    OperandSize::B64 => "ldr",
-                };
-                match target.os {
-                    Os::MacOS => {
-                        let _ = writeln!(
-                            out,
-                            "    {} {}, [{}, {}@PAGEOFF]",
-                            ldr_insn,
-                            dst.name_for_size(sz),
-                            base.name64(),
-                            sym_name
-                        );
-                    }
-                    Os::Linux | Os::FreeBSD => {
-                        let _ = writeln!(
-                            out,
-                            "    {} {}, [{}, :lo12:{}]",
-                            ldr_insn,
-                            dst.name_for_size(sz),
-                            base.name64(),
-                            sym_name
-                        );
-                    }
-                }
-            }
-
+            } => Self::emit_ldr_sym_offset(size, sym, base, dst, target, out),
             Aarch64Inst::LdrSymGotPageOff { sym, base, dst } => {
-                let sym_name = sym.format_for_target(target);
-                // As above: `@GOTPAGEOFF` is Mach-O, `:got_lo12:` is ELF.
-                match target.os {
-                    Os::MacOS => {
-                        let _ = writeln!(
-                            out,
-                            "    ldr {}, [{}, {}@GOTPAGEOFF]",
-                            dst.name64(),
-                            base.name64(),
-                            sym_name
-                        );
-                    }
-                    _ => {
-                        let _ = writeln!(
-                            out,
-                            "    ldr {}, [{}, :got_lo12:{}]",
-                            dst.name64(),
-                            base.name64(),
-                            sym_name
-                        );
-                    }
-                }
+                Self::emit_ldr_sym_got_page_off(sym, base, dst, target, out)
             }
-
             // TLS Instructions
             Aarch64Inst::Mrs { sysreg, dst } => {
                 let _ = writeln!(out, "    mrs {}, {}", dst.name64(), sysreg);
@@ -1189,12 +956,8 @@ impl EmitAsm for Aarch64Inst {
             Aarch64Inst::TlsdescCall { sym } => {
                 let _ = writeln!(out, "    .tlsdesccall {}", sym.name);
             }
-            Aarch64Inst::Blr { reg } => {
-                let _ = writeln!(out, "    blr {}", reg.name64());
-            }
-            Aarch64Inst::BrReg { reg } => {
-                let _ = writeln!(out, "    br {}", reg.name64());
-            }
+            Aarch64Inst::Blr { reg } => Self::emit_branch_reg("blr", reg, out),
+            Aarch64Inst::BrReg { reg } => Self::emit_branch_reg("br", reg, out),
             Aarch64Inst::AdrpGottpoff { sym, dst } => {
                 let sym_name = sym.format_for_target(target);
                 let _ = writeln!(out, "    adrp {}, :gottpoff:{}", dst.name64(), sym_name);
@@ -1217,257 +980,81 @@ impl EmitAsm for Aarch64Inst {
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    add {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
-                );
-            }
-
+            } => Self::emit_alu3("add", size, src1, src2, dst, out),
             Aarch64Inst::Sub {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    sub {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
-                );
-            }
-
+            } => Self::emit_alu3("sub", size, src1, src2, dst, out),
             Aarch64Inst::Mul {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    mul {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.name_for_size(sz)
-                );
-            }
-
+            } => Self::emit_alu3_reg("mul", size, src1, src2, dst, out),
             Aarch64Inst::Sdiv {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    sdiv {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.name_for_size(sz)
-                );
-            }
-
+            } => Self::emit_alu3_reg("sdiv", size, src1, src2, dst, out),
             Aarch64Inst::Udiv {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    udiv {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.name_for_size(sz)
-                );
-            }
-
+            } => Self::emit_alu3_reg("udiv", size, src1, src2, dst, out),
             Aarch64Inst::Msub {
                 size,
                 mul1,
                 mul2,
                 sub,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    msub {}, {}, {}, {}",
-                    dst.name_for_size(sz),
-                    mul1.name_for_size(sz),
-                    mul2.name_for_size(sz),
-                    sub.name_for_size(sz)
-                );
-            }
-
-            Aarch64Inst::Neg { size, src, dst } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    neg {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz)
-                );
-            }
-
+            } => Self::emit_msub(size, mul1, mul2, sub, dst, out),
+            Aarch64Inst::Neg { size, src, dst } => Self::emit_alu2("neg", size, src, dst, out),
             // Bitwise Operations
             Aarch64Inst::And {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    and {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
-                );
-            }
-
+            } => Self::emit_alu3("and", size, src1, src2, dst, out),
             Aarch64Inst::Orr {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    orr {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
-                );
-            }
-
+            } => Self::emit_alu3("orr", size, src1, src2, dst, out),
             Aarch64Inst::Eor {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    eor {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
-                );
-            }
-
-            Aarch64Inst::Mvn { size, src, dst } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    mvn {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz)
-                );
-            }
-
+            } => Self::emit_alu3("eor", size, src1, src2, dst, out),
+            Aarch64Inst::Mvn { size, src, dst } => Self::emit_alu2("mvn", size, src, dst, out),
             Aarch64Inst::Lsl {
                 size,
                 src,
                 amount,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    lsl {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz),
-                    amount.format(OperandSize::from_bits(sz))
-                );
-            }
-
+            } => Self::emit_shift("lsl", size, src, amount, dst, out),
             Aarch64Inst::Lsr {
                 size,
                 src,
                 amount,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    lsr {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz),
-                    amount.format(OperandSize::from_bits(sz))
-                );
-            }
-
+            } => Self::emit_shift("lsr", size, src, amount, dst, out),
             Aarch64Inst::Asr {
                 size,
                 src,
                 amount,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    asr {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz),
-                    amount.format(OperandSize::from_bits(sz))
-                );
-            }
-
-            Aarch64Inst::Rev { size, src, dst } => {
-                let sz = size.bits().max(32);
-                // rev for 32-bit uses w registers, rev for 64-bit uses x registers
-                let _ = writeln!(
-                    out,
-                    "    rev {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz)
-                );
-            }
-
-            Aarch64Inst::Rev16 { size, src, dst } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    rev16 {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz)
-                );
-            }
-
-            Aarch64Inst::Rbit { size, src, dst } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    rbit {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz)
-                );
-            }
-
-            Aarch64Inst::Clz { size, src, dst } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    clz {}, {}",
-                    dst.name_for_size(sz),
-                    src.name_for_size(sz)
-                );
-            }
-
+            } => Self::emit_shift("asr", size, src, amount, dst, out),
+            Aarch64Inst::Rev { size, src, dst } => Self::emit_alu2("rev", size, src, dst, out),
+            Aarch64Inst::Rev16 { size, src, dst } => Self::emit_alu2("rev16", size, src, dst, out),
+            Aarch64Inst::Rbit { size, src, dst } => Self::emit_alu2("rbit", size, src, dst, out),
+            Aarch64Inst::Clz { size, src, dst } => Self::emit_alu2("clz", size, src, dst, out),
             // Comparison and Conditional
             Aarch64Inst::Cmp { size, src1, src2 } => {
                 let sz = size.bits().max(32);
@@ -1489,41 +1076,20 @@ impl EmitAsm for Aarch64Inst {
                 src_true,
                 src_false,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    csel {}, {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src_true.name_for_size(sz),
-                    src_false.name_for_size(sz),
-                    cond.aarch64_suffix()
-                );
-            }
-
+            } => Self::emit_csel(size, cond, src_true, src_false, dst, out),
             // Sign/Zero Extension
             Aarch64Inst::Sxtb { dst_size, src, dst } => {
-                let sz = dst_size.bits().max(32);
-                let _ = writeln!(out, "    sxtb {}, {}", dst.name_for_size(sz), src.name32());
+                Self::emit_sxt("sxtb", dst_size, src, dst, out)
             }
-
             Aarch64Inst::Sxth { dst_size, src, dst } => {
-                let sz = dst_size.bits().max(32);
-                let _ = writeln!(out, "    sxth {}, {}", dst.name_for_size(sz), src.name32());
+                Self::emit_sxt("sxth", dst_size, src, dst, out)
             }
-
             Aarch64Inst::Sxtw { src, dst } => {
                 let _ = writeln!(out, "    sxtw {}, {}", dst.name64(), src.name32());
             }
 
-            Aarch64Inst::Uxtb { src, dst } => {
-                let _ = writeln!(out, "    uxtb {}, {}", dst.name32(), src.name32());
-            }
-
-            Aarch64Inst::Uxth { src, dst } => {
-                let _ = writeln!(out, "    uxth {}, {}", dst.name32(), src.name32());
-            }
-
+            Aarch64Inst::Uxtb { src, dst } => Self::emit_uxt("uxtb", src, dst, out),
+            Aarch64Inst::Uxth { src, dst } => Self::emit_uxt("uxth", src, dst, out),
             // Control Flow
             Aarch64Inst::B { target: lbl } => {
                 let _ = writeln!(out, "    b {}", lbl.name());
@@ -1560,41 +1126,10 @@ impl EmitAsm for Aarch64Inst {
             }
 
             // Floating-Point
-            Aarch64Inst::FmovReg { size, src, dst } => {
-                // `fmov` has no 128-bit form. A whole-register copy is the
-                // vector move, which is what gcc emits for `long double`.
-                if *size == FpSize::Quad {
-                    let _ = writeln!(out, "    mov {}.16b, {}.16b", dst.name_v(), src.name_v());
-                    return;
-                }
-                let name = match size {
-                    FpSize::Half => (src.name_h(), dst.name_h()),
-                    FpSize::Single => (src.name_s(), dst.name_s()),
-                    FpSize::Double => (src.name_d(), dst.name_d()),
-                    FpSize::Quad => unreachable!("handled above"),
-                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
-                };
-                let _ = writeln!(out, "    fmov {}, {}", name.1, name.0);
-            }
-
+            Aarch64Inst::FmovReg { size, src, dst } => Self::emit_fmov_reg(size, src, dst, out),
             Aarch64Inst::FmovFromGp { size, src, dst } => {
-                let fp_name = match size {
-                    FpSize::Half => dst.name_h(),
-                    FpSize::Single => dst.name_s(),
-                    FpSize::Double => dst.name_d(),
-                    FpSize::Quad => dst.name_q(),
-                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
-                };
-                let gp_name = match size {
-                    FpSize::Half => src.name32(), // half is moved via 32-bit GP
-                    FpSize::Single => src.name32(),
-                    FpSize::Double => src.name64(),
-                    FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
-                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
-                };
-                let _ = writeln!(out, "    fmov {}, {}", fp_name, gp_name);
+                Self::emit_fmov_from_gp(size, src, dst, out)
             }
-
             Aarch64Inst::InsGpToVecD { lane, src, dst } => {
                 let _ = writeln!(
                     out,
@@ -1605,36 +1140,8 @@ impl EmitAsm for Aarch64Inst {
                 );
             }
 
-            Aarch64Inst::FmovToGp { size, src, dst } => {
-                let fp_name = match size {
-                    FpSize::Half => src.name_h(),
-                    FpSize::Single => src.name_s(),
-                    FpSize::Double => src.name_d(),
-                    FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
-                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
-                };
-                let gp_name = match size {
-                    FpSize::Half => dst.name32(), // half is moved via 32-bit GP
-                    FpSize::Single => dst.name32(),
-                    FpSize::Double => dst.name64(),
-                    FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
-                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
-                };
-                let _ = writeln!(out, "    fmov {}, {}", gp_name, fp_name);
-            }
-
-            Aarch64Inst::LdrFp { size, addr, dst } => {
-                let name = match size {
-                    FpSize::Half => dst.name_h(),
-                    FpSize::Single => dst.name_s(),
-                    FpSize::Double => dst.name_d(),
-                    // AAPCS64 keeps binary128 in a whole Q register.
-                    FpSize::Quad => dst.name_q(),
-                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
-                };
-                let _ = writeln!(out, "    ldr {}, {}", name, addr.format());
-            }
-
+            Aarch64Inst::FmovToGp { size, src, dst } => Self::emit_fmov_to_gp(size, src, dst, out),
+            Aarch64Inst::LdrFp { size, addr, dst } => Self::emit_ldr_fp(size, addr, dst, out),
             Aarch64Inst::StrFp { size, src, addr } => {
                 let name = match size {
                     FpSize::Half => src.name_h(),
@@ -1683,97 +1190,31 @@ impl EmitAsm for Aarch64Inst {
                 sym,
                 base,
                 dst,
-            } => {
-                let sym_name = sym.format_for_target(target);
-                let fp_name = match size {
-                    FpSize::Half => dst.name_h(),
-                    FpSize::Single => dst.name_s(),
-                    FpSize::Double => dst.name_d(),
-                    FpSize::Quad => dst.name_q(),
-                    FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
-                };
-                match target.os {
-                    Os::MacOS => {
-                        let _ = writeln!(
-                            out,
-                            "    ldr {}, [{}, {}@PAGEOFF]",
-                            fp_name,
-                            base.name64(),
-                            sym_name
-                        );
-                    }
-                    Os::Linux | Os::FreeBSD => {
-                        let _ = writeln!(
-                            out,
-                            "    ldr {}, [{}, :lo12:{}]",
-                            fp_name,
-                            base.name64(),
-                            sym_name
-                        );
-                    }
-                }
-            }
-
+            } => Self::emit_ldr_fp_sym_offset(size, sym, base, dst, target, out),
             Aarch64Inst::Fadd {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let _ = writeln!(
-                    out,
-                    "    fadd {}, {}, {}",
-                    dst.name_for_size(size_bits(*size)),
-                    src1.name_for_size(size_bits(*size)),
-                    src2.name_for_size(size_bits(*size))
-                );
-            }
-
+            } => Self::emit_fp3("fadd", size, src1, src2, dst, out),
             Aarch64Inst::Fsub {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let _ = writeln!(
-                    out,
-                    "    fsub {}, {}, {}",
-                    dst.name_for_size(size_bits(*size)),
-                    src1.name_for_size(size_bits(*size)),
-                    src2.name_for_size(size_bits(*size))
-                );
-            }
-
+            } => Self::emit_fp3("fsub", size, src1, src2, dst, out),
             Aarch64Inst::Fmul {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let _ = writeln!(
-                    out,
-                    "    fmul {}, {}, {}",
-                    dst.name_for_size(size_bits(*size)),
-                    src1.name_for_size(size_bits(*size)),
-                    src2.name_for_size(size_bits(*size))
-                );
-            }
-
+            } => Self::emit_fp3("fmul", size, src1, src2, dst, out),
             Aarch64Inst::Fdiv {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let _ = writeln!(
-                    out,
-                    "    fdiv {}, {}, {}",
-                    dst.name_for_size(size_bits(*size)),
-                    src1.name_for_size(size_bits(*size)),
-                    src2.name_for_size(size_bits(*size))
-                );
-            }
-
+            } => Self::emit_fp3("fdiv", size, src1, src2, dst, out),
             Aarch64Inst::Fneg { size, src, dst } => {
                 let _ = writeln!(
                     out,
@@ -1805,45 +1246,25 @@ impl EmitAsm for Aarch64Inst {
                 fp_size,
                 src,
                 dst,
-            } => {
-                let fp_name = dst.name_for_size(size_bits(*fp_size));
-                let gp_name = src.name_for_size(int_size.bits().max(32));
-                let _ = writeln!(out, "    scvtf {}, {}", fp_name, gp_name);
-            }
-
+            } => Self::emit_int_to_fp("scvtf", int_size, fp_size, src, dst, out),
             Aarch64Inst::Ucvtf {
                 int_size,
                 fp_size,
                 src,
                 dst,
-            } => {
-                let fp_name = dst.name_for_size(size_bits(*fp_size));
-                let gp_name = src.name_for_size(int_size.bits().max(32));
-                let _ = writeln!(out, "    ucvtf {}, {}", fp_name, gp_name);
-            }
-
+            } => Self::emit_int_to_fp("ucvtf", int_size, fp_size, src, dst, out),
             Aarch64Inst::Fcvtzs {
                 fp_size,
                 int_size,
                 src,
                 dst,
-            } => {
-                let fp_name = src.name_for_size(size_bits(*fp_size));
-                let gp_name = dst.name_for_size(int_size.bits().max(32));
-                let _ = writeln!(out, "    fcvtzs {}, {}", gp_name, fp_name);
-            }
-
+            } => Self::emit_fp_to_int("fcvtzs", fp_size, int_size, src, dst, out),
             Aarch64Inst::Fcvtzu {
                 fp_size,
                 int_size,
                 src,
                 dst,
-            } => {
-                let fp_name = src.name_for_size(size_bits(*fp_size));
-                let gp_name = dst.name_for_size(int_size.bits().max(32));
-                let _ = writeln!(out, "    fcvtzu {}, {}", gp_name, fp_name);
-            }
-
+            } => Self::emit_fp_to_int("fcvtzu", fp_size, int_size, src, dst, out),
             Aarch64Inst::Fcvt {
                 src_size,
                 dst_size,
@@ -1871,83 +1292,17 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(out, "    addv {}, {}.8b", dst.name_b(), src.name_v());
             }
 
-            // ================================================================
             // Atomic Operations (ARMv8.1 LSE)
-            // ================================================================
-            Aarch64Inst::Ldar { size, addr, dst } => {
-                let insn = match size {
-                    OperandSize::B8 => "ldarb",
-                    OperandSize::B16 => "ldarh",
-                    OperandSize::B32 | OperandSize::B64 => "ldar",
-                };
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    {} {}, {}",
-                    insn,
-                    dst.name_for_size(sz),
-                    addr.format()
-                );
-            }
-
-            Aarch64Inst::Stlr { size, src, addr } => {
-                let insn = match size {
-                    OperandSize::B8 => "stlrb",
-                    OperandSize::B16 => "stlrh",
-                    OperandSize::B32 | OperandSize::B64 => "stlr",
-                };
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    {} {}, {}",
-                    insn,
-                    src.name_for_size(sz),
-                    addr.format()
-                );
-            }
-
-            // ================================================================
+            Aarch64Inst::Ldar { size, addr, dst } => Self::emit_ldar(size, addr, dst, out),
+            Aarch64Inst::Stlr { size, src, addr } => Self::emit_stlr(size, src, addr, out),
             // Atomic LL/SC Operations (baseline ARMv8.0)
-            // ================================================================
-            Aarch64Inst::Ldaxr { size, addr, dst } => {
-                let insn = match size {
-                    OperandSize::B8 => "ldaxrb",
-                    OperandSize::B16 => "ldaxrh",
-                    OperandSize::B32 | OperandSize::B64 => "ldaxr",
-                };
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    {} {}, {}",
-                    insn,
-                    dst.name_for_size(sz),
-                    addr.format()
-                );
-            }
-
+            Aarch64Inst::Ldaxr { size, addr, dst } => Self::emit_ldaxr(size, addr, dst, out),
             Aarch64Inst::Stlxr {
                 size,
                 src,
                 addr,
                 status,
-            } => {
-                let insn = match size {
-                    OperandSize::B8 => "stlxrb",
-                    OperandSize::B16 => "stlxrh",
-                    OperandSize::B32 | OperandSize::B64 => "stlxr",
-                };
-                let sz = size.bits().max(32);
-                // Status is always W register
-                let _ = writeln!(
-                    out,
-                    "    {} {}, {}, {}",
-                    insn,
-                    status.name_for_size(32),
-                    src.name_for_size(sz),
-                    addr.format()
-                );
-            }
-
+            } => Self::emit_stlxr(size, src, addr, status, out),
             Aarch64Inst::Dmb { option } => {
                 let opt = match option {
                     DmbOption::Ish => "ish",
@@ -1963,65 +1318,25 @@ impl EmitAsm for Aarch64Inst {
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    adds {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
-                );
-            }
-
+            } => Self::emit_alu3("adds", size, src1, src2, dst, out),
             Aarch64Inst::Adc {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    adc {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.name_for_size(sz)
-                );
-            }
-
+            } => Self::emit_alu3_reg("adc", size, src1, src2, dst, out),
             Aarch64Inst::Subs {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    subs {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
-                );
-            }
-
+            } => Self::emit_alu3("subs", size, src1, src2, dst, out),
             Aarch64Inst::Sbc {
                 size,
                 src1,
                 src2,
                 dst,
-            } => {
-                let sz = size.bits().max(32);
-                let _ = writeln!(
-                    out,
-                    "    sbc {}, {}, {}",
-                    dst.name_for_size(sz),
-                    src1.name_for_size(sz),
-                    src2.name_for_size(sz)
-                );
-            }
-
+            } => Self::emit_alu3_reg("sbc", size, src1, src2, dst, out),
             Aarch64Inst::Umulh { src1, src2, dst } => {
                 let _ = writeln!(
                     out,
@@ -2040,6 +1355,586 @@ impl EmitAsm for Aarch64Inst {
     }
 }
 
+impl Aarch64Inst {
+    /// `op reg` -- an indirect branch through a register.
+    fn emit_branch_reg(op: &str, reg: &Reg, out: &mut String) {
+        let _ = writeln!(out, "    {op} {}", reg.name64());
+    }
+
+    /// `op dst, src1, src2`, where src2 may be a register or an immediate.
+    fn emit_alu3(
+        op: &str,
+        size: &OperandSize,
+        src1: &Reg,
+        src2: &GpOperand,
+        dst: &Reg,
+        out: &mut String,
+    ) {
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    {op} {}, {}, {}",
+            dst.name_for_size(sz),
+            src1.name_for_size(sz),
+            src2.format(OperandSize::from_bits(sz))
+        );
+    }
+
+    /// `op dst, src1, src2`, where src2 is always a register.
+    fn emit_alu3_reg(
+        op: &str,
+        size: &OperandSize,
+        src1: &Reg,
+        src2: &Reg,
+        dst: &Reg,
+        out: &mut String,
+    ) {
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    {op} {}, {}, {}",
+            dst.name_for_size(sz),
+            src1.name_for_size(sz),
+            src2.name_for_size(sz)
+        );
+    }
+
+    /// `op dst, src` -- one source register, both operands at the same size.
+    fn emit_alu2(op: &str, size: &OperandSize, src: &Reg, dst: &Reg, out: &mut String) {
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    {op} {}, {}",
+            dst.name_for_size(sz),
+            src.name_for_size(sz)
+        );
+    }
+
+    /// `op dst, src, amount` -- a shift by register or immediate.
+    fn emit_shift(
+        op: &str,
+        size: &OperandSize,
+        src: &Reg,
+        amount: &GpOperand,
+        dst: &Reg,
+        out: &mut String,
+    ) {
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    {op} {}, {}, {}",
+            dst.name_for_size(sz),
+            src.name_for_size(sz),
+            amount.format(OperandSize::from_bits(sz))
+        );
+    }
+
+    /// `op dst, src` -- sign-extend a narrow value into dst_size.
+    fn emit_sxt(op: &str, dst_size: &OperandSize, src: &Reg, dst: &Reg, out: &mut String) {
+        let sz = dst_size.bits().max(32);
+        let _ = writeln!(out, "    {op} {}, {}", dst.name_for_size(sz), src.name32());
+    }
+
+    /// `op dst, src` -- zero-extend a narrow value into w-sized dst.
+    fn emit_uxt(op: &str, src: &Reg, dst: &Reg, out: &mut String) {
+        let _ = writeln!(out, "    {op} {}, {}", dst.name32(), src.name32());
+    }
+
+    /// `op dst, src1, src2` on the floating-point registers.
+    fn emit_fp3(op: &str, size: &FpSize, src1: &VReg, src2: &VReg, dst: &VReg, out: &mut String) {
+        let _ = writeln!(
+            out,
+            "    {op} {}, {}, {}",
+            dst.name_for_size(size_bits(*size)),
+            src1.name_for_size(size_bits(*size)),
+            src2.name_for_size(size_bits(*size))
+        );
+    }
+
+    /// `op fp_dst, gp_src` -- integer to floating-point.
+    fn emit_int_to_fp(
+        op: &str,
+        int_size: &OperandSize,
+        fp_size: &FpSize,
+        src: &Reg,
+        dst: &VReg,
+        out: &mut String,
+    ) {
+        let fp_name = dst.name_for_size(size_bits(*fp_size));
+        let gp_name = src.name_for_size(int_size.bits().max(32));
+        let _ = writeln!(out, "    {op} {}, {}", fp_name, gp_name);
+    }
+
+    /// `op gp_dst, fp_src` -- floating-point to integer, truncating.
+    fn emit_fp_to_int(
+        op: &str,
+        fp_size: &FpSize,
+        int_size: &OperandSize,
+        src: &VReg,
+        dst: &Reg,
+        out: &mut String,
+    ) {
+        let fp_name = src.name_for_size(size_bits(*fp_size));
+        let gp_name = dst.name_for_size(int_size.bits().max(32));
+        let _ = writeln!(out, "    {op} {}, {}", gp_name, fp_name);
+    }
+
+    // Data Movement
+    fn emit_mov(size: &OperandSize, src: &GpOperand, dst: &Reg, out: &mut String) {
+        let sz = size.bits().max(32);
+        match src {
+            GpOperand::Reg(_) => {
+                let _ = writeln!(
+                    out,
+                    "    mov {}, {}",
+                    dst.name_for_size(sz),
+                    src.format(OperandSize::from_bits(sz))
+                );
+            }
+            GpOperand::Imm(v) => Self::emit_mov_imm(sz, *v as u64, dst, out),
+        }
+    }
+
+    /// Materialise an immediate into a register.
+    ///
+    /// AArch64's MOV immediate encodes only a limited set of values; anything
+    /// else is built 16 bits at a time with MOVZ followed by MOVK.
+    fn emit_mov_imm(sz: u32, v: u64, dst: &Reg, out: &mut String) {
+        if v == 0 {
+            let _ = writeln!(out, "    mov {}, #0", dst.name_for_size(sz));
+        } else if sz == 32 {
+            Self::emit_mov_imm32(v as u32, dst, out);
+        } else {
+            Self::emit_mov_imm64(v, dst, out);
+        }
+    }
+
+    /// A 32-bit immediate: at most one MOVZ and one MOVK.
+    fn emit_mov_imm32(v: u32, dst: &Reg, out: &mut String) {
+        let lo = (v & 0xFFFF) as u16;
+        let hi = ((v >> 16) & 0xFFFF) as u16;
+        if hi == 0 {
+            let _ = writeln!(out, "    movz {}, #{}", dst.name_for_size(32), lo);
+        } else if lo == 0 {
+            let _ = writeln!(out, "    movz {}, #{}, lsl #16", dst.name_for_size(32), hi);
+        } else {
+            let _ = writeln!(out, "    movz {}, #{}", dst.name_for_size(32), lo);
+            let _ = writeln!(out, "    movk {}, #{}, lsl #16", dst.name_for_size(32), hi);
+        }
+    }
+
+    /// A 64-bit immediate: a MOVZ for the first non-zero halfword, then a MOVK
+    /// for each remaining one.
+    fn emit_mov_imm64(v: u64, dst: &Reg, out: &mut String) {
+        let parts = [
+            (v & 0xFFFF) as u16,
+            ((v >> 16) & 0xFFFF) as u16,
+            ((v >> 32) & 0xFFFF) as u16,
+            ((v >> 48) & 0xFFFF) as u16,
+        ];
+        let mut first = true;
+        for (i, &part) in parts.iter().enumerate() {
+            if part != 0 || (first && i == 3) {
+                let shift = i * 16;
+                if first {
+                    if shift == 0 {
+                        let _ = writeln!(out, "    movz {}, #{}", dst.name_for_size(64), part);
+                    } else {
+                        let _ = writeln!(
+                            out,
+                            "    movz {}, #{}, lsl #{}",
+                            dst.name_for_size(64),
+                            part,
+                            shift
+                        );
+                    }
+                    first = false;
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "    movk {}, #{}, lsl #{}",
+                        dst.name_for_size(64),
+                        part,
+                        shift
+                    );
+                }
+            }
+        }
+        if first {
+            let _ = writeln!(out, "    movz {}, #0", dst.name_for_size(64));
+        }
+    }
+
+    fn emit_movz(size: &OperandSize, imm: &u16, shift: &u8, dst: &Reg, out: &mut String) {
+        let sz = size.bits().max(32);
+        if *shift == 0 {
+            let _ = writeln!(out, "    movz {}, #{}", dst.name_for_size(sz), imm);
+        } else {
+            let _ = writeln!(
+                out,
+                "    movz {}, #{}, lsl #{}",
+                dst.name_for_size(sz),
+                imm,
+                shift
+            );
+        }
+    }
+
+    fn emit_ldrs(
+        src_size: &OperandSize,
+        dst_size: &OperandSize,
+        addr: &MemAddr,
+        dst: &Reg,
+        out: &mut String,
+    ) {
+        let insn = match (src_size, dst_size) {
+            (OperandSize::B8, OperandSize::B32) => "ldrsb",
+            (OperandSize::B8, OperandSize::B64) => "ldrsb",
+            (OperandSize::B16, OperandSize::B32) => "ldrsh",
+            (OperandSize::B16, OperandSize::B64) => "ldrsh",
+            (OperandSize::B32, OperandSize::B64) => "ldrsw",
+            _ => "ldr",
+        };
+        let reg = dst.name_for_size(dst_size.bits());
+        let _ = writeln!(out, "    {} {}, {}", insn, reg, addr.format());
+    }
+
+    fn emit_adrp(sym: &Symbol, dst: &Reg, target: &Target, out: &mut String) {
+        let sym_name = sym.format_for_target(target);
+        match target.os {
+            Os::MacOS => {
+                let _ = writeln!(out, "    adrp {}, {}@PAGE", dst.name64(), sym_name);
+            }
+            Os::Linux | Os::FreeBSD => {
+                let _ = writeln!(out, "    adrp {}, {}", dst.name64(), sym_name);
+            }
+        }
+    }
+
+    fn emit_adrp_got_page(sym: &Symbol, dst: &Reg, target: &Target, out: &mut String) {
+        let sym_name = sym.format_for_target(target);
+        // The GOT relocation spelling is per object format. `@GOTPAGE`
+        // is Mach-O; ELF writes `:got:`. This emitted the Mach-O form
+        // unconditionally -- its comment even said "macOS only" -- but
+        // needs_got_access fires for every extern symbol on every
+        // target, so GNU as saw `adrp x0, stdout@GOTPAGE` and rejected
+        // it as "unexpected characters following instruction".
+        match target.os {
+            Os::MacOS => {
+                let _ = writeln!(out, "    adrp {}, {}@GOTPAGE", dst.name64(), sym_name);
+            }
+            _ => {
+                let _ = writeln!(out, "    adrp {}, :got:{}", dst.name64(), sym_name);
+            }
+        }
+    }
+
+    fn emit_add_sym_offset(sym: &Symbol, base: &Reg, dst: &Reg, target: &Target, out: &mut String) {
+        let sym_name = sym.format_for_target(target);
+        match target.os {
+            Os::MacOS => {
+                let _ = writeln!(
+                    out,
+                    "    add {}, {}, {}@PAGEOFF",
+                    dst.name64(),
+                    base.name64(),
+                    sym_name
+                );
+            }
+            Os::Linux | Os::FreeBSD => {
+                let _ = writeln!(
+                    out,
+                    "    add {}, {}, :lo12:{}",
+                    dst.name64(),
+                    base.name64(),
+                    sym_name
+                );
+            }
+        }
+    }
+
+    fn emit_ldr_sym_offset(
+        size: &OperandSize,
+        sym: &Symbol,
+        base: &Reg,
+        dst: &Reg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let sym_name = sym.format_for_target(target);
+        let sz = size.bits().max(32);
+        let ldr_insn = match size {
+            OperandSize::B8 => "ldrb",
+            OperandSize::B16 => "ldrh",
+            OperandSize::B32 => "ldr",
+            OperandSize::B64 => "ldr",
+        };
+        match target.os {
+            Os::MacOS => {
+                let _ = writeln!(
+                    out,
+                    "    {} {}, [{}, {}@PAGEOFF]",
+                    ldr_insn,
+                    dst.name_for_size(sz),
+                    base.name64(),
+                    sym_name
+                );
+            }
+            Os::Linux | Os::FreeBSD => {
+                let _ = writeln!(
+                    out,
+                    "    {} {}, [{}, :lo12:{}]",
+                    ldr_insn,
+                    dst.name_for_size(sz),
+                    base.name64(),
+                    sym_name
+                );
+            }
+        }
+    }
+
+    fn emit_ldr_sym_got_page_off(
+        sym: &Symbol,
+        base: &Reg,
+        dst: &Reg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let sym_name = sym.format_for_target(target);
+        // As above: `@GOTPAGEOFF` is Mach-O, `:got_lo12:` is ELF.
+        match target.os {
+            Os::MacOS => {
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, {}@GOTPAGEOFF]",
+                    dst.name64(),
+                    base.name64(),
+                    sym_name
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, :got_lo12:{}]",
+                    dst.name64(),
+                    base.name64(),
+                    sym_name
+                );
+            }
+        }
+    }
+
+    fn emit_msub(
+        size: &OperandSize,
+        mul1: &Reg,
+        mul2: &Reg,
+        sub: &Reg,
+        dst: &Reg,
+        out: &mut String,
+    ) {
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    msub {}, {}, {}, {}",
+            dst.name_for_size(sz),
+            mul1.name_for_size(sz),
+            mul2.name_for_size(sz),
+            sub.name_for_size(sz)
+        );
+    }
+
+    fn emit_csel(
+        size: &OperandSize,
+        cond: &CondCode,
+        src_true: &Reg,
+        src_false: &Reg,
+        dst: &Reg,
+        out: &mut String,
+    ) {
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    csel {}, {}, {}, {}",
+            dst.name_for_size(sz),
+            src_true.name_for_size(sz),
+            src_false.name_for_size(sz),
+            cond.aarch64_suffix()
+        );
+    }
+
+    // Floating-Point
+    fn emit_fmov_reg(size: &FpSize, src: &VReg, dst: &VReg, out: &mut String) {
+        // `fmov` has no 128-bit form. A whole-register copy is the
+        // vector move, which is what gcc emits for `long double`.
+        if *size == FpSize::Quad {
+            let _ = writeln!(out, "    mov {}.16b, {}.16b", dst.name_v(), src.name_v());
+            return;
+        }
+        let name = match size {
+            FpSize::Half => (src.name_h(), dst.name_h()),
+            FpSize::Single => (src.name_s(), dst.name_s()),
+            FpSize::Double => (src.name_d(), dst.name_d()),
+            FpSize::Quad => unreachable!("handled above"),
+            FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
+        };
+        let _ = writeln!(out, "    fmov {}, {}", name.1, name.0);
+    }
+
+    fn emit_fmov_from_gp(size: &FpSize, src: &Reg, dst: &VReg, out: &mut String) {
+        let fp_name = match size {
+            FpSize::Half => dst.name_h(),
+            FpSize::Single => dst.name_s(),
+            FpSize::Double => dst.name_d(),
+            FpSize::Quad => dst.name_q(),
+            FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
+        };
+        let gp_name = match size {
+            FpSize::Half => src.name32(), // half is moved via 32-bit GP
+            FpSize::Single => src.name32(),
+            FpSize::Double => src.name64(),
+            FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
+            FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
+        };
+        let _ = writeln!(out, "    fmov {}, {}", fp_name, gp_name);
+    }
+
+    fn emit_fmov_to_gp(size: &FpSize, src: &VReg, dst: &Reg, out: &mut String) {
+        let fp_name = match size {
+            FpSize::Half => src.name_h(),
+            FpSize::Single => src.name_s(),
+            FpSize::Double => src.name_d(),
+            FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
+            FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
+        };
+        let gp_name = match size {
+            FpSize::Half => dst.name32(), // half is moved via 32-bit GP
+            FpSize::Single => dst.name32(),
+            FpSize::Double => dst.name64(),
+            FpSize::Quad => unreachable!("a binary128 value does not fit one X register"),
+            FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
+        };
+        let _ = writeln!(out, "    fmov {}, {}", gp_name, fp_name);
+    }
+
+    fn emit_ldr_fp(size: &FpSize, addr: &MemAddr, dst: &VReg, out: &mut String) {
+        let name = match size {
+            FpSize::Half => dst.name_h(),
+            FpSize::Single => dst.name_s(),
+            FpSize::Double => dst.name_d(),
+            // AAPCS64 keeps binary128 in a whole Q register.
+            FpSize::Quad => dst.name_q(),
+            FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
+        };
+        let _ = writeln!(out, "    ldr {}, {}", name, addr.format());
+    }
+
+    fn emit_ldr_fp_sym_offset(
+        size: &FpSize,
+        sym: &Symbol,
+        base: &Reg,
+        dst: &VReg,
+        target: &Target,
+        out: &mut String,
+    ) {
+        let sym_name = sym.format_for_target(target);
+        let fp_name = match size {
+            FpSize::Half => dst.name_h(),
+            FpSize::Single => dst.name_s(),
+            FpSize::Double => dst.name_d(),
+            FpSize::Quad => dst.name_q(),
+            FpSize::Extended => unreachable!("x87 extended not available on AArch64"),
+        };
+        match target.os {
+            Os::MacOS => {
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, {}@PAGEOFF]",
+                    fp_name,
+                    base.name64(),
+                    sym_name
+                );
+            }
+            Os::Linux | Os::FreeBSD => {
+                let _ = writeln!(
+                    out,
+                    "    ldr {}, [{}, :lo12:{}]",
+                    fp_name,
+                    base.name64(),
+                    sym_name
+                );
+            }
+        }
+    }
+
+    // Atomic Operations (ARMv8.1 LSE)
+    fn emit_ldar(size: &OperandSize, addr: &MemAddr, dst: &Reg, out: &mut String) {
+        let insn = match size {
+            OperandSize::B8 => "ldarb",
+            OperandSize::B16 => "ldarh",
+            OperandSize::B32 | OperandSize::B64 => "ldar",
+        };
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    {} {}, {}",
+            insn,
+            dst.name_for_size(sz),
+            addr.format()
+        );
+    }
+
+    fn emit_stlr(size: &OperandSize, src: &Reg, addr: &MemAddr, out: &mut String) {
+        let insn = match size {
+            OperandSize::B8 => "stlrb",
+            OperandSize::B16 => "stlrh",
+            OperandSize::B32 | OperandSize::B64 => "stlr",
+        };
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    {} {}, {}",
+            insn,
+            src.name_for_size(sz),
+            addr.format()
+        );
+    }
+
+    // Atomic LL/SC Operations (baseline ARMv8.0)
+    fn emit_ldaxr(size: &OperandSize, addr: &MemAddr, dst: &Reg, out: &mut String) {
+        let insn = match size {
+            OperandSize::B8 => "ldaxrb",
+            OperandSize::B16 => "ldaxrh",
+            OperandSize::B32 | OperandSize::B64 => "ldaxr",
+        };
+        let sz = size.bits().max(32);
+        let _ = writeln!(
+            out,
+            "    {} {}, {}",
+            insn,
+            dst.name_for_size(sz),
+            addr.format()
+        );
+    }
+
+    fn emit_stlxr(size: &OperandSize, src: &Reg, addr: &MemAddr, status: &Reg, out: &mut String) {
+        let insn = match size {
+            OperandSize::B8 => "stlxrb",
+            OperandSize::B16 => "stlxrh",
+            OperandSize::B32 | OperandSize::B64 => "stlxr",
+        };
+        let sz = size.bits().max(32);
+        // Status is always W register
+        let _ = writeln!(
+            out,
+            "    {} {}, {}, {}",
+            insn,
+            status.name_for_size(32),
+            src.name_for_size(sz),
+            addr.format()
+        );
+    }
+}
+
 /// Helper to convert FpSize to bits
 fn size_bits(size: FpSize) -> u32 {
     match size {
@@ -2050,10 +1945,6 @@ fn size_bits(size: FpSize) -> u32 {
         FpSize::Extended => 80, // x87 not used on AArch64, but provide size
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

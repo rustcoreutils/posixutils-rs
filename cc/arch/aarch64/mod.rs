@@ -9,20 +9,22 @@
 // AArch64 architecture support
 //
 
+mod atomic;
 mod call;
 pub mod codegen;
 mod expression;
 mod features;
 mod float;
+mod frame;
+mod inline_asm;
 pub mod lir;
 pub mod macros;
 pub(crate) mod mapping;
+mod memory;
 pub mod regalloc;
 
 pub use macros::get_macros;
 
-/// Convert f64 to IEEE 754 half-precision (binary16) bits.
-/// This handles the conversion from 64-bit double to 16-bit half precision.
 /// Where a 128-bit integer argument's register pair starts, or `None` if it
 /// must go on the stack.
 ///
@@ -38,7 +40,4 @@ pub(crate) fn int128_pair_start(ngrn: usize, num_arg_regs: usize) -> Option<usiz
     (start + 2 <= num_arg_regs).then_some(start)
 }
 
-/// Half-precision conversion lives in `crate::float`, which is where the
-/// rounding is defined; this target used to carry a verbatim copy, and the
-/// copy is what kept a rounding fix from reaching both backends at once.
 pub(super) use crate::float::f64_to_f16_bits;

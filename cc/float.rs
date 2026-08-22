@@ -22,11 +22,6 @@
 // rounding to. `float` and `double` are strict subsets and round out of it on
 // demand.
 //
-// Carrying x87's 64 bits instead, which this did at first, is exact only for
-// the format it was taken from: on aarch64, where `long double` is binary128,
-// `LDBL_MAX` lost all 112 of its fraction bits and `LDBL_TRUE_MIN` -- below
-// x87's smallest subnormal -- flushed to zero.
-//
 
 use std::fmt;
 
@@ -442,7 +437,6 @@ impl FloatVal {
     /// This is the only way to name a floating constant in an assembler
     /// operand: an inline-asm constraint asking for an immediate gets these
     /// bits, and one asking for a general register gets them loaded into it.
-    /// Both backends need it, and both used to `panic!` instead.
     ///
     /// Widths above 64 bits are not representable in one integer; callers with
     /// a `long double` want [`to_x87_bytes`](Self::to_x87_bytes) or
@@ -582,9 +576,7 @@ impl From<f64> for FloatVal {
     }
 }
 
-// ============================================================================
 // Decimal to binary conversion
-// ============================================================================
 
 /// A minimal unsigned big integer, little-endian limbs.
 ///
@@ -915,9 +907,7 @@ pub(crate) fn parse_decimal_float_parts(s: &str) -> Result<(u128, i32), ()> {
     Ok(decimal_to_binary(&digits, exp10))
 }
 
-// ============================================================================
 // Exact arithmetic
-// ============================================================================
 
 /// A target binary floating-point format.
 ///
@@ -1432,8 +1422,6 @@ mod tests {
 
     #[test]
     fn subnormal_doubles_survive() {
-        // The old f64-to-x87 conversion gave these a zero exponent and no
-        // integer bit, which is a different value, not a rounded one.
         for v in [f64::from_bits(1), f64::from_bits(0x000F_FFFF_FFFF_FFFF)] {
             let round = FloatVal::from_f64(v).to_f64();
             assert_eq!(round.to_bits(), v.to_bits(), "subnormal {v:e} lost");
@@ -1772,9 +1760,8 @@ mod tests {
         }
     }
 
-    /// Every `double` result agrees with the hardware, exhaustively over a
-    /// wide random sample -- the arithmetic here has to be a drop-in for what
-    /// folding through `f64` used to do, for the format where that was right.
+    /// Every `double` result agrees with the hardware, over a wide random
+    /// sample: for the `double` format this arithmetic must match `f64`.
     #[test]
     fn double_results_agree_with_hardware() {
         // A xorshift, so the sample is fixed without pulling in a dependency.
@@ -1855,8 +1842,7 @@ mod tests {
             v.to_f128_bits(),
             (0x0800_0000_0000_0000, 0x4034_0000_0000_0000)
         );
-        // Rounding it to double loses the low bit, which is exactly what
-        // the old fold did to it on the way in.
+        // Rounding it to double loses the low bit.
         assert_ne!(
             v.key(),
             FloatVal::from_f64(9007199254740993i64 as f64).key()

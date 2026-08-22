@@ -278,7 +278,7 @@ mod tests {
     }
 
     /// Every accepted spelling is classified; the `c`/`gnu` prefix does not
-    /// change the answer, because it no longer selects anything.
+    /// change the answer, because it selects nothing.
     #[test]
     fn test_classify_std_spellings() {
         for spec in [

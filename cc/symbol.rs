@@ -16,17 +16,13 @@ use std::collections::HashMap;
 
 const DEFAULT_SYMBOL_MAP_CAPACITY: usize = 16384;
 
-// ============================================================================
 // Symbol ID
-// ============================================================================
 
 /// Unique identifier for a symbol in the symbol table
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolId(pub u32);
 
-// ============================================================================
 // Namespace
-// ============================================================================
 
 /// C has multiple namespaces (C99 6.2.3)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,9 +33,7 @@ pub enum Namespace {
     Tag,
 }
 
-// ============================================================================
 // Symbol Kind
-// ============================================================================
 
 /// What kind of entity this symbol represents
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,9 +52,7 @@ pub enum SymbolKind {
     Typedef,
 }
 
-// ============================================================================
 // Symbol
-// ============================================================================
 
 /// A symbol in the symbol table
 #[derive(Debug, Clone)]
@@ -137,7 +129,6 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    /// Create a new variable symbol
     pub fn variable(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
@@ -155,7 +146,6 @@ impl Symbol {
         }
     }
 
-    /// Create a new function symbol
     pub fn function(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
@@ -173,7 +163,6 @@ impl Symbol {
         }
     }
 
-    /// Create a new parameter symbol
     pub fn parameter(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
@@ -227,7 +216,6 @@ impl Symbol {
         }
     }
 
-    /// Create a new typedef symbol
     pub fn typedef(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
@@ -259,20 +247,16 @@ impl Symbol {
         self
     }
 
-    /// Check if this is an enum constant
     pub fn is_enum_constant(&self) -> bool {
         self.kind == SymbolKind::EnumConstant
     }
 
-    /// Check if this is a typedef
     pub fn is_typedef(&self) -> bool {
         self.kind == SymbolKind::Typedef
     }
 }
 
-// ============================================================================
 // Scope
-// ============================================================================
 
 /// A scope in the symbol table
 #[derive(Debug)]
@@ -292,9 +276,7 @@ impl Scope {
     }
 }
 
-// ============================================================================
 // Symbol Table
-// ============================================================================
 
 /// Scope-aware symbol table
 ///
@@ -336,7 +318,6 @@ impl SymbolTable {
         table
     }
 
-    /// Enter a new scope
     pub fn enter_scope(&mut self) {
         let new_scope_id = self.scopes.len() as u32;
         self.scopes.push(Scope::new(Some(self.current_scope)));
@@ -344,7 +325,6 @@ impl SymbolTable {
         self.scope_depth += 1;
     }
 
-    /// Leave the current scope, returning to the parent
     pub fn leave_scope(&mut self) {
         if let Some(parent) = self.scopes[self.current_scope as usize].parent {
             // Remove symbols from name_map that were in this scope
@@ -447,12 +427,10 @@ impl SymbolTable {
         self.name_map.get(&key).and_then(|ids| ids.first().copied())
     }
 
-    /// Get a symbol by its ID
     pub fn get(&self, id: SymbolId) -> &Symbol {
         &self.symbols[id.0 as usize]
     }
 
-    /// Get a mutable reference to a symbol by its ID
     pub fn get_mut(&mut self, id: SymbolId) -> &mut Symbol {
         &mut self.symbols[id.0 as usize]
     }
@@ -490,13 +468,11 @@ impl SymbolTable {
         })
     }
 
-    /// Look up an enum constant symbol by name
     pub fn lookup_enum_constant(&self, name: StringId) -> Option<&Symbol> {
         self.lookup(name, Namespace::Ordinary)
             .filter(|s| s.is_enum_constant())
     }
 
-    /// Get the number of symbols declared
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.symbols.len()
@@ -509,9 +485,7 @@ impl Default for SymbolTable {
     }
 }
 
-// ============================================================================
 // Errors
-// ============================================================================
 
 /// Symbol table errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -529,10 +503,6 @@ impl std::fmt::Display for SymbolError {
 }
 
 impl std::error::Error for SymbolError {}
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -6,13 +6,10 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// ABI (Application Binary Interface) handling for c17
+// Platform-specific calling-convention classification for function parameters
+// and return values: the contract between the frontend (linearizer) and the
+// backend (code generator).
 //
-// This module provides platform-specific calling convention classification
-// for function parameters and return values. It serves as the contract
-// between the frontend (linearizer) and backend (code generator).
-//
-// Supported ABIs:
 // - System V AMD64 (x86-64 Linux/BSD/macOS)
 // - AAPCS64 (AArch64 Linux/macOS)
 //
@@ -26,9 +23,7 @@ pub use sysv_amd64::{param_is_memory_class, sse_struct_regs, struct_param_classe
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
-// ============================================================================
 // Register Classification
-// ============================================================================
 
 /// Classification of a single eightbyte (x86-64) or register slot.
 ///
@@ -70,9 +65,7 @@ impl RegClass {
     }
 }
 
-// ============================================================================
 // Argument Classification
-// ============================================================================
 
 /// Base type for Homogeneous Floating-Point Aggregate (HFA) on AAPCS64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,9 +133,7 @@ pub enum ArgClass {
     Ignore,
 }
 
-// ============================================================================
 // Calling Convention
-// ============================================================================
 
 /// Calling convention for a function.
 ///
@@ -159,9 +150,7 @@ pub enum CallingConv {
     Win64,
 }
 
-// ============================================================================
 // ABI Trait
-// ============================================================================
 
 /// Trait for platform-specific ABI classification.
 ///
@@ -175,9 +164,7 @@ pub trait Abi {
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass;
 }
 
-// ============================================================================
 // ABI Factory
-// ============================================================================
 
 /// Get the appropriate ABI implementation for a target.
 pub fn get_abi(target: &Target) -> Box<dyn Abi> {
@@ -200,9 +187,7 @@ pub fn get_abi_for_conv(conv: CallingConv, target: &Target) -> Box<dyn Abi> {
     }
 }
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Check if a type is a struct or union.
 fn is_aggregate(kind: TypeKind) -> bool {

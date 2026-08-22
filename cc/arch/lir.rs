@@ -17,9 +17,7 @@ use crate::target::{Arch, Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::fmt::{self, Write};
 
-// ============================================================================
 // Operand Size
-// ============================================================================
 
 /// Size specifier for operations (in bits)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,9 +70,7 @@ impl fmt::Display for OperandSize {
     }
 }
 
-// ============================================================================
 // Floating-Point Size
-// ============================================================================
 
 /// Floating-point size specifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -220,9 +216,7 @@ impl fmt::Display for FpSize {
     }
 }
 
-// ============================================================================
 // Condition Codes (Architecture-Independent)
-// ============================================================================
 
 /// Unified condition code for comparisons (architecture-independent semantics).
 /// Each architecture translates these to its specific condition suffixes.
@@ -312,9 +306,7 @@ impl fmt::Display for CondCode {
     }
 }
 
-// ============================================================================
 // Call Target (Architecture-Independent)
-// ============================================================================
 
 /// Call target - either direct (symbol) or indirect (register).
 /// Generic over register type R to support different architectures.
@@ -326,9 +318,7 @@ pub enum CallTarget<R> {
     Indirect(R),
 }
 
-// ============================================================================
 // Complex Type Helpers
-// ============================================================================
 
 /// How many SSE registers a complex argument occupies under System V AMD64.
 ///
@@ -358,9 +348,7 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
 ///
 /// Two kinds qualify: an aggregate the ABI classifies MEMORY, and
 /// `long double _Complex`, which System V classifies COMPLEX_X87. Both are
-/// copied onto the stack by value, so they share one code path — the callers
-/// used to spell this as `kind == Struct || kind == Union`, which quietly
-/// excluded the complex case and sent it down the SSE path instead.
+/// copied onto the stack by value, so they share one code path.
 ///
 /// The aggregate half asks the classifier rather than testing the size: an
 /// aggregate of two eightbytes or fewer is MEMORY too when one of them holds a
@@ -412,9 +400,7 @@ pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) 
     }
 }
 
-// ============================================================================
 // Labels and Symbols
-// ============================================================================
 
 /// Label for local jumps (basic block targets within a function)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -527,7 +513,7 @@ fn is_bare_symbol_byte(b: u8) -> bool {
 /// not, and an identifier holding one produced `_café: error: invalid
 /// operand` and `adrp x0, _café@PAGE: error: unexpected token`. That is not a
 /// niche case -- C17 6.4.2.1 admits extended characters in identifiers, by
-/// UCN since C99 and written directly as of #C158.
+/// UCN since C99 and written directly.
 ///
 /// LLVM does exactly this in `MCSymbol::print`, and quoting is accepted
 /// everywhere c17 emits a name: bare, in `.globl`/`.type`/`.size`, as a call
@@ -586,9 +572,7 @@ impl fmt::Display for Symbol {
     }
 }
 
-// ============================================================================
 // Symbol Type (for ELF .type directive)
-// ============================================================================
 
 /// Symbol type for ELF .type directive
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -611,9 +595,7 @@ impl SymbolType {
     }
 }
 
-// ============================================================================
 // EmitAsm Trait
-// ============================================================================
 
 /// Trait for LIR instructions that can be emitted to assembly text
 pub trait EmitAsm {
@@ -621,9 +603,7 @@ pub trait EmitAsm {
     fn emit(&self, target: &Target, out: &mut String);
 }
 
-// ============================================================================
 // LirInst Trait (Architecture-Generic LIR Instructions)
-// ============================================================================
 
 /// Trait for architecture-specific LIR instruction types.
 /// This enables generic code generation infrastructure while preserving
@@ -634,9 +614,7 @@ pub trait LirInst: Clone + std::fmt::Debug {
     fn from_directive(dir: Directive) -> Self;
 }
 
-// ============================================================================
 // Assembler Directives (Architecture-Independent)
-// ============================================================================
 
 /// Which side of a weak symbol a directive names. ELF does not distinguish
 /// them; Mach-O has a separate directive for each.
@@ -1298,10 +1276,6 @@ impl EmitAsm for Directive {
         }
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -423,13 +423,10 @@ impl Aarch64CodeGen {
                         });
                     }
                     32 => {
-                        // Writing a W register zeros the upper half -- but the
-                        // move above was 64 bits wide, so nothing had been
-                        // narrowed yet and the pseudo still carried all of it.
-                        // A later widening then read bits the truncation was
-                        // supposed to have dropped: `__builtin_add_overflow`
-                        // compared its result against an untruncated copy of
-                        // itself and could never report an overflow. x86-64
+                        // Writing a W register zeros the upper half, but the
+                        // move above is 64 bits wide, so the truncation has to
+                        // be materialized here: a later widening would
+                        // otherwise read bits it is supposed to drop. x86-64
                         // emits the same self-move for the same reason.
                         self.push_lir(Aarch64Inst::Mov {
                             size: OperandSize::B32,
@@ -911,9 +908,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    // ========================================================================
     // Int128 decomposition ops (Lo64, Hi64, Pair64)
-    // ========================================================================
 
     /// Lo64: extract low 64 bits from 128-bit pseudo.
     pub(super) fn emit_lo64(&mut self, insn: &Instruction) {
@@ -1219,8 +1214,8 @@ mod immediate_tests {
         }
     }
 
-    /// Each family has its own encoding, and one 0..=4095 test used to serve
-    /// all three: `x & 0`, `x | 1000` and `x << 32` all emitted operands the
+    /// Each family has its own encoding, so one 0..=4095 test cannot serve
+    /// all three: `x & 0`, `x | 1000` and `x << 32` all name operands the
     /// assembler rejects.
     #[test]
     fn each_opcode_family_has_its_own_immediate_range() {

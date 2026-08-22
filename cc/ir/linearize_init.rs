@@ -71,9 +71,7 @@ fn describe_expr(kind: &ExprKind) -> &'static str {
 }
 
 impl<'a> super::linearize::Linearizer<'a> {
-    // ========================================================================
     // Global declarations
-    // ========================================================================
 
     pub(crate) fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
@@ -129,8 +127,6 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // A definition here outranks anything recorded for the declaration.
             self.module.declared_symbol_attrs.remove(&name);
-            // If this symbol was previously declared extern, remove it from extern_symbols
-            // (we now have the actual definition)
             self.module.extern_symbols.remove(&name);
 
             // Check for thread-local storage
@@ -288,8 +284,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         Initializer::Int(val)
                     } else {
                         // Returning `Initializer::None` here would put the
-                        // object in .bss and make it silently zero -- which is
-                        // what `-(1.0 + 2.0)` used to do.
+                        // object in .bss and make it silently zero.
                         self.reject_initializer(expr);
                         Initializer::None
                     }
@@ -731,11 +726,6 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Report an initializer that is not a constant expression we can fold.
-    ///
-    /// Named rather than inlined because several arms need it and they used to
-    /// disagree: some printed a raw Rust `{:?}` dump of the AST -- internal
-    /// representation in a user-facing message, at position 0 -- and one said
-    /// nothing at all, which silently zeroed the object.
     fn reject_initializer(&self, expr: &Expr) {
         error(
             self.expr_pos(expr),
@@ -793,8 +783,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// The position to report for `expr`.
     ///
     /// `linearize_global_decl` has no statement to set `current_pos` from, so
-    /// it stays `None` at file scope and every such diagnostic used to come
-    /// out as `file:0`. The expression carries its own position; prefer it.
+    /// at file scope it stays `None` and a diagnostic reads `file:0`. The
+    /// expression carries its own position; prefer it.
     fn expr_pos(&self, expr: &Expr) -> Position {
         if expr.pos != Position::default() {
             expr.pos
@@ -807,8 +797,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// (for brace elision per C99 6.7.8p17-20).
     ///
     /// The rule itself lives on the type table, because the parser needs the
-    /// same count to decide an incomplete array's bound and had been counting
-    /// one array element per initializer element instead.
+    /// same count to decide an incomplete array's bound.
     pub(crate) fn count_scalar_fields(&self, typ: TypeId) -> usize {
         self.types.count_scalar_fields(typ)
     }

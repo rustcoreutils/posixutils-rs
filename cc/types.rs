@@ -16,9 +16,7 @@ use crate::target::{Arch, Os, Target};
 use std::collections::HashMap;
 use std::fmt;
 
-// ============================================================================
 // Type ID - Unique identifier for interned types
-// ============================================================================
 
 /// A unique identifier for an interned type (like IdentTable for strings)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -35,9 +33,7 @@ impl TypeId {
     }
 }
 
-// ============================================================================
 // Composite Type Components
-// ============================================================================
 
 /// A struct/union member
 #[derive(Debug, Clone, PartialEq)]
@@ -140,9 +136,7 @@ impl CompositeType {
     // since they require access to member type sizes via TypeId lookup.
 }
 
-// ============================================================================
 // Type Modifiers
-// ============================================================================
 
 bitflags::bitflags! {
     /// Type modifiers (storage class, qualifiers, signedness)
@@ -186,9 +180,7 @@ bitflags::bitflags! {
     }
 }
 
-// ============================================================================
 // Type Kinds
-// ============================================================================
 
 /// Basic type kinds for C99 types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -262,9 +254,7 @@ impl fmt::Display for TypeKind {
     }
 }
 
-// ============================================================================
 // Type Representation
-// ============================================================================
 
 /// A C type (compositional structure)
 ///
@@ -652,9 +642,7 @@ impl fmt::Display for Type {
     }
 }
 
-// ============================================================================
 // Type Table - Interned type storage and query methods
-// ============================================================================
 
 /// Key for type lookup/deduplication (hashable representation)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -990,9 +978,7 @@ impl TypeTable {
         typ.composite = Some(Box::new(composite));
     }
 
-    // =========================================================================
     // Type query methods (moved from Type to TypeTable)
-    // =========================================================================
 
     /// Get the type kind
     #[inline]
@@ -1025,9 +1011,7 @@ impl TypeTable {
         self.void_ptr_id
     }
 
-    // =========================================================================
     // Type-shape accessors
-    // =========================================================================
 
     /// Get array size
     #[inline]
@@ -1306,9 +1290,7 @@ impl TypeTable {
         }
     }
 
-    // =========================================================================
     // Production methods (used by compiler proper)
-    // =========================================================================
 
     /// Check if type is an integer type
     #[inline]
@@ -1930,9 +1912,7 @@ impl TypeTable {
         }
     }
 
-    // ========================================================================
     // Target-dependent type size helpers
-    // ========================================================================
 
     /// Whether `__float128` is available on this target.
     ///
@@ -2354,10 +2334,6 @@ impl TypeTable {
         (size, max_align)
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -48,9 +48,7 @@ const DEFAULT_BLOCK_CAPACITY: usize = 512;
 const DEFAULT_PSEUDO_CAPACITY: usize = 2048;
 const DEFAULT_LOCAL_CAPACITY: usize = 64;
 
-// ============================================================================
 // Call ABI Information
-// ============================================================================
 
 /// ABI classification information for a function call.
 ///
@@ -72,9 +70,7 @@ impl CallAbiInfo {
     }
 }
 
-// ============================================================================
 // Instruction Reference - for def-use chains
-// ============================================================================
 
 /// Reference to an instruction by (basic block id, instruction index)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,9 +85,7 @@ impl InsnRef {
     }
 }
 
-// ============================================================================
 // Opcodes
-// ============================================================================
 
 /// IR opcodes for the intermediate representation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,9 +474,7 @@ impl fmt::Display for Opcode {
     }
 }
 
-// ============================================================================
 // Memory Ordering - for atomic operations
-// ============================================================================
 
 /// Memory ordering for atomic operations (C11 memory model)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -516,9 +508,7 @@ impl fmt::Display for MemoryOrder {
     }
 }
 
-// ============================================================================
 // Pseudo - Virtual registers / values in SSA form
-// ============================================================================
 
 /// Unique ID for a pseudo (virtual register)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -671,9 +661,7 @@ impl fmt::Display for Pseudo {
     }
 }
 
-// ============================================================================
 // BasicBlock ID
-// ============================================================================
 
 /// Unique ID for a basic block
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -685,9 +673,7 @@ impl fmt::Display for BasicBlockId {
     }
 }
 
-// ============================================================================
 // Inline Assembly Support
-// ============================================================================
 
 /// Constraint information for an inline asm operand
 #[derive(Debug, Clone)]
@@ -761,9 +747,7 @@ pub struct AsmData {
     pub goto_labels: Vec<(BasicBlockId, String)>,
 }
 
-// ============================================================================
 // Instruction
-// ============================================================================
 
 /// An IR instruction
 #[derive(Debug, Clone)]
@@ -1377,9 +1361,7 @@ impl fmt::Display for Instruction {
     }
 }
 
-// ============================================================================
 // BasicBlock
-// ============================================================================
 
 /// A basic block - a sequence of instructions ending with a terminator
 #[derive(Debug, Clone)]
@@ -1520,9 +1502,7 @@ impl fmt::Display for BasicBlock {
     }
 }
 
-// ============================================================================
 // Function (Entrypoint)
-// ============================================================================
 
 /// Information about a local variable for SSA conversion
 #[derive(Debug, Clone)]
@@ -1848,9 +1828,7 @@ impl fmt::Display for Function {
     }
 }
 
-// ============================================================================
 // Global Variable Initializer
-// ============================================================================
 
 /// Initializer for global variables
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1998,9 +1976,7 @@ impl fmt::Display for Initializer {
     }
 }
 
-// ============================================================================
 // Global Variable Definition
-// ============================================================================
 
 /// How a global is stored, as three facts that always travel together.
 ///
@@ -2070,9 +2046,7 @@ impl GlobalDef {
     }
 }
 
-// ============================================================================
 // Module (Translation Unit)
-// ============================================================================
 
 /// A module containing multiple functions
 #[derive(Debug, Clone, Default)]
@@ -2305,10 +2279,6 @@ impl fmt::Display for Module {
         Ok(())
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -2777,9 +2747,7 @@ mod tests {
         assert!(insn.returns_two_regs());
     }
 
-    // ========================================================================
     // Function::create_reg_pseudo
-    // ========================================================================
 
     #[test]
     fn test_create_reg_pseudo() {
@@ -2803,9 +2771,7 @@ mod tests {
         assert_ne!(id1, id2);
     }
 
-    // ========================================================================
     // Instruction::call_with_abi
-    // ========================================================================
 
     #[test]
     fn test_call_with_abi_basic() {
@@ -2877,9 +2843,7 @@ mod tests {
         assert_eq!(insn.size, types.size_bits(types.double_id));
     }
 
-    // ========================================================================
     // is_memory_barrier
-    // ========================================================================
 
     fn make_asm_with_clobbers(clobbers: Vec<&str>) -> Instruction {
         let mut insn = Instruction::new(Opcode::Asm);

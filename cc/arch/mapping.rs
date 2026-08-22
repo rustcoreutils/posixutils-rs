@@ -19,9 +19,7 @@ use crate::rtlib::{Float16Abi, RtlibNames};
 use crate::target::{Arch, Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
-// ============================================================================
 // Trait and types
-// ============================================================================
 
 /// Context passed to arch mapper. Provides mutable access to the
 /// function for pseudo allocation, plus type/target info.
@@ -46,9 +44,7 @@ pub trait ArchMapper {
     fn map_insn(&self, insn: &Instruction, ctx: &mut MappingCtx<'_>) -> MappedInsn;
 }
 
-// ============================================================================
 // Complex number rtlib name selection
-// ============================================================================
 
 /// Get the rtlib function name for complex multiplication.
 /// Target-dependent for long double (x87 vs IEEE quad).
@@ -92,9 +88,7 @@ pub fn complex_div_name(base_kind: TypeKind, target: &Target) -> &'static str {
     }
 }
 
-// ============================================================================
 // Utility helpers
-// ============================================================================
 
 /// Get the rtlib suffix for a float type kind on the given target.
 pub(crate) fn float_suffix(kind: TypeKind, target: &Target) -> &'static str {
@@ -155,9 +149,7 @@ pub(crate) fn int_suffix_for_longdouble(types: &TypeTable, int_type: TypeId) -> 
     }
 }
 
-// ============================================================================
 // Instruction helpers
-// ============================================================================
 
 /// Extract lo and hi 64-bit halves from a 128-bit pseudo.
 fn extract_halves(
@@ -173,9 +165,7 @@ fn extract_halves(
     (lo, hi)
 }
 
-// ============================================================================
 // Rtlib call builders (convenience wrappers over Instruction::call_with_abi)
-// ============================================================================
 
 /// Build a rtlib call replacing a binop (both args same type as result).
 pub(crate) fn build_binop_rtlib_call(
@@ -381,9 +371,7 @@ fn build_f16_truncate_call(
     call_insn
 }
 
-// ============================================================================
 // Int128 expansion helpers
-// ============================================================================
 
 /// Expand int128 bitwise op (And/Or/Xor) into 64-bit operations.
 fn expand_int128_bitwise(
@@ -821,9 +809,7 @@ fn expand_int128_sext(
     insns
 }
 
-// ============================================================================
 // Int128 constant shift expansion helpers
-// ============================================================================
 
 /// Expand int128 Shl by a constant amount into 64-bit operations.
 fn expand_int128_const_shl(
@@ -1216,9 +1202,7 @@ fn expand_int128_const_asr(
     insns
 }
 
-// ============================================================================
 // Float16 expansion helpers
-// ============================================================================
 
 /// Expand Float16 binary arithmetic (promote-operate-truncate).
 pub(crate) fn expand_float16_arith(
@@ -1479,9 +1463,7 @@ pub(crate) fn expand_float16_cmp(
     insns
 }
 
-// ============================================================================
 // Shared mapping decision functions
-// ============================================================================
 
 /// Classify and expand an int128 div/mod instruction into a rtlib call.
 pub(crate) fn map_int128_divmod(
@@ -1711,9 +1693,7 @@ pub(crate) fn map_int128_float_convert(
     }
 }
 
-// ============================================================================
 // Pass infrastructure
-// ============================================================================
 
 /// Create the appropriate ArchMapper for the given target.
 fn create_mapper(target: &Target) -> Box<dyn ArchMapper> {
@@ -1762,9 +1742,7 @@ pub fn run_mapping(module: &mut Module, types: &TypeTable, target: &Target) {
     }
 }
 
-// ============================================================================
 // Shared test helpers
-// ============================================================================
 
 /// Expand an operation on an IEEE binary128 value into libgcc soft-float calls.
 ///
@@ -2167,10 +2145,6 @@ pub(crate) mod test_helpers {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::test_helpers::*;
@@ -2179,9 +2153,7 @@ mod tests {
     use crate::target::{Arch, Os, Target};
     use crate::types::TypeTable;
 
-    // ========================================================================
     // Pass runner tests
-    // ========================================================================
 
     #[test]
     fn test_run_mapping_empty() {
@@ -2263,9 +2235,7 @@ mod tests {
         assert_eq!(module.functions[0].blocks[0].insns.len(), orig_insn_count);
     }
 
-    // ========================================================================
     // Integration: int128 div/mod transformation
-    // ========================================================================
 
     #[test]
     fn test_mapping_transforms_int128_divmod() {
@@ -2306,9 +2276,7 @@ mod tests {
         assert!(block.insns[1].abi_info.is_some());
     }
 
-    // ========================================================================
     // Integration: int128↔float conversion transformation
-    // ========================================================================
 
     #[test]
     fn test_mapping_transforms_int128_conversion() {
@@ -2344,9 +2312,7 @@ mod tests {
         assert!(block.insns[1].abi_info.is_some());
     }
 
-    // ========================================================================
     // Complex mul/div rtlib name tests
-    // ========================================================================
 
     #[test]
     fn test_complex_mul_name_float() {

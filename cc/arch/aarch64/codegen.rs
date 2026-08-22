@@ -28,9 +28,7 @@ use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 
-// ============================================================================
 // AArch64 Code Generator
-// ============================================================================
 
 /// AArch64 code generator
 pub struct Aarch64CodeGen {
@@ -2394,9 +2392,7 @@ impl Aarch64CodeGen {
                 self.emit_float_to_float(insn, types);
             }
 
-            // ================================================================
             // Variadic function support (va_* builtins)
-            // ================================================================
             Opcode::VaStart => {
                 self.emit_va_start(insn);
             }
@@ -2461,9 +2457,7 @@ impl Aarch64CodeGen {
                 self.emit_return_address(insn);
             }
 
-            // ================================================================
             // setjmp/longjmp support
-            // ================================================================
             Opcode::Setjmp => {
                 self.emit_setjmp(insn);
             }
@@ -2472,16 +2466,12 @@ impl Aarch64CodeGen {
                 self.emit_longjmp(insn);
             }
 
-            // ================================================================
             // Inline Assembly
-            // ================================================================
             Opcode::Asm => {
                 self.emit_inline_asm(insn);
             }
 
-            // ================================================================
             // Atomic Operations
-            // ================================================================
             Opcode::AtomicLoad => {
                 self.emit_atomic_load(insn);
             }
@@ -3672,9 +3662,7 @@ impl Aarch64CodeGen {
 
     // Floating-Point Operations - see float.rs
 
-    // ========================================================================
     // Inline Assembly Support
-    // ========================================================================
 
     /// Emit inline assembly instruction
     fn emit_inline_asm(&mut self, insn: &Instruction) {
@@ -4145,9 +4133,7 @@ impl Aarch64CodeGen {
         crate::arch::substitute_asm_operands(self, template, slots, goto_labels)
     }
 
-    // ========================================================================
     // Atomic Operations (ARMv8.1 LSE)
-    // ========================================================================
 
     /// Emit atomic load
     fn emit_atomic_load(&mut self, insn: &Instruction) {
@@ -4731,9 +4717,7 @@ impl Aarch64CodeGen {
 // Import shared helper from parent module
 use super::f64_to_f16_bits;
 
-// ============================================================================
 // Inline Assembly Helper Functions
-// ============================================================================
 
 /// Get the 64-bit register name for inline asm
 fn asm_reg_name_64(reg: Reg) -> &'static str {
@@ -4811,9 +4795,7 @@ fn asm_reg_name_32(reg: Reg) -> &'static str {
     }
 }
 
-// ============================================================================
 // AsmOperandFormatter trait implementation
-// ============================================================================
 
 impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
     type Reg = Reg;
@@ -4851,9 +4833,7 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
     }
 }
 
-// ============================================================================
 // CodeGenerator trait implementation
-// ============================================================================
 
 impl CodeGenerator for Aarch64CodeGen {
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String {

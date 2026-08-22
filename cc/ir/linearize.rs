@@ -196,9 +196,7 @@ pub(crate) struct StaticLocalInfo {
     pub(crate) typ: TypeId,
 }
 
-// ============================================================================
 // Linearizer
-// ============================================================================
 
 /// Linearizer context for converting AST to IR
 pub struct Linearizer<'a> {
@@ -729,9 +727,7 @@ impl<'a> Linearizer<'a> {
         self.get_or_create_bb(id);
     }
 
-    // ========================================================================
     // Function linearization
-    // ========================================================================
 
     /// Whether a return value of this type comes back through a hidden
     /// pointer (sret) rather than in registers.
@@ -1326,9 +1322,7 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    // ========================================================================
     // Statement linearization
-    // ========================================================================
 
     /// Emit large struct return via hidden pointer (sret)
     pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_size: u32) {
@@ -1434,9 +1428,7 @@ impl<'a> Linearizer<'a> {
         self.emit(ret_insn);
     }
 
-    // ========================================================================
     // Expression linearization
-    // ========================================================================
 
     /// Get the type of an expression.
     /// PANICS if expression has no type - type evaluation pass must run first.
@@ -4361,9 +4353,7 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_va_op(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
-            // ================================================================
             // Variadic function support (va_* builtins)
-            // ================================================================
             ExprKind::VaStart { ap, last_param } => {
                 // va_start(ap, last_param)
                 // Get address of ap (it's an lvalue)
@@ -4462,9 +4452,7 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_builtin(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
-            // ================================================================
             // Byte-swapping builtins
-            // ================================================================
             ExprKind::Bswap16 { arg } => {
                 let arg_val = self.linearize_expr(arg);
                 let result = self.alloc_pseudo();
@@ -4504,9 +4492,7 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            // ================================================================
             // Count trailing zeros builtins
-            // ================================================================
             ExprKind::Ctz { arg } => {
                 // __builtin_ctz - counts trailing zeros in unsigned int (32-bit)
                 let arg_val = self.linearize_expr(arg);
@@ -4535,9 +4521,7 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            // ================================================================
             // Count leading zeros builtins
-            // ================================================================
             ExprKind::Clz { arg } => {
                 // __builtin_clz - counts leading zeros in unsigned int (32-bit)
                 let arg_val = self.linearize_expr(arg);
@@ -4569,9 +4553,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::Clrsb { arg } => self.linearize_clrsb(arg, 32),
             ExprKind::Clrsbl { arg } | ExprKind::Clrsbll { arg } => self.linearize_clrsb(arg, 64),
 
-            // ================================================================
             // Population count builtins
-            // ================================================================
             ExprKind::Popcount { arg } => {
                 // __builtin_popcount - counts set bits in unsigned int (32-bit)
                 let arg_val = self.linearize_expr(arg);
@@ -4846,9 +4828,7 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_c11_atomic(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
-            // ================================================================
             // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
-            // ================================================================
             ExprKind::C11AtomicInit { ptr, val } => {
                 self.emit_c11_atomic_builtin(Opcode::AtomicStore, ptr, Some(val), None)
             }
@@ -5620,9 +5600,7 @@ impl<'a> Linearizer<'a> {
     }
 }
 
-// ============================================================================
 // Public API
-// ============================================================================
 
 /// Linearize an AST to IR
 pub fn linearize(

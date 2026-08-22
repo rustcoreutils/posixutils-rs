@@ -28,9 +28,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::process::ExitCode;
 
-// ============================================================================
 // CLI
-// ============================================================================
 
 #[derive(Parser)]
 #[command(version, about = gettext("cxref - generate a C-language program cross-reference table"))]
@@ -64,9 +62,7 @@ struct Args {
     files: Vec<String>,
 }
 
-// ============================================================================
 // Symbol Reference
-// ============================================================================
 
 /// A reference to a symbol
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -161,9 +157,7 @@ impl CrossRef {
     }
 }
 
-// ============================================================================
 // AST Walking
-// ============================================================================
 
 /// Walk an expression to find symbol references
 fn extract_refs_from_expr(
@@ -385,9 +379,7 @@ fn extract_refs_from_stmt(
     }
 }
 
-// ============================================================================
 // Macro cross-referencing
-// ============================================================================
 
 /// Split a line into identifier-like tokens with their column offsets.
 fn identifiers(line: &str) -> Vec<&str> {
@@ -519,9 +511,7 @@ fn parse_line_marker(line: &str) -> Option<(String, u32)> {
     Some((name[..end].to_string(), line_no))
 }
 
-// ============================================================================
 // File Processing
-// ============================================================================
 
 fn process_file(
     path: &str,
@@ -645,9 +635,7 @@ fn process_file(
     Ok(())
 }
 
-// ============================================================================
 // Output
-// ============================================================================
 
 /// Format and print the cross-reference.
 ///
@@ -746,9 +734,7 @@ fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Writ
     }
 }
 
-// ============================================================================
 // Main
-// ============================================================================
 
 fn main() -> ExitCode {
     plib::diag::init_locale("cxref");

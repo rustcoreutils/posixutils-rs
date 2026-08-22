@@ -21,9 +21,7 @@ use std::collections::HashMap;
 
 const DEFAULT_COPY_CAPACITY: usize = 8;
 
-// ============================================================================
 // Phi Elimination
-// ============================================================================
 
 /// Eliminate phi nodes by converting PhiSource instructions to Copy.
 ///
@@ -239,9 +237,7 @@ fn sequentialize_copies(copies: &[CopyInfo], func: &mut Function) -> Vec<CopyInf
     result
 }
 
-// ============================================================================
 // Module-level lowering
-// ============================================================================
 
 /// Lower all functions in a module.
 ///
@@ -259,10 +255,6 @@ pub fn lower_module(module: &mut Module) {
 pub fn lower_function(func: &mut Function) {
     eliminate_phi_nodes(func);
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -451,9 +443,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // Tests for sequentialize_copies (parallel copy sequentialization)
-    // ========================================================================
 
     fn make_minimal_func() -> Function {
         let types = TypeTable::new(&Target::host());

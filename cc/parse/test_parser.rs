@@ -55,9 +55,7 @@ fn check_name(strings: &StringTable, id: StringId, expected: &str) {
     assert_eq!(strings.get(id), expected);
 }
 
-// ========================================================================
 // Literal tests
-// ========================================================================
 
 #[test]
 fn test_int_literal() {
@@ -107,9 +105,7 @@ fn test_string_literal() {
     }
 }
 
-// ========================================================================
 // Character literal escape sequence tests
-// ========================================================================
 
 #[test]
 fn test_char_escape_newline() {
@@ -201,9 +197,7 @@ fn test_char_escape_octal_012() {
     assert!(matches!(expr.kind, ExprKind::CharLit(10))); // octal 012 = 10 = '\n'
 }
 
-// ========================================================================
 // UCN (Universal Character Name) escape sequence tests - C99 6.4.3
-// ========================================================================
 
 #[test]
 fn test_char_escape_ucn_short() {
@@ -267,9 +261,7 @@ fn test_string_ucn_long() {
     }
 }
 
-// ========================================================================
 // String literal escape sequence tests
-// ========================================================================
 
 #[test]
 fn test_string_escape_newline() {
@@ -520,9 +512,7 @@ fn test_identifier() {
     }
 }
 
-// ========================================================================
 // Binary operator tests
-// ========================================================================
 
 #[test]
 fn test_addition() {
@@ -704,9 +694,7 @@ fn test_shift_ops() {
     }
 }
 
-// ========================================================================
 // Unary operator tests
-// ========================================================================
 
 #[test]
 fn test_unary_neg() {
@@ -779,9 +767,7 @@ fn test_pre_decrement() {
     }
 }
 
-// ========================================================================
 // Postfix operator tests
-// ========================================================================
 
 #[test]
 fn test_post_increment() {
@@ -904,9 +890,7 @@ fn test_chained_postfix() {
     }
 }
 
-// ========================================================================
 // Assignment tests
-// ========================================================================
 
 #[test]
 fn test_simple_assignment() {
@@ -974,9 +958,7 @@ fn test_assignment_right_associativity() {
     }
 }
 
-// ========================================================================
 // Ternary expression tests
-// ========================================================================
 
 #[test]
 fn test_ternary() {
@@ -1023,9 +1005,7 @@ fn test_nested_ternary() {
     }
 }
 
-// ========================================================================
 // Comma expression tests
-// ========================================================================
 
 #[test]
 fn test_comma_expr() {
@@ -1036,9 +1016,7 @@ fn test_comma_expr() {
     }
 }
 
-// ========================================================================
 // sizeof tests
-// ========================================================================
 
 #[test]
 fn test_sizeof_expr() {
@@ -1130,9 +1108,7 @@ fn test_sizeof_paren_expr() {
     assert!(matches!(expr.kind, ExprKind::SizeofExpr(_)));
 }
 
-// ========================================================================
 // Cast tests
-// ========================================================================
 
 #[test]
 fn test_cast() {
@@ -1425,9 +1401,7 @@ fn test_sizeof_pointer_type() {
     }
 }
 
-// ========================================================================
 // Parentheses tests
-// ========================================================================
 
 #[test]
 fn test_parentheses() {
@@ -1444,9 +1418,7 @@ fn test_parentheses() {
     }
 }
 
-// ========================================================================
 // Complex expression tests
-// ========================================================================
 
 #[test]
 fn test_complex_expr() {
@@ -1496,9 +1468,7 @@ fn test_pointer_arithmetic() {
     }
 }
 
-// ========================================================================
 // Statement tests
-// ========================================================================
 
 fn parse_stmt(input: &str) -> ParseResult<(Stmt, StringTable)> {
     parse_stmt_with_vars(input, &[])
@@ -1751,9 +1721,7 @@ fn test_block_with_decl() {
     }
 }
 
-// ========================================================================
 // Declaration tests
-// ========================================================================
 
 fn parse_decl(input: &str) -> ParseResult<(Declaration, TypeTable, StringTable, SymbolTable)> {
     let mut strings = StringTable::new();
@@ -1887,9 +1855,7 @@ fn test_typedef_array_modifier_propagation() {
     );
 }
 
-// ========================================================================
 // Function parsing tests
-// ========================================================================
 
 fn parse_func(input: &str) -> ParseResult<(FunctionDef, TypeTable, StringTable, SymbolTable)> {
     let mut strings = StringTable::new();
@@ -1945,9 +1911,7 @@ fn test_pointer_return() {
     assert_eq!(types.kind(func.return_type), TypeKind::Pointer);
 }
 
-// ========================================================================
 // Translation unit tests
-// ========================================================================
 
 fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
     let mut strings = StringTable::new();
@@ -2081,9 +2045,7 @@ fn test_struct_with_variable_declaration() {
     }
 }
 
-// ========================================================================
 // Typedef tests
-// ========================================================================
 
 #[test]
 fn test_typedef_basic() {
@@ -2256,9 +2218,7 @@ fn test_typedef_local_variable() {
     }
 }
 
-// ========================================================================
 // Restrict qualifier tests
-// ========================================================================
 
 #[test]
 fn test_restrict_pointer_decl() {
@@ -2328,9 +2288,7 @@ fn test_restrict_global_pointer() {
     }
 }
 
-// ========================================================================
 // Volatile qualifier tests
-// ========================================================================
 
 #[test]
 fn test_volatile_basic() {
@@ -2435,9 +2393,7 @@ fn test_volatile_function_param() {
     }
 }
 
-// ========================================================================
 // __attribute__ tests
-// ========================================================================
 
 #[test]
 fn test_attribute_on_function_declaration() {
@@ -2648,9 +2604,7 @@ fn test_const_pointer_types() {
     assert!(matches!(tu.items[0], ExternalDecl::FunctionDef(_)));
 }
 
-// ========================================================================
 // Function declaration tests (prototypes)
-// ========================================================================
 
 #[test]
 fn test_function_decl_no_params() {
@@ -2786,9 +2740,7 @@ fn test_function_decl_pointer_param() {
     }
 }
 
-// ========================================================================
 // Variadic function declaration tests
-// ========================================================================
 
 #[test]
 fn test_function_decl_variadic_printf() {
@@ -3074,9 +3026,7 @@ fn test_function_decl_array_decay() {
     }
 }
 
-// ========================================================================
 // Function pointer tests
-// ========================================================================
 
 #[test]
 fn test_function_pointer_declaration() {
@@ -3351,9 +3301,7 @@ fn test_pointer_to_array_of_pointers() {
     }
 }
 
-// ========================================================================
 // Bitfield tests
-// ========================================================================
 
 #[test]
 fn test_bitfield_basic() {
@@ -3512,9 +3460,7 @@ fn test_bitfield_too_wide_error() {
     }
 }
 
-// ========================================================================
 // Enum tests
-// ========================================================================
 
 #[test]
 fn test_empty_enum_warning() {
@@ -3534,10 +3480,8 @@ fn test_empty_enum_warning() {
     }
 }
 
-// ========================================================================
 // Typedef with trailing qualifiers tests (C99)
 // Tests for "typedef_name const" and "typedef_name volatile" syntax
-// ========================================================================
 
 #[test]
 fn test_typedef_trailing_const() {
@@ -3636,9 +3580,7 @@ fn test_typedef_trailing_const_pointer() {
     }
 }
 
-// ========================================================================
 // Bug fix regression tests
-// ========================================================================
 
 #[test]
 fn test_forward_declared_struct_member_access() {
@@ -3717,9 +3659,7 @@ fn test_typedef_function_pointer_call() {
     assert_eq!(tu.items.len(), 3);
 }
 
-// ========================================================================
 // Designated Initializer Edge Cases
-// ========================================================================
 
 #[test]
 fn test_nested_field_designator() {
@@ -3753,9 +3693,7 @@ fn test_repeated_designator() {
     assert_eq!(tu.items.len(), 1);
 }
 
-// ========================================================================
 // Complex Declarator Edge Cases
-// ========================================================================
 
 #[test]
 fn test_function_returning_ptr_to_array() {
@@ -3890,9 +3828,7 @@ fn test_abstract_declarators_in_type_names() {
     }
 }
 
-// ========================================================================
 // Array Parameter Edge Cases
-// ========================================================================
 
 #[test]
 fn test_static_array_parameter() {
@@ -3918,9 +3854,7 @@ fn test_vla_star_parameter() {
     assert_eq!(tu.items.len(), 1);
 }
 
-// ========================================================================
 // Type Parsing Edge Cases
-// ========================================================================
 
 #[test]
 fn test_multiple_type_qualifiers() {
@@ -3968,9 +3902,7 @@ fn test_inline_function() {
     }
 }
 
-// ========================================================================
 // Escape Sequence Edge Cases
-// ========================================================================
 
 #[test]
 fn test_octal_escape_boundary() {
@@ -4022,9 +3954,7 @@ fn test_escape_sequences_comprehensive() {
     }
 }
 
-// ========================================================================
 // Expression Edge Cases
-// ========================================================================
 
 #[test]
 fn test_comma_expression_in_parens() {
@@ -4113,9 +4043,7 @@ fn test_compound_literal_in_expression() {
     }
 }
 
-// ========================================================================
 // __builtin_offsetof tests
-// ========================================================================
 
 #[test]
 fn test_offsetof_basic() {
@@ -4150,9 +4078,7 @@ fn test_offsetof_macro_style() {
     assert_eq!(tu.items.len(), 2);
 }
 
-// ========================================================================
 // Statement expression tests (GNU extension)
-// ========================================================================
 
 #[test]
 fn test_stmt_expr_basic() {
@@ -4186,9 +4112,7 @@ fn test_stmt_expr_in_function() {
     assert_eq!(tu.items.len(), 1);
 }
 
-// ========================================================================
 // Integer literal type promotion tests (C99 6.4.4.1)
-// ========================================================================
 
 #[test]
 fn test_hex_literal_type_promotion() {
@@ -4248,9 +4172,7 @@ fn test_decimal_literal_stays_signed() {
     assert!(!types.is_unsigned(expr.typ.unwrap()));
 }
 
-// ========================================================================
 // Incomplete array size from string literal tests
-// ========================================================================
 
 #[test]
 fn test_incomplete_array_string_literal_size() {
@@ -4324,9 +4246,7 @@ fn test_incomplete_array_designator_sequence_size() {
     }
 }
 
-// ========================================================================
 // typeof operator tests (GCC extension)
-// ========================================================================
 
 #[test]
 fn test_typeof_with_type() {
@@ -4382,9 +4302,7 @@ fn test_dunder_typeof() {
     }
 }
 
-// ========================================================================
 // Anonymous struct/union member tests (C11)
-// ========================================================================
 
 #[test]
 fn test_anonymous_union_in_struct() {
@@ -4401,9 +4319,7 @@ fn test_anonymous_struct_in_union() {
     assert!(result.is_ok(), "Anonymous struct in union should parse");
 }
 
-// ========================================================================
 // Statement expression void type tests
-// ========================================================================
 
 #[test]
 fn test_stmt_expr_void_when_last_is_if() {
@@ -4430,9 +4346,7 @@ fn test_stmt_expr_empty_is_void() {
     }
 }
 
-// ========================================================================
 // Wide string literal tests
-// ========================================================================
 
 #[test]
 fn test_wide_string_literal_basic() {
@@ -4485,9 +4399,7 @@ fn test_wide_string_array_size_inference() {
     }
 }
 
-// ========================================================================
 // Function parameter adjustment tests
-// ========================================================================
 
 #[test]
 fn test_function_param_adjusted_to_pointer() {
@@ -4542,9 +4454,7 @@ fn test_function_param_array_adjusted_to_pointer() {
     }
 }
 
-// ========================================================================
 // __FUNCTION__ and __PRETTY_FUNCTION__ parsing tests
-// ========================================================================
 
 #[test]
 fn test_gcc_function_identifier_parsing() {
@@ -4572,9 +4482,7 @@ fn test_gcc_pretty_function_identifier_parsing() {
     assert_eq!(types.kind(typ), TypeKind::Pointer);
 }
 
-// ========================================================================
 // Long double type parsing tests
-// ========================================================================
 
 #[test]
 fn test_long_double_type() {
@@ -4607,9 +4515,7 @@ fn test_long_double_function_param() {
     assert_eq!(types.kind(param_type), TypeKind::LongDouble);
 }
 
-// ========================================================================
 // C11 _Atomic qualifier tests
-// ========================================================================
 
 #[test]
 fn test_atomic_type_qualifier() {
@@ -4752,9 +4658,7 @@ fn test_atomic_specifier_in_sizeof() {
     assert_eq!(tu.items.len(), 1);
 }
 
-// =======================================================================
 // Atomic builtin tests
-// =======================================================================
 
 #[test]
 fn test_atomic_load_n() {
@@ -4879,9 +4783,7 @@ fn test_atomic_signal_fence() {
     assert!(matches!(&tu.items[0], ExternalDecl::FunctionDef(_)));
 }
 
-// ========================================================================
 // C23 _Float* type tests (TS 18661-3)
-// ========================================================================
 
 #[test]
 fn test_float16_type_decl() {
@@ -4924,9 +4826,7 @@ fn test_float64_type_decl() {
     }
 }
 
-// ========================================================================
 // C23 _Float* literal suffix tests (f16, f32, f64)
-// ========================================================================
 
 #[test]
 fn test_float16_literal_suffix() {
@@ -4981,9 +4881,7 @@ fn test_int_with_float16_suffix() {
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Float16);
 }
 
-// ========================================================================
 // _Alignof expression tests (C11)
-// ========================================================================
 
 #[test]
 fn test_alignof_type_int() {
@@ -5059,9 +4957,7 @@ fn test_alignof_returns_size_t_type() {
     assert_eq!(expr.typ, Some(types.ulong_id));
 }
 
-// ========================================================================
 // __builtin_nan/nanf/nanl tests
-// ========================================================================
 
 #[test]
 fn test_builtin_nan() {
@@ -5092,9 +4988,7 @@ fn test_builtin_nans() {
     assert_eq!(expr.typ, Some(types.double_id));
 }
 
-// ========================================================================
 // __builtin_flt_rounds test
-// ========================================================================
 
 #[test]
 fn test_builtin_flt_rounds() {
@@ -5104,9 +4998,7 @@ fn test_builtin_flt_rounds() {
     assert_eq!(expr.typ, Some(types.int_id));
 }
 
-// ========================================================================
 // __builtin_expect test
-// ========================================================================
 
 #[test]
 fn test_builtin_expect() {
@@ -5128,9 +5020,7 @@ fn test_builtin_expect_with_expression() {
     }
 }
 
-// ========================================================================
 // Wide character literal test
-// ========================================================================
 
 #[test]
 fn test_wide_char_literal() {
@@ -5146,9 +5036,7 @@ fn test_wide_char_escape() {
     assert!(matches!(expr.kind, ExprKind::CharLit(10)));
 }
 
-// ========================================================================
 // Hex float suffix fix test (f16/f32/f64 are hex digits, not suffixes)
-// ========================================================================
 
 #[test]
 fn test_hex_float_not_f16_suffix() {
@@ -5266,9 +5154,7 @@ fn test_atomic_is_not_an_identifier() {
     );
 }
 
-// ========================================================================
 // Alignment tests
-// ========================================================================
 
 #[test]
 fn test_alignas_on_variable() {
@@ -5431,9 +5317,7 @@ fn test_int128_struct_member() {
     assert_eq!(types.size_bytes(typ), 512);
 }
 
-// ============================================================================
 // C11 `_Generic` type-generic selection (C17 6.5.1.1)
-// ============================================================================
 
 /// `_Generic` is resolved at parse time and the *selected* association's
 /// expression is returned verbatim -- there is no `ExprKind::Generic`. These

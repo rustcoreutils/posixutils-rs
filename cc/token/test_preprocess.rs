@@ -370,9 +370,7 @@ fn test_if_comparison() {
     assert!(strs.contains(&"no".to_string()));
 }
 
-// ========================================================================
 // Header guard tests
-// ========================================================================
 
 #[test]
 fn test_header_guard_basic() {
@@ -412,9 +410,7 @@ second
     assert!(strs.contains(&"second".to_string()));
 }
 
-// ========================================================================
 // Multiple elif chain tests
-// ========================================================================
 
 #[test]
 fn test_multiple_elif_first() {
@@ -449,9 +445,7 @@ fn test_multiple_elif_else() {
     assert!(strs.contains(&"four".to_string()));
 }
 
-// ========================================================================
 // Defined operator tests
-// ========================================================================
 
 #[test]
 fn test_defined_without_parens() {
@@ -486,9 +480,7 @@ fn test_defined_in_complex_expr() {
     assert!(strs.contains(&"yes".to_string()));
 }
 
-// ========================================================================
 // Macro expansion tests
-// ========================================================================
 
 #[test]
 fn test_multi_token_macro() {
@@ -609,9 +601,7 @@ fn test_replacement_lists_ignore_leading_whitespace() {
     assert!(!replacement_lists_identical(&two(true), &two(false)));
 }
 
-// ========================================================================
 // Arithmetic in #if expressions
-// ========================================================================
 
 #[test]
 fn test_if_addition() {
@@ -661,9 +651,7 @@ fn test_if_parentheses() {
     assert!(strs.contains(&"yes".to_string()));
 }
 
-// ========================================================================
 // Comparison operators in #if
-// ========================================================================
 
 #[test]
 fn test_if_equal() {
@@ -697,9 +685,7 @@ fn test_if_greater_equal() {
     assert!(strs.contains(&"yes".to_string()));
 }
 
-// ========================================================================
 // Bitwise operators in #if
-// ========================================================================
 
 #[test]
 fn test_if_bitwise_and() {
@@ -717,9 +703,7 @@ fn test_if_bitwise_or() {
     assert!(strs.contains(&"yes".to_string()));
 }
 
-// ========================================================================
 // Edge cases
-// ========================================================================
 
 #[test]
 fn test_empty_if_block() {
@@ -903,9 +887,7 @@ PASTE(foo, bar)
     assert!(strs.contains(&"42".to_string()));
 }
 
-// ========================================================================
 // Tests for __INCLUDE_LEVEL__ macro
-// ========================================================================
 
 #[test]
 fn test_include_level_macro() {
@@ -924,9 +906,7 @@ fn test_include_level_macro() {
     assert!(nums.contains(&"0".to_string()));
 }
 
-// ========================================================================
 // Tests for __BASE_FILE__ macro
-// ========================================================================
 
 #[test]
 fn test_base_file_macro() {
@@ -936,9 +916,7 @@ fn test_base_file_macro() {
     assert!(tokens.iter().any(|t| t.typ == TokenType::String));
 }
 
-// ========================================================================
 // Tests for ternary operator in #if expressions
-// ========================================================================
 
 #[test]
 fn test_ternary_true_branch() {
@@ -981,9 +959,7 @@ fn test_ternary_with_defined() {
     assert!(strs.contains(&"yes".to_string()));
 }
 
-// ========================================================================
 // Tests for GNU ,##__VA_ARGS__ comma suppression
-// ========================================================================
 
 #[test]
 fn test_va_args_basic() {
@@ -1054,9 +1030,7 @@ fn test_chained_paste_expansion() {
     assert!(!strs.contains(&"ADD_func".to_string()));
 }
 
-// ========================================================================
 // _Pragma operator tests (C99)
-// ========================================================================
 
 #[test]
 fn test_pragma_operator_basic() {
@@ -1096,9 +1070,7 @@ fn test_pragma_operator_multiple() {
     assert!(!strs.contains(&"_Pragma".to_string()));
 }
 
-// ========================================================================
 // Include guard detection tests
-// ========================================================================
 
 /// Tokenize a header and ask whether it is exactly one guarded group.
 ///
@@ -1213,9 +1185,7 @@ fn test_guard_rejects_unterminated() {
     assert_eq!(guard_of("#ifndef G\n#define G\nint body;\n"), None);
 }
 
-// ========================================================================
 // bool/true/false predefined macro tests
-// ========================================================================
 
 #[test]
 fn test_bool_macro_expands_to_bool_with_stdbool() {
@@ -1251,9 +1221,7 @@ fn test_bool_not_predefined_without_stdbool() {
     assert!(!strs.contains(&"_Bool".to_string()));
 }
 
-// ========================================================================
 // Blue-painting tests (C99 6.10.3.4 - recursive macro prevention)
-// ========================================================================
 
 #[test]
 fn test_blue_painting_object_like_macro() {
@@ -1289,9 +1257,7 @@ fn test_blue_painting_indirect_recursion() {
     assert!(strs.contains(&"A".to_string()));
 }
 
-// ========================================================================
 // Predefined macro tokenization tests
-// ========================================================================
 
 #[test]
 fn test_predefined_macro_tokenization_parentheses() {
@@ -1334,9 +1300,7 @@ fn test_predefined_macro_expansion_with_parens() {
     assert!(strs.contains(&")".to_string()));
 }
 
-// ========================================================================
 // Wide string/char in macro expansion tests
-// ========================================================================
 
 #[test]
 fn test_wide_string_in_macro() {
@@ -1360,9 +1324,7 @@ fn test_wide_char_in_macro() {
     assert_eq!(wide_char_count, 1, "should have one wide char token");
 }
 
-// ========================================================================
 // Stringify, paste, include, and #if edge-case tests
-// ========================================================================
 
 /// 6.10.3.1p2 makes `__VA_ARGS__` the whole variadic token sequence,
 /// commas included. Substitution took its first element alone, so
@@ -1670,9 +1632,7 @@ fn test_line_directive_skipped_in_false_branch() {
     );
 }
 
-// ========================================================================
 // C99 compliance gap tests
-// ========================================================================
 
 #[test]
 fn test_line_directive_macro_expansion() {

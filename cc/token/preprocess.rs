@@ -53,9 +53,7 @@ pub enum IncludeSource {
     Builtin(&'static str), // content
 }
 
-// ============================================================================
 // Macro Definition
-// ============================================================================
 
 /// A macro parameter
 #[derive(Debug, Clone)]
@@ -358,9 +356,7 @@ impl Macro {
     }
 }
 
-// ============================================================================
 // Conditional Compilation State
-// ============================================================================
 
 /// State of a conditional (#if/#ifdef block)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,9 +390,7 @@ struct Conditional {
     pos: Position,
 }
 
-// ============================================================================
 // Preprocessor
-// ============================================================================
 
 /// C Preprocessor
 pub struct Preprocessor<'a> {
@@ -1559,9 +1553,7 @@ impl<'a> Preprocessor<'a> {
     }
 }
 
-// ============================================================================
 // Expression Evaluator for #if
-// ============================================================================
 
 /// A value in a `#if` expression.
 ///
@@ -2460,9 +2452,7 @@ fn suffix_is_valid(suffix: &str) -> bool {
     true
 }
 
-// ============================================================================
 // Public API
-// ============================================================================
 
 /// Where the system headers are, and what the command line added to that.
 ///
@@ -2650,9 +2640,7 @@ pub fn preprocess_collecting(
     (output, outcome)
 }
 
-// ============================================================================
 // Assembly File Preprocessing
-// ============================================================================
 
 /// Configuration for assembly file preprocessing
 #[derive(Debug, Clone, Default)]
@@ -2752,10 +2740,6 @@ pub fn preprocess_asm_file(
     // Convert tokens back to text
     tokens_to_source_bytes(&preprocessed, &strings)
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 #[path = "test_preprocess.rs"]

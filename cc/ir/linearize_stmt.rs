@@ -2421,9 +2421,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    // ========================================================================
     // Inline assembly linearization
-    // ========================================================================
 
     /// Linearize an inline assembly statement
     /// Check if an expression is a simple identifier that's a parameter (in var_map)

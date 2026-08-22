@@ -24,9 +24,7 @@ use gettextrs::gettext;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-// ============================================================================
 // Parse Error
-// ============================================================================
 
 /// Parse error type
 #[derive(Debug, Clone)]
@@ -103,9 +101,7 @@ pub(crate) enum DeclaratorName {
     Optional,
 }
 
-// ============================================================================
 // GCC __attribute__ Support
-// ============================================================================
 
 /// An argument to a GCC __attribute__
 #[derive(Debug, Clone, PartialEq)]
@@ -344,9 +340,7 @@ impl fmt::Display for AttributeList {
     }
 }
 
-// ============================================================================
 // Parser
-// ============================================================================
 
 /// C expression parser using recursive descent with precedence climbing
 ///
@@ -572,9 +566,7 @@ impl<'a> Parser<'a> {
         self.pack_current
     }
 
-    // ========================================================================
     // Token Navigation
-    // ========================================================================
 
     /// Get the current token
     pub(crate) fn current(&self) -> &Token {
@@ -1652,9 +1644,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-// ============================================================================
 // Statement Parsing
-// ============================================================================
 
 impl Parser<'_> {
     /// Parse a statement

@@ -51,9 +51,7 @@ use token::{
     Tokenizer,
 };
 
-// ============================================================================
 // Runtime Library Selection
-// ============================================================================
 
 /// Runtime library for soft-float and complex operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,9 +72,7 @@ impl RuntimeLib {
     }
 }
 
-// ============================================================================
 // CLI
-// ============================================================================
 
 #[derive(Parser)]
 #[command(version, about = gettext("c17 - compile standard C programs"))]
@@ -2234,9 +2230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    // ========================================================================
     // Tests for is_object_file()
-    // ========================================================================
 
     #[test]
     fn test_is_object_file_object() {
@@ -2280,9 +2274,7 @@ mod tests {
         assert!(!is_object_file("also.conf")); // should not match .so
     }
 
-    // ========================================================================
     // Tests for is_source_file()
-    // ========================================================================
 
     #[test]
     fn test_is_source_file_c() {
@@ -2308,9 +2300,7 @@ mod tests {
         assert!(!is_source_file("baz.cpp"));
     }
 
-    // ========================================================================
     // Tests for preprocess_args()
-    // ========================================================================
 
     fn run_preprocess(args: &[&str]) -> Vec<String> {
         let raw_args: Vec<String> = std::iter::once("c17".to_string())
@@ -2414,9 +2404,7 @@ mod tests {
         assert!(result.contains(&".".to_string()));
     }
 
-    // ========================================================================
     // Tests for silently-ignored flags
-    // ========================================================================
 
     #[test]
     fn test_preprocess_fvisibility_ignored() {
@@ -2513,9 +2501,7 @@ mod tests {
         assert!(result.contains(&"--c17-linker-flag=-no-pie".to_string()));
     }
 
-    // ========================================================================
     // Tests for linker passthrough flags
-    // ========================================================================
 
     #[test]
     fn test_preprocess_wl_flags() {

@@ -1027,9 +1027,7 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            // ================================================================
             // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
-            // ================================================================
             crate::kw::C11_ATOMIC_INIT => Some((|| {
                 // __c11_atomic_init(ptr, val) - initialize atomic (no ordering)
                 self.expect_special(b'(')?;

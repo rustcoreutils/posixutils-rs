@@ -18,9 +18,7 @@ use crate::ir::instcombine;
 use crate::ir::validate;
 use crate::ir::{Function, Module};
 
-// ============================================================================
 // What optimization was asked for
-// ============================================================================
 
 /// The optimization the command line asked for.
 ///
@@ -120,9 +118,7 @@ impl Optimization {
 /// Prevents infinite loops if passes keep making changes.
 const MAX_ITERATIONS: usize = 10;
 
-// ============================================================================
 // Pass Runner
-// ============================================================================
 
 /// Whether `func` names its caller's variadic arguments -- that is, whether
 /// its body contains `__builtin_va_arg_pack()` or `__builtin_va_arg_pack_len()`.

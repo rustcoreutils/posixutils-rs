@@ -71,9 +71,7 @@ fn describe_expr(kind: &ExprKind) -> &'static str {
 }
 
 impl<'a> super::linearize::Linearizer<'a> {
-    // ========================================================================
     // Global declarations
-    // ========================================================================
 
     pub(crate) fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {

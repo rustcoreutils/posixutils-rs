@@ -49,9 +49,7 @@ use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-// ============================================================================
 // x86-64 Register Definitions
-// ============================================================================
 
 /// x86-64 physical registers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -227,9 +225,7 @@ impl Reg {
     }
 }
 
-// ============================================================================
 // Register Constraints (LLVM-style constraint-aware allocation)
-// ============================================================================
 
 /// Register constraints for an instruction.
 /// Used by the register allocator to avoid assigning pseudos to registers
@@ -754,9 +750,7 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
     Some((clobbers, involved))
 }
 
-// ============================================================================
 // XMM Register Definitions (SSE/FP)
-// ============================================================================
 
 /// x86-64 XMM registers for floating-point operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -841,9 +835,7 @@ impl XmmReg {
     }
 }
 
-// ============================================================================
 // Operand - Location of a value (register or memory)
-// ============================================================================
 
 /// Location of a value
 #[derive(Debug, Clone, PartialEq)]
@@ -891,9 +883,7 @@ pub struct SpilledXmmArg {
     pub size: FpSize,
 }
 
-// ============================================================================
 // Register Allocator (Linear Scan)
-// ============================================================================
 
 /// Simple linear scan register allocator for x86-64
 pub struct RegAlloc {

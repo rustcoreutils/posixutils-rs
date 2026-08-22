@@ -17,9 +17,7 @@ use gettextrs::gettext;
 // Re-export Position for use by other modules
 pub use crate::diag::Position;
 
-// ============================================================================
 // Lexer Mode
-// ============================================================================
 
 /// Lexer mode - controls how a few characters are classified
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -123,9 +121,7 @@ enum HeaderNamePos {
     Expect { in_condition: bool },
 }
 
-// ============================================================================
 // Token Types
-// ============================================================================
 
 /// Drop a leading UTF-8 byte order mark.
 ///
@@ -310,9 +306,7 @@ pub(crate) fn report_forbidden_ucn(pos: Position, val: u32) {
     );
 }
 
-// ============================================================================
 // Identifier characters (C17 Annex D)
-// ============================================================================
 
 /// Annex D.1: the characters an identifier may contain beyond the basic
 /// source character set.
@@ -461,9 +455,7 @@ pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
     (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60) || (0xD800..=0xDFFF).contains(&val)
 }
 
-// ============================================================================
 // Translation phase 2 (line splicing)
-// ============================================================================
 
 /// Delete the run of backslash-newline splices starting at `offset`, returning
 /// the offset of the first byte that survives phase 2 and how many source
@@ -600,17 +592,13 @@ impl SpecialToken {
 
 // Position is imported from crate::diag
 
-// ============================================================================
 // Identifier Interning
-// ============================================================================
 
 /// Identifier intern table - now a re-export of StringTable
 /// Kept for backward compatibility during transition
 pub type IdentTable = StringTable;
 
-// ============================================================================
 // Token Value
-// ============================================================================
 
 /// Token value - type-specific payload for each token kind
 #[derive(Debug, Clone)]
@@ -646,9 +634,7 @@ pub enum TokenValue {
     HeaderName(String),
 }
 
-// ============================================================================
 // Token
-// ============================================================================
 
 /// A C token
 #[derive(Debug, Clone)]
@@ -731,9 +717,7 @@ impl Token {
     }
 }
 
-// ============================================================================
 // Character Classification
-// ============================================================================
 
 /// Character class flags for lexer character classification
 const LETTER: u8 = 1;
@@ -798,9 +782,7 @@ fn is_letter_or_digit(c: u8) -> bool {
     char_class(c) & (LETTER | DIGIT) != 0
 }
 
-// ============================================================================
 // Stream (Input Source)
-// ============================================================================
 
 // Stream management is now in crate::diag
 
@@ -825,9 +807,7 @@ impl Default for StreamTable {
     }
 }
 
-// ============================================================================
 // Tokenizer
-// ============================================================================
 
 const EOF: i32 = -1;
 
@@ -1701,9 +1681,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     }
 }
 
-// ============================================================================
 // Token Display
-// ============================================================================
 
 /// Display a special token
 pub fn show_special(value: u32) -> String {
@@ -1882,9 +1860,7 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
     }
 }
 
-// ============================================================================
 // Token to Text Conversion (for preprocessing output)
-// ============================================================================
 
 /// Convert preprocessed tokens back to source text, byte for byte.
 ///
@@ -1948,10 +1924,6 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
 
     result
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 #[path = "test_lexer.rs"]

@@ -16,9 +16,7 @@ use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 
-// ============================================================================
 // Operators
-// ============================================================================
 
 /// Which operation a checked-arithmetic builtin performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,9 +139,7 @@ pub enum AssignOp {
     ShrAssign,
 }
 
-// ============================================================================
 // Expressions
-// ============================================================================
 
 /// An expression with type annotation
 ///
@@ -846,9 +842,7 @@ pub enum ExprKind {
     },
 }
 
-// ============================================================================
 // OffsetOf Support (__builtin_offsetof)
-// ============================================================================
 
 /// A path element in __builtin_offsetof(type, path)
 /// Supports member.path[index].field style paths
@@ -860,9 +854,7 @@ pub enum OffsetOfPath {
     Index(i64),
 }
 
-// ============================================================================
 // Initializer List Support (C99)
-// ============================================================================
 
 /// A designator for struct field or array index in an initializer
 #[derive(Debug, Clone)]
@@ -1056,9 +1048,7 @@ impl Expr {
     }
 }
 
-// ============================================================================
 // Inline Assembly Support (GCC Extended Asm)
-// ============================================================================
 
 /// An operand in an inline assembly statement
 /// Format: [name] "constraint" (expr)
@@ -1072,9 +1062,7 @@ pub struct AsmOperand {
     pub expr: Expr,
 }
 
-// ============================================================================
 // Statements
-// ============================================================================
 
 /// A statement in the AST
 #[derive(Debug, Clone)]
@@ -1185,9 +1173,7 @@ pub enum BlockItem {
     Statement(Box<Stmt>),
 }
 
-// ============================================================================
 // Declarations
-// ============================================================================
 
 /// A declaration
 #[derive(Debug, Clone)]
@@ -1272,9 +1258,7 @@ impl Declaration {
     }
 }
 
-// ============================================================================
 // Function Definition
-// ============================================================================
 
 /// A function parameter
 #[derive(Debug, Clone)]
@@ -1383,9 +1367,7 @@ pub struct FunctionDef {
     pub attrs: FunctionAttrs,
 }
 
-// ============================================================================
 // Translation Unit
-// ============================================================================
 
 /// An external declaration (top-level item)
 #[derive(Debug, Clone)]
@@ -1408,10 +1390,6 @@ impl TranslationUnit {
         self.items.push(item);
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -24,9 +24,7 @@ use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 
-// ============================================================================
 // x86-64 Code Generator
-// ============================================================================
 
 /// x86-64 code generator
 pub struct X86_64CodeGen {
@@ -2217,9 +2215,7 @@ impl X86_64CodeGen {
                 self.emit_extend(insn);
             }
 
-            // ================================================================
             // Variadic function support (va_* builtins)
-            // ================================================================
             Opcode::VaStart => {
                 self.emit_va_start(insn);
             }
@@ -2305,9 +2301,7 @@ impl X86_64CodeGen {
                 self.emit_return_address(insn);
             }
 
-            // ================================================================
             // setjmp/longjmp support
-            // ================================================================
             Opcode::Setjmp => {
                 self.emit_setjmp(insn);
             }
@@ -2320,9 +2314,7 @@ impl X86_64CodeGen {
                 self.emit_inline_asm(insn);
             }
 
-            // ================================================================
             // Atomic Operations (C11 _Atomic support)
-            // ================================================================
             Opcode::AtomicLoad => {
                 self.emit_atomic_load(insn, types);
             }
@@ -4038,9 +4030,7 @@ impl X86_64CodeGen {
         }
     }
 
-    // ========================================================================
     // Inline Assembly Support
-    // ========================================================================
 
     /// Emit inline assembly
     fn emit_inline_asm(&mut self, insn: &Instruction) {
@@ -5017,9 +5007,7 @@ impl X86_64CodeGen {
         }
     }
 
-    // ========================================================================
     // Atomic Operations (C11 _Atomic support)
-    // ========================================================================
 
     /// Emit atomic load
     /// On x86-64, aligned loads are already atomic - just use regular mov
@@ -5736,9 +5724,7 @@ enum AtomicBitOp {
     Xor,
 }
 
-// ============================================================================
 // AsmOperandFormatter trait implementation
-// ============================================================================
 
 impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
     type Reg = Reg;
@@ -5763,9 +5749,7 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
     }
 }
 
-// ============================================================================
 // CodeGenerator trait implementation
-// ============================================================================
 
 impl CodeGenerator for X86_64CodeGen {
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String {

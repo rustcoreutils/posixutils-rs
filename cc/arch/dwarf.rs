@@ -12,9 +12,7 @@
 use super::codegen::CodeGenBase;
 use super::lir::{Directive, EmitAsm, LirInst, Symbol};
 
-// ============================================================================
 // DWARF Constants (DWARF Version 2)
-// ============================================================================
 
 // DWARF Tags (DW_TAG_*)
 pub const DW_TAG_COMPILE_UNIT: u64 = 0x11;
@@ -39,9 +37,7 @@ pub const DW_LANG_C99: u64 = 0x0c;
 // DWARF Children flag
 pub const DW_CHILDREN_NO: u64 = 0x00;
 
-// ============================================================================
 // DWARF Generation Functions
-// ============================================================================
 
 /// Generate the abbreviation table for a minimal compile unit.
 /// This defines the structure of DIEs (Debug Information Entries).

@@ -911,9 +911,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    // ========================================================================
     // Int128 decomposition ops (Lo64, Hi64, Pair64)
-    // ========================================================================
 
     /// Lo64: extract low 64 bits from 128-bit pseudo.
     pub(super) fn emit_lo64(&mut self, insn: &Instruction) {

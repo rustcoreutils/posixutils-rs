@@ -29,9 +29,7 @@
 use super::{Function, Instruction, Opcode, PseudoId};
 use crate::types::TypeId;
 
-// ============================================================================
 // Simplification Result
-// ============================================================================
 
 /// Result of trying to simplify an instruction
 enum Simplification {
@@ -43,9 +41,7 @@ enum Simplification {
     FoldToConst(i128),
 }
 
-// ============================================================================
 // Main Entry Point
-// ============================================================================
 
 /// Run the InstCombine pass on a function.
 /// Returns true if any changes were made.
@@ -88,9 +84,7 @@ pub fn run(func: &mut Function) -> bool {
     changed
 }
 
-// ============================================================================
 // Simplification Dispatch
-// ============================================================================
 
 /// Try to simplify an instruction. Returns the simplification to apply.
 fn try_simplify(insn: &Instruction, func: &Function) -> Simplification {
@@ -155,9 +149,7 @@ fn make_copy_from_parts(
     }
 }
 
-// ============================================================================
 // Add Simplification
-// ============================================================================
 
 fn simplify_add(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
@@ -183,9 +175,7 @@ fn simplify_add(insn: &Instruction, func: &Function) -> Simplification {
     }
 }
 
-// ============================================================================
 // Sub Simplification
-// ============================================================================
 
 fn simplify_sub(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
@@ -214,9 +204,7 @@ fn simplify_sub(insn: &Instruction, func: &Function) -> Simplification {
     }
 }
 
-// ============================================================================
 // Mul Simplification
-// ============================================================================
 
 fn simplify_mul(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
@@ -244,9 +232,7 @@ fn simplify_mul(insn: &Instruction, func: &Function) -> Simplification {
     }
 }
 
-// ============================================================================
 // Div Simplification
-// ============================================================================
 
 fn simplify_div(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
@@ -278,9 +264,7 @@ fn simplify_div(insn: &Instruction, func: &Function) -> Simplification {
     }
 }
 
-// ============================================================================
 // Mod Simplification
-// ============================================================================
 
 fn simplify_mod(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 2 {
@@ -312,9 +296,7 @@ fn simplify_mod(insn: &Instruction, func: &Function) -> Simplification {
     }
 }
 
-// ============================================================================
 // Shift Simplifications
-// ============================================================================
 
 /// A constant as it actually is at `size` bits.
 ///
@@ -376,9 +358,7 @@ fn simplify_shift(insn: &Instruction, func: &Function) -> Simplification {
     }
 }
 
-// ============================================================================
 // And Simplification
-// ============================================================================
 
 /// Result when applying x op x
 enum SelfOpResult {
@@ -467,9 +447,7 @@ fn simplify_bitwise(insn: &Instruction, func: &Function) -> Simplification {
     }
 }
 
-// ============================================================================
 // Comparison Simplifications
-// ============================================================================
 
 /// Comparison behavior for identity (x op x) and constant folding
 struct CmpInfo {
@@ -556,9 +534,7 @@ fn simplify_comparison(insn: &Instruction, func: &Function) -> Simplification {
     Simplification::None
 }
 
-// ============================================================================
 // Unary Simplifications
-// ============================================================================
 
 fn simplify_neg(insn: &Instruction, func: &Function) -> Simplification {
     if insn.src.len() != 1 {
@@ -585,10 +561,6 @@ fn simplify_not(insn: &Instruction, func: &Function) -> Simplification {
         Simplification::None
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -619,9 +591,7 @@ mod tests {
         func
     }
 
-    // ========================================================================
     // Algebraic Simplification Tests
-    // ========================================================================
 
     #[test]
     fn test_add_zero_right() {
@@ -827,9 +797,7 @@ mod tests {
         assert_eq!(result_insn.op, Opcode::Add);
     }
 
-    // ========================================================================
     // Constant Folding Tests
-    // ========================================================================
 
     #[test]
     fn test_const_fold_add() {
@@ -1089,9 +1057,7 @@ mod tests {
         assert_eq!(new_const.kind, PseudoKind::Val(0x0F));
     }
 
-    // ========================================================================
     // Comparison Folding Tests
-    // ========================================================================
 
     #[test]
     fn test_const_fold_seteq_true() {
@@ -1230,9 +1196,7 @@ mod tests {
         assert_eq!(new_const.kind, PseudoKind::Val(0));
     }
 
-    // ========================================================================
     // Unary Folding Tests
-    // ========================================================================
 
     #[test]
     fn test_const_fold_neg() {

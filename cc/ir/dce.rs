@@ -30,9 +30,7 @@ const DEFAULT_USE_CAPACITY: usize = 4;
 const DEFAULT_LIVE_CAPACITY: usize = 64;
 const DEFAULT_REACHABLE_CAPACITY: usize = 16;
 
-// ============================================================================
 // Main Entry Point
-// ============================================================================
 
 /// Run the DCE pass on a function.
 /// Returns true if any changes were made.
@@ -53,9 +51,7 @@ pub fn run(func: &mut Function) -> bool {
     changed
 }
 
-// ============================================================================
 // Dead Code Elimination
-// ============================================================================
 
 /// Check if an opcode is a "root" (has side effects, cannot be deleted).
 #[inline]
@@ -178,9 +174,7 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
     changed
 }
 
-// ============================================================================
 // Unreachable Block Optimization
-// ============================================================================
 
 /// Identify blocks that are *trivially unreachable* — i.e., entering the
 /// block immediately leads to undefined behavior with no observable work.
@@ -268,9 +262,7 @@ fn fold_branches_to_unreachable(func: &mut Function) -> bool {
     changed
 }
 
-// ============================================================================
 // Unreachable Block Removal
-// ============================================================================
 
 /// Compute the set of reachable block IDs starting from entry.
 fn compute_reachable(func: &Function) -> HashSet<BasicBlockId> {
@@ -332,10 +324,6 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
 
     func.blocks.len() < before
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

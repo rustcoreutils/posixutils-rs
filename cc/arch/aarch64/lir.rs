@@ -20,9 +20,7 @@ use crate::arch::lir::{
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
-// ============================================================================
 // Memory Addressing Modes
-// ============================================================================
 
 /// AArch64 memory addressing mode
 #[derive(Debug, Clone, PartialEq)]
@@ -62,9 +60,7 @@ impl MemAddr {
     }
 }
 
-// ============================================================================
 // General-Purpose Operands
-// ============================================================================
 
 /// AArch64 general-purpose operand (register or immediate)
 #[derive(Debug, Clone, PartialEq)]
@@ -85,9 +81,7 @@ impl GpOperand {
     }
 }
 
-// ============================================================================
 // AArch64 LIR Instructions
-// ============================================================================
 
 /// AArch64 Low-level IR instruction
 #[derive(Debug, Clone)]
@@ -801,9 +795,7 @@ pub enum DmbOption {
     Ishld,
 }
 
-// ============================================================================
 // LirInst Implementation
-// ============================================================================
 
 impl crate::arch::lir::LirInst for Aarch64Inst {
     fn from_directive(dir: Directive) -> Self {
@@ -811,9 +803,7 @@ impl crate::arch::lir::LirInst for Aarch64Inst {
     }
 }
 
-// ============================================================================
 // EmitAsm Implementation
-// ============================================================================
 
 impl EmitAsm for Aarch64Inst {
     fn emit(&self, target: &Target, out: &mut String) {
@@ -1871,9 +1861,7 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(out, "    addv {}, {}.8b", dst.name_b(), src.name_v());
             }
 
-            // ================================================================
             // Atomic Operations (ARMv8.1 LSE)
-            // ================================================================
             Aarch64Inst::Ldar { size, addr, dst } => {
                 let insn = match size {
                     OperandSize::B8 => "ldarb",
@@ -1906,9 +1894,7 @@ impl EmitAsm for Aarch64Inst {
                 );
             }
 
-            // ================================================================
             // Atomic LL/SC Operations (baseline ARMv8.0)
-            // ================================================================
             Aarch64Inst::Ldaxr { size, addr, dst } => {
                 let insn = match size {
                     OperandSize::B8 => "ldaxrb",
@@ -2050,10 +2036,6 @@ fn size_bits(size: FpSize) -> u32 {
         FpSize::Extended => 80, // x87 not used on AArch64, but provide size
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

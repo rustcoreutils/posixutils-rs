@@ -45,9 +45,7 @@ use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-// ============================================================================
 // AArch64 Register Definitions
-// ============================================================================
 
 /// AArch64 physical registers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -334,9 +332,7 @@ impl FrameBase {
     }
 }
 
-// ============================================================================
 // AArch64 Floating-Point Register Definitions
-// ============================================================================
 
 /// AArch64 SIMD/FP registers (V0-V31, accessed as D0-D31 for double, S0-S31 for float)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -682,9 +678,7 @@ impl VReg {
     }
 }
 
-// ============================================================================
 // Operand - Location of a value (register or memory)
-// ============================================================================
 
 /// A slot in the **callee's** frame -- a local, a spill slot, or an alloca.
 ///
@@ -787,9 +781,7 @@ pub enum Loc {
     Global(String),
 }
 
-// ============================================================================
 // Register Allocator (Linear Scan)
-// ============================================================================
 
 /// Information about an argument spilled from a caller-saved register to stack
 #[derive(Debug, Clone)]

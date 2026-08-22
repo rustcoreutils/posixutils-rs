@@ -24,7 +24,6 @@ const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
 const DEFAULT_INIT_CAPACITY: usize = 8;
 
 impl<'a> Parser<'a> {
-    // ========================================================================
     // Expression Parsing - Precedence Chain
     //
     // From lowest to highest precedence:
@@ -44,7 +43,6 @@ impl<'a> Parser<'a> {
     // 14. unary (right-to-left)
     // 15. postfix (left-to-right)
     // 16. primary
-    // ========================================================================
 
     /// Parse an expression (comma expression, lowest precedence)
     pub fn parse_expression(&mut self) -> ParseResult<Expr> {

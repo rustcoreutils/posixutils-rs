@@ -108,9 +108,7 @@ fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDe
     }
 }
 
-// ============================================================================
 // Bug fix regression tests
-// ============================================================================
 
 #[test]
 fn test_parameter_stored_to_local() {
@@ -209,11 +207,9 @@ fn test_function_with_many_params() {
     assert!(ir.contains("add"), "IR should have add for a + h: {}", ir);
 }
 
-// ============================================================================
 // Compound assignment lvalue regression tests
 // These test the fix for assignment operators with complex lvalues
 // (Member, Arrow, Deref, Index) - linearize.rs:3730
-// ============================================================================
 
 #[test]
 fn test_compound_assignment_deref() {
@@ -359,10 +355,8 @@ fn test_compound_assignment_index() {
     );
 }
 
-// ============================================================================
 // Array field initialization regression test
 // Tests the fix for C99 6.7.8p14: scalar initializes first array element
-// ============================================================================
 
 #[test]
 fn test_simple_array_element_store() {
@@ -424,10 +418,8 @@ fn test_simple_array_element_store() {
     );
 }
 
-// ============================================================================
 // Nested if-else CFG edge linking regression test
 // Tests the fix for current_bb changing during nested control flow
-// ============================================================================
 
 #[test]
 fn test_nested_if_cfg_linking() {
@@ -537,9 +529,7 @@ fn test_nested_if_cfg_linking() {
     );
 }
 
-// ============================================================================
 // Switch statement linearization tests
-// ============================================================================
 
 #[test]
 fn test_switch_basic() {
@@ -679,9 +669,7 @@ fn test_switch_with_break() {
     );
 }
 
-// ============================================================================
 // Do-while loop linearization tests
-// ============================================================================
 
 #[test]
 fn test_do_while_basic() {
@@ -846,9 +834,7 @@ fn test_do_while_with_break() {
     );
 }
 
-// ============================================================================
 // Goto and label linearization tests
-// ============================================================================
 
 #[test]
 fn test_goto_forward() {
@@ -1011,9 +997,7 @@ fn test_goto_backward() {
     );
 }
 
-// ============================================================================
 // Nested loop break/continue tests
-// ============================================================================
 
 #[test]
 fn test_nested_loop_break() {
@@ -1182,9 +1166,7 @@ fn test_nested_loop_continue() {
     );
 }
 
-// ============================================================================
 // Unary operation tests
-// ============================================================================
 
 #[test]
 fn test_unary_logical_not() {
@@ -1381,9 +1363,7 @@ fn test_pre_increment() {
     );
 }
 
-// ============================================================================
 // Pointer arithmetic tests
-// ============================================================================
 
 #[test]
 fn test_pointer_add_int() {
@@ -1506,9 +1486,7 @@ fn test_pointer_difference() {
     );
 }
 
-// ============================================================================
 // Floating-point operation tests
-// ============================================================================
 
 #[test]
 fn test_float_add() {
@@ -1715,9 +1693,7 @@ fn test_int_to_float_cast() {
     );
 }
 
-// ============================================================================
 // Core linearization tests (moved from linearize.rs)
-// ============================================================================
 
 #[test]
 fn test_linearize_empty_function() {
@@ -2059,9 +2035,7 @@ fn test_type_propagation_double_literal() {
     assert_eq!(types.kind(typ), TypeKind::Double);
 }
 
-// ========================================================================
 // SSA Conversion Tests
-// ========================================================================
 
 /// Helper to linearize without SSA conversion (for comparing before/after)
 fn linearize_no_ssa(
@@ -2693,9 +2667,7 @@ fn test_ternary_with_post_increment_uses_phi() {
     );
 }
 
-// ============================================================================
 // String literal initialization tests
-// ============================================================================
 
 #[test]
 fn test_string_literal_char_array_init() {
@@ -2814,11 +2786,9 @@ fn test_string_literal_char_pointer_init() {
     );
 }
 
-// ============================================================================
 // Incomplete struct type resolution test (regression test for forward declarations)
 // Tests the fix in resolve_struct_type() that resolves incomplete struct types
 // to their complete definitions when processing initializers.
-// ============================================================================
 
 /// Helper to linearize with a custom symbol table (for testing struct resolution)
 fn test_linearize_with_symbols(
@@ -2980,11 +2950,9 @@ fn test_incomplete_struct_type_resolution() {
     );
 }
 
-// ============================================================================
 // Static local variable increment/decrement regression tests
 // These test the fix for pre/post increment/decrement on static locals
 // Bug: was storing to sentinel value (u32::MAX) instead of looking up global name
-// ============================================================================
 
 use crate::types::TypeModifiers;
 
@@ -3355,9 +3323,7 @@ fn test_static_local_compound_assignment() {
     );
 }
 
-// ============================================================================
 // Wide string literal tests
-// ============================================================================
 
 #[test]
 fn test_wide_string_literal_expression() {
@@ -3467,9 +3433,7 @@ fn test_wide_string_literal_is_pure() {
     );
 }
 
-// ============================================================================
 // __FUNCTION__ and __PRETTY_FUNCTION__ tests
-// ============================================================================
 
 #[test]
 fn test_gcc_function_identifier() {
@@ -3554,9 +3518,7 @@ fn test_gcc_pretty_function_identifier() {
     );
 }
 
-// ============================================================================
 // Static local address in initializer tests
-// ============================================================================
 
 #[test]
 fn test_static_local_address_in_initializer() {
@@ -3660,9 +3622,7 @@ fn test_static_local_address_in_initializer() {
     }
 }
 
-// ============================================================================
 // Struct/union dereference tests
-// ============================================================================
 
 #[test]
 fn test_struct_deref_returns_address() {
@@ -3737,9 +3697,7 @@ fn test_struct_deref_returns_address() {
     );
 }
 
-// ============================================================================
 // Tests for src_typ field on conversion instructions
-// ============================================================================
 
 #[test]
 fn test_int_to_float_cast_has_src_typ() {
@@ -3891,9 +3849,7 @@ fn test_integer_extension_has_src_typ() {
     assert!(has_src_typ, "Integer extension should have src_typ set");
 }
 
-// ========================================================================
 // Float16 (_Float16) conversion tests
-// ========================================================================
 
 #[test]
 fn test_float16_to_float_conversion() {
@@ -4111,9 +4067,7 @@ fn test_int_to_float16_conversion() {
     );
 }
 
-// ============================================================================
 // C11 _Alignof tests
-// ============================================================================
 
 #[test]
 fn test_alignof_type_emits_setval() {
@@ -4197,9 +4151,7 @@ fn test_alignof_expr_emits_setval() {
     );
 }
 
-// ============================================================================
 // Frame/Return address builtin tests
-// ============================================================================
 
 #[test]
 fn test_frame_address_emits_opcode() {
@@ -4287,12 +4239,10 @@ fn test_return_address_emits_opcode() {
     );
 }
 
-// ============================================================================
 // Mixed designated + positional initializer field tracking
 // Regression test: positional fields after a designator must use the correct
 // field index (one past the designated field), not the element's enumeration index.
 // Bug: {.b = 20, 30, 40} stored 30 at offset 4 (b) instead of offset 8 (c).
-// ============================================================================
 
 #[test]
 fn test_mixed_designated_positional_struct_init() {
@@ -5006,11 +4956,9 @@ fn test_union_first_named_member_positional_init() {
     );
 }
 
-// ============================================================================
 // va_list parameter handling tests
 // ============================================================================
 // va_list parameter handling tests
-// ============================================================================
 
 #[test]
 fn test_valist_parameter_stored_as_pointer() {
@@ -5910,9 +5858,7 @@ fn test_conditional_short_circuit_arrow() {
     );
 }
 
-// ========================================================================
 // Phase 1: Foundation Helper Tests
-// ========================================================================
 
 #[test]
 fn test_bitfield_storage_type() {
@@ -5993,9 +5939,7 @@ fn test_bool_is_an_unsigned_type_for_bitfield_extension() {
     );
 }
 
-// ============================================================================
 // `_Atomic` through ordinary operators (audit #X1)
-// ============================================================================
 
 /// Build `void test(T x) { x <op>= 1; }` with T either `_Atomic int` or
 /// plain `int`, and linearize it.

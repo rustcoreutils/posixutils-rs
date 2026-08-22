@@ -76,9 +76,7 @@ const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
 const DEFAULT_CALL_POS_CAPACITY: usize = 16;
 const DEFAULT_SMALL_VEC_CAPACITY: usize = 8;
 
-// ============================================================================
 // Common Types
-// ============================================================================
 
 /// Live interval for a pseudo-register
 #[derive(Debug, Clone)]
@@ -161,9 +159,7 @@ impl<R> ConstraintPoint<R> {
     }
 }
 
-// ============================================================================
 // Common Functions
-// ============================================================================
 
 /// Release stack slots whose owning interval ended before `point` back
 /// to the free-slot pool, where future `try_reuse_stack_slot` calls

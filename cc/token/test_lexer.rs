@@ -357,9 +357,7 @@ fn test_function_declaration() {
     );
 }
 
-// ========================================================================
 // Additional coverage tests for multi-char operators
-// ========================================================================
 
 #[test]
 fn test_hashhash_operator() {
@@ -440,9 +438,7 @@ fn test_three_char_in_context() {
     );
 }
 
-// ========================================================================
 // Multi-line comment tests
-// ========================================================================
 
 #[test]
 fn test_multiline_block_comment() {
@@ -488,9 +484,7 @@ fn test_multiline_comment_position_tracking() {
     assert_eq!(tokens[2].pos.line, 5);
 }
 
-// ========================================================================
 // Additional number format tests
-// ========================================================================
 
 #[test]
 fn test_hex_float_numbers() {
@@ -552,9 +546,7 @@ fn test_dot_starting_number() {
     }
 }
 
-// ========================================================================
 // Edge cases and tricky sequences
-// ========================================================================
 
 #[test]
 fn test_operator_adjacency() {
@@ -670,9 +662,7 @@ fn test_line_comment_at_eof() {
     assert_eq!(show_token(&tokens[1], &idents), "a");
 }
 
-// ========================================================================
 // UCN (Universal Character Name) tests - C99 6.4.3
-// ========================================================================
 
 #[test]
 fn test_ucn_in_identifier() {
@@ -1036,9 +1026,7 @@ fn test_ucn_splice_disabled() {
     assert_eq!(show_token(&tokens[1], &strings), "caf");
 }
 
-// ========================================================================
 // Diagnostic warning tests
-// ========================================================================
 
 #[test]
 fn test_unterminated_string() {
@@ -1183,9 +1171,7 @@ fn test_multiline_comment_newline_flag() {
     );
 }
 
-// ========================================================================
 // Assembly mode tests
-// ========================================================================
 
 fn tokenize_asm(input: &str) -> (Vec<Token>, StringTable) {
     let mut strings = StringTable::new();
@@ -1296,9 +1282,7 @@ fn test_c_mode_semicolon_not_comment() {
     assert_eq!(toks, vec!["int", "x", ";", "int", "y"]);
 }
 
-// ========================================================================
 // tokens_to_source_bytes tests
-// ========================================================================
 
 fn source_text(input: &str) -> String {
     let (tokens, strings) = tokenize_str(input);
@@ -1334,9 +1318,7 @@ fn test_tokens_to_source_bytes_keeps_literal_bytes() {
     assert_eq!(out, b".ascii \"caf\xc3\xa9\"\n");
 }
 
-// ========================================================================
 // C99 6.4.6 Digraph tests
-// ========================================================================
 
 #[test]
 fn test_digraph_brackets() {
@@ -1413,9 +1395,7 @@ fn test_digraph_keeps_its_own_spelling() {
     assert_eq!(spelled, vec!["[", "]", "{", "}", "#", "##"]);
 }
 
-// ========================================================================
 // Character classification table tests
-// ========================================================================
 
 #[test]
 fn test_char_table_digits() {

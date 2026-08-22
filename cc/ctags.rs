@@ -27,9 +27,7 @@ use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
-// ============================================================================
 // CLI
-// ============================================================================
 
 #[derive(Parser)]
 #[command(version, about = gettext("ctags - create a tags file"))]
@@ -51,9 +49,7 @@ struct Args {
     files: Vec<String>,
 }
 
-// ============================================================================
 // Tag Entry
-// ============================================================================
 
 /// A tag entry representing a definition location
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,9 +98,7 @@ impl TagEntry {
     }
 }
 
-// ============================================================================
 // Source File Processing
-// ============================================================================
 
 /// Get the line content for a given line number (1-based)
 fn get_line_content(lines: &[String], line_num: u32) -> String {
@@ -343,9 +337,7 @@ fn extract_macro_tags(lines: &[String], path: &str, tags: &mut Vec<TagEntry>) {
     }
 }
 
-// ============================================================================
 // Main
-// ============================================================================
 
 fn main() -> ExitCode {
     plib::diag::init_locale("ctags");

@@ -19,9 +19,7 @@ use std::collections::{HashMap, HashSet};
 const DEFAULT_POSTORDER_CAPACITY: usize = 16;
 const DEFAULT_IDF_CAPACITY: usize = 8;
 
-// ============================================================================
 // Reverse Postorder Computation
-// ============================================================================
 
 /// Compute reverse postorder numbering for all blocks.
 /// Returns a vector of block IDs in reverse postorder, and updates each block
@@ -70,9 +68,7 @@ fn compute_postorder(func: &mut Function) -> Vec<BasicBlockId> {
     postorder
 }
 
-// ============================================================================
 // Dominator Tree Construction (Cooper et al.)
-// ============================================================================
 
 /// Build the dominator tree for a function.
 ///
@@ -248,9 +244,7 @@ pub fn domtree_build(func: &mut Function) {
     func.max_dom_level = max_level;
 }
 
-// ============================================================================
 // Dominance Frontier Computation
-// ============================================================================
 
 /// Compute the dominance frontier for all blocks.
 ///
@@ -301,9 +295,7 @@ pub fn compute_dominance_frontiers(func: &mut Function) {
     }
 }
 
-// ============================================================================
 // Iterated Dominance Frontier (IDF) Computation
-// ============================================================================
 
 /// Priority queue based on dominator tree level (higher level = higher priority).
 /// Used by the Sreedhar-Gao algorithm.
@@ -497,10 +489,6 @@ fn visit_domtree(
         }
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

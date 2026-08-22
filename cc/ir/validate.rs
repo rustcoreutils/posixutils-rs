@@ -72,9 +72,7 @@ use super::{BasicBlockId, Function, Module, Opcode, PseudoId};
 use std::collections::HashMap;
 use std::fmt;
 
-// ============================================================================
 // Error model
-// ============================================================================
 
 /// A single invariant violation. Carries enough context for a developer
 /// inspecting an IR dump or stepping through with a debugger to find the
@@ -162,9 +160,7 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
-// ============================================================================
 // Entry points
-// ============================================================================
 
 /// Validate every function in a module. Returns the full list of violations
 /// (across all functions) when something is wrong, or `Ok(())` otherwise.
@@ -200,9 +196,7 @@ pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
     }
 }
 
-// ============================================================================
 // Invariant checks
-// ============================================================================
 
 /// I1 — every SSA target pseudo is defined exactly once.
 ///
@@ -305,10 +299,6 @@ fn check_barrier_implies_side_effect(func: &Function, out: &mut Vec<ValidationEr
         }
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

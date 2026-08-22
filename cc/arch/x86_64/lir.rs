@@ -20,9 +20,7 @@ use crate::arch::lir::{
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
-// ============================================================================
 // Memory Addressing Modes
-// ============================================================================
 
 /// x86-64 memory addressing mode
 #[derive(Debug, Clone, PartialEq)]
@@ -119,9 +117,7 @@ impl MemAddr {
     }
 }
 
-// ============================================================================
 // General-Purpose Operands
-// ============================================================================
 
 /// x86-64 general-purpose operand (register, memory, or immediate)
 #[derive(Debug, Clone, PartialEq)]
@@ -145,9 +141,7 @@ impl GpOperand {
     }
 }
 
-// ============================================================================
 // XMM (Floating-Point) Operands
-// ============================================================================
 
 /// x86-64 XMM operand (register or memory)
 #[derive(Debug, Clone, PartialEq)]
@@ -168,9 +162,7 @@ impl XmmOperand {
     }
 }
 
-// ============================================================================
 // Shift Count
-// ============================================================================
 
 /// Shift/rotate count specifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,9 +173,7 @@ pub enum ShiftCount {
     Cl,
 }
 
-// ============================================================================
 // x87 FPU Binary Operations
-// ============================================================================
 
 /// x87 FPU binary operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,9 +188,7 @@ pub enum X87BinOp {
     Div,
 }
 
-// ============================================================================
 // x86-64 LIR Instructions
-// ============================================================================
 
 /// x86-64 Low-level IR instruction
 #[derive(Debug, Clone)]
@@ -656,9 +644,7 @@ pub enum X86Inst {
     Directive(Directive),
 }
 
-// ============================================================================
 // LirInst Implementation
-// ============================================================================
 
 impl crate::arch::lir::LirInst for X86Inst {
     fn from_directive(dir: Directive) -> Self {
@@ -666,9 +652,7 @@ impl crate::arch::lir::LirInst for X86Inst {
     }
 }
 
-// ============================================================================
 // EmitAsm Implementation
-// ============================================================================
 
 impl EmitAsm for X86Inst {
     fn emit(&self, target: &Target, out: &mut String) {
@@ -1361,9 +1345,7 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    xorps {}, {}", reg.name(), reg.name());
             }
 
-            // ================================================================
             // Atomic Instructions
-            // ================================================================
             X86Inst::Xchg { size, reg, mem } => {
                 // XCHG implicitly has LOCK semantics
                 let _ = writeln!(
@@ -1414,10 +1396,6 @@ impl EmitAsm for X86Inst {
         }
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

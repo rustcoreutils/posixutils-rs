@@ -15,9 +15,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-// ============================================================================
 // Source Position
-// ============================================================================
 
 /// Source position tracking for tokens and diagnostics.
 ///
@@ -71,9 +69,7 @@ impl fmt::Display for Position {
     }
 }
 
-// ============================================================================
 // Stream (Input Source)
-// ============================================================================
 
 /// Input stream information for tracking source files and includes.
 #[derive(Debug, Clone)]
@@ -115,9 +111,7 @@ impl Stream {
     }
 }
 
-// ============================================================================
 // Stream Registry (Global)
-// ============================================================================
 
 /// Stream registry for managing all input files
 #[derive(Debug, Default)]
@@ -284,9 +278,7 @@ pub fn get_all_stream_names() -> Vec<String> {
     })
 }
 
-// ============================================================================
 // Error Tracking
-// ============================================================================
 
 /// Error phase flag
 pub const ERROR_CURR_PHASE: u32 = 1;
@@ -366,9 +358,7 @@ pub fn reset_counts() {
     HAS_ERROR.store(0, Ordering::Relaxed);
 }
 
-// ============================================================================
 // Diagnostic Output
-// ============================================================================
 
 /// Diagnostic severity level
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,9 +483,7 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
     };
 }
 
-// ============================================================================
 // Public Diagnostic Functions
-// ============================================================================
 
 /// Print a warning message
 pub fn warning(pos: Position, msg: &str) {
@@ -534,10 +522,6 @@ pub fn error_plural(pos: Position, singular: &str, plural: &str, n: usize, args:
         &ngettext_args(singular, plural, n, args),
     );
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

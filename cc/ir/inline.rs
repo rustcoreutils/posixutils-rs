@@ -26,9 +26,7 @@ use super::{
 use crate::opt::Optimization;
 use std::collections::{HashMap, HashSet};
 
-// ============================================================================
 // Inlining Constants
-// ============================================================================
 
 /// Maximum iterations for the inlining pass (handles nested inlining)
 const MAX_INLINE_ITERATIONS: usize = 3;
@@ -73,9 +71,7 @@ const DEFAULT_CANDIDATE_CAPACITY: usize = 16;
 const DEFAULT_REMAP_CAPACITY: usize = 64;
 const DEFAULT_ORDER_CAPACITY: usize = 16;
 
-// ============================================================================
 // Inline Candidate Analysis
-// ============================================================================
 
 /// Metadata about a function's suitability for inlining
 #[derive(Debug, Clone, Default)]
@@ -183,9 +179,7 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
     candidate
 }
 
-// ============================================================================
 // Inlining Decision Heuristics
-// ============================================================================
 
 /// Determine whether to inline a function at a specific call site.
 ///
@@ -317,9 +311,7 @@ fn should_inline(
     true
 }
 
-// ============================================================================
 // Inline Context and Remapping
-// ============================================================================
 
 /// Context for cloning a function body into caller
 /// The caller's variadic arguments, for `__builtin_va_arg_pack()`.
@@ -553,9 +545,7 @@ impl InlineContext {
     }
 }
 
-// ============================================================================
 // Instruction Cloning
-// ============================================================================
 
 /// Clone an instruction with remapped pseudos and basic blocks
 fn clone_instruction(
@@ -855,9 +845,7 @@ fn clone_instruction(
     }
 }
 
-// ============================================================================
 // Call Site Inlining
-// ============================================================================
 
 /// Clone all callee basic blocks into the inline context, remapping instructions.
 fn clone_callee_blocks(ctx: &mut InlineContext, callee: &Function) -> Vec<BasicBlock> {
@@ -1287,9 +1275,7 @@ fn inline_call_site(
     true
 }
 
-// ============================================================================
 // Block Reordering (for correct liveness analysis in regalloc)
-// ============================================================================
 
 /// Reorder blocks in control flow (topological) order.
 /// This is critical for the linear scan register allocator, which assumes
@@ -1350,9 +1336,7 @@ fn reorder_blocks_topologically(func: &mut Function) {
     func.rebuild_block_idx();
 }
 
-// ============================================================================
 // Main Inlining Pass
-// ============================================================================
 
 /// Run the inlining pass on a module
 ///
@@ -1559,10 +1543,6 @@ fn remove_dead_functions(module: &mut Module) {
             || f.destructor.is_some()
     });
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

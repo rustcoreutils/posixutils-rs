@@ -19,9 +19,7 @@
 
 use crate::strings::StringId;
 
-// ============================================================================
 // Tag bit constants (u32, 15 of 32 used)
-// ============================================================================
 
 pub const TYPE_SPEC: u32 = 1 << 0;
 pub const STORAGE: u32 = 1 << 1;
@@ -52,9 +50,7 @@ pub const RESERVED_NAME: u32 = 1 << 14;
 pub const DECL_START: u32 =
     TYPE_SPEC | STORAGE | QUALIFIER | INLINE_KW | NORETURN_KW | ATTR_KW | ASSERT_KW | ALIGNAS_KW;
 
-// ============================================================================
 // Keyword definition macros
-// ============================================================================
 
 /// Helper macro: recursive counter that assigns sequential StringId values starting from 1.
 /// Entries named `_` are anonymous — they get interned and tagged but no `pub const` is emitted.
@@ -545,9 +541,7 @@ define_keywords! {
     (IMAG_KW_SHORT,     "__imag",            RESERVED_NAME),
 }
 
-// ============================================================================
 // Tag query API
-// ============================================================================
 
 /// Check if a StringId has any of the given tag bits set.
 /// Returns false for non-keyword IDs (dynamic strings interned after keywords).
@@ -556,10 +550,6 @@ pub fn has_tag(id: StringId, mask: u32) -> bool {
     let idx = id.0 as usize;
     idx > 0 && idx <= KEYWORD_COUNT && KEYWORD_TAGS[idx - 1] & mask != 0
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

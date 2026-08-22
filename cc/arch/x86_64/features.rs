@@ -991,9 +991,7 @@ impl X86_64CodeGen {
         }
     }
 
-    // =========================================================================
     // Byte-swapping builtins
-    // =========================================================================
 
     /// Emit byte-swap instruction for 16/32/64-bit values
     pub(super) fn emit_bswap(&mut self, insn: &Instruction, swap_size: BswapSize) {
@@ -1336,9 +1334,7 @@ impl X86_64CodeGen {
         }
     }
 
-    // ========================================================================
     // setjmp/longjmp/alloca support
-    // ========================================================================
 
     /// Emit setjmp(env) - saves execution context
     /// System V AMD64 ABI: env in RDI, returns int in EAX

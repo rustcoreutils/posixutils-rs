@@ -848,9 +848,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    // =========================================================================
     // Byte-swapping builtins
-    // =========================================================================
 
     /// Emit byte-swap instruction for 16/32/64-bit values
     pub(super) fn emit_bswap(&mut self, insn: &Instruction, swap_size: BswapSize) {
@@ -1174,9 +1172,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    // ========================================================================
     // setjmp/longjmp/alloca support
-    // ========================================================================
 
     /// Emit setjmp(env) - saves execution context
     /// AAPCS64: env in X0, returns int in W0

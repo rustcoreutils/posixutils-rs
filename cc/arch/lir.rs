@@ -17,9 +17,7 @@ use crate::target::{Arch, Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::fmt::{self, Write};
 
-// ============================================================================
 // Operand Size
-// ============================================================================
 
 /// Size specifier for operations (in bits)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,9 +70,7 @@ impl fmt::Display for OperandSize {
     }
 }
 
-// ============================================================================
 // Floating-Point Size
-// ============================================================================
 
 /// Floating-point size specifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -220,9 +216,7 @@ impl fmt::Display for FpSize {
     }
 }
 
-// ============================================================================
 // Condition Codes (Architecture-Independent)
-// ============================================================================
 
 /// Unified condition code for comparisons (architecture-independent semantics).
 /// Each architecture translates these to its specific condition suffixes.
@@ -312,9 +306,7 @@ impl fmt::Display for CondCode {
     }
 }
 
-// ============================================================================
 // Call Target (Architecture-Independent)
-// ============================================================================
 
 /// Call target - either direct (symbol) or indirect (register).
 /// Generic over register type R to support different architectures.
@@ -326,9 +318,7 @@ pub enum CallTarget<R> {
     Indirect(R),
 }
 
-// ============================================================================
 // Complex Type Helpers
-// ============================================================================
 
 /// How many SSE registers a complex argument occupies under System V AMD64.
 ///
@@ -412,9 +402,7 @@ pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) 
     }
 }
 
-// ============================================================================
 // Labels and Symbols
-// ============================================================================
 
 /// Label for local jumps (basic block targets within a function)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -586,9 +574,7 @@ impl fmt::Display for Symbol {
     }
 }
 
-// ============================================================================
 // Symbol Type (for ELF .type directive)
-// ============================================================================
 
 /// Symbol type for ELF .type directive
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -611,9 +597,7 @@ impl SymbolType {
     }
 }
 
-// ============================================================================
 // EmitAsm Trait
-// ============================================================================
 
 /// Trait for LIR instructions that can be emitted to assembly text
 pub trait EmitAsm {
@@ -621,9 +605,7 @@ pub trait EmitAsm {
     fn emit(&self, target: &Target, out: &mut String);
 }
 
-// ============================================================================
 // LirInst Trait (Architecture-Generic LIR Instructions)
-// ============================================================================
 
 /// Trait for architecture-specific LIR instruction types.
 /// This enables generic code generation infrastructure while preserving
@@ -634,9 +616,7 @@ pub trait LirInst: Clone + std::fmt::Debug {
     fn from_directive(dir: Directive) -> Self;
 }
 
-// ============================================================================
 // Assembler Directives (Architecture-Independent)
-// ============================================================================
 
 /// Which side of a weak symbol a directive names. ELF does not distinguish
 /// them; Mach-O has a separate directive for each.
@@ -1298,10 +1278,6 @@ impl EmitAsm for Directive {
         }
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

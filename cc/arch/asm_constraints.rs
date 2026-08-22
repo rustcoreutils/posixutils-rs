@@ -446,9 +446,7 @@ mod tests {
         ));
     }
 
-    // ========================================================================
     // C9 — Multi-alternative constraints
-    // ========================================================================
 
     fn alternative_kinds<R: Copy>(c: &OperandConstraint<R>) -> Vec<&'static str> {
         match c {
@@ -564,9 +562,7 @@ mod tests {
         assert!(matches!(c, OperandConstraint::Match(0)));
     }
 
-    // ========================================================================
     // C10 — Per-arch class letters
-    // ========================================================================
 
     /// A fake class-letter mapper for the parser tests: `J` → `Any`
     /// (register-class synonym), `K` → `Imm`. Lets us exercise the

@@ -16,9 +16,7 @@ use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, Pseu
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
 
-// ============================================================================
 // Shared Helper Types
-// ============================================================================
 
 /// Unary integer operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,9 +33,7 @@ pub enum BswapSize {
     B64,
 }
 
-// ============================================================================
 // Constants
-// ============================================================================
 
 /// c17 version string for assembly header
 pub const C17_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -103,9 +99,7 @@ pub fn escape_string(s: &str) -> String {
     result
 }
 
-// ============================================================================
 // CodeGenBase - Generic Code Generation Infrastructure
-// ============================================================================
 
 /// Common code generation state shared between all architectures.
 /// Generic over the LIR instruction type I, enabling type-safe architecture-specific
@@ -752,9 +746,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     }
 }
 
-// ============================================================================
 // Inline Assembly Support
-// ============================================================================
 
 /// Trait for architecture-specific inline asm operand formatting.
 /// Implementations provide register formatting specific to their architecture.
@@ -1011,9 +1003,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
     result
 }
 
-// ============================================================================
 // CodeGenerator Trait
-// ============================================================================
 
 /// Trait for architecture-specific code generators
 pub trait CodeGenerator {

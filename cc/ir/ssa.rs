@@ -21,9 +21,7 @@ use std::collections::{HashMap, HashSet};
 const DEFAULT_SSA_RENAME_CAPACITY: usize = 32;
 const DEFAULT_SSA_PHI_CAPACITY: usize = 16;
 
-// ============================================================================
 // SSA Conversion State
-// ============================================================================
 
 /// State for SSA conversion
 struct SsaConverter<'a> {
@@ -114,9 +112,7 @@ impl<'a> SsaConverter<'a> {
     }
 }
 
-// ============================================================================
 // Phase 1: Variable Analysis and Phi Placement
-// ============================================================================
 
 /// Information about a local variable during SSA conversion
 #[derive(Default)]
@@ -261,9 +257,7 @@ fn insert_phi_nodes(converter: &mut SsaConverter, var_name: &str, var_info: &Var
     }
 }
 
-// ============================================================================
 // Phase 2: Variable Renaming
-// ============================================================================
 
 /// Definition stack for variable renaming
 struct DefStack {
@@ -589,9 +583,7 @@ fn lookup_var_in_pred(func: &Function, bb_id: BasicBlockId, var: &str) -> Option
     }
 }
 
-// ============================================================================
 // Phase 3: Cleanup
-// ============================================================================
 
 /// Remove dead stores that were converted to SSA.
 fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
@@ -606,9 +598,7 @@ fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
     }
 }
 
-// ============================================================================
 // Main Entry Point
-// ============================================================================
 
 /// Convert a function to SSA form.
 ///
@@ -680,10 +670,6 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
     // Update function's next_pseudo to avoid ID collisions with later allocations
     converter.func.next_pseudo = converter.next_pseudo_id;
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -813,11 +799,9 @@ mod tests {
         assert_eq!(merge.idom, Some(BasicBlockId(0)));
     }
 
-    // ========================================================================
     // Bug fix regression test: pseudo ID tracking from instructions
     // Verifies that SSA conversion correctly finds max pseudo ID from
     // instruction operands, not just func.pseudos
-    // ========================================================================
 
     #[test]
     fn test_max_pseudo_id_from_instructions() {
@@ -866,7 +850,6 @@ mod tests {
         // indicates the fix is working)
     }
 
-    // ========================================================================
     // Regression test: phi insertion in goto-dispatch CFG
     //
     // The bug: insert_phi_nodes() had a filter that skipped phi node insertion
@@ -877,7 +860,6 @@ mod tests {
     // connected by goto back-edges.
     //
     // The fix: remove the decl_block dominance filter from insert_phi_nodes().
-    // ========================================================================
 
     fn make_goto_dispatch_cfg(types: &TypeTable) -> Function {
         // Create a CFG mimicking CPython's ceval.c goto-dispatch pattern:
@@ -1092,9 +1074,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // PhiSource tests: verify SSA conversion emits PhiSource instructions
-    // ========================================================================
 
     #[test]
     fn test_phisource_in_predecessors() {

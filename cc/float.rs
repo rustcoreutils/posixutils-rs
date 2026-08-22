@@ -582,9 +582,7 @@ impl From<f64> for FloatVal {
     }
 }
 
-// ============================================================================
 // Decimal to binary conversion
-// ============================================================================
 
 /// A minimal unsigned big integer, little-endian limbs.
 ///
@@ -915,9 +913,7 @@ pub(crate) fn parse_decimal_float_parts(s: &str) -> Result<(u128, i32), ()> {
     Ok(decimal_to_binary(&digits, exp10))
 }
 
-// ============================================================================
 // Exact arithmetic
-// ============================================================================
 
 /// A target binary floating-point format.
 ///

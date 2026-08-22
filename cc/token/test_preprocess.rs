@@ -1100,80 +1100,117 @@ fn test_pragma_operator_multiple() {
 // Include guard detection tests
 // ========================================================================
 
+/// Tokenize a header and ask whether it is exactly one guarded group.
+///
+/// The scan reads tokens rather than raw bytes, so comments and whitespace are
+/// already gone by the time it looks -- the cases that used to need their own
+/// comment lexer are now free.
+fn guard_of(content: &str) -> Option<String> {
+    let mut strings = IdentTable::new();
+    let tokens = Tokenizer::new(content.as_bytes(), 0, &mut strings).tokenize();
+    Preprocessor::guard_of(&tokens, &strings)
+}
+
 #[test]
-fn test_detect_include_guard_ifndef_define() {
+fn test_guard_ifndef_define() {
     // Standard include guard pattern: #ifndef X / #define X
-    let content = b"#ifndef FOO_H\n#define FOO_H\n// content\n#endif\n";
     assert_eq!(
-        Preprocessor::detect_include_guard(content),
+        guard_of("#ifndef FOO_H\n#define FOO_H\nint content;\n#endif\n"),
         Some("FOO_H".to_string())
     );
 }
 
 #[test]
-fn test_detect_include_guard_with_leading_comment() {
-    // Include guard with leading block comment
-    let content = b"/* Header file */\n#ifndef MY_HEADER_H\n#define MY_HEADER_H\n#endif\n";
+fn test_guard_with_leading_comment() {
     assert_eq!(
-        Preprocessor::detect_include_guard(content),
+        guard_of("/* Header file */\n#ifndef MY_HEADER_H\n#define MY_HEADER_H\n#endif\n"),
         Some("MY_HEADER_H".to_string())
     );
-}
-
-#[test]
-fn test_detect_include_guard_with_line_comment() {
-    // Include guard with leading line comment
-    let content = b"// Header file\n#ifndef GUARD_H\n#define GUARD_H\n#endif\n";
     assert_eq!(
-        Preprocessor::detect_include_guard(content),
+        guard_of("// Header file\n#ifndef GUARD_H\n#define GUARD_H\n#endif\n"),
         Some("GUARD_H".to_string())
     );
 }
 
 #[test]
-fn test_detect_include_guard_no_define() {
-    // Not a guard - #ifndef without matching #define
-    let content = b"#ifndef FOO_H\n#error \"Use other header\"\n#endif\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
-}
-
-#[test]
-fn test_detect_include_guard_different_macro() {
-    // Not a guard - #define defines different macro
-    let content = b"#ifndef FOO_H\n#define BAR_H\n#endif\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
-}
-
-#[test]
-fn test_detect_include_guard_if_not_defined() {
-    // Alternative pattern: #if !defined(X)
-    let content = b"#if !defined(MYGUARD)\n#define MYGUARD\n#endif\n";
+fn test_guard_no_define() {
+    // Not a guard -- #ifndef without a matching #define. This is the
+    // <sys/cdefs.h> sentinel shape, which must keep being re-read.
     assert_eq!(
-        Preprocessor::detect_include_guard(content),
+        guard_of("#ifndef FOO_H\n#error \"Use other header\"\n#endif\n"),
+        None
+    );
+}
+
+#[test]
+fn test_guard_different_macro() {
+    // Not a guard -- the #define names something else.
+    assert_eq!(guard_of("#ifndef FOO_H\n#define BAR_H\n#endif\n"), None);
+}
+
+#[test]
+fn test_guard_if_not_defined() {
+    // The `#if !defined(X)` spelling, with and without parentheses.
+    assert_eq!(
+        guard_of("#if !defined(MYGUARD)\n#define MYGUARD\n#endif\n"),
+        Some("MYGUARD".to_string())
+    );
+    assert_eq!(
+        guard_of("#if !defined MYGUARD\n#define MYGUARD\n#endif\n"),
         Some("MYGUARD".to_string())
     );
 }
 
 #[test]
-fn test_detect_include_guard_no_guard() {
-    // Not a guard - just regular code
-    let content = b"int x = 1;\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
+fn test_guard_no_guard() {
+    assert_eq!(guard_of("int x = 1;\n"), None);
+    assert_eq!(guard_of(""), None);
 }
 
 #[test]
-fn test_detect_include_guard_conditional_default_with_content() {
-    // NOT a guard - conditional default definition followed by more content
-    // This pattern: #ifndef X / #define X default / #endif / more macros
-    let content = b"#ifndef FOO\n#define FOO 1\n#endif\n#define BAR 2\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
+fn test_guard_conditional_default_with_content() {
+    // NOT a guard: the conditional-default idiom, where something follows the
+    // #endif. Treating it as one would delete that something.
+    assert_eq!(
+        guard_of("#ifndef FOO\n#define FOO 1\n#endif\n#define BAR 2\n"),
+        None
+    );
+    assert_eq!(
+        guard_of("#if !defined(DEFAULT_VAL)\n#define DEFAULT_VAL 42\n#endif\n#define OTHER 1\n"),
+        None
+    );
 }
 
+/// The case the byte scanner could not see: it stopped at the first token of
+/// the body, so it never found the closing `#endif` and never noticed that a
+/// header had code after it. Such a header is not guarded, and skipping it on
+/// re-inclusion deleted that code.
 #[test]
-fn test_detect_include_guard_if_defined_conditional_default() {
-    // NOT a guard - #if !defined() pattern with content after #endif
-    let content = b"#if !defined(DEFAULT_VAL)\n#define DEFAULT_VAL 42\n#endif\n#define OTHER 1\n";
-    assert_eq!(Preprocessor::detect_include_guard(content), None);
+fn test_guard_rejects_code_after_endif() {
+    assert_eq!(
+        guard_of("#ifndef G\n#define G\nint body;\n#endif\nint outside;\n"),
+        None
+    );
+}
+
+/// Nesting has to be counted, or an inner `#endif` looks like the guard's.
+#[test]
+fn test_guard_counts_nesting() {
+    assert_eq!(
+        guard_of("#ifndef G\n#define G\n#if 1\nint a;\n#endif\nint b;\n#endif\n"),
+        Some("G".to_string())
+    );
+    // Same shape, but with something after the *outer* #endif.
+    assert_eq!(
+        guard_of("#ifndef G\n#define G\n#if 1\nint a;\n#endif\n#endif\nint after;\n"),
+        None
+    );
+}
+
+/// A guard whose group never closes is not a guard.
+#[test]
+fn test_guard_rejects_unterminated() {
+    assert_eq!(guard_of("#ifndef G\n#define G\nint body;\n"), None);
 }
 
 // ========================================================================
@@ -1415,6 +1452,134 @@ fn test_if_multichar_constant() {
     assert!(
         strs.contains(&"yes".to_string()),
         "expected 'yes' for multi-char constant packing, got: {:?}",
+        strs
+    );
+}
+
+/// `#if` runs one branch of a conditional; picking the wrong one is silent.
+/// Every case here used to pick the wrong one, because the evaluator packed
+/// the *source spelling* between the quotes: `'\n'` was the two characters
+/// `\` and `n`, so it evaluated to 23662, and `'\0'` evaluated to 23600 --
+/// which is to say `#if '\0'` was true.
+#[test]
+fn test_if_character_escapes() {
+    for (expr, want_yes) in [
+        ("'\\n' == 10", true),
+        ("'\\0' == 0", true),
+        ("'\\0'", false),
+        ("'\\t' == 9", true),
+        ("'\\x41' == 65", true),
+        ("'\\101' == 65", true),
+        ("'\\\\' == 92", true),
+        ("'\\'' == 39", true),
+        ("'A' == 65", true),
+    ] {
+        let code = format!(
+            "#if {}
+yes
+#else
+no
+#endif",
+            expr
+        );
+        let (tokens, idents) = preprocess_str(&code);
+        let strs = get_token_strings(&tokens, &idents);
+        let want = if want_yes { "yes" } else { "no" };
+        assert!(
+            strs.contains(&want.to_string()),
+            "#if {} should take the {} branch, got: {:?}",
+            expr,
+            want,
+            strs
+        );
+    }
+}
+
+/// C17 6.4.4.4p10: an ordinary character constant has plain `char`'s
+/// signedness, so the answer differs by target and `#if` must agree with what
+/// the compiled program would compute.
+#[test]
+fn test_if_char_signedness_follows_target() {
+    let code = "#if '\\xff' < 0
+signed
+#else
+unsigned
+#endif";
+    let (tokens, idents) = preprocess_str(code);
+    let strs = get_token_strings(&tokens, &idents);
+    let want = if Target::host().char_signed {
+        "signed"
+    } else {
+        "unsigned"
+    };
+    assert!(
+        strs.contains(&want.to_string()),
+        "expected {:?} for '\\xff' < 0 on this target, got: {:?}",
+        want,
+        strs
+    );
+}
+
+/// A prefixed constant holds one wide character, not the bytes of an
+/// encoding: `L'\n'` is 10, never a packed pair.
+#[test]
+fn test_if_prefixed_character_constants() {
+    for expr in ["L'\\n' == 10", "u'\\x41' == 65", "U'A' == 65", "L'A' == 65"] {
+        let code = format!(
+            "#if {}
+yes
+#else
+no
+#endif",
+            expr
+        );
+        let (tokens, idents) = preprocess_str(&code);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"yes".to_string()),
+            "#if {} should be true, got: {:?}",
+            expr,
+            strs
+        );
+    }
+}
+
+/// gcc packs a multi-character constant big-endian into `int` and lets it
+/// wrap, so a five-byte constant keeps only its last four bytes.
+#[test]
+fn test_if_multichar_constant_wraps_at_int() {
+    for expr in ["'abcd' == 0x61626364", "'abcde' == 0x62636465"] {
+        let code = format!(
+            "#if {}
+yes
+#else
+no
+#endif",
+            expr
+        );
+        let (tokens, idents) = preprocess_str(&code);
+        let strs = get_token_strings(&tokens, &idents);
+        assert!(
+            strs.contains(&"yes".to_string()),
+            "#if {} should be true, got: {:?}",
+            expr,
+            strs
+        );
+    }
+}
+
+/// A `defined` that comes *out* of an expansion, with an operand that is
+/// itself a macro. The operand must not be expanded on the way through, or
+/// the evaluator sees `defined(1)`.
+#[test]
+fn test_if_defined_from_macro_expansion() {
+    let code =
+        "#define FOO 1\n#define D defined(FOO)\n#if D\nyes\n#else\nno\n#endif".replace("\\n", "\n");
+    let (tokens, idents) = preprocess_str(&code);
+    let strs = get_token_strings(&tokens, &idents);
+    assert!(
+        strs.contains(&"yes".to_string()),
+        "expected 'yes' for defined() produced by expansion, got: {:?}",
         strs
     );
 }

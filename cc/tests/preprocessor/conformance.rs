@@ -1263,3 +1263,414 @@ fn preprocessor_diagnostic_outside_a_header_has_no_include_chain() {
         r.stderr
     );
 }
+
+/// Every one of these used to evaluate to zero in silence and pick a branch.
+/// A typo in a feature test compiled the wrong half of the file with nothing
+/// on stderr to say so, which is the worst failure a preprocessor has.
+///
+/// The message text is asserted, not just the rejection: a check that only
+/// looks at the exit status passes when the wrong diagnostic fires.
+#[test]
+fn preprocessor_malformed_if_is_diagnosed() {
+    for (name, cond, needle) in [
+        ("empty", "", "#if with no expression"),
+        ("unclosed_paren", "(1", "missing ')' in expression"),
+        ("garbage_tail", "1 2 3", "missing binary operator"),
+        (
+            "assignment",
+            "X = 2",
+            "not valid in preprocessor expressions",
+        ),
+        ("float", "1.5", "floating constant"),
+        ("hex_float", "0x1p3", "floating constant"),
+        ("string", "\"abc\"", "not valid in preprocessor expressions"),
+        ("bad_suffix", "1zz", "invalid suffix"),
+        ("bad_octal", "07778", "invalid suffix"),
+        ("defined_nonident", "defined(1)", "requires an identifier"),
+        (
+            "defined_unclosed",
+            "defined(X",
+            "missing ')' after \"defined\"",
+        ),
+    ] {
+        let src = format!(
+            "#if {}\nint taken = 1;\n#endif\nint main(void){{return 0;}}\n",
+            cond
+        );
+        let r = preprocess_text(&format!("bad_if_{}", name), &src, &[]);
+        assert!(
+            !r.success,
+            "#if {:?} should be rejected, but -E succeeded:\n{}",
+            cond, r.stdout
+        );
+        assert!(
+            r.stderr.contains(needle),
+            "#if {:?} should say {:?}, got:\n{}",
+            cond,
+            needle,
+            r.stderr
+        );
+    }
+}
+
+/// A shift count outside [0, 64) is undefined. c17 clamps it, which is a fine
+/// answer, but clamping in silence made `#if (1 << 64) == 0` false with
+/// nothing to explain it. gcc warns rather than erroring, so the expression
+/// still evaluates and the file still compiles.
+#[test]
+fn preprocessor_out_of_range_shift_warns() {
+    let src = "#if (1 << 64) == 0\nint taken = 1;\n#endif\nint main(void){return 0;}\n";
+    let r = preprocess_text("shift_overflow", src, &[]);
+    assert!(
+        r.success,
+        "a shift overflow is a warning, not an error:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr
+            .contains("integer overflow in preprocessor expression"),
+        "expected an overflow warning, got:\n{}",
+        r.stderr
+    );
+}
+
+/// A short-circuited operand is not evaluated, so nothing in it may be
+/// diagnosed — the same rule that already keeps `#if 0 && 1/0` quiet.
+#[test]
+fn preprocessor_short_circuit_suppresses_if_diagnostics() {
+    let src = "#if 0 && (1\nint taken = 1;\n#endif\nint main(void){return 0;}\n";
+    let r = preprocess_text("short_circuit_quiet", src, &[]);
+    assert!(
+        r.success,
+        "the skipped operand must not be diagnosed:\n{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("missing ')'"),
+        "the skipped operand must not be diagnosed:\n{}",
+        r.stderr
+    );
+}
+
+/// `#if 'c'` and the compiled `'c'` must agree. They did not: the evaluator
+/// packed the source spelling, so `'\n'` was 23662 and `'\0'` was true.
+#[test]
+fn preprocessor_if_character_constants_match_the_compiler() {
+    let src = r#"
+#if '\n' != 10
+#error newline
+#endif
+#if '\0' != 0
+#error nul
+#endif
+#if '\x41' != 65
+#error hex
+#endif
+#if '\101' != 65
+#error octal
+#endif
+#if L'\n' != 10
+#error wide
+#endif
+int main(void) {
+    // The same expressions, compiled. A disagreement here is the bug.
+    if ('\n' != 10) return 1;
+    if ('\0' != 0) return 2;
+    if ('\x41' != 65) return 3;
+    if ('\101' != 65) return 4;
+    if (L'\n' != 10) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(
+        crate::common::compile_and_run("if_char_agrees", src, &[]),
+        0
+    );
+}
+
+/// C17 6.4.4.4p10: an ordinary character constant carries plain `char`'s
+/// signedness, which differs by target. `compile_and_run` only ever exercises
+/// the host, so the other answer is only visible through `--target`.
+#[test]
+fn preprocessor_if_char_signedness_is_per_target() {
+    let src = "#if '\\xff' < 0\nSIGNED_CHAR\n#else\nUNSIGNED_CHAR\n#endif\n";
+    for (target, want) in [
+        ("x86_64-unknown-linux-gnu", "SIGNED_CHAR"),
+        ("aarch64-unknown-linux-gnu", "UNSIGNED_CHAR"),
+    ] {
+        let r = preprocess_text("char_sign", src, &["--target", target]);
+        assert!(r.success, "-E failed for {}: {}", target, r.stderr);
+        assert_has(&r.stdout, want, target);
+    }
+}
+
+/// An expansion stands where the invocation stood, so one at the start of a
+/// line still starts a line. c17 dropped that flag and ran the expansion onto
+/// the previous line; stringification hid the bug for its own case by copying
+/// the invocation position wholesale, which then made a `#x` result claim to
+/// begin a line even in the middle of one.
+#[test]
+fn preprocessor_expansion_keeps_the_invocation_line_break() {
+    let src = "#define M 42\n#define F(x) (x)\n#define S(x) #x\n\
+               int a;\nM int b;\nint c;\nF(9) int d;\nint e;\nS(hi) int f;\n";
+    let r = preprocess_text("expansion_linebreak", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+
+    // Each expansion begins its own line, exactly as gcc lays it out.
+    for (before, after) in [
+        ("int a;", "42 int b;"),
+        ("int c;", "(9) int d;"),
+        ("int e;", "\"hi\" int f;"),
+    ] {
+        assert_lacks(
+            &r.stdout,
+            &format!("{} {}", before, after),
+            "expansion ran onto the previous line",
+        );
+        assert_has(&r.stdout, after, "the expansion itself");
+    }
+}
+
+/// A macro argument may span lines, and its tokens go into the expansion
+/// carrying the file's flags. One that still says it begins a line would be
+/// read back as starting a directive once expansions are rescanned in place.
+#[test]
+fn preprocessor_multiline_argument_does_not_begin_a_line() {
+    let src = "#define C(a,b) a##b\nint xy_z = 1;\nint v = C(x,\ny_z);\n";
+    let r = preprocess_text("multiline_arg", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "int v = xy_z;", "pasted across a line break");
+}
+
+/// Recursion is stopped by the hide set carried on the expansion's tokens, so
+/// each of these has to terminate on that alone. They are here rather than in
+/// the unit tests because a failure is a hang, and the integration harness
+/// runs `c17` as a subprocess where a hang is visible as one.
+#[test]
+fn preprocessor_recursive_macros_terminate() {
+    for (name, src, want) in [
+        // The classic: the macro's own name in its own body.
+        ("self", "#define f(x) f(x)\nf(1)\n", "f(1)"),
+        // Indirect, through a second name.
+        ("mutual_object", "#define a b\n#define b a\na\n", "a"),
+        // Indirect, function-like, so the hide set has to survive argument
+        // collection as well as substitution.
+        (
+            "mutual_function",
+            "#define F(x) G(x)\n#define G(x) F(x)\nF(1)\n",
+            "F(1)",
+        ),
+        // The argument is the macro, and the body calls whatever it is given.
+        // If argument-derived tokens were exempt from hiding, each round would
+        // produce another unhidden `f`.
+        ("arg_is_the_macro", "#define f(x) x(x)\nf(f)\n", "f(f)"),
+        // A macro name built by `##`. The pasted token is new and so is
+        // eligible for expansion, but it must still inherit the hiding of the
+        // expansion it was built in, or this never settles.
+        (
+            "pasted_name",
+            "#define CAT(a,b) a##b\n#define X CAT(A,B)\n#define AB X\nX\n",
+            "X",
+        ),
+        // expat's portability shim, and the case that proves a token has to
+        // carry the *whole* hide set rather than only names matching its own
+        // spelling: the chain runs `__inline` -> `inline` -> `__inline`, and
+        // neither name matches the other.
+        (
+            "chain_through_another_name",
+            "#define __inline inline\n#define inline __inline\n__inline int f(void);\n",
+            "inline int f(void);",
+        ),
+        // glibc's enum-and-macro idiom, where the body is the name itself.
+        (
+            "body_is_the_name",
+            "#define MSG_DONTROUTE MSG_DONTROUTE\nint x = MSG_DONTROUTE;\n",
+            "int x = MSG_DONTROUTE;",
+        ),
+    ] {
+        let r = preprocess_text(&format!("recursive_{}", name), src, &[]);
+        assert!(r.success, "{}: -E failed: {}", name, r.stderr);
+        assert_has(&r.stdout, want, name);
+    }
+}
+
+/// C17 6.10.3.4 EXAMPLE 3 — the standard's own definitive test of rescanning.
+///
+/// `h` expands to `g(~`, an expansion that ends in the middle of a call. The
+/// rest of that call is in the file, not in the replacement list, so a rescan
+/// that only ever saw the replacement list could not finish it: c17 used to
+/// reject this with "unterminated argument list invoking macro f".
+#[test]
+fn preprocessor_c17_example_3() {
+    let src = "#define f(a) f(2 * (a))\n#define g f\n#define h g(~\n\
+               #define m(a) a(w)\n#define w 0,1\nint x = h 5) ;\n";
+    let r = preprocess_text("example3", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "f(2 * (~ 5))", "EXAMPLE 3");
+}
+
+/// An expansion may consume tokens from the rest of the file, and one that
+/// runs out of file has to give them back rather than expand with whatever it
+/// managed to collect. Splicing made the scan run to end of file looking for
+/// the `)`, so expanding anyway substituted the remainder of the translation
+/// unit into the macro and emitted the result in its place.
+#[test]
+fn preprocessor_unterminated_call_keeps_the_rest_of_the_file() {
+    let src = "#define f(x) ((x)+1)\n#define BAD f(\nint before = 1;\nBAD\nint after = 2;\n";
+    let r = preprocess_text("unterminated_call", src, &[]);
+    assert!(
+        !r.success,
+        "an unterminated call is an error:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.contains("unterminated argument list"),
+        "expected the unterminated-call diagnostic, got:\n{}",
+        r.stderr
+    );
+    assert_has(&r.stdout, "int before = 1;", "text before the call");
+    assert_has(&r.stdout, "int after = 2;", "text after the call");
+    assert_lacks(&r.stdout, "((", "the macro must not have expanded");
+}
+
+/// A function-like macro name that only exists after an expansion still finds
+/// its argument list in the file. This worked before only because of a
+/// hand-rolled loop that reached back into the output and re-spliced; deleting
+/// that loop must not lose the behaviour.
+#[test]
+fn preprocessor_pasted_macro_name_takes_arguments_from_the_file() {
+    let src = "#define CONCAT(a,b) a##b\n#define CALL(name) CONCAT(name, _func)\n\
+               #define ADD_func(a,b) ((a)+(b))\nint v = CALL(ADD)(10, 32);\n";
+    let r = preprocess_text("pasted_call", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    // Compared without spacing: c17 puts a space before a substituted
+    // argument that had one at the call site, which gcc does not. That is a
+    // separate, pre-existing divergence and not what this test is about.
+    let squeezed: String = r.stdout.split_whitespace().collect();
+    assert!(
+        squeezed.contains("((10)+(32))"),
+        "expected the arguments to be taken from the file, got:\n{}",
+        r.stdout
+    );
+}
+
+/// The loop that re-spliced from the output also popped tokens that predated
+/// the expansion, so a function-like macro name left legitimately unexpanded
+/// got pulled back in once a *following* macro expanded to nothing. gcc and
+/// clang both leave this alone.
+#[test]
+fn preprocessor_empty_macro_does_not_trigger_the_previous_name() {
+    let src = "#define f(x) ((x)+1)\n#define E\nf E (3)\n";
+    let r = preprocess_text("empty_between", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_has(&r.stdout, "f (3)", "the call must not be formed");
+    assert_lacks(&r.stdout, "((3)+1)", "f was expanded across E");
+}
+
+/// C17 6.10.3.3p3 requires `##` to produce a single preprocessing token, and
+/// a diagnostic when it does not. The result used to be whatever re-lexing the
+/// concatenated spelling produced, with no check and no message.
+///
+/// `cat(/,/)` is the one that mattered: `//` is a comment, so both operands
+/// *and* the tokens around them disappeared from the output.
+#[test]
+fn preprocessor_invalid_paste_is_diagnosed() {
+    for (name, call) in [
+        ("two_punctuators", "cat(+,-)"),
+        ("ident_and_string", "cat(x,\"s\")"),
+        ("comment", "cat(/,/)"),
+    ] {
+        let src = format!(
+            "#define cat(a,b) a##b\nint y = 1 {} 2;\nint main(void){{return 0;}}\n",
+            call
+        );
+        let r = preprocess_text(&format!("bad_paste_{}", name), &src, &[]);
+        assert!(!r.success, "{} should be rejected:\n{}", call, r.stdout);
+        assert!(
+            r.stderr
+                .contains("does not give a valid preprocessing token"),
+            "{} should say so, got:\n{}",
+            call,
+            r.stderr
+        );
+    }
+}
+
+/// The pastes that are valid have to stay valid, including the ones that join
+/// two punctuators into a third and the one that puts a `.` in front of a
+/// digit sequence.
+#[test]
+fn preprocessor_valid_pastes_still_work() {
+    let src = "#define cat(a,b) a##b\n\
+               int ab; int x12; int y = 1 cat(<,<) 2; int *p; int q = p cat(-,>) ab;\n\
+               double d = cat(1,.5);\nint z = cat(x,12);\n";
+    let r = preprocess_text("good_pastes", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    for want in ["1 << 2", "p -> ab", "1.5", "x12"] {
+        assert_has(&r.stdout, want, "valid paste");
+    }
+}
+
+/// `#define` accepted three malformed forms in silence. A duplicate parameter
+/// was the worst: substitution matches a parameter by name and takes the first,
+/// so `#define F(a,a) a` made `F(1,2)` expand to `1`.
+#[test]
+fn preprocessor_malformed_define_is_diagnosed() {
+    for (name, src, needle) in [
+        (
+            "duplicate_param",
+            "#define F(a,a) a\n",
+            "duplicate macro parameter",
+        ),
+        (
+            "defined",
+            "#define defined 1\n",
+            "cannot be used as a macro name",
+        ),
+        ("unclosed_params", "#define G(x,y\n", "expected ')'"),
+        (
+            "junk_in_params",
+            "#define H(x + y) x\n",
+            "expected ',' or ')'",
+        ),
+    ] {
+        let full = format!("{}int main(void){{return 0;}}\n", src);
+        let r = preprocess_text(&format!("bad_define_{}", name), &full, &[]);
+        assert!(!r.success, "{:?} should be rejected:\n{}", src, r.stdout);
+        assert!(
+            r.stderr.contains(needle),
+            "{:?} should say {:?}, got:\n{}",
+            src,
+            needle,
+            r.stderr
+        );
+    }
+}
+
+/// Recovery from an unterminated call puts *file* tokens back in front of the
+/// cursor. They have to be read back as file tokens: `remap_pos` and the
+/// directive check both ask where a token came from, so tokens unread as if
+/// they were macro output leave the rest of the file unpreprocessed — the
+/// later `#define` was not processed and `LATER` came out unexpanded.
+#[test]
+fn preprocessor_recovery_keeps_processing_the_rest_of_the_file() {
+    let src = "#define f(x) ((x)+1)\n#define BAD f(\nint before;\nBAD\n\
+               #define LATER 7\nint after = LATER;\n";
+    let r = preprocess_text("recovery_provenance", src, &[]);
+    assert!(
+        !r.success,
+        "an unterminated call is an error:\n{}",
+        r.stdout
+    );
+    assert_has(
+        &r.stdout,
+        "int after = 7;",
+        "the later #define was processed",
+    );
+    assert_lacks(&r.stdout, "LATER", "the macro should have expanded");
+    assert_lacks(
+        &r.stdout,
+        "#define",
+        "the later directive is not passed through",
+    );
+}

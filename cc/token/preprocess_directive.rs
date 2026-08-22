@@ -16,6 +16,31 @@
 
 use super::*;
 
+/// Undo the escaping of a `_Pragma` operand (C99 6.10.9p1): `\\"` becomes `"`
+/// and `\\\\` becomes `\\`, and nothing else changes.
+fn destringify(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            // Any other escape is not one this operator introduced, so it
+            // stands as written.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 impl<'a> Preprocessor<'a> {
     /// Handle a preprocessor directive
     /// The directives that survive into an already-preprocessed file.
@@ -56,15 +81,19 @@ impl<'a> Preprocessor<'a> {
             )
     }
 
-    pub(super) fn handle_directive<I>(
+    pub(super) fn handle_directive(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         hash_token: &Token,
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
+        // No assertion about the pushback being empty here. It used to say so,
+        // on the premise that file provenance implies nothing is pending --
+        // which stopped being true once recovery began unreading file tokens.
+        // What the line-oriented helpers below actually need is that this token
+        // came from the file, which is what the caller already checked.
+
         // C17 6.10p7: a `#` alone on a line is the null directive and has no
         // effect. Check before consuming, because the next token belongs to the
         // *next* line — taking it unconditionally treated that line's first
@@ -138,19 +167,19 @@ impl<'a> Preprocessor<'a> {
         }
 
         match directive_id {
-            crate::kw::DEFINE => self.handle_define(iter, idents),
-            crate::kw::UNDEF => self.handle_undef(iter, idents),
+            crate::kw::DEFINE => self.handle_define(iter, idents, hash_token.pos),
+            crate::kw::UNDEF => self.handle_undef(iter, idents, hash_token.pos),
             crate::kw::IFDEF => self.handle_ifdef(iter, idents, hash_token.pos),
             crate::kw::IFNDEF => self.handle_ifndef(iter, idents, hash_token.pos),
             crate::kw::IF => self.handle_if(iter, idents, hash_token.pos),
-            crate::kw::ELIF => self.handle_elif(iter, idents),
-            crate::kw::ELSE => self.handle_else(iter),
-            crate::kw::ENDIF => self.handle_endif(iter),
+            crate::kw::ELIF => self.handle_elif(iter, idents, hash_token.pos),
+            crate::kw::ELSE => self.handle_else(iter, hash_token.pos),
+            crate::kw::ENDIF => self.handle_endif(iter, hash_token.pos),
             crate::kw::INCLUDE => self.handle_include(iter, output, idents, hash_token, false),
             crate::kw::INCLUDE_NEXT => self.handle_include(iter, output, idents, hash_token, true),
             crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
-            crate::kw::PRAGMA => self.handle_pragma(iter, output, idents),
+            crate::kw::PRAGMA => self.handle_pragma(iter, output, idents, hash_token.pos),
             crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
             // `#ident` and `#sccs` carry a version string for the object file.
             // c17 records nothing, but they are directives it knows, so they
@@ -187,10 +216,7 @@ impl<'a> Preprocessor<'a> {
     /// identifier. C17 has no such directive; this is the GCC form that
     /// `c17 -E` itself writes, and `#line` is deliberately *not* routed here
     /// (GCC honors only this form in a preprocessed file, and so does c17).
-    fn handle_linemarker<I>(&mut self, iter: &mut std::iter::Peekable<I>, number: &Token)
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_linemarker(&mut self, iter: &mut TokenCursor, number: &Token) {
         let origin = self.physical_stream;
         let TokenValue::Number(ref text) = number.value else {
             self.skip_to_eol(iter);
@@ -241,10 +267,77 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Skip tokens until end of line
-    fn skip_to_eol<I>(&self, iter: &mut std::iter::Peekable<I>)
-    where
-        I: Iterator<Item = Token>,
-    {
+    /// The next token, only if it is on the directive's own line.
+    ///
+    /// A directive's operand cannot be on the next line. There is no newline
+    /// token in the stream, so a bare `next()` silently reaches into the
+    /// following line and `skip_to_eol` then eats the rest of it -- deleting a
+    /// line of source. The same check already guards the directive *name* in
+    /// `handle_directive`; this is that check applied to the operands, where it
+    /// was missing.
+    fn next_on_line(&self, iter: &mut TokenCursor) -> Option<Token> {
+        match iter.peek() {
+            Some(token) if !token.pos.newline => iter.next(),
+            _ => None,
+        }
+    }
+
+    /// The macro name a `#define`, `#undef`, `#ifdef` or `#ifndef` operates on.
+    ///
+    /// `None` means the directive was malformed and has been diagnosed; the
+    /// caller must not go on to define, undefine or test anything, but must
+    /// still keep the conditional stack balanced where that applies.
+    fn macro_name_operand(
+        &self,
+        iter: &mut TokenCursor,
+        idents: &IdentTable,
+        directive: &str,
+        pos: Position,
+    ) -> Option<String> {
+        let Some(token) = self.next_on_line(iter) else {
+            diag::error_args(pos, "no macro name given in #{0} directive", &[directive]);
+            return None;
+        };
+        match &token.value {
+            TokenValue::Ident(id) if token.typ == TokenType::Ident => {
+                Some(idents.get_opt(*id)?.to_string())
+            }
+            _ => {
+                diag::error(token.pos, &gettext("macro names must be identifiers"));
+                None
+            }
+        }
+    }
+
+    /// Drain the rest of the directive's line, warning if there was any.
+    ///
+    /// C17 6.10p1 gives `#else` and `#endif` no operands at all, and gcc warns
+    /// about anything after them -- usually a stale `#endif MACRO` left from
+    /// before comments were the convention. These used to be eaten in silence.
+    fn warn_extra_tokens(&self, iter: &mut TokenCursor, directive: &str) {
+        if iter.peek().is_some_and(|t| !t.pos.newline) {
+            let pos = iter.peek().map(|t| t.pos).unwrap_or_default();
+            diag::warning_args(pos, "extra tokens at end of #{0} directive", &[directive]);
+        }
+        self.skip_to_eol(iter);
+    }
+
+    /// A pragma's tokens, written back out as the directive they came from.
+    ///
+    /// Spacing follows each token's own `whitespace` flag, so the line reads
+    /// the way it was written rather than the way a default joiner would guess.
+    fn pragma_line_text(line: &[Token], idents: &IdentTable) -> String {
+        let mut out = String::from("#pragma");
+        for (i, token) in line.iter().enumerate() {
+            if i == 0 || token.pos.whitespace {
+                out.push(' ');
+            }
+            out.push_str(&show_token(token, idents));
+        }
+        out
+    }
+
+    fn skip_to_eol(&self, iter: &mut TokenCursor) {
         while let Some(token) = iter.peek() {
             if token.pos.newline {
                 break;
@@ -254,46 +347,44 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #define
-    pub(super) fn handle_define<I>(
+    pub(super) fn handle_define(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         idents: &IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+        pos: Position,
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
         }
 
         // Get macro name
-        let name_token = match iter.next() {
-            Some(t) => t,
-            None => return,
+        let name_pos = iter.peek().map(|t| t.pos).unwrap_or(pos);
+        let Some(name) = self.macro_name_operand(iter, idents, "define", pos) else {
+            self.skip_to_eol(iter);
+            return;
         };
 
-        let macro_name = match &name_token.typ {
-            TokenType::Ident => {
-                if let TokenValue::Ident(id) = &name_token.value {
-                    idents.get_opt(*id).map(|s| s.to_string())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-        let name = match macro_name {
-            Some(n) => n,
-            None => {
-                self.skip_to_eol(iter);
-                return;
-            }
-        };
+        // C17 6.10.8p4: `defined` is not available to be defined. Accepting it
+        // put a macro in the table that `#if` can never see, because the
+        // operator is recognised before expansion.
+        if name == "defined" {
+            diag::error(
+                name_pos,
+                &gettext("\"defined\" cannot be used as a macro name"),
+            );
+            self.skip_to_eol(iter);
+            return;
+        }
 
         // Check if function-like macro (immediate '(' without whitespace)
         let mut params: Vec<MacroParam> = Vec::new();
         let mut is_function = false;
+        // A parameter list that does not parse defines nothing: continuing
+        // with a guessed list is how `#define F(a,a) a` and
+        // `#define H(x + y) x` came to be accepted.
+        let mut malformed_params = false;
+        let mut closed_params = false;
         let mut is_variadic = false;
         let mut variadic_name = None;
 
@@ -313,13 +404,12 @@ impl<'a> Preprocessor<'a> {
                         // trailing arguments rather than being a parameter of
                         // its own.
                         let mut ident_immediately_before = false;
-                        while let Some(param_tok) = iter.next() {
-                            if param_tok.pos.newline {
-                                break;
-                            }
-
+                        while let Some(param_tok) = self.next_on_line(iter) {
                             match &param_tok.value {
-                                TokenValue::Special(c) if *c == b')' as u32 => break,
+                                TokenValue::Special(c) if *c == b')' as u32 => {
+                                    closed_params = true;
+                                    break;
+                                }
                                 TokenValue::Special(c) if *c == b',' as u32 => {
                                     ident_immediately_before = false;
                                     continue;
@@ -338,12 +428,10 @@ impl<'a> Preprocessor<'a> {
                                         }
                                     }
                                     // Consume closing paren
-                                    for t in iter.by_ref() {
-                                        if t.pos.newline {
-                                            break;
-                                        }
+                                    while let Some(t) = self.next_on_line(iter) {
                                         if let TokenValue::Special(c) = &t.value {
                                             if *c == b')' as u32 {
+                                                closed_params = true;
                                                 break;
                                             }
                                         }
@@ -352,6 +440,20 @@ impl<'a> Preprocessor<'a> {
                                 }
                                 TokenValue::Ident(id) => {
                                     if let Some(param_name) = idents.get_opt(*id) {
+                                        // C17 6.10.3p6: the parameters have to
+                                        // be distinct. A repeat used to be
+                                        // pushed anyway, and since substitution
+                                        // matches the *first* one by name,
+                                        // `#define F(a,a) a` silently made
+                                        // `F(1,2)` expand to `1`.
+                                        if params.iter().any(|p| p.name == param_name) {
+                                            diag::error_args(
+                                                param_tok.pos,
+                                                "duplicate macro parameter \"{0}\"",
+                                                &[param_name],
+                                            );
+                                            malformed_params = true;
+                                        }
                                         params.push(MacroParam {
                                             name: param_name.to_string(),
                                             index: param_index,
@@ -360,12 +462,37 @@ impl<'a> Preprocessor<'a> {
                                         ident_immediately_before = true;
                                     }
                                 }
-                                _ => {}
+                                // Anything else cannot be a parameter. This was
+                                // a bare `_ => {}`, so `#define H(x + y) x`
+                                // quietly defined a two-parameter macro.
+                                _ => {
+                                    diag::error_args(
+                                        param_tok.pos,
+                                        "expected ',' or ')' in macro parameter list, found \"{0}\"",
+                                        &[&self.token_to_string(&param_tok, idents)],
+                                    );
+                                    malformed_params = true;
+                                }
                             }
+                        }
+                        if !closed_params {
+                            diag::error(
+                                name_pos,
+                                &gettext("expected ')' at end of macro parameter list"),
+                            );
+                            malformed_params = true;
                         }
                     }
                 }
             }
+        }
+        if malformed_params {
+            // The parameter list was rejected, so the replacement list is not a
+            // macro body -- it is not anything. Returning without draining the
+            // line left it in the stream to be emitted as ordinary code, after
+            // the directive that produced it had already been diagnosed.
+            self.skip_to_eol(iter);
+            return;
         }
 
         // Collect body tokens
@@ -396,11 +523,7 @@ impl<'a> Preprocessor<'a> {
         // break a great deal of code that redefines a macro benignly.
         if let Some(existing) = self.macros.get(&name) {
             if let Some(why) = macro_redefinition_conflict(existing, &mac) {
-                diag::warning_args(
-                    name_token.pos,
-                    "'{0}' redefined: {1}",
-                    &[&name.to_string(), why],
-                );
+                diag::warning_args(name_pos, "'{0}' redefined: {1}", &[&name.to_string(), why]);
             }
         }
 
@@ -408,129 +531,89 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #undef
-    fn handle_undef<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &IdentTable)
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_undef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
         }
 
-        if let Some(token) = iter.next() {
-            if let TokenType::Ident = &token.typ {
-                if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get_opt(*id) {
-                        self.undef_macro(name);
-                    }
-                }
-            }
+        if let Some(name) = self.macro_name_operand(iter, idents, "undef", pos) {
+            self.undef_macro(&name);
         }
 
         self.skip_to_eol(iter);
     }
 
     /// Handle #ifdef
-    fn handle_ifdef<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        idents: &IdentTable,
-        pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
-        let defined = if let Some(token) = iter.next() {
-            if let TokenType::Ident = &token.typ {
-                if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get_opt(*id) {
-                        self.is_defined(name)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+    fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
+        // A malformed operand still pushes a group, so the matching
+        // `#endif` closes something and one bad directive does not cascade
+        // into a run of "#endif without #if". The group is skipped, since
+        // nothing was established about the name.
+        let name = self.macro_name_operand(iter, idents, "ifdef", pos);
+        let take_branch = match &name {
+            Some(name) => self.is_defined(name),
+            None => false,
         };
 
         self.skip_to_eol(iter);
-        self.push_conditional(defined, pos);
+        self.push_conditional(take_branch, pos);
     }
 
     /// Handle #ifndef
-    fn handle_ifndef<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        idents: &IdentTable,
-        pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
-        let defined = if let Some(token) = iter.next() {
-            if let TokenType::Ident = &token.typ {
-                if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get_opt(*id) {
-                        self.is_defined(name)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+    fn handle_ifndef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
+        // A malformed operand still pushes a group, so the matching
+        // `#endif` closes something and one bad directive does not cascade
+        // into a run of "#endif without #if". The group is skipped, since
+        // nothing was established about the name.
+        let name = self.macro_name_operand(iter, idents, "ifndef", pos);
+        let take_branch = match &name {
+            Some(name) => !self.is_defined(name),
+            None => false,
         };
 
         self.skip_to_eol(iter);
-        self.push_conditional(!defined, pos);
+        self.push_conditional(take_branch, pos);
     }
 
     /// Handle #if
-    fn handle_if<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        idents: &mut IdentTable,
-        pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_if(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
         let value = if self.is_skipping() {
             false
         } else {
             // Expand macros before evaluation (per C standard)
             let expanded = self.expand_if_tokens(&tokens, idents);
-            self.evaluate_expression(&expanded, idents)
+            self.evaluate_expression(&expanded, idents, pos)
         };
 
         self.push_conditional(value, pos);
     }
 
     /// Handle #elif
-    fn handle_elif<I>(&mut self, iter: &mut std::iter::Peekable<I>, idents: &mut IdentTable)
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_elif(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
 
-        // Check if we should evaluate this branch
-        let should_eval = if let Some(cond) = self.cond_stack.last() {
-            cond.state == CondState::Skipping && !cond.had_true
-        } else {
-            false
+        // C17 6.10.1: a group runs `#if`, then any `#elif`s, then at most one
+        // `#else`. Neither of these was checked, so a stray `#elif` did nothing
+        // and an `#elif` after `#else` silently turned the group `Done`,
+        // truncating the `#else` body it had already started emitting.
+        let should_eval = match self.cond_stack.last() {
+            None => {
+                diag::error(pos, &gettext("#elif without #if"));
+                return;
+            }
+            Some(cond) if cond.seen_else => {
+                diag::error(pos, &gettext("#elif after #else"));
+                return;
+            }
+            Some(cond) => cond.state == CondState::Skipping && !cond.had_true,
         };
 
         let expr_value = if should_eval {
             // Expand macros before evaluation (per C standard)
             let expanded = self.expand_if_tokens(&tokens, idents);
-            self.evaluate_expression(&expanded, idents)
+            self.evaluate_expression(&expanded, idents, pos)
         } else {
             false
         };
@@ -557,13 +640,19 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #else
-    fn handle_else<I>(&mut self, iter: &mut std::iter::Peekable<I>)
-    where
-        I: Iterator<Item = Token>,
-    {
-        self.skip_to_eol(iter);
+    fn handle_else(&mut self, iter: &mut TokenCursor, pos: Position) {
+        self.warn_extra_tokens(iter, "else");
 
-        if let Some(cond) = self.cond_stack.last_mut() {
+        let Some(cond) = self.cond_stack.last_mut() else {
+            diag::error(pos, &gettext("#else without #if"));
+            return;
+        };
+        if cond.seen_else {
+            diag::error(pos, &gettext("#else after #else"));
+            return;
+        }
+        cond.seen_else = true;
+        {
             match cond.state {
                 CondState::Active => {
                     cond.state = CondState::Done;
@@ -583,25 +672,22 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #endif
-    fn handle_endif<I>(&mut self, iter: &mut std::iter::Peekable<I>)
-    where
-        I: Iterator<Item = Token>,
-    {
-        self.skip_to_eol(iter);
-        self.cond_stack.pop();
+    fn handle_endif(&mut self, iter: &mut TokenCursor, pos: Position) {
+        self.warn_extra_tokens(iter, "endif");
+        if self.cond_stack.pop().is_none() {
+            diag::error(pos, &gettext("#endif without #if"));
+        }
     }
 
     /// Handle #include
-    fn handle_include<I>(
+    fn handle_include(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
         hash_token: &Token,
         is_include_next: bool,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -628,6 +714,7 @@ impl<'a> Preprocessor<'a> {
             self.cond_stack.push(Conditional {
                 state: CondState::Active,
                 had_true: true,
+                seen_else: false,
                 pos: Position::default(),
             });
             let expanded = self.preprocess(path_tokens, idents);
@@ -791,454 +878,123 @@ impl<'a> Preprocessor<'a> {
         None
     }
 
-    /// Detect include guard macro from file content.
-    /// Returns Some(macro_name) if the file starts with `#ifndef MACRO` followed by `#define MACRO`.
-    /// This ensures we only detect true include guards, not conditional includes like:
-    ///   #ifndef _CDEFS_H_
-    ///   # error "Use <sys/cdefs.h> instead"
-    ///   #endif
-    pub(super) fn detect_include_guard(content: &[u8]) -> Option<String> {
-        // Convert to string for simple parsing
-        let text = match std::str::from_utf8(content) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
+    /// The macro guarding this file, if the file is exactly one guarded group.
+    ///
+    /// Requires all of: nothing before the opening directive; `#ifndef X` or
+    /// `#if !defined X` immediately followed by `#define X`; and the `#endif`
+    /// that closes *that* group being the last token in the file. The last of
+    /// those is what the previous implementation could not check -- it stopped
+    /// scanning at the first token of the body -- so a header with code after
+    /// its `#endif` was treated as fully guarded and lost that code.
+    ///
+    /// It also rejects the conditional-default idiom, `#ifndef FOO / #define
+    /// FOO 1 / #endif / #define BAR 2`, for the same reason: something follows
+    /// the `#endif`.
+    ///
+    /// This reads the token stream the file was tokenized into anyway, rather
+    /// than re-scanning the raw bytes with a second, ad-hoc lexer.
+    pub(super) fn guard_of(tokens: &[Token], idents: &IdentTable) -> Option<String> {
+        let mut it = tokens
+            .iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .peekable();
 
-        // Skip leading whitespace and find the first preprocessor directive
-        let mut chars = text.chars().peekable();
+        let guard = Self::opening_guard(&mut it, idents)?;
 
-        // Helper to skip whitespace and comments
-        let skip_ws_and_comments = |chars: &mut std::iter::Peekable<std::str::Chars>| {
-            loop {
-                // Skip whitespace
-                while chars.peek().map(|c| c.is_whitespace()).unwrap_or(false) {
-                    chars.next();
-                }
-
-                // Check for comment
-                if chars.peek() == Some(&'/') {
-                    chars.next();
-                    match chars.peek() {
-                        Some(&'/') => {
-                            // Line comment - skip to end of line
-                            while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                                chars.next();
-                            }
-                            continue;
-                        }
-                        Some(&'*') => {
-                            // Block comment - skip to */
-                            chars.next();
-                            while let Some(c) = chars.next() {
-                                if c == '*' && chars.peek() == Some(&'/') {
-                                    chars.next();
-                                    break;
-                                }
-                            }
-                            continue;
-                        }
-                        _ => return false, // Unexpected /
-                    }
-                }
-                return true;
+        // Walk the rest, tracking how deeply nested the conditionals are. The
+        // guard's own group is depth 1 on entry.
+        let mut depth = 1usize;
+        while let Some(token) = it.next() {
+            if !Self::is_directive_hash(token) {
+                continue;
             }
-        };
-
-        if !skip_ws_and_comments(&mut chars) {
-            return None;
-        }
-
-        // Now we should be at #
-        if chars.next() != Some('#') {
-            return None;
-        }
-
-        // Skip whitespace after #
-        while chars
-            .peek()
-            .map(|c| *c == ' ' || *c == '\t')
-            .unwrap_or(false)
-        {
-            chars.next();
-        }
-
-        // Collect directive name
-        let mut directive = String::new();
-        while chars
-            .peek()
-            .map(|c| c.is_ascii_alphabetic() || *c == '_')
-            .unwrap_or(false)
-        {
-            directive.push(chars.next().unwrap());
-        }
-
-        match directive.as_str() {
-            "ifndef" => {
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                // Collect macro name
-                let mut macro_name = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    macro_name.push(chars.next().unwrap());
-                }
-                if macro_name.is_empty() {
-                    return None;
-                }
-
-                // Skip to end of line
-                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                    chars.next();
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-
-                // Skip whitespace and comments before next directive
-                if !skip_ws_and_comments(&mut chars) {
-                    return None;
-                }
-
-                // Now check for #define MACRO (the second part of include guard pattern)
-                if chars.next() != Some('#') {
-                    return None;
-                }
-
-                // Skip whitespace after #
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-
-                // Collect directive name
-                let mut next_directive = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphabetic() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    next_directive.push(chars.next().unwrap());
-                }
-
-                if next_directive != "define" {
-                    return None;
-                }
-
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-
-                // Collect the defined macro name
-                let mut define_name = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    define_name.push(chars.next().unwrap());
-                }
-
-                // The #define must define the same macro as the #ifndef
-                if define_name != macro_name {
-                    return None;
-                }
-
-                // Check for conditional default definition pattern:
-                //   #ifndef MACRO
-                //   #define MACRO [value]
-                //   #endif
-                //   ... more content ...  <-- content AFTER #endif = NOT a guard
-                //
-                // vs true include guard:
-                //   #ifndef MACRO
-                //   #define MACRO
-                //   ... guarded content ...
-                //   #endif
-                //   [end of file or just whitespace/comments]
-
-                // Skip to end of #define line
-                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                    chars.next();
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-
-                // Skip whitespace and comments
-                if !skip_ws_and_comments(&mut chars) {
-                    return None;
-                }
-
-                // Check if next thing is #endif followed by more content
-                if chars.peek() == Some(&'#') {
-                    let mut check_chars = chars.clone();
-                    check_chars.next(); // consume #
-                                        // Skip whitespace after #
-                    while check_chars
-                        .peek()
-                        .map(|c| *c == ' ' || *c == '\t')
-                        .unwrap_or(false)
-                    {
-                        check_chars.next();
-                    }
-                    // Collect directive name
-                    let mut next_dir = String::new();
-                    while check_chars
-                        .peek()
-                        .map(|c| c.is_ascii_alphabetic() || *c == '_')
-                        .unwrap_or(false)
-                    {
-                        next_dir.push(check_chars.next().unwrap());
-                    }
-                    if next_dir == "endif" {
-                        // Found #endif immediately after #define
-                        // Now check if there's more content after the #endif
-                        // Skip to end of #endif line
-                        while check_chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                            check_chars.next();
-                        }
-                        if check_chars.peek() == Some(&'\n') {
-                            check_chars.next();
-                        }
-                        // Skip whitespace and comments after #endif
-                        skip_ws_and_comments(&mut check_chars);
-                        // If there's more content after #endif, this is NOT a guard
-                        if check_chars.peek().is_some() {
-                            return None;
-                        }
-                        // Otherwise it's a valid (empty) include guard
+            match it.peek().and_then(|t| Self::directive_name(t, idents)) {
+                Some("if" | "ifdef" | "ifndef") => depth += 1,
+                Some("endif") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // The closing `#endif` of the guard. Everything after
+                        // its own line would be outside the guard, so the file
+                        // is only guarded if there is nothing after it.
+                        it.next();
+                        return it.next().is_none().then_some(guard);
                     }
                 }
-
-                // Looks like a valid include guard
-                return Some(macro_name);
+                _ => {}
             }
-            "if" => {
-                // Check for !defined(MACRO) pattern
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                // Check for !
-                if chars.next() != Some('!') {
-                    return None;
-                }
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                // Collect "defined"
-                let mut keyword = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphabetic())
-                    .unwrap_or(false)
-                {
-                    keyword.push(chars.next().unwrap());
-                }
-                if keyword != "defined" {
-                    return None;
-                }
-                // Skip whitespace and optional (
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                let has_paren = chars.peek() == Some(&'(');
-                if has_paren {
-                    chars.next();
-                }
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-                // Collect macro name
-                let mut macro_name = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    macro_name.push(chars.next().unwrap());
-                }
-                if macro_name.is_empty() {
-                    return None;
-                }
-                // Skip optional closing paren
-                if has_paren {
-                    while chars
-                        .peek()
-                        .map(|c| *c == ' ' || *c == '\t')
-                        .unwrap_or(false)
-                    {
-                        chars.next();
-                    }
-                    if chars.peek() == Some(&')') {
-                        chars.next();
-                    }
-                }
-
-                // Skip to end of line
-                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                    chars.next();
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-
-                // Skip whitespace and comments before next directive
-                if !skip_ws_and_comments(&mut chars) {
-                    return None;
-                }
-
-                // Now check for #define MACRO (second part of include guard pattern)
-                if chars.next() != Some('#') {
-                    return None;
-                }
-
-                // Skip whitespace after #
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-
-                // Collect directive name
-                let mut next_directive = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphabetic() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    next_directive.push(chars.next().unwrap());
-                }
-
-                if next_directive != "define" {
-                    return None;
-                }
-
-                // Skip whitespace
-                while chars
-                    .peek()
-                    .map(|c| *c == ' ' || *c == '\t')
-                    .unwrap_or(false)
-                {
-                    chars.next();
-                }
-
-                // Collect the defined macro name
-                let mut define_name = String::new();
-                while chars
-                    .peek()
-                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .unwrap_or(false)
-                {
-                    define_name.push(chars.next().unwrap());
-                }
-
-                // The #define must define the same macro as the #if !defined
-                if define_name != macro_name {
-                    return None;
-                }
-
-                // Same check as for #ifndef case:
-                // Check for conditional default definition pattern
-
-                // Skip to end of #define line
-                while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                    chars.next();
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-
-                // Skip whitespace and comments
-                if !skip_ws_and_comments(&mut chars) {
-                    return None;
-                }
-
-                // Check if next thing is #endif followed by more content
-                if chars.peek() == Some(&'#') {
-                    let mut check_chars = chars.clone();
-                    check_chars.next(); // consume #
-                                        // Skip whitespace after #
-                    while check_chars
-                        .peek()
-                        .map(|c| *c == ' ' || *c == '\t')
-                        .unwrap_or(false)
-                    {
-                        check_chars.next();
-                    }
-                    // Collect directive name
-                    let mut next_dir = String::new();
-                    while check_chars
-                        .peek()
-                        .map(|c| c.is_ascii_alphabetic() || *c == '_')
-                        .unwrap_or(false)
-                    {
-                        next_dir.push(check_chars.next().unwrap());
-                    }
-                    if next_dir == "endif" {
-                        // Found #endif immediately after #define
-                        // Now check if there's more content after the #endif
-                        // Skip to end of #endif line
-                        while check_chars.peek().map(|c| *c != '\n').unwrap_or(false) {
-                            check_chars.next();
-                        }
-                        if check_chars.peek() == Some(&'\n') {
-                            check_chars.next();
-                        }
-                        // Skip whitespace and comments after #endif
-                        skip_ws_and_comments(&mut check_chars);
-                        // If there's more content after #endif, this is NOT a guard
-                        if check_chars.peek().is_some() {
-                            return None;
-                        }
-                        // Otherwise it's a valid (empty) include guard
-                    }
-                }
-
-                // Looks like a valid include guard
-                return Some(macro_name);
-            }
-            _ => {}
         }
-
         None
+    }
+
+    /// `#ifndef X` / `#define X`, or `#if !defined X` / `#define X`, at the
+    /// very start of the file. Returns `X`.
+    fn opening_guard<'t, I>(it: &mut std::iter::Peekable<I>, idents: &IdentTable) -> Option<String>
+    where
+        I: Iterator<Item = &'t Token>,
+    {
+        if !Self::is_directive_hash(it.next()?) {
+            return None;
+        }
+        let guard = match Self::directive_name(it.next()?, idents)? {
+            "ifndef" => Self::ident_text(it.next()?, idents)?,
+            "if" => {
+                // `!` `defined` [`(`] NAME [`)`]
+                if !Self::is_punct(it.next()?, b'!' as u32) {
+                    return None;
+                }
+                if Self::directive_name(it.next()?, idents)? != "defined" {
+                    return None;
+                }
+                let parens = Self::is_punct(it.peek()?, b'(' as u32);
+                if parens {
+                    it.next();
+                }
+                let name = Self::ident_text(it.next()?, idents)?;
+                if parens && !Self::is_punct(it.next()?, b')' as u32) {
+                    return None;
+                }
+                name
+            }
+            _ => return None,
+        };
+
+        // The `#define` has to be the next directive, and name the same macro.
+        if !Self::is_directive_hash(it.next()?) {
+            return None;
+        }
+        if Self::directive_name(it.next()?, idents)? != "define" {
+            return None;
+        }
+        if Self::ident_text(it.next()?, idents)? != guard {
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// A `#` that begins a line, i.e. one that introduces a directive.
+    fn is_directive_hash(token: &Token) -> bool {
+        token.pos.newline && Self::is_punct(token, b'#' as u32)
+    }
+
+    fn is_punct(token: &Token, code: u32) -> bool {
+        matches!(&token.value, TokenValue::Special(c) if *c == code)
+    }
+
+    /// The spelling of an identifier token, whatever it is.
+    fn ident_text(token: &Token, idents: &IdentTable) -> Option<String> {
+        match &token.value {
+            TokenValue::Ident(id) => idents.get_opt(*id).map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
+    /// The spelling of a directive name, which the lexer may have interned as
+    /// a keyword (`if`, `else`) rather than a plain identifier.
+    fn directive_name<'i>(token: &Token, idents: &'i IdentTable) -> Option<&'i str> {
+        match &token.value {
+            TokenValue::Ident(id) => idents.get_opt(*id),
+            _ => None,
+        }
     }
 
     /// Include a file
@@ -1259,6 +1015,16 @@ impl<'a> Preprocessor<'a> {
         // Check for #pragma once
         if self.once_files.contains(&canonical) {
             return;
+        }
+
+        // A file already read to the end, found to be one guarded group, and
+        // whose guard is still defined, would contribute nothing. Checked
+        // before the file is even opened, which is where the old text scan
+        // could not be: it had to read and re-scan on every include.
+        if let Some(guard) = self.guarded_files.get(&canonical) {
+            if self.is_defined(guard) {
+                return;
+            }
         }
 
         // Read the file first so we can check for include guards
@@ -1282,24 +1048,11 @@ impl<'a> Preprocessor<'a> {
             content
         };
 
-        // Check for include guard optimization: if file starts with #ifndef MACRO
-        // or #if !defined(MACRO) and that macro is already defined, skip the include.
-        // This allows circular includes protected by guards to work correctly.
-        if let Some(guard_macro) = Self::detect_include_guard(&content) {
-            if self.is_defined(&guard_macro) {
-                return;
-            }
-        }
-
-        // Check for include cycle (only error if no include guard protects it)
-        if self.include_stack.contains(&canonical) {
-            diag::error_args(
-                hash_token.pos,
-                "recursive include of '{0}'",
-                &[&path.display().to_string()],
-            );
-            return;
-        }
+        // No cycle check here. A file that includes itself under a counter
+        // guard is legal and useful, and the only thing that kept it out of a
+        // "recursive include" error before was the guard fast path guessing
+        // that it could skip the file. Depth is what bounds a real cycle, as
+        // it does for gcc.
 
         // Check include depth
         if self.include_depth >= self.max_include_depth {
@@ -1326,7 +1079,6 @@ impl<'a> Preprocessor<'a> {
         let saved_include_path_index =
             std::mem::replace(&mut self.current_include_path_index, include_path_index);
 
-        self.include_stack.insert(canonical.clone());
         self.include_depth += 1;
 
         // Create a new stream for this file, remembering which `#include`
@@ -1344,6 +1096,11 @@ impl<'a> Preprocessor<'a> {
             tokenizer.tokenize()
         };
 
+        // Whether this file is one guarded group is a property of its text, so
+        // read it now; whether that entitles a *later* include to skip the file
+        // is decided after this one finishes, below.
+        let guard = Self::guard_of(&tokens, idents);
+
         // Preprocess the included tokens
         let preprocessed = self.preprocess(tokens, idents);
 
@@ -1355,11 +1112,21 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
+        // The file has now been read through to the end, so what its guard
+        // protects is known rather than guessed.
+        if let Some(guard) = guard {
+            self.guarded_files.insert(canonical, guard);
+        }
+
         // Restore state
         self.include_depth -= 1;
-        self.include_stack.remove(&canonical);
         self.current_file = saved_file;
         self.current_dir = saved_dir;
+        // Whatever the file left open, it left open. The stack is swapped out
+        // around an inclusion so a header cannot close one of the includer's
+        // groups, which also meant an unterminated `#if` in a header was
+        // discarded here rather than reported.
+        self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
         self.current_include_path_index = saved_include_path_index;
     }
@@ -1415,18 +1182,16 @@ impl<'a> Preprocessor<'a> {
         self.include_depth -= 1;
         self.current_file = saved_file;
         self.current_dir = saved_dir;
+        // Whatever the file left open, it left open. The stack is swapped out
+        // around an inclusion so a header cannot close one of the includer's
+        // groups, which also meant an unterminated `#if` in a header was
+        // discarded here rather than reported.
+        self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
     }
 
     /// Handle #error
-    fn handle_error<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        pos: &Position,
-        idents: &IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_error(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -1438,14 +1203,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #warning
-    fn handle_warning<I>(
-        &mut self,
-        iter: &mut std::iter::Peekable<I>,
-        pos: &Position,
-        idents: &IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    fn handle_warning(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -1457,18 +1215,29 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #pragma
-    fn handle_pragma<I>(
+    fn handle_pragma(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         output: &mut Vec<Token>,
         idents: &IdentTable,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+        hash_pos: Position,
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
         }
+
+        // Take the whole line up front. The recognisers below consume from it,
+        // and whatever they do not act on still has to be reproduced verbatim,
+        // which needs the tokens as they were written.
+        let line = self.collect_to_eol(iter);
+        let verbatim = Self::pragma_line_text(&line, idents);
+        let emit_verbatim = |pp: &mut Self, output: &mut Vec<Token>| {
+            let mut marker = Token::new(TokenType::Pragma, pp.remap_pos(hash_pos));
+            marker.value = TokenValue::String(format!("{}{}", PRAGMA_TEXT_PREFIX, verbatim));
+            output.push(marker);
+        };
+        let iter = &mut TokenCursor::new(line);
 
         // Check for #pragma once and #pragma STDC
         if let Some(token) = iter.peek() {
@@ -1499,6 +1268,10 @@ impl<'a> Preprocessor<'a> {
                         if let Ok(canonical) = Path::new(&self.current_file).canonicalize() {
                             self.once_files.insert(canonical);
                         }
+                        // Acted on, and still reproduced: a `.i` that had lost
+                        // its `#pragma once` would be included twice.
+                        emit_verbatim(self, output);
+                        return;
                     } else if name == "STDC" {
                         let pos = token.pos;
                         iter.next(); // consume "STDC"
@@ -1554,26 +1327,27 @@ impl<'a> Preprocessor<'a> {
                             );
                         }
 
-                        self.skip_to_eol(iter);
+                        emit_verbatim(self, output);
                         return;
                     }
                 }
             }
         }
 
-        self.skip_to_eol(iter);
+        // Anything c17 does not act on -- `#pragma GCC ...`, `#pragma weak`,
+        // OpenMP, a vendor pragma -- is carried through unchanged rather than
+        // discarded.
+        emit_verbatim(self, output);
     }
 
     /// Handle _Pragma operator (C99)
     /// _Pragma("string") is equivalent to #pragma string
     /// Since we ignore most pragmas anyway, this just consumes the tokens
-    pub(super) fn handle_pragma_operator<I>(
+    pub(super) fn handle_pragma_operator(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         output: &mut Vec<Token>,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
         // Expect '('
         if let Some(token) = iter.next() {
             if !matches!(&token.value, TokenValue::Special(code) if *code == b'(' as u32) {
@@ -1599,11 +1373,21 @@ impl<'a> Preprocessor<'a> {
             return;
         }
         if let TokenValue::String(body) = &token.value {
-            if let Some(action) = parse_pragma_text(body, token.pos) {
-                let mut marker = Token::new(TokenType::Pragma, self.remap_pos(token.pos));
-                marker.value = TokenValue::String(action.encode());
-                output.push(marker);
-            }
+            let pos = self.remap_pos(token.pos);
+            let mut marker = Token::new(TokenType::Pragma, pos);
+            marker.value = TokenValue::String(match parse_pragma_text(body, token.pos) {
+                Some(action) => action.encode(),
+                // Not one c17 acts on, so it travels as the directive it
+                // stands for. C99 6.10.9p1 makes `_Pragma("x")` mean
+                // `#pragma x`, and the operand is a string literal, so the
+                // escaping the lexer kept has to come back off.
+                None => format!(
+                    "{}#pragma {}",
+                    PRAGMA_TEXT_PREFIX,
+                    destringify(&payload_text(body))
+                ),
+            });
+            output.push(marker);
         }
 
         // Expect ')' - if not found or malformed, silently ignore
@@ -1617,14 +1401,12 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Handle #line directive
-    fn handle_line<I>(
+    fn handle_line(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         idents: &mut IdentTable,
         directive_pos: Position,
-    ) where
-        I: Iterator<Item = Token>,
-    {
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;

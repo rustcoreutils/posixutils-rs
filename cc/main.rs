@@ -631,9 +631,17 @@ fn process_file(
                 // dropping it would lose the packing, which is the one thing
                 // the marker exists to carry.
                 let pragma = if token.typ == TokenType::Pragma {
+                    // `pack` travels decoded, because the parser acts on it;
+                    // every other pragma travels as its own text. Dropping the
+                    // second kind is what made `c17 -E` keep one pragma line
+                    // out of five, so an `-E`/compile split silently meant
+                    // something different from compiling in one step.
                     match token::preprocess::PackAction::from_token(token) {
                         Some(action) => Some(action.to_pragma_text()),
-                        None => continue,
+                        None => match token::preprocess::pragma_text(token) {
+                            Some(text) => Some(text),
+                            None => continue,
+                        },
                     }
                 } else {
                     None

@@ -11,7 +11,7 @@
 // Tests for #line and other preprocessor directives.
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, preprocess_text, run_c17};
 
 #[test]
 fn preprocessor_line_directive() {
@@ -82,4 +82,428 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("line_directive_macro_expand", code, &[]), 0);
+}
+
+/// A directive's operand has to be on the directive's own line.
+///
+/// There is no newline token in the stream, so fetching the operand with a
+/// bare `next()` reached into the following line and `skip_to_eol` then ate
+/// the rest of it. A lone `#define` followed by `alpha beta` silently defined
+/// `alpha` as `beta` and deleted the line.
+#[test]
+fn preprocessor_bare_directive_is_diagnosed() {
+    for (name, directive, close) in [
+        ("define", "#define", ""),
+        ("undef", "#undef", ""),
+        ("ifdef", "#ifdef", "#endif\n"),
+        ("ifndef", "#ifndef", "#endif\n"),
+    ] {
+        let src = format!("{}\nalpha beta\n{}int after;\n", directive, close);
+        let r = preprocess_text(&format!("bare_{}", name), &src, &[]);
+        let want = format!("no macro name given in {} directive", directive);
+        assert!(
+            !r.success,
+            "{} alone should be rejected:\n{}",
+            directive, r.stdout
+        );
+        assert!(
+            r.stderr.contains(&want),
+            "{} alone should say {:?}, got:\n{}",
+            directive,
+            want,
+            r.stderr
+        );
+    }
+}
+
+/// The line after a bare directive survives untouched.
+///
+/// Only `#define` and `#undef` can show this directly: a bare `#ifdef` opens a
+/// group that is (correctly) skipped, so the following line is absent for a
+/// reason that has nothing to do with token theft.
+#[test]
+fn preprocessor_bare_directive_keeps_the_next_line() {
+    for (name, directive) in [("define", "#define"), ("undef", "#undef")] {
+        let src = format!("{}\nalpha beta;\nint after;\n", directive);
+        let r = preprocess_text(&format!("bare_keeps_{}", name), &src, &[]);
+        assert!(
+            r.stdout.contains("alpha beta;"),
+            "{} alone must not consume the next line, got:\n{}",
+            directive,
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains("int after;"),
+            "{}: later lines survive too, got:\n{}",
+            directive,
+            r.stdout
+        );
+    }
+}
+
+/// gcc: "macro names must be identifiers".
+#[test]
+fn preprocessor_macro_name_must_be_an_identifier() {
+    for (name, src) in [
+        ("define", "#define 123 x\n"),
+        ("undef", "#undef 456\n"),
+        ("ifdef", "#ifdef 789\n#endif\n"),
+        ("ifndef", "#ifndef +\n#endif\n"),
+    ] {
+        let r = preprocess_text(&format!("nonident_{}", name), src, &[]);
+        assert!(!r.success, "{} should be rejected:\n{}", name, r.stdout);
+        assert!(
+            r.stderr.contains("macro names must be identifiers"),
+            "{} should say so, got:\n{}",
+            name,
+            r.stderr
+        );
+    }
+}
+
+/// A rejected `#define` is not a macro and its replacement list is not
+/// anything. Returning from the parameter-list error without draining the line
+/// left those tokens to be emitted as ordinary code, after the directive that
+/// produced them had already been diagnosed.
+#[test]
+fn preprocessor_rejected_define_does_not_emit_its_body() {
+    let r = preprocess_text(
+        "rejected_define_body",
+        "#define H(x + y) THIS_SHOULD_NOT_APPEAR\nint ok;\n",
+        &[],
+    );
+    assert!(
+        !r.success,
+        "the directive should be rejected:\n{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("THIS_SHOULD_NOT_APPEAR"),
+        "the rejected body must not be emitted:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("int ok;"),
+        "the next line survives:\n{}",
+        r.stdout
+    );
+}
+
+/// An unterminated parameter list must stop at the line boundary rather than
+/// consuming the next line's first token. Two loops did the opposite --
+/// consume, then test `pos.newline` -- so the token was already gone.
+#[test]
+fn preprocessor_unterminated_param_list_keeps_the_next_line() {
+    for (name, src) in [
+        ("plain", "#define F(x\nDROPPED kept;\nint ok;\n"),
+        (
+            "named_variadic",
+            "#define G(a, rest...\nDROPPED kept;\nint ok;\n",
+        ),
+    ] {
+        let r = preprocess_text(&format!("unterminated_params_{}", name), src, &[]);
+        assert!(!r.success, "{} should be rejected:\n{}", name, r.stdout);
+        assert!(
+            r.stdout.contains("DROPPED"),
+            "{}: the next line's first token must survive, got:\n{}",
+            name,
+            r.stdout
+        );
+    }
+}
+
+/// `-D` is one directive however the shell wrapped it. Its first token is the
+/// first token of its own buffer, so it is flagged as beginning a line, which
+/// the operand's same-line check read as `#define` with nothing after it.
+#[test]
+fn preprocessor_command_line_defines_still_work() {
+    let r = preprocess_text(
+        "cmdline_defines",
+        "const char *v = GITVERSION;\nint p = PLAIN;\nint q = VAL;\n",
+        &["-DGITVERSION=\"abc\"", "-DPLAIN=1", "-DVAL=3"],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    for want in ["\"abc\"", "int p = 1;", "int q = 3;"] {
+        assert!(
+            r.stdout.contains(want),
+            "expected {:?} in:\n{}",
+            want,
+            r.stdout
+        );
+    }
+}
+
+/// C17 6.10.1: a conditional group runs `#if`, then any `#elif`s, then at most
+/// one `#else`, and it must be closed. None of that was checked.
+///
+/// The two duplicate cases are the destructive ones: a second `#else` was a
+/// legal state transition that turned the group `Done`, truncating the first
+/// `#else` body and dropping the second, with nothing on stderr.
+#[test]
+fn preprocessor_conditional_nesting_is_validated() {
+    for (name, src, needle) in [
+        ("stray_endif", "#endif\nint v;\n", "#endif without #if"),
+        ("stray_else", "#else\nint v;\n", "#else without #if"),
+        ("stray_elif", "#elif 1\nint v;\n", "#elif without #if"),
+        (
+            "double_else",
+            "#if 1\nint a;\n#else\nint b;\n#else\nint c;\n#endif\n",
+            "#else after #else",
+        ),
+        (
+            "elif_after_else",
+            "#if 0\nint a;\n#else\nint b;\n#elif 1\nint c;\n#endif\n",
+            "#elif after #else",
+        ),
+        ("unterminated", "#if 1\nint a;\n", "unterminated #if"),
+    ] {
+        let r = preprocess_text(&format!("cond_{}", name), src, &[]);
+        assert!(!r.success, "{} should be rejected:\n{}", name, r.stdout);
+        assert!(
+            r.stderr.contains(needle),
+            "{} should say {:?}, got:\n{}",
+            name,
+            needle,
+            r.stderr
+        );
+    }
+}
+
+/// The conditional stack is swapped out around an inclusion so a header cannot
+/// close one of the includer's groups. That also meant an unterminated `#if`
+/// in a header was discarded rather than reported.
+#[test]
+fn preprocessor_unterminated_conditional_in_a_header_is_diagnosed() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_unterm_hdr_")
+        .tempdir()
+        .unwrap();
+    std::fs::write(dir.path().join("u.h"), "#if 1\nint never_closed;\n").unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "#include \"u.h\"\nint after;\n").unwrap();
+
+    let r = run_c17(&["-E", &src.to_string_lossy()]);
+    assert!(!r.success, "the header leaves a group open:\n{}", r.stdout);
+    assert!(
+        r.stderr.contains("unterminated #if"),
+        "expected the unterminated-#if error, got:\n{}",
+        r.stderr
+    );
+}
+
+/// gcc warns about anything after `#else` or `#endif`, which take no operands.
+/// These were eaten in silence.
+#[test]
+fn preprocessor_extra_tokens_after_a_conditional_warn() {
+    let r = preprocess_text(
+        "extra_after_cond",
+        "#if 1\nint a;\n#else JUNK\nint b;\n#endif TRAILING\n",
+        &[],
+    );
+    assert!(r.success, "these are warnings, not errors:\n{}", r.stderr);
+    for want in [
+        "extra tokens at end of #else directive",
+        "extra tokens at end of #endif directive",
+    ] {
+        assert!(
+            r.stderr.contains(want),
+            "expected {:?}, got:\n{}",
+            want,
+            r.stderr
+        );
+    }
+}
+
+/// A header is only skipped on re-inclusion once it has been read through to
+/// the end and found to be exactly one guarded group.
+///
+/// Guessing instead — scanning for an `#ifndef` and skipping whenever that
+/// name happened to be defined — deleted source three ways, all of them here.
+#[test]
+fn preprocessor_include_guard_never_deletes_source() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_guard_")
+        .tempdir()
+        .unwrap();
+    let write = |name: &str, body: &str| {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    };
+    let run = |name: &str, extra: &[&str]| {
+        let src = dir.path().join(name).to_string_lossy().to_string();
+        let mut args: Vec<&str> = vec!["-E"];
+        args.extend_from_slice(extra);
+        args.push(&src);
+        run_c17(&args)
+    };
+
+    // 1. Code after the closing `#endif` is not guarded, so it appears on
+    //    every include. The old scan stopped at the first body token and never
+    //    saw the `#endif`, let alone what followed it.
+    write(
+        "g1.h",
+        "#ifndef G1_H\n#define G1_H\nint inside;\n#endif\nint outside;\n",
+    );
+    write("g1.c", "#include \"g1.h\"\n#include \"g1.h\"\n");
+    let r = run("g1.c", &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(
+        r.stdout.matches("int outside;").count(),
+        2,
+        "code outside the guard belongs to every include:\n{}",
+        r.stdout
+    );
+    assert_eq!(
+        r.stdout.matches("int inside;").count(),
+        1,
+        "the guarded body belongs to the first include only:\n{}",
+        r.stdout
+    );
+
+    // 2. Defining the guard name on the command line must not delete the file.
+    //    It was never read, so nothing was known about it.
+    write(
+        "g2.h",
+        "#ifndef G2_H\n#define G2_H\nint guarded;\n#endif\nint outside;\n",
+    );
+    write("g2.c", "#include \"g2.h\"\n");
+    let r = run("g2.c", &["-DG2_H"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("int outside;"),
+        "-D<guard> must not delete code outside the guard:\n{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("int guarded;"),
+        "the guarded body is still skipped:\n{}",
+        r.stdout
+    );
+
+    // 3. A header including itself under a counter guard. The recursion is
+    //    bounded by the guard, and both arms belong in the output.
+    write(
+        "g3.h",
+        "#ifndef DEPTH\n#define DEPTH 1\n#include \"g3.h\"\nint outer_arm;\n\
+         #else\nint inner_arm;\n#endif\n",
+    );
+    write("g3.c", "#include \"g3.h\"\n");
+    let r = run("g3.c", &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let inner = r.stdout.find("int inner_arm;");
+    let outer = r.stdout.find("int outer_arm;");
+    assert!(
+        inner.is_some() && outer.is_some() && inner < outer,
+        "expected the inner arm then the outer, got:\n{}",
+        r.stdout
+    );
+
+    // 4. The optimization still works: a properly guarded header contributes
+    //    nothing the second time.
+    write("g4.h", "#ifndef G4_H\n#define G4_H\nint once;\n#endif\n");
+    write("g4.c", "#include \"g4.h\"\n#include \"g4.h\"\n");
+    let r = run("g4.c", &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(
+        r.stdout.matches("int once;").count(),
+        1,
+        "a guarded header is included once:\n{}",
+        r.stdout
+    );
+}
+
+/// A genuine cycle is bounded by include depth rather than by an immediate
+/// error, which is what gcc does and what lets a counter-guarded self-include
+/// work at all.
+#[test]
+fn preprocessor_unguarded_include_cycle_is_bounded() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_cycle_")
+        .tempdir()
+        .unwrap();
+    std::fs::write(dir.path().join("a.h"), "#include \"b.h\"\n").unwrap();
+    std::fs::write(dir.path().join("b.h"), "#include \"a.h\"\n").unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(&src, "#include \"a.h\"\nint x;\n").unwrap();
+
+    let r = run_c17(&["-E", &src.to_string_lossy()]);
+    assert!(!r.success, "a cycle must not succeed:\n{}", r.stdout);
+    assert!(
+        r.stderr.contains("nested too deeply"),
+        "expected the depth limit to catch it, got:\n{}",
+        r.stderr
+    );
+}
+
+/// `c17 -E` used to keep one pragma line out of five. POSIX makes a `.i` a
+/// valid operand and c17 compiles one, so dropping the rest meant that
+/// preprocessing and compiling in two steps did something different from
+/// compiling in one.
+#[test]
+fn preprocessor_every_pragma_survives_preprocessing() {
+    let src = "#pragma GCC visibility push(default)\n\
+               #pragma GCC diagnostic ignored \"-Wunused\"\n\
+               #pragma omp parallel for\n\
+               #pragma pack(1)\n\
+               _Pragma(\"GCC diagnostic pop\")\n\
+               int q;\n";
+    let r = preprocess_text("all_pragmas", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    for want in [
+        "#pragma GCC visibility push(default)",
+        "#pragma GCC diagnostic ignored \"-Wunused\"",
+        "#pragma omp parallel for",
+        "#pragma pack(1)",
+        // The operator lowers to the directive it stands for (C99 6.10.9p1).
+        "#pragma GCC diagnostic pop",
+    ] {
+        assert!(
+            r.stdout.contains(want),
+            "expected {:?} in:\n{}",
+            want,
+            r.stdout
+        );
+    }
+    assert_eq!(
+        r.stdout.matches("#pragma").count(),
+        5,
+        "expected exactly five pragma lines:\n{}",
+        r.stdout
+    );
+}
+
+/// A `_Pragma` operand is a string literal, so the escaping the lexer kept has
+/// to come back off before the directive is written.
+#[test]
+fn preprocessor_pragma_operator_destringifies() {
+    let r = preprocess_text(
+        "pragma_destringify",
+        "_Pragma(\"GCC diagnostic ignored \\\"-Wunused\\\"\")\nint q;\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout
+            .contains("#pragma GCC diagnostic ignored \"-Wunused\""),
+        "the operand's escaping should be undone:\n{}",
+        r.stdout
+    );
+}
+
+/// Preprocessing to a `.i` and compiling that must lay a struct out the same
+/// way as compiling the source directly — which is the whole reason the
+/// pragmas have to survive.
+#[test]
+fn preprocessor_packing_survives_a_two_step_compile() {
+    let src = r#"
+#pragma pack(push, 1)
+struct S { char c; int i; };
+#pragma pack(pop)
+struct T { char c; int i; };
+int main(void) {
+    if (sizeof(struct S) != 5) return 1;
+    if (sizeof(struct T) <= 5) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("pack_two_step", src, &[]), 0);
 }

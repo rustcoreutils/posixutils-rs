@@ -17,10 +17,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
-    literal_payload, payload_text, tokens_to_source_bytes, write_token, IdentTable, LexerMode,
-    Position, Punctuator, SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
+    literal_payload, payload_bytes, payload_text, report_forbidden_ucn, show_token,
+    tokens_to_source_bytes, write_token, IdentTable, LexerMode, Position, Punctuator, SpecialToken,
+    Spelling, Token, TokenType, TokenValue, Tokenizer,
 };
+use super::literal;
 use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
@@ -186,14 +189,35 @@ pub enum BuiltinMacro {
     HasIncludeNext,
 }
 
+thread_local! {
+    /// A string table for tokenizing predefined macro values.
+    ///
+    /// `Macro::predefined` needs a table only because the tokenizer takes one;
+    /// every identifier it interns is de-interned again before the function
+    /// returns, so no id escapes. Building a fresh table per call was not free:
+    /// `StringTable::new` pre-interns every keyword at a fixed slot, and the
+    /// compiler defines about fifty of these macros before it reads a line of
+    /// source. That was half the instructions executed for an empty
+    /// translation unit.
+    ///
+    /// Shared rather than keyword-free so the fixed keyword slots -- which the
+    /// directive dispatch matches against as integers -- still hold.
+    static SCRATCH_IDENTS: std::cell::RefCell<IdentTable> =
+        std::cell::RefCell::new(IdentTable::new());
+}
+
+/// Run `f` with the shared scratch string table.
+fn scratch_idents<T>(f: impl FnOnce(&mut IdentTable) -> T) -> T {
+    SCRATCH_IDENTS.with(|cell| f(&mut cell.borrow_mut()))
+}
+
 impl Macro {
     /// Create a predefined macro (value is treated as a number/literal)
     pub fn predefined(name: &str, value: Option<&str>) -> Self {
         let body = match value {
-            Some(v) => {
+            Some(v) => scratch_idents(|idents| {
                 // Tokenize the value string properly so (-1021) becomes (, -, 1021, )
-                let mut idents = IdentTable::new();
-                let mut tokenizer = Tokenizer::new(v.as_bytes(), 0, &mut idents);
+                let mut tokenizer = Tokenizer::new(v.as_bytes(), 0, idents);
                 let tokens = tokenizer.tokenize();
 
                 tokens
@@ -230,7 +254,7 @@ impl Macro {
                         }
                     })
                     .collect()
-            }
+            }),
             None => vec![],
         };
         Self {
@@ -338,7 +362,18 @@ enum CondState {
 struct Conditional {
     state: CondState,
     /// Has this conditional had a true branch?
+    ///
+    /// Not quite what it says: `push_conditional` also sets it when the whole
+    /// group is inside a skipped parent, so that no branch of a dead group can
+    /// activate. It therefore cannot answer "was there an `#else`", which is
+    /// why that is a separate flag.
     had_true: bool,
+    /// Whether this group's `#else` has been seen.
+    ///
+    /// Without it a second `#else` is a legal state transition rather than an
+    /// error, and a silently destructive one: it turns the group `Done`, so the
+    /// first `#else` body is truncated and the second is dropped.
+    seen_else: bool,
     /// Position of the #if/#ifdef/#ifndef directive
     pos: Position,
 }
@@ -353,7 +388,7 @@ pub struct Preprocessor<'a> {
     target: &'a Target,
 
     /// Macro definitions
-    macros: HashMap<String, Macro>,
+    macros: HashMap<String, std::rc::Rc<Macro>>,
 
     /// Conditional compilation stack
     cond_stack: Vec<Conditional>,
@@ -376,29 +411,39 @@ pub struct Preprocessor<'a> {
     /// Counter for __COUNTER__
     counter: u32,
 
-    /// Include depth (for cycle detection)
+    /// How many `#include`s deep the pass currently is. This is what bounds a
+    /// cycle; there is no set of open files.
     include_depth: u32,
 
     /// Maximum include depth
     max_include_depth: u32,
 
-    /// Set of files currently being included (cycle detection)
-    include_stack: HashSet<PathBuf>,
-
-    /// Files that have been included with #pragma once or include guards
+    /// Files named by a `#pragma once`.
     once_files: HashSet<PathBuf>,
 
-    /// Macros currently being expanded (for recursion prevention)
-    expanding: HashSet<String>,
+    /// Files whose whole contents are one `#ifndef`/`#endif` group, and the
+    /// macro that guards them.
+    ///
+    /// Only a file that has been read *through to the end* gets an entry, and
+    /// only if its group closed with nothing outside it. That is what makes
+    /// the entry mean "including this again would produce nothing", which is
+    /// the only thing that justifies skipping it.
+    ///
+    /// Guessing instead -- scanning the text for an `#ifndef` and skipping
+    /// whenever that name happened to be defined -- deleted source three ways:
+    /// a header with anything after its `#endif` lost it on every include but
+    /// the first; `-D<guard>` on the command line deleted the file entire,
+    /// having never read it; and a header that includes itself under a counter
+    /// guard lost its `#else` arm.
+    ///
+    /// Pure lookup, never iterated, so a `HashMap` cannot leak its order.
+    guarded_files: HashMap<PathBuf, String>,
 
     /// Compilation date string for __DATE__ (format: "Mmm dd yyyy")
     compile_date: String,
 
     /// Compilation time string for __TIME__ (format: "hh:mm:ss")
     compile_time: String,
-
-    /// Preprocess call depth (0 = top level, >0 = recursive for macros/includes)
-    preprocess_depth: u32,
 
     /// Whether to use builtin headers (disabled by -nobuiltininc or -nostdinc)
     use_builtin_headers: bool,
@@ -436,6 +481,34 @@ pub struct Preprocessor<'a> {
     /// applied to its own `#` token.
     physical_line: u32,
     physical_stream: u16,
+    /// The one diagnostic stream every `##` result is attributed to.
+    ///
+    /// `diag::init_stream` appends to a registry and returns its length as a
+    /// `u16`. Calling it per paste grew that registry without bound and wrapped
+    /// silently past 65535, at which point *other* files' stream ids collided
+    /// and every later diagnostic named the wrong file. A translation unit
+    /// does far more than 65535 pastes.
+    paste_stream: std::cell::Cell<Option<u16>>,
+    /// How many more expansions may be spliced in before the pass gives up.
+    /// Seeded once, at construction: the nested calls for an argument's own
+    /// replacement and for an included file share it, since a runaway in
+    /// either is the same failure, and re-seeding per call would let an
+    /// exhausted budget come back.
+    ///
+    /// Termination rests entirely on the hide set now, and a hole in it is an
+    /// infinite loop rather than a wrong answer -- a hang has no diagnostic and
+    /// no exit status to read. This turns one into an error. It is a backstop,
+    /// not a policy: the bound is far above what any real translation unit
+    /// reaches, so hitting it means a bug here, not an unusual program.
+    expansion_budget: u64,
+    /// Set while a `#if`/`#elif` controlling expression is being expanded.
+    ///
+    /// C17 6.10.1p1 exempts the operand of `defined` from macro expansion, and
+    /// the operand can only be recognised in the same walk that does the
+    /// expanding: rewriting `defined X` in a pass *beforehand* misses a
+    /// `defined` that an expansion produces, and expanding first destroys the
+    /// operand. `#define D defined(FOO)` / `#if D` used to evaluate `0 (1)`.
+    in_if_condition: bool,
 }
 
 /// Where a linemarker says the text after it really came from.
@@ -460,6 +533,25 @@ struct LineMarker {
     target: u16,
     /// Added to a physical line number to get the reported one.
     delta: i64,
+}
+
+/// The payload prefix a marker uses when it carries a pragma c17 does not act
+/// on and only needs to reproduce.
+const PRAGMA_TEXT_PREFIX: &str = "text:";
+
+/// The directive a marker token stands for, when it is one c17 only carries.
+///
+/// `#pragma pack` is the one pragma that changes what the compiler does, so it
+/// travels decoded, as a [`PackAction`]. Everything else travels as its own
+/// text: c17 does not act on `#pragma GCC diagnostic` or an OpenMP directive,
+/// but POSIX makes a `.i` a valid operand and c17 compiles one, so dropping
+/// them made preprocessing and compiling in two steps mean something different
+/// from doing it in one.
+pub fn pragma_text(token: &Token) -> Option<String> {
+    match &token.value {
+        TokenValue::String(s) => s.strip_prefix(PRAGMA_TEXT_PREFIX).map(str::to_string),
+        _ => None,
+    }
 }
 
 /// What a `#pragma pack` directive does to the packing state.
@@ -755,12 +847,10 @@ impl<'a> Preprocessor<'a> {
             counter: 0,
             include_depth: 0,
             max_include_depth: 200,
-            include_stack: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
-            expanding: HashSet::with_capacity(DEFAULT_COND_STACK_CAPACITY),
+            guarded_files: HashMap::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             compile_date,
             compile_time,
-            preprocess_depth: 0,
             use_builtin_headers: true,
             trigraphs: false,
             use_system_headers: true,
@@ -772,6 +862,9 @@ impl<'a> Preprocessor<'a> {
             linemarker: None,
             physical_line: 0,
             physical_stream: 0,
+            expansion_budget: EXPANSION_BUDGET,
+            paste_stream: std::cell::Cell::new(None),
+            in_if_condition: false,
         };
 
         // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
@@ -1017,7 +1110,7 @@ impl<'a> Preprocessor<'a> {
 
     /// Define a macro
     pub fn define_macro(&mut self, mac: Macro) {
-        self.macros.insert(mac.name.clone(), mac);
+        self.macros.insert(mac.name.clone(), std::rc::Rc::new(mac));
     }
 
     /// Apply one command-line `-D` specification.
@@ -1042,11 +1135,26 @@ impl<'a> Preprocessor<'a> {
         };
         // handle_define expects to start at the macro name, and stream markers
         // would be taken for one.
-        let mut iter = tokens
-            .into_iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .peekable();
-        self.handle_define(&mut iter, idents);
+        //
+        // The line flags are cleared too. A `-D` is one directive however the
+        // shell wrapped it, but its first token is the first token of its own
+        // buffer and so is flagged as beginning a line -- which the operand's
+        // same-line check then reads as `#define` with nothing after it.
+        // `-DGITVERSION="..."`, which CPython's build passes, was rejected.
+        let mut cursor = TokenCursor::new(
+            tokens
+                .into_iter()
+                .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+                .map(|mut t| {
+                    t.pos.newline = false;
+                    t
+                })
+                .collect(),
+        );
+        // A `-D` has no `#` to blame, so a malformed one is reported at the
+        // start of the synthesized directive.
+        let pos = cursor.peek().map(|t| t.pos).unwrap_or_default();
+        self.handle_define(&mut cursor, idents, pos);
     }
 
     /// Undefine a macro
@@ -1059,9 +1167,16 @@ impl<'a> Preprocessor<'a> {
         self.macros.contains_key(name)
     }
 
-    /// Get a macro definition
-    pub fn get_macro(&self, name: &str) -> Option<&Macro> {
-        self.macros.get(name)
+    /// The `<paste>` stream id, created once.
+    fn paste_stream(&self) -> u16 {
+        match self.paste_stream.get() {
+            Some(id) => id,
+            None => {
+                let id = diag::init_stream("<paste>");
+                self.paste_stream.set(Some(id));
+                id
+            }
+        }
     }
 
     /// Check if we're currently skipping tokens
@@ -1074,18 +1189,31 @@ impl<'a> Preprocessor<'a> {
 
     /// Process tokens through the preprocessor
     pub fn preprocess(&mut self, tokens: Vec<Token>, idents: &mut IdentTable) -> Vec<Token> {
-        self.preprocess_depth += 1;
         let mut output = Vec::new();
-        let mut iter = tokens.into_iter().peekable();
+        // Tracks `defined X` / `defined ( X )` so the operand escapes macro
+        // expansion; inert outside a controlling expression.
+        let mut defined_scan = DefinedScan::Idle;
+        let mut cursor = TokenCursor::new(tokens);
 
-        while let Some(mut token) = iter.next() {
+        while let Some(mut token) = cursor.next() {
             // Attribute the token before anything looks at it, so that macro
             // expansion, diagnostics and the `-E` marker writer all inherit
             // the position a linemarker established. The physical position is
             // kept because the next linemarker's delta is measured from it.
-            self.physical_line = token.pos.line;
-            self.physical_stream = token.pos.stream;
-            token.pos = self.remap_pos(token.pos);
+            //
+            // Only for tokens read from the file. A token from an expansion
+            // already carries the invocation's position, remapped when the
+            // invoking token came through here, and `remap_pos` is not
+            // idempotent when a linemarker's target is its own origin -- which
+            // is what `# 100 "this-file.c"` produces -- so a second pass
+            // applies the delta twice. Letting an expansion token write
+            // `physical_line` is worse still: the next linemarker measures its
+            // delta from that already-remapped line.
+            if cursor.provenance() == Provenance::Main {
+                self.physical_line = token.pos.line;
+                self.physical_stream = token.pos.stream;
+                token.pos = self.remap_pos(token.pos);
+            }
 
             match token.typ {
                 TokenType::StreamBegin | TokenType::StreamEnd => {
@@ -1095,13 +1223,27 @@ impl<'a> Preprocessor<'a> {
 
                 TokenType::Special => {
                     if let TokenValue::Special(code) = &token.value {
-                        // Check for # at start of line (preprocessor directive)
-                        if *code == b'#' as u32 && token.pos.newline {
-                            self.handle_directive(&mut iter, &token, &mut output, idents);
+                        // Check for # at start of line (preprocessor directive).
+                        //
+                        // Only from the file. C17 6.10.3p11 makes a directive
+                        // produced by a macro expansion undefined, and taking
+                        // one would be worse than undefined here: `skip_to_eol`
+                        // and `collect_to_eol` stop at the next token that
+                        // begins a line, so a stray `#` out of an expansion
+                        // would swallow the rest of the file rather than the
+                        // rest of a replacement list.
+                        if *code == b'#' as u32
+                            && token.pos.newline
+                            && cursor.provenance() == Provenance::Main
+                        {
+                            self.handle_directive(&mut cursor, &token, &mut output, idents);
                             continue;
                         }
                     }
                     if !self.is_skipping() {
+                        if self.in_if_condition {
+                            defined_scan = defined_scan.punctuator(&token);
+                        }
                         output.push(token);
                     }
                 }
@@ -1109,6 +1251,15 @@ impl<'a> Preprocessor<'a> {
                 TokenType::Ident => {
                     if self.is_skipping() {
                         continue;
+                    }
+                    // The operand of `defined` is not expanded (C17 6.10.1p1).
+                    if self.in_if_condition {
+                        let (next, protect) = defined_scan.identifier(&token, idents);
+                        defined_scan = next;
+                        if protect {
+                            output.push(token);
+                            continue;
+                        }
                     }
                     // In an already-preprocessed file every macro has already
                     // been expanded, so nothing here is a macro name: not a
@@ -1124,99 +1275,61 @@ impl<'a> Preprocessor<'a> {
                     // Check for macro expansion
                     if let TokenValue::Ident(id) = &token.value {
                         if let Some(name) = idents.get_opt(*id) {
-                            let name = name.to_string();
+                            // Everything that can reject this token is decided
+                            // against the interned name, before it is copied.
+                            // Almost every identifier in a translation unit is
+                            // not a macro, and copying each one to find that
+                            // out was an allocation per identifier -- the cost
+                            // was paid by programs that define no macros at
+                            // all. The copy is needed only past this point,
+                            // because expanding wants `idents` mutably.
+                            let is_pragma = name == "_Pragma";
+                            let is_macro = self.macros.contains_key(name);
+                            let hidden = token.is_no_expand(name);
 
                             // Handle _Pragma operator (C99)
                             // _Pragma("string") is equivalent to #pragma string
                             // We silently consume it since we ignore #pragma anyway
-                            if name == "_Pragma" {
-                                self.handle_pragma_operator(&mut iter, &mut output);
+                            if is_pragma {
+                                self.handle_pragma_operator(&mut cursor, &mut output);
                                 continue;
                             }
 
-                            // Check blue-painting: if this token was marked as no-expand
-                            // for this macro (from a previous expansion), don't expand it.
-                            // Per C99 6.10.3.4, macro names in their own expansion are
-                            // "blue painted" and should not be re-expanded.
-                            if token.is_no_expand(&name) {
+                            // Per C99 6.10.3.4, a macro name that its own
+                            // expansion put here is not expanded again.
+                            if !is_macro || hidden {
                                 output.push(token);
                                 continue;
                             }
+                            let name = name.to_string();
 
                             if let Some(expanded) =
-                                self.try_expand_macro(&name, &token.pos, &mut iter, idents)
+                                self.try_expand_macro(&name, &token, &mut cursor, idents)
                             {
-                                output.extend(expanded);
-
-                                // Check if the last expanded token is a function-like macro
-                                // followed by '(' in the remaining input stream.
-                                // This handles cases like: CALL(ADD)(10, 32) where token paste
-                                // creates a function-like macro name and args come from outside.
-                                while let Some(last) = output.last() {
-                                    if last.typ != TokenType::Ident {
-                                        break;
-                                    }
-                                    let TokenValue::Ident(id) = &last.value else {
-                                        break;
-                                    };
-                                    let Some(macro_name) = idents.get_opt(*id) else {
-                                        break;
-                                    };
-                                    let macro_name = macro_name.to_string();
-
-                                    // Check if it's a function-like macro
-                                    let Some(mac) = self.macros.get(&macro_name) else {
-                                        break;
-                                    };
-                                    if !mac.is_function {
-                                        break;
-                                    }
-
-                                    // Check if next token is '('
-                                    let Some(next) = iter.peek() else { break };
-                                    let TokenValue::Special(code) = &next.value else {
-                                        break;
-                                    };
-                                    if *code != b'(' as u32 {
-                                        break;
-                                    }
-
-                                    // Check for recursion
-                                    if self.expanding.contains(&macro_name) {
-                                        break;
-                                    }
-
-                                    // Pop the identifier and expand as function-like macro
-                                    let last_token = output.pop().unwrap();
-
-                                    // Check blue-painting on the token itself
-                                    if last_token.is_no_expand(&macro_name) {
-                                        output.push(last_token);
-                                        break;
-                                    }
-                                    iter.next(); // consume '('
-                                    let args = self.collect_macro_args(
-                                        &mut iter,
-                                        idents,
-                                        &last_token.pos,
-                                        &macro_name,
-                                    );
-                                    let mac = mac.clone();
-                                    if let Some(more_expanded) = self.expand_function_macro(
-                                        &mac,
-                                        &args,
-                                        &last_token.pos,
-                                        idents,
-                                    ) {
-                                        output.extend(more_expanded);
-                                        // Loop to handle chained expansions
-                                    } else {
-                                        // Put back the identifier if expansion failed
-                                        output.push(last_token);
-                                        break;
-                                    }
+                                // Put the expansion back in front of the file
+                                // rather than into the output, and do not
+                                // advance. Rescanning is then this same loop
+                                // reading on, and an expansion that ends in
+                                // the middle of a call can finish it from the
+                                // rest of the file -- which is what C17
+                                // 6.10.3.4 EXAMPLE 3 asks for and what the
+                                // recursive rescan could not do, because it
+                                // only ever saw the replacement list.
+                                //
+                                // The invocation's spacing goes with it, to be
+                                // applied to whichever token comes next: an
+                                // expansion may be empty, or may begin with a
+                                // macro that expands to nothing, and stamping
+                                // the first token would lose it in both cases.
+                                if !self.charge_expansion(token.pos) {
+                                    output.push(token);
+                                    continue;
                                 }
-
+                                cursor.push_expansion(
+                                    expanded,
+                                    token.pos.whitespace,
+                                    token.pos.newline,
+                                );
                                 continue;
                             }
                         }
@@ -1226,25 +1339,53 @@ impl<'a> Preprocessor<'a> {
 
                 _ => {
                     if !self.is_skipping() {
+                        if self.in_if_condition {
+                            defined_scan = DefinedScan::Idle;
+                        }
                         output.push(token);
                     }
                 }
             }
         }
 
-        // Check for unterminated conditionals (only at top level)
-        // - preprocess_depth == 1: we're at the outermost preprocess call (not recursive)
-        // - include_depth == 0: we're not inside an included file
-        // Recursive calls happen during macro expansion and include file processing
-        if self.preprocess_depth == 1 && self.include_depth == 0 && !self.cond_stack.is_empty() {
-            // Report location of first unterminated #if directive
-            let first_pos = self.cond_stack.first().map(|c| c.pos).unwrap_or_default();
-            let msg = format!("{} unterminated #if directive(s)", self.cond_stack.len());
-            diag::warning(first_pos, &msg);
-        }
-
-        self.preprocess_depth -= 1;
         output
+    }
+
+    /// Account for one expansion, and say whether it may proceed.
+    ///
+    /// Reports once, then keeps returning false so the rest of the file is
+    /// emitted without expansion rather than producing one error per token.
+    fn charge_expansion(&mut self, pos: Position) -> bool {
+        if self.expansion_budget == 0 {
+            return false;
+        }
+        self.expansion_budget -= 1;
+        if self.expansion_budget == 0 {
+            diag::error(
+                pos,
+                &gettext("macro expansion is not terminating; giving up"),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Warn about `#if` groups the file never closed.
+    ///
+    /// This belongs to the whole pass, not to one call of it: `preprocess` is
+    /// still re-entered for an argument's own macro replacement and for an
+    /// included file, and only the outermost caller knows the run is over. It
+    /// used to be guarded by a recursion depth counter for exactly that
+    /// reason.
+    ///
+    /// An included file's leftover groups are not reported, because
+    /// `include_file` swaps the conditional stack out around it and drops
+    /// whatever is left. gcc does diagnose that; changing it is a separate
+    /// question from this one.
+    fn report_unterminated_conditionals(&mut self) {
+        for cond in std::mem::take(&mut self.cond_stack) {
+            diag::error(cond.pos, &gettext("unterminated #if"));
+        }
     }
 
     /// Apply the active [`LineMarker`] to a position.
@@ -1260,10 +1401,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Collect tokens until end of line
-    fn collect_to_eol<I>(&self, iter: &mut std::iter::Peekable<I>) -> Vec<Token>
-    where
-        I: Iterator<Item = Token>,
-    {
+    fn collect_to_eol(&self, iter: &mut TokenCursor) -> Vec<Token> {
         let mut tokens = Vec::new();
         while let Some(token) = iter.peek() {
             if token.pos.newline {
@@ -1291,14 +1429,32 @@ impl<'a> Preprocessor<'a> {
             state,
             // When parent is skipping, mark had_true so #else/#elif won't activate
             had_true: parent_skipping || condition,
+            seen_else: false,
             pos,
         });
     }
 
-    /// Evaluate a preprocessor expression
-    fn evaluate_expression(&self, tokens: &[Token], idents: &IdentTable) -> bool {
+    /// Evaluate a controlling expression (C17 6.10.1).
+    ///
+    /// `directive_pos` is where to blame an expression that is missing
+    /// altogether. A rejected expression is false, so the group is skipped and
+    /// the error is what the user acts on; recovering to "whatever the parser
+    /// happened to compute" is how a typo used to compile the wrong half of a
+    /// file in silence.
+    fn evaluate_expression(
+        &self,
+        tokens: &[Token],
+        idents: &IdentTable,
+        directive_pos: Position,
+    ) -> bool {
+        if tokens.is_empty() {
+            diag::error(directive_pos, &gettext("#if with no expression"));
+            return false;
+        }
         let mut evaluator = ExprEvaluator::new(self, idents);
-        evaluator.evaluate(tokens).is_true()
+        let value = evaluator.evaluate(tokens);
+        evaluator.check_fully_consumed();
+        !evaluator.had_error && value.is_true()
     }
 
     /// Convert token to string
@@ -1319,15 +1475,12 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Reduce `#pragma pack(...)`'s tokens to `PackTok`s and read them.
-    fn parse_pack_pragma<I>(
+    fn parse_pack_pragma(
         &mut self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         idents: &IdentTable,
         pos: Position,
-    ) -> Option<PackAction>
-    where
-        I: Iterator<Item = Token>,
-    {
+    ) -> Option<PackAction> {
         let mut toks = Vec::new();
         while let Some(tok) = iter.peek() {
             if tok.pos.newline && !toks.is_empty() {
@@ -1424,6 +1577,12 @@ struct ExprEvaluator<'a, 'b> {
     /// Set while parsing a short-circuited operand, whose diagnostics must not
     /// fire — the whole point of `&&`/`||` not evaluating that side.
     suppressed: bool,
+    /// Set once anything in the expression was rejected. The controlling
+    /// expression then counts as false rather than as whatever the recovery
+    /// path happened to compute: every `expr_*` used to fall through to zero
+    /// in silence, so `#if (1`, `#if X = 2` and `#if 1.5` each picked a branch
+    /// with no diagnostic at all.
+    had_error: bool,
 }
 
 impl<'a, 'b> ExprEvaluator<'a, 'b> {
@@ -1434,6 +1593,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             tokens: Vec::new(),
             pos: 0,
             suppressed: false,
+            had_error: false,
         }
     }
 
@@ -1441,6 +1601,66 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         self.tokens = tokens.to_vec();
         self.pos = 0;
         self.expr_ternary()
+    }
+
+    /// Reject the expression, unless this operand is being skipped by a
+    /// short-circuit — `#if 0 && (1` must stay quiet for the same reason
+    /// `#if 0 && 1/0` does.
+    fn err(&mut self, pos: Position, msg: &str) {
+        if self.suppressed {
+            return;
+        }
+        self.had_error = true;
+        diag::error(pos, msg);
+    }
+
+    /// Same, for a diagnostic that names the offending token.
+    fn err_token(&mut self, pos: Position, template: &str, arg: &str) {
+        if self.suppressed {
+            return;
+        }
+        self.had_error = true;
+        diag::error_args(pos, template, &[arg]);
+    }
+
+    /// C17 6.10.1p4: the line is *one* controlling expression. Anything left
+    /// over is a typo the user wants to hear about — `#if 1 2 3` used to be
+    /// simply true.
+    fn check_fully_consumed(&mut self) {
+        if self.had_error || self.pos >= self.tokens.len() {
+            return;
+        }
+        let tok = self.tokens[self.pos].clone();
+        let spelling = self.spell(&tok);
+        // Two different mistakes, as gcc distinguishes them: an operand with
+        // no operator joining it on (`#if 1 2`), versus a token that has no
+        // meaning in a controlling expression at all (`#if X = 2`).
+        if matches!(tok.typ, TokenType::Special) {
+            self.err_token(
+                tok.pos,
+                "token \"{0}\" is not valid in preprocessor expressions",
+                &spelling,
+            );
+        } else {
+            self.err_token(
+                tok.pos,
+                "missing binary operator before token \"{0}\"",
+                &spelling,
+            );
+        }
+    }
+
+    /// How a token should be named in a diagnostic.
+    fn spell(&self, tok: &Token) -> String {
+        self.pp.token_to_string(tok, self.idents)
+    }
+
+    /// The position to blame when the expression ran out of tokens.
+    fn here(&self) -> Position {
+        match self.current() {
+            Some(tok) => tok.pos,
+            None => self.tokens.last().map(|t| t.pos).unwrap_or_default(),
+        }
     }
 
     fn current(&self) -> Option<&Token> {
@@ -1643,11 +1863,21 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             if !is_left && !self.is_special(SpecialToken::RightShift as u32) {
                 break;
             }
+            let op_pos = self.here();
             self.advance();
             let right = self.expr_additive();
             // A shift does not apply the usual arithmetic conversions: the
             // result takes the left operand's type (C17 6.5.7p3). A count
-            // outside [0, 64) is undefined; clamp rather than panic.
+            // outside [0, 64) is undefined; clamp rather than panic, but say
+            // so -- clamping in silence made `#if (1 << 64) == 0` false with
+            // nothing to explain it. gcc warns here rather than erroring, so
+            // the expression still evaluates.
+            if !self.suppressed && !(0..64).contains(&right.v) {
+                diag::warning(
+                    op_pos,
+                    &gettext("integer overflow in preprocessor expression"),
+                );
+            }
             let count = right.v.clamp(0, 63) as u32;
             let v = if is_left {
                 left.raw() << count
@@ -1774,6 +2004,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             let val = self.expr_ternary();
             if self.is_special(b')' as u32) {
                 self.advance();
+            } else {
+                let pos = self.here();
+                self.err(pos, &gettext("missing ')' in expression"));
             }
             return val;
         }
@@ -1782,13 +2015,18 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         if let Some(tok) = self.current() {
             if let TokenValue::Number(n) = &tok.value {
                 let num_str = n.clone();
+                let pos = tok.pos;
                 self.advance();
-                return self.parse_number(&num_str);
+                return self.parse_number(&num_str, pos);
             }
         }
 
         // Handle character literal (any encoding prefix: L'x', u'x', U'x')
         if let Some(tok) = self.current() {
+            let wide = matches!(
+                &tok.value,
+                TokenValue::WideChar(_) | TokenValue::Utf16Char(_) | TokenValue::Utf32Char(_)
+            );
             let char_str = match &tok.value {
                 TokenValue::Char(c)
                 | TokenValue::WideChar(c)
@@ -1797,16 +2035,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 _ => None,
             };
             if let Some(char_str) = char_str {
+                let pos = tok.pos;
                 self.advance();
-                if char_str.is_empty() {
-                    return PpValue::signed(0);
-                }
-                // Pack all chars big-endian (GCC-compatible)
-                let mut val: i64 = 0;
-                for c in char_str.chars() {
-                    val = (val << 8) | (c as i64);
-                }
-                return PpValue::signed(val as i128);
+                return self.char_constant(&char_str, wide, pos);
             }
         }
 
@@ -1819,7 +2050,78 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             }
         }
 
+        // Nothing here can start an operand. Reaching this used to return zero
+        // in silence, which is why a string literal, a stray punctuator or a
+        // missing operand all quietly chose a branch.
+        match self.current().cloned() {
+            None => {
+                let pos = self.here();
+                self.err(pos, &gettext("expression expected"));
+            }
+            Some(tok) => {
+                let spelling = self.spell(&tok);
+                // Do not advance: the caller's operator loop stops on this
+                // token, and consuming it here would hide the rest of the line.
+                self.err_token(
+                    tok.pos,
+                    "token \"{0}\" is not valid in preprocessor expressions",
+                    &spelling,
+                );
+            }
+        }
         PpValue::signed(0)
+    }
+
+    /// The value of a character constant in a controlling expression.
+    ///
+    /// The token payload is the source spelling between the quotes, so the
+    /// escapes are still in it: `'\n'` arrives as the two characters `\` and
+    /// `n`. Packing that verbatim is how `#if '\n'` came to be 23662 and
+    /// `#if '\0'` came to be *true*. Decoding goes through the same
+    /// [`literal`] module the parser uses, so `#if 'c' == V` and the compiled
+    /// `'c' == V` cannot disagree.
+    fn char_constant(&mut self, payload: &str, wide: bool, pos: Position) -> PpValue {
+        let elements = literal::parse_string_literal(payload);
+        for e in &elements {
+            if let literal::Escaped::ForbiddenUcn(val) = e {
+                if !self.suppressed {
+                    report_forbidden_ucn(pos, *val);
+                }
+            }
+        }
+        if elements.is_empty() {
+            self.err(pos, "empty character constant");
+            return PpValue::signed(0);
+        }
+
+        // A prefixed constant holds characters, not bytes: `L'\n'` is the one
+        // wide character 10, never the two bytes of a UTF-8 encoding.
+        if wide {
+            let units = literal::literal_wide_chars(&elements);
+            return PpValue::signed(units.first().copied().unwrap_or(0) as i128);
+        }
+
+        // C17 6.4.4.4p10: an ordinary character constant has type `int`. One
+        // character takes plain `char`'s signedness, so `'\xff'` is negative
+        // where `char` is signed and positive where it is not -- which is the
+        // whole reason `Target::char_signed` exists.
+        let bytes: Vec<u8> = payload_bytes(&literal::literal_bytes(&elements)).collect();
+        if bytes.len() == 1 {
+            let b = bytes[0];
+            return PpValue::signed(if self.pp.target.char_signed {
+                b as i8 as i128
+            } else {
+                b as i128
+            });
+        }
+
+        // More than one: gcc packs big-endian and lets the value wrap in
+        // `int`, so `'abcde'` keeps only its last four bytes.
+        let mut val: u32 = 0;
+        for b in bytes {
+            val = (val << 8) | b as u32;
+        }
+        PpValue::signed(val as i32 as i128)
     }
 
     fn eval_defined(&mut self) -> i64 {
@@ -1937,29 +2239,56 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     /// into `u64` first is what makes `#if 0xFFFFFFFFFFFFFFFF` work; the old
     /// `i64::from_str_radix(...).unwrap_or(0)` turned every such constant into
     /// a silent zero.
-    fn parse_number(&self, s: &str) -> PpValue {
-        let digits = s.trim_end_matches(['u', 'U', 'l', 'L']);
-        let suffix = &s[digits.len()..];
-        let suffix_unsigned = suffix.contains('u') || suffix.contains('U');
+    fn parse_number(&mut self, s: &str, pos: Position) -> PpValue {
+        // C17 6.10.1p4: the operands are integer constants. A pp-number that
+        // is not one used to evaluate to zero in silence, so `#if 1.5` picked
+        // the else branch and `#if 1zz` picked it too.
+        if s.contains('.')
+            || ((s.contains('e') || s.contains('E'))
+                && !s.starts_with("0x")
+                && !s.starts_with("0X"))
+            || ((s.contains('p') || s.contains('P'))
+                && (s.starts_with("0x") || s.starts_with("0X")))
+        {
+            self.err_token(
+                pos,
+                "floating constant \"{0}\" in preprocessor expression",
+                s,
+            );
+            return PpValue::signed(0);
+        }
 
-        let (body, radix) = if let Some(hex) = digits
-            .strip_prefix("0x")
-            .or_else(|| digits.strip_prefix("0X"))
-        {
-            (hex, 16)
-        } else if let Some(bin) = digits
-            .strip_prefix("0b")
-            .or_else(|| digits.strip_prefix("0B"))
-        {
-            (bin, 2)
-        } else if digits.len() > 1
-            && digits.starts_with('0')
-            && digits[1..].starts_with(|c: char| c.is_ascii_digit())
-        {
-            (&digits[1..], 8)
-        } else {
-            (digits, 10)
-        };
+        // Split at the first character the radix cannot spell, rather than
+        // trimming a suffix off the end: `1zz` has no valid suffix to trim, so
+        // the old trim left `1zz` as the body and the parse failure went
+        // unreported.
+        let (prefix, radix) =
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                (hex, 16)
+            } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+                (bin, 2)
+            } else if s.len() > 1
+                && s.starts_with('0')
+                && s[1..].starts_with(|c: char| c.is_ascii_digit())
+            {
+                (&s[1..], 8)
+            } else {
+                (s, 10)
+            };
+        let digit_len = prefix
+            .find(|c: char| !c.is_digit(radix))
+            .unwrap_or(prefix.len());
+        let (body, suffix) = prefix.split_at(digit_len);
+
+        if body.is_empty() {
+            self.err_token(pos, "invalid integer constant \"{0}\"", s);
+            return PpValue::signed(0);
+        }
+        if !suffix_is_valid(suffix) {
+            self.err_token(pos, "invalid suffix \"{0}\" on integer constant", suffix);
+            return PpValue::signed(0);
+        }
+        let suffix_unsigned = suffix.contains('u') || suffix.contains('U');
 
         match u64::from_str_radix(body, radix) {
             Ok(v) => {
@@ -1968,9 +2297,111 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 let unsigned = suffix_unsigned || v > i64::MAX as u64;
                 PpValue::from_parts(v as i128, unsigned)
             }
-            Err(_) => PpValue::signed(0),
+            // The body is all digits of the radix, so the only way to fail is
+            // to be wider than `uintmax_t`.
+            Err(_) => {
+                self.err_token(pos, "integer constant \"{0}\" is too large", s);
+                PpValue::signed(0)
+            }
         }
     }
+}
+
+/// The macro-expansion backstop. Orders of magnitude above what a real
+/// translation unit reaches -- CPython's largest needs a few hundred thousand
+/// -- so exhausting it means a hole in the hide set, not an unusual program.
+const EXPANSION_BUDGET: u64 = 1 << 26;
+
+/// Where a `#if` scan is within a `defined` operator.
+///
+/// The operand must not be macro-expanded (C17 6.10.1p1), and recognising it
+/// requires walking the condition in the same pass that expands the rest: a
+/// pass beforehand cannot see a `defined` that an expansion produces, and a
+/// pass afterwards finds the operand already expanded away. This is the four
+/// states that walk needs -- the same shape as sparse's `expression_value`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefinedScan {
+    /// Not in a `defined` operator.
+    Idle,
+    /// Just past `defined`; the next token is either `(` or the operand.
+    SawOperator,
+    /// Just past `defined (`; the next identifier is the operand.
+    SawParen,
+    /// Past `defined ( X`; expecting the `)`.
+    NeedClose,
+}
+
+impl DefinedScan {
+    /// Step over an identifier. The `bool` says whether this identifier is a
+    /// `defined` operand and must therefore be emitted unexpanded.
+    fn identifier(self, token: &Token, idents: &IdentTable) -> (Self, bool) {
+        let is_operator = match &token.value {
+            TokenValue::Ident(id) => idents.get_opt(*id) == Some("defined"),
+            _ => false,
+        };
+        match self {
+            // `defined defined` -- the operand is the identifier, whatever it
+            // is spelled, so it is protected rather than treated as a second
+            // operator.
+            Self::SawOperator | Self::SawParen => {
+                let next = if self == Self::SawParen {
+                    Self::NeedClose
+                } else {
+                    Self::Idle
+                };
+                (next, true)
+            }
+            _ if is_operator => (Self::SawOperator, false),
+            _ => (Self::Idle, false),
+        }
+    }
+
+    /// Step over a punctuator.
+    fn punctuator(self, token: &Token) -> Self {
+        let TokenValue::Special(code) = &token.value else {
+            return Self::Idle;
+        };
+        match self {
+            Self::SawOperator if *code == b'(' as u32 => Self::SawParen,
+            Self::NeedClose if *code == b')' as u32 => Self::Idle,
+            _ => Self::Idle,
+        }
+    }
+}
+
+/// A synthetic decimal pp-number token, for the `0`/`1` a `defined` operator
+/// stands for and the `0` an unresolved identifier becomes.
+fn pp_number(text: &str, pos: Position) -> Token {
+    Token {
+        typ: TokenType::Number,
+        value: TokenValue::Number(text.to_string()),
+        pos,
+        spelling: Spelling::Canonical,
+        no_expand: None,
+    }
+}
+
+/// The integer-suffix grammar of C17 6.4.4.1: `u`/`U` at most once, and `l`,
+/// `L`, `ll` or `LL` at most once, in either order.
+fn suffix_is_valid(suffix: &str) -> bool {
+    let mut rest = suffix;
+    let mut seen_unsigned = false;
+    let mut seen_long = false;
+    while !rest.is_empty() {
+        if !seen_unsigned && (rest.starts_with('u') || rest.starts_with('U')) {
+            seen_unsigned = true;
+            rest = &rest[1..];
+        } else if !seen_long && (rest.starts_with("ll") || rest.starts_with("LL")) {
+            seen_long = true;
+            rest = &rest[2..];
+        } else if !seen_long && (rest.starts_with('l') || rest.starts_with('L')) {
+            seen_long = true;
+            rest = &rest[1..];
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 // ============================================================================
@@ -2097,7 +2528,9 @@ pub fn preprocess_with_defines(
         pp.undef_macro(undef);
     }
 
-    pp.preprocess(tokens, idents)
+    let output = pp.preprocess(tokens, idents);
+    pp.report_unterminated_conditionals();
+    output
 }
 
 // ============================================================================
@@ -2197,6 +2630,7 @@ pub fn preprocess_asm_file(
 
     // Preprocess
     let preprocessed = pp.preprocess(tokens, &mut strings);
+    pp.report_unterminated_conditionals();
 
     // Convert tokens back to text
     tokens_to_source_bytes(&preprocessed, &strings)

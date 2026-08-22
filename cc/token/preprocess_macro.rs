@@ -26,136 +26,164 @@ pub(super) fn replacement_lists_identical(a: &[MacroToken], b: &[MacroToken]) ->
     })
 }
 
+/// Strip the "begins a line" flag from a token being placed into a macro
+/// expansion.
+///
+/// Nothing an expansion produces starts a line: C17 6.10.3p11 makes a
+/// directive built by an expansion undefined, and `-E` breaks lines on this
+/// flag. Argument tokens are the ones that carry it in, since they come
+/// straight from the file and an argument list may span lines.
+fn clear_newline(mut token: Token) -> Token {
+    token.pos.newline = false;
+    token
+}
+
+/// Hide, on every token an expansion produced, each name the invocation was
+/// already hiding plus the macro's own (C17 6.10.3.4p2).
+///
+/// Two things about this are load-bearing.
+///
+/// It is applied to the *final* list, after pasting. `paste_tokens` re-lexes
+/// its operands and returns fresh tokens with no hide set at all, which is
+/// right -- a pasted token is a new token and is eligible for expansion -- but
+/// it means a macro name that `##` synthesises would otherwise escape with
+/// nothing hiding it. `#define X A##B` with `#define AB X` then never
+/// terminates.
+///
+/// Argument-derived tokens are included, never exempt. `#define f(x) x(x)`
+/// with `f(f)` substitutes `f` into a body that immediately calls it; if the
+/// substituted `f` kept only its own hide set, each round would produce
+/// another unhidden `f` and the expansion would not terminate either.
+///
+/// The whole set rides on each identifier token, not just names matching that
+/// token's own spelling. Recording only self-names looks equivalent -- a hide
+/// set is read in exactly one place, when that token is the identifier about
+/// to be expanded -- but it breaks the moment a chain runs through a *different*
+/// name. `#define __inline inline` with `#define inline __inline`, which is
+/// expat's portability shim, expands `__inline` to an `inline` that hides
+/// nothing, which expands back to an unhidden `__inline`, forever. The set has
+/// to reach the token that will carry it into the next expansion.
+///
+/// Non-identifier tokens get nothing: they can never be the invoker of an
+/// expansion, so a set on them could not be read.
+fn hide_in_expansion(
+    tokens: &mut [Token],
+    macro_name: &str,
+    invoker_hide: Option<&std::collections::HashSet<String>>,
+) {
+    for tok in tokens.iter_mut() {
+        if !matches!(tok.value, TokenValue::Ident(_)) {
+            continue;
+        }
+        if let Some(hide) = invoker_hide {
+            for name in hide {
+                tok.mark_no_expand(name);
+            }
+        }
+        tok.mark_no_expand(macro_name);
+    }
+}
+
 impl<'a> Preprocessor<'a> {
-    /// Expand macros in #if/#elif condition tokens.
-    /// This follows the C standard: macros are expanded, except for arguments to `defined`.
-    /// Undefined identifiers are replaced with 0.
+    /// Resolve one `defined` operator: `defined X` or `defined ( X )`.
+    ///
+    /// `i` indexes the token just after `defined`. Returns the `0`/`1` it
+    /// stands for and the index past the operand.
+    fn resolve_defined(
+        &self,
+        tokens: &[Token],
+        mut i: usize,
+        pos: Position,
+        idents: &IdentTable,
+    ) -> (Token, usize) {
+        let has_paren = matches!(
+            tokens.get(i).map(|t| &t.value),
+            Some(TokenValue::Special(code)) if *code == b'(' as u32
+        );
+        if has_paren {
+            i += 1;
+        }
+
+        let is_defined = match tokens.get(i).map(|t| &t.value) {
+            Some(TokenValue::Ident(id)) => {
+                let defined = idents.get_opt(*id).is_some_and(|n| self.is_defined(n));
+                i += 1;
+                defined
+            }
+            _ => {
+                diag::error(pos, &gettext("operator \"defined\" requires an identifier"));
+                false
+            }
+        };
+
+        if has_paren {
+            let closed = matches!(
+                tokens.get(i).map(|t| &t.value),
+                Some(TokenValue::Special(code)) if *code == b')' as u32
+            );
+            if closed {
+                i += 1;
+            } else {
+                diag::error(pos, &gettext("missing ')' after \"defined\""));
+            }
+        }
+
+        (pp_number(if is_defined { "1" } else { "0" }, pos), i)
+    }
+
+    /// Expand macros in `#if`/`#elif` condition tokens.
+    ///
+    /// C17 6.10.1p1: macros are expanded, except for the operand of `defined`,
+    /// and every identifier that survives becomes `0`.
+    ///
+    /// `defined` is recognised on both sides of expansion. Doing it only
+    /// beforehand -- which is what the standard's wording literally describes
+    /// -- left a `defined` that came *out* of an expansion to be zeroed along
+    /// with everything else, so `#define D defined(FOO)` / `#if D` evaluated
+    /// `0 (1)`. That form is undefined behaviour, but gcc, clang and MSVC all
+    /// agree on the answer and the `IS_ENABLED(x)` idiom depends on it.
     pub(super) fn expand_if_tokens(
         &mut self,
         tokens: &[Token],
         idents: &mut IdentTable,
     ) -> Vec<Token> {
-        let mut result = Vec::new();
-        let mut i = 0;
-
-        while i < tokens.len() {
-            let token = &tokens[i];
-
-            // Check for `defined` operator
-            if let TokenValue::Ident(id) = &token.value {
-                if let Some(name) = idents.get_opt(*id) {
-                    if name == "defined" {
-                        // Handle defined(X) or defined X
-                        let pos = token.pos;
-                        i += 1;
-
-                        // Skip optional whitespace and check for paren
-                        let has_paren = if i < tokens.len() {
-                            if let TokenValue::Special(code) = &tokens[i].value {
-                                *code == b'(' as u32
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if has_paren {
-                            i += 1; // skip '('
-                        }
-
-                        // Get the identifier to check
-                        let is_defined = if i < tokens.len() {
-                            if let TokenValue::Ident(check_id) = &tokens[i].value {
-                                if let Some(check_name) = idents.get_opt(*check_id) {
-                                    i += 1;
-                                    self.is_defined(check_name)
-                                } else {
-                                    i += 1;
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if has_paren {
-                            // Skip closing ')'
-                            if i < tokens.len() {
-                                if let TokenValue::Special(code) = &tokens[i].value {
-                                    if *code == b')' as u32 {
-                                        i += 1;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Replace with 0 or 1
-                        result.push(Token {
-                            typ: TokenType::Number,
-                            value: TokenValue::Number(if is_defined {
-                                "1".to_string()
-                            } else {
-                                "0".to_string()
-                            }),
-                            pos,
-                            spelling: Spelling::Canonical,
-                            no_expand: None,
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            // Not `defined` - collect this token for expansion
-            result.push(token.clone());
-            i += 1;
-        }
-
-        // Now expand macros in the result (except `defined` which we already handled)
-        // We need to temporarily disable skipping because we're evaluating an expression
-        // that will determine whether to skip. Push a dummy "Active" conditional.
+        // Expand, with `defined` operands protected on the way through. The
+        // condition decides whether to skip, so the expansion itself must not
+        // be skipped: push a dummy active group.
         self.cond_stack.push(Conditional {
             state: CondState::Active,
             had_true: true,
+            seen_else: false,
             pos: Position::default(),
         });
-        let expanded = self.preprocess(result, idents);
+        let saved_in_if = std::mem::replace(&mut self.in_if_condition, true);
+        let expanded = self.preprocess(tokens.to_vec(), idents);
+        self.in_if_condition = saved_in_if;
         self.cond_stack.pop();
 
-        // Replace any remaining undefined identifiers with 0
+        // Now resolve the operators, then zero whatever identifiers remain.
         let mut final_result = Vec::new();
-        for token in expanded {
-            if let TokenValue::Ident(id) = &token.value {
-                if let Some(name) = idents.get_opt(*id) {
-                    // Check if it's a defined macro
-                    if self.get_macro(name).is_some() {
-                        // This shouldn't happen after expansion, but keep it
-                        final_result.push(token);
-                    } else {
-                        // Undefined identifier -> 0
-                        final_result.push(Token {
-                            typ: TokenType::Number,
-                            value: TokenValue::Number("0".to_string()),
-                            pos: token.pos,
-                            spelling: Spelling::Canonical,
-                            no_expand: None,
-                        });
-                    }
-                } else {
-                    // Unknown identifier -> 0
-                    final_result.push(Token {
-                        typ: TokenType::Number,
-                        value: TokenValue::Number("0".to_string()),
-                        pos: token.pos,
-                        spelling: Spelling::Canonical,
-                        no_expand: None,
-                    });
+        let mut i = 0;
+        while i < expanded.len() {
+            let token = &expanded[i];
+            let TokenValue::Ident(id) = &token.value else {
+                final_result.push(token.clone());
+                i += 1;
+                continue;
+            };
+            match idents.get_opt(*id) {
+                Some("defined") => {
+                    let (tok, next) = self.resolve_defined(&expanded, i + 1, token.pos, idents);
+                    final_result.push(tok);
+                    i = next;
                 }
-            } else {
-                final_result.push(token);
+                // Still a macro name after expansion means it was blue-painted
+                // by its own expansion; it is not defined *here*, so it is 0
+                // like any other identifier.
+                _ => {
+                    final_result.push(pp_number("0", token.pos));
+                    i += 1;
+                }
             }
         }
 
@@ -502,20 +530,15 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Try to expand a macro
-    pub(super) fn try_expand_macro<I>(
+    pub(super) fn try_expand_macro(
         &mut self,
         name: &str,
-        pos: &Position,
-        iter: &mut std::iter::Peekable<I>,
+        invoker: &Token,
+        iter: &mut TokenCursor,
         idents: &mut IdentTable,
-    ) -> Option<Vec<Token>>
-    where
-        I: Iterator<Item = Token>,
-    {
-        // Check for recursion
-        if self.expanding.contains(name) {
-            return None;
-        }
+    ) -> Option<Vec<Token>> {
+        let pos = &invoker.pos;
+        let invoker_hide = invoker.no_expand.as_ref();
 
         let mac = self.macros.get(name)?.clone();
 
@@ -530,9 +553,11 @@ impl<'a> Preprocessor<'a> {
             if let Some(next) = iter.peek() {
                 if let TokenValue::Special(code) = &next.value {
                     if *code == b'(' as u32 {
-                        iter.next(); // consume '('
-                        let args = self.collect_macro_args(iter, idents, pos, name);
-                        return self.expand_function_macro(&mac, &args, pos, idents);
+                        let open_paren = iter.next()?; // consume '('
+                                                       // Returns None having pushed the '(' and everything
+                                                       // after it back, so the macro name is emitted plain.
+                        let args = self.collect_macro_args(iter, idents, pos, name, &open_paren)?;
+                        return self.expand_function_macro(&mac, &args, pos, invoker_hide, idents);
                     }
                 }
             }
@@ -541,20 +566,18 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Object-like macro
-        self.expand_object_macro(&mac, pos, idents)
+        self.expand_object_macro(&mac, pos, invoker_hide, idents)
     }
 
     /// Collect arguments for a function-like macro call
-    pub(super) fn collect_macro_args<I>(
+    pub(super) fn collect_macro_args(
         &self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         _idents: &IdentTable,
         macro_pos: &Position,
         macro_name: &str,
-    ) -> Vec<Vec<Token>>
-    where
-        I: Iterator<Item = Token>,
-    {
+        open_paren: &Token,
+    ) -> Option<Vec<Vec<Token>>> {
         let mut args = Vec::new();
         let mut current_arg = Vec::new();
         // Start at depth 1 because the opening '(' has already been consumed
@@ -573,7 +596,7 @@ impl<'a> Preprocessor<'a> {
                         if paren_depth == 0 {
                             // End of arguments - closing ')' of macro call
                             if !current_arg.is_empty() || !args.is_empty() {
-                                args.push(current_arg);
+                                args.push(std::mem::take(&mut current_arg));
                             }
                             found_closing_paren = true;
                             break;
@@ -582,8 +605,7 @@ impl<'a> Preprocessor<'a> {
                         current_arg.push(token);
                     } else if *code == b',' as u32 && paren_depth == 1 {
                         // Argument separator at top level (paren_depth == 1 since we're inside the macro call)
-                        args.push(current_arg);
-                        current_arg = Vec::new();
+                        args.push(std::mem::take(&mut current_arg));
                     } else {
                         current_arg.push(token);
                     }
@@ -594,16 +616,34 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Check for unterminated macro call (EOF before closing ')')
+        // Unterminated: the whole file went by without a closing ')'.
+        //
+        // Give the tokens back rather than expanding with whatever was
+        // collected. Since expansion became a splice, the scan runs to end of
+        // file looking for that ')', so expanding anyway would substitute the
+        // rest of the translation unit into the macro and emit the result --
+        // `#define BAD f(` followed by `BAD` produced `(()+1)` and deleted
+        // everything after it. gcc leaves the macro name in place, and so does
+        // this now.
         if !found_closing_paren {
             crate::diag::error_args(
                 *macro_pos,
                 "unterminated argument list invoking macro \"{0}\"",
                 &[macro_name],
             );
+            let mut back = vec![open_paren.clone()];
+            for (i, arg) in args.into_iter().enumerate() {
+                if i > 0 {
+                    back.push(Self::variadic_separator(*macro_pos));
+                }
+                back.extend(arg);
+            }
+            back.extend(current_arg);
+            iter.unread(back);
+            return None;
         }
 
-        args
+        Some(args)
     }
 
     /// Expand a function-like macro
@@ -661,12 +701,20 @@ impl<'a> Preprocessor<'a> {
         mac: &Macro,
         args: &[Vec<Token>],
         pos: &Position,
+        invoker_hide: Option<&std::collections::HashSet<String>>,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
         self.check_macro_arity(mac, args, pos);
 
-        // Note: Don't add to expanding set yet - arguments need to be fully expanded first.
-        // The expanding set is only used during the rescan phase to prevent infinite recursion.
+        // One fully-replaced form per argument, filled in on first use. Only
+        // the unquoted uses go through it: `#x` needs the argument's original
+        // spelling and `a##b` needs its unexpanded tokens.
+        let mut expanded_args: Vec<Option<Vec<Token>>> = vec![None; args.len()];
+
+        // Arguments are macro-replaced on their own first (C17 6.10.3.1p1:
+        // "as if they formed the rest of the preprocessing file"), and are not
+        // yet hidden by this macro -- so `#define f(x) (x)` expands `f(f(1))`
+        // to `((1))`.
 
         let mut result = Vec::new();
         let mut i = 0;
@@ -699,9 +747,17 @@ impl<'a> Preprocessor<'a> {
                         args.get(*idx).cloned().unwrap_or_default()
                     };
                     let text = self.stringify_arg(&arg, idents);
+                    // The result is one token of the expansion, not the
+                    // invocation: it takes the `#` operator's spacing, and it
+                    // never starts a line. Copying `*pos` verbatim gave a
+                    // line-initial `S(x)` a stringified token flagged as
+                    // beginning a line, which `-E` then broke a line on.
+                    let mut str_pos = *pos;
+                    str_pos.whitespace = mt.whitespace;
+                    str_pos.newline = false;
                     result.push(Token::with_value(
                         TokenType::String,
-                        *pos,
+                        str_pos,
                         TokenValue::String(text),
                     ));
                 }
@@ -716,29 +772,46 @@ impl<'a> Preprocessor<'a> {
                             let pasted = self.paste_tokens(&prev, &arg, pos, idents);
                             result.extend(pasted);
                         } else {
-                            result.extend(arg);
+                            // Raw argument tokens, straight from the file. An
+                            // argument may span lines, and a token that still
+                            // says it begins one would be read back as
+                            // starting a directive.
+                            result.extend(arg.into_iter().map(clear_newline));
                         }
                     } else {
-                        // Expand the argument
-                        let expanded = self.preprocess(arg, idents);
-                        for mut tok in expanded {
-                            if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd) {
-                                continue;
+                        // Expand the argument once, however many times the body
+                        // names the parameter. C17 6.10.3.1p1 replaces a
+                        // parameter with the *same* fully-replaced sequence
+                        // each time, so re-running the pass per occurrence
+                        // could only produce the same tokens again -- and it
+                        // dominated the cost of any macro that used a parameter
+                        // more than once.
+                        if expanded_args[*idx].is_none() {
+                            let expanded = self.preprocess(arg, idents);
+                            let mut out = Vec::with_capacity(expanded.len());
+                            for mut tok in expanded {
+                                if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd)
+                                {
+                                    continue;
+                                }
+                                // Re-point the token at the invocation for
+                                // diagnostics, but keep whether it was preceded
+                                // by white space: that belongs to the
+                                // argument's own spelling, and 6.10.3.2p2 makes
+                                // `#` reproduce it. Taking `whitespace` from
+                                // the invocation site gave every expanded token
+                                // one, so the two-level `XSTR(x)`/`STR(x)`
+                                // idiom turned `1+2` into `"1 + 2"` while the
+                                // direct `STR(1+2)` was right.
+                                let whitespace = tok.pos.whitespace;
+                                tok.pos = *pos;
+                                tok.pos.newline = false;
+                                tok.pos.whitespace = whitespace;
+                                out.push(tok);
                             }
-                            // Re-point the token at the invocation for
-                            // diagnostics, but keep whether it was preceded by
-                            // white space: that belongs to the argument's own
-                            // spelling, and 6.10.3.2p2 makes `#` reproduce it.
-                            // Taking `whitespace` from the invocation site gave
-                            // every expanded token one, so the two-level
-                            // `XSTR(x)`/`STR(x)` idiom turned `1+2` into
-                            // `"1 + 2"` while the direct `STR(1+2)` was right.
-                            let whitespace = tok.pos.whitespace;
-                            tok.pos = *pos;
-                            tok.pos.newline = false;
-                            tok.pos.whitespace = whitespace;
-                            result.push(tok);
+                            expanded_args[*idx] = Some(out);
                         }
+                        result.extend(expanded_args[*idx].as_ref().unwrap().iter().cloned());
                     }
                 }
                 MacroTokenValue::VaArgs => {
@@ -817,34 +890,38 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Rescan for more macro expansion
-        // NOTE: Only add to expanding set during rescan to prevent infinite recursion
         // Arguments were already expanded above, so this only affects the replacement list rescan
-        self.expanding.insert(mac.name.clone());
-        let rescanned = self.preprocess(result, idents);
-        self.expanding.remove(&mac.name);
+        // Hide before handing the expansion back.
+        //
+        // The result is rescanned by the caller's loop, which is where a
+        // self-referential macro would recurse -- so hiding has to happen
+        // before it is handed back, not after. glibc's enum-and-macro idiom,
+        // `#define MSG_DONTROUTE MSG_DONTROUTE`, is the shape that catches
+        // this. Hiding here also propagates: a nested expansion sees an
+        // invoking token that already carries this set.
+        //
+        // Substitution and pasting are both finished by now, which is the
+        // other half of the requirement -- a name that `##` built has to be
+        // hidden too.
+        hide_in_expansion(&mut result, &mac.name, invoker_hide);
 
-        let mut filtered: Vec<_> = rescanned
-            .into_iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .collect();
+        // No rescan here: the caller pushes this back in front of the cursor,
+        // so it is rescanned by the same loop that produced it.
+        let mut filtered = result;
 
-        // Mark any occurrences of this macro's name in the result as "blue painted"
-        // per C99 6.10.3.4: if the macro name appears in its own expansion, it should
-        // not be re-expanded in subsequent contexts.
-        let mac_name_id = idents.intern(&mac.name);
-        for tok in &mut filtered {
-            if let TokenValue::Ident(id) = &tok.value {
-                if *id == mac_name_id {
-                    tok.mark_no_expand(&mac.name);
-                }
-            }
-        }
-
-        // The FIRST token of a macro expansion should inherit whitespace
-        // from the macro invocation position, not the macro body.
-        // This ensures "MACRO(args)" expands with proper spacing.
+        // The FIRST token of a macro expansion stands where the invocation
+        // stood: it inherits both the spacing before it and whether it begins
+        // a line. Body tokens carry neither, since they were written somewhere
+        // else entirely.
+        //
+        // The line flag used to be dropped, so an expansion at the start of a
+        // line ran onto the previous one in `-E` output -- `M int b;` came out
+        // as `int a; 42 int b;` where gcc breaks the line. Stringification hid
+        // that for its own case by copying the invocation position wholesale,
+        // which then made a `#x` result claim to begin a line even mid-line.
         if let Some(first) = filtered.first_mut() {
             first.pos.whitespace = pos.whitespace;
+            first.pos.newline = pos.newline;
         }
 
         Some(filtered)
@@ -862,33 +939,132 @@ impl<'a> Preprocessor<'a> {
             return vec![left.clone()];
         }
 
-        let left_str = self.token_to_string(left, idents);
-        let right_str = self.token_to_string(&right[0], idents);
-        let combined = format!("{}{}", left_str, right_str);
+        let mut result = self.paste_one(left, &right[0], pos, idents);
 
-        // Re-tokenize the combined string using the same shared string table
-        // Since we use the same StringTable, all StringIds are consistent
-        // and no ID remapping is needed.
-        let stream_id = diag::init_stream("<paste>");
-        let tokens = {
-            let mut tokenizer = Tokenizer::new(combined.as_bytes(), stream_id, idents);
-            tokenizer.tokenize()
-        };
-
-        let mut result: Vec<_> = tokens
-            .into_iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .map(|mut t| {
-                t.pos = *pos;
-                t.pos.newline = false;
-                t
-            })
-            .collect();
-
-        // Add remaining right tokens
-        result.extend(right.iter().skip(1).cloned());
+        // Add remaining right tokens. Only `right[0]` took part in the paste,
+        // so these still carry the file's line flags.
+        result.extend(right.iter().skip(1).cloned().map(clear_newline));
 
         result
+    }
+
+    /// Paste exactly two tokens.
+    ///
+    /// C17 6.10.3.3p3: the result has to be a single preprocessing token, and
+    /// a paste that does not produce one is a constraint violation requiring a
+    /// diagnostic. This used to concatenate the two spellings, re-lex, and keep
+    /// every token that fell out -- so `cat(+,-)` quietly produced two tokens,
+    /// and `cat(/,/)` produced `//`, which the lexer read as a comment: both
+    /// operands and the tokens around them vanished from
+    /// `int y = 1 cat(/,/) 2;` with nothing reported.
+    ///
+    /// The operand *types* decide whether a paste can be valid at all, before
+    /// any spelling is built. Only an identifier, a pp-number or a punctuator
+    /// can take part; a string or character literal can only ever be the right
+    /// operand of an encoding prefix.
+    fn paste_one(
+        &self,
+        left: &Token,
+        right: &Token,
+        pos: &Position,
+        idents: &mut IdentTable,
+    ) -> Vec<Token> {
+        // `L ## "x"` and friends: the prefix and the literal are one token.
+        if let Some(token) = Self::paste_encoding_prefix(left, right, pos, idents) {
+            return vec![token];
+        }
+
+        if !Self::pasteable(left) || !Self::pasteable(right) {
+            self.reject_paste(left, right, pos, idents);
+            return vec![clear_newline(left.clone()), clear_newline(right.clone())];
+        }
+
+        let combined = format!("{}{}", show_token(left, idents), show_token(right, idents));
+
+        // The spelling is built from two tokens that are each valid on their
+        // own, so re-lexing it is a way of *constructing* the result, not of
+        // deciding whether there is one. That is what the count below decides.
+        let stream_id = self.paste_stream();
+        let tokens: Vec<_> = {
+            let mut tokenizer = Tokenizer::new(combined.as_bytes(), stream_id, idents);
+            tokenizer.tokenize()
+        }
+        .into_iter()
+        .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+        .map(|mut t| {
+            t.pos = *pos;
+            t.pos.newline = false;
+            t
+        })
+        .collect();
+
+        if tokens.len() == 1 {
+            return tokens;
+        }
+
+        // Zero tokens means the spelling lexed as a comment (`/` ## `/`); more
+        // than one means it never joined.
+        self.reject_paste(left, right, pos, idents);
+        vec![clear_newline(left.clone()), clear_newline(right.clone())]
+    }
+
+    /// Whether a token can be an operand of `##` at all.
+    fn pasteable(token: &Token) -> bool {
+        matches!(
+            token.typ,
+            TokenType::Ident | TokenType::Number | TokenType::Special
+        )
+    }
+
+    /// `L`, `u`, `U` or `u8` pasted onto a literal, which C17 6.4.5 spells as
+    /// one token.
+    fn paste_encoding_prefix(
+        left: &Token,
+        right: &Token,
+        pos: &Position,
+        idents: &IdentTable,
+    ) -> Option<Token> {
+        if left.typ != TokenType::Ident {
+            return None;
+        }
+        let TokenValue::Ident(id) = &left.value else {
+            return None;
+        };
+        let prefix = idents.get_opt(*id)?;
+        let value = match (prefix, &right.value) {
+            ("L", TokenValue::String(s)) => TokenValue::WideString(s.clone()),
+            ("u", TokenValue::String(s)) => TokenValue::Utf16String(s.clone()),
+            ("U", TokenValue::String(s)) => TokenValue::Utf32String(s.clone()),
+            ("u8", TokenValue::String(s)) => TokenValue::String(s.clone()),
+            ("L", TokenValue::Char(c)) => TokenValue::WideChar(c.clone()),
+            ("u", TokenValue::Char(c)) => TokenValue::Utf16Char(c.clone()),
+            ("U", TokenValue::Char(c)) => TokenValue::Utf32Char(c.clone()),
+            _ => return None,
+        };
+        let typ = match &value {
+            TokenValue::WideString(_) => TokenType::WideString,
+            TokenValue::Utf16String(_) => TokenType::Utf16String,
+            TokenValue::Utf32String(_) => TokenType::Utf32String,
+            TokenValue::String(_) => TokenType::String,
+            TokenValue::WideChar(_) => TokenType::WideChar,
+            TokenValue::Utf16Char(_) => TokenType::Utf16Char,
+            _ => TokenType::Utf32Char,
+        };
+        let mut token = Token::with_value(typ, *pos, value);
+        token.pos.newline = false;
+        Some(token)
+    }
+
+    /// Report a `##` whose result is not a single preprocessing token.
+    ///
+    /// The operands are then emitted side by side, unpasted, which is what gcc
+    /// does and keeps the rest of the line meaningful.
+    fn reject_paste(&self, left: &Token, right: &Token, pos: &Position, idents: &IdentTable) {
+        crate::diag::error_args(
+            *pos,
+            "pasting \"{0}\" and \"{1}\" does not give a valid preprocessing token",
+            &[&show_token(left, idents), &show_token(right, idents)],
+        );
     }
 
     /// Expand an object-like macro
@@ -896,13 +1072,12 @@ impl<'a> Preprocessor<'a> {
         &mut self,
         mac: &Macro,
         pos: &Position,
+        invoker_hide: Option<&std::collections::HashSet<String>>,
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
         if mac.body.is_empty() {
             return Some(vec![]);
         }
-
-        // Note: Don't add to expanding set yet - that happens during rescan phase only.
 
         let mut result = Vec::new();
         let mut i = 0;
@@ -937,34 +1112,38 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Rescan for more macro expansion
-        // NOTE: Only add to expanding set during rescan to prevent infinite recursion
         // (e.g., when const -> __const and __const -> const both exist)
-        self.expanding.insert(mac.name.clone());
-        let rescanned = self.preprocess(result, idents);
-        self.expanding.remove(&mac.name);
+        // Hide before handing the expansion back.
+        //
+        // The result is rescanned by the caller's loop, which is where a
+        // self-referential macro would recurse -- so hiding has to happen
+        // before it is handed back, not after. glibc's enum-and-macro idiom,
+        // `#define MSG_DONTROUTE MSG_DONTROUTE`, is the shape that catches
+        // this. Hiding here also propagates: a nested expansion sees an
+        // invoking token that already carries this set.
+        //
+        // Substitution and pasting are both finished by now, which is the
+        // other half of the requirement -- a name that `##` built has to be
+        // hidden too.
+        hide_in_expansion(&mut result, &mac.name, invoker_hide);
 
-        let mut filtered: Vec<_> = rescanned
-            .into_iter()
-            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
-            .collect();
+        // No rescan here: the caller pushes this back in front of the cursor,
+        // so it is rescanned by the same loop that produced it.
+        let mut filtered = result;
 
-        // Mark any occurrences of this macro's name in the result as "blue painted"
-        // per C99 6.10.3.4: if the macro name appears in its own expansion, it should
-        // not be re-expanded in subsequent contexts.
-        let mac_name_id = idents.intern(&mac.name);
-        for tok in &mut filtered {
-            if let TokenValue::Ident(id) = &tok.value {
-                if *id == mac_name_id {
-                    tok.mark_no_expand(&mac.name);
-                }
-            }
-        }
-
-        // The FIRST token of a macro expansion should inherit whitespace
-        // from the macro invocation position, not the macro body.
-        // This ensures "extern __inline" expands to "extern inline" with space.
+        // The FIRST token of a macro expansion stands where the invocation
+        // stood: it inherits both the spacing before it and whether it begins
+        // a line. Body tokens carry neither, since they were written somewhere
+        // else entirely.
+        //
+        // The line flag used to be dropped, so an expansion at the start of a
+        // line ran onto the previous one in `-E` output -- `M int b;` came out
+        // as `int a; 42 int b;` where gcc breaks the line. Stringification hid
+        // that for its own case by copying the invocation position wholesale,
+        // which then made a `#x` result claim to begin a line even mid-line.
         if let Some(first) = filtered.first_mut() {
             first.pos.whitespace = pos.whitespace;
+            first.pos.newline = pos.newline;
         }
 
         Some(filtered)
@@ -1012,17 +1191,14 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Expand a builtin macro
-    pub(super) fn expand_builtin<I>(
+    pub(super) fn expand_builtin(
         &mut self,
         builtin: BuiltinMacro,
         pos: &Position,
         mac: &Macro,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut TokenCursor,
         idents: &mut IdentTable,
-    ) -> Option<Vec<Token>>
-    where
-        I: Iterator<Item = Token>,
-    {
+    ) -> Option<Vec<Token>> {
         match builtin {
             BuiltinMacro::Line => {
                 let effective_line = (pos.line as i32 + self.line_offset) as u32;
@@ -1081,8 +1257,10 @@ impl<'a> Preprocessor<'a> {
                 if let Some(next) = iter.peek() {
                     if let TokenValue::Special(code) = &next.value {
                         if *code == b'(' as u32 {
-                            iter.next();
-                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
+                            let open_paren = iter.next()?;
+                            let args = self
+                                .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
+                                .unwrap_or_default();
                             let result = self.eval_has_builtin(builtin, &args, idents);
                             return Some(vec![Token::with_value(
                                 TokenType::Number,
@@ -1103,8 +1281,10 @@ impl<'a> Preprocessor<'a> {
                 if let Some(next) = iter.peek() {
                     if let TokenValue::Special(code) = &next.value {
                         if *code == b'(' as u32 {
-                            iter.next();
-                            let args = self.collect_macro_args(iter, idents, pos, &mac.name);
+                            let open_paren = iter.next()?;
+                            let args = self
+                                .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
+                                .unwrap_or_default();
                             let result = self.eval_has_include(&args, idents);
                             return Some(vec![Token::with_value(
                                 TokenType::Number,

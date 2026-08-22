@@ -469,13 +469,16 @@ fn preprocessor_c99_edge_cases_mega() {
 #define HEADER "stdbool.h"
 #include HEADER
 
-// Section 6: Macro expansion producing defined() in #if (UB per C99, must not crash)
-#define HAS(x) defined(x)
+// Section 6: an expansion that produces `defined` (UB per C99 6.10.1p1, but
+// gcc, clang and MSVC all agree it works, and IS_ENABLED()-style headers
+// depend on it). The operand must survive expansion: `TESTMACRO` here is
+// itself a macro, so evaluating `defined(1)` would be the bug.
+#define HAS defined(TESTMACRO)
 #define TESTMACRO 1
-#if HAS(TESTMACRO)
+#if HAS
 int defined_ok = 1;
 #else
-int defined_ok = 1; // Either branch is fine, just no crash
+int defined_ok = 0;
 #endif
 
 int main(void) {

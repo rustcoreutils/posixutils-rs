@@ -1666,9 +1666,12 @@ fn driver_dash_mmd_writes_the_rule_and_still_compiles() {
     assert!(r.success, "-MMD failed: {}", r.stderr);
     assert!(obj.exists(), "-MMD must still compile");
 
-    // The rule defaults to the source renamed `.d`.
+    // The `.d` is `-o`'s path with the suffix replaced. It happens to equal
+    // the source renamed `.d` here only because the object shares the source's
+    // stem and directory; `driver_dependency_rule_follows_dash_o` is the one
+    // that tells the two rules apart.
     let dep = w.join("d.d");
-    assert!(dep.exists(), "-MMD writes a .d beside the source");
+    assert!(dep.exists(), "-MMD writes a .d named from -o");
     let rule = std::fs::read_to_string(&dep).unwrap();
     assert!(rule.contains("local.h"), "unexpected rule: {:?}", rule);
 }
@@ -1742,4 +1745,117 @@ fn driver_dependency_rule_fails_when_preprocessing_did() {
         "expected the not-found diagnostic, got:\n{}",
         r.stderr
     );
+}
+
+/// The `.d` file and the rule's target both come from `-o` for the compiling
+/// forms. Deriving them from the *source* wrote `./sub/dep.d` naming `dep.o`
+/// for an object the build had asked to put in `build/`, so every out-of-tree
+/// `-MMD -o $@` build lost its dependency tracking and littered the tree.
+#[test]
+fn driver_dependency_rule_follows_dash_o() {
+    let w = WorkDir::new("dep_dash_o");
+    std::fs::create_dir(w.join("build")).unwrap();
+    std::fs::create_dir(w.join("sub")).unwrap();
+    std::fs::write(w.join("sub/dep.c"), "int v;\n").unwrap();
+    let src = s(&w.join("sub/dep.c"));
+    let obj = s(&w.join("build/foo.o"));
+
+    let r = run_c17(&["-MMD", "-c", &src, "-o", &obj]);
+    assert!(r.success, "-MMD failed: {}", r.stderr);
+
+    let dep = w.join("build/foo.d");
+    assert!(dep.exists(), "the .d is named from -o, not from the source");
+    assert!(!w.join("sub/dep.d").exists(), "nothing beside the source");
+    let rule = std::fs::read_to_string(&dep).unwrap();
+    assert!(
+        rule.starts_with(&format!("{}:", obj)),
+        "the target is -o verbatim, got: {:?}",
+        rule
+    );
+}
+
+/// Without `-o` the `.d` and the target come from the source's *basename*, in
+/// the working directory — the same rule `-c` uses for the object file.
+#[test]
+fn driver_dependency_rule_without_dash_o_uses_the_basename() {
+    let w = WorkDir::new("dep_no_dash_o");
+    std::fs::create_dir(w.join("sub")).unwrap();
+    std::fs::write(w.join("sub/dep.c"), "int v;\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
+        .args(["-MMD", "-c", "sub/dep.c"])
+        .current_dir(w.path())
+        .output()
+        .expect("failed to run c17");
+    assert!(
+        out.status.success(),
+        "-MMD failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        w.join("dep.d").exists(),
+        "the .d lands in the working directory"
+    );
+    let rule = std::fs::read_to_string(w.join("dep.d")).unwrap();
+    assert!(
+        rule.starts_with("dep.o:"),
+        "target is the basename: {:?}",
+        rule
+    );
+}
+
+/// For `-M`/`-MM` the rule *is* the output, so `-o` names it.
+#[test]
+fn driver_dash_m_honors_dash_o() {
+    let w = WorkDir::new("dep_m_dash_o");
+    let src = w.write("d.c", "int v;\n");
+    let out = w.join("out.d");
+
+    let r = run_c17(&["-MM", "-o", &s(&out), &s(&src)]);
+    assert!(r.success, "-MM -o failed: {}", r.stderr);
+    assert!(
+        r.stdout.is_empty(),
+        "-o means nothing on stdout: {:?}",
+        r.stdout
+    );
+    assert!(out.exists(), "-M/-MM write the rule to -o");
+    let rule = std::fs::read_to_string(&out).unwrap();
+    // The target still comes from the source: `-o` named the file, not the
+    // thing being built.
+    assert!(rule.starts_with("d.o:"), "unexpected target: {:?}", rule);
+}
+
+/// gcc joins repeated `-MT` with a space; a second one used to be a clap error.
+#[test]
+fn driver_dash_mt_is_repeatable() {
+    let w = WorkDir::new("dep_mt_repeat");
+    let src = w.write("d.c", "int v;\n");
+    let r = run_c17(&["-MM", "-MT", "a.o", "-MT", "b.o", &s(&src)]);
+    assert!(r.success, "repeated -MT failed: {}", r.stderr);
+    assert!(
+        r.stdout.starts_with("a.o b.o:"),
+        "unexpected target:\n{}",
+        r.stdout
+    );
+}
+
+/// `-E` on an assembler operand preprocesses it. Not assembling is not the
+/// same as producing nothing, which is what it used to do: an empty file, rc=0.
+#[test]
+fn driver_preprocess_an_assembler_operand() {
+    let w = WorkDir::new("preprocess_asm");
+    let src = w.write(
+        "a.S",
+        "#define REG %rax\n.text\n.globl foo\nfoo:\n  mov REG, REG\n  ret\n",
+    );
+    let r = run_c17(&["-E", &s(&src)]);
+    assert!(r.success, "-E on .S failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("mov %rax, %rax"),
+        "the macro should have expanded:\n{}",
+        r.stdout
+    );
+    // And still no object: -E means no compilation.
+    assert!(!w.join("a.o").exists(), "-E must not assemble");
 }

@@ -130,8 +130,13 @@ struct Args {
     deps_file: Option<String>,
 
     /// The rule's target (`-MT`), in place of the source renamed `.o`.
-    #[arg(long = "MT", value_name = "target", help = gettext("Name the dependency rule's target"))]
-    deps_target: Option<String>,
+    #[arg(
+        long = "MT",
+        value_name = "target",
+        action = clap::ArgAction::Append,
+        help = gettext("Name the dependency rule's target")
+    )]
+    deps_target: Vec<String>,
 
     /// Add a bare rule for each header, so removing one does not break the
     /// build until the makefile is regenerated (`-MP`).
@@ -548,6 +553,39 @@ impl Args {
     }
 }
 
+/// Preprocess an assembler operand under `-E` and write the text out.
+///
+/// The same pass `assemble_operand` runs before handing a `.S` to `as`, with
+/// the result going to the preprocessed sink instead of a scratch file. A `.s`
+/// has no directives to act on, so this is a copy for it -- which is also what
+/// gcc does rather than skipping the operand.
+fn preprocess_asm_operand(
+    path: &str,
+    args: &Args,
+    target: &Target,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let content = std::fs::read(path)?;
+    let config = AsmPreprocessConfig {
+        optimization: args.optimization(),
+        defines: &args.defines,
+        undefines: &args.undefines,
+        include_paths: &args.include_paths,
+        search: system_search(args),
+        no_std_inc: args.no_std_inc,
+    };
+    let preprocessed = preprocess_asm_file(&content, target, path, &config);
+    if diag::has_error() != 0 {
+        diag::reset_counts();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "preprocessing failed",
+        ));
+    }
+    out.write_all(&preprocessed)?;
+    out.flush()
+}
+
 /// Write the make rule for one translation unit.
 ///
 /// The shape is gcc's, which is what a makefile's `include` expects:
@@ -560,20 +598,14 @@ fn write_dependency_rule(
     source: &str,
     dependencies: &[(std::path::PathBuf, bool)],
 ) -> io::Result<()> {
-    let target = match &args.deps_target {
-        Some(t) => t.clone(),
-        None => {
-            let stem = Path::new(source).file_stem().unwrap_or_default();
-            format!("{}.o", stem.to_string_lossy())
-        }
-    };
+    let target = dependency_target(args, source);
 
-    let mut prerequisites = vec![source.to_string()];
+    let mut prerequisites = vec![escape_for_make(source)];
     for (path, is_system) in dependencies {
         if *is_system && args.dependencies_omit_system() {
             continue;
         }
-        prerequisites.push(path.to_string_lossy().to_string());
+        prerequisites.push(escape_for_make(&path.to_string_lossy()));
     }
 
     // gcc wraps near 80 columns; the exact column is cosmetic, the
@@ -583,8 +615,10 @@ fn write_dependency_rule(
     let mut column = rule.len();
     for prereq in &prerequisites {
         if column + prereq.len() + 1 > WRAP {
-            rule.push_str(" \\\n ");
-            column = 1;
+            // gcc continues with " \\" then a single leading space, so the
+            // space that separates prerequisites is the one already written.
+            rule.push_str(" \\\n");
+            column = 0;
         }
         rule.push(' ');
         rule.push_str(prereq);
@@ -610,16 +644,75 @@ fn write_dependency_rule(
     }
 }
 
-/// Where the rule goes: `-MF` if given, a `.d` beside the source for the
-/// side-output forms, and stdout for `-M`/`-MM`.
+/// A path as make will read it back.
+///
+/// The rule is written to be `include`d, so a character make gives meaning to
+/// has to lose it: an unescaped space in a header path becomes two
+/// prerequisites, and an unescaped `$` is variable-expanded when the `.d` is
+/// read. gcc's escaping, probed: space and tab take a backslash, `#` takes a
+/// backslash, and `$` is doubled.
+fn escape_for_make(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            ' ' | '\t' | '#' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '$' => out.push_str("$$"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The source's name with its directory dropped and its suffix replaced.
+///
+/// gcc derives both the default target and the default `.d` from the *basename*
+/// -- `sub/dep.c` gives `dep.o` and `./dep.d`, not `sub/dep.o` -- which is the
+/// same rule `-c` uses for the object file.
+fn source_basename_with(source: &str, extension: &str) -> String {
+    let stem = Path::new(source).file_stem().unwrap_or_default();
+    format!("{}.{}", stem.to_string_lossy(), extension)
+}
+
+/// The rule's target.
+///
+/// `-MT` wins, joined by spaces when repeated, and is used verbatim: it is how
+/// a caller writes a target make already understands, so escaping it would be
+/// wrong. Otherwise the compiling forms take `-o` -- the object really being
+/// built is what the rule is about -- and everything else falls back to the
+/// source's basename with `.o`.
+fn dependency_target(args: &Args, source: &str) -> String {
+    if !args.deps_target.is_empty() {
+        return args.deps_target.join(" ");
+    }
+    match &args.output {
+        Some(out) if !args.dependencies_replace_output() && out != "-" => escape_for_make(out),
+        _ => escape_for_make(&source_basename_with(source, "o")),
+    }
+}
+
+/// Where the rule goes.
+///
+/// `-MF` wins outright. For `-M`/`-MM` the rule *is* the output, so `-o` names
+/// it and stdout is the fallback. For `-MD`/`-MMD` it is a side output: `-o`'s
+/// path with the suffix replaced -- keeping the directory, so `build/foo.o`
+/// gives `build/foo.d` -- or the source's basename with `.d` when there is no
+/// `-o`. Deriving it from the *source* path, as this did, wrote `./sub/dep.d`
+/// for an object the build had asked to put in `build/`.
 fn dependency_sink(args: &Args, source: &str) -> Option<std::path::PathBuf> {
     if let Some(file) = &args.deps_file {
         return Some(std::path::PathBuf::from(file));
     }
+    let output = args.output.as_deref().filter(|p| *p != "-");
     if args.dependencies_replace_output() {
-        return None;
+        return output.map(std::path::PathBuf::from);
     }
-    Some(Path::new(source).with_extension("d"))
+    Some(match output {
+        Some(out) => Path::new(out).with_extension("d"),
+        None => std::path::PathBuf::from(source_basename_with(source, "d")),
+    })
 }
 
 fn process_file(
@@ -2046,7 +2139,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 87883-87885: with -E "no compilation shall be performed". An
             // assembler operand was being handed to `as` regardless, so
             // `c17 -E foo.s` assembled it and wrote foo.o.
-            OperandKind::Asm if args.preprocess_only => {}
+            //
+            // Not assembling is not the same as producing nothing, though,
+            // which is what this arm used to do: `c17 -E foo.S` wrote an empty
+            // file and exited 0. Preprocess it and write the text, as gcc does.
+            OperandKind::Asm if args.preprocess_only => {
+                match preprocess_asm_operand(&op.path, &args, &target, &mut pp_out) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("c17: {}: {}", op.path, plib::diag::io_error_text(&e));
+                        failed = true;
+                    }
+                }
+            }
             OperandKind::Asm => {
                 match assemble_operand(&op.path, &args, &target, scratch.path(), idx) {
                     Ok(Some(obj)) => operand_objects[idx] = Some(obj),

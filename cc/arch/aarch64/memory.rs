@@ -252,7 +252,7 @@ impl Aarch64CodeGen {
 
     /// Move a 128-bit value from a source pseudo to a stack destination.
     /// Both halves (lo/hi) are loaded into scratch registers and stored via STP.
-    pub(super) fn emit_int128_move_to_stack(&mut self, src: PseudoId, dst_offset: LocalSlot) {
+    fn emit_int128_move_to_stack(&mut self, src: PseudoId, dst_offset: LocalSlot) {
         let loc = self.get_location(src);
         match loc {
             ref loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {

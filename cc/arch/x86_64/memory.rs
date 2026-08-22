@@ -219,7 +219,7 @@ impl X86_64CodeGen {
     /// zero-extends to 64 bits, so `movq %reg, mem` is correct.
     /// For 8/16-bit values, store the actual size to avoid clobbering adjacent
     /// struct fields when the "slot" is really a struct member.
-    pub(super) fn store_to_stack_slot(&mut self, src: Reg, stack_offset: i32) {
+    fn store_to_stack_slot(&mut self, src: Reg, stack_offset: i32) {
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(src),

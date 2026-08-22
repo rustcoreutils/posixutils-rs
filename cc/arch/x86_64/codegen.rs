@@ -187,7 +187,7 @@ impl X86_64CodeGen {
     /// FS segment. TLS lowering here is Linux-only; the other targets fall
     /// through to ordinary global access.
     #[inline]
-    pub(super) fn is_tls_symbol(&self, name: &str) -> bool {
+    fn is_tls_symbol(&self, name: &str) -> bool {
         self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
     }
 
@@ -205,7 +205,7 @@ impl X86_64CodeGen {
     /// memory operand, not a value. Getting this wrong is invisible on a read
     /// -- the bad address often still points at something mapped -- and
     /// segfaults on a write.
-    pub(super) fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
+    fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let symbol = Symbol::global(name.to_string());
         if self.base.use_tls_dynamic() {
             // TLS descriptor, the dynamic model:

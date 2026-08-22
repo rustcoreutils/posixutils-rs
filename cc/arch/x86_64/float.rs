@@ -919,7 +919,7 @@ impl X86_64CodeGen {
     /// value is interned and loaded. Narrowing it through `f64` first — which
     /// is what the scalar immediate path does — lost 60 of its significand
     /// bits.
-    pub(super) fn emit_quad_const_to_xmm(&mut self, value: FloatVal, xmm: XmmReg) {
+    fn emit_quad_const_to_xmm(&mut self, value: FloatVal, xmm: XmmReg) {
         let (lo, hi) = value.to_f128_bits();
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&lo.to_le_bytes());

@@ -169,7 +169,7 @@ impl X86_64CodeGen {
     }
 
     /// Helper for emit_va_arg: emit integer path for va_arg
-    pub(super) fn emit_va_arg_int(
+    fn emit_va_arg_int(
         &mut self,
         ap_base: Reg,
         ap_base_offset: i32,

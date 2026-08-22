@@ -114,7 +114,7 @@ impl Aarch64CodeGen {
     /// register save area in varargs functions which is placed at the
     /// end of the frame (after locals).
     #[inline]
-    pub(super) fn stack_offset(&self, offset: i32) -> i32 {
+    fn stack_offset(&self, offset: i32) -> i32 {
         if offset < 0 {
             if let FrameBase::Aligned { align, .. } = self.frame_base {
                 // Over-aligned locals: x19-relative addressing.
@@ -171,7 +171,7 @@ impl Aarch64CodeGen {
 
     /// The address of an incoming stack argument, in the caller's frame.
     #[inline]
-    pub(super) fn incoming_mem(&self, off: IncomingOff) -> MemAddr {
+    fn incoming_mem(&self, off: IncomingOff) -> MemAddr {
         self.raw_mem(off.displacement(), 0)
     }
 
@@ -948,7 +948,7 @@ impl Aarch64CodeGen {
 
     /// Whether accessing the thread-local `name` needs the Initial Exec model
     /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
-    pub(super) fn use_tls_ie(&self, name: &str) -> bool {
+    fn use_tls_ie(&self, name: &str) -> bool {
         self.base.use_tls_ie(self.extern_symbols.contains(name))
     }
 

@@ -107,6 +107,37 @@ struct Args {
     #[arg(long = "dM", help = gettext("Dump macro definitions instead of output"))]
     dump_macros: bool,
 
+    /// Write a make rule naming every header the source depends on, instead of
+    /// compiling it (`-M`).
+    #[arg(short = 'M', help = gettext("Write a make dependency rule instead of compiling"))]
+    deps_only: bool,
+
+    /// As `-M`, but leave out headers found on a system path (`-MM`).
+    #[arg(long = "MM", help = gettext("Like -M, but omit system headers"))]
+    deps_only_user: bool,
+
+    /// Write the dependency rule *as well as* compiling (`-MD`).
+    #[arg(long = "MD", help = gettext("Write a dependency rule and still compile"))]
+    deps_side: bool,
+
+    /// As `-MD`, but leave out system headers (`-MMD`).
+    #[arg(long = "MMD", help = gettext("Like -MD, but omit system headers"))]
+    deps_side_user: bool,
+
+    /// Where the dependency rule goes (`-MF`). Defaults to stdout for `-M`
+    /// and `-MM`, and to the source renamed `.d` for `-MD` and `-MMD`.
+    #[arg(long = "MF", value_name = "file", help = gettext("Write dependencies to <file>"))]
+    deps_file: Option<String>,
+
+    /// The rule's target (`-MT`), in place of the source renamed `.o`.
+    #[arg(long = "MT", value_name = "target", help = gettext("Name the dependency rule's target"))]
+    deps_target: Option<String>,
+
+    /// Add a bare rule for each header, so removing one does not break the
+    /// build until the makefile is regenerated (`-MP`).
+    #[arg(long = "MP", help = gettext("Add a phony target for each dependency"))]
+    deps_phony: bool,
+
     /// Process a file as if `#include "<file>"` were the first line
     /// (`-include`). Repeatable, applied in order.
     #[arg(
@@ -499,6 +530,98 @@ struct Outputs<'a> {
     preprocessed: &'a mut dyn Write,
 }
 
+impl Args {
+    /// Whether any of the `-M` family was asked for.
+    fn wants_dependencies(&self) -> bool {
+        self.deps_only || self.deps_only_user || self.deps_side || self.deps_side_user
+    }
+
+    /// Whether the dependency rule *replaces* the compile (`-M`, `-MM`) rather
+    /// than accompanying it (`-MD`, `-MMD`).
+    fn dependencies_replace_output(&self) -> bool {
+        self.deps_only || self.deps_only_user
+    }
+
+    /// Whether headers found on a system path are left out.
+    fn dependencies_omit_system(&self) -> bool {
+        self.deps_only_user || self.deps_side_user
+    }
+}
+
+/// Write the make rule for one translation unit.
+///
+/// The shape is gcc's, which is what a makefile's `include` expects:
+/// `target: source header...`, wrapped at a sensible width with a trailing
+/// backslash, and -- under `-MP` -- a bare `header:` rule for each
+/// prerequisite so that deleting a header does not break the build before the
+/// makefile is regenerated.
+fn write_dependency_rule(
+    args: &Args,
+    source: &str,
+    dependencies: &[(std::path::PathBuf, bool)],
+) -> io::Result<()> {
+    let target = match &args.deps_target {
+        Some(t) => t.clone(),
+        None => {
+            let stem = Path::new(source).file_stem().unwrap_or_default();
+            format!("{}.o", stem.to_string_lossy())
+        }
+    };
+
+    let mut prerequisites = vec![source.to_string()];
+    for (path, is_system) in dependencies {
+        if *is_system && args.dependencies_omit_system() {
+            continue;
+        }
+        prerequisites.push(path.to_string_lossy().to_string());
+    }
+
+    // gcc wraps near 80 columns; the exact column is cosmetic, the
+    // backslash-newline is not.
+    const WRAP: usize = 72;
+    let mut rule = format!("{}:", target);
+    let mut column = rule.len();
+    for prereq in &prerequisites {
+        if column + prereq.len() + 1 > WRAP {
+            rule.push_str(" \\\n ");
+            column = 1;
+        }
+        rule.push(' ');
+        rule.push_str(prereq);
+        column += prereq.len() + 1;
+    }
+    rule.push('\n');
+
+    if args.deps_phony {
+        // Not for the source itself: it is not a header, and a rule for it
+        // would shadow the real one.
+        for prereq in prerequisites.iter().skip(1) {
+            rule.push_str(prereq);
+            rule.push_str(":\n");
+        }
+    }
+
+    match dependency_sink(args, source) {
+        Some(path) => std::fs::write(path, rule),
+        None => {
+            io::stdout().write_all(rule.as_bytes())?;
+            io::stdout().flush()
+        }
+    }
+}
+
+/// Where the rule goes: `-MF` if given, a `.d` beside the source for the
+/// side-output forms, and stdout for `-M`/`-MM`.
+fn dependency_sink(args: &Args, source: &str) -> Option<std::path::PathBuf> {
+    if let Some(file) = &args.deps_file {
+        return Some(std::path::PathBuf::from(file));
+    }
+    if args.dependencies_replace_output() {
+        return None;
+    }
+    Some(Path::new(source).with_extension("d"))
+}
+
 fn process_file(
     path: &str,
     streams: &mut StreamTable,
@@ -595,9 +718,21 @@ fn process_file(
             preprocessed,
             pre_includes: &args.pre_includes,
             dump_macros: args.dump_macros,
+            collect_dependencies: args.wants_dependencies(),
             optimization: args.optimization(),
         },
     );
+
+    // The dependency rule is a property of preprocessing, so it is written
+    // here whichever form asked for it -- before `-E` decides what to print,
+    // and before compilation, which `-MD`/`-MMD` do not suppress.
+    if args.wants_dependencies() {
+        write_dependency_rule(args, display_path, &outcome.dependencies)?;
+        if args.dependencies_replace_output() {
+            // `-M` and `-MM` produce the rule *instead of* anything else.
+            return Ok(Compiled::Nothing);
+        }
+    }
 
     if args.preprocess_only {
         // Output preprocessed tokens.
@@ -1362,6 +1497,19 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // so they used to reach it unrewritten and be rejected outright.
             result.push(format!("-{}", arg));
             i += 1;
+        } else if matches!(arg.as_str(), "-MM" | "-MD" | "-MMD" | "-MP") {
+            // gcc spells these with one dash; clap would read them as short
+            // clusters.
+            result.push(format!("-{}", arg));
+            i += 1;
+        } else if arg == "-MF" || arg == "-MT" {
+            result.push(format!("-{}", arg));
+            if let Some(v) = raw_args.get(i + 1) {
+                result.push(v.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
         } else if arg == "-dM" {
             // One dash in gcc; clap would read it as the short cluster `-d -M`.
             result.push("--dM".to_string());

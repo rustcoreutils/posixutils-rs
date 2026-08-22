@@ -418,6 +418,17 @@ pub struct Preprocessor<'a> {
     /// Maximum include depth
     max_include_depth: u32,
 
+    /// Every header opened, in the order first opened, and whether it came
+    /// from a system directory. Collected only when asked for (the `-M` family).
+    ///
+    /// Recorded where the file is *resolved* rather than where it is read, so a
+    /// header that the `#pragma once` or include-guard fast path skips is still
+    /// listed -- gcc lists it, and a makefile that omitted it would not rebuild
+    /// when it changed.
+    dependencies: Vec<(PathBuf, bool)>,
+    /// Whether to collect the above.
+    collect_dependencies: bool,
+
     /// Files named by a `#pragma once`.
     once_files: HashSet<PathBuf>,
 
@@ -847,6 +858,8 @@ impl<'a> Preprocessor<'a> {
             counter: 0,
             include_depth: 0,
             max_include_depth: 200,
+            dependencies: Vec::new(),
+            collect_dependencies: false,
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             guarded_files: HashMap::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             compile_date,
@@ -1131,6 +1144,8 @@ impl<'a> Preprocessor<'a> {
         // `-I`, then the system paths.
         match self.find_include_file(path, false, false) {
             Some((IncludeSource::File(found), index)) => {
+                // A `-include` is a dependency exactly as a `#include` is.
+                self.record_dependency(&found, index.is_some());
                 self.include_file(&found, output, idents, &hash, index)
             }
             Some((IncludeSource::Builtin(content), _)) => {
@@ -2474,6 +2489,8 @@ pub struct PreprocessConfig<'a> {
     pub pre_includes: &'a [String],
     /// Collect every macro definition for `-dM` instead of only the tokens.
     pub dump_macros: bool,
+    /// Collect the headers this translation unit depends on (the `-M` family).
+    pub collect_dependencies: bool,
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2518,6 +2535,9 @@ pub struct PreprocessOutcome {
     /// Every macro in force at the end, as `#define` lines, sorted (`-dM`).
     /// Empty unless asked for: rendering them is not free.
     pub macro_definitions: Vec<String>,
+    /// Every header opened, in the order first opened, with whether it came
+    /// from a system directory (the `-M` family). Empty unless asked for.
+    pub dependencies: Vec<(PathBuf, bool)>,
 }
 
 /// Preprocess tokens with command-line defines and undefines, collecting
@@ -2554,6 +2574,7 @@ pub fn preprocess_collecting(
     }
     pp.trigraphs = config.trigraphs;
     pp.preprocessed = config.preprocessed;
+    pp.collect_dependencies = config.collect_dependencies;
 
     define_optimization_macros(&mut pp, config.optimization);
 
@@ -2601,6 +2622,7 @@ pub fn preprocess_collecting(
         } else {
             Vec::new()
         },
+        dependencies: std::mem::take(&mut pp.dependencies),
     };
     (output, outcome)
 }

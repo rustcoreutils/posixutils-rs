@@ -1569,3 +1569,145 @@ fn driver_dash_dm_output_is_deterministic() {
     sorted.sort_unstable();
     assert_eq!(names, sorted, "-dM output must be sorted by name");
 }
+
+/// `-M` and `-MM` write a make rule naming what the source depends on, instead
+/// of compiling it. This is how a make-based build tracks header changes, and
+/// c17 had no way to produce one.
+#[test]
+fn driver_dash_mm_writes_a_dependency_rule() {
+    let w = WorkDir::new("dash_mm");
+    w.write("local.h", "int local_thing;\n");
+    let src = w.write(
+        "d.c",
+        "#include \"local.h\"\n#include <stdio.h>\nint main(void){return 0;}\n",
+    );
+
+    let r = run_c17(&["-MM", &s(&src)]);
+    assert!(r.success, "-MM failed: {}", r.stderr);
+    let rule = r.stdout.trim_end();
+    assert!(
+        rule.starts_with("d.o:"),
+        "target should be the source renamed .o: {:?}",
+        rule
+    );
+    assert!(
+        rule.contains("local.h"),
+        "the user header is a prerequisite: {:?}",
+        rule
+    );
+    // `-MM` leaves out headers found on a system path. The `<>` vs `""`
+    // spelling is not the test — where it resolved is.
+    assert!(
+        !rule.contains("stdio.h"),
+        "-MM omits system headers: {:?}",
+        rule
+    );
+
+    // Nothing was compiled.
+    assert!(!w.join("d.o").exists(), "-MM must not produce an object");
+}
+
+/// `-M` keeps the system headers `-MM` drops.
+#[test]
+fn driver_dash_m_includes_system_headers() {
+    let w = WorkDir::new("dash_m");
+    let src = w.write("d.c", "#include <stdio.h>\nint main(void){return 0;}\n");
+    let r = run_c17(&["-M", &s(&src)]);
+    assert!(r.success, "-M failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("stdio.h"),
+        "-M lists system headers:\n{}",
+        r.stdout
+    );
+}
+
+/// `-MT` names the target; `-MP` adds a bare rule per header so that deleting
+/// one does not break the build before the makefile is regenerated.
+#[test]
+fn driver_dependency_rule_target_and_phony() {
+    let w = WorkDir::new("dash_mt");
+    w.write("local.h", "int local_thing;\n");
+    let src = w.write("d.c", "#include \"local.h\"\nint main(void){return 0;}\n");
+
+    let r = run_c17(&["-MM", "-MT", "obj/d.o", &s(&src)]);
+    assert!(r.success, "-MT failed: {}", r.stderr);
+    assert!(
+        r.stdout.starts_with("obj/d.o:"),
+        "-MT names the target:\n{}",
+        r.stdout
+    );
+
+    let r = run_c17(&["-MM", "-MP", &s(&src)]);
+    assert!(r.success, "-MP failed: {}", r.stderr);
+    let phony: Vec<&str> = r.stdout.lines().filter(|l| l.ends_with(':')).collect();
+    assert_eq!(
+        phony.len(),
+        1,
+        "one bare rule, for the header only:\n{}",
+        r.stdout
+    );
+    assert!(
+        phony[0].contains("local.h"),
+        "the bare rule names the header:\n{}",
+        r.stdout
+    );
+}
+
+/// `-MD` and `-MMD` are side outputs: the rule goes to a file *and* the source
+/// is still compiled. Putting them in the `-E` branch would have lost that.
+#[test]
+fn driver_dash_mmd_writes_the_rule_and_still_compiles() {
+    let w = WorkDir::new("dash_mmd");
+    w.write("local.h", "int local_thing;\n");
+    let src = w.write("d.c", "#include \"local.h\"\nint main(void){return 0;}\n");
+    let obj = w.join("d.o");
+
+    let r = run_c17(&["-MMD", "-c", &s(&src), "-o", &s(&obj)]);
+    assert!(r.success, "-MMD failed: {}", r.stderr);
+    assert!(obj.exists(), "-MMD must still compile");
+
+    // The rule defaults to the source renamed `.d`.
+    let dep = w.join("d.d");
+    assert!(dep.exists(), "-MMD writes a .d beside the source");
+    let rule = std::fs::read_to_string(&dep).unwrap();
+    assert!(rule.contains("local.h"), "unexpected rule: {:?}", rule);
+}
+
+/// `-MF` says where the rule goes, and then nothing goes to stdout.
+#[test]
+fn driver_dash_mf_redirects_the_rule() {
+    let w = WorkDir::new("dash_mf");
+    w.write("local.h", "int local_thing;\n");
+    let src = w.write("d.c", "#include \"local.h\"\nint main(void){return 0;}\n");
+    let out = w.join("custom.d");
+
+    let r = run_c17(&["-MM", "-MF", &s(&out), &s(&src)]);
+    assert!(r.success, "-MF failed: {}", r.stderr);
+    assert!(
+        r.stdout.is_empty(),
+        "-MF means nothing on stdout: {:?}",
+        r.stdout
+    );
+    let rule = std::fs::read_to_string(&out).unwrap();
+    assert!(rule.contains("local.h"), "unexpected rule: {:?}", rule);
+}
+
+/// A header reached twice is one prerequisite, not two — and an include guard
+/// skipping the second read must not lose it either.
+#[test]
+fn driver_dependency_rule_lists_each_header_once() {
+    let w = WorkDir::new("dash_mm_once");
+    w.write("g.h", "#ifndef G_H\n#define G_H\nint g;\n#endif\n");
+    let src = w.write(
+        "d.c",
+        "#include \"g.h\"\n#include \"g.h\"\nint main(void){return 0;}\n",
+    );
+    let r = run_c17(&["-MM", &s(&src)]);
+    assert!(r.success, "-MM failed: {}", r.stderr);
+    assert_eq!(
+        r.stdout.matches("g.h").count(),
+        1,
+        "a header included twice is one prerequisite:\n{}",
+        r.stdout
+    );
+}

@@ -738,6 +738,11 @@ impl<'a> Preprocessor<'a> {
         {
             match source {
                 IncludeSource::File(path) => {
+                    // `path_index` is `Some` only for a file found on a system
+                    // path, which is what `-MM` filters on. The `<>` vs `""`
+                    // spelling is not the same question: a `"..."` include can
+                    // resolve out of a system directory and often does.
+                    self.record_dependency(&path, path_index.is_some());
                     self.include_file(&path, output, idents, hash_token, path_index);
                 }
                 IncludeSource::Builtin(content) => {
@@ -808,6 +813,18 @@ impl<'a> Preprocessor<'a> {
 
     /// Find an include file
     /// Returns (IncludeSource, Option<system_include_path_index>)
+    /// Note a header this translation unit depends on.
+    pub(super) fn record_dependency(&mut self, path: &Path, is_system: bool) {
+        if !self.collect_dependencies {
+            return;
+        }
+        // Listed once however many times it is included. Linear because the
+        // list is short and its order is the output's order.
+        if !self.dependencies.iter().any(|(p, _)| p == path) {
+            self.dependencies.push((path.to_path_buf(), is_system));
+        }
+    }
+
     pub(super) fn find_include_file(
         &self,
         filename: &str,

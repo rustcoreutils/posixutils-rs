@@ -1909,3 +1909,32 @@ fn preprocessor_malformed_conditional_operand_in_a_dead_branch_is_quiet() {
         r.stdout
     );
 }
+
+/// The parser and the `#if` evaluator decode the same token, so they must
+/// agree about it. They stopped agreeing when only the evaluator learned to
+/// pack a multi-character constant: `'ab'` compiled to 97 while `#if 'ab' ==
+/// 24930` took the true branch.
+#[test]
+fn preprocessor_character_constants_agree_with_the_compiler() {
+    let src = r#"
+#if 'ab' != 24930
+#error preprocessor disagrees about a multi-character constant
+#endif
+#if '\777' != -1 && '\777' != 255
+#error preprocessor disagrees about an over-wide octal escape
+#endif
+int main(void) {
+    // The same constants, compiled. A disagreement here is the bug.
+    if ('ab' != 24930) return 1;
+    // `\777` is 511, which is not a byte; the low eight bits survive, and
+    // plain `char`'s signedness decides the sign.
+    if ((unsigned char)'\777' != 255) return 2;
+    if (L'é' != 233) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        crate::common::compile_and_run("char_agreement", src, &[]),
+        0
+    );
+}

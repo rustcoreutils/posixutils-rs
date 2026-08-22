@@ -132,7 +132,11 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
                 oct_chars += 1;
             }
             let oct: String = chars[i..i + oct_chars].iter().collect();
-            let val = u8::from_str_radix(&oct, 8).unwrap_or(0);
+            // `\777` is 511, which is not a byte. C leaves it undefined and gcc
+            // takes the low eight bits; parsing straight into `u8` failed and
+            // silently produced NUL instead, so `'\777'` was 0 where gcc gives
+            // 255.
+            let val = u32::from_str_radix(&oct, 8).unwrap_or(0) as u8;
             (Escaped::Byte(val), oct_chars)
         }
         // An unknown escape stands for the character itself. In a narrow
@@ -154,30 +158,60 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
 /// a *single*-character constant. A multi-character constant such as `'ab'` is
 /// the preprocessor's business (C17 6.10.1) and goes through
 /// [`parse_string_literal`] instead.
-pub(crate) fn char_literal_value(s: &str, pos: Position) -> (u32, bool) {
-    if s.is_empty() {
+pub(crate) fn char_literal_value(s: &str, wide: bool, pos: Position) -> (u32, bool) {
+    let elements = parse_string_literal(s);
+    for e in &elements {
+        if let Escaped::ForbiddenUcn(val) = e {
+            report_forbidden_ucn(pos, *val);
+        }
+    }
+    if elements.is_empty() {
         return (0, false);
     }
 
-    let chars: Vec<char> = s.chars().collect();
-    if chars[0] == '\\' && chars.len() > 1 {
-        match parse_escape_sequence(&chars, 1).0 {
-            Escaped::Byte(b) | Escaped::SourceByte(b) => (b as u32, false),
-            Escaped::ForbiddenUcn(val) => {
-                report_forbidden_ucn(pos, val);
-                (val, true)
-            }
-            // `'\u00e9'` names a code point. gcc makes it a multi-character
-            // constant of its UTF-8 bytes, with a warning; c17 keeps the
-            // code point, which is the more useful answer for its callers
-            // and costs nothing elsewhere. Truncating it to a byte here would
-            // lose that, and would flatten `'\U0001F600'` to zero.
-            Escaped::CodePoint(c) => (c as u32, true),
+    // A prefixed constant holds characters, not bytes: `L'é'` is the one wide
+    // character U+00E9, never the first byte of its UTF-8.
+    if wide {
+        let units = literal_wide_chars(&elements);
+        return (units.first().copied().unwrap_or(0), true);
+    }
+
+    // A lone universal character name keeps its code point. gcc makes it a
+    // multi-character constant of its UTF-8 bytes, with a warning; c17 keeps
+    // the code point, which is the more useful answer and is what
+    // `test_char_escape_ucn_*` pin. Truncating it would also flatten
+    // `'\U0001F600'` to zero.
+    if elements.len() == 1 {
+        if let Escaped::CodePoint(c) = elements[0] {
+            return (c as u32, true);
         }
-    } else {
-        // The lexer stores one `char` per source byte, so an ordinary
-        // character is a byte even when the source is UTF-8.
-        (chars[0] as u32, false)
+        if let Escaped::ForbiddenUcn(v) = elements[0] {
+            return (v, true);
+        }
+    }
+
+    let bytes: Vec<u8> = literal_bytes(&elements)
+        .chars()
+        .map(|c| c as u32 as u8)
+        .collect();
+    match bytes.len() {
+        0 => (0, false),
+        // One byte is what a `char` object would hold, so plain `char`'s
+        // signedness applies to it (C17 6.4.4.4p10) -- which is what the
+        // `false` says.
+        1 => (bytes[0] as u32, false),
+        // More than one: a multi-character constant has type `int`, packed
+        // big-endian and wrapped, so signedness does not apply. Reading only
+        // the first byte made `'ab'` compile to 97 while the preprocessor
+        // evaluated it as 24930 -- the two disagreeing about the same token,
+        // which having one decoder was supposed to prevent.
+        _ => {
+            let mut val: u32 = 0;
+            for b in bytes {
+                val = (val << 8) | b as u32;
+            }
+            (val, true)
+        }
     }
 }
 

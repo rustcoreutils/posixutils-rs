@@ -729,7 +729,16 @@ fn process_file(
     if args.wants_dependencies() {
         write_dependency_rule(args, display_path, &outcome.dependencies)?;
         if args.dependencies_replace_output() {
-            // `-M` and `-MM` produce the rule *instead of* anything else.
+            // `-M` and `-MM` produce the rule *instead of* anything else --
+            // but a rule built from a translation unit that did not
+            // preprocess is incomplete, and exiting 0 would have a makefile
+            // record it as authoritative.
+            if diag::has_error() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "preprocessing failed",
+                ));
+            }
             return Ok(Compiled::Nothing);
         }
     }

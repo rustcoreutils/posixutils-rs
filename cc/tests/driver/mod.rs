@@ -1724,3 +1724,22 @@ fn driver_dash_include_finds_a_bundled_header() {
     assert!(r.success, "compile failed: {}", r.stderr);
     assert_eq!(run_exe(&exe), 0, "`true` should have expanded to 1");
 }
+
+/// A dependency rule built from a translation unit that did not preprocess is
+/// incomplete, and exiting 0 would have a makefile record it as authoritative.
+#[test]
+fn driver_dependency_rule_fails_when_preprocessing_did() {
+    let w = WorkDir::new("dep_exit");
+    let src = w.write("d.c", "#include \"no_such_header.h\"\nint v;\n");
+    let r = run_c17(&["-MM", &s(&src)]);
+    assert!(
+        !r.success,
+        "a missing header must fail the rule:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.contains("file not found"),
+        "expected the not-found diagnostic, got:\n{}",
+        r.stderr
+    );
+}

@@ -584,9 +584,6 @@ fn preprocessor_include_next_from_a_system_path_still_advances() {
     let src = dir.path().join("m.c");
     std::fs::write(&src, "#include <n.h>\nint y = S1 + S2;\n").unwrap();
 
-    // No `-nostdinc`: c17 drops `-isystem` paths along with the standard ones,
-    // where gcc keeps them. Unrelated to what this checks, so it stays out of
-    // the way.
     let r = run_c17(&[
         "-E",
         &format!("-I{}", q.display()),
@@ -605,6 +602,64 @@ fn preprocessor_include_next_from_a_system_path_still_advances() {
     assert!(
         text.contains("int y = 1 + 2;"),
         "expected both system levels:\n{}",
+        r.stdout
+    );
+}
+
+/// `-nostdinc` drops the *target's own* header directories. It does not drop
+/// the ones the caller named with `-isystem` or `-idirafter`: those were asked
+/// for explicitly, and gcc keeps searching them.
+///
+/// c17 held one flag for "use system paths", cleared it for `-nostdinc`, and
+/// so lost all three at once -- `-nostdinc -isystem d` could not find a header
+/// sitting in `d`.
+#[test]
+fn preprocessor_nostdinc_keeps_the_caller_s_system_paths() {
+    let dir = tempfile::Builder::new()
+        .prefix("c17_nostdinc_")
+        .tempdir()
+        .unwrap();
+    let (sys, quote) = (dir.path().join("sys"), dir.path().join("q"));
+    for d in [&sys, &quote] {
+        std::fs::create_dir(d).unwrap();
+    }
+    std::fs::write(sys.join("h.h"), "#define FROM_SYSTEM 1\n").unwrap();
+    std::fs::write(quote.join("qh.h"), "#define FROM_QUOTE 2\n").unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(
+        &src,
+        "#include <h.h>\n#include \"qh.h\"\nint a = FROM_SYSTEM;\nint b = FROM_QUOTE;\n",
+    )
+    .unwrap();
+
+    for flag in ["--isystem", "--idirafter"] {
+        let r = run_c17(&[
+            "-E",
+            "-nostdinc",
+            flag,
+            &sys.to_string_lossy(),
+            &format!("-I{}", quote.display()),
+            &src.to_string_lossy(),
+        ]);
+        assert!(r.success, "{} under -nostdinc failed:\n{}", flag, r.stderr);
+        let text: String = r.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("int a = 1;") && text.contains("int b = 2;"),
+            "{} should still be searched under -nostdinc:\n{}",
+            flag,
+            r.stdout
+        );
+    }
+
+    // The half that must keep working: `-nostdinc` on its own really does drop
+    // the standard directories, the bundled headers among them -- `gcc
+    // -nostdinc` cannot find <stddef.h> either.
+    let bare = dir.path().join("bare.c");
+    std::fs::write(&bare, "#include <stddef.h>\n").unwrap();
+    let r = run_c17(&["-E", "-nostdinc", &bare.to_string_lossy()]);
+    assert!(
+        !r.success,
+        "-nostdinc should drop the standard directories:\n{}",
         r.stdout
     );
 }

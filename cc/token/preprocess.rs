@@ -477,9 +477,6 @@ pub struct Preprocessor<'a> {
     /// Apply translation phase 1 trigraph replacement to included files.
     trigraphs: bool,
 
-    /// Whether to use system include paths (disabled by -nostdinc)
-    use_system_headers: bool,
-
     /// Index of current file's system include path (for #include_next)
     /// None if current file is not from a system include path
     current_include_path_index: Option<usize>,
@@ -882,7 +879,6 @@ impl<'a> Preprocessor<'a> {
             compile_time,
             use_builtin_headers: true,
             trigraphs: false,
-            use_system_headers: true,
             current_include_path_index: None,
             lexer_mode: LexerMode::C,
             line_offset: 0,
@@ -904,8 +900,10 @@ impl<'a> Preprocessor<'a> {
         for path in search.isystem {
             pp.system_include_paths.push(path.clone());
         }
-        for path in os::get_include_paths(target, search.sysroot) {
-            pp.system_include_paths.push(path);
+        if !search.no_std_inc {
+            for path in os::get_include_paths(target, search.sysroot) {
+                pp.system_include_paths.push(path);
+            }
         }
         for path in search.idirafter {
             pp.system_include_paths.push(path.clone());
@@ -2478,6 +2476,13 @@ pub struct SystemSearch<'a> {
     pub isystem: &'a [String],
     /// `-idirafter`: system directories searched behind the target's own.
     pub idirafter: &'a [String],
+    /// `-nostdinc`: leave the *target's own* directories out of the search.
+    ///
+    /// Only those. `-isystem` and `-idirafter` name directories the caller
+    /// asked for explicitly and are still searched, which is what gcc does --
+    /// `gcc -nostdinc -isystem d` finds `<h.h>` in `d`. Treating `-nostdinc`
+    /// as "no system paths at all" dropped those too.
+    pub no_std_inc: bool,
 }
 
 /// Configuration for preprocessing command-line options
@@ -2577,12 +2582,14 @@ pub fn preprocess_collecting(
 ) -> (Vec<Token>, PreprocessOutcome) {
     let mut pp = Preprocessor::new(target, filename, &config.search);
 
-    // -nostdinc drops the bundled headers as well as the system directories,
-    // which is what gcc does: `gcc -nostdinc` cannot find <stddef.h> either,
-    // its own include directory being one of the standard ones. Probed rather
-    // than assumed -- this was very nearly "aligned" the other way.
+    // -nostdinc drops the bundled headers as well as the target's own
+    // directories, which is what gcc does: `gcc -nostdinc` cannot find
+    // <stddef.h> either, its own include directory being one of the standard
+    // ones. Probed rather than assumed -- this was very nearly "aligned" the
+    // other way. The directories themselves are left out in
+    // `Preprocessor::new`, which is the only place that knows which of them
+    // came from `-isystem`.
     if config.no_std_inc {
-        pp.use_system_headers = false;
         pp.use_builtin_headers = false;
     }
     if config.no_builtin_inc {
@@ -2717,9 +2724,9 @@ pub fn preprocess_asm_file(
 
     define_optimization_macros(&mut pp, config.optimization);
 
-    // Handle -nostdinc flag
+    // -nostdinc: the directories are dropped in `Preprocessor::new`; the
+    // bundled headers go with them.
     if config.no_std_inc {
-        pp.use_system_headers = false;
         pp.use_builtin_headers = false;
     }
 

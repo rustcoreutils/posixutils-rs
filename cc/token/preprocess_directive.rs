@@ -905,20 +905,19 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Check system include paths (unless -nostdinc). Their indices continue
-        // the same numbering, so a resume point means the same thing whichever
-        // half of the path the current file came from.
-        if self.use_system_headers {
-            for (idx, dir) in self
-                .system_include_paths
-                .iter()
-                .enumerate()
-                .skip(start_index.saturating_sub(quote_count))
-            {
-                let path = Path::new(dir).join(filename);
-                if path.exists() {
-                    return Some((IncludeSource::File(path), Some(quote_count + idx)));
-                }
+        // Then the system directories. Their indices continue the same
+        // numbering, so a resume point means the same thing whichever half of
+        // the path the current file came from. Under `-nostdinc` the list holds
+        // only what `-isystem` and `-idirafter` put there.
+        for (idx, dir) in self
+            .system_include_paths
+            .iter()
+            .enumerate()
+            .skip(start_index.saturating_sub(quote_count))
+        {
+            let path = Path::new(dir).join(filename);
+            if path.exists() {
+                return Some((IncludeSource::File(path), Some(quote_count + idx)));
             }
         }
 

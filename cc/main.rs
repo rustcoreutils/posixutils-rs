@@ -500,6 +500,7 @@ fn system_search(args: &Args) -> token::preprocess::SystemSearch<'_> {
         sysroot: args.sysroot.as_deref(),
         isystem: &args.isystem_paths,
         idirafter: &args.idirafter_paths,
+        no_std_inc: args.no_std_inc,
     }
 }
 

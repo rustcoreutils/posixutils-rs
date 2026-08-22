@@ -612,6 +612,8 @@ impl Parser<'_> {
 
     /// Parse a bitfield width (constant expression after ':')
     fn parse_bitfield_width(&mut self) -> ParseResult<u32> {
+        // C11 6.7.5p2: not on a bit-field.
+        self.reject_alignas_in("a bit-field");
         let expr = self.parse_conditional_expr()?;
         match self.eval_const_expr(&expr) {
             Some(val) if val >= 0 => Ok(val as u32),

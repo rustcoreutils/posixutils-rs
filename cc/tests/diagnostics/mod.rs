@@ -4684,3 +4684,91 @@ fn diagnostics_implicit_int_still_outranks_the_empty_case() {
         "type specifier missing",
     );
 }
+
+// ============================================================================
+// C11 6.7.5p2 — _Alignas is forbidden on a typedef, bit-field, function,
+// parameter, or register object
+// ============================================================================
+
+/// C11 6.7.5p2 names five declarations an alignment specifier may not appear
+/// in. None of the five was diagnosed; all five compiled silently.
+///
+/// The GNU `__attribute__((aligned(N)))` spelling is *not* covered by this
+/// constraint — it is legal on a typedef and is how a typedef gets an
+/// alignment at all — so only the `_Alignas` keyword is rejected here.
+#[test]
+fn diagnostics_alignas_forbidden_contexts_are_rejected() {
+    compile_expect_error(
+        "alignas_on_typedef",
+        "_Alignas(64) typedef int T;\n",
+        "_Alignas",
+    );
+    compile_expect_error(
+        "alignas_on_bitfield",
+        "struct S { _Alignas(64) int b : 3; };\n",
+        "_Alignas",
+    );
+    compile_expect_error(
+        "alignas_on_function",
+        "_Alignas(64) void f(void);\n",
+        "_Alignas",
+    );
+    compile_expect_error(
+        "alignas_on_parameter",
+        "void f(_Alignas(64) int p);\n",
+        "_Alignas",
+    );
+    compile_expect_error(
+        "alignas_on_register",
+        "void f(void) { _Alignas(64) register int r; (void)r; }\n",
+        "_Alignas",
+    );
+    // The same two, reached by the other declaration path.
+    compile_expect_error(
+        "alignas_on_function_block_scope",
+        "void g(void) { _Alignas(64) void h(void); }\n",
+        "_Alignas",
+    );
+    compile_expect_error(
+        "alignas_on_param_of_function_pointer",
+        "void (*fp)(_Alignas(64) int);\n",
+        "_Alignas",
+    );
+}
+
+/// The accept side, so the check above cannot pass by rejecting everything:
+/// `_Alignas` on an ordinary object is the whole point of the feature, and the
+/// `aligned` attribute stays legal everywhere it was.
+#[test]
+fn diagnostics_alignas_legal_contexts_still_compile() {
+    compile_expect_ok("alignas_on_object", "_Alignas(64) int v;\n");
+    compile_expect_ok("alignas_type_operand", "_Alignas(double) int v;\n");
+    compile_expect_ok(
+        "aligned_attr_on_typedef",
+        "typedef int T __attribute__((aligned(64)));\nT v;\n",
+    );
+    compile_expect_ok(
+        "aligned_attr_on_bitfield_struct",
+        "struct S { int b : 3; } __attribute__((aligned(64)));\n",
+    );
+    compile_expect_ok(
+        "alignas_on_struct_member",
+        "struct S { _Alignas(64) int m; };\n",
+    );
+    // A pointer to function is an *object*, so it may carry an alignment even
+    // though a function may not. The parameter list of such a declarator must
+    // not see the enclosing `_Alignas` and mistake it for its own -- which is
+    // exactly what the first attempt at the parameter check did.
+    compile_expect_ok(
+        "alignas_on_function_pointer_object",
+        "_Alignas(64) void (*fp)(int);\n",
+    );
+    compile_expect_ok(
+        "alignas_on_array_of_function_pointers",
+        "_Alignas(64) void (*fps[4])(int);\n",
+    );
+    compile_expect_ok(
+        "aligned_attr_on_function",
+        "__attribute__((aligned(64))) void f(void) {}\n",
+    );
+}

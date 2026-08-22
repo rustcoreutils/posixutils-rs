@@ -411,18 +411,39 @@ impl Parser<'_> {
     /// Parameters are declared in a temporary scope during parsing so that
     /// VLA sizes like `arr[n]` can reference earlier parameters like `n`.
     /// The scope is exited at the end; callers re-declare parameters as needed.
+    /// Parse `( parameters )`.
+    ///
+    /// The enclosing declaration's alignment specifier is hidden for the
+    /// duration and restored afterwards, however the inner parse exits. Without
+    /// that, `_Alignas(64) void (*fp)(int);` -- a legal pointer-to-function
+    /// *object* -- saw the outer `_Alignas` while parsing `(int)` and reported
+    /// it as an alignment on a parameter.
+    ///
+    /// The parameter scope is bracketed here for the same reason.
     pub(crate) fn parse_parameter_list(&mut self) -> ParseResult<ParameterList> {
+        let saved_align = self.pending_alignas.take();
+        let saved_align_kw = self.pending_alignas_kw.take();
+        // The parameter scope is opened and closed here rather than inside, so
+        // that it is balanced however the inner parse exits. It used to be left
+        // open on the `?` paths and on the trailing-comma `return Err`.
+        self.symbols.enter_scope();
+        let result = self.parse_parameter_list_inner();
+        self.symbols.leave_scope();
+        self.pending_alignas = saved_align;
+        self.pending_alignas_kw = saved_align_kw;
+        result
+    }
+
+    fn parse_parameter_list_inner(&mut self) -> ParseResult<ParameterList> {
         let mut params: Vec<RawParam> = Vec::with_capacity(DEFAULT_PARAM_CAPACITY);
         let mut variadic = false;
         let mut prototyped = true;
 
         // Enter a temporary scope for parameter parsing (C99 6.9.1p9)
         // This allows VLA sizes to reference earlier parameters
-        self.symbols.enter_scope();
 
         // `()` -- an empty identifier list, which is not a prototype.
         if self.is_special(b')') {
-            self.symbols.leave_scope();
             return Ok(ParameterList {
                 params,
                 variadic,
@@ -437,7 +458,6 @@ impl Parser<'_> {
                     let saved_pos = self.pos;
                     self.advance();
                     if self.is_special(b')') {
-                        self.symbols.leave_scope();
                         return Ok(ParameterList {
                             params,
                             variadic,
@@ -468,6 +488,8 @@ impl Parser<'_> {
 
             // Parse parameter type
             let param_type = self.parse_type_specifier()?;
+            // C11 6.7.5p2: not on a parameter.
+            self.reject_alignas_in("a parameter");
             // An identifier list -- `int f(a, b) int a, b;` -- is not a
             // prototype (C17 6.7.6.3p14), and it is exactly the case where the
             // specifier parser supplied an implicit `int` without consuming an
@@ -555,7 +577,6 @@ impl Parser<'_> {
             // one-parameter prototype.
             if self.types.kind(typ_id) == TypeKind::Void {
                 if name_opt.is_none() && params.is_empty() && self.is_special(b')') {
-                    self.symbols.leave_scope();
                     return Ok(ParameterList {
                         params,
                         variadic,
@@ -622,7 +643,6 @@ impl Parser<'_> {
         }
 
         // Leave temporary parameter scope
-        self.symbols.leave_scope();
 
         Ok(ParameterList {
             params,

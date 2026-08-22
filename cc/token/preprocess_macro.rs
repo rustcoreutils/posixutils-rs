@@ -191,12 +191,114 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Convert tokens to macro body
+    /// The index just past the `)` closing a `__VA_OPT__` whose identifier is
+    /// at `i`, or `None` if it is not followed by a balanced `( ... )`.
+    fn va_opt_extent(tokens: &[Token], i: usize) -> Option<usize> {
+        let is_punct =
+            |t: &Token, c: u8| matches!(&t.value, TokenValue::Special(code) if *code == c as u32);
+        if !tokens.get(i + 1).is_some_and(|t| is_punct(t, b'(')) {
+            return None;
+        }
+        // Balanced, because the content may itself contain parentheses --
+        // `__VA_OPT__(f(a,b))` is one group, not a group ending at the inner
+        // `)`.
+        let mut depth = 0usize;
+        for (j, t) in tokens.iter().enumerate().skip(i + 1) {
+            if is_punct(t, b'(') {
+                depth += 1;
+            } else if is_punct(t, b')') {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+        }
+        None
+    }
+
+    /// Where the comma is, if what has been built so far ends in the GNU
+    /// `, ##` that precedes a `__VA_ARGS__`.
+    ///
+    /// Returns the index of the comma, so the caller can drop both it and the
+    /// `##` and put a `__VA_OPT__(,)` group there instead.
+    fn gnu_comma_elision(body: &[MacroToken]) -> Option<usize> {
+        let n = body.len();
+        if n < 2 || !matches!(body[n - 1].value, MacroTokenValue::Paste) {
+            return None;
+        }
+        match body[n - 2].value {
+            MacroTokenValue::Special(c) if c == b',' as u32 => Some(n - 2),
+            _ => None,
+        }
+    }
+
+    /// Build the flat marker group for a `__VA_OPT__(...)` whose identifier is
+    /// at `at`, returning the tokens and the index just past the group.
+    ///
+    /// `end` inside the `VaOptStart` is relative to the group, and is fixed up
+    /// by [`Self::patch_va_opt_end`] once the caller knows where the group
+    /// landed in the body.
+    #[allow(clippy::too_many_arguments)]
+    fn build_va_opt(
+        &self,
+        tokens: &[Token],
+        at: usize,
+        stringify: bool,
+        whitespace: bool,
+        params: &[MacroParam],
+        variadic_name: Option<&str>,
+        is_function: bool,
+        idents: &IdentTable,
+    ) -> Option<(Vec<MacroToken>, usize)> {
+        let after_close = Self::va_opt_extent(tokens, at)?;
+        // The content goes through the same analysis, so `#param`, `##` and
+        // `__VA_ARGS__` inside the group mean what they mean anywhere else.
+        let inner = self.tokens_to_macro_body(
+            &tokens[at + 2..after_close - 1],
+            params,
+            variadic_name,
+            is_function,
+            true,
+            idents,
+        );
+        let mut group = Vec::with_capacity(inner.len() + 2);
+        group.push(MacroToken {
+            typ: TokenType::Ident,
+            value: MacroTokenValue::VaOptStart { end: 0, stringify },
+            whitespace,
+            spelling: Spelling::Canonical,
+        });
+        group.extend(inner);
+        group.push(MacroToken {
+            typ: TokenType::Ident,
+            value: MacroTokenValue::VaOptEnd,
+            whitespace: false,
+            spelling: Spelling::Canonical,
+        });
+        Some((group, after_close))
+    }
+
+    /// Fill in the `end` of the group that was just pushed onto `body`.
+    fn patch_va_opt_end(body: &mut [MacroToken]) {
+        let end = body.len();
+        // The group is the tail; its start is the last unfilled marker.
+        for i in (0..body.len()).rev() {
+            if let MacroTokenValue::VaOptStart { end: slot, .. } = &mut body[i].value {
+                if *slot == 0 {
+                    *slot = end;
+                    return;
+                }
+            }
+        }
+    }
+
     pub(super) fn tokens_to_macro_body(
         &self,
         tokens: &[Token],
         params: &[MacroParam],
         variadic_name: Option<&str>,
         is_function: bool,
+        is_variadic: bool,
         idents: &IdentTable,
     ) -> Vec<MacroToken> {
         // C17 6.10.3.3p1: `##` shall occur at neither end of a replacement
@@ -284,6 +386,28 @@ impl<'a> Preprocessor<'a> {
                                     i += 2;
                                     continue;
                                 }
+                                // `#__VA_OPT__(...)`: the group's spelling, or
+                                // `""` when there are no variadic arguments.
+                                // The group builder is shared with the
+                                // unprefixed form, one token further on.
+                                if name == "__VA_OPT__" && is_variadic {
+                                    if let Some(built) = self.build_va_opt(
+                                        tokens,
+                                        i + 1,
+                                        true,
+                                        token.pos.whitespace,
+                                        params,
+                                        variadic_name,
+                                        is_function,
+                                        idents,
+                                    ) {
+                                        let (group, after) = built;
+                                        body.extend(group);
+                                        Self::patch_va_opt_end(&mut body);
+                                        i = after;
+                                        continue;
+                                    }
+                                }
                             }
                         }
                     }
@@ -315,9 +439,80 @@ impl<'a> Preprocessor<'a> {
             // Check for parameter reference or __VA_ARGS__
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
+                    // `__VA_OPT__(content)`: content when the variadic
+                    // arguments are non-empty, nothing when they are not
+                    // (C23 6.10.5.1).
+                    if name == "__VA_OPT__" {
+                        match Self::va_opt_extent(tokens, i) {
+                            Some(_) if is_variadic => {
+                                let (group, after) = self
+                                    .build_va_opt(
+                                        tokens,
+                                        i,
+                                        false,
+                                        token.pos.whitespace,
+                                        params,
+                                        variadic_name,
+                                        is_function,
+                                        idents,
+                                    )
+                                    .expect("extent already checked");
+                                body.extend(group);
+                                Self::patch_va_opt_end(&mut body);
+                                i = after;
+                                continue;
+                            }
+                            Some(_) => {
+                                // gcc warns and leaves it alone rather than
+                                // rejecting the definition.
+                                diag::warning(
+                                    token.pos,
+                                    &gettext("__VA_OPT__ is only meaningful in a variadic macro"),
+                                );
+                            }
+                            None => {
+                                diag::error(token.pos, &gettext("expected '(' after __VA_OPT__"));
+                            }
+                        }
+                    }
+
                     // Check if it's __VA_ARGS__, or the GNU named variadic
                     // that stands in for it.
                     if name == "__VA_ARGS__" || Some(name) == variadic_name {
+                        // The GNU `, ## __VA_ARGS__` extension means exactly
+                        // `__VA_OPT__(,) __VA_ARGS__`: keep the comma when
+                        // there are trailing arguments, drop it when there are
+                        // not. Lower it here so there is one mechanism rather
+                        // than a second, subtly different one in the
+                        // substitution loop -- the old special case fired on
+                        // "the previous body token was `##`" alone and, when
+                        // the arguments were non-empty, never actually pasted.
+                        if is_variadic {
+                            if let Some(comma) = Self::gnu_comma_elision(&body) {
+                                body.truncate(comma);
+                                body.push(MacroToken {
+                                    typ: TokenType::Ident,
+                                    value: MacroTokenValue::VaOptStart {
+                                        end: comma + 3,
+                                        stringify: false,
+                                    },
+                                    whitespace: true,
+                                    spelling: Spelling::Canonical,
+                                });
+                                body.push(MacroToken {
+                                    typ: TokenType::Special,
+                                    value: MacroTokenValue::Special(b',' as u32),
+                                    whitespace: false,
+                                    spelling: Spelling::Canonical,
+                                });
+                                body.push(MacroToken {
+                                    typ: TokenType::Ident,
+                                    value: MacroTokenValue::VaOptEnd,
+                                    whitespace: false,
+                                    spelling: Spelling::Canonical,
+                                });
+                            }
+                        }
                         body.push(MacroToken {
                             typ: TokenType::Ident,
                             value: MacroTokenValue::VaArgs,
@@ -646,6 +841,75 @@ impl<'a> Preprocessor<'a> {
         Some(args)
     }
 
+    /// Whether a variadic macro's trailing arguments amount to no tokens.
+    ///
+    /// C23 6.10.5.1 asks this of the arguments *before* expansion, so it is a
+    /// token count and not a question about what they expand to: `F(a,)` is
+    /// empty, `F(a, EMPTY)` is not, even when `EMPTY` expands to nothing.
+    ///
+    /// Two shapes mean "no arguments", because `collect_macro_args` yields an
+    /// empty vector for `F()` and a one-empty-argument vector for `F(a,)`. It
+    /// is deliberately not "all arguments empty": `F(a,,)` denotes a comma and
+    /// is *not* empty.
+    fn variadic_is_empty(mac: &Macro, args: &[Vec<Token>]) -> bool {
+        let va: Vec<_> = args.iter().skip(mac.params.len()).collect();
+        va.is_empty() || (va.len() == 1 && va[0].is_empty())
+    }
+
+    /// Whether a `##` sits next to `body[i]` in direction `step`, looking past
+    /// the `__VA_OPT__` group markers.
+    ///
+    /// Those markers are not tokens of the replacement list; they say where a
+    /// group begins and ends. A paste written against the group -- as in
+    /// `a ## __VA_OPT__(b)` -- is adjacent to the token inside it, and stopping
+    /// at the marker would silently drop the paste.
+    fn paste_adjacent(body: &[MacroToken], i: usize, step: isize) -> bool {
+        let mut j = i as isize + step;
+        while j >= 0 && (j as usize) < body.len() {
+            match body[j as usize].value {
+                MacroTokenValue::VaOptStart { .. } | MacroTokenValue::VaOptEnd => j += step,
+                MacroTokenValue::Paste => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// A body slice with parameters replaced by their arguments *as written*.
+    ///
+    /// This is what `#` sees: 6.10.3.2p2 stringifies the argument's own
+    /// spelling, not what it expands to, and `#__VA_OPT__(...)` inherits that.
+    fn substitute_unexpanded(
+        &self,
+        mac: &Macro,
+        args: &[Vec<Token>],
+        body: &[MacroToken],
+        pos: &Position,
+        idents: &mut IdentTable,
+    ) -> Vec<Token> {
+        let mut out = Vec::new();
+        for mt in body {
+            match &mt.value {
+                MacroTokenValue::Param(idx) => {
+                    out.extend(args.get(*idx).cloned().unwrap_or_default())
+                }
+                MacroTokenValue::VaArgs => {
+                    out.extend(Self::join_variadic_args(args, mac.params.len()))
+                }
+                // A nested group's markers contribute nothing of their own, and
+                // `#`/`##` inside a stringified group are spelled as written.
+                MacroTokenValue::VaOptStart { .. } | MacroTokenValue::VaOptEnd => {}
+                MacroTokenValue::Paste => out.push(Token::with_value(
+                    TokenType::Special,
+                    *pos,
+                    TokenValue::Special(SpecialToken::HashHash as u32),
+                )),
+                _ => out.push(self.macro_token_to_token(mt, pos, idents)),
+            }
+        }
+        out
+    }
+
     /// Expand a function-like macro
     /// C17 6.10.3p4: a function-like macro invocation must supply as many
     /// arguments as the definition has parameters (and at least that many for a
@@ -723,11 +987,47 @@ impl<'a> Preprocessor<'a> {
             let mt = &mac.body[i];
 
             // Check for token pasting
-            let next_is_paste =
-                i + 1 < mac.body.len() && matches!(mac.body[i + 1].value, MacroTokenValue::Paste);
-            let prev_was_paste = i > 0 && matches!(mac.body[i - 1].value, MacroTokenValue::Paste);
+            let next_is_paste = Self::paste_adjacent(&mac.body, i, 1);
+            let prev_was_paste = Self::paste_adjacent(&mac.body, i, -1);
 
             match &mt.value {
+                MacroTokenValue::VaOptStart { end, stringify } => {
+                    let empty = Self::variadic_is_empty(mac, args);
+                    if *stringify {
+                        // `#__VA_OPT__(...)`: one string token standing for the
+                        // whole group, so the group's own tokens are never
+                        // emitted and the scan resumes past it either way.
+                        let text = if empty {
+                            String::new()
+                        } else {
+                            let inner = self.substitute_unexpanded(
+                                mac,
+                                args,
+                                &mac.body[i + 1..*end - 1],
+                                pos,
+                                idents,
+                            );
+                            self.stringify_arg(&inner, idents)
+                        };
+                        let mut str_pos = *pos;
+                        str_pos.whitespace = mt.whitespace;
+                        str_pos.newline = false;
+                        result.push(Token::with_value(
+                            TokenType::String,
+                            str_pos,
+                            TokenValue::String(text),
+                        ));
+                        i = *end;
+                        continue;
+                    }
+                    // The group's content stands only when there are variadic
+                    // arguments; otherwise skip past its end entirely.
+                    if empty {
+                        i = *end;
+                        continue;
+                    }
+                }
+                MacroTokenValue::VaOptEnd => {}
                 MacroTokenValue::Paste => {
                     // Skip paste markers
                     i += 1;
@@ -817,24 +1117,6 @@ impl<'a> Preprocessor<'a> {
                 MacroTokenValue::VaArgs => {
                     // Variadic arguments
                     let start = mac.params.len();
-                    let va_args: Vec<_> = args.iter().skip(start).collect();
-                    let va_args_empty =
-                        va_args.is_empty() || (va_args.len() == 1 && va_args[0].is_empty());
-
-                    // GNU extension: ,##__VA_ARGS__ - suppress comma when VA_ARGS is empty
-                    if prev_was_paste && va_args_empty {
-                        // Check if the previous token (before ##) was a comma and remove it
-                        if let Some(last) = result.last() {
-                            if let TokenValue::Special(code) = &last.value {
-                                if *code == b',' as u32 {
-                                    result.pop(); // Remove the comma
-                                }
-                            }
-                        }
-                        // Skip emitting empty VA_ARGS
-                        i += 1;
-                        continue;
-                    }
 
                     let va_start = result.len();
                     for (j, arg) in args.iter().enumerate().skip(start) {

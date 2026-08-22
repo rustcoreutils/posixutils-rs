@@ -167,8 +167,24 @@ pub enum MacroTokenValue {
     Stringify(usize),
     /// Token paste marker (##)
     Paste,
-    /// __VA_ARGS__ (index of variadic params start)
+    /// `__VA_ARGS__`, or the GNU name standing in for it. The variadic
+    /// arguments begin at `params.len()`; nothing is carried here.
     VaArgs,
+    /// The start of a `__VA_OPT__(...)` group.
+    ///
+    /// Flat markers rather than a nested list, because the substitution loop's
+    /// paste lookbehind indexes `body[i-1]` and `body[i+1]` directly -- a
+    /// nested group would put a list where a token has to be, and
+    /// `x ## __VA_OPT__(y)` would stop pasting.
+    VaOptStart {
+        /// The index just past the matching [`MacroTokenValue::VaOptEnd`].
+        end: usize,
+        /// Whether a `#` was written against the group, making the result the
+        /// spelling of what it produces rather than the tokens themselves.
+        stringify: bool,
+    },
+    /// The end of a `__VA_OPT__(...)` group.
+    VaOptEnd,
 }
 
 /// Built-in macro types

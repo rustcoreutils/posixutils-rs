@@ -502,6 +502,7 @@ impl<'a> Preprocessor<'a> {
             &params,
             variadic_name.as_deref(),
             is_function,
+            is_variadic,
             idents,
         );
 

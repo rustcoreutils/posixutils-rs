@@ -1674,3 +1674,167 @@ fn preprocessor_recovery_keeps_processing_the_rest_of_the_file() {
         "the later directive is not passed through",
     );
 }
+
+/// C23 6.10.5: `__VA_OPT__(content)` is `content` when the variadic arguments
+/// have at least one token, and nothing when they do not. gcc and clang accept
+/// it in every mode; c17 used to pass it through literally.
+///
+/// Each row was probed against gcc before being written down.
+#[test]
+fn preprocessor_va_opt() {
+    for (name, def, empty_call, full_call, want_empty, want_full) in [
+        // The idiom it exists for: a separator that appears only when there is
+        // something to separate.
+        (
+            "separator",
+            "#define P(f,...) g(f __VA_OPT__(,) __VA_ARGS__)",
+            "P(a)",
+            "P(a,b)",
+            "g(a)",
+            "g(a, b)",
+        ),
+        // `##` reaches into the group: the markers are not tokens, so paste
+        // adjacency has to look past them.
+        (
+            "paste_into",
+            "#define Q(...) a ## __VA_OPT__(b)",
+            "Q()",
+            "Q(1)",
+            "a",
+            "ab",
+        ),
+        // The content may contain parentheses of its own.
+        (
+            "nested_parens",
+            "#define N(...) __VA_OPT__(f(a,b))",
+            "N()",
+            "N(1)",
+            "",
+            "f(a,b)",
+        ),
+        // A group that produces nothing still separates its neighbours.
+        (
+            "adjacent",
+            "#define R(...) __VA_OPT__(x)y",
+            "R()",
+            "R(1)",
+            "y",
+            "x y",
+        ),
+        // `#` against the group gives its spelling, or the empty string.
+        (
+            "stringify",
+            "#define S(...) #__VA_OPT__(x)",
+            "S()",
+            "S(1)",
+            "\"\"",
+            "\"x\"",
+        ),
+        // `##` inside the group works like `##` anywhere.
+        (
+            "paste_inside",
+            "#define D(...) __VA_OPT__(a ## b)",
+            "D()",
+            "D(1)",
+            "",
+            "ab",
+        ),
+    ] {
+        let src = format!("{}\nA {}\nB {}\n", def, empty_call, full_call);
+        let r = preprocess_text(&format!("va_opt_{}", name), &src, &["-P"]);
+        assert!(r.success, "{}: -E failed: {}", name, r.stderr);
+
+        let line = |prefix: &str| -> String {
+            r.stdout
+                .lines()
+                .find(|l| l.trim_start().starts_with(prefix))
+                .unwrap_or_default()
+                .trim()
+                .strip_prefix(prefix)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            line("A"),
+            want_empty,
+            "{}: empty variadic\n{}",
+            name,
+            r.stdout
+        );
+        assert_eq!(
+            line("B"),
+            want_full,
+            "{}: non-empty variadic\n{}",
+            name,
+            r.stdout
+        );
+    }
+}
+
+/// An empty *argument* is not the same as no arguments: C23 asks the question
+/// of the argument tokens before expansion, so `F(a,)` is empty and `F(a,,)`
+/// — which denotes a comma — is not.
+#[test]
+fn preprocessor_va_opt_emptiness_is_about_tokens() {
+    let src = "#define P(f,...) g(f __VA_OPT__(!) __VA_ARGS__)\n\
+               #define EMPTY\nA P(a)\nB P(a,)\nC P(a,,)\nD P(a,EMPTY)\n";
+    let r = preprocess_text("va_opt_empty", src, &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let has = |prefix: &str| -> bool {
+        r.stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with(prefix))
+            .is_some_and(|l| l.contains('!'))
+    };
+    assert!(!has("A"), "no arguments at all is empty:\n{}", r.stdout);
+    assert!(!has("B"), "one empty argument is empty:\n{}", r.stdout);
+    assert!(
+        has("C"),
+        "two empty arguments denote a comma:\n{}",
+        r.stdout
+    );
+    assert!(
+        has("D"),
+        "an argument that expands to nothing is still a token:\n{}",
+        r.stdout
+    );
+}
+
+/// In a non-variadic macro `__VA_OPT__` means nothing. gcc warns and leaves it
+/// alone rather than rejecting the definition.
+#[test]
+fn preprocessor_va_opt_in_a_non_variadic_macro_warns() {
+    let r = preprocess_text(
+        "va_opt_nonvariadic",
+        "#define E(a) __VA_OPT__(x)\nA E(1)\n",
+        &["-P"],
+    );
+    assert!(r.success, "it is a warning, not an error:\n{}", r.stderr);
+    assert!(
+        r.stderr.contains("__VA_OPT__"),
+        "expected a diagnostic naming it, got:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stdout.contains("__VA_OPT__(x)"),
+        "and it is left alone:\n{}",
+        r.stdout
+    );
+}
+
+/// An expansion that produces nothing must not take the *next* token's line
+/// break with it.
+///
+/// The invocation's spacing is handed to whichever token comes next, so that
+/// an expansion beginning with a macro that expands to nothing still lands
+/// where the invocation stood. When the expansion is empty the token it lands
+/// on is the next one from the *file*, which already knows where it stands —
+/// so the flags are added to, never taken away. Overwriting merged the lines:
+/// `#define E` with `A E` and `B c` came out as `A B c`.
+#[test]
+fn preprocessor_empty_expansion_keeps_the_next_line_break() {
+    let r = preprocess_text("empty_expansion_break", "#define E\nA E\nB c\n", &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(r.stdout, "A\nB c\n", "the lines must stay separate");
+}

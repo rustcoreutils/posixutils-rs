@@ -869,3 +869,63 @@ int main(void) {
     assert_eq!(compile_and_run("cond_rank", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("cond_rank_opt", code), 0);
 }
+
+/// The usual arithmetic conversions now have one implementation, on the type
+/// table, and the binary operators and the conditional both reach it. They
+/// used to have two, which had drifted: the table compared `size_bits` where
+/// the parser ranked by kind, so they disagreed about `long` against
+/// `long long`.
+///
+/// C17 6.3.1.8 needs rank *and* width, which are different questions -- `long`
+/// and `long long` rank apart at the same width. Each of the standard's three
+/// mixed-signedness steps gets a case here.
+#[test]
+fn c99_usual_arithmetic_conversions_rank_and_width() {
+    let code = r#"
+#define TY(e) _Generic((e), \
+    int: 1, unsigned int: 2, long: 3, unsigned long: 4, \
+    long long: 5, unsigned long long: 6, default: 0)
+int c(void) { return 1; }
+int main(void) {
+    int i = 1; unsigned u = 1;
+    long l = 1; unsigned long ul = 1;
+    long long ll = 1; unsigned long long ull = 1;
+    unsigned char uc = 1; short sh = 1;
+
+    /* Same signedness: the higher rank wins, at equal width too. */
+    if (TY(l + ll) != 5) return 1;
+    if (TY(ll + l) != 5) return 2;
+    if (TY(ul + ull) != 6) return 3;
+    if (TY(i + ll) != 5) return 4;
+
+    /* Mixed, unsigned ranks at least as high: the unsigned type. */
+    if (TY(l + ul) != 4) return 5;
+    if (TY(i + u) != 2) return 6;
+
+    /* Mixed, signed ranks higher AND is wider, so it holds every value of the
+       unsigned one and keeps its sign. This is the case a rank-only rule gets
+       wrong -- `-1L / 2u` really is negative, so it truncates to 0. */
+    if (TY(l + u) != 3) return 7;
+    if (TY(u + l) != 3) return 8;
+    if (-1L / 2u != 0) return 9;
+
+    /* Mixed, signed ranks higher but has no room to spare: neither represents
+       the other, so the unsigned counterpart of the signed type. */
+    if (TY(ul + ll) != 6) return 10;
+    if (TY(ll + ul) != 6) return 11;
+
+    /* Both narrower than int: promotion strips the signedness first. */
+    if (TY(uc + sh) != 1) return 12;
+    if ((unsigned char)200 / -1 != -200) return 13;
+
+    /* And the conditional gives the same answers, since it is the same code. */
+    if (TY(c() ? l : ll) != 5) return 14;
+    if (TY(c() ? ul : ll) != 6) return 15;
+    if (TY(c() ? l : u) != 3) return 16;
+    if (TY(c() ? uc : sh) != 1) return 17;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("uac_rank_width", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("uac_rank_width_opt", code), 0);
+}

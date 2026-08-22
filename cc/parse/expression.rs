@@ -312,24 +312,37 @@ impl<'a> Parser<'a> {
             return self.types.float_id;
         }
 
-        // Integer types: promote both, then pick the wider/unsigned
-        let then_size = self.types.size_bits(then_typ).max(32); // integer promotion
+        // Integers: C17 6.3.1.8, the usual arithmetic conversions.
+        //
+        // Promotion first -- anything narrower than `int` becomes `int`, since
+        // `int` holds all its values whether it was signed or not, so a narrow
+        // type's own signedness does not survive.
+        let then_size = self.types.size_bits(then_typ).max(32);
         let else_size = self.types.size_bits(else_typ).max(32);
+        let promoted_unsigned = |t| self.types.size_bits(t) >= 32 && self.types.is_unsigned(t);
 
-        // Pick the wider type, or int if both are narrow
-        if then_size >= else_size && then_size >= 32 {
-            if then_size == 32 {
-                return self.types.int_id;
-            }
-            return then_typ;
+        if then_size != else_size {
+            // A strictly wider signed type represents every value of the
+            // narrower one, so rank alone decides.
+            return if then_size > else_size {
+                then_typ
+            } else {
+                else_typ
+            };
         }
-        if else_size >= then_size && else_size >= 32 {
-            if else_size == 32 {
-                return self.types.int_id;
-            }
-            return else_typ;
+
+        // Equal rank, and this is where it went wrong: an unsigned operand
+        // wins. Collapsing every 32-bit pair to `int` made `(long)(u ?: -1)`
+        // with `unsigned u = 0` give -1 where C gives 4294967295, and at 64
+        // bits it kept whichever arm was written first.
+        match (promoted_unsigned(then_typ), promoted_unsigned(else_typ)) {
+            (true, _) => then_typ,
+            (_, true) => else_typ,
+            // Both signed. A promoted narrow type is `int`; anything already
+            // at least that wide keeps its own type.
+            _ if then_size == 32 => self.types.int_id,
+            _ => then_typ,
         }
-        self.types.int_id
     }
 
     /// Apply the array-to-pointer and function-to-pointer decays of C17

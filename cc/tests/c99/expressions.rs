@@ -737,3 +737,49 @@ int main(void) {
         0
     );
 }
+
+/// C17 6.3.1.8: the arms of a conditional expression go through the usual
+/// arithmetic conversions, so at equal rank an unsigned operand wins.
+///
+/// Every 32-bit pair was collapsed to `int` instead, which made
+/// `(long)(u ?: -1)` with `unsigned u = 0` give -1 where C gives 4294967295;
+/// at 64 bits the type was whichever arm happened to be written first.
+///
+/// Each case picks the arm whose *own* type is not the common one, since that
+/// is the only arm a conversion has anything to do to.
+#[test]
+fn c99_conditional_usual_arithmetic_conversions() {
+    let code = r#"
+int t(void) { return 1; }
+int f(void) { return 0; }
+int main(void) {
+    unsigned u = 0;
+    long sl = -1;
+    unsigned long ul = 1;
+
+    // Equal rank, one unsigned: the unsigned type wins, so the -1 arm is
+    // converted to UINT_MAX before the result widens to long.
+    if ((long)(f() ? u : -1) != 4294967295L) return 1;
+    if ((long)(f() ? -1 : u) != 0L) return 2;
+    if ((long)(u ?: -1) != 4294967295L) return 3;
+
+    // Equal rank at 64 bits: still the unsigned one, whichever arm it is.
+    if ((f() ? ul : sl) != 18446744073709551615UL) return 4;
+    if ((f() ? sl : ul) != 1UL) return 5;
+
+    // Unequal rank: the wider type, which being signed represents every value
+    // of the narrower unsigned one.
+    if ((t() ? sl : u) != -1L) return 6;
+
+    // A type narrower than `int` promotes to `int`, so its own signedness does
+    // not survive to decide anything.
+    unsigned char uc = 200;
+    if ((long)(t() ? (signed char)-1 : 1) != -1L) return 7;
+    if ((long)(f() ? uc : -1) != -1L) return 8;
+    if ((long)(f() ? (unsigned short)1 : -1) != -1L) return 9;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cond_uac", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("cond_uac_opt", code), 0);
+}

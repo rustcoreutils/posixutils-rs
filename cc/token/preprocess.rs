@@ -535,6 +535,25 @@ struct LineMarker {
     delta: i64,
 }
 
+/// The payload prefix a marker uses when it carries a pragma c17 does not act
+/// on and only needs to reproduce.
+const PRAGMA_TEXT_PREFIX: &str = "text:";
+
+/// The directive a marker token stands for, when it is one c17 only carries.
+///
+/// `#pragma pack` is the one pragma that changes what the compiler does, so it
+/// travels decoded, as a [`PackAction`]. Everything else travels as its own
+/// text: c17 does not act on `#pragma GCC diagnostic` or an OpenMP directive,
+/// but POSIX makes a `.i` a valid operand and c17 compiles one, so dropping
+/// them made preprocessing and compiling in two steps mean something different
+/// from doing it in one.
+pub fn pragma_text(token: &Token) -> Option<String> {
+    match &token.value {
+        TokenValue::String(s) => s.strip_prefix(PRAGMA_TEXT_PREFIX).map(str::to_string),
+        _ => None,
+    }
+}
+
 /// What a `#pragma pack` directive does to the packing state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackAction {

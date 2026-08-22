@@ -433,3 +433,77 @@ fn preprocessor_unguarded_include_cycle_is_bounded() {
         r.stderr
     );
 }
+
+/// `c17 -E` used to keep one pragma line out of five. POSIX makes a `.i` a
+/// valid operand and c17 compiles one, so dropping the rest meant that
+/// preprocessing and compiling in two steps did something different from
+/// compiling in one.
+#[test]
+fn preprocessor_every_pragma_survives_preprocessing() {
+    let src = "#pragma GCC visibility push(default)\n\
+               #pragma GCC diagnostic ignored \"-Wunused\"\n\
+               #pragma omp parallel for\n\
+               #pragma pack(1)\n\
+               _Pragma(\"GCC diagnostic pop\")\n\
+               int q;\n";
+    let r = preprocess_text("all_pragmas", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    for want in [
+        "#pragma GCC visibility push(default)",
+        "#pragma GCC diagnostic ignored \"-Wunused\"",
+        "#pragma omp parallel for",
+        "#pragma pack(1)",
+        // The operator lowers to the directive it stands for (C99 6.10.9p1).
+        "#pragma GCC diagnostic pop",
+    ] {
+        assert!(
+            r.stdout.contains(want),
+            "expected {:?} in:\n{}",
+            want,
+            r.stdout
+        );
+    }
+    assert_eq!(
+        r.stdout.matches("#pragma").count(),
+        5,
+        "expected exactly five pragma lines:\n{}",
+        r.stdout
+    );
+}
+
+/// A `_Pragma` operand is a string literal, so the escaping the lexer kept has
+/// to come back off before the directive is written.
+#[test]
+fn preprocessor_pragma_operator_destringifies() {
+    let r = preprocess_text(
+        "pragma_destringify",
+        "_Pragma(\"GCC diagnostic ignored \\\"-Wunused\\\"\")\nint q;\n",
+        &[],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(
+        r.stdout
+            .contains("#pragma GCC diagnostic ignored \"-Wunused\""),
+        "the operand's escaping should be undone:\n{}",
+        r.stdout
+    );
+}
+
+/// Preprocessing to a `.i` and compiling that must lay a struct out the same
+/// way as compiling the source directly — which is the whole reason the
+/// pragmas have to survive.
+#[test]
+fn preprocessor_packing_survives_a_two_step_compile() {
+    let src = r#"
+#pragma pack(push, 1)
+struct S { char c; int i; };
+#pragma pack(pop)
+struct T { char c; int i; };
+int main(void) {
+    if (sizeof(struct S) != 5) return 1;
+    if (sizeof(struct T) <= 5) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("pack_two_step", src, &[]), 0);
+}

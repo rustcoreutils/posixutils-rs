@@ -16,6 +16,31 @@
 
 use super::*;
 
+/// Undo the escaping of a `_Pragma` operand (C99 6.10.9p1): `\\"` becomes `"`
+/// and `\\\\` becomes `\\`, and nothing else changes.
+fn destringify(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            // Any other escape is not one this operator introduced, so it
+            // stands as written.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 impl<'a> Preprocessor<'a> {
     /// Handle a preprocessor directive
     /// The directives that survive into an already-preprocessed file.
@@ -154,7 +179,7 @@ impl<'a> Preprocessor<'a> {
             crate::kw::INCLUDE_NEXT => self.handle_include(iter, output, idents, hash_token, true),
             crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
-            crate::kw::PRAGMA => self.handle_pragma(iter, output, idents),
+            crate::kw::PRAGMA => self.handle_pragma(iter, output, idents, hash_token.pos),
             crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
             // `#ident` and `#sccs` carry a version string for the object file.
             // c17 records nothing, but they are directives it knows, so they
@@ -295,6 +320,21 @@ impl<'a> Preprocessor<'a> {
             diag::warning_args(pos, "extra tokens at end of #{0} directive", &[directive]);
         }
         self.skip_to_eol(iter);
+    }
+
+    /// A pragma's tokens, written back out as the directive they came from.
+    ///
+    /// Spacing follows each token's own `whitespace` flag, so the line reads
+    /// the way it was written rather than the way a default joiner would guess.
+    fn pragma_line_text(line: &[Token], idents: &IdentTable) -> String {
+        let mut out = String::from("#pragma");
+        for (i, token) in line.iter().enumerate() {
+            if i == 0 || token.pos.whitespace {
+                out.push(' ');
+            }
+            out.push_str(&show_token(token, idents));
+        }
+        out
     }
 
     fn skip_to_eol(&self, iter: &mut TokenCursor) {
@@ -1180,11 +1220,24 @@ impl<'a> Preprocessor<'a> {
         iter: &mut TokenCursor,
         output: &mut Vec<Token>,
         idents: &IdentTable,
+        hash_pos: Position,
     ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
         }
+
+        // Take the whole line up front. The recognisers below consume from it,
+        // and whatever they do not act on still has to be reproduced verbatim,
+        // which needs the tokens as they were written.
+        let line = self.collect_to_eol(iter);
+        let verbatim = Self::pragma_line_text(&line, idents);
+        let emit_verbatim = |pp: &mut Self, output: &mut Vec<Token>| {
+            let mut marker = Token::new(TokenType::Pragma, pp.remap_pos(hash_pos));
+            marker.value = TokenValue::String(format!("{}{}", PRAGMA_TEXT_PREFIX, verbatim));
+            output.push(marker);
+        };
+        let iter = &mut TokenCursor::new(line);
 
         // Check for #pragma once and #pragma STDC
         if let Some(token) = iter.peek() {
@@ -1215,6 +1268,10 @@ impl<'a> Preprocessor<'a> {
                         if let Ok(canonical) = Path::new(&self.current_file).canonicalize() {
                             self.once_files.insert(canonical);
                         }
+                        // Acted on, and still reproduced: a `.i` that had lost
+                        // its `#pragma once` would be included twice.
+                        emit_verbatim(self, output);
+                        return;
                     } else if name == "STDC" {
                         let pos = token.pos;
                         iter.next(); // consume "STDC"
@@ -1270,14 +1327,17 @@ impl<'a> Preprocessor<'a> {
                             );
                         }
 
-                        self.skip_to_eol(iter);
+                        emit_verbatim(self, output);
                         return;
                     }
                 }
             }
         }
 
-        self.skip_to_eol(iter);
+        // Anything c17 does not act on -- `#pragma GCC ...`, `#pragma weak`,
+        // OpenMP, a vendor pragma -- is carried through unchanged rather than
+        // discarded.
+        emit_verbatim(self, output);
     }
 
     /// Handle _Pragma operator (C99)
@@ -1313,11 +1373,21 @@ impl<'a> Preprocessor<'a> {
             return;
         }
         if let TokenValue::String(body) = &token.value {
-            if let Some(action) = parse_pragma_text(body, token.pos) {
-                let mut marker = Token::new(TokenType::Pragma, self.remap_pos(token.pos));
-                marker.value = TokenValue::String(action.encode());
-                output.push(marker);
-            }
+            let pos = self.remap_pos(token.pos);
+            let mut marker = Token::new(TokenType::Pragma, pos);
+            marker.value = TokenValue::String(match parse_pragma_text(body, token.pos) {
+                Some(action) => action.encode(),
+                // Not one c17 acts on, so it travels as the directive it
+                // stands for. C99 6.10.9p1 makes `_Pragma("x")` mean
+                // `#pragma x`, and the operand is a string literal, so the
+                // escaping the lexer kept has to come back off.
+                None => format!(
+                    "{}#pragma {}",
+                    PRAGMA_TEXT_PREFIX,
+                    destringify(&payload_text(body))
+                ),
+            });
+            output.push(marker);
         }
 
         // Expect ')' - if not found or malformed, silently ignore

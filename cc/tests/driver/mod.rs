@@ -1496,7 +1496,10 @@ fn driver_dash_dm_dumps_macro_definitions() {
         "m.c",
         "#define OBJ 1\n#define FN(a,b) ((a)+(b))\n#define EMPTY\n\
          #define VAR(...) f(__VA_ARGS__)\n#define STR(x) #x\n#define CAT(a,b) a##b\n\
-         #define GNU(a, rest...) g(rest)\nint v;\n",
+         #define GNU(a, rest...) g(rest)\n\
+         #define OPT(a,...) a __VA_OPT__(, __VA_ARGS__)\n\
+         #define OPTP(...) __VA_OPT__(f(a,b)) end\n\
+         #define OPTS(...) #__VA_OPT__(q)\nint v;\n",
     );
     let r = run_c17(&["-dM", "-E", &s(&src)]);
     assert!(r.success, "-dM failed: {}", r.stderr);
@@ -1511,6 +1514,12 @@ fn driver_dash_dm_dumps_macro_definitions() {
         "#define CAT(a,b) a##b",
         // The GNU named-variadic spelling round-trips as itself.
         "#define GNU(a,rest...) g(rest)",
+        // The group markers are flat -- one token for `__VA_OPT__(` and one
+        // for `)` -- so without arms of their own they fell to the catch-all
+        // and printed `<ident?>` at each end.
+        "#define OPT(a,...) a __VA_OPT__(, __VA_ARGS__)",
+        "#define OPTP(...) __VA_OPT__(f(a,b)) end",
+        "#define OPTS(...) #__VA_OPT__(q)",
     ] {
         assert!(
             r.stdout.contains(want),

@@ -520,6 +520,41 @@ fn cflow_reproduces_spec_example() {
     assert_eq!(squeeze(&stdout), expected, "raw output was:\n{}", stdout);
 }
 
+/// `a ?: b` has two subexpressions, not three, and the walker `-i` uses had no
+/// arm for it -- so it fell into the catch-all and reported neither half, while
+/// the spelled-out `a ? a : b` reported both.
+#[test]
+fn cflow_elvis_operands_are_visited() {
+    let dir = TempDir::new().unwrap();
+    let body =
+        "int gvar;\nint other;\nint pick(void) { return %s; }\nint main(void) { return pick(); }\n";
+
+    let elvis = src(&dir, "elvis.c", &body.replace("%s", "gvar ?: other"));
+    let (elvis_out, _, _) = run("cflow", &["-i", "x", &elvis]);
+
+    let ternary = src(
+        &dir,
+        "ternary.c",
+        &body.replace("%s", "gvar ? gvar : other"),
+    );
+    let (ternary_out, _, _) = run("cflow", &["-i", "x", &ternary]);
+
+    for want in ["gvar: int", "other: int"] {
+        assert!(
+            elvis_out.contains(want),
+            "expected {:?} from `?:`:\n{}",
+            want,
+            elvis_out
+        );
+    }
+    // Same graph either way, once the filenames are taken out of it.
+    assert_eq!(
+        elvis_out.replace("elvis.c", "F"),
+        ternary_out.replace("ternary.c", "F"),
+        "`?:` and the spelled-out conditional should give the same graph"
+    );
+}
+
 /// #F2: without -i x, data symbols stay out of the graph.
 #[test]
 fn cflow_data_symbols_require_i_x() {

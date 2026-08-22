@@ -479,6 +479,13 @@ fn visit_subexprs(
             f(then_expr);
             f(else_expr);
         }
+        // `a ?: b`, where the condition is also the true arm, so there are two
+        // subexpressions rather than three. Falling into the catch-all below
+        // meant `-i` never reported either half.
+        ExprKind::CondElvis { cond, else_expr } => {
+            f(cond);
+            f(else_expr);
+        }
         ExprKind::Member { expr, .. } | ExprKind::Arrow { expr, .. } => f(expr),
         ExprKind::Index { array, index } => {
             f(array);

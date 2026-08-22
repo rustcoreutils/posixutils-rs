@@ -498,8 +498,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Get memory address for x87 operand.
-    /// Long doubles are always in memory per System V AMD64 ABI.
     /// Materialize the *address* of a pseudo's storage into a register.
     ///
     /// A stack slot means one of two things: for a symbol pseudo the slot is

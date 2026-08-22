@@ -221,8 +221,6 @@ pub fn expire_stack_intervals(
 /// x86_64). Without this, chordal coloring will happily put a live
 /// pseudo into a caller-saved register that the codegen helper's
 /// embedded libc call silently overwrites — see `memory/MEMORY.md`
-/// "Variadic float argument promotion" and the M6+M7 era xmm0
-/// clobber bugs for the historical context.
 pub fn find_call_positions(func: &Function, is_call_like: impl Fn(Opcode) -> bool) -> Vec<usize> {
     let mut call_positions = Vec::with_capacity(DEFAULT_CALL_POS_CAPACITY);
     let mut pos = 0usize;
@@ -261,14 +259,6 @@ pub struct LivenessResult<R> {
 ///
 /// This is the shared core of live interval computation used by both x86-64 and AArch64.
 /// The `get_constraint_info` callback allows architecture-specific constraint handling.
-///
-/// # Arguments
-/// * `func` - The function to analyze
-/// * `get_constraint_info` - Callback that returns constraint info for an instruction:
-///   - Returns `Some((clobbers, involved_pseudos))` if the instruction has register constraints
-///   - Returns `None` if no constraints apply
-///
-/// The callback signature: `Fn(&Instruction) -> Option<(Vec<R>, Vec<PseudoId>)>`
 pub fn compute_live_intervals<R, F>(func: &Function, get_constraint_info: F) -> LivenessResult<R>
 where
     R: Clone,
@@ -821,10 +811,6 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
     }
 }
 
-// ============================================================================
-// Chordal coloring on the SSA interference graph (M6)
-// ============================================================================
-//
 // SSA interference graphs are chordal (Pereira/Palsberg 2005, Hack
 // 2005): a perfect elimination ordering exists and greedy coloring on
 // that ordering achieves the chromatic number. The two-step recipe:
@@ -1000,26 +986,6 @@ pub fn build_interference_graph(
     }
     graph
 }
-
-// ============================================================================
-// M9 — Register Coalescing helpers
-// ============================================================================
-//
-// Coalescing reduces the number of `Opcode::Copy` instructions that
-// emit a real `mov` by giving the source and target pseudos the same
-// physical location. After M9b's post-coloring opportunistic merge
-// reassigns matching `Loc`s, the surviving Copy becomes identity and
-// M9a's codegen short-circuit elides it.
-//
-// c17 uses the simplest viable strategy: walk every Copy after
-// chordal coloring completes, and migrate the target pseudo to the
-// source's location when the migration is safe (no interference, no
-// pre-color conflict, no forbidden-set violation, no neighbor of the
-// target already at the source's register). Naive — no Briggs
-// degree analysis, no global iteration to a fixed point — but it
-// captures most low-hanging copies introduced by phi elimination,
-// matched-asm-constraint initializers, and parameter shuffling, and
-// the CPython smoke test catches any allocator drift.
 
 /// Walk `func` and collect every `Opcode::Copy` instruction's
 /// `(target, src)` pair as a coalescing candidate. Skips Copies
@@ -1247,16 +1213,6 @@ pub fn try_reuse_stack_slot(
     None
 }
 
-// ============================================================================
-// Allocator–ABI contract layer (M1)
-// ============================================================================
-//
-// Both per-arch register allocators previously re-derived argument
-// classification inline — repeating type-kind checks (`is_float`,
-// `is_complex`, `is_long_double`, `is_int128`, struct-size thresholds)
-// that the `cc/abi/*::classify_param` implementations already perform.
-// Two sources of truth, two opportunities to drift.
-//
 // `AbiLowering` centralizes that contract:
 //
 //   * Build it once per function with the `Function` + `TypeTable`. It

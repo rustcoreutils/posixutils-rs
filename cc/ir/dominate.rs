@@ -342,13 +342,6 @@ impl LevelQueue {
 ///
 /// Uses the linear time algorithm from:
 /// "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
-///
-/// # Arguments
-/// * `func` - The function (must have dominator tree built)
-/// * `alpha` - The set of defining blocks
-///
-/// # Returns
-/// * Vector of blocks in the IDF
 pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId> {
     if func.max_dom_level == 0 && func.blocks.len() > 1 {
         // Dominator tree not built
@@ -499,16 +492,6 @@ mod tests {
 
     fn make_test_cfg() -> Function {
         // Create a simple CFG:
-        //       entry(0)
-        //       /     \
-        //      v       v
-        //    bb1(1)   bb2(2)
-        //       \     /
-        //        v   v
-        //       merge(3)
-        //          |
-        //          v
-        //        exit(4)
 
         let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.void_id);
@@ -637,18 +620,6 @@ mod tests {
     #[test]
     fn test_domtree_with_unreachable_block() {
         // Create a CFG with an unreachable block:
-        //       entry(0)
-        //          |
-        //          v
-        //        bb1(1)
-        //          |
-        //          v
-        //        exit(2)
-        //
-        //    unreachable(3) <-- has edge from nowhere reachable
-        //          |
-        //          v
-        //        bb1(1) <-- unreachable points TO bb1, making bb1 have unreachable as predecessor
 
         let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.void_id);
@@ -677,7 +648,6 @@ mod tests {
         func.blocks = vec![entry, bb1, exit, unreachable];
         func.rebuild_block_idx();
 
-        // This should not panic - the fix skips predecessors not reached during DFS
         domtree_build(&mut func);
 
         // Verify the reachable blocks have correct dominators

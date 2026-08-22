@@ -162,7 +162,6 @@ impl Reg {
         }
     }
 
-    /// Get register name for a given bit size
     pub fn name_for_size(&self, bits: u32) -> &'static str {
         match bits {
             8 => self.name8(),
@@ -172,7 +171,6 @@ impl Reg {
         }
     }
 
-    /// Is this a callee-saved register?
     pub fn is_callee_saved(&self) -> bool {
         matches!(
             self,
@@ -357,17 +355,6 @@ fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
     )
 }
 
-// ============================================================================
-// C4 status — R10/R11 freeing deferred.
-// ============================================================================
-//
-// The C4 milestone intended to add R10/R11 to `Reg::allocatable()`
-// so the chordal allocator could place pseudos in them when their
-// live range doesn't cross an opcode whose codegen helper uses them
-// as scratch. The constraint declaration `opcode_clobbers_r10_r11`
-// above is the infrastructure that *would* make the allocator
-// respect those clobbers.
-//
 // In practice the per-IR-opcode constraint model is **not
 // sufficient**. Inter-instruction codegen paths use R10/R11 in
 // ways no IR-instruction-level constraint can express:
@@ -380,27 +367,6 @@ fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
 // 4. Several FP and struct lowerings use R10/R11 between LIR
 //    pushes that span more than one IR instruction's worth of
 //    LIR output.
-//
-// Empirical proof: adding R10/R11 to `Reg::allocatable()` even
-// with `opcode_clobbers_r10_r11` returning `true` for everything
-// but the 7 truly-trivial opcodes still segfaults CPython's
-// `_bootstrap_python` at deepfreeze generation. The crash site
-// (`ucs1lib_default_find`) is in code whose codegen exercises one
-// of the inter-instruction paths.
-//
-// Genuine freeing requires either:
-// - **Codegen refactor**: every `emit_*` helper takes an
-//   allocator-supplied scratch register. Prologue/epilogue/
-//   variadic-save also route through the allocator. Estimated
-//   4000–8000 LOC change.
-// - **Pre-IR scratch-declaration table**: every helper publishes
-//   its scratch needs into a side table the allocator consults
-//   before liveness analysis; ConstraintPoints get added for
-//   prologue/epilogue positions. Estimated 1500–2500 LOC.
-//
-// Both are multi-session milestones in their own right. C4 ships
-// the constraint-declaration infrastructure that enables either
-// approach without lock-in.
 
 /// Opcodes whose x86_64 codegen lowering invokes an external function
 /// (libc or otherwise) and therefore clobbers caller-saved registers.
@@ -413,12 +379,6 @@ fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
 ///   signbit-double libc call (features.rs:1407+)
 /// - `Memset` / `Memcpy` / `Memmove` → libc memset/memcpy/memmove
 ///   (features.rs:1214+)
-///
-/// Before this list existed, the chordal allocator (M6+M7) had a
-/// latent bug: live FP pseudos in the same block as a `Signbit64`
-/// would be allocated to XMM regs that the emitted libc call
-/// clobbered. Linear scan never used those XMM regs (pop'd from
-/// end of palette) so the bug was invisible until M6.
 pub fn is_call_like_x86_64(op: Opcode) -> bool {
     matches!(
         op,
@@ -518,26 +478,6 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     })
 }
 
-/// Get constraint info for an instruction (used by shared compute_live_intervals).
-/// Returns (clobbered_registers, involved_pseudos) if constraints apply, None otherwise.
-///
-/// Sources:
-/// - **Opcode-level hardware constraints** (`opcode_constraints`):
-///   division clobbers Rax/Rdx; shifts clobber Rcx; vaarg clobbers
-///   Rax/Rcx; mul (int128 path) clobbers Rax/Rdx.
-/// - **Inline-asm explicit clobbers** (`Opcode::Asm`): the parser
-///   collected the asm's clobber list into `AsmData.clobbers`. Named
-///   GP registers in that list become hard clobbers at the asm
-///   position. Special tokens (`"memory"`, `"cc"`) are not GP
-///   register clobbers and are filtered out here — `"memory"` gets
-///   full barrier semantics in C3 via `InstrConstraints.memory_barrier`;
-///   `"cc"` is a no-op for our allocator since we don't track
-///   condition-code liveness.
-///
-/// `involved_pseudos` includes the instruction's target + sources so
-/// they may legally occupy a clobbered register if needed (the
-/// operand exemption — see `pseudos_interfere` documentation). VaArg
-/// is the exception: its sources must NOT alias the clobbered regs.
 /// Build the per-operand `InstrConstraints` view of an inline-asm
 /// instruction. Walks `AsmData.outputs` + `AsmData.inputs` + the
 /// clobber list and produces a single structured value. Returns
@@ -1810,19 +1750,6 @@ impl RegAlloc {
                             // interval of a Sym pseudo only captures
                             // its direct Store/Load/SymAddr uses,
                             // not the lifetime of register pseudos
-                            // that derive their values from the
-                            // slot. Linear scan allocated slot
-                            // offsets monotonically and so happened
-                            // not to reuse Sym slots in conflicting
-                            // ways; chordal coloring exposes the
-                            // gap. CPython `_warnings.o::init_filters`
-                            // and `flowgraph.o::_PyCfgBuilder_Addop`
-                            // both miscompiled on the Sym-slot reuse
-                            // pattern even with the
-                            // [[interval-overlap fix]] (the Sym's
-                            // IR interval ends before the derived
-                            // register pseudo's lifetime does, so
-                            // interval-overlap reports no conflict).
                             //
                             // Future fix: extend the Sym's interval
                             // to cover all derived register pseudos'
@@ -2120,8 +2047,6 @@ impl RegAlloc {
             }
         }
 
-        // -------- M9b post-coloring Copy coalescing --------
-        //
         // For each `Opcode::Copy { target: t, src: [s] }` in the
         // function, try to migrate `t`'s location to `s`'s location
         // (so the Copy becomes identity and M9a elides it). Skip if:
@@ -2136,10 +2061,6 @@ impl RegAlloc {
         //   move would create a conflict)
         // - `t`'s forbidden set contains `s`'s register (the
         //   constraint system reserved that register against `t`)
-        //
-        // Naive non-Briggs heuristic: per-candidate decision, no
-        // global degree analysis. Cargo + CPython gates catch any
-        // mis-coloring.
         let candidates = crate::arch::regalloc::find_copy_coalesce_candidates(func);
         for (t, s) in candidates {
             if !gp_candidates.contains(&t) || !gp_candidates.contains(&s) {
@@ -2183,18 +2104,6 @@ impl RegAlloc {
                 self.used_callee_saved.push(s_reg);
             }
         }
-        // Process spill commits in interval.start order with
-        // monotonic expiration. Earlier (M6+M7 v1) drained everything
-        // with `usize::MAX` then relied on `pseudos_interfere` to
-        // gate reuse — but that check uses block-level live_in/out
-        // sets which miss within-block interference. A spilled
-        // register pseudo whose lifetime sits entirely inside one
-        // block has empty live_in/out projections and was happily
-        // assigned to a slot owned by a Sym pseudo still alive in
-        // the same block (root cause of the CPython
-        // `PyThread_acquire_lock_timed` miscompile — slot reused for
-        // `_PyTime_Add` result while `thelock` was still live).
-        //
         // The monotonic sweep mirrors linear scan's invariant: a
         // slot is only freed once the owning interval has ended,
         // and a new interval's start ≥ the freed slot's owner's
@@ -2444,18 +2353,6 @@ mod arg_location_tests {
     }
 
     /// Where an `Arg` pseudo lives must be where the ABI actually puts it.
-    ///
-    /// This is the check for the hazard recorded as regalloc "Bug 3": that
-    /// `get_location(Arg(0))` answered `Loc::Stack(+8)` -- the saved
-    /// return-address slot -- for an argument that arrives in `%rdi`. Nothing
-    /// read that answer, because every use of an `Arg` went through a `Copy`
-    /// the allocator had placed in a register; folding those away is exactly
-    /// what copy propagation, CSE, GVN and SCCP do, which is why the note
-    /// forbade all four.
-    ///
-    /// A positive `Loc::Stack` is the specific shape that was wrong: on this
-    /// target the callee's own frame is addressed at negative offsets, and the
-    /// caller's incoming area has its own variant.
     #[test]
     fn arg_pseudos_land_where_the_abi_puts_them() {
         let types = TypeTable::new(&Target::host());

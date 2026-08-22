@@ -403,7 +403,6 @@ fn expand_int128_bitwise(
     insns
 }
 
-/// Expand int128 Not into 64-bit operations.
 fn expand_int128_not(
     insn: &Instruction,
     func: &mut Function,
@@ -471,7 +470,6 @@ fn expand_int128_neg(
     insns
 }
 
-/// Expand int128 Add (carry chain).
 fn expand_int128_add(
     insn: &Instruction,
     func: &mut Function,
@@ -510,7 +508,6 @@ fn expand_int128_add(
     insns
 }
 
-/// Expand int128 Sub (borrow chain).
 fn expand_int128_sub(
     insn: &Instruction,
     func: &mut Function,
@@ -726,7 +723,6 @@ fn expand_int128_cmp_ord(
     insns
 }
 
-/// Expand int128 Zext (zero-extend to 128 bits).
 fn expand_int128_zext(
     insn: &Instruction,
     func: &mut Function,
@@ -763,7 +759,6 @@ fn expand_int128_zext(
     insns
 }
 
-/// Expand int128 Sext (sign-extend to 128 bits).
 fn expand_int128_sext(
     insn: &Instruction,
     func: &mut Function,
@@ -811,7 +806,6 @@ fn expand_int128_sext(
 
 // Int128 constant shift expansion helpers
 
-/// Expand int128 Shl by a constant amount into 64-bit operations.
 fn expand_int128_const_shl(
     insn: &Instruction,
     func: &mut Function,
@@ -932,7 +926,6 @@ fn expand_int128_const_shl(
     insns
 }
 
-/// Expand int128 Lsr (logical shift right) by a constant amount into 64-bit operations.
 fn expand_int128_const_lsr(
     insn: &Instruction,
     func: &mut Function,
@@ -1053,7 +1046,6 @@ fn expand_int128_const_lsr(
     insns
 }
 
-/// Expand int128 Asr (arithmetic shift right) by a constant amount into 64-bit operations.
 fn expand_int128_const_asr(
     insn: &Instruction,
     func: &mut Function,

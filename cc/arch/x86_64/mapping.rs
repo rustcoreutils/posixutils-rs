@@ -124,14 +124,6 @@ impl X86_64Mapper {
                 }
             }
             // Float16 <-> integer, converted through `float`.
-            //
-            // These used to emit one direct libcall each -- `__fixhfsi`,
-            // `__floatsihf` and their long/unsigned siblings -- and libgcc
-            // defines not one of them, so valid C failed to link. They also
-            // chose the helper by `dst_size <= 32`, which handed a 128-bit
-            // operand the 64-bit helper and would have read half of it.
-            // Going through `float` fixes both: see
-            // `expand_float16_int_convert`.
             Opcode::FCvtS | Opcode::FCvtU => {
                 if types.kind(insn.src_typ?) != TypeKind::Float16 {
                     return None;
@@ -667,9 +659,7 @@ mod tests {
     }
 
     /// A `_Float16` <-> integer conversion goes through `float`, because
-    /// libgcc implements no half<->integer helper at all. These used to assert
-    /// a single direct call to `__fixhfsi` and its siblings -- the symbols that
-    /// made valid C fail to link.
+    /// libgcc implements no half<->integer helper at all.
     #[test]
     fn test_x86_64_float16_int_conversions_go_through_float() {
         let target = Target::new(Arch::X86_64, Os::Linux);

@@ -167,7 +167,6 @@ impl Reg {
         }
     }
 
-    /// Get register name for a given bit size
     pub fn name_for_size(&self, bits: u32) -> &'static str {
         match bits {
             8 | 16 | 32 => self.name32(),
@@ -175,7 +174,6 @@ impl Reg {
         }
     }
 
-    /// Is this a callee-saved register?
     pub fn is_callee_saved(&self) -> bool {
         matches!(
             self,
@@ -728,7 +726,6 @@ impl IncomingOff {
     /// The first incoming stack argument, just above the saved FP and LR.
     pub const FIRST: IncomingOff = IncomingOff(16);
 
-    /// This argument's offset, advancing `next` past it.
     /// Reserve `bytes` for an argument whose type wants `align`-byte
     /// alignment, and hand back where it starts.
     ///
@@ -793,10 +790,6 @@ pub struct SpilledArg {
     /// The FP register the argument originally arrived in (if FP arg)
     pub from_fp_reg: Option<VReg>,
     /// The slot it was spilled to.
-    ///
-    /// Typed, because this is the value the M4 regression corrupted: the shared
-    /// helper hands the same raw counter to the location closure and to this
-    /// record, each of which used to negate it independently, and one did not.
     pub to_stack_offset: LocalSlot,
     /// Bytes the value occupies.
     ///
@@ -1032,29 +1025,6 @@ fn opcode_clobbers_aarch64_scratches(op: Opcode) -> bool {
             | Opcode::VaEnd
     )
 }
-
-// ============================================================================
-// C5 status — AArch64 codegen scratch freeing deferred.
-// ============================================================================
-//
-// Same story as x86_64's C4 (see the deferred-freeing block in
-// `cc/arch/x86_64/regalloc.rs`). The per-IR-opcode constraint
-// declarations above are the future-extension point for freeing
-// X9 / X10 / X11 (and eventually X16 / X17), but the codegen
-// paths that use these scratches across instruction boundaries
-// (function prologue, callee-saved save/restore, the pair-address
-// legalizer's X16 materialization, int128 lo/hi shuttle) all
-// require either a wholesale codegen refactor or a pre-IR
-// scratch-declaration table before adding the registers to
-// `Reg::allocatable()` is safe.
-//
-// V16 / V17 / V18 (FP scratches in `cc/arch/aarch64/float.rs`)
-// additionally need V-bank ConstraintPoint plumbing through
-// `color_vreg_bank` — same prerequisite the x86_64 XMM14/XMM15
-// freeing has on `color_xmm_bank`.
-//
-// This commit ships the predicate + integration so the eventual
-// freeing change is just `Reg::allocatable()` modification.
 
 /// Build the per-operand `InstrConstraints` view of an inline-asm
 /// instruction. Mirror of `build_asm_instr_constraints_x86_64`.
@@ -1517,8 +1487,7 @@ impl RegAlloc {
             |pseudo, from_reg, to_stack_offset| {
                 // The shared helper hands both closures the same raw counter.
                 // `LocalSlot` applies the sign once, so this record and the
-                // location cannot disagree about which frame they name -- the
-                // M4 regression was exactly that disagreement.
+                // location cannot disagree about which frame they name.
                 spilled_args.push(SpilledArg {
                     pseudo,
                     from_gp_reg: Some(from_reg),

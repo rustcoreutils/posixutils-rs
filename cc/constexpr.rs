@@ -189,9 +189,6 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
         ExprKind::SizeofExpr(inner) => {
             // `sizeof a` where `a` is a variable-length array is computed at
             // run time (6.5.3.4p2) and is not an integer constant expression.
-            // `SizeofType` grew this guard; this arm did not, so `case sizeof a:`
-            // folded to 0 -- `size_bits` reports 0 for an array with no extent --
-            // and the case label was silently accepted with the wrong value.
             //
             // A `TypeId` for `int[n]` is indistinguishable from one for `int[]`,
             // so the question has to be asked of the levels, not the size.

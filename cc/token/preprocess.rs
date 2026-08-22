@@ -392,7 +392,6 @@ struct Conditional {
 
 // Preprocessor
 
-/// C Preprocessor
 pub struct Preprocessor<'a> {
     /// Target configuration
     target: &'a Target,
@@ -908,7 +907,6 @@ impl<'a> Preprocessor<'a> {
         pp
     }
 
-    /// Initialize predefined macros
     fn init_predefined_macros(&mut self) {
         // Standard C macros. c17 compiles one language -- C17 plus the GNU
         // extensions it has always provided -- so the version is fixed.
@@ -1129,7 +1127,6 @@ impl<'a> Preprocessor<'a> {
             .any(|dir| Path::new(dir).join("threads.h").exists())
     }
 
-    /// Define a macro
     pub fn define_macro(&mut self, mac: Macro) {
         self.macros.insert(mac.name.clone(), std::rc::Rc::new(mac));
     }
@@ -1207,7 +1204,6 @@ impl<'a> Preprocessor<'a> {
         self.handle_define(&mut cursor, idents, pos);
     }
 
-    /// Undefine a macro
     pub fn undef_macro(&mut self, name: &str) {
         self.macros.remove(name);
     }
@@ -1462,7 +1458,6 @@ impl<'a> Preprocessor<'a> {
         tokens
     }
 
-    /// Push a new conditional
     fn push_conditional(&mut self, condition: bool, pos: Position) {
         // If we're already skipping, new conditional starts in skip mode
         let parent_skipping = self.is_skipping();
@@ -1507,7 +1502,6 @@ impl<'a> Preprocessor<'a> {
         !evaluator.had_error && value.is_true()
     }
 
-    /// Convert token to string
     fn token_to_string(&self, token: &Token, idents: &IdentTable) -> String {
         match &token.value {
             TokenValue::Ident(id) => idents.get_opt(*id).unwrap_or("").to_string(),
@@ -2556,13 +2550,6 @@ pub struct PreprocessOutcome {
 ///
 /// This is the entry point for preprocessing: lexer output in, preprocessed
 /// tokens out. A caller that wants only the tokens ignores the outcome.
-///
-/// # Arguments
-/// * `tokens` - Lexer output tokens
-/// * `target` - Target platform configuration
-/// * `idents` - Identifier table for string interning
-/// * `filename` - Name of the source file
-/// * `config` - Preprocessing configuration (defines, undefines, include paths, flags)
 pub fn preprocess_collecting(
     tokens: Vec<Token>,
     target: &Target,
@@ -2664,12 +2651,6 @@ pub struct AsmPreprocessConfig<'a> {
 ///
 /// This uses the same preprocessor as C files but with assembly-specific
 /// comment syntax (`;` for line comments, no `//` or `/* */`).
-///
-/// # Arguments
-/// * `content` - Raw bytes of the assembly source file
-/// * `target` - Target platform configuration
-/// * `filename` - Name of the source file (for `__FILE__` and diagnostics)
-/// * `config` - Preprocessing configuration (defines, undefines, include paths)
 ///
 /// # Returns
 /// The preprocessed assembly text, as bytes: a string literal's payload is a

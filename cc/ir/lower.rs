@@ -265,16 +265,6 @@ mod tests {
 
     fn make_loop_cfg() -> Function {
         // Create a simple loop CFG with PhiSource instructions:
-        //
-        //     entry(0): setval %1; phisrc %5 <- %1 (-> .L1:%3); br .L1
-        //        |
-        //        v
-        //     cond(1): %3 = phi [.L0: %5], [.L2: %6]; cbr
-        //      / \
-        //     v   v
-        //   body(2): add %2; phisrc %6 <- %2 (-> .L1:%3); br .L1
-        //     |                              exit(3)
-        //     +------> cond(1)
 
         let types = TypeTable::new(&Target::host());
         let int_type = types.int_id;

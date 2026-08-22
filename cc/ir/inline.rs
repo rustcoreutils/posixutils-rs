@@ -1765,7 +1765,6 @@ mod tests {
     fn test_global_initializer_func_ref_preserved() {
         // Test that static functions referenced in global struct/array initializers
         // are NOT removed by dead function elimination.
-        // This tests the fix for: static const struct { func_ptr fn; } = { my_func };
         let types = TypeTable::new(&Target::host());
         let mut module = Module::default();
 

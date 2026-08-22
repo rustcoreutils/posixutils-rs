@@ -437,12 +437,6 @@ impl X86_64CodeGen {
 
     /// Read an aggregate argument, per SysV AMD64 §3.5.7.
     ///
-    /// Every aggregate used to go through [`Self::emit_va_arg_int`], which
-    /// pulls one value of the type's whole width out of the general-register
-    /// save area. For anything the classifier put in SSE registers that is
-    /// unrelated data -- `struct { float a, b, c, d; }` arrives in `xmm0` and
-    /// `xmm1` and came back as whatever the integer area happened to hold.
-    ///
     /// An aggregate in registers is *not* contiguous in the save area: its
     /// eightbytes are taken from the general and SSE areas independently, and
     /// those advance by 8 and 16 bytes respectively. So each eightbyte is

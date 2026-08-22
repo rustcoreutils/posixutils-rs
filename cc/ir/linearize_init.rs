@@ -127,8 +127,6 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // A definition here outranks anything recorded for the declaration.
             self.module.declared_symbol_attrs.remove(&name);
-            // If this symbol was previously declared extern, remove it from extern_symbols
-            // (we now have the actual definition)
             self.module.extern_symbols.remove(&name);
 
             // Check for thread-local storage
@@ -729,11 +727,6 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Report an initializer that is not a constant expression we can fold.
-    ///
-    /// Named rather than inlined because several arms need it and they used to
-    /// disagree: some printed a raw Rust `{:?}` dump of the AST -- internal
-    /// representation in a user-facing message, at position 0 -- and one said
-    /// nothing at all, which silently zeroed the object.
     fn reject_initializer(&self, expr: &Expr) {
         error(
             self.expr_pos(expr),

@@ -129,7 +129,6 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    /// Create a new variable symbol
     pub fn variable(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
@@ -147,7 +146,6 @@ impl Symbol {
         }
     }
 
-    /// Create a new function symbol
     pub fn function(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
@@ -165,7 +163,6 @@ impl Symbol {
         }
     }
 
-    /// Create a new parameter symbol
     pub fn parameter(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
@@ -219,7 +216,6 @@ impl Symbol {
         }
     }
 
-    /// Create a new typedef symbol
     pub fn typedef(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
@@ -251,12 +247,10 @@ impl Symbol {
         self
     }
 
-    /// Check if this is an enum constant
     pub fn is_enum_constant(&self) -> bool {
         self.kind == SymbolKind::EnumConstant
     }
 
-    /// Check if this is a typedef
     pub fn is_typedef(&self) -> bool {
         self.kind == SymbolKind::Typedef
     }
@@ -324,7 +318,6 @@ impl SymbolTable {
         table
     }
 
-    /// Enter a new scope
     pub fn enter_scope(&mut self) {
         let new_scope_id = self.scopes.len() as u32;
         self.scopes.push(Scope::new(Some(self.current_scope)));
@@ -332,7 +325,6 @@ impl SymbolTable {
         self.scope_depth += 1;
     }
 
-    /// Leave the current scope, returning to the parent
     pub fn leave_scope(&mut self) {
         if let Some(parent) = self.scopes[self.current_scope as usize].parent {
             // Remove symbols from name_map that were in this scope
@@ -435,12 +427,10 @@ impl SymbolTable {
         self.name_map.get(&key).and_then(|ids| ids.first().copied())
     }
 
-    /// Get a symbol by its ID
     pub fn get(&self, id: SymbolId) -> &Symbol {
         &self.symbols[id.0 as usize]
     }
 
-    /// Get a mutable reference to a symbol by its ID
     pub fn get_mut(&mut self, id: SymbolId) -> &mut Symbol {
         &mut self.symbols[id.0 as usize]
     }
@@ -478,13 +468,11 @@ impl SymbolTable {
         })
     }
 
-    /// Look up an enum constant symbol by name
     pub fn lookup_enum_constant(&self, name: StringId) -> Option<&Symbol> {
         self.lookup(name, Namespace::Ordinary)
             .filter(|s| s.is_enum_constant())
     }
 
-    /// Get the number of symbols declared
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.symbols.len()

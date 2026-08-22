@@ -298,7 +298,6 @@ pub struct Linearizer<'a> {
 }
 
 impl<'a> Linearizer<'a> {
-    /// Create a new linearizer
     pub fn new(
         symbols: &'a SymbolTable,
         types: &'a TypeTable,
@@ -442,7 +441,6 @@ impl<'a> Linearizer<'a> {
             .is_some_and(|s| s.has_non_inline_decl)
     }
 
-    /// Linearize a translation unit
     pub fn linearize(&mut self, tu: &TranslationUnit) -> Module {
         for item in &tu.items {
             match item {
@@ -1687,7 +1685,6 @@ impl<'a> Linearizer<'a> {
     ///   lowers to a temp holding a pointer to the value, which is the answer
     ///   as it stands.
     ///
-    /// Each caller used to pick one of these by hand, and they did not agree.
     /// Both ways of being wrong are silent and fatal: asking an rvalue for its
     /// lvalue yields a bogus pointer, and handing a consumer the value's own
     /// bits gets them dereferenced as an address. Which crash you got depended
@@ -5602,7 +5599,6 @@ impl<'a> Linearizer<'a> {
 
 // Public API
 
-/// Linearize an AST to IR
 pub fn linearize(
     tu: &TranslationUnit,
     symbols: &SymbolTable,

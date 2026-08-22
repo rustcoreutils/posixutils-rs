@@ -141,14 +141,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Copy a memory-class parameter from the incoming argument area into the
-    /// local the rest of the function reads.
-    ///
-    /// Register-class arguments that ran out of registers arrive on the stack
-    /// like any MEMORY-class one, but unlike a `long double` — which is simply
-    /// used in place — a complex or two-SSE-struct parameter has a local, and
-    /// the prologue is what fills it. `bytes` is the type's real size, copied a
-    /// qword at a time through R10 (reserved, never allocated).
     /// The address of byte `byte` of the object in stack slot `slot`.
     ///
     /// A slot index is not an `%rbp` displacement: [`Self::stack_mem`] turns it
@@ -3469,7 +3461,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit a 128-bit integer copy (stack-to-stack, imm128-to-stack, etc).
     /// Write a 128-bit constant into the sixteen bytes at `dst_loc`.
     ///
     /// Each half goes as an immediate where it fits in the `mov` displacement
@@ -3909,13 +3900,6 @@ impl X86_64CodeGen {
         // copy doesn't carry narrow-type truncation (8/16 bit needs
         // explicit AND/SHL+SAR) AND it's not a FP copy (FP path has
         // size-specific quirks), the Copy is a true no-op and can be
-        // skipped entirely. Captures ~1% of reg-to-reg movs in
-        // CPython's `ceval.o` (measured 105/10,653 identity movs in
-        // a clean build). Without coalescing this only catches the
-        // accidental same-location cases that the chordal allocator
-        // already produces by greedy coloring; with M9b's Copy
-        // coalescing, every successfully-coalesced Copy collapses
-        // here.
         if src_loc == dst_loc && actual_size >= 32 && !is_fp_copy {
             return;
         }
@@ -4175,15 +4159,6 @@ impl X86_64CodeGen {
                         let mem_str = format!("(%{})", self.reg_name_64(r));
                         slots.push(mk(None, Some(mem_str)));
                     }
-                    // An SSE-class output. `constraint_requires_register` and
-                    // `constraint_requires_memory` know no FP class letter, so
-                    // without this arm `"=x"` fell through to the general
-                    // `Loc::Reg` arm below and the template was handed `%rax`:
-                    // `movsd %xmm0, %rax`, which the assembler refuses (#C139).
-                    //
-                    // The operand is rendered as text rather than a register
-                    // slot because `AsmOperandSlot` carries only a general
-                    // register; `XmmReg::name()` already includes the `%`.
                     // An x87-class output. Written back off the FP stack once
                     // the template has run; a read-write `"+t"` is also pushed
                     // before it, while a pure `"=t"` takes its value from the
@@ -4364,10 +4339,6 @@ impl X86_64CodeGen {
                     let requires_mem = Self::constraint_requires_memory(constraint_for_reg);
                     // No specific register - use allocated location
                     match loc {
-                        // A floating constant has no address, so a
-                        // memory-class constraint cannot be satisfied. gcc
-                        // says the same thing and stops; c17 used to reach
-                        // `loc_to_asm_string` and panic.
                         // An x87-class input: pushed onto the FP stack before the
                         // template, which then names it `%st`/`%st(1)`. Without
                         // this arm an x87 input fell through to the general path
@@ -4839,20 +4810,6 @@ impl X86_64CodeGen {
         None
     }
 
-    /// Check if an inline asm constraint requires the operand to land
-    /// in a register — i.e., the codegen must force-load a spilled
-    /// value to a temp.
-    ///
-    /// C9 multi-alternative semantics: a constraint that explicitly
-    /// lists a memory class (`m`/`o`/`V`/`Q`/`g`) does NOT require a
-    /// register, because memory syntax is acceptable. Immediate
-    /// letters (`i`/`n`/`I`/`J`/`K`/`L`/`M`/`N`/`O`) substitute as
-    /// literals when the operand is `Loc::Imm`, so they don't count
-    /// as "memory" — combined with `r` they still force-load a spilled
-    /// runtime value, since neither register nor immediate is
-    /// satisfied by a memory operand.
-    /// C10 adds the x86_64 class letters `q`/`R`/`l` (register-class
-    /// synonyms) and `X` (any-of-three, same as `g`).
     /// Whether the constraint asks for an SSE register specifically.
     ///
     /// These are separate from `constraint_requires_register`, which is about
@@ -4868,11 +4825,6 @@ impl X86_64CodeGen {
         constraint.chars().any(|c| matches!(c, 'x' | 'v' | 'Y'))
     }
 
-    /// An x87 stack class: `t` is st(0), `u` is st(1), `f` is any of them.
-    ///
-    /// c17 keeps a long double in memory and reaches it with `fldt`/`fstpt`,
-    /// so an x87 operand is loaded onto the stack before the template and
-    /// popped back afterwards rather than being given a register.
     /// Whether `get_x87_mem_addr` can address this location soundly.
     ///
     /// It has no arm for `Loc::Xmm` and falls back to `[rbp+0]` -- the saved
@@ -5096,7 +5048,6 @@ impl X86_64CodeGen {
         self.locations.set(target, Loc::Imm(0));
     }
 
-    /// Emit atomic exchange (swap)
     fn emit_atomic_swap(&mut self, insn: &Instruction, types: &TypeTable) {
         let target = insn.target.expect("atomic swap needs target");
         let addr = insn.src[0];
@@ -5362,7 +5313,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit atomic fetch-and-add
     fn emit_atomic_fetch_add(&mut self, insn: &Instruction, types: &TypeTable) {
         let target = insn.target.expect("atomic fetch_add needs target");
         let addr = insn.src[0];
@@ -5448,17 +5398,14 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit atomic fetch-and-and
     fn emit_atomic_fetch_and(&mut self, insn: &Instruction, types: &TypeTable) {
         self.emit_atomic_fetch_bitop(insn, AtomicBitOp::And, types);
     }
 
-    /// Emit atomic fetch-and-or
     fn emit_atomic_fetch_or(&mut self, insn: &Instruction, types: &TypeTable) {
         self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Or, types);
     }
 
-    /// Emit atomic fetch-and-xor
     fn emit_atomic_fetch_xor(&mut self, insn: &Instruction, types: &TypeTable) {
         self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Xor, types);
     }
@@ -5558,7 +5505,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit memory fence
     fn emit_fence(&mut self, insn: &Instruction) {
         use crate::ir::MemoryOrder;
 

@@ -685,12 +685,6 @@ fn test_ucn_identifier_start() {
 #[test]
 fn test_ucn_long_form() {
     // Long UCN form, with a code point it is allowed to name.
-    //
-    // This used to use `\U00000041` and assert the identifier `testAbc`,
-    // which C17 6.4.3p2 forbids: a UCN may not name a character below
-    // 00A0 other than `$`, `@` and `` ` ``, precisely so it cannot spell
-    // an `A` that already has a spelling. gcc rejects that input, and so
-    // does c17 now, so the long form is exercised with `\U000000E9`.
     let (tokens, idents) = tokenize_str("test\\U000000E9bc");
     assert_eq!(tokens[1].typ, TokenType::Ident);
     assert_eq!(show_token(&tokens[1], &idents), "testébc");

@@ -13,8 +13,6 @@
 // but BEFORE `lower.rs`, which intentionally introduces multi-def Copies
 // as part of φ-elimination).
 //
-// Current invariants (M0 skeleton — later milestones extend):
-//
 //   I1 — SINGLE-DEF SSA TARGETS
 //        Every `PseudoId` that appears as an instruction's `target` must
 //        appear as such at most once across the function. SSA single-def is
@@ -64,9 +62,6 @@
 //
 //     #[cfg(debug_assertions)]
 //     validate::validate_module(&module).unwrap();
-//
-// Each new milestone documents the invariant it adds here, and extends
-// `validate_function` with a corresponding check.
 
 use super::{BasicBlockId, Function, Module, Opcode, PseudoId};
 use std::collections::HashMap;

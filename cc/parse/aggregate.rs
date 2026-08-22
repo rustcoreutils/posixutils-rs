@@ -635,20 +635,6 @@ impl Parser<'_> {
         }
     }
 
-    /// Validate a bitfield declaration
-    ///
-    /// `is_named` indicates if this bitfield has a name (unnamed bitfields are
-    /// allowed to have zero width for alignment purposes).
-    /// C17 6.7.2.1p18: an array of unspecified size may appear only as the
-    /// *last* member of a structure with more than one named member.
-    ///
-    /// Nothing in the tree recognised a flexible array member at all, so
-    /// `struct S { int a[]; int b; }` compiled and sized the array zero. The
-    /// distinction that matters is against the GNU zero-length array: `int
-    /// a[]` has no extent while `char d[0]` has one that happens to be zero,
-    /// and `unsized_array_levels` tells them apart. Mid-struct `char d[0]` is
-    /// an ordinary member and is everywhere in system headers, so conflating
-    /// the two would reject far more than this rejects.
     /// A bit-field wider than 64 bits needs a whole 16-byte storage unit.
     ///
     /// `emit_bitfield_load`/`_store` reach the 128-bit carrier only for an

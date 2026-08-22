@@ -8,14 +8,6 @@
 //
 // mem2reg — drop stack slots for promoted locals (M3).
 //
-// `ssa::ssa_convert` already does the heavy lifting: for each non-
-// addr-taken, non-volatile, non-atomic scalar local, it inserts φ-nodes
-// at the iterated dominance frontier, then converts every `Load` from
-// the local into `Copy reaching_def` and every `Store` into `Nop`. The
-// local's `Sym` pseudo no longer has any users — there is no `SymAddr`
-// (those are the ones ssa.rs *won't* promote, by definition) and no
-// surviving Load/Store reference.
-//
 // What ssa.rs does NOT do is delete the now-orphaned entries from
 // `func.locals`. The backend regalloc still walks the locals map to
 // allocate a stack slot per Sym, even though the slot is never read

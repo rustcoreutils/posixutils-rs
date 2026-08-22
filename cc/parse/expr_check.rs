@@ -140,11 +140,6 @@ impl Parser<'_> {
         }
     }
 
-    /// Check a subscript's operands (C17 6.5.2.1p1): one must be a pointer to
-    /// a complete object type and the other an integer.
-    ///
-    /// `a[i]` is defined as `*(a + i)`, so it is symmetric -- `3[arr]` is
-    /// legal C and has to stay so.
     /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type.
     ///
     /// `int x; *x;` compiled and dereferenced the integer's value as an
@@ -270,7 +265,6 @@ impl Parser<'_> {
         })
     }
 
-    /// Check if an expression is const and report error if assigning to it
     /// Report a simple assignment whose value cannot be converted to the
     /// target's type (C17 6.5.16.1).
     ///

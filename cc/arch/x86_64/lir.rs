@@ -74,7 +74,6 @@ pub enum MemAddr {
 }
 
 impl MemAddr {
-    /// Format memory operand in AT&T syntax
     pub fn format(&self, target: &Target) -> String {
         match self {
             MemAddr::BaseOffset { base, offset } => {
@@ -153,7 +152,6 @@ pub enum XmmOperand {
 }
 
 impl XmmOperand {
-    /// Format operand in AT&T syntax
     pub fn format(&self, target: &Target) -> String {
         match self {
             XmmOperand::Reg(r) => r.name().to_string(),

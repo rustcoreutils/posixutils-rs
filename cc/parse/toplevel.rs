@@ -22,7 +22,6 @@ use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 impl Parser<'_> {
-    /// Parse a translation unit (top-level)
     pub fn parse_translation_unit(&mut self) -> ParseResult<TranslationUnit> {
         let mut tu = TranslationUnit::default();
 
@@ -143,12 +142,6 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// Fold the attributes pending on this declaration into what `name` has
-    /// collected so far, and return the total.
-    ///
-    /// Called for declarations as well as definitions, so that an attribute on
-    /// a prototype reaches the definition parsed later; see
-    /// [`Parser::declared_fn_attrs`].
     /// Parse a function body, recording whether the forwarding builtins may
     /// appear in it.
     ///

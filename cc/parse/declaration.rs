@@ -198,13 +198,6 @@ impl Parser<'_> {
         self.parse_declaration_and_bind_impl(false)
     }
 
-    /// Infer array size from initializer for incomplete array types.
-    ///
-    /// For declarations like `int arr[] = {1,2,3}` or `char arr[] = "hello"`,
-    /// infers the array size from the initializer and returns a complete type.
-    ///
-    /// This handles C99 6.7.8 paragraph 22: "If an array of unknown size is initialized,
-    /// its size is determined by the largest indexed element with an explicit initializer."
     /// The element count an array takes from a string-literal initializer:
     /// the characters plus the terminating null.
     ///
@@ -394,14 +387,6 @@ impl Parser<'_> {
         }
     }
 
-    /// How many elements an incomplete array's initializer list implies.
-    ///
-    /// One list element is not one array element. When the array's element
-    /// type is an aggregate and the initializer leaves its braces out, that
-    /// one array element swallows as many list elements as it has scalar
-    /// fields (C17 6.7.9p20) -- so `int a[][2] = {1,2,3,4}` names two rows,
-    /// not four. Counting list elements instead sized the object at twice
-    /// what the linearizer then filled.
     /// C17 6.7.6.2p1: an array's size expression shall have integer type.
     ///
     /// Without this the non-constant fallback took over and `int a[1.5];`
@@ -789,7 +774,6 @@ impl Parser<'_> {
         Ok(Declaration { declarators })
     }
 
-    /// Parse a type specifier
     /// Parse a type specifier, reporting whether one was actually present.
     ///
     /// See [`SpecifierTally`] for the C17 6.7.2p2 combination check this makes.

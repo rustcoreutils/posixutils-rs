@@ -1589,17 +1589,13 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             result.push(format!("--c17-inline={}", arg == "-finline"));
             i += 1;
         } else if arg == "-fverbose-asm" {
-            // Rewritten rather than swallowed: the catch-all below used to
-            // drop it before clap saw it, so the flag was accepted and did
-            // nothing at all.
             result.push("--fverbose-asm".to_string());
             i += 1;
         } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
             // Catch-all: silently ignore any other -f* flag we don't handle
             i += 1;
         } else if arg == "-nostdinc" || arg == "-nobuiltininc" {
-            // gcc spells these with one dash and clap declares them long-only,
-            // so they used to reach it unrewritten and be rejected outright.
+            // gcc spells these with one dash; clap declares them long-only.
             result.push(format!("-{}", arg));
             i += 1;
         } else if matches!(arg.as_str(), "-MM" | "-MD" | "-MMD" | "-MP") {
@@ -2311,8 +2307,6 @@ mod tests {
 
     #[test]
     fn test_preprocess_std_is_forwarded_not_dropped() {
-        // -std= used to be consumed and discarded here, which is why
-        // __STDC_VERSION__ could not follow it (audit #P1/#X2).
         let result = run_preprocess(&["-std=c11", "foo.c"]);
         assert!(result.contains(&"--c17-std".to_string()));
         assert!(result.contains(&"c11".to_string()));

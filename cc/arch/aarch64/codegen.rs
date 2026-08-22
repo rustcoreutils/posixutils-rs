@@ -1135,14 +1135,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Move arguments from registers to their allocated stack locations
-    /// Copy a stack-passed two-element floating-point argument (a `_Complex`
-    /// or a two-element HFA) into the parameter's local.
-    ///
-    /// The register-passed path stores straight from the argument registers;
-    /// this is the overflow case, where the value already sits in the caller's
-    /// outgoing area and only needs moving to where the body looks for it.
-    /// V16 is a scratch V register, not part of the argument sequence.
     /// Element size and FP width for a two-element floating-point argument.
     ///
     /// A `_Complex` and a two-element HFA are both passed in a V-register pair
@@ -1257,11 +1249,6 @@ impl Aarch64CodeGen {
             // it arrives in V registers at all. A `_Complex` is two by
             // definition; a struct is whatever the ABI's HFA classification
             // says, which is one through four.
-            //
-            // This used to ask for `count: 2` and let every other count fall
-            // through to the GP arm below, so a three- or four-element HFA was
-            // read out of an integer register -- and consumed an integer slot,
-            // which shifted every following integer parameter by one.
             let fp_reg_count: Option<usize> = if is_complex {
                 Some(2)
             } else if !is_fp && matches!(types.kind(*typ), TypeKind::Struct | TypeKind::Union) {
@@ -4135,7 +4122,6 @@ impl Aarch64CodeGen {
 
     // Atomic Operations (ARMv8.1 LSE)
 
-    /// Emit atomic load
     fn emit_atomic_load(&mut self, insn: &Instruction) {
         let target = insn.target.expect("atomic load needs target");
         let addr = insn.src[0];
@@ -4165,7 +4151,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit atomic store
     fn emit_atomic_store(&mut self, insn: &Instruction) {
         let addr = insn.src[0];
         let value = insn.src[1];
@@ -4605,7 +4590,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit memory fence
     fn emit_fence(&mut self, insn: &Instruction) {
         use crate::ir::MemoryOrder;
 

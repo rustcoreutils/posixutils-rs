@@ -26,14 +26,6 @@
 //   * `"&=r"(t)` — operand t is an early-clobber output (allocator
 //                  must keep it disjoint from every input)
 //   * `"m"(p)`  — operand p must be a memory operand
-//
-// `InstrConstraints<R>` collects per-operand `OperandConstraint`s,
-// the hard clobber set, and a `memory_barrier` flag. C2 introduces
-// the vocabulary and parser; C3 wires the allocator to consume
-// `OperandConstraint::{Fixed, Match, Mem, EarlyClobber}` and the
-// memory barrier. Until then, `InstrConstraints` lowers to the
-// existing `ConstraintPoint` so the allocator's behaviour is
-// unchanged.
 
 use crate::ir::PseudoId;
 

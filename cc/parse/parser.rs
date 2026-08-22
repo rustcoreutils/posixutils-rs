@@ -26,7 +26,6 @@ use std::fmt;
 
 // Parse Error
 
-/// Parse error type
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
@@ -198,21 +197,18 @@ impl AttributeList {
             .any(|a| a.name == "noreturn" || a.name == "__noreturn__")
     }
 
-    /// Check if this attribute list contains sysv_abi attribute
     pub fn has_sysv_abi(&self) -> bool {
         self.attrs
             .iter()
             .any(|a| a.name == "sysv_abi" || a.name == "__sysv_abi__")
     }
 
-    /// Check if this attribute list contains ms_abi attribute
     pub fn has_ms_abi(&self) -> bool {
         self.attrs
             .iter()
             .any(|a| a.name == "ms_abi" || a.name == "__ms_abi__")
     }
 
-    /// Get the calling convention from attributes, if any
     pub fn calling_conv(&self) -> Option<crate::abi::CallingConv> {
         if self.has_sysv_abi() {
             Some(crate::abi::CallingConv::SysV)
@@ -284,12 +280,7 @@ impl AttributeList {
         }
     }
 
-    /// Get alignment from __attribute__((aligned(N))) or __attribute__((aligned))
-    /// Returns Some(alignment) if found, None otherwise.
-    /// Per GCC: aligned with no args defaults to 16 ("max useful alignment").
     /// The `weak`, `used`, `section(...)` and `visibility(...)` requests in
-    /// this list. All four were parsed and dropped before, while
-    /// `__has_attribute` answered 1 for each.
     pub fn symbol_attrs(&self) -> crate::parse::ast::SymbolAttrs {
         let mut out = crate::parse::ast::SymbolAttrs::default();
         for attr in &self.attrs {
@@ -568,14 +559,12 @@ impl<'a> Parser<'a> {
 
     // Token Navigation
 
-    /// Get the current token
     pub(crate) fn current(&self) -> &Token {
         self.tokens
             .get(self.pos)
             .unwrap_or(&self.tokens[self.tokens.len() - 1])
     }
 
-    /// Peek at the current token type
     pub(crate) fn peek(&self) -> TokenType {
         self.current().typ
     }
@@ -591,7 +580,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Peek at the current token's special value (if it's a Special token)
     pub(crate) fn peek_special(&self) -> Option<u32> {
         let token = self.current();
         if token.typ == TokenType::Special {
@@ -602,36 +590,30 @@ impl<'a> Parser<'a> {
         None
     }
 
-    /// Check if current token is a specific special character
     pub(crate) fn is_special(&self, c: u8) -> bool {
         self.peek_special() == Some(c as u32)
     }
 
-    /// Check if current token is a specific multi-char special token
     pub(crate) fn is_special_token(&self, tok: SpecialToken) -> bool {
         self.peek_special() == Some(tok as u32)
     }
 
-    /// Get current position for error messages
     pub(crate) fn current_pos(&self) -> Position {
         self.current().pos
     }
 
-    /// Advance to the next token
     pub(crate) fn advance(&mut self) {
         if self.pos < self.tokens.len() - 1 {
             self.pos += 1;
         }
     }
 
-    /// Consume a token and advance, returning a clone
     pub(crate) fn consume(&mut self) -> Token {
         let token = self.current().clone();
         self.advance();
         token
     }
 
-    /// Expect a specific special character, return error if not found
     pub(crate) fn expect_special(&mut self, c: u8) -> ParseResult<()> {
         if self.is_special(c) {
             self.advance();
@@ -656,7 +638,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Get the identifier name from an Ident token value
     pub(crate) fn get_ident_name(&self, token: &Token) -> Option<String> {
         if let TokenValue::Ident(id) = &token.value {
             self.idents.get_opt(*id).map(|s| s.to_string())
@@ -665,7 +646,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Get the StringId directly from an Ident token
     pub(crate) fn get_ident_id(&self, token: &Token) -> Option<StringId> {
         if let TokenValue::Ident(id) = &token.value {
             Some(*id)
@@ -674,7 +654,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Get string value for a StringId
     #[inline]
     pub(crate) fn str(&self, id: StringId) -> &str {
         self.idents.get(id)
@@ -828,7 +807,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Check if we're at end of input
     pub(crate) fn is_eof(&self) -> bool {
         matches!(self.peek(), TokenType::StreamEnd)
     }
@@ -1647,7 +1625,6 @@ impl<'a> Parser<'a> {
 // Statement Parsing
 
 impl Parser<'_> {
-    /// Parse a statement
     pub fn parse_statement(&mut self) -> ParseResult<Stmt> {
         // Check for keywords
         if self.peek() == TokenType::Ident {
@@ -1732,7 +1709,6 @@ impl Parser<'_> {
         Ok(Stmt::Expr(expr))
     }
 
-    /// Parse an if statement
     fn parse_if_stmt(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'if'
         self.expect_special(b'(')?;
@@ -1762,7 +1738,6 @@ impl Parser<'_> {
         })
     }
 
-    /// Parse a while statement
     fn parse_while_stmt(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'while'
         self.expect_special(b'(')?;
@@ -1776,7 +1751,6 @@ impl Parser<'_> {
         })
     }
 
-    /// Parse a do-while statement
     fn parse_do_while_stmt(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'do'
         let body = self.parse_statement()?;
@@ -1862,7 +1836,6 @@ impl Parser<'_> {
         })
     }
 
-    /// Parse a return statement
     fn parse_return_stmt(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'return'
 
@@ -1876,7 +1849,6 @@ impl Parser<'_> {
         Ok(Stmt::Return(Some(expr)))
     }
 
-    /// Parse a switch statement
     fn parse_switch_stmt(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'switch'
         self.expect_special(b'(')?;
@@ -1950,7 +1922,6 @@ impl Parser<'_> {
         Ok(Stmt::Case(expr, high))
     }
 
-    /// Parse a default label
     fn parse_default_label(&mut self) -> ParseResult<Stmt> {
         let pos = self.current_pos();
         self.advance(); // consume 'default'
@@ -1958,11 +1929,6 @@ impl Parser<'_> {
         Ok(Stmt::Default(pos))
     }
 
-    /// Parse a compound statement (block) with its own scope
-    ///
-    /// Blocks create their own scope for local declarations. This enters a
-    /// new scope, parses the block, binds any declarations, then leaves
-    /// the scope.
     /// Parse block items (declarations and statements) until closing brace
     fn parse_block_items(&mut self) -> ParseResult<Vec<BlockItem>> {
         let mut items = Vec::new();
@@ -2065,7 +2031,6 @@ impl Parser<'_> {
         ))
     }
 
-    /// Check if current position starts a declaration
     pub(super) fn is_declaration_start(&self) -> bool {
         if self.peek() != TokenType::Ident {
             return false;

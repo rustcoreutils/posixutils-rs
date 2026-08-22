@@ -39,7 +39,6 @@ pub enum MemAddr {
 }
 
 impl MemAddr {
-    /// Format memory operand in AArch64 syntax
     pub fn format(&self) -> String {
         match self {
             MemAddr::Base(base) => format!("[{}]", base.name64()),

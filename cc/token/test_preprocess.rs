@@ -514,9 +514,6 @@ fn test_macro_redefinition() {
     // fatal: the standard requires only a diagnostic, and rejecting would
     // break a great deal of code that redefines a macro benignly. The
     // later definition wins, as it always has.
-    //
-    // This test used to assert the silent override *as intended*, which is
-    // why the constraint went unimplemented.
     let input = "#define X 1\n#define X 2\nX";
     let (tokens, idents) = preprocess_str(input);
     let strs = get_token_strings(&tokens, &idents);

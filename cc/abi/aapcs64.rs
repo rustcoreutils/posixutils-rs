@@ -52,7 +52,6 @@ fn complex_hfa_base(ty: TypeId, types: &TypeTable) -> Option<HfaBase> {
     }
 }
 
-/// AAPCS64 ABI implementation.
 #[derive(Debug, Clone, Default)]
 pub struct Aapcs64Abi;
 

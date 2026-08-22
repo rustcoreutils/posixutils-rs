@@ -297,7 +297,6 @@ fn compute_reachable(func: &Function) -> HashSet<BasicBlockId> {
     reachable
 }
 
-/// Remove unreachable blocks from the function.
 fn remove_unreachable_blocks(func: &mut Function) -> bool {
     let reachable = compute_reachable(func);
     let before = func.blocks.len();

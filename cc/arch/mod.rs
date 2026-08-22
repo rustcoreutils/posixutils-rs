@@ -362,7 +362,6 @@ pub fn get_format_macros(_target: &Target) -> Vec<(&'static str, &'static str)> 
     ]
 }
 
-/// Get additional sizeof macros
 pub fn get_additional_sizeof_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
     // 16 bytes for the x87 80-bit format and for IEEE binary128 alike; Apple's
     // aarch64 `long double` is a `double` and occupies 8.

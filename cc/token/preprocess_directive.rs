@@ -346,7 +346,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Handle #define
     pub(super) fn handle_define(
         &mut self,
         iter: &mut TokenCursor,
@@ -531,7 +530,6 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(mac);
     }
 
-    /// Handle #undef
     fn handle_undef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
@@ -545,7 +543,6 @@ impl<'a> Preprocessor<'a> {
         self.skip_to_eol(iter);
     }
 
-    /// Handle #ifdef
     fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
         // Nesting is tracked in a dead branch, but the operand is not
         // examined there: gcc skips it entirely, and junk inside an `#if 0`
@@ -570,16 +567,8 @@ impl<'a> Preprocessor<'a> {
         self.push_conditional(take_branch, pos);
     }
 
-    /// Handle #ifndef
     fn handle_ifndef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
-        // Nesting is tracked in a dead branch, but the operand is not
-        // examined there: gcc skips it entirely, and junk inside an `#if 0`
-        // is common enough that diagnosing it would reject working code.
-        //
-        // A malformed operand still pushes a group, so the matching `#endif`
-        // closes something and one bad directive does not cascade into a run
-        // of "#endif without #if". The group is skipped, since nothing was
-        // established about the name.
+        // Same rule as `handle_ifdef` for a dead branch and a malformed operand.
         let name = if self.is_skipping() {
             self.skip_to_eol(iter);
             None
@@ -595,7 +584,6 @@ impl<'a> Preprocessor<'a> {
         self.push_conditional(take_branch, pos);
     }
 
-    /// Handle #if
     fn handle_if(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
         let value = if self.is_skipping() {
@@ -609,7 +597,6 @@ impl<'a> Preprocessor<'a> {
         self.push_conditional(value, pos);
     }
 
-    /// Handle #elif
     fn handle_elif(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
 
@@ -658,7 +645,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Handle #else
     fn handle_else(&mut self, iter: &mut TokenCursor, pos: Position) {
         self.warn_extra_tokens(iter, "else");
 
@@ -690,7 +676,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Handle #endif
     fn handle_endif(&mut self, iter: &mut TokenCursor, pos: Position) {
         self.warn_extra_tokens(iter, "endif");
         if self.cond_stack.pop().is_none() {
@@ -698,7 +683,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Handle #include
     fn handle_include(
         &mut self,
         iter: &mut TokenCursor,
@@ -1043,7 +1027,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Include a file
     pub(super) fn include_file(
         &mut self,
         path: &Path,
@@ -1239,7 +1222,6 @@ impl<'a> Preprocessor<'a> {
         self.cond_stack = saved_cond_stack;
     }
 
-    /// Handle #error
     fn handle_error(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
@@ -1251,7 +1233,6 @@ impl<'a> Preprocessor<'a> {
         diag::error_args(*pos, "#error {0}", &[&msg.to_string()]);
     }
 
-    /// Handle #warning
     fn handle_warning(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
@@ -1263,7 +1244,6 @@ impl<'a> Preprocessor<'a> {
         diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
     }
 
-    /// Handle #pragma
     fn handle_pragma(
         &mut self,
         iter: &mut TokenCursor,
@@ -1449,7 +1429,6 @@ impl<'a> Preprocessor<'a> {
         // Successfully consumed _Pragma("...")
     }
 
-    /// Handle #line directive
     fn handle_line(
         &mut self,
         iter: &mut TokenCursor,
@@ -1528,7 +1507,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Evaluate __has_include
     pub(super) fn eval_has_include(&self, args: &[Vec<Token>], idents: &IdentTable) -> bool {
         if args.is_empty() {
             return false;

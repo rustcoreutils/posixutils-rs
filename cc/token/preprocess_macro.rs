@@ -739,7 +739,6 @@ impl<'a> Preprocessor<'a> {
         out
     }
 
-    /// Try to expand a macro
     pub(super) fn try_expand_macro(
         &mut self,
         name: &str,
@@ -1220,8 +1219,6 @@ impl<'a> Preprocessor<'a> {
             i += 1;
         }
 
-        // Rescan for more macro expansion
-        // Arguments were already expanded above, so this only affects the replacement list rescan
         // Hide before handing the expansion back.
         //
         // The result is rescanned by the caller's loop, which is where a
@@ -1258,7 +1255,6 @@ impl<'a> Preprocessor<'a> {
         Some(filtered)
     }
 
-    /// Paste tokens together
     fn paste_tokens(
         &self,
         left: &Token,
@@ -1404,7 +1400,6 @@ impl<'a> Preprocessor<'a> {
         );
     }
 
-    /// Expand an object-like macro
     fn expand_object_macro(
         &mut self,
         mac: &Macro,
@@ -1448,36 +1443,14 @@ impl<'a> Preprocessor<'a> {
             i += 1;
         }
 
-        // Rescan for more macro expansion
-        // (e.g., when const -> __const and __const -> const both exist)
-        // Hide before handing the expansion back.
-        //
-        // The result is rescanned by the caller's loop, which is where a
-        // self-referential macro would recurse -- so hiding has to happen
-        // before it is handed back, not after. glibc's enum-and-macro idiom,
-        // `#define MSG_DONTROUTE MSG_DONTROUTE`, is the shape that catches
-        // this. Hiding here also propagates: a nested expansion sees an
-        // invoking token that already carries this set.
-        //
-        // Substitution and pasting are both finished by now, which is the
-        // other half of the requirement -- a name that `##` built has to be
-        // hidden too.
+        // Hide before handing the expansion back; see `expand_function_macro` for the full rule.
         hide_in_expansion(&mut result, &mac.name, invoker_hide);
 
         // No rescan here: the caller pushes this back in front of the cursor,
         // so it is rescanned by the same loop that produced it.
         let mut filtered = result;
 
-        // The FIRST token of a macro expansion stands where the invocation
-        // stood: it inherits both the spacing before it and whether it begins
-        // a line. Body tokens carry neither, since they were written somewhere
-        // else entirely.
-        //
-        // The line flag used to be dropped, so an expansion at the start of a
-        // line ran onto the previous one in `-E` output -- `M int b;` came out
-        // as `int a; 42 int b;` where gcc breaks the line. Stringification hid
-        // that for its own case by copying the invocation position wholesale,
-        // which then made a `#x` result claim to begin a line even mid-line.
+        // The first token inherits the invocation's spacing and line flag; see `expand_function_macro`.
         if let Some(first) = filtered.first_mut() {
             first.pos.whitespace = pos.whitespace;
             first.pos.newline = pos.newline;
@@ -1641,7 +1614,6 @@ impl<'a> Preprocessor<'a> {
         token
     }
 
-    /// Expand a builtin macro
     pub(super) fn expand_builtin(
         &mut self,
         builtin: BuiltinMacro,

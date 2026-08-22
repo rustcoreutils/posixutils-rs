@@ -558,7 +558,6 @@ impl PartialEq for Pseudo {
 }
 
 impl Pseudo {
-    /// Create an undefined pseudo
     pub fn undef(id: PseudoId) -> Self {
         Self {
             id,
@@ -567,7 +566,6 @@ impl Pseudo {
         }
     }
 
-    /// Create a register pseudo
     pub fn reg(id: PseudoId, nr: u32) -> Self {
         Self {
             id,
@@ -585,7 +583,6 @@ impl Pseudo {
         }
     }
 
-    /// Create a phi pseudo
     pub fn phi(id: PseudoId, nr: u32) -> Self {
         Self {
             id,
@@ -594,7 +591,6 @@ impl Pseudo {
         }
     }
 
-    /// Create a symbol pseudo
     pub fn sym(id: PseudoId, name: String) -> Self {
         Self {
             id,
@@ -845,7 +841,6 @@ impl Default for Instruction {
 }
 
 impl Instruction {
-    /// Create a new instruction
     pub fn new(op: Opcode) -> Self {
         Self {
             op,
@@ -1061,7 +1056,6 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    /// Create a load instruction
     pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Load)
             .with_target(target)
@@ -1070,7 +1064,6 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    /// Create a store instruction
     pub fn store(value: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Store)
             .with_src(addr)
@@ -1079,7 +1072,6 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    /// Create a call instruction
     pub fn call(
         target: Option<PseudoId>,
         func: &str,
@@ -1160,7 +1152,6 @@ impl Instruction {
             .with_type_and_size(typ, 64)
     }
 
-    /// Create a phi node
     pub fn phi(target: PseudoId, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Phi)
             .with_target(target)
@@ -1421,7 +1412,6 @@ impl Default for BasicBlock {
 }
 
 impl BasicBlock {
-    /// Create a new basic block
     pub fn new(id: BasicBlockId) -> Self {
         Self {
             id,
@@ -1444,7 +1434,6 @@ impl BasicBlock {
         }
     }
 
-    /// Check if the block is terminated
     pub fn is_terminated(&self) -> bool {
         self.insns
             .last()
@@ -1657,7 +1646,6 @@ impl Default for Function {
 }
 
 impl Function {
-    /// Create a new function
     pub fn new(name: impl Into<String>, return_type: TypeId) -> Self {
         Self {
             name: name.into(),

@@ -898,16 +898,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     // directly to the unsigned storage type skipped
                                     // it, so `struct { _Bool f:1; } v = {2};` stored
                                     // 2, truncated it to one bit and read back 0.
-                                    // A *second* conversion, to a type derived from
-                                    // the access span, used to follow. It truncated
-                                    // whenever the span was not 1, 2, 4 or 8 bytes,
-                                    // because `bitfield_storage_type` answers
-                                    // `unsigned int` for everything else -- so a
-                                    // 64-bit field in a sixteen-byte window, or a
-                                    // packed nine-byte span, kept 32 bits of its
-                                    // initializer. `emit_bitfield_store` takes the
-                                    // member-typed value, exactly as the assignment
-                                    // path hands it over through `emit_member_store`.
                                     let member_val = self.emit_convert(val, val_type, field_type);
                                     self.emit_bitfield_store(
                                         base_sym,
@@ -1707,8 +1697,6 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Evaluate a constant expression (for case labels, static initializers)
     ///
-    /// C99 6.6 defines integer constant expressions. This function evaluates
-    /// expressions that can be computed at compile time.
     /// Copy a string literal's code units into an array object, followed by
     /// its null terminator.
     ///
@@ -1916,14 +1904,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         crate::constexpr::eval(self, scope, expr)
     }
 
-    /// Fold a constant floating expression for a static initializer.
-    ///
-    /// Every step is done in the expression's own format, exactly, and rounded
-    /// once -- the same thing the target would do at run time. Folding through
-    /// `f64` instead cost a `long double` eleven significand bits and a
-    /// `__float128` sixty, so `static __float128 c = 1.0q/3.0q;` disagreed with
-    /// the *same initializer written for a local*, which is computed at run
-    /// time and was right.
     /// Fold a floating constant expression for a static initializer, with the
     /// `const`-object folding [`Self::eval_const_init_expr`] describes.
     ///

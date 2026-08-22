@@ -1156,7 +1156,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
     }
 
-    /// Get an identifier token
     fn get_identifier(&mut self, first: u8) -> Token {
         let pos = self.pos();
         let mut name = String::new();
@@ -1193,7 +1192,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         self.ident_token(pos, &name)
     }
 
-    /// Get a string or character literal
     fn get_string_or_char(&mut self, delim: u8, enc: LiteralEncoding) -> Token {
         let pos = self.pos();
         let mut content = String::new();
@@ -1504,7 +1502,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         ))
     }
 
-    /// Get one token
     fn get_one_token(&mut self, c: u8) -> Option<Token> {
         let class = char_class(c);
 
@@ -1683,7 +1680,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
 // Token Display
 
-/// Display a special token
 pub fn show_special(value: u32) -> String {
     if value < SpecialToken::BASE {
         // Single character
@@ -1839,7 +1835,6 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
     }
 }
 
-/// Format token type name
 pub fn token_type_name(typ: TokenType) -> &'static str {
     match typ {
         TokenType::Pragma => "PRAGMA",

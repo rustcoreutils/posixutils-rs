@@ -106,43 +106,23 @@ impl Parser<'_> {
             let saved_pos = self.pos;
             self.advance(); // consume '('
 
-            // One predicate decides this everywhere. The copy that used to
-            // live here treated *any* identifier as a grouped declarator,
-            // where `is_grouped_declarator` excludes typedef names and type
-            // keywords -- so `void f(int (size_t));`, a function-type
-            // parameter, was read as a declarator named `size_t`.
             let is_grouped = self.is_grouped_declarator();
 
             if is_grouped {
-                // Parse nested declarator recursively
                 // For int (*p)[3]: we're now at *p), base_type is int
-                // We need to parse *p as the declarator, but we don't know the full type yet
-                // because [3] comes after the )
-                // So we use a placeholder and fix it up after
 
-                // Parse the inner declarator with a placeholder type (void)
                 // Note: We ignore any VLA expression from inner declarators - VLAs would be
                 // in the outer array dimensions, not inner pointer/grouped declarators
                 let (inner_name, inner_decl_type_id, _inner_vla, inner_func_params) =
                     self.parse_declarator(self.types.void_id, name)?;
                 self.expect_special(b')')?;
 
-                // Now parse any suffix modifiers (arrays, function params)
-                // These apply to the base type, not the inner declarator
                 (inner_name, Some(inner_decl_type_id), inner_func_params)
             } else {
                 // The `(` opens a parameter list, so this declarator is
                 // abstract: `int (size_t)` names a function type, and there is
                 // no identifier to find. Rewind to the `(` and let the
                 // function-suffix loop below consume the parameter list.
-                //
-                // This branch used to call `expect_declarator_name()` here,
-                // which cannot succeed while positioned on `(`. It was
-                // unreachable in practice because the old predicate claimed
-                // every identifier -- including a typedef name or a type
-                // keyword -- as a grouped declarator, so an abstract function
-                // type reached the recursive branch and had its first
-                // parameter's type name mistaken for the declarator's name.
                 self.pos = saved_pos;
                 (StringId::EMPTY, None, None)
             }
@@ -440,7 +420,6 @@ impl Parser<'_> {
         }
     }
 
-    /// Parse a parameter list, returning raw parameter info (name and type)
     /// Parameters are declared in a temporary scope during parsing so that
     /// VLA sizes like `arr[n]` can reference earlier parameters like `n`.
     /// The scope is exited at the end; callers re-declare parameters as needed.

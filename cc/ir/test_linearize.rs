@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 // Additional unit tests for linearize.rs
-// These tests cover bug fixes and regression prevention
 //
 
 // Allow approximate float constants in tests - we're testing literal parsing, not using PI
@@ -64,7 +63,6 @@ impl TestContext {
         self.strings.intern(name)
     }
 
-    /// Get common int type
     fn int_type(&self) -> TypeId {
         self.types.int_id
     }
@@ -107,8 +105,6 @@ fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDe
         calling_conv: crate::abi::CallingConv::default(),
     }
 }
-
-// Bug fix regression tests
 
 #[test]
 fn test_parameter_stored_to_local() {
@@ -208,8 +204,6 @@ fn test_function_with_many_params() {
 }
 
 // Compound assignment lvalue regression tests
-// These test the fix for assignment operators with complex lvalues
-// (Member, Arrow, Deref, Index) - linearize.rs:3730
 
 #[test]
 fn test_compound_assignment_deref() {
@@ -361,7 +355,6 @@ fn test_compound_assignment_index() {
 #[test]
 fn test_simple_array_element_store() {
     // Simpler test: verify we can store to a specific array element
-    // This exercises the path that was fixed for array field initialization
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
     let int_type = ctx.int_type();
@@ -419,7 +412,6 @@ fn test_simple_array_element_store() {
 }
 
 // Nested if-else CFG edge linking regression test
-// Tests the fix for current_bb changing during nested control flow
 
 #[test]
 fn test_nested_if_cfg_linking() {
@@ -519,7 +511,6 @@ fn test_nested_if_cfg_linking() {
 
     // The outer merge block (last block) should have 2 parents:
     // one from the inner merge block (via outer then path) and one from outer else.
-    // Without the fix, the outer merge would have incorrect parents.
     let outer_merge = func.blocks.last().unwrap();
     assert!(
         outer_merge.parents.len() >= 2,
@@ -2787,8 +2778,6 @@ fn test_string_literal_char_pointer_init() {
 }
 
 // Incomplete struct type resolution test (regression test for forward declarations)
-// Tests the fix in resolve_struct_type() that resolves incomplete struct types
-// to their complete definitions when processing initializers.
 
 /// Helper to linearize with a custom symbol table (for testing struct resolution)
 fn test_linearize_with_symbols(
@@ -2932,7 +2921,6 @@ fn test_incomplete_struct_type_resolution() {
     let ir = format!("{}", module);
 
     // The IR should show stores to the struct fields at proper offsets
-    // Without the fix, the initializer would have total_size=0 and generate no stores
     assert!(
         ir.contains("store"),
         "Struct initializer should generate store instructions. \
@@ -2951,8 +2939,6 @@ fn test_incomplete_struct_type_resolution() {
 }
 
 // Static local variable increment/decrement regression tests
-// These test the fix for pre/post increment/decrement on static locals
-// Bug: was storing to sentinel value (u32::MAX) instead of looking up global name
 
 use crate::types::TypeModifiers;
 
@@ -4242,7 +4228,6 @@ fn test_return_address_emits_opcode() {
 // Mixed designated + positional initializer field tracking
 // Regression test: positional fields after a designator must use the correct
 // field index (one past the designated field), not the element's enumeration index.
-// Bug: {.b = 20, 30, 40} stored 30 at offset 4 (b) instead of offset 8 (c).
 
 #[test]
 fn test_mixed_designated_positional_struct_init() {
@@ -4373,7 +4358,6 @@ fn test_mixed_designated_positional_struct_init() {
     );
 
     // Verify stores go to distinct offsets (not the same offset twice)
-    // The bug caused 20 and 30 to both be stored at offset +4
     // Extract all "+ N" store offsets from the IR
     let store_lines: Vec<&str> = ir.lines().filter(|l| l.contains("store")).collect();
 
@@ -4386,7 +4370,6 @@ fn test_mixed_designated_positional_struct_init() {
     offsets.dedup();
 
     // With the fix, we should have 3 distinct offsets (4, 8, 12)
-    // Without the fix, offset 4 appears twice and we'd only have 2 unique offsets
     assert!(
         offsets.len() >= 3,
         "Expected 3 distinct store offsets for fields b(+4), c(+8), d(+12), \
@@ -4481,7 +4464,6 @@ fn test_mixed_designated_positional_array_init() {
     offsets.dedup();
 
     // With the fix: 3 distinct offsets (8, 12, 16 for indices 2, 3, 4)
-    // Without the fix: offset 8 appears twice (indices 2 and "1" via enumerate)
     assert!(
         offsets.len() >= 3,
         "Expected 3 distinct store offsets for arr[2](+8), arr[3](+12), arr[4](+16), \
@@ -5147,8 +5129,6 @@ fn test_valist_expression_decay() {
 
 /// Test that multiple bitfields at the same offset are all initialized
 /// when using designated initializers (static local case, which uses same path as globals).
-/// This tests the fix for the bug where only the last bitfield was initialized
-/// due to incorrect deduplication of fields sharing the same offset.
 #[test]
 fn test_bitfield_designated_init_multiple_same_offset() {
     let mut ctx = TestContext::new();
@@ -5452,9 +5432,6 @@ fn test_bitfield_designated_init_local_var() {
 }
 
 /// Test that large struct (> 64 bits) copy from array element works correctly.
-/// This was a bug where copying a struct from an array would incorrectly
-/// dereference the first field as a pointer instead of doing a proper memcpy-style copy.
-/// Bug manifested when struct size > 64 bits (e.g., struct with two pointers = 128 bits).
 #[test]
 fn test_large_struct_copy_from_array() {
     let mut ctx = TestContext::new();
@@ -5582,8 +5559,6 @@ fn test_large_struct_copy_from_array() {
 /// brace-enclosed list than there are elements or members of an aggregate,
 /// ... the remainder of the aggregate shall be initialized implicitly the same
 /// as objects that have static storage duration."
-/// Bug: When using `*p = (struct S){.field1 = val}`, fields not mentioned in
-/// the initializer would contain garbage instead of being zeroed.
 #[test]
 fn test_compound_literal_zero_init_lvalue() {
     let mut ctx = TestContext::new();
@@ -5743,11 +5718,6 @@ fn test_compound_literal_zero_init_lvalue() {
 
 /// Test that ternary conditional expressions with pointer dereference use
 /// short-circuit evaluation (control flow + phi) instead of Select instruction.
-///
-/// Bug: `value = entry == NULL ? 0 : entry->x` would evaluate `entry->x`
-/// unconditionally, causing a crash when `entry` is NULL. The is_pure_expr()
-/// function incorrectly considered Arrow expressions as "pure" when they can
-/// cause undefined behavior if the pointer is NULL.
 #[test]
 fn test_conditional_short_circuit_arrow() {
     let mut ctx = TestContext::new();
@@ -6350,7 +6320,6 @@ fn test_bitfield_value_mask_covers_the_full_carrier() {
     assert_eq!(bitfield_value_mask(32), 0xffff_ffff);
     assert_eq!(bitfield_value_mask(33), 0x1_ffff_ffff);
     assert_eq!(bitfield_value_mask(63), 0x7fff_ffff_ffff_ffff);
-    // The regression: this was 0.
     assert_eq!(bitfield_value_mask(64), u64::MAX);
 
     // Every width is a contiguous run of low bits of exactly that length.

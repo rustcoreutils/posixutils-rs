@@ -438,7 +438,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse logical-or: expr || expr
     fn parse_logical_or_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_logical_and_expr()?;
 
@@ -451,7 +450,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse logical-and: expr && expr
     fn parse_logical_and_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_bitwise_or_expr()?;
 
@@ -464,7 +462,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse bitwise-or: expr | expr
     fn parse_bitwise_or_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_bitwise_xor_expr()?;
 
@@ -478,7 +475,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse bitwise-xor: expr ^ expr
     fn parse_bitwise_xor_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_bitwise_and_expr()?;
 
@@ -491,7 +487,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse bitwise-and: expr & expr
     fn parse_bitwise_and_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_equality_expr()?;
 
@@ -505,7 +500,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse equality: expr == expr, expr != expr
     fn parse_equality_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_relational_expr()?;
 
@@ -530,7 +524,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse relational: expr < expr, expr > expr, expr <= expr, expr >= expr
     fn parse_relational_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_shift_expr()?;
 
@@ -559,7 +552,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse shift: expr << expr, expr >> expr
     fn parse_shift_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_additive_expr()?;
 
@@ -584,7 +576,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse additive: expr + expr, expr - expr
     fn parse_additive_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_multiplicative_expr()?;
 
@@ -609,7 +600,6 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse multiplicative: expr * expr, expr / expr, expr % expr
     fn parse_multiplicative_expr(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_unary_expr()?;
 
@@ -870,7 +860,6 @@ impl<'a> Parser<'a> {
         self.parse_postfix_expr()
     }
 
-    /// Parse sizeof expression
     /// The operand of a `sizeof (typeof ( E ))`, when `E` is an *expression*.
     ///
     /// Returns `None` -- having restored the position -- for `typeof` of a
@@ -978,19 +967,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// C17 6.5.3.4p1: `sizeof` shall not be applied to an incomplete type.
-    ///
-    /// An array is the awkward case, because the type table cannot tell
-    /// `int[n]` from `int[]` -- both simply have no extent. The size
-    /// expressions decide it: a level with an expression is variably modified
-    /// and therefore complete, and a level without one is incomplete. So
-    /// `sizeof(int[][n])`, with two absent extents and one expression, is the
-    /// incomplete `int[]` of arrays and is refused, while `sizeof(int[n])` is
-    /// not.
-    ///
-    /// `void` and function types are deliberately not refused: strict C
-    /// forbids both, gcc accepts them as an extension giving 1, and matching
-    /// gcc is this compiler's policy.
     /// 6.5.3.4p1 for the *expression* form of `sizeof`.
     ///
     /// `check_sizeof_operand_is_complete` answers for a type-name, where the
@@ -1270,7 +1246,6 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    /// Parse function argument list
     /// Parse a run of adjacent string literals into one expression.
     ///
     /// C11 6.4.5p5: if any literal in the run has an encoding prefix, the
@@ -1438,7 +1413,6 @@ impl<'a> Parser<'a> {
         Ok(id)
     }
 
-    /// Parse primary expression: literals, identifiers, parenthesized expressions
     /// Create a typed expression with position
     pub(crate) fn typed_expr(kind: ExprKind, typ: TypeId, pos: Position) -> Expr {
         Expr {
@@ -2191,9 +2165,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a hexadecimal floating-point literal (C99 feature)
-    /// Format: 0x[hex-mantissa]p[±exponent] where mantissa can have decimal point
-    /// Value = significand × 2^exponent
     /// Decompose a hex float literal into an exact `(mantissa, exp2)` pair,
     /// where the value is `mantissa * 2^exp2` with `mantissa` an integer.
     ///

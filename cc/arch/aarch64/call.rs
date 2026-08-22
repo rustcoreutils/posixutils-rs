@@ -289,13 +289,6 @@ impl Aarch64CodeGen {
         }
 
         impl StackArg {
-            /// Bytes this argument occupies in the outgoing area.
-            ///
-            /// The reservation below and the store loop further down both need
-            /// this, and computing it twice is how a 256-bit complex came to
-            /// reserve 8 bytes and write 32 -- straight through the caller's
-            /// own frame. AAPCS64 rounds each stacked argument up to 8, which
-            /// is also what the callee's allocator does.
             /// Where this argument starts, relative to the outgoing area.
             ///
             /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address
@@ -866,16 +859,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Set up an HFA argument: one V register per element, `regs.len()` of them.
-    ///
-    /// AAPCS64 §5.4.2 gives a homogeneous floating-point aggregate one V
-    /// register per element, for one to four elements. Where the aggregate is
-    /// wider than a register the pseudo holds its address and each element is
-    /// loaded from memory; where it fits in one -- `struct { float a, b; }` is
-    /// eight bytes -- the pseudo holds the *value*, and the elements have to
-    /// be cut out of it. A stack slot holding that value is the aggregate's
-    /// own bytes and can simply be loaded from, but a general register has to
-    /// be shifted down an element at a time.
     /// Load element `index` of an HFA argument into `dst`.
     ///
     /// The three shapes an HFA argument arrives in. Above a register's worth

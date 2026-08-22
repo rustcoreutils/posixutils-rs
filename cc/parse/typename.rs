@@ -59,8 +59,6 @@ impl Parser<'_> {
         mods
     }
 
-    /// Apply trailing qualifiers to a type and return the qualified type id
-    /// Used for patterns like "struct foo const *" where const comes after the struct
     /// Apply the qualifiers written after a tag reference, plus `leading` --
     /// the ones already collected before it.
     ///
@@ -90,8 +88,6 @@ impl Parser<'_> {
             .ok_or_else(|| ParseError::new("expected type name".to_string(), self.current_pos()))
     }
 
-    /// Try to parse a type name for casts and sizeof
-    /// Supports compound types like `unsigned char`, `long long`, pointers, etc.
     /// Parse a type-name: a specifier-qualifier list followed by an optional
     /// abstract declarator (C17 6.7.7). Speculative -- the caller uses it to
     /// tell `(type)expr` from `(expr)`, so a failure rewinds and answers

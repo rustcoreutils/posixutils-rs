@@ -232,11 +232,6 @@ fn test_string_ucn() {
     // A narrow literal holds *bytes*, one per `char`, and a UCN names a code
     // point that the execution character set encodes -- UTF-8 here. So
     // `"caf\u00E9"` is five bytes, the last two being 0xC3 0xA9.
-    //
-    // This test used to assert the Rust string "café", which is the same four
-    // characters but only *four* C bytes, and that is precisely the bug it was
-    // pinning: the code point was stored as the single byte 0xE9, so `sizeof`
-    // answered 5 where gcc says 6.
     let (expr, _types, _strings, _symbols) = parse_expr("\"caf\\u00E9\"").unwrap();
     match expr.kind {
         ExprKind::StringLit(s) => {
@@ -1806,7 +1801,6 @@ fn test_long_long_decl() {
 
 #[test]
 fn test_extern_pointer_modifier_propagation() {
-    // Bug fix: "extern int *p" - EXTERN should be on the pointer type, not just int
     let (decl, types, _strings, _symbols) = parse_decl("extern int *p;").unwrap();
     let ptr_typ = decl.declarators[0].typ;
 
@@ -1822,7 +1816,6 @@ fn test_extern_pointer_modifier_propagation() {
 
 #[test]
 fn test_static_pointer_modifier_propagation() {
-    // Bug fix: "static int *p" - STATIC should be on the pointer type, not just int
     let (decl, types, _strings, _symbols) = parse_decl("static int *p;").unwrap();
     let ptr_typ = decl.declarators[0].typ;
 
@@ -1838,7 +1831,6 @@ fn test_static_pointer_modifier_propagation() {
 
 #[test]
 fn test_typedef_array_modifier_propagation() {
-    // Bug fix: "typedef int arr[10]" - TYPEDEF should be on the array type, not just int
     let (decl, types, _strings, _symbols) = parse_decl("typedef int arr[10];").unwrap();
     let arr_typ = decl.declarators[0].typ;
 
@@ -1933,11 +1925,6 @@ fn test_simple_program() {
 
 /// C17 6.7.6.2p2 confines a variably modified ordinary identifier to block
 /// scope, and 6.7.6.2p1 requires an array size to be greater than zero.
-///
-/// Both used to fall to `unwrap_or(0)` in the first file-scope declarator's
-/// own dimension loop -- a fourth copy of array-declarator parsing that the
-/// three existing file-scope checks do not guard -- so each was accepted and
-/// silently sized zero.
 #[test]
 fn test_file_scope_array_size_constraints() {
     for src in [
@@ -3215,8 +3202,6 @@ fn test_function_returning_function_pointer() {
 fn test_function_pointer_returning_struct_pointer() {
     // Function pointer returning a struct pointer: struct node *(*fp)(int)
     // This declares fp as a pointer to a function (int) -> struct node*
-    // Regression test for issue where outer pointers in grouped declarators
-    // were applied after the function type instead of before (to the return type)
     let (tu, types, _strings, _symbols) =
         parse_tu("struct node { int value; }; struct node *(*fp)(int);").unwrap();
     assert_eq!(tu.items.len(), 2);
@@ -3264,7 +3249,6 @@ fn test_function_pointer_returning_struct_pointer() {
 fn test_pointer_to_array_of_pointers() {
     // Pointer to array of pointers: int *(*p)[3]
     // This declares p as a pointer to an array of 3 int pointers
-    // Regression test for issue where type chain was incorrectly built
     let (tu, types, _strings, _symbols) = parse_tu("int *(*p)[3];").unwrap();
     assert_eq!(tu.items.len(), 1);
     match &tu.items[0] {
@@ -3580,11 +3564,8 @@ fn test_typedef_trailing_const_pointer() {
     }
 }
 
-// Bug fix regression tests
-
 #[test]
 fn test_forward_declared_struct_member_access() {
-    // Regression test: forward-declared struct pointer member access
     // The incomplete struct type should be resolved to the complete type
     // when the member access is performed.
     let (tu, types, _strings, _symbols) =
@@ -3619,7 +3600,6 @@ fn test_forward_declared_struct_via_pointer_param() {
 #[test]
 fn test_function_pointer_call() {
     // Regression test: function pointer calls should return the correct type
-    // Previously, the parser only handled TypeKind::Function, not pointers to functions
     let (tu, types, _strings, _symbols) = parse_tu(
         "int (*fp)(int); \
          int test(void) { return fp(42); }",

@@ -453,8 +453,6 @@ define_keywords! {
     (_, "no_sanitize_memory",   SUPPORTED_ATTR),
     (_, "no_sanitize_address",  SUPPORTED_ATTR),
     (_, "no_sanitize_thread",   SUPPORTED_ATTR),
-    // Honoured by the compiler but previously absent here, so
-    // __has_attribute answered 0 for things it actually implements.
     (_, "gnu_inline",              SUPPORTED_ATTR),
     (_, "artificial",              SUPPORTED_ATTR),
     (_, "sysv_abi",                SUPPORTED_ATTR),

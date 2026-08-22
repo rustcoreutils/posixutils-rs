@@ -294,12 +294,6 @@ impl X86_64CodeGen {
         // allocator's palette (xmm0-xmm13) so we don't clobber a live
         // pseudo. Use xmm15 — xmm14 is used as the fallback scratch
         // elsewhere in this file when dst_xmm == xmm15.
-        //
-        // Pre-fix: this used Xmm0, which silently clobbered chordal-
-        // allocated FP pseudos whose intervals didn't cross a call
-        // (e.g., short-lived temporaries in _Py_dg_strtod's
-        // correction loop). Manifested as infinite loops where the
-        // computation went off the rails.
         let dst_xmm = match &dst_loc {
             Loc::Xmm(x) => *x,
             _ => XmmReg::Xmm15,
@@ -503,11 +497,6 @@ impl X86_64CodeGen {
         // reserved scratch — not in the allocator palette). src2 cannot
         // be in Xmm15 (allocator never picks it), so no aliasing check
         // is needed.
-        //
-        // Pre-fix: this used Xmm0 as the work register and Xmm15 as the
-        // src2-aliasing escape hatch. Under chordal coloring, any FP
-        // pseudo could be allocated to Xmm0, so loading src1 into Xmm0
-        // silently clobbered live values.
 
         // Load first operand to XMM15
         self.emit_fp_move(src1, XmmReg::Xmm15, move_size);

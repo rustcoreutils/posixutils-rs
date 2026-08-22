@@ -83,7 +83,6 @@ pub struct MemberInfo {
     pub access_bytes: Option<u32>,
 }
 
-/// An enum constant
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumConstant {
     /// Constant name (interned StringId)
@@ -313,7 +312,6 @@ impl Default for Type {
 }
 
 impl Type {
-    /// Create a new basic type
     pub fn basic(kind: TypeKind) -> Self {
         Self {
             kind,
@@ -321,7 +319,6 @@ impl Type {
         }
     }
 
-    /// Create a type with modifiers
     pub fn with_modifiers(kind: TypeKind, modifiers: TypeModifiers) -> Self {
         Self {
             kind,
@@ -385,7 +382,6 @@ impl Type {
         }
     }
 
-    /// Create a struct type
     pub fn struct_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Struct,
@@ -394,7 +390,6 @@ impl Type {
         }
     }
 
-    /// Create a union type
     pub fn union_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Union,
@@ -403,7 +398,6 @@ impl Type {
         }
     }
 
-    /// Create an enum type
     pub fn enum_type(composite: CompositeType) -> Self {
         Self {
             kind: TypeKind::Enum,
@@ -980,13 +974,11 @@ impl TypeTable {
 
     // Type query methods (moved from Type to TypeTable)
 
-    /// Get the type kind
     #[inline]
     pub fn kind(&self, id: TypeId) -> TypeKind {
         self.get(id).kind
     }
 
-    /// Get type modifiers
     #[inline]
     pub fn modifiers(&self, id: TypeId) -> TypeModifiers {
         self.get(id).modifiers
@@ -1013,7 +1005,6 @@ impl TypeTable {
 
     // Type-shape accessors
 
-    /// Get array size
     #[inline]
     pub fn array_size(&self, id: TypeId) -> Option<usize> {
         self.get(id).array_size
@@ -1088,7 +1079,6 @@ impl TypeTable {
         self.get(id).params.as_ref()
     }
 
-    /// Check if function is variadic
     #[cfg(test)]
     #[inline]
     pub fn is_variadic(&self, id: TypeId) -> bool {
@@ -1777,8 +1767,6 @@ impl TypeTable {
     /// This lives on the type table rather than on one consumer because the
     /// promotions are a prerequisite of the usual arithmetic conversions
     /// (6.3.1.8p1), and both the parser and the linearizer compute those.
-    /// Only the linearizer used to promote, which is why `unsigned char`
-    /// arithmetic came out unsigned.
     #[inline]
     pub fn integer_promote(&self, id: TypeId) -> TypeId {
         match self.kind(id) {

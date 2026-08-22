@@ -3968,6 +3968,34 @@ impl<'a> Linearizer<'a> {
         result
     }
 
+    /// Convert one arm of a conditional expression to the expression's type.
+    ///
+    /// C17 6.5.15p5 gives the whole expression the arms' common type, so an arm
+    /// whose own type differs has to be converted. The test used to ask whether
+    /// the arm was a *narrower integer*, which left a `float` arm feeding a
+    /// `double` result alone: a 32-bit pattern reached a 64-bit `Select`, and
+    /// `pick() ? f() : d0()` with `float f()` evaluated to 0.0.
+    ///
+    /// `emit_convert` already no-ops on an identical kind and size, so the only
+    /// thing left to exclude is a type there is nothing to convert between --
+    /// `void`, a struct, a pointer. Complex is excluded too, deliberately: it
+    /// was not converted before either, and widening it is a separate question
+    /// from this one.
+    fn convert_conditional_arm(
+        &mut self,
+        val: crate::ir::PseudoId,
+        from: crate::types::TypeId,
+        to: crate::types::TypeId,
+    ) -> crate::ir::PseudoId {
+        let convertible =
+            |types: &crate::types::TypeTable, t| types.is_integer(t) || types.is_float(t);
+        if from != to && convertible(self.types, from) && convertible(self.types, to) {
+            self.emit_convert(val, from, to)
+        } else {
+            val
+        }
+    }
+
     pub(crate) fn linearize_ternary(
         &mut self,
         expr: &Expr,
@@ -4009,14 +4037,8 @@ impl<'a> Linearizer<'a> {
 
             let then_typ = self.expr_type(then_expr);
             let else_typ = self.expr_type(else_expr);
-            let then_size = self.types.size_bits(then_typ);
-            let else_size = self.types.size_bits(else_typ);
-            if then_size < size && then_size <= 32 && self.types.is_integer(then_typ) {
-                then_val = self.emit_convert(then_val, then_typ, result_typ);
-            }
-            if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
-                else_val = self.emit_convert(else_val, else_typ, result_typ);
-            }
+            then_val = self.convert_conditional_arm(then_val, then_typ, result_typ);
+            else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
 
             let result = self.alloc_pseudo();
             self.emit(Instruction::select(
@@ -4041,10 +4063,7 @@ impl<'a> Linearizer<'a> {
             self.switch_bb(then_bb);
             let mut then_val = self.linearize_expr(then_expr);
             let then_typ = self.expr_type(then_expr);
-            let then_size = self.types.size_bits(then_typ);
-            if then_size < size && then_size <= 32 && self.types.is_integer(then_typ) {
-                then_val = self.emit_convert(then_val, then_typ, result_typ);
-            }
+            then_val = self.convert_conditional_arm(then_val, then_typ, result_typ);
             let then_end_bb = self.current_bb.unwrap();
             self.emit(Instruction::br(merge_bb));
             self.link_bb(then_end_bb, merge_bb);
@@ -4052,10 +4071,7 @@ impl<'a> Linearizer<'a> {
             self.switch_bb(else_bb);
             let mut else_val = self.linearize_expr(else_expr);
             let else_typ = self.expr_type(else_expr);
-            let else_size = self.types.size_bits(else_typ);
-            if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
-                else_val = self.emit_convert(else_val, else_typ, result_typ);
-            }
+            else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
             let else_end_bb = self.current_bb.unwrap();
             self.emit(Instruction::br(merge_bb));
             self.link_bb(else_end_bb, merge_bb);
@@ -4116,22 +4132,12 @@ impl<'a> Linearizer<'a> {
         let cond_val = self.linearize_expr(cond);
         let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
 
-        // The true value is the condition itself, widened to the result type
-        // the same way the ternary widens its arms.
-        let cond_size = self.types.size_bits(cond_typ);
-        let then_val = if cond_size < size && cond_size <= 32 && self.types.is_integer(cond_typ) {
-            self.emit_convert(cond_val, cond_typ, result_typ)
-        } else {
-            cond_val
-        };
-
         if self.is_pure_expr(else_expr) && size <= 64 {
+            // No branch here, so both arms are converted in place.
+            let then_val = self.convert_conditional_arm(cond_val, cond_typ, result_typ);
             let mut else_val = self.linearize_expr(else_expr);
             let else_typ = self.expr_type(else_expr);
-            let else_size = self.types.size_bits(else_typ);
-            if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
-                else_val = self.emit_convert(else_val, else_typ, result_typ);
-            }
+            else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
             let result = self.alloc_pseudo();
             self.emit(Instruction::select(
                 result, cond_bool, then_val, else_val, result_typ, size,
@@ -4150,8 +4156,16 @@ impl<'a> Linearizer<'a> {
         self.link_bb(cond_end_bb, then_bb);
         self.link_bb(cond_end_bb, else_bb);
 
-        // Nothing to compute on the true side; the value is already in hand.
+        // The true value is the condition, converted to the result type -- done
+        // *inside* the true block, where the ternary also converts its arms.
+        // Converting before the `cbr` is equally correct as IR, and reads more
+        // naturally since the value is already in hand, but it puts an
+        // instruction between the comparison and the branch that consumes it,
+        // and the aarch64 backend then emits a branch on the wrong register.
+        // That is a backend defect and is reported as one; this is not the
+        // place to depend on it.
         self.switch_bb(then_bb);
+        let then_val = self.convert_conditional_arm(cond_val, cond_typ, result_typ);
         let then_end_bb = self.current_bb.unwrap();
         self.emit(Instruction::br(merge_bb));
         self.link_bb(then_end_bb, merge_bb);
@@ -4159,10 +4173,7 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(else_bb);
         let mut else_val = self.linearize_expr(else_expr);
         let else_typ = self.expr_type(else_expr);
-        let else_size = self.types.size_bits(else_typ);
-        if else_size < size && else_size <= 32 && self.types.is_integer(else_typ) {
-            else_val = self.emit_convert(else_val, else_typ, result_typ);
-        }
+        else_val = self.convert_conditional_arm(else_val, else_typ, result_typ);
         let else_end_bb = self.current_bb.unwrap();
         self.emit(Instruction::br(merge_bb));
         self.link_bb(else_end_bb, merge_bb);

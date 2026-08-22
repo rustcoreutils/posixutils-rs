@@ -687,3 +687,53 @@ int main(void) {
     assert_eq!(compile_and_run("c99_elvis", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("c99_elvis_o2", code), 0);
 }
+
+/// C17 6.5.15p5: the conditional expression has the arms' common type, so an
+/// arm whose own type differs is converted.
+///
+/// The conversion used to be attempted only for a *narrower integer* arm, so a
+/// `float` arm feeding a `double` result was left alone and a 32-bit pattern
+/// reached a 64-bit select: `pick() ? f() : d0()` evaluated to 0.0. Both the
+/// ternary and the GNU elvis form were affected, at every one of the seven
+/// places the test was written out.
+#[test]
+fn c99_conditional_arms_are_converted_to_the_common_type() {
+    let code = r#"
+float ff(void) { return 2.5f; }
+double dd(void) { return 7.5; }
+int pick(void) { return 1; }
+int zero(void) { return 0; }
+float g_f = 1.25f;
+
+int main(void) {
+    // Impure arms: the value is produced in a branch and merged.
+    if ((pick() ? ff() : dd()) != 2.5) return 1;
+    if ((zero() ? ff() : dd()) != 7.5) return 2;
+
+    // Pure arms: the value is produced with a select.
+    double one = 1.0;
+    if ((pick() ? g_f : one) != 1.25) return 3;
+
+    // The elvis form: the condition is also the true value.
+    if ((ff() ?: dd()) != 2.5) return 4;
+    float zf = 0.0f;
+    if ((zf ?: dd()) != 7.5) return 5;
+
+    // A narrowing arm is converted too -- `double` arm, `float` result.
+    float narrowed = pick() ? dd() : ff();
+    if (narrowed != 7.5f) return 6;
+
+    // The integer widening the old test did handle must still work.
+    char c = 3;
+    long wide = 1;
+    if ((pick() ? c : wide) != 3) return 7;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("cond_arm_conversion", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("cond_arm_conversion_opt", code),
+        0
+    );
+}

@@ -693,7 +693,15 @@ where
                 }
             }
 
-            // Also check type information (but exclude comparisons)
+            // Type information decides the rest -- except for a comparison,
+            // whose *result* is a boolean integer whatever it compared. The
+            // list used to hold only the `FCmpO*` opcodes, but the `Set*`
+            // family is typed by its operands too: `emit_compare_zero` on a
+            // `float` produces a `SetNe` typed `float`, so its boolean landed
+            // in a vector register while the code that computed it wrote a
+            // general one. On aarch64 the branch then compared a vector
+            // register nothing had loaded, and `f() ?: g()` took whichever arm
+            // the previous call's return value happened to select.
             let is_comparison = matches!(
                 insn.op,
                 Opcode::FCmpOEq
@@ -702,6 +710,16 @@ where
                     | Opcode::FCmpOLe
                     | Opcode::FCmpOGt
                     | Opcode::FCmpOGe
+                    | Opcode::SetEq
+                    | Opcode::SetNe
+                    | Opcode::SetLt
+                    | Opcode::SetLe
+                    | Opcode::SetGt
+                    | Opcode::SetGe
+                    | Opcode::SetB
+                    | Opcode::SetBe
+                    | Opcode::SetA
+                    | Opcode::SetAe
             );
 
             if !is_comparison {

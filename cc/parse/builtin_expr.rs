@@ -118,7 +118,22 @@ impl Parser<'_> {
 
     /// Try to parse a builtin function expression.
     /// Returns `Some(result)` if `name_id` is a recognized builtin, `None` otherwise.
-    pub(super) fn parse_builtin_expr(
+    /// A `__builtin_*(x)` taking one argument, wrapping it in `kind`, and
+    /// carrying result type `typ`.
+    fn parse_unary_builtin(
+        &mut self,
+        token_pos: Position,
+        typ: TypeId,
+        kind: fn(Box<Expr>) -> ExprKind,
+    ) -> ParseResult<Expr> {
+        self.expect_special(b'(')?;
+        let arg = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+        Ok(Self::typed_expr(kind(Box::new(arg)), typ, token_pos))
+    }
+
+    /// `__builtin_va_*`: the variadic-argument builtins, plus `_Generic`.
+    fn parse_varargs_builtin(
         &mut self,
         name_id: StringId,
         token_pos: Position,
@@ -220,75 +235,53 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            crate::kw::BUILTIN_BSWAP16 => Some((|| {
-                // __builtin_bswap16(x) - returns uint16_t
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Bswap16 { arg: Box::new(arg) },
-                    self.types.ushort_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_BSWAP32 => Some((|| {
-                // __builtin_bswap32(x) - returns uint32_t
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Bswap32 { arg: Box::new(arg) },
-                    self.types.uint_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_BSWAP64 => Some((|| {
-                // __builtin_bswap64(x) - returns uint64_t
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Bswap64 { arg: Box::new(arg) },
-                    self.types.ulonglong_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CTZ => Some((|| {
-                // __builtin_ctz(x) - returns int, counts trailing zeros in unsigned int
-                // Result is undefined if x is 0
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Ctz { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CTZL => Some((|| {
-                // __builtin_ctzl(x) - returns int, counts trailing zeros in unsigned long
-                // Result is undefined if x is 0
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Ctzl { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CTZLL => Some((|| {
-                // __builtin_ctzll(x) - returns int, counts trailing zeros in unsigned long long
-                // Result is undefined if x is 0
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Ctzll { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
+            _ => None,
+        }
+    }
+
+    /// Byte swaps, bit counts, checked arithmetic and `__builtin_choose_expr`.
+    fn parse_bit_builtin(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        match name_id {
+            crate::kw::BUILTIN_BSWAP16 => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.ushort_id,
+                |arg| ExprKind::Bswap16 { arg },
+            )),
+
+            crate::kw::BUILTIN_BSWAP32 => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.uint_id,
+                |arg| ExprKind::Bswap32 { arg },
+            )),
+
+            crate::kw::BUILTIN_BSWAP64 => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.ulonglong_id,
+                |arg| ExprKind::Bswap64 { arg },
+            )),
+
+            crate::kw::BUILTIN_CTZ => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Ctz { arg },
+            )),
+
+            crate::kw::BUILTIN_CTZL => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Ctzl { arg },
+            )),
+
+            crate::kw::BUILTIN_CTZLL => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Ctzll { arg },
+            )),
+
             // Checked arithmetic: compute exactly, store the wrapped
             // result, and answer whether wrapping lost anything.
             crate::kw::BUILTIN_ADD_OVERFLOW
@@ -366,114 +359,60 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            crate::kw::BUILTIN_CLZ => Some((|| {
-                // __builtin_clz(x) - returns int, counts leading zeros in unsigned int
-                // Result is undefined if x is 0
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Clz { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CLZL => Some((|| {
-                // __builtin_clzl(x) - returns int, counts leading zeros in unsigned long
-                // Result is undefined if x is 0
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Clzl { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CLZLL => Some((|| {
-                // __builtin_clzll(x) - returns int, counts leading zeros in unsigned long long
-                // Result is undefined if x is 0
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Clzll { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CLRSB => Some((|| {
-                // __builtin_clrsb(x) - redundant sign bits in a signed int.
-                // Defined for every input, so unlike `clz` there is no
-                // undefined case to document.
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Clrsb { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CLRSBL => Some((|| {
-                // __builtin_clrsbl(x) - redundant sign bits in a signed long.
-                // Defined for every input, so unlike `clz` there is no
-                // undefined case to document.
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Clrsbl { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_CLRSBLL => Some((|| {
-                // __builtin_clrsbll(x) - redundant sign bits in a signed long long.
-                // Defined for every input, so unlike `clz` there is no
-                // undefined case to document.
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Clrsbll { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_POPCOUNT => Some((|| {
-                // __builtin_popcount(x) - returns int, counts set bits in unsigned int
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Popcount { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_POPCOUNTL => Some((|| {
-                // __builtin_popcountl(x) - returns int, counts set bits in unsigned long
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Popcountl { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_POPCOUNTLL => Some((|| {
-                // __builtin_popcountll(x) - returns int, counts set bits in unsigned long long
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Popcountll { arg: Box::new(arg) },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
+            crate::kw::BUILTIN_CLZ => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Clz { arg },
+            )),
+
+            crate::kw::BUILTIN_CLZL => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Clzl { arg },
+            )),
+
+            crate::kw::BUILTIN_CLZLL => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Clzll { arg },
+            )),
+
+            crate::kw::BUILTIN_CLRSB => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Clrsb { arg },
+            )),
+
+            crate::kw::BUILTIN_CLRSBL => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Clrsbl { arg },
+            )),
+
+            crate::kw::BUILTIN_CLRSBLL => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Clrsbll { arg },
+            )),
+
+            crate::kw::BUILTIN_POPCOUNT => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Popcount { arg },
+            )),
+
+            crate::kw::BUILTIN_POPCOUNTL => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Popcountl { arg },
+            )),
+
+            crate::kw::BUILTIN_POPCOUNTLL => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.int_id,
+                |arg| ExprKind::Popcountll { arg },
+            )),
+
             crate::kw::BUILTIN_PARITY
             | crate::kw::BUILTIN_PARITYL
             | crate::kw::BUILTIN_PARITYLL => Some((|| {
@@ -535,6 +474,17 @@ impl Parser<'_> {
                     }
                 }
             })()),
+            _ => None,
+        }
+    }
+
+    /// `alloca` and the `mem*` builtins, which lower to library calls.
+    fn parse_memory_builtin(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        match name_id {
             crate::kw::BUILTIN_ALLOCA => Some((|| {
                 // __builtin_alloca(size) - returns void*
                 self.expect_special(b'(')?;
@@ -607,6 +557,17 @@ impl Parser<'_> {
                 ))
             })()),
             // Infinity builtins - return float constants
+            _ => None,
+        }
+    }
+
+    /// Floating-point constants, classification and sign tests.
+    fn parse_float_builtin(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        match name_id {
             crate::kw::BUILTIN_INF | crate::kw::BUILTIN_HUGE_VAL => Some((|| {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
@@ -677,26 +638,18 @@ impl Parser<'_> {
                 ))
             })()),
             // Fabs builtins - absolute value for floats
-            crate::kw::BUILTIN_FABS => Some((|| {
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Fabs { arg: Box::new(arg) },
-                    self.types.double_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::BUILTIN_FABSF => Some((|| {
-                self.expect_special(b'(')?;
-                let arg = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Fabsf { arg: Box::new(arg) },
-                    self.types.float_id,
-                    token_pos,
-                ))
-            })()),
+            crate::kw::BUILTIN_FABS => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.double_id,
+                |arg| ExprKind::Fabs { arg },
+            )),
+
+            crate::kw::BUILTIN_FABSF => Some(self.parse_unary_builtin(
+                token_pos,
+                self.types.float_id,
+                |arg| ExprKind::Fabsf { arg },
+            )),
+
             crate::kw::BUILTIN_FABSL => Some((|| {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
@@ -813,6 +766,17 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            _ => None,
+        }
+    }
+
+    /// Optimiser hints, stack introspection, `setjmp`/`longjmp` and `offsetof`.
+    fn parse_misc_builtin(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        match name_id {
             crate::kw::BUILTIN_UNREACHABLE => Some((|| {
                 // __builtin_unreachable() - marks code as unreachable
                 // Takes no arguments, returns void
@@ -1020,6 +984,40 @@ impl Parser<'_> {
                 ))
             })()),
             // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
+            _ => None,
+        }
+    }
+
+    /// `__c11_atomic_fetch_<op>(ptr, val, order)`: apply the operation and
+    /// return the old value.  The result type is the pointed-to type.
+    fn parse_atomic_fetch_op(
+        &mut self,
+        token_pos: Position,
+        kind: fn(Box<Expr>, Box<Expr>, Box<Expr>) -> ExprKind,
+    ) -> ParseResult<Expr> {
+        self.expect_special(b'(')?;
+        let ptr = self.parse_assignment_expr()?;
+        self.expect_special(b',')?;
+        let val = self.parse_assignment_expr()?;
+        self.expect_special(b',')?;
+        let order = self.parse_assignment_expr()?;
+        self.expect_special(b')')?;
+        let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
+        let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        Ok(Self::typed_expr(
+            kind(Box::new(ptr), Box::new(val), Box::new(order)),
+            result_type,
+            token_pos,
+        ))
+    }
+
+    /// Clang's `__c11_atomic_*` family, behind C11 <stdatomic.h>.
+    fn parse_atomic_builtin(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        match name_id {
             crate::kw::C11_ATOMIC_INIT => Some((|| {
                 // __c11_atomic_init(ptr, val) - initialize atomic (no ordering)
                 self.expect_special(b'(')?;
@@ -1148,116 +1146,31 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            crate::kw::C11_ATOMIC_FETCH_ADD => Some((|| {
-                // __c11_atomic_fetch_add(ptr, val, order) - add and return old
-                self.expect_special(b'(')?;
-                let ptr = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let val = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let order = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                // Result type is the pointed-to type
-                let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                Ok(Self::typed_expr(
-                    ExprKind::C11AtomicFetchAdd {
-                        ptr: Box::new(ptr),
-                        val: Box::new(val),
-                        order: Box::new(order),
-                    },
-                    result_type,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::C11_ATOMIC_FETCH_SUB => Some((|| {
-                // __c11_atomic_fetch_sub(ptr, val, order) - subtract and return old
-                self.expect_special(b'(')?;
-                let ptr = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let val = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let order = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                // Result type is the pointed-to type
-                let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                Ok(Self::typed_expr(
-                    ExprKind::C11AtomicFetchSub {
-                        ptr: Box::new(ptr),
-                        val: Box::new(val),
-                        order: Box::new(order),
-                    },
-                    result_type,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::C11_ATOMIC_FETCH_AND => Some((|| {
-                // __c11_atomic_fetch_and(ptr, val, order) - AND and return old
-                self.expect_special(b'(')?;
-                let ptr = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let val = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let order = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                // Result type is the pointed-to type
-                let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                Ok(Self::typed_expr(
-                    ExprKind::C11AtomicFetchAnd {
-                        ptr: Box::new(ptr),
-                        val: Box::new(val),
-                        order: Box::new(order),
-                    },
-                    result_type,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::C11_ATOMIC_FETCH_OR => Some((|| {
-                // __c11_atomic_fetch_or(ptr, val, order) - OR and return old
-                self.expect_special(b'(')?;
-                let ptr = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let val = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let order = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                // Result type is the pointed-to type
-                let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                Ok(Self::typed_expr(
-                    ExprKind::C11AtomicFetchOr {
-                        ptr: Box::new(ptr),
-                        val: Box::new(val),
-                        order: Box::new(order),
-                    },
-                    result_type,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::C11_ATOMIC_FETCH_XOR => Some((|| {
-                // __c11_atomic_fetch_xor(ptr, val, order) - XOR and return old
-                self.expect_special(b'(')?;
-                let ptr = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let val = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let order = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                // Result type is the pointed-to type
-                let ptr_type = ptr.typ.unwrap_or(self.types.void_ptr_id);
-                let result_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                Ok(Self::typed_expr(
-                    ExprKind::C11AtomicFetchXor {
-                        ptr: Box::new(ptr),
-                        val: Box::new(val),
-                        order: Box::new(order),
-                    },
-                    result_type,
-                    token_pos,
-                ))
-            })()),
+            crate::kw::C11_ATOMIC_FETCH_ADD => {
+                Some(self.parse_atomic_fetch_op(token_pos, |ptr, val, order| {
+                    ExprKind::C11AtomicFetchAdd { ptr, val, order }
+                }))
+            }
+            crate::kw::C11_ATOMIC_FETCH_SUB => {
+                Some(self.parse_atomic_fetch_op(token_pos, |ptr, val, order| {
+                    ExprKind::C11AtomicFetchSub { ptr, val, order }
+                }))
+            }
+            crate::kw::C11_ATOMIC_FETCH_AND => {
+                Some(self.parse_atomic_fetch_op(token_pos, |ptr, val, order| {
+                    ExprKind::C11AtomicFetchAnd { ptr, val, order }
+                }))
+            }
+            crate::kw::C11_ATOMIC_FETCH_OR => {
+                Some(self.parse_atomic_fetch_op(token_pos, |ptr, val, order| {
+                    ExprKind::C11AtomicFetchOr { ptr, val, order }
+                }))
+            }
+            crate::kw::C11_ATOMIC_FETCH_XOR => {
+                Some(self.parse_atomic_fetch_op(token_pos, |ptr, val, order| {
+                    ExprKind::C11AtomicFetchXor { ptr, val, order }
+                }))
+            }
             crate::kw::C11_ATOMIC_THREAD_FENCE => Some((|| {
                 // __c11_atomic_thread_fence(order) - memory fence
                 self.expect_special(b'(')?;
@@ -1284,6 +1197,17 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            _ => None,
+        }
+    }
+
+    /// `__builtin_object_size`, the _FORTIFY_SOURCE size query.
+    fn parse_object_size_builtin(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        match name_id {
             crate::kw::BUILTIN_OBJECT_SIZE => Some((|| {
                 // __builtin_object_size(ptr, type): how many bytes remain in
                 // the object `ptr` points into, when that is known statically.
@@ -1315,99 +1239,140 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            _ => {
-                let name_str = self.idents.get_opt(name_id).unwrap_or("");
-                // A builtin that is nothing but the library function under a
-                // reserved name. gcc knows these intrinsically, and code that
-                // uses them is usually inside the very header that declares
-                // the real one, so the call is spelled `__builtin_` to avoid
-                // depending on a declaration it is in the middle of making.
-                //
-                // They ride the same de-prefixing path as the `_chk` family
-                // below rather than getting an `ExprKind` each: an expression
-                // node per builtin means a case in the linearizer and in both
-                // backends, for something that is already an ordinary call.
-                if name_str.starts_with("__builtin___") || Self::is_library_builtin(name_id) {
-                    Some((|| {
-                        // Fortified builtins: __builtin___snprintf_chk etc.
-                        // Strip __builtin_ prefix → __snprintf_chk, which is a
-                        // real libc function (declared by macOS/glibc headers).
-                        // `__builtin_trap` has no same-named library entry
-                        // point; its contract is abnormal termination, which
-                        // is `abort`. Everything else keeps its own name.
-                        let real_name = match name_str {
-                            "__builtin_trap" => "abort",
-                            _ => &name_str["__builtin_".len()..],
-                        };
-                        // Parse arguments first (must consume tokens regardless)
-                        self.expect_special(b'(')?;
-                        let mut args = Vec::new();
-                        if !self.is_special(b')') {
-                            args.push(self.parse_assignment_expr()?);
-                            while self.is_special(b',') {
-                                self.advance();
-                                args.push(self.parse_assignment_expr()?);
-                            }
-                        }
-                        self.expect_special(b')')?;
-                        // Look up the real function by its de-prefixed name
-                        let real_name_id = self.idents.lookup(real_name);
-                        let symbol_id = real_name_id.and_then(|id| {
-                            self.symbols
-                                .lookup_id(id, crate::symbol::Namespace::Ordinary)
-                        });
-                        if let Some(symbol_id) = symbol_id {
-                            let func_type = self.symbols.get(symbol_id).typ;
-                            let ret_type =
-                                self.types.base_type(func_type).unwrap_or(self.types.int_id);
-                            let func_expr =
-                                Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
-                            return Ok(Self::typed_expr(
-                                ExprKind::Call {
-                                    func: Box::new(func_expr),
-                                    args,
-                                },
-                                ret_type,
-                                token_pos,
-                            ));
-                        }
-                        // Not declared. gcc knows these intrinsically and
-                        // glibc relies on that: `bits/string_fortified.h`
-                        // calls `__builtin___memcpy_chk` without ever
-                        // declaring `__memcpy_chk`. Synthesize the
-                        // declaration rather than failing.
-                        if let Some(symbol_id) = self
-                            .chk_builtin_return_type(real_name)
-                            .and_then(|ret| self.declare_chk_builtin(real_name, ret))
-                        {
-                            let ret_type = self
-                                .types
-                                .base_type(self.symbols.get(symbol_id).typ)
-                                .unwrap_or(self.types.int_id);
-                            let func_type = self.symbols.get(symbol_id).typ;
-                            let func_expr =
-                                Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
-                            return Ok(Self::typed_expr(
-                                ExprKind::Call {
-                                    func: Box::new(func_expr),
-                                    args,
-                                },
-                                ret_type,
-                                token_pos,
-                            ));
-                        }
-                        diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
-                        Ok(Self::typed_expr(
-                            ExprKind::IntLit(0),
-                            self.types.int_id,
-                            token_pos,
-                        ))
-                    })())
-                } else {
-                    None
-                }
-            }
+            _ => None,
         }
+    }
+
+    /// A builtin that is nothing but the library function under a
+    /// reserved name, including the fortified `__builtin___*_chk`
+    /// family.  These ride a de-prefixing path rather than getting an
+    /// `ExprKind` each: an expression node per builtin means a case in
+    /// the linearizer and in both backends, for something that is
+    /// already an ordinary call.
+    fn parse_library_builtin(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        let name_str = self.idents.get_opt(name_id).unwrap_or("");
+        // A builtin that is nothing but the library function under a
+        // reserved name. gcc knows these intrinsically, and code that
+        // uses them is usually inside the very header that declares
+        // the real one, so the call is spelled `__builtin_` to avoid
+        // depending on a declaration it is in the middle of making.
+        //
+        // They ride the same de-prefixing path as the `_chk` family
+        // below rather than getting an `ExprKind` each: an expression
+        // node per builtin means a case in the linearizer and in both
+        // backends, for something that is already an ordinary call.
+        if name_str.starts_with("__builtin___") || Self::is_library_builtin(name_id) {
+            Some((|| {
+                // Fortified builtins: __builtin___snprintf_chk etc.
+                // Strip __builtin_ prefix → __snprintf_chk, which is a
+                // real libc function (declared by macOS/glibc headers).
+                // `__builtin_trap` has no same-named library entry
+                // point; its contract is abnormal termination, which
+                // is `abort`. Everything else keeps its own name.
+                let real_name = match name_str {
+                    "__builtin_trap" => "abort",
+                    _ => &name_str["__builtin_".len()..],
+                };
+                // Parse arguments first (must consume tokens regardless)
+                self.expect_special(b'(')?;
+                let mut args = Vec::new();
+                if !self.is_special(b')') {
+                    args.push(self.parse_assignment_expr()?);
+                    while self.is_special(b',') {
+                        self.advance();
+                        args.push(self.parse_assignment_expr()?);
+                    }
+                }
+                self.expect_special(b')')?;
+                // Look up the real function by its de-prefixed name
+                let real_name_id = self.idents.lookup(real_name);
+                let symbol_id = real_name_id.and_then(|id| {
+                    self.symbols
+                        .lookup_id(id, crate::symbol::Namespace::Ordinary)
+                });
+                if let Some(symbol_id) = symbol_id {
+                    let func_type = self.symbols.get(symbol_id).typ;
+                    let ret_type = self.types.base_type(func_type).unwrap_or(self.types.int_id);
+                    let func_expr =
+                        Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
+                    return Ok(Self::typed_expr(
+                        ExprKind::Call {
+                            func: Box::new(func_expr),
+                            args,
+                        },
+                        ret_type,
+                        token_pos,
+                    ));
+                }
+                // Not declared. gcc knows these intrinsically and
+                // glibc relies on that: `bits/string_fortified.h`
+                // calls `__builtin___memcpy_chk` without ever
+                // declaring `__memcpy_chk`. Synthesize the
+                // declaration rather than failing.
+                if let Some(symbol_id) = self
+                    .chk_builtin_return_type(real_name)
+                    .and_then(|ret| self.declare_chk_builtin(real_name, ret))
+                {
+                    let ret_type = self
+                        .types
+                        .base_type(self.symbols.get(symbol_id).typ)
+                        .unwrap_or(self.types.int_id);
+                    let func_type = self.symbols.get(symbol_id).typ;
+                    let func_expr =
+                        Self::typed_expr(ExprKind::Ident(symbol_id), func_type, token_pos);
+                    return Ok(Self::typed_expr(
+                        ExprKind::Call {
+                            func: Box::new(func_expr),
+                            args,
+                        },
+                        ret_type,
+                        token_pos,
+                    ));
+                }
+                diag::error_args(token_pos, "undeclared function '{0}'", &[real_name]);
+                Ok(Self::typed_expr(
+                    ExprKind::IntLit(0),
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })())
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn parse_builtin_expr(
+        &mut self,
+        name_id: StringId,
+        token_pos: Position,
+    ) -> Option<ParseResult<Expr>> {
+        // Each family answers `None` for a name it does not own.
+        if let Some(result) = self.parse_varargs_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_bit_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_memory_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_float_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_misc_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_atomic_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_object_size_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        self.parse_library_builtin(name_id, token_pos)
     }
 
     /// What is statically known about the object a pointer expression

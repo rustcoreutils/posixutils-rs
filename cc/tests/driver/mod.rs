@@ -1486,3 +1486,86 @@ fn driver_dash_include_missing_file_is_an_error() {
         r.stderr
     );
 }
+
+/// `-dM` dumps every macro in force as the `#define` that would make it,
+/// instead of the preprocessed text.
+#[test]
+fn driver_dash_dm_dumps_macro_definitions() {
+    let w = WorkDir::new("dash_dm");
+    let src = w.write(
+        "m.c",
+        "#define OBJ 1\n#define FN(a,b) ((a)+(b))\n#define EMPTY\n\
+         #define VAR(...) f(__VA_ARGS__)\n#define STR(x) #x\n#define CAT(a,b) a##b\n\
+         #define GNU(a, rest...) g(rest)\nint v;\n",
+    );
+    let r = run_c17(&["-dM", "-E", &s(&src)]);
+    assert!(r.success, "-dM failed: {}", r.stderr);
+
+    for want in [
+        "#define OBJ 1",
+        "#define FN(a,b) ((a)+(b))",
+        "#define VAR(...) f(__VA_ARGS__)",
+        // The `#` and `##` operators are put back, and parameters are named
+        // rather than shown as the indices the body actually stores.
+        "#define STR(x) #x",
+        "#define CAT(a,b) a##b",
+        // The GNU named-variadic spelling round-trips as itself.
+        "#define GNU(a,rest...) g(rest)",
+    ] {
+        assert!(
+            r.stdout.contains(want),
+            "expected {:?} in:\n{}",
+            want,
+            r.stdout
+        );
+    }
+    assert!(
+        r.stdout.lines().any(|l| l.trim_end() == "#define EMPTY"),
+        "an empty replacement list still gets a line:\n{}",
+        r.stdout
+    );
+
+    // The source's own text is not the output.
+    assert!(
+        !r.stdout.contains("int v;"),
+        "-dM replaces the text:\n{}",
+        r.stdout
+    );
+
+    // Predefines are in there too, which is what `-dM` is usually asked for.
+    assert!(
+        r.stdout.contains("#define __STDC__ 1"),
+        "missing predefines"
+    );
+
+    // The dynamic builtins have no replacement list to print; gcc omits them.
+    for absent in [
+        "#define __FILE__",
+        "#define __LINE__",
+        "#define __COUNTER__",
+    ] {
+        assert!(!r.stdout.contains(absent), "{} should be omitted", absent);
+    }
+}
+
+/// The macro table is a `HashMap`, whose iteration order differs per process.
+/// `-dM` sorts, or its output would differ run to run.
+#[test]
+fn driver_dash_dm_output_is_deterministic() {
+    let w = WorkDir::new("dash_dm_det");
+    let src = w.write("m.c", "#define B 2\n#define A 1\n#define C 3\nint v;\n");
+    let first = run_c17(&["-dM", "-E", &s(&src)]);
+    let second = run_c17(&["-dM", "-E", &s(&src)]);
+    assert!(first.success && second.success);
+    assert_eq!(first.stdout, second.stdout, "-dM output must not vary");
+
+    let names: Vec<&str> = first
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("#define "))
+        .map(|l| l.split(['(', ' ']).next().unwrap_or(""))
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "-dM output must be sorted by name");
+}

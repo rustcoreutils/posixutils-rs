@@ -1149,6 +1149,108 @@ impl<'a> Preprocessor<'a> {
         Some(filtered)
     }
 
+    /// Every macro definition in force, as the `#define` that would make it,
+    /// sorted by name.
+    ///
+    /// Sorted because `macros` is a `HashMap` and its iteration order differs
+    /// per process: an unsorted dump would make `-dM` output differ run to run,
+    /// which is exactly what the determinism rule exists to stop.
+    ///
+    /// The dynamic builtins -- `__FILE__`, `__LINE__`, `__COUNTER__`,
+    /// `__has_include` and the rest -- are omitted, as gcc omits them. They
+    /// have no replacement list to print; what they expand to is a function of
+    /// where they appear.
+    pub fn macro_definitions(&self, idents: &mut IdentTable) -> Vec<String> {
+        let mut names: Vec<&String> = self
+            .macros
+            .iter()
+            .filter(|(_, mac)| mac.builtin.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+
+        names
+            .into_iter()
+            .map(|name| {
+                // Cloned out so the table is not borrowed while rendering,
+                // which needs `&mut IdentTable`.
+                let mac = self.macros[name].clone();
+                self.render_definition(&mac, idents)
+            })
+            .collect()
+    }
+
+    /// One `#define` line for one macro.
+    fn render_definition(&self, mac: &Macro, idents: &mut IdentTable) -> String {
+        let mut out = format!("#define {}", mac.name);
+
+        if mac.is_function {
+            out.push('(');
+            for (i, p) in mac.params.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&p.name);
+            }
+            if mac.is_variadic {
+                if !mac.params.is_empty() {
+                    out.push(',');
+                }
+                match &mac.variadic_name {
+                    // The GNU spelling names the trailing arguments.
+                    Some(name) => {
+                        out.push_str(name);
+                        out.push_str("...");
+                    }
+                    None => out.push_str("..."),
+                }
+            }
+            out.push(')');
+        }
+
+        // gcc writes a trailing space even for an empty replacement list, and
+        // the space is what separates the name from the body in every other
+        // case, so it is unconditional here too.
+        out.push(' ');
+        for (i, mt) in mac.body.iter().enumerate() {
+            if i > 0 && mt.whitespace {
+                out.push(' ');
+            }
+            out.push_str(&self.render_body_token(mac, mt, idents));
+        }
+        out
+    }
+
+    /// One body token, with the parameter references put back as names.
+    fn render_body_token(&self, mac: &Macro, mt: &MacroToken, idents: &mut IdentTable) -> String {
+        let variadic = || match &mac.variadic_name {
+            Some(name) => name.clone(),
+            None => "__VA_ARGS__".to_string(),
+        };
+        match &mt.value {
+            MacroTokenValue::Param(idx) => mac
+                .params
+                .get(*idx)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(variadic),
+            MacroTokenValue::Stringify(idx) => format!(
+                "#{}",
+                mac.params
+                    .get(*idx)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(variadic)
+            ),
+            MacroTokenValue::Paste => "##".to_string(),
+            MacroTokenValue::VaArgs => variadic(),
+            // An ordinary body token: round-trip it through a real token so the
+            // spelling is the lexer's, not a second guess at one.
+            _ => {
+                let token = self.macro_token_to_token(mt, &Position::default(), idents);
+                show_token(&token, idents)
+            }
+        }
+    }
+
     /// Convert a macro token to a regular token
     fn macro_token_to_token(
         &self,

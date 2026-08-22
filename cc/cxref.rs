@@ -21,7 +21,7 @@ use posixutils_cc::ppargs;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_with_defines, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::token::{preprocess_collecting, PreprocessConfig, StreamTable, Tokenizer};
 use posixutils_cc::types::TypeTable;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -558,7 +558,7 @@ fn process_file(
 
     // Preprocess
     let target = Target::host();
-    let preprocessed = preprocess_with_defines(
+    let (preprocessed, _) = preprocess_collecting(
         tokens,
         &target,
         &mut strings,

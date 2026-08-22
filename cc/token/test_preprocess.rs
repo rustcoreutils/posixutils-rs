@@ -19,7 +19,7 @@ fn preprocess_str(input: &str) -> (Vec<Token>, IdentTable) {
     let mut strings = IdentTable::new();
     let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
-    let result = preprocess_with_defines(
+    let (result, _) = preprocess_collecting(
         tokens,
         &target,
         &mut strings,

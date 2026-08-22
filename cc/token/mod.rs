@@ -19,5 +19,5 @@ pub use lexer::{
     replace_trigraphs, show_token, token_type_name, write_token, StreamTable, TokenType, Tokenizer,
 };
 pub use preprocess::{
-    preprocess_asm_file, preprocess_with_defines, AsmPreprocessConfig, PreprocessConfig,
+    preprocess_asm_file, preprocess_collecting, AsmPreprocessConfig, PreprocessConfig,
 };

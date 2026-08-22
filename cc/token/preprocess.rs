@@ -2472,6 +2472,8 @@ pub struct PreprocessConfig<'a> {
     /// Files to process as if each were a `#include "..."` on the line before
     /// the source, in the order given (`-include`).
     pub pre_includes: &'a [String],
+    /// Collect every macro definition for `-dM` instead of only the tokens.
+    pub dump_macros: bool,
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2507,10 +2509,22 @@ fn define_optimization_macros(pp: &mut Preprocessor, opt: crate::opt::Optimizati
     }
 }
 
-/// Preprocess tokens with command-line defines and undefines
+/// What preprocessing found, beyond the tokens.
 ///
-/// This is the main entry point for preprocessing.
-/// Takes lexer output and returns preprocessed tokens.
+/// The `Preprocessor` is a local of the function below and is dropped when it
+/// returns, so anything a caller wants to *collect* has to leave through here.
+#[derive(Debug, Default)]
+pub struct PreprocessOutcome {
+    /// Every macro in force at the end, as `#define` lines, sorted (`-dM`).
+    /// Empty unless asked for: rendering them is not free.
+    pub macro_definitions: Vec<String>,
+}
+
+/// Preprocess tokens with command-line defines and undefines, collecting
+/// whatever [`PreprocessConfig`] asked to be collected.
+///
+/// This is the entry point for preprocessing: lexer output in, preprocessed
+/// tokens out. A caller that wants only the tokens ignores the outcome.
 ///
 /// # Arguments
 /// * `tokens` - Lexer output tokens
@@ -2518,13 +2532,13 @@ fn define_optimization_macros(pp: &mut Preprocessor, opt: crate::opt::Optimizati
 /// * `idents` - Identifier table for string interning
 /// * `filename` - Name of the source file
 /// * `config` - Preprocessing configuration (defines, undefines, include paths, flags)
-pub fn preprocess_with_defines(
+pub fn preprocess_collecting(
     tokens: Vec<Token>,
     target: &Target,
     idents: &mut IdentTable,
     filename: &str,
     config: &PreprocessConfig<'_>,
-) -> Vec<Token> {
+) -> (Vec<Token>, PreprocessOutcome) {
     let mut pp = Preprocessor::new(target, filename, &config.search);
 
     // -nostdinc drops the bundled headers as well as the system directories,
@@ -2580,7 +2594,15 @@ pub fn preprocess_with_defines(
         ));
         output.splice(at..at, included);
     }
-    output
+
+    let outcome = PreprocessOutcome {
+        macro_definitions: if config.dump_macros {
+            pp.macro_definitions(idents)
+        } else {
+            Vec::new()
+        },
+    };
+    (output, outcome)
 }
 
 // ============================================================================

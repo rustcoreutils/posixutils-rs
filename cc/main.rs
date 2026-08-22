@@ -46,7 +46,7 @@ use symbol::SymbolTable;
 use target::Os;
 use target::{classify_std, StdRequest, Target};
 use token::{
-    preprocess_asm_file, preprocess_with_defines, replace_trigraphs, show_token, token_type_name,
+    preprocess_asm_file, preprocess_collecting, replace_trigraphs, show_token, token_type_name,
     write_token, AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType, Tokenizer,
 };
 
@@ -102,6 +102,10 @@ struct Args {
     /// headers.
     #[arg(short = 'P', help = gettext("Do not emit line markers in preprocessed output"))]
     no_line_markers: bool,
+
+    /// Dump every macro definition instead of the preprocessed text (`-dM`).
+    #[arg(long = "dM", help = gettext("Dump macro definitions instead of output"))]
+    dump_macros: bool,
 
     /// Process a file as if `#include "<file>"` were the first line
     /// (`-include`). Repeatable, applied in order.
@@ -575,7 +579,7 @@ fn process_file(
     }
 
     // Preprocess (may add new identifiers from included files)
-    let mut preprocessed = preprocess_with_defines(
+    let (mut preprocessed, outcome) = preprocess_collecting(
         tokens,
         target,
         &mut strings,
@@ -590,6 +594,7 @@ fn process_file(
             trigraphs: args.trigraphs,
             preprocessed,
             pre_includes: &args.pre_includes,
+            dump_macros: args.dump_macros,
             optimization: args.optimization(),
         },
     );
@@ -613,6 +618,22 @@ fn process_file(
         // state on the preprocessor and is never recorded in the stream
         // registry, so `effective_position` cannot see it either — the same
         // pre-existing gap that keeps parser diagnostics on physical lines.
+        // `-dM` asks what the macros are, not what the source becomes, so it
+        // replaces the output rather than adding to it.
+        if args.dump_macros {
+            for line in &outcome.macro_definitions {
+                writeln!(out.preprocessed, "{}", line)?;
+            }
+            out.preprocessed.flush()?;
+            if diag::has_error() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "preprocessing failed",
+                ));
+            }
+            return Ok(Compiled::Nothing);
+        }
+
         // `-P` asks for the text alone. Everything that would emit a marker
         // below checks this; a marker is never merely cosmetic, so each site
         // has to say what it does instead.
@@ -1340,6 +1361,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // gcc spells these with one dash and clap declares them long-only,
             // so they used to reach it unrewritten and be rejected outright.
             result.push(format!("-{}", arg));
+            i += 1;
+        } else if arg == "-dM" {
+            // One dash in gcc; clap would read it as the short cluster `-d -M`.
+            result.push("--dM".to_string());
             i += 1;
         } else if arg == "-include" {
             // gcc spells it with one dash; clap would read that as the short

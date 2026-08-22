@@ -1760,9 +1760,8 @@ mod tests {
         }
     }
 
-    /// Every `double` result agrees with the hardware, exhaustively over a
-    /// wide random sample -- the arithmetic here has to be a drop-in for what
-    /// folding through `f64` used to do, for the format where that was right.
+    /// Every `double` result agrees with the hardware, over a wide random
+    /// sample: for the `double` format this arithmetic must match `f64`.
     #[test]
     fn double_results_agree_with_hardware() {
         // A xorshift, so the sample is fixed without pulling in a dependency.
@@ -1843,8 +1842,7 @@ mod tests {
             v.to_f128_bits(),
             (0x0800_0000_0000_0000, 0x4034_0000_0000_0000)
         );
-        // Rounding it to double loses the low bit, which is exactly what
-        // the old fold did to it on the way in.
+        // Rounding it to double loses the low bit.
         assert_ne!(
             v.key(),
             FloatVal::from_f64(9007199254740993i64 as f64).key()

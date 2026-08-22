@@ -19,20 +19,10 @@ use crate::token::lexer::{Position, TokenType};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 
-/// The type specifiers seen while parsing one declaration specifier list.
-///
-/// C17 6.7.2p2 does not let a declaration name a type by accumulation: the
-/// specifiers must together be one of a fixed list of combinations. The
-/// specifier loop only tracked the resulting kind, each keyword overwriting
-/// the last, so an impossible combination named whichever type came last --
-/// `float double x;` was a `double`, `void int y;` an object of type void with
-/// a size of 4, and `long long long z;` a `long long`. All three were accepted
-/// silently, which makes this a wrong program rather than the missing
-/// diagnostic it was first filed as.
-///
-/// `short`, `long`, `signed` and `unsigned` are counted rather than recorded
-/// as data types, because the valid combinations pair them with `int`, and
-/// `long` with `double` -- they qualify a data type instead of naming one.
+/// C17 6.7.2p2: the type specifiers must together name one of a
+/// fixed list of combinations, so they are tallied, not accumulated.
+/// `short`/`long`/`signed`/`unsigned` are counted; they qualify a
+/// data type rather than naming one.
 #[derive(Default)]
 struct SpecifierTally {
     /// Data-type specifiers, in source order, under their canonical spelling.
@@ -388,12 +378,8 @@ impl Parser<'_> {
     }
 
     /// C17 6.7.6.2p1: an array's size expression shall have integer type.
-    ///
-    /// Without this the non-constant fallback took over and `int a[1.5];`
-    /// became a variable length array at block scope -- accepted, and sized
-    /// from a `double` -- where gcc says *"size of array has non-integer
-    /// type"*. At file scope it read as a VLA rejection, which is a different
-    /// reason and the wrong one.
+    /// Without it the non-constant fallback takes over and `int a[1.5];`
+    /// parses as a variable length array sized from a `double`.
     pub(super) fn check_array_size_type(&self, expr: &Expr, pos: Position) -> ParseResult<()> {
         match expr.typ {
             Some(t) if !self.types.is_integer(t) => Err(ParseError::new(
@@ -404,14 +390,11 @@ impl Parser<'_> {
         }
     }
 
-    /// Derive an array type, refusing an extent the compiler cannot describe.
-    ///
+    /// Derive an array type, refusing an extent the compiler cannot describe:
     /// `TypeTable::size_bits` answers in a `u32`, so an object wider than
-    /// `u32::MAX` bits has no representable size. That used to saturate in
-    /// silence: `char big[5000000000];` reported `sizeof` 536870911 with no
-    /// diagnostic anywhere. The bound is enforced here, where the element
-    /// type is known, so the outer dimension of a multi-dimensional array is
-    /// measured against an inner one that is already within it.
+    /// `u32::MAX` bits has no representable size. Enforced here, where the
+    /// element type is known, so an outer dimension is measured against an
+    /// inner one already within the bound.
     pub(super) fn derive_array_type(
         &mut self,
         elem: TypeId,
@@ -539,9 +522,8 @@ impl Parser<'_> {
         let decl_pos = self.current_pos();
         let base_type = self.parse_type_specifier()?;
         // A declaration that stops right here declares nothing, and that --
-        // not a missing type specifier -- is what to report. `static;` used to
-        // draw "type specifier missing", blaming the half that was absent
-        // rather than the declarator that was. The `;` arms below do it.
+        // not a missing type specifier -- is what to report. The `;` arms
+        // below do it.
         if !self.is_special(b';') {
             self.check_implicit_int(decl_pos);
         }
@@ -792,10 +774,8 @@ impl Parser<'_> {
         // to collect trailing qualifiers like "z_word_t const"
         let mut typedef_base: Option<TypeId> = None;
         // C17 6.7.2p2 admits only a fixed list of specifier combinations. The
-        // loop below merely overwrites `base_kind`, so without a tally
-        // `float double x;` silently became a `double` and `void int y;` an
-        // object of type void with a size -- accepted, and wrong, rather than
-        // diagnosed. Recorded here and checked once the list is complete.
+        // loop below merely overwrites `base_kind`, so the specifiers are
+        // recorded here and checked once the list is complete.
         let mut tally = SpecifierTally::default();
 
         // Skip any leading __attribute__
@@ -1289,10 +1269,7 @@ impl Parser<'_> {
     /// type, which for a function declarator *is* the return type -- so
     /// `inline int hdr(int)` and `extern int hdr(int)` build function types
     /// whose returns are two different `int`s, and compatibility comparing
-    /// bases by id calls them different. They print identically, which is how
-    /// the diagnostic gave itself away: "conflicting types for 'hdr':
-    /// 'int(int)' then 'int(int)'". `cc/audit.md` records the same family of
-    /// bug reaching call compatibility once before.
+    /// bases by id calls them different, though they print identically.
     fn strip_declaration_modifiers_deep(&mut self, id: TypeId) -> TypeId {
         let id = self.strip_declaration_modifiers(id);
         if self.types.kind(id) != TypeKind::Function {
@@ -1312,20 +1289,10 @@ impl Parser<'_> {
 
     /// Diagnose a redeclaration whose type conflicts with the one already in
     /// scope (C17 6.7p4: all declarations of the same object or function shall
-    /// specify compatible types).
-    ///
-    /// Nothing compared types before: `SymbolTable::declare` only rejects two
-    /// *definitions* at one depth, and `Symbol::function` is never marked
-    /// defined, so two function declarations never collided at all. `int x;
-    /// double x;` therefore bound the second declarator to the first symbol
-    /// and emitted `.comm x,4,4` -- a silent miscompile, since a `double`
-    /// store through it runs off the object.
-    ///
-    /// The two guards are what keep legal code legal, and both are borrowed
-    /// from `check_typedef_redefinition`: only a repeat *in the same scope* is
-    /// a redeclaration, so shadowing survives; and the declaration-only
-    /// modifiers come off first, so `extern int x;` followed by `int x = 5;`
-    /// is one type, not two.
+    /// specify compatible types). Two guards keep legal code legal: only a
+    /// repeat *in the same scope* is a redeclaration, so shadowing survives,
+    /// and the declaration-only modifiers come off first, so `extern int x;`
+    /// followed by `int x = 5;` is one type, not two.
     pub(super) fn check_redeclaration(&mut self, name: StringId, new_type: TypeId, pos: Position) {
         let Some(existing_id) = self.symbols.lookup_id(name, Namespace::Ordinary) else {
             return;

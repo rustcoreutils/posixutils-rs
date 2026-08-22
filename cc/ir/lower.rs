@@ -6,13 +6,9 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Lowering passes for c17 C17 compiler
-//
-// This module contains IR-to-IR transformation passes that lower
-// high-level IR constructs to forms suitable for code generation.
-//
-// Key passes:
-// - Phi elimination: Converts SSA phi nodes to copy instructions
+// IR-to-IR passes that lower high-level constructs to a form the code
+// generator accepts. Currently: phi elimination, which converts SSA phi
+// nodes to copy instructions.
 //
 
 use super::{BasicBlockId, Function, Instruction, Module, Opcode, PseudoKind};
@@ -147,25 +143,11 @@ struct CopyInfo {
 
 /// Sequentialize parallel copies to handle the "lost copy" problem.
 ///
-/// When multiple phi nodes in the same block have overlapping targets and sources,
-/// naive sequential insertion can corrupt values. For example:
-///
-///   %a = phi [pred: %b]
-///   %b = phi [pred: %a]
-///
-/// If we naively emit:
-///   %a = copy %b
-///   %b = copy %a   // BUG: %a already overwritten!
-///
-/// The solution is to:
-/// 1. Detect when a target is used as a source in another copy
-/// 2. Order copies so targets are written before they're read as sources
-/// 3. For cycles, break them using a temporary variable
-///
-/// Algorithm (based on "Translating Out of SSA" by Sreedhar et al.):
-/// - A copy is "free" if its TARGET is not used as SOURCE by any other pending copy
-/// - Process free copies first (writing to a target that no one else needs to read)
-/// - For cycles, save one source to a temp, update all uses, then continue
+/// A block's phi copies are parallel: overwriting a target that another
+/// pending copy still reads as a source destroys that value. So a copy whose
+/// target no other pending copy reads is emitted first, and a cycle -- where
+/// no such copy exists -- is broken by saving one source to a temp and
+/// redirecting its readers. (Sreedhar et al., "Translating Out of SSA".)
 fn sequentialize_copies(copies: &[CopyInfo], func: &mut Function) -> Vec<CopyInfo> {
     use std::collections::HashSet;
 

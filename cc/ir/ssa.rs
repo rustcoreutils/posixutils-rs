@@ -6,11 +6,8 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// SSA Conversion for c17 C17 compiler
-//
-// Converts memory-based local variables to SSA form:
-// - Inserts phi nodes at dominance frontiers
-// - Renames variables to complete SSA construction
+// Converts memory-based local variables to SSA form: phi nodes at dominance
+// frontiers, then renaming to complete the construction.
 //
 
 use super::dominate::{compute_dominance_frontiers, domtree_build, idf_compute};
@@ -602,19 +599,8 @@ fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
 /// Convert a function to SSA form.
 ///
 /// This promotes eligible local variables from memory to SSA registers,
-/// inserting phi nodes at control flow merge points.
-///
-/// # Algorithm
-/// 1. Build dominator tree
-/// 2. For each promotable local variable:
-///    - Compute its iterated dominance frontier (IDF)
-///    - Insert phi nodes at IDF blocks
-/// 3. Rename variables:
-///    - Walk blocks in dominator tree order
-///    - Replace loads with reaching definitions
-///    - Record stores as new definitions
-///    - Fill in phi operands from predecessors
-/// 4. Remove dead stores
+/// inserting phi nodes at each variable's iterated dominance frontier. The
+/// phases are marked in the body.
 pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
     if func.blocks.is_empty() {
         return;

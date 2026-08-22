@@ -1072,8 +1072,7 @@ fn test_pragma_operator_multiple() {
 /// Tokenize a header and ask whether it is exactly one guarded group.
 ///
 /// The scan reads tokens rather than raw bytes, so comments and whitespace are
-/// already gone by the time it looks -- the cases that used to need their own
-/// comment lexer are now free.
+/// already gone by the time it looks.
 fn guard_of(content: &str) -> Option<String> {
     let mut strings = IdentTable::new();
     let tokens = Tokenizer::new(content.as_bytes(), 0, &mut strings).tokenize();
@@ -1150,10 +1149,8 @@ fn test_guard_conditional_default_with_content() {
     );
 }
 
-/// The case the byte scanner could not see: it stopped at the first token of
-/// the body, so it never found the closing `#endif` and never noticed that a
-/// header had code after it. Such a header is not guarded, and skipping it on
-/// re-inclusion deleted that code.
+/// A header with code after its `#endif` is not one guarded group: skipping it
+/// on re-inclusion would delete that code.
 #[test]
 fn test_guard_rejects_code_after_endif() {
     assert_eq!(
@@ -1323,10 +1320,8 @@ fn test_wide_char_in_macro() {
 
 // Stringify, paste, include, and #if edge-case tests
 
-/// 6.10.3.1p2 makes `__VA_ARGS__` the whole variadic token sequence,
-/// commas included. Substitution took its first element alone, so
-/// `V(1,2,3)` stringified to `"1"` -- silently, and the idiom is common
-/// in logging macros.
+/// 6.10.3.1p2 makes `__VA_ARGS__` the whole variadic token sequence, commas
+/// included, and `#__VA_ARGS__` stringifies all of it.
 #[test]
 fn test_stringify_all_va_args() {
     for (code, want) in [
@@ -1336,8 +1331,7 @@ fn test_stringify_all_va_args() {
         // A comma inside parentheses is not a separator.
         ("#define V(...) #__VA_ARGS__\nV(f(1,2),3)", "\"f(1,2),3\""),
         // Spacing that the source has is kept; spacing it lacks is not
-        // invented, which is what made `V(1,2,3)` come out `"1 , 2 , 3"`
-        // once every argument survived.
+        // invented.
         ("#define V(...) #__VA_ARGS__\nV(a, b)", "\"a, b\""),
     ] {
         let (tokens, idents) = preprocess_str(code);
@@ -1350,8 +1344,7 @@ fn test_stringify_all_va_args() {
 }
 
 /// 6.4.6p3: a digraph behaves as its primary token "except for their
-/// spelling", and 6.10.3.2p2 asks `#` for that spelling. The punctuator
-/// renderer used the primary token's, so `S(<:1:>)` came out `"[1]"`.
+/// spelling", and 6.10.3.2p2 asks `#` for that spelling.
 #[test]
 fn test_stringify_keeps_digraph_spelling() {
     for (code, want) in [
@@ -1415,11 +1408,8 @@ fn test_if_multichar_constant() {
     );
 }
 
-/// `#if` runs one branch of a conditional; picking the wrong one is silent.
-/// Every case here used to pick the wrong one, because the evaluator packed
-/// the *source spelling* between the quotes: `'\n'` was the two characters
-/// `\` and `n`, so it evaluated to 23662, and `'\0'` evaluated to 23600 --
-/// which is to say `#if '\0'` was true.
+/// A character constant in `#if` evaluates to its escape's value, not to the
+/// *source spelling* between the quotes: `'\n'` is 10, and `#if '\0'` is false.
 #[test]
 fn test_if_character_escapes() {
     for (expr, want_yes) in [

@@ -886,10 +886,8 @@ pub struct InitElement {
 /// - a pointer to a variably-modified array. `sizeof(int(*)[n])` is the
 ///   pointer's size, and gcc does not evaluate `n` there either;
 /// - a type whose unsized levels outnumber the expressions supplied, as in
-///   `sizeof(int[][n])`. That is invalid C -- gcc rejects it as an incomplete
-///   type -- and declining leaves it at its previous behaviour rather than
-///   pairing the one expression with the wrong level and inventing a
-///   plausible-looking number.
+///   `sizeof(int[][n])`, which is invalid C anyway -- gcc rejects it as an
+///   incomplete type.
 ///
 /// Five consumers need this same answer, so it is asked in one place: the
 /// linearizer, both constant folders, `is_pure_expr` and `expr_is_runtime`.
@@ -1725,8 +1723,8 @@ mod tests {
         }
 
         // There is no `Fabsl` variant: `__builtin_fabsl` lowers to an ordinary
-        // call to `fabsl` (#C121), because the opcode it used to build takes a
-        // `double` and so read only the low eight bytes of an x87 value.
+        // call to `fabsl`, because a `double` opcode would read only the low
+        // eight bytes of an x87 value.
     }
 
     #[test]

@@ -203,7 +203,7 @@ fn test_function_with_many_params() {
     assert!(ir.contains("add"), "IR should have add for a + h: {}", ir);
 }
 
-// Compound assignment lvalue regression tests
+// Compound assignment lvalue tests
 
 #[test]
 fn test_compound_assignment_deref() {
@@ -349,8 +349,7 @@ fn test_compound_assignment_index() {
     );
 }
 
-// Array field initialization regression test
-// Tests the fix for C99 6.7.8p14: scalar initializes first array element
+// C99 6.7.8p14: a scalar initializes the first array element.
 
 #[test]
 fn test_simple_array_element_store() {
@@ -411,7 +410,7 @@ fn test_simple_array_element_store() {
     );
 }
 
-// Nested if-else CFG edge linking regression test
+// Nested if-else CFG edge linking
 
 #[test]
 fn test_nested_if_cfg_linking() {
@@ -2777,7 +2776,7 @@ fn test_string_literal_char_pointer_init() {
     );
 }
 
-// Incomplete struct type resolution test (regression test for forward declarations)
+// Incomplete struct type resolution, through a forward declaration.
 
 /// Helper to linearize with a custom symbol table (for testing struct resolution)
 fn test_linearize_with_symbols(
@@ -2938,7 +2937,7 @@ fn test_incomplete_struct_type_resolution() {
     );
 }
 
-// Static local variable increment/decrement regression tests
+// Static local variable increment/decrement tests
 
 use crate::types::TypeModifiers;
 
@@ -4369,7 +4368,7 @@ fn test_mixed_designated_positional_struct_init() {
     offsets.sort();
     offsets.dedup();
 
-    // With the fix, we should have 3 distinct offsets (4, 8, 12)
+    // 3 distinct offsets (4, 8, 12)
     assert!(
         offsets.len() >= 3,
         "Expected 3 distinct store offsets for fields b(+4), c(+8), d(+12), \
@@ -4463,7 +4462,7 @@ fn test_mixed_designated_positional_array_init() {
     offsets.sort();
     offsets.dedup();
 
-    // With the fix: 3 distinct offsets (8, 12, 16 for indices 2, 3, 4)
+    // 3 distinct offsets (8, 12, 16 for indices 2, 3, 4)
     assert!(
         offsets.len() >= 3,
         "Expected 3 distinct store offsets for arr[2](+8), arr[3](+12), arr[4](+16), \
@@ -6092,12 +6091,11 @@ fn test_atomic_plain_assign_uses_atomic_store() {
 }
 
 /// An `_Atomic` aggregate of lock-free size lowers to a single atomic store
-/// at the aggregate's own width, through an unsigned integer surrogate
-/// (#C116).
+/// at the aggregate's own width, through an unsigned integer surrogate.
 ///
-/// The IR is where this is worth asserting: the fallback it replaced was an
-/// ordinary struct copy, which reads back what it wrote exactly as the atomic
-/// store does. `insn.size` is what every backend uses to size the access, so a
+/// The IR is where this is worth asserting: an ordinary struct copy reads back
+/// what it wrote exactly as the atomic store does, so running the program
+/// cannot tell them apart. `insn.size` is what every backend uses, so a
 /// wrong width here is a read or write of the neighbouring bytes.
 #[test]
 fn test_atomic_aggregate_assign_uses_atomic_store() {
@@ -6234,8 +6232,8 @@ fn test_complex_struct_member_init_stores_both_halves() {
 
     // void test(void) { struct S s = { 1.0 }; }
     //
-    // A *real* initializer is the case that used to crash outright, and it is
-    // the one that proves the zero imaginary half gets written.
+    // A *real* initializer is the case that proves the zero imaginary half
+    // gets written.
     let init = Expr::typed_unpositioned(
         ExprKind::InitList {
             elements: vec![InitElement {
@@ -6306,9 +6304,9 @@ fn test_complex_struct_member_init_stores_both_halves() {
 
 /// `(1 << width) - 1` overflows at the one width that matters most: Rust masks
 /// a shift amount to the operand's width, so `1u64 << 64` is `1` and the mask
-/// comes out `0`. `struct { unsigned long long a:64; }` therefore read back as
-/// zero. The boundary cases are what the fix is about, so they are asserted
-/// individually rather than through a loop that could share the same mistake.
+/// comes out `0`, so `struct { unsigned long long a:64; }` reads back as zero.
+/// The boundary cases are asserted individually rather than through a loop
+/// that could share the same mistake.
 #[test]
 fn test_bitfield_value_mask_covers_the_full_carrier() {
     use crate::ir::linearize_emit::bitfield_value_mask;

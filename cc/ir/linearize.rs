@@ -6,8 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Linearizer for c17 C17 compiler
-// Converts AST to SSA-form IR with basic blocks and typed pseudo-registers
+// Converts the AST to SSA-form IR: basic blocks and typed pseudo-registers.
 //
 
 use super::mem2reg::mem2reg;
@@ -747,10 +746,8 @@ impl<'a> Linearizer<'a> {
         if matches!(class, crate::abi::ArgClass::Hfa { .. }) {
             // An HFA comes back in one V register per element, up to four, so
             // size does not enter into it: `struct { double a, b, c, d; }` is
-            // thirty-two bytes and still returns in V0-V3. The size rule below
-            // used to claim it, on the grounds that nothing implemented a
-            // three- or four-register HFA return -- which was true until both
-            // ends of the aarch64 return path learned to count elements.
+            // thirty-two bytes and still returns in V0-V3, never through the
+            // size rule below.
             return false;
         }
         if self.types.size_bits(typ) > self.target.max_aggregate_register_bits {
@@ -937,11 +934,9 @@ impl<'a> Linearizer<'a> {
                 // through complex_params so the codegen handles the register split.
                 let size = self.types.size_bits(param.typ);
                 // An HFA arrives in one register per element whatever its
-                // size, and the prologue is what writes them into the local --
-                // so it must not also get the small-struct store below. A
-                // two-element half-precision HFA is four bytes, and used to get
-                // both: the store overwrote the halves the prologue had just
-                // put there.
+                // size, and the prologue writes them into the local -- so it
+                // must not also get the small-struct store below, which would
+                // overwrite what the prologue just put there.
                 let is_hfa_param = {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     matches!(
@@ -963,11 +958,8 @@ impl<'a> Linearizer<'a> {
                                     && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                         ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
                         // Two eightbytes of any classes -- both integer, or one
-                        // of each -- arrive in two registers. AAPCS64 §5.4.2
-                        // C.10 and SysV AMD64 §3.2.3 agree on this; aarch64
-                        // used to be excluded here and passed such a composite
-                        // as a pointer, which disagreed with gcc in both
-                        // directions and segfaulted when gcc was the caller.
+                        // of each -- arrive in two registers on both targets:
+                        // AAPCS64 §5.4.2 C.10 and SysV AMD64 §3.2.3 agree.
                         let reg_pair = matches!(
                             class,
                             crate::abi::ArgClass::Direct { ref classes, .. }
@@ -1300,8 +1292,8 @@ impl<'a> Linearizer<'a> {
             if let Some(ref mut ir_func) = self.current_func {
                 ssa_convert(ir_func, self.types);
                 // Note: ssa_convert sets ir_func.next_pseudo to account for phi nodes
-                // M3: drop func.locals entries whose Sym is now unused so the
-                // backend regalloc no longer allocates a stack slot for them.
+                // Drop func.locals entries whose Sym is now unused, so the
+                // backend regalloc allocates no stack slot for them.
                 mem2reg(ir_func);
             }
         } else {
@@ -2344,9 +2336,8 @@ impl<'a> Linearizer<'a> {
     /// A variably-modified pointee reports a compile-time size of 0, so the
     /// stride has to come from the object's recorded extents. Every place
     /// that scales by a pointee's size goes through here -- `p[i]`, `p + i`,
-    /// `p - q`, `++p`, `p++`, `p += i` -- because each of them used to work it
-    /// out separately, and fixing three of the six left the other three
-    /// stepping nowhere.
+    /// `p - q`, `++p`, `p++`, `p += i` -- rather than each working it out
+    /// separately.
     pub(crate) fn pointer_step_bytes(&mut self, ptr_expr: &Expr, ptr_typ: TypeId) -> PseudoId {
         if let Some(stride) = self.vm_index_stride(ptr_expr) {
             return stride;
@@ -2823,14 +2814,9 @@ impl<'a> Linearizer<'a> {
         let struct_size_bits = self.types.size_bits(typ);
         let returns_large_struct = self.returns_via_hidden_pointer(typ);
         // An aggregate that comes back in registers still needs somewhere to
-        // land, and the backend writes the registers into this local. The
-        // upper bound used to be two eightbytes -- hence the old name
-        // `returns_reg_aggregate` -- which was every such case until an HFA
-        // of three or four `double`s stopped going through the hidden
-        // pointer: at twenty-four bytes it had no local, so the result pseudo
-        // held nothing and its first use dereferenced a zero. It can now be
-        // as many as four registers, so the name says registers rather than
-        // two.
+        // land, and the backend writes the registers into this local. There is
+        // no upper size bound: an HFA of four `double`s is thirty-two bytes
+        // and still returns in registers, not through the hidden pointer.
         let returns_reg_aggregate = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 64
             && !returns_large_struct;
@@ -3011,9 +2997,9 @@ impl<'a> Linearizer<'a> {
                     }
                 }
                 // A struct argument travels by address. `linearize_lvalue`
-                // now materializes an rvalue -- a call returning a struct --
-                // and hands back the temporary's address, so both cases are
-                // the same call; this used to open-code the rvalue half.
+                // materializes an rvalue -- a call returning a struct -- and
+                // hands back the temporary's address, so both cases are the
+                // same call.
                 self.linearize_lvalue(a)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
@@ -3059,17 +3045,9 @@ impl<'a> Linearizer<'a> {
                         let param_is_fp = self.types.is_float(param_type);
 
                         let needs_convert =
-                            // Integer widening (e.g., int→long, long→__int128).
-                            //
-                            // The size bounds this test used to carry --
-                            // `arg_size <= 32 && param_size <= 64` -- were
-                            // written when int→long was the only widening
-                            // there was, and they silently excluded every
-                            // 128-bit parameter. An `int` argument then
-                            // reached an `__int128` parameter unconverted, so
-                            // the callee read a register pair of which only
-                            // half had been written. Widening is decided by
-                            // the two sizes; nothing about it stops at 64.
+                            // Integer widening (int→long, long→__int128, ...),
+                            // decided by the two sizes alone: nothing about it
+                            // stops at 64 bits.
                             (arg_is_int && param_is_int && arg_size < param_size)
                             // FP size mismatch (float→double, long double→double, etc.)
                             || (arg_is_fp && param_is_fp && arg_size != param_size)
@@ -3090,13 +3068,11 @@ impl<'a> Linearizer<'a> {
                 // Both halves have to happen here. The formal-parameter
                 // conversion above is guarded by `arg_idx < params.len()`, and
                 // a variadic argument is by definition at or past that bound,
-                // so it never runs for these -- an earlier comment claimed
-                // integers were "already handled above", which was false and is
-                // what left `printf("%02x", (unsigned char)c)` printing
-                // ffffff80 for a negative `signed char` (audit #C5). The cast
-                // itself emits no IR, because emit_convert short-circuits
-                // same-size integer conversions, so without an explicit
-                // promotion the pseudo still holds the sign-extended load.
+                // so it never runs for these. The cast itself emits no IR
+                // either, because emit_convert short-circuits same-size integer
+                // conversions -- without an explicit promotion the pseudo still
+                // holds the sign-extended load, and `printf("%02x", (unsigned
+                // char)c)` prints ffffff80 for a negative `signed char`.
                 if let Some(va_start) = variadic_arg_start {
                     if arg_idx >= va_start {
                         let promoted = match self.types.kind(arg_type) {
@@ -3959,17 +3935,14 @@ impl<'a> Linearizer<'a> {
 
     /// Convert one arm of a conditional expression to the expression's type.
     ///
-    /// C17 6.5.15p5 gives the whole expression the arms' common type, so an arm
-    /// whose own type differs has to be converted. The test used to ask whether
-    /// the arm was a *narrower integer*, which left a `float` arm feeding a
-    /// `double` result alone: a 32-bit pattern reached a 64-bit `Select`, and
-    /// `pick() ? f() : d0()` with `float f()` evaluated to 0.0.
+    /// C17 6.5.15p5 gives the whole expression the arms' common type, so *any*
+    /// arm whose own type differs has to be converted -- a `float` arm feeding
+    /// a `double` result as much as a narrower integer one.
     ///
     /// `emit_convert` already no-ops on an identical kind and size, so the only
     /// thing left to exclude is a type there is nothing to convert between --
-    /// `void`, a struct, a pointer. Complex is excluded too, deliberately: it
-    /// was not converted before either, and widening it is a separate question
-    /// from this one.
+    /// `void`, a struct, a pointer. Complex is excluded deliberately: widening
+    /// it is a separate question from this one.
     fn convert_conditional_arm(
         &mut self,
         val: crate::ir::PseudoId,
@@ -4944,7 +4917,7 @@ impl<'a> Linearizer<'a> {
     /// conversion is not value-preserving -- a negative operand with an
     /// unsigned destination, or an `unsigned __int128` one with a signed
     /// destination -- the answer follows the converted value rather than the
-    /// mathematical one. See #C62 in `cc/audit.md`.
+    /// mathematical one.
     fn linearize_checked_arith_wide(
         &mut self,
         op: crate::parse::ast::CheckedOp,
@@ -5199,30 +5172,23 @@ impl<'a> Linearizer<'a> {
                     crate::parse::ast::CheckedOp::Sub => BinaryOp::Sub,
                     crate::parse::ast::CheckedOp::Mul => BinaryOp::Mul,
                 };
-                // Nothing here is wider than 128 bits, so "compute exactly,
-                // then see whether it survived the narrowing" has nothing to
-                // compare against once the destination is that wide: it tested
-                // a value against itself and always answered "no overflow".
-                // At that width the result has to be examined directly.
                 if self.types.size_bits(dst_typ) >= 128 {
-                    // ...unless both operands are *narrower* than 128 bits, in
-                    // which case the computation in `wide` is still exact: a
-                    // sum or difference of two 64-bit values needs 65 bits and
-                    // a product 128, both of which fit. Only the *check* has to
-                    // change, from "did narrowing lose anything" to "is the
-                    // exact value representable at all" -- and the two differ
-                    // exactly where #C62 was wrong, a negative operand with an
-                    // unsigned destination. `__builtin_add_overflow(-1, 5u,
-                    // &u128)` is 4 and does not overflow; converting the
-                    // operands to the destination first made it 2^128-1 + 5 and
-                    // reported that it did.
-                    // "Narrower than the destination" is not enough on its
-                    // own: `(u64)-1 * (u64)-1` is just under 2^128, which fits
+                    // A 128-bit destination has no wider type to compute in,
+                    // so "did narrowing lose anything" would compare a value
+                    // to itself -- `linearize_checked_arith_wide` below
+                    // examines the result directly instead. Where the
+                    // computation in `wide` is nevertheless exact, the check
+                    // becomes "is the exact value representable at all". The
+                    // two differ for a negative operand with an unsigned
+                    // destination: `__builtin_add_overflow(-1, 5u, &u128)` is
+                    // 4, not 2^128-1 + 5.
+                    //
+                    // Exactness is not "narrower than the destination":
+                    // `(u64)-1 * (u64)-1` is just under 2^128, which fits
                     // `unsigned __int128` but *not* `__int128`, so the exact
-                    // computation would itself wrap and the check would pass a
-                    // value it never saw. Count magnitude bits instead -- `w`
-                    // for an unsigned operand, `w-1` for a signed one -- and
-                    // require the result to fit `wide`.
+                    // computation would itself wrap. Count magnitude bits --
+                    // `w` for an unsigned operand, `w-1` for a signed one --
+                    // and require the result to fit `wide`.
                     let magnitude_bits = |t: TypeId| {
                         let w = self.types.size_bits(t);
                         if self.types.is_unsigned(t) {

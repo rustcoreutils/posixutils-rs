@@ -6,9 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// InstCombine pass for c17 C17 compiler
-//
-// This pass performs instruction combining optimizations:
+// InstCombine: instruction-combining optimizations.
 // - Constant folding: evaluate operations on constants at compile time
 // - Algebraic simplification: x + 0 -> x, x * 1 -> x, etc.
 // - Identity patterns: x - x -> 0, x ^ x -> 0, etc.

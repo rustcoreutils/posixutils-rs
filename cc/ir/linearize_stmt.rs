@@ -73,8 +73,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Return(expr) => {
                 // C99 6.8.6.4p1: a `return` with an expression may not appear
                 // in a void function, and one without an expression may not
-                // appear in a function that returns a value. Both used to
-                // compile clean.
+                // appear in a function that returns a value.
                 let declared_ret = self.current_func.as_ref().map(|f| f.return_type);
                 if let Some(rt) = declared_ret {
                     let returns_void = self.types.kind(rt) == TypeKind::Void;
@@ -255,11 +254,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             let typ = declarator.typ;
 
             // A typedef declares a name, not an object, so nothing is
-            // allocated for it. It used to fall through and take a local slot
-            // for the type name -- harmless while nothing read it, and not
-            // harmless once a typedef can be variably modified, since the VLA
-            // arm below tests only `vla_sizes` and would have allocated the
-            // array itself.
+            // allocated for it. Falling through would matter most for a
+            // variably modified typedef: the VLA arm below tests only
+            // `vla_sizes`, so it would allocate the array itself.
             if declarator.storage_class.contains(TypeModifiers::TYPEDEF) {
                 // C17 6.7.7p3: a variably modified typedef's size expressions
                 // are evaluated "each time the declaration of the typedef name
@@ -310,9 +307,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             // declarator that is itself the array is allocated here.
             if !declarator.vla_sizes.is_empty() && self.types.kind(typ) == TypeKind::Array {
                 // C99 6.7.8: VLAs cannot have initializers.
-                // Report against the declarator's own position: `current_pos`
-                // is an Option and, when it is None, this constraint violation
-                // used to be dropped without any diagnostic at all.
+                // Report against the declarator's own position, which always
+                // exists -- `current_pos` is an Option that can be None here.
                 if declarator.init.is_some() {
                     error(
                         declarator.pos,
@@ -890,14 +886,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);
 
-                                    // Convert to the *member's* type first, not
-                                    // straight to the storage unit's. C17 6.7.9p11
-                                    // initializes a member by converting to its own
-                                    // type, and for `_Bool` that conversion is the
-                                    // one that normalizes to 0/1 (6.3.1.2). Going
-                                    // directly to the unsigned storage type skipped
-                                    // it, so `struct { _Bool f:1; } v = {2};` stored
-                                    // 2, truncated it to one bit and read back 0.
+                                    // C17 6.7.9p11 initializes a member by
+                                    // converting to the *member's* type, not the
+                                    // storage unit's: for `_Bool` that is the
+                                    // conversion normalizing to 0/1 (6.3.1.2), so
+                                    // `struct { _Bool f:1; } v = {2};` stores 1.
                                     let member_val = self.emit_convert(val, val_type, field_type);
                                     self.emit_bitfield_store(
                                         base_sym,
@@ -945,10 +938,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Store a complex value into `base_sym` at `offset`, as two halves.
     ///
     /// A complex value lives in memory and travels by *address*, so storing it
-    /// the way a scalar member is stored writes the address instead of the
-    /// value. That is what left every complex member of an automatic aggregate
-    /// reading back as a stack address reinterpreted as a double, and what
-    /// made a real initializer for one crash outright.
+    /// the way a scalar member is stored would write the address instead of
+    /// the value.
     ///
     /// The initializer's base precision need not match the object's -- and
     /// usually does not, because `I` is `__builtin_complex(0.0, 1.0)`, a
@@ -1488,9 +1479,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// Reported at the jump, where gcc points, and naming the declaration that
     /// could not be entered, which gcc does not -- the position says where to
-    /// look and the name says what the problem is. This used to report at the
-    /// declaration for want of anything better: the jump and label statements
-    /// carried no position until #C106 gave them one.
+    /// look and the name says what the problem is.
     pub(crate) fn check_jumps_into_variably_modified_scopes(&self, body: &Stmt) {
         let mut w = VmScopeWalk {
             open: Vec::new(),
@@ -1637,8 +1626,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                     case_values.push((val, hi));
                 } else if self.expr_is_runtime(expr) {
-                    // A non-constant label can never match; it used to be
-                    // dropped without a word.
+                    // A non-constant label can never match.
                     error(expr.pos, "case label is not an integer constant expression");
                 } else {
                     // Constant in principle, but `eval_const_expr` is a partial
@@ -1702,8 +1690,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// Shared by the two ways a string can initialize an array: written
     /// directly (`char b[] = "hi"`) or enclosed in braces
-    /// (`char b[] = {"hi"}`, C17 6.7.9p14). They used to be separate code, and
-    /// only the first one worked.
+    /// (`char b[] = {"hi"}`, C17 6.7.9p14).
     pub(crate) fn store_string_units(
         &mut self,
         base_sym: PseudoId,

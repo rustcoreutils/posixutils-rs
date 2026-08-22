@@ -505,12 +505,10 @@ fn system_search(args: &Args) -> token::preprocess::SystemSearch<'_> {
 /// `-o` is honored here, as gcc and clang do and as every build system that
 /// runs `cc -E -o foo.i foo.c` assumes. POSIX leaves `-o` with `-E`
 /// unspecified (88941-88942) and its own EXAMPLE redirects with `>` instead,
-/// so this is a compatibility choice rather than a conformance one — but
-/// accepting the option and then discarding it, which is what c17 did, is not
-/// one of the readings on offer.
+/// so this is a compatibility choice rather than a conformance one.
 ///
 /// One sink serves the whole run: with several source operands the
-/// preprocessed forms concatenate, exactly as they already did on stdout.
+/// preprocessed forms concatenate, as they do on stdout.
 fn preprocess_sink(args: &Args) -> io::Result<Box<dyn Write>> {
     // Only `-E` may open `args.output`. Every other mode names its own output
     // downstream, and creating the file here would truncate the executable or
@@ -845,8 +843,7 @@ fn process_file(
         // STDOUT (88032-88038) requires the -E output to carry at least one
         // `# <line> "<file>"` line for each file processed via #include, so
         // that a consumer can attribute the text; RATIONALE (88370-88374)
-        // names makefile dependency generation as the purpose. The markers
-        // were being discarded outright.
+        // names makefile dependency generation as the purpose.
         //
         // `include_file` strips the included stream's begin/end tokens, so the
         // transition is detected from `pos.stream` instead. The trailing flag
@@ -887,12 +884,11 @@ fn process_file(
         // The source line the next output line stands for.
         //
         // Directives and blank lines produce no tokens, so without this the
-        // output closed up the gaps they left and every line after the first
-        // `#define` claimed a number several too low. That is not cosmetic:
-        // the markers are the only record of where the text came from, so
-        // `c17 -E x.c -o x.i` followed by `c17 -c x.i` reported an error in
-        // `x.c` at the wrong line -- c17 read *gcc's* `.i` correctly, which is
-        // what showed the producer was at fault rather than the consumer.
+        // output would close up the gaps they leave and every line after the
+        // first `#define` would claim a number several too low. The markers
+        // are the only record of where the text came from, so `c17 -E x.c -o
+        // x.i` followed by `c17 -c x.i` would report an error in `x.c` at the
+        // wrong line.
         let mut current_line: u32 = 1;
         let mut spelling: Vec<u8> = Vec::new();
 
@@ -1432,8 +1428,7 @@ fn preprocess_args() -> Vec<String> {
 /// - Handles -O flag: standalone -O followed by non-level becomes -O1
 ///
 /// Takes the raw argument vector rather than reading the environment so the
-/// unit tests exercise this exact function. They previously re-implemented it,
-/// and the copy had already drifted.
+/// unit tests exercise this exact function.
 fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
@@ -1779,13 +1774,11 @@ impl Operand {
 ///
 /// The directory itself is created by `tempfile`, which is why these names
 /// need no PID or randomness of their own: the directory is unpredictable,
-/// created with `O_EXCL`, and removed when the run ends. That closes both the
-/// old `/tmp/c17_<pid>.s` symlink hazard and the leak on every early exit.
+/// created with `O_EXCL`, and removed when the run ends.
 ///
-/// The name is prefixed with the operand's position because one run now
-/// compiles every operand into this one directory, and a file stem is not
-/// unique across them: `c17 a/util.c b/util.c` gave both the same `util.o`,
-/// so the second silently overwrote the first and the link named it twice.
+/// The name is prefixed with the operand's position because one run compiles
+/// every operand into this one directory, and a file stem is not unique across
+/// them: `c17 a/util.c b/util.c` names both outputs `util.o`.
 fn scratch_path(scratch: &Path, operand_id: usize, stem: &str, ext: &str) -> String {
     scratch
         .join(format!("{}-{}.{}", operand_id, stem, ext))
@@ -2135,13 +2128,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match op.kind {
             OperandKind::Unknown => {}
             OperandKind::Object => operand_objects[idx] = Some(op.path.clone()),
-            // 87883-87885: with -E "no compilation shall be performed". An
-            // assembler operand was being handed to `as` regardless, so
-            // `c17 -E foo.s` assembled it and wrote foo.o.
-            //
-            // Not assembling is not the same as producing nothing, though,
-            // which is what this arm used to do: `c17 -E foo.S` wrote an empty
-            // file and exited 0. Preprocess it and write the text, as gcc does.
+            // 87883-87885: with -E "no compilation shall be performed", so an
+            // assembler operand is never handed to `as`. Not assembling is not
+            // the same as producing nothing, though: preprocess it and write
+            // the text, as gcc does.
             OperandKind::Asm if args.preprocess_only => {
                 match preprocess_asm_operand(&op.path, &args, &target, &mut pp_out) {
                     Ok(()) => {}

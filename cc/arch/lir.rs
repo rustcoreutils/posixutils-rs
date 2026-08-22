@@ -348,9 +348,7 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
 ///
 /// Two kinds qualify: an aggregate the ABI classifies MEMORY, and
 /// `long double _Complex`, which System V classifies COMPLEX_X87. Both are
-/// copied onto the stack by value, so they share one code path — the callers
-/// used to spell this as `kind == Struct || kind == Union`, which quietly
-/// excluded the complex case and sent it down the SSE path instead.
+/// copied onto the stack by value, so they share one code path.
 ///
 /// The aggregate half asks the classifier rather than testing the size: an
 /// aggregate of two eightbytes or fewer is MEMORY too when one of them holds a
@@ -515,7 +513,7 @@ fn is_bare_symbol_byte(b: u8) -> bool {
 /// not, and an identifier holding one produced `_café: error: invalid
 /// operand` and `adrp x0, _café@PAGE: error: unexpected token`. That is not a
 /// niche case -- C17 6.4.2.1 admits extended characters in identifiers, by
-/// UCN since C99 and written directly as of #C158.
+/// UCN since C99 and written directly.
 ///
 /// LLVM does exactly this in `MCSymbol::print`, and quoting is accepted
 /// everywhere c17 emits a name: bare, in `.globl`/`.type`/`.size`, as a call

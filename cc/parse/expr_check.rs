@@ -140,13 +140,10 @@ impl Parser<'_> {
         }
     }
 
-    /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type.
-    ///
-    /// `int x; *x;` compiled and dereferenced the integer's value as an
-    /// address, so the program built and segfaulted. A *function designator*
-    /// is deliberately allowed: `(*f)()` and even `(***f)()` are ordinary
-    /// idioms that gcc accepts, `*f` on a function being a no-op, and the
-    /// result type computed just above already models that.
+    /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type. A
+    /// *function designator* is deliberately allowed: `(*f)()` and even
+    /// `(***f)()` are ordinary idioms gcc accepts, `*f` on a function being a
+    /// no-op, and the result type computed just above already models that.
     pub(super) fn check_dereferenceable(&self, operand: &Expr, pos: Position) {
         let Some(typ) = operand.typ else {
             return;
@@ -166,13 +163,9 @@ impl Parser<'_> {
     }
 
     /// C17 6.5.2.2p1: the expression before `(` shall be a function, or a
-    /// pointer to one.
-    ///
-    /// `int x; x();` reached the back end and emitted a call to a symbol named
-    /// `x`, so what should have been a front-end error surfaced as an
-    /// undefined-reference *link* failure naming a variable that plainly
-    /// exists. A pointer to a function is the ordinary spelling and a pointer
-    /// to a pointer to one is reached through `*`, so both are accepted.
+    /// pointer to one. A pointer to a function is the ordinary spelling and a
+    /// pointer to a pointer to one is reached through `*`, so both are
+    /// accepted.
     pub(super) fn check_callable(&self, callee: &Expr, pos: Position) {
         let Some(typ) = callee.typ else {
             return;
@@ -321,15 +314,6 @@ impl Parser<'_> {
     /// C17 6.7.9p11: the initializer for a scalar shall satisfy the
     /// constraints of simple assignment; p13 and p14 confine an aggregate to a
     /// brace-enclosed list, or a string literal for a character array.
-    ///
-    /// Nothing checked an initializer at all. `int x = s;` from a struct and
-    /// `int b[3] = a;` from an array both compiled and yielded **zero**;
-    /// `struct S s = 1;` was accepted; `int *q = d;` from a `double` reached
-    /// the same `emit_convert` that #C47 stopped a plain assignment from
-    /// taking. The assignment form of every one of those was already
-    /// diagnosed, which is what made this a gap rather than a policy: the same
-    /// program was accepted or rejected depending on whether the value arrived
-    /// through `=` in a declaration or `=` in a statement.
     ///
     /// The severities come from `AssignFault::is_error`, so they are gcc's
     /// without a table to maintain: incompatible types are an error, the

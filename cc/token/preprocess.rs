@@ -449,13 +449,6 @@ pub struct Preprocessor<'a> {
     /// the entry mean "including this again would produce nothing", which is
     /// the only thing that justifies skipping it.
     ///
-    /// Guessing instead -- scanning the text for an `#ifndef` and skipping
-    /// whenever that name happened to be defined -- deleted source three ways:
-    /// a header with anything after its `#endif` lost it on every include but
-    /// the first; `-D<guard>` on the command line deleted the file entire,
-    /// having never read it; and a header that includes itself under a counter
-    /// guard lost its `#else` arm.
-    ///
     /// Pure lookup, never iterated, so a `HashMap` cannot leak its order.
     guarded_files: HashMap<PathBuf, String>,
 
@@ -501,10 +494,9 @@ pub struct Preprocessor<'a> {
     /// The one diagnostic stream every `##` result is attributed to.
     ///
     /// `diag::init_stream` appends to a registry and returns its length as a
-    /// `u16`. Calling it per paste grew that registry without bound and wrapped
-    /// silently past 65535, at which point *other* files' stream ids collided
-    /// and every later diagnostic named the wrong file. A translation unit
-    /// does far more than 65535 pastes.
+    /// `u16`, so calling it per paste would grow the registry without bound and
+    /// wrap silently past 65535, colliding with *other* files' stream ids. A
+    /// translation unit does far more than 65535 pastes.
     paste_stream: std::cell::Cell<Option<u16>>,
     /// How many more expansions may be spliced in before the pass gives up.
     /// Seeded once, at construction: the nested calls for an argument's own
@@ -512,7 +504,7 @@ pub struct Preprocessor<'a> {
     /// either is the same failure, and re-seeding per call would let an
     /// exhausted budget come back.
     ///
-    /// Termination rests entirely on the hide set now, and a hole in it is an
+    /// Termination rests entirely on the hide set, and a hole in it is an
     /// infinite loop rather than a wrong answer -- a hang has no diagnostic and
     /// no exit status to read. This turns one into an error. It is a backstop,
     /// not a policy: the bound is far above what any real translation unit
@@ -524,7 +516,7 @@ pub struct Preprocessor<'a> {
     /// the operand can only be recognised in the same walk that does the
     /// expanding: rewriting `defined X` in a pass *beforehand* misses a
     /// `defined` that an expansion produces, and expanding first destroys the
-    /// operand. `#define D defined(FOO)` / `#if D` used to evaluate `0 (1)`.
+    /// operand: `#define D defined(FOO)` / `#if D` would evaluate `0 (1)`.
     in_if_condition: bool,
 }
 
@@ -533,7 +525,7 @@ pub struct Preprocessor<'a> {
 /// `c17 -E` writes `# N "file" flags` at every file transition, and POSIX
 /// 87981 makes that output a `.i` operand. Compiling one has to attribute
 /// diagnostics to the original file and line rather than to the position in
-/// the preprocessed text, which is what GCC does and what c17 did not.
+/// the preprocessed text, which is what GCC does.
 ///
 /// The mapping is applied by rewriting token positions rather than by
 /// consulting a side table at diagnostic time: `Position` already carries a
@@ -935,16 +927,13 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(Macro::predefined("__STDC_UTF_32__", Some("1")));
 
         // __STDC_IEC_559_COMPLEX__ is deliberately NOT defined. It asserts
-        // conformance to Annex G. The original reason -- that complex support
-        // was broken outright -- no longer holds: #C1/#C2 are fixed, and the
-        // arithmetic is now byte-identical to gcc's at float, double and long
-        // double. What is still missing is G.5.1p4: an infinite operand must
-        // give an infinite result even against a NaN, and
+        // conformance to Annex G, and G.5.1p4 is missing: an infinite operand
+        // must give an infinite result even against a NaN, but
         // `CMPLX(INFINITY,0) * CMPLX(NAN,NAN)` yields NaN here.
         //
         // gcc fails that same rule and defines the macro regardless, so this
         // is a deliberate divergence: the macro is a claim about the
-        // arithmetic, and the arithmetic does not support it yet. Pinned by
+        // arithmetic, which does not support it. Pinned by
         // `c17_complex_infinity_rules_match_gcc`, which fails the day G.5.1
         // is implemented -- the signal to revisit this rather than inherit it.
 
@@ -1333,9 +1322,8 @@ impl<'a> Preprocessor<'a> {
                             let is_macro = self.macros.contains_key(name);
                             let hidden = token.is_no_expand(name);
 
-                            // Handle _Pragma operator (C99)
-                            // _Pragma("string") is equivalent to #pragma string
-                            // We silently consume it since we ignore #pragma anyway
+                            // Handle the _Pragma operator (C99):
+                            // `_Pragma("string")` is `#pragma string`.
                             if is_pragma {
                                 self.handle_pragma_operator(&mut cursor, &mut output);
                                 continue;
@@ -1354,19 +1342,11 @@ impl<'a> Preprocessor<'a> {
                             {
                                 // Put the expansion back in front of the file
                                 // rather than into the output, and do not
-                                // advance. Rescanning is then this same loop
-                                // reading on, and an expansion that ends in
-                                // the middle of a call can finish it from the
-                                // rest of the file -- which is what C17
-                                // 6.10.3.4 EXAMPLE 3 asks for and what the
-                                // recursive rescan could not do, because it
-                                // only ever saw the replacement list.
-                                //
-                                // The invocation's spacing goes with it, to be
-                                // applied to whichever token comes next: an
-                                // expansion may be empty, or may begin with a
-                                // macro that expands to nothing, and stamping
-                                // the first token would lose it in both cases.
+                                // advance: C17 6.10.3.4 EXAMPLE 3 needs an
+                                // expansion that ends mid-call to finish it
+                                // from the rest of the file. See
+                                // `TokenCursor::push_expansion` for the
+                                // spacing that rides along with it.
                                 if !self.charge_expansion(token.pos) {
                                     output.push(token);
                                     continue;
@@ -1420,9 +1400,7 @@ impl<'a> Preprocessor<'a> {
     ///
     /// This belongs to the whole pass, not to one call of it: `preprocess` is
     /// still re-entered for an argument's own macro replacement and for an
-    /// included file, and only the outermost caller knows the run is over. It
-    /// used to be guarded by a recursion depth counter for exactly that
-    /// reason.
+    /// included file, and only the outermost caller knows the run is over.
     ///
     /// An included file's leftover groups are not reported, because
     /// `include_file` swaps the conditional stack out around it and drops
@@ -1484,8 +1462,7 @@ impl<'a> Preprocessor<'a> {
     /// `directive_pos` is where to blame an expression that is missing
     /// altogether. A rejected expression is false, so the group is skipped and
     /// the error is what the user acts on; recovering to "whatever the parser
-    /// happened to compute" is how a typo used to compile the wrong half of a
-    /// file in silence.
+    /// happened to compute" would compile the wrong half of a file in silence.
     fn evaluate_expression(
         &self,
         tokens: &[Token],
@@ -1557,10 +1534,6 @@ impl<'a> Preprocessor<'a> {
 /// comparison of the carrier is already the correct unsigned comparison once
 /// both sides have been promoted. Results are wrapped back to 64 bits after
 /// every operation, so overflow behaves as it does in the target's arithmetic.
-///
-/// This replaces a plain `i64` that silently mapped anything out of range to
-/// `0`, so `#if 0xFFFFFFFFFFFFFFFF` took the false branch and `__UINT64_MAX__`
-/// evaluated as zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PpValue {
     /// The value: a sign-extended i64 when signed, a zero-extended u64 when not.
@@ -1621,9 +1594,7 @@ struct ExprEvaluator<'a, 'b> {
     suppressed: bool,
     /// Set once anything in the expression was rejected. The controlling
     /// expression then counts as false rather than as whatever the recovery
-    /// path happened to compute: every `expr_*` used to fall through to zero
-    /// in silence, so `#if (1`, `#if X = 2` and `#if 1.5` each picked a branch
-    /// with no diagnostic at all.
+    /// path happened to compute.
     had_error: bool,
 }
 
@@ -1666,8 +1637,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     }
 
     /// C17 6.10.1p4: the line is *one* controlling expression. Anything left
-    /// over is a typo the user wants to hear about — `#if 1 2 3` used to be
-    /// simply true.
+    /// over is a typo the user wants to hear about.
     fn check_fully_consumed(&mut self) {
         if self.had_error || self.pos >= self.tokens.len() {
             return;
@@ -1911,9 +1881,8 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             // A shift does not apply the usual arithmetic conversions: the
             // result takes the left operand's type (C17 6.5.7p3). A count
             // outside [0, 64) is undefined; clamp rather than panic, but say
-            // so -- clamping in silence made `#if (1 << 64) == 0` false with
-            // nothing to explain it. gcc warns here rather than erroring, so
-            // the expression still evaluates.
+            // so. gcc warns here rather than erroring, so the expression still
+            // evaluates.
             if !self.suppressed && !(0..64).contains(&right.v) {
                 diag::warning(
                     op_pos,
@@ -2092,9 +2061,8 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             }
         }
 
-        // Nothing here can start an operand. Reaching this used to return zero
-        // in silence, which is why a string literal, a stray punctuator or a
-        // missing operand all quietly chose a branch.
+        // Nothing here can start an operand. Diagnosed rather than evaluated
+        // to zero, which would quietly choose a branch.
         match self.current().cloned() {
             None => {
                 let pos = self.here();
@@ -2278,13 +2246,10 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     ///
     /// The value is unsigned if it carries a `u`/`U` suffix, or if it does not
     /// fit in `intmax_t` but does fit in `uintmax_t` (C17 6.4.4.1p5). Parsing
-    /// into `u64` first is what makes `#if 0xFFFFFFFFFFFFFFFF` work; the old
-    /// `i64::from_str_radix(...).unwrap_or(0)` turned every such constant into
-    /// a silent zero.
+    /// into `u64` first is what makes `#if 0xFFFFFFFFFFFFFFFF` work.
     fn parse_number(&mut self, s: &str, pos: Position) -> PpValue {
         // C17 6.10.1p4: the operands are integer constants. A pp-number that
-        // is not one used to evaluate to zero in silence, so `#if 1.5` picked
-        // the else branch and `#if 1zz` picked it too.
+        // is not one is diagnosed, not silently evaluated to zero.
         if s.contains('.')
             || ((s.contains('e') || s.contains('E'))
                 && !s.starts_with("0x")
@@ -2301,9 +2266,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         }
 
         // Split at the first character the radix cannot spell, rather than
-        // trimming a suffix off the end: `1zz` has no valid suffix to trim, so
-        // the old trim left `1zz` as the body and the parse failure went
-        // unreported.
+        // trimming a suffix off the end: `1zz` has no valid suffix to trim.
         let (prefix, radix) =
             if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
                 (hex, 16)
@@ -2562,8 +2525,7 @@ pub fn preprocess_collecting(
     // -nostdinc drops the bundled headers as well as the target's own
     // directories, which is what gcc does: `gcc -nostdinc` cannot find
     // <stddef.h> either, its own include directory being one of the standard
-    // ones. Probed rather than assumed -- this was very nearly "aligned" the
-    // other way. The directories themselves are left out in
+    // ones. The directories themselves are left out in
     // `Preprocessor::new`, which is the only place that knows which of them
     // came from `-isystem`.
     if config.no_std_inc {

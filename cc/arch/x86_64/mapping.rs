@@ -756,8 +756,7 @@ mod tests {
     /// A 128-bit operand builds its own libcall inside the expansion rather
     /// than leaving a `float` <-> `__int128` conversion for a later pass:
     /// `map_function` does not re-map a replacement. Picking the helper by
-    /// `dst_size <= 32`, as the old code did, handed a 128-bit operand the
-    /// 64-bit `__fixhfdi` / `__floatdihf` and would have read half of it.
+    /// `dst_size <= 32` would hand it the 64-bit `__fixhfdi`/`__floatdihf`.
     #[test]
     fn test_x86_64_float16_int128_conversions_use_the_128_bit_helper() {
         let target = Target::new(Arch::X86_64, Os::Linux);

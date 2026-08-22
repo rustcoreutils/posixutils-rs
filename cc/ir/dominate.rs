@@ -6,9 +6,8 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Dominator tree computation for c17 C17 compiler
+// Dominator tree computation.
 //
-// Algorithms used:
 // - Dominator tree: "A simple, fast dominance algorithm" by Cooper, Harvey, Kennedy
 // - IDF computation: "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
 //

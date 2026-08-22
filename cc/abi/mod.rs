@@ -6,13 +6,10 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// ABI (Application Binary Interface) handling for c17
+// Platform-specific calling-convention classification for function parameters
+// and return values: the contract between the frontend (linearizer) and the
+// backend (code generator).
 //
-// This module provides platform-specific calling convention classification
-// for function parameters and return values. It serves as the contract
-// between the frontend (linearizer) and backend (code generator).
-//
-// Supported ABIs:
 // - System V AMD64 (x86-64 Linux/BSD/macOS)
 // - AAPCS64 (AArch64 Linux/macOS)
 //

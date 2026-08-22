@@ -684,10 +684,8 @@ impl EmitAsm for X86Inst {
                     (OperandSize::B16, OperandSize::B64) => "movzwq",
                     // `movz` extends from a byte or a word only; a 32-bit
                     // source is already zero-extended by an ordinary `movl`.
-                    // Anything else is a malformed instruction, and the
-                    // "fallback to movzbl" that used to stand here turned it
-                    // into a silently-narrower load -- a three-byte struct
-                    // argument reached its callee as one byte and two zeros.
+                    // Anything else is a malformed instruction, so panic
+                    // rather than emit a silently-narrower load.
                     (s, d) => panic!("no movz encoding from {s:?} to {d:?}"),
                 };
                 let _ = writeln!(
@@ -1051,10 +1049,9 @@ impl EmitAsm for X86Inst {
             X86Inst::MovFp { size, src, dst } => {
                 // A binary128 occupies the whole register, so it moves as a
                 // packed 16-byte quantity rather than as a scalar: there is no
-                // `movsq`, which is what asking `x86_suffix()` for a suffix
-                // here used to trip over. `movaps` between registers;
-                // `movups` whenever memory is involved, because a 16-byte
-                // stack slot is not guaranteed to be 16-byte aligned.
+                // `movsq`. `movaps` between registers; `movups` whenever
+                // memory is involved, because a 16-byte stack slot is not
+                // guaranteed to be 16-byte aligned.
                 if *size == FpSize::Quad {
                     let both_regs = matches!((src, dst), (XmmOperand::Reg(_), XmmOperand::Reg(_)));
                     let op = if both_regs { "movaps" } else { "movups" };

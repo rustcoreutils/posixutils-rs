@@ -16,14 +16,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 // ============================================================================
-// LocationMap — single owner for PseudoId → Loc bindings (M2)
+// LocationMap — single owner for PseudoId → Loc bindings
 // ============================================================================
 //
 // Every PseudoId has at most one current Loc, set by the regalloc and
-// observed by the codegen. Bug-class C in the regalloc findings was
-// "two disagreeing location computations" — codegen deriving an alternate
-// Loc from `PseudoKind` instead of asking the allocator. Routing all
-// accesses through this newtype makes that pattern syntactically visible:
+// observed by the codegen. Routing all accesses through this newtype
+// keeps codegen from deriving an alternate Loc from `PseudoKind`
+// instead of asking the allocator:
 //   * `get(p)` returns the single current binding.
 //   * `set(p, loc)` is the only way to write — call sites stand out in
 //     review (the allocator owns most writes; codegen needs the seam
@@ -165,9 +164,8 @@ impl<R> ConstraintPoint<R> {
 /// to the free-slot pool, where future `try_reuse_stack_slot` calls
 /// can find them.
 ///
-/// Linear scan called this on every iteration with the next interval's
-/// `start`. The chordal allocator (M6) calls it twice per bank: once
-/// in Phase 1 sweeping monotonically by interval start, then once with
+/// The chordal allocator calls it twice per bank: once in Phase 1
+/// sweeping monotonically by interval start, then once with
 /// `usize::MAX` just before Phase 3 spill commits to drain everything
 /// so spilled pseudos can reuse any non-interfering slot.
 ///
@@ -304,8 +302,7 @@ where
 
     // Phase B: per-block first/last use positions, def-block map, and the
     // set of pseudos written in each block (used to bound liveness via
-    // Phase C's Boissinot Up_and_Mark traversal). Replaces the legacy
-    // gen/kill + backward dataflow fixpoint.
+    // Phase C's Boissinot Up_and_Mark traversal).
     let mut first_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut last_pos_map: Vec<HashMap<PseudoId, usize>> = vec![HashMap::new(); num_blocks];
     let mut defined_in: Vec<HashSet<PseudoId>> = vec![HashSet::new(); num_blocks];
@@ -681,13 +678,10 @@ where
 
             // Type information decides the rest -- except for a comparison,
             // whose *result* is a boolean integer whatever it compared. The
-            // list used to hold only the `FCmpO*` opcodes, but the `Set*`
-            // family is typed by its operands too: `emit_compare_zero` on a
-            // `float` produces a `SetNe` typed `float`, so its boolean landed
-            // in a vector register while the code that computed it wrote a
-            // general one. On aarch64 the branch then compared a vector
-            // register nothing had loaded, and `f() ?: g()` took whichever arm
-            // the previous call's return value happened to select.
+            // `Set*` family is typed by its operands too: `emit_compare_zero`
+            // on a `float` produces a `SetNe` typed `float`, whose boolean
+            // would otherwise land in a vector register while the code that
+            // computed it wrote a general one.
             let is_comparison = matches!(
                 insn.op,
                 Opcode::FCmpOEq
@@ -724,7 +718,7 @@ where
 }
 
 // ============================================================================
-// Backend orchestration helpers (M4)
+// Backend orchestration helpers
 // ============================================================================
 //
 // Both backends contain a few short, structurally identical loops in their
@@ -823,18 +817,18 @@ pub fn spill_gp_args_across_calls<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpi
 // `lower::eliminate_phi_nodes` introduces multi-def Copy patterns. The
 // interference graph is still well-defined: vertex u interferes with
 // vertex v iff u and v are simultaneously live somewhere in the
-// function. We construct it precisely with a per-instruction backward
-// walk (the textbook "for each def, add edges to currently-live"
-// pattern) rather than the coarser block-level all-pairs that would
-// over-constrain coloring with spurious edges.
+// function. It is built with a per-instruction backward walk (the
+// textbook "for each def, add edges to currently-live" pattern) rather
+// than a coarser block-level all-pairs, which would over-constrain
+// coloring with spurious edges.
 //
 // Constraint pre-coloring (e.g. x86_64 `idiv` clobbers RAX/RDX) is
 // expressed via per-pseudo `forbidden` colors passed to greedy_color.
 // ABI-pinned arg pseudos arrive via `pre_colored`. Physical registers
 // don't need to be modeled as graph vertices.
 //
-// Use BTreeMap / BTreeSet throughout so iteration is deterministic —
-// the project's determinism invariant (cc/CLAUDE.md) covers this.
+// BTreeMap / BTreeSet throughout, so iteration is deterministic per
+// the project's determinism invariant (cc/CLAUDE.md).
 
 /// Per-pseudo set of interfering pseudos for one register bank.
 #[derive(Debug, Default)]
@@ -1112,7 +1106,7 @@ where
 }
 
 /// For each pseudo, the sorted positions at which it is used (read).
-/// M7 Belady uses this to compute "next-use distance" — when register
+/// Belady eviction uses this for "next-use distance" — when register
 /// pressure forces a spill, the pseudo with the furthest next use is
 /// the cheapest to evict (reloading later costs less than reloading
 /// sooner).
@@ -1213,12 +1207,12 @@ pub fn try_reuse_stack_slot(
     None
 }
 
-// `AbiLowering` centralizes that contract:
+// `AbiLowering` is the single place the allocator asks the ABI how an
+// argument is passed:
 //
 //   * Build it once per function with the `Function` + `TypeTable`. It
 //     pre-indexes the function's pseudos by `Arg(n)` for O(1) lookup
-//     (the previous code did an O(P) inner scan per argument) and
-//     detects the hidden sret pointer.
+//     and detects the hidden sret pointer.
 //
 //   * For each parameter, `iter_args(abi)` yields an `AbiArg` carrying
 //     the `ArgClass` from `abi.classify_param` plus a handful of type
@@ -1230,7 +1224,7 @@ pub fn try_reuse_stack_slot(
 //
 // Backends still own the actual `Loc` decision because `Loc` is per-arch
 // (each has its own `Reg`/`XmmReg`/`VReg`). They dispatch on `arg.class`
-// and the `is_*` flags, eliminating the duplicated type-kind checks.
+// and the `is_*` flags.
 
 /// Per-argument context yielded by `AbiLowering::iter_args`.
 ///
@@ -1289,8 +1283,7 @@ impl<'a> AbiLowering<'a> {
             .map(|p| p.id);
         let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
 
-        // Index pseudos by Arg(n). The previous backend code did an
-        // O(P) scan per argument; this is O(P) once.
+        // Index pseudos by Arg(n): O(P) once, O(1) per argument.
         let max_arg = func
             .pseudos
             .iter()

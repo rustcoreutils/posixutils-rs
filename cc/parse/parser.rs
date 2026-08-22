@@ -72,10 +72,9 @@ pub(crate) struct RawParam {
 /// C17 6.7.6.3p14 makes `()` and `(void)` different types: an empty
 /// *identifier* list supplies no information about the number or types of the
 /// parameters, while `(void)` says there are none. A K&R identifier list --
-/// `int f(a, b) int a, b;` -- is likewise no prototype. Both used to arrive as
-/// a plain `Vec<RawParam>`, so "unknown" and "none" were indistinguishable:
-/// a call to `int f(void)` went unchecked, and a call to a K&R definition was
-/// checked when 6.5.2.2p1 forbids it.
+/// `int f(a, b) int a, b;` -- is likewise no prototype, so `prototyped`
+/// records a distinction the parameter vector alone cannot: a call to
+/// `int f(void)` is checked, a call to a K&R definition is not (6.5.2.2p1).
 pub(crate) struct ParameterList {
     pub params: Vec<RawParam>,
     pub variadic: bool,
@@ -906,9 +905,9 @@ impl<'a> Parser<'a> {
         self.advance();
 
         // Every attribute in the program passes through here exactly once, so
-        // this is where an unrecognised one gets said out loud. It used to be
-        // dropped in silence, which is survivable for an attribute that only
-        // hints -- and is not for one that changes what the type *is*.
+        // this is where an unrecognised one gets said out loud: dropping one
+        // in silence is survivable for an attribute that only hints, and is
+        // not for one that changes what the type *is*.
         let recognised = id.is_some_and(|id| crate::kw::has_tag(id, crate::kw::SUPPORTED_ATTR));
         if !recognised {
             if name.trim_matches('_') == "vector_size" {
@@ -1067,7 +1066,7 @@ impl<'a> Parser<'a> {
             self.advance(); // consume '('
 
             // Collect the string literals, and skip anything else so that a
-            // shape we do not model still parses as it used to.
+            // shape we do not model still parses.
             let mut label = String::new();
             let mut depth = 1;
             while depth > 0 && !self.is_eof() {
@@ -1865,17 +1864,10 @@ impl Parser<'_> {
     ///
     /// `case E : statement` is a single *labeled statement* in the grammar, but
     /// the AST flattens the label into a sibling marker -- `Stmt::Case` carries
-    /// the value and not the statement it labels. That flattening is only sound
-    /// inside a block, where the marker and its statement stay adjacent items of
-    /// one list. Given a non-compound body there is room for exactly one
-    /// statement, so the marker took the whole body and the labeled statement
-    /// escaped the switch to become the *following* statement of the enclosing
-    /// block -- reached unconditionally, whatever the controlling expression.
-    /// `switch (x) case 1: return 2;` returned 2 for every `x`.
-    ///
-    /// So rebuild the block the flattening assumes. A body that opens a block,
-    /// or that carries no label at all, is returned exactly as before; only the
-    /// labeled non-compound form gains the wrapper.
+    /// the value, not the statement it labels -- which is only sound inside a
+    /// block, where the two stay adjacent items of one list. So a labeled
+    /// non-compound body gains the block that flattening assumes; a compound
+    /// or unlabeled body is returned unchanged.
     fn parse_switch_body(&mut self) -> ParseResult<Stmt> {
         if self.is_special(b'{') {
             return self.parse_statement();
@@ -2109,14 +2101,10 @@ impl Parser<'_> {
     ///
     /// A declarator whose type is a function declares a *function*, whatever
     /// company it keeps -- `int f(int), g(int);` at file scope, or
-    /// `void h(void) { int g(int); }` inside a block. Both of those binders
-    /// took "not a function definition" to mean "variable", and `is_lvalue`
-    /// asks the symbol's *kind* rather than its type, so a function bound as a
-    /// variable was assignable: `g = 0;` compiled and stored through the
-    /// function's own address.
-    ///
-    /// `_Alignas` does not apply to a function, so an alignment is dropped
-    /// here rather than recorded against one.
+    /// `void h(void) { int g(int); }` inside a block. `is_lvalue` asks the
+    /// symbol's *kind* rather than its type, so a function bound as a variable
+    /// would be assignable. `_Alignas` does not apply to a function, so an
+    /// alignment is dropped here rather than recorded against one.
     pub(super) fn declared_symbol(
         &self,
         name: StringId,

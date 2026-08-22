@@ -116,11 +116,9 @@ const LIBRARY_SUFFIXES: &[&str] = &["so", "a", "dylib", "tbd"];
 /// Only the seven standard names are ever dropped, and only when the host has
 /// no such library in either form. Anything else — a name the user chose, or a
 /// standard name the host really does provide — is forwarded untouched, so
-/// this cannot mask a genuine "cannot find -lfoo".
-///
-/// Dropping is the whole mechanism: on the platforms where these come up
-/// missing, the interfaces are in the C library, which the host driver links
-/// unconditionally. `-l xnet` and `-l y` used to reach `ld` verbatim and fail.
+/// this cannot mask a genuine "cannot find -lfoo". Dropping is the whole
+/// mechanism: on the platforms where these come up missing, the interfaces are
+/// in the C library, which the host driver links unconditionally.
 ///
 /// `lib_paths` is the `-L` directories seen *before* this `-l`, per 88925-88929
 /// — a later `-L` cannot satisfy an earlier `-l`.

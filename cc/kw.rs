@@ -422,7 +422,7 @@ define_keywords! {
     (_,                 "abort",                0),
     // The long-double magnitude and sign builtins lower to these rather than
     // to `fabs`/`__signbit`, which take a `double` and so read only the low
-    // eight bytes of an x87 value. See #C121.
+    // eight bytes of an x87 value.
     (_,                 "fabsl",                0),
     (_,                 "__signbitl",           0),
 

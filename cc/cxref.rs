@@ -136,8 +136,8 @@ impl CrossRef {
     /// `# N "file"`
     /// marker names, and reporting them against the preprocessed file names a
     /// place the reader cannot go and look. Since the line numbers already
-    /// come from the marker, leaving the file alone made the two halves of one
-    /// location disagree. This is the fix `cflow` took under #F10.
+    /// come from the marker, leaving the file alone would make the two halves
+    /// of one location disagree. `cflow` resolves it the same way.
     fn add_ref_at(&mut self, name: &str, pos: Position, is_definition: bool) {
         let (file, line, _) = diag::effective_position(pos);
         self.symbols.entry(name.to_string()).or_default().add_ref(
@@ -292,9 +292,8 @@ fn extract_refs_from_stmt(
                     posixutils_cc::parse::ast::BlockItem::Declaration(decl) => {
                         for d in &decl.declarators {
                             let name = strings.get(symbols.get(d.symbol).name).to_string();
-                            // The declarator carries its own position, so a local
-                            // with no initializer is still recorded (previously
-                            // such declarations were skipped entirely).
+                            // The declarator carries its own position, so a
+                            // local with no initializer is still recorded.
                             xref.add_definition_at(&name, d.pos);
                             if let Some(init) = &d.init {
                                 extract_refs_from_expr(init, strings, symbols, xref);

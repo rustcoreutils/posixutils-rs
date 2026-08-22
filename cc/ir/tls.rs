@@ -119,10 +119,9 @@ fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr_type: TypeId)
                         func.add_pseudo(Pseudo::reg(addr, addr.0));
                         // The result is an address, so it is typed as one.
                         // Typing it as whatever is accessed through it --
-                        // which the instruction carries, and which is what
-                        // this used to reach for -- hands a pointer to the
-                        // register allocator as, say, a double, and it is
-                        // allocated an SSE register accordingly.
+                        // which is what the instruction itself carries --
+                        // would hand a pointer to the register allocator as,
+                        // say, a double, and get an SSE register for it.
                         new.push(Instruction::tls_addr(addr, sym, ptr_type));
                         addr_of.insert(name, addr);
                         addr

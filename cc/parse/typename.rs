@@ -60,13 +60,9 @@ impl Parser<'_> {
     }
 
     /// Apply the qualifiers written after a tag reference, plus `leading` --
-    /// the ones already collected before it.
-    ///
-    /// Both halves matter and only the trailing half used to be applied, so
-    /// `_Atomic struct S;` for an already-declared tag quietly produced the
-    /// unqualified struct. That is invisible for `const` and `volatile`, which
-    /// the back end does not act on, and load-bearing for `_Atomic`, which
-    /// decides both the access and the alignment.
+    /// the ones already collected before it. Both halves matter: `const` and
+    /// `volatile` the back end does not act on, but `_Atomic` decides both the
+    /// access and the alignment.
     fn apply_trailing_qualifiers_with(
         &mut self,
         base_type: TypeId,
@@ -91,17 +87,10 @@ impl Parser<'_> {
     /// Parse a type-name: a specifier-qualifier list followed by an optional
     /// abstract declarator (C17 6.7.7). Speculative -- the caller uses it to
     /// tell `(type)expr` from `(expr)`, so a failure rewinds and answers
-    /// `None` rather than reporting anything.
-    ///
-    /// The abstract declarator goes through `parse_declarator`, the same
-    /// parser every other declarator uses. This file used to carry its own,
-    /// which recognised exactly one shape -- `(*)(params)` -- and backtracked
-    /// on everything else, so `int (*)[3]`, `int (**)(void)` and
-    /// `int (*[4])(void)` were not type-names at all: `sizeof(int (*)[3])` and
-    /// the cast `(int(*)[3])0` were parse errors. An abstract declarator is
-    /// just a declarator whose identifier is absent, which `parse_declarator`
-    /// already represents as `StringId::EMPTY`, so there was never a reason
-    /// for a second implementation.
+    /// `None` rather than reporting anything. The abstract declarator goes
+    /// through `parse_declarator`, the same parser every other declarator
+    /// uses: an abstract declarator is just a declarator whose identifier is
+    /// absent, which it already represents as `StringId::EMPTY`.
     pub(crate) fn try_parse_type_name(&mut self) -> Option<TypeId> {
         self.try_parse_type_name_vm().map(|(typ, _dims)| typ)
     }
@@ -112,9 +101,8 @@ impl Parser<'_> {
     /// Only `sizeof` needs the expressions. C17 6.5.3.4p2 evaluates the
     /// operand of `sizeof` when the type is a variable length array, and the
     /// size cannot be recovered afterwards: `int[n]`, `int[m]` and `int[]` all
-    /// intern to one `TypeId`. `parse_declarator` has always computed them
-    /// correctly; they were simply discarded here. Every other caller wants
-    /// the type alone and keeps using [`Self::try_parse_type_name`].
+    /// intern to one `TypeId`. Every other caller wants the type alone and
+    /// uses [`Self::try_parse_type_name`].
     pub(crate) fn try_parse_type_name_vm(&mut self) -> Option<(TypeId, Vec<Expr>)> {
         let saved_pos = self.pos;
         let (base, spec_dims) = self.try_parse_specifier_qualifier_list()?;
@@ -127,8 +115,7 @@ impl Parser<'_> {
                 // in `typeof(int[n])[3]` the constant 3 is the outer extent and
                 // `n` the inner one. Concatenated the other way round,
                 // `int[3][n]` and `int[n][3]` would come out the same size --
-                // right for one shape and wrong for another, which is the
-                // failure #C52's series existed to remove.
+                // right for one shape and wrong for another.
                 let mut dims = vla;
                 dims.extend(spec_dims);
                 Some((typ, dims))
@@ -142,15 +129,11 @@ impl Parser<'_> {
             }
             // The specifier-qualifier list parsed, so this *is* a type-name
             // and the declarator after it is simply invalid. Report the
-            // declarator's own error instead of rewinding (#C123).
-            //
-            // Rewinding here discarded the real diagnostic and let the caller
-            // re-read the tokens as an expression, which produced two about
-            // neither problem: `sizeof(char[-1])` said "undeclared identifier
-            // 'char'" and "subscripted value is neither array nor pointer"
-            // where gcc says "size of unnamed array is negative". Every
-            // constraint an abstract declarator can violate was reported that
-            // way, not just these two.
+            // declarator's own error instead of rewinding: rewinding discards
+            // it and lets the caller re-read the tokens as an expression,
+            // which diagnoses neither problem -- `sizeof(char[-1])` would draw
+            // "undeclared identifier 'char'" where gcc says "size of unnamed
+            // array is negative".
             Err(e) => {
                 crate::diag::error(e.pos, &e.message);
                 self.resync_to_enclosing_paren();

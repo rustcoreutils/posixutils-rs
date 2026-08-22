@@ -54,13 +54,11 @@ impl Parser<'_> {
             } else if fits(0, u64::MAX as i128) {
                 (self.types.ulong_id, 8)
             } else {
-                // Not unreachable, as this once claimed: nothing clamps an
-                // enumerator to 64 bits and the folder computes in `i128`, so
-                // `enum E { A = 1 << 64 };` reached here and **panicked the
-                // compiler**. gcc warns and carries on, folding the shift to 0
-                // because it truncates to the expression's type -- which c17's
-                // folders do not yet do (see #C115). Until they do, say what is
-                // wrong rather than aborting: a compiler diagnoses.
+                // Reachable: nothing clamps an enumerator to 64 bits and the
+                // folder computes in `i128`, so `enum E { A = 1 << 64 };`
+                // arrives here. gcc warns and carries on, folding the shift to
+                // 0 because it truncates to the expression's type, which c17's
+                // folders do not do. Say what is wrong rather than aborting.
                 diag::error(
                     pos,
                     &gettext("no integer type can represent all values of this enumeration"),
@@ -123,8 +121,7 @@ impl Parser<'_> {
                     // representable as `int`, so exceeding it is a constraint
                     // violation and 5.1.1.3 requires it be diagnosed. gcc
                     // widens the enumerated type rather than rejecting, and
-                    // so does c17 -- but not in silence, which is how
-                    // `X = 5000000000` used to become 705032704.
+                    // so does c17 -- but not in silence.
                     if v < i32::MIN as i128 || v > i32::MAX as i128 {
                         diag::warning_args(
                             value_pos,
@@ -440,15 +437,9 @@ impl Parser<'_> {
                     // Skip any __attribute__ after member declaration
                     self.skip_extensions();
 
-                    // A member's type attributes are the member's. Nothing
-                    // consumed them here, so `__attribute__((mode(M)))` on a
-                    // member did two wrong things at once: it did not size the
-                    // member, and it stayed pending, so the next declarator to
-                    // consume one -- the enclosing declaration's -- took it
-                    // instead. `struct Big { int arr[100]; int x
-                    // __attribute__((mode(QI))); } b;` gave `sizeof b == 1`
-                    // where gcc gives 404. The eight declarator sites all do
-                    // this; the member loop was the gap.
+                    // A member's type attributes are the member's: consuming
+                    // them here sizes the member, and keeps a `mode(M)` from
+                    // staying pending for the enclosing declaration.
                     let typ = self.apply_pending_type_attrs(typ);
 
                     // Capture any pending _Alignas from type specifier

@@ -6,12 +6,9 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Intermediate Representation (IR) for c17 C17 compiler
-// SSA-form IR with basic blocks and typed pseudo-registers
-//
-// The IR uses Single Static Assignment (SSA) form where each variable
-// is assigned exactly once. This simplifies dataflow analysis and
-// optimization passes.
+// Intermediate Representation: basic blocks and typed pseudo-registers in
+// Single Static Assignment form, where each variable is assigned exactly
+// once so that dataflow analysis and the optimization passes stay simple.
 //
 
 pub mod dce;
@@ -695,10 +692,8 @@ impl AsmConstraint {
     ///
     /// This matters for liveness in a way that is easy to miss: a memory
     /// *output* still **reads** its pseudo, because the pseudo holds the
-    /// address the assembly writes through. Treating `"=m"` as write-only let
-    /// DCE delete the instruction that materialized the address, leaving the
-    /// emitted `fnstcw (%rax)` to fault on whatever happened to be in the
-    /// register. Anything that computes uses must call this.
+    /// address the assembly writes through. Anything that computes uses must
+    /// call this, or DCE deletes what materialized the address.
     ///
     /// A constraint may offer several alternatives (`"rm"`); it is only a
     /// memory operand if no register/immediate alternative is available.
@@ -1601,13 +1596,10 @@ pub struct Function {
     /// that is nothing but a `long double`, which comes back in st(0) and so
     /// is loaded from memory. At a call site the backend stores the returned
     /// registers into the result local, so that pseudo's slot holds the value
-    /// itself. Inlining splices the callee's body in and drops the call, which
-    /// would hand the caller an address where it expects a value -- and the
-    /// difference is invisible, since it reads the first eight bytes of the
-    /// pointer as a float.
-    ///
-    /// Bridging the two needs the base type and stride, and the optimizer has
-    /// no `TypeTable` to ask, so such functions are simply not inlined.
+    /// itself; inlining drops the call and would hand the caller an address
+    /// where it expects a value. Bridging the two needs the base type and
+    /// stride, which the optimizer has no `TypeTable` to ask for, so such
+    /// functions are simply not inlined.
     pub ret_is_address: bool,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,

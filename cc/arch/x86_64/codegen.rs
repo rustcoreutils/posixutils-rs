@@ -30,8 +30,8 @@ use std::collections::{HashMap, HashSet};
 pub struct X86_64CodeGen {
     /// Common code generation infrastructure
     pub(super) base: CodeGenBase<X86Inst>,
-    /// Current function's register allocation. M2 routes every PseudoId
-    /// → Loc lookup through `LocationMap` so codegen never derives an
+    /// Current function's register allocation. Every PseudoId → Loc
+    /// lookup goes through `LocationMap`, so codegen never derives an
     /// alternative location from `PseudoKind`. The intrinsic-result and
     /// inline-asm sites that write into the map are the only post-
     /// allocate writers and remain visible as `.set` calls.
@@ -66,12 +66,10 @@ pub struct X86_64CodeGen {
     /// across runs, breaking reproducible builds).
     pub(super) ld_constants: std::collections::BTreeMap<u128, [u8; 16]>,
     /// Double constants to emit (label_bits -> f64 value).
-    /// BTreeMap for the same reason as `ld_constants` — emission
-    /// order in `emit_double_constants` must be reproducible.
+    /// BTreeMap for reproducible order, as `ld_constants`.
     pub(super) double_constants: std::collections::BTreeMap<u64, f64>,
     /// binary128 constants to emit (pool key -> the 16-byte image).
-    /// BTreeMap for the same reason as `ld_constants` — emission order must
-    /// be reproducible.
+    /// BTreeMap for reproducible order, as `ld_constants`.
     pub(super) quad_constants: std::collections::BTreeMap<u128, [u8; 16]>,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     sym_type_sizes: HashMap<PseudoId, u32>,
@@ -1026,8 +1024,7 @@ impl X86_64CodeGen {
                                 // Spilled: the caller wrote the value into the
                                 // incoming argument area, so copy it into the
                                 // local rather than reading registers that hold
-                                // something else. Skipping the copy entirely, as
-                                // this used to, left the parameter uninitialized.
+                                // something else.
                                 self.copy_incoming_arg_to_local(
                                     func,
                                     &func.params[i].0,
@@ -4740,8 +4737,8 @@ impl X86_64CodeGen {
             // An immediate-class constraint takes the constant's bit pattern,
             // which is what gcc substitutes: `"i"(1.0)` gives
             // `$0x3ff0000000000000`. The register and memory classes never
-            // reach here -- `emit_inline_asm` materializes or diagnoses them
-            // first -- and this used to `panic!` for all three.
+            // reach here; `emit_inline_asm` materializes or diagnoses them
+            // first.
             Loc::FImm(v, fp_size) => format!("${}", v.to_bits_at_width(*fp_size)),
             Loc::Global(name) => {
                 format!("{}(%rip)", self.format_symbol_name(name))
@@ -4876,7 +4873,7 @@ impl X86_64CodeGen {
     /// in memory — i.e., the codegen must produce a memory operand
     /// reference rather than a register reference.
     ///
-    /// C9 multi-alternative semantics: a constraint that lists any
+    /// Multi-alternative semantics: a constraint that lists any
     /// non-memory class (`r`, `a`..`d`, `S`, `D`, `i`, `n`, `g`) does
     /// NOT require memory, because the operand can use the register
     /// or immediate form directly. Only constraints that are memory-
@@ -5567,9 +5564,7 @@ impl X86_64CodeGen {
                 });
             }
             // A caller-passed stack argument. Reachable whenever an atomic
-            // operand is the seventh or later parameter; it used to fall to
-            // the `load 0` default below, which for an address operand meant
-            // dereferencing a null pointer.
+            // operand is the seventh or later parameter.
             Loc::IncomingArg(offset) => {
                 self.push_lir(X86Inst::Mov {
                     size: op_size,

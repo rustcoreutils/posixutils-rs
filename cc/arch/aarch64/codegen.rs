@@ -34,8 +34,8 @@ use std::collections::{HashMap, HashSet};
 pub struct Aarch64CodeGen {
     /// Common code generation infrastructure
     pub(super) base: CodeGenBase<Aarch64Inst>,
-    /// Current function's register allocation. M2 routes every PseudoId
-    /// → Loc lookup through `LocationMap` so codegen never derives an
+    /// Current function's register allocation. Every PseudoId → Loc
+    /// lookup goes through `LocationMap`, so codegen never derives an
     /// alternative location from `PseudoKind`. The intrinsic-result
     /// sites that write into the map are the only post-allocate writers
     /// and remain visible as `.set` calls.
@@ -157,7 +157,7 @@ impl Aarch64CodeGen {
     ///
     /// Private and raw: callers name their frame through the typed helpers
     /// below, so that the sign is applied by the producer rather than
-    /// re-derived here. See #C34.
+    /// re-derived here.
     #[inline]
     fn stack_base_reg(&self, raw_offset: i32) -> Reg {
         match self.frame_base.reg() {
@@ -259,8 +259,7 @@ impl Aarch64CodeGen {
     /// `fadd h0, h1, h2`), which are an ARMv8.2-A extension. GNU as defaults to
     /// plain armv8-a and rejects every one of them with "selected processor
     /// does not support", so any translation unit touching `_Float16` failed to
-    /// assemble on Linux. Apple's assembler enables fp16 for its own targets,
-    /// which is why macOS never saw this.
+    /// assemble on Linux. Apple's assembler enables fp16 for its own targets.
     ///
     /// `+fp16` is added to the base architecture rather than raising it to
     /// armv8.2-a, so nothing else about the ISA baseline changes. Mach-O does
@@ -318,9 +317,7 @@ impl Aarch64CodeGen {
         // For variadic functions on Linux/FreeBSD, we need extra space for the register save area.
         // AAPCS64 va_list reads unnamed arguments out of *two* save areas: the
         // GP one (x0-x7, 8 bytes each = 64) and the SIMD/FP one (q0-q7, 16
-        // bytes each = 128). Only the GP half used to be reserved, so a
-        // `va_arg(ap, double)` read whatever the caller left in the GP slots
-        // -- the incoming d0-d7 were never spilled anywhere.
+        // bytes each = 128).
         // On Darwin (macOS/iOS), variadic args are passed on the stack by the caller,
         // so we don't need a register save area.
         let is_darwin = self.base.target.os == crate::target::Os::MacOS;
@@ -679,9 +676,9 @@ impl Aarch64CodeGen {
     //   Quad (128b)  : [-1024, 1008] step 16
     //
     // A deep stack frame (large alloca, int128-heavy locals, many
-    // spills) routinely overflows these. The pre-fix codegen blindly
-    // emitted out-of-range offsets and the assembler rejected them
-    // ("index must be a multiple of 8 in range [-512, 504]").
+    // spills) routinely overflows these, and the assembler rejects an
+    // out-of-range offset ("index must be a multiple of 8 in range
+    // [-512, 504]").
     //
     // Every body-emitted pair instruction that takes a `BaseOffset`
     // routes through `emit_{stp,ldp,stp_fp,ldp_fp}_legalized`. The
@@ -1230,9 +1227,7 @@ impl Aarch64CodeGen {
             // A composite of at most sixteen bytes that is not an HFA arrives
             // in two consecutive X registers, and the prologue writes them
             // into the parameter's local -- the same arrangement the HFA arm
-            // below uses. It used to fall to the single-register arm, which
-            // stored one register and advanced by one, so the aggregate was
-            // half wrong and every later integer parameter moved as well.
+            // below uses.
             let gp_pair = !is_complex
                 && !is_fp
                 && matches!(types.kind(*typ), TypeKind::Struct | TypeKind::Union)
@@ -1359,10 +1354,8 @@ impl Aarch64CodeGen {
                                 // the V registers, so the caller laid it on the
                                 // stack. The prologue still has to copy it into
                                 // the parameter's local, which is what the body
-                                // reads -- without this the local was left
-                                // uninitialized and the parameter read as
-                                // garbage (#H13). regalloc has already assigned
-                                // the incoming slot; find it and shuttle both
+                                // reads. regalloc has already assigned the
+                                // incoming slot; find it and shuttle both
                                 // elements through V16.
                                 self.copy_stacked_fp_elems_to_local(
                                     func,
@@ -3077,12 +3070,10 @@ impl Aarch64CodeGen {
             _ => return,
         };
 
-        // Floating-point stores need the FP path, as they do on x86_64 -- this
-        // dispatch was missing entirely here. A 128-bit `long double` therefore
-        // fell through to emit_struct_store below, whose operand match ends in
-        // `_ => return` and so *silently dropped the store* when the value was
-        // in a V register. That, not the FpSize mapping, is why assigning a
-        // long double to a global produced no instruction at all (#H4).
+        // Floating-point stores need the FP path, as they do on x86_64.
+        // emit_struct_store below ends its operand match in `_ => return`, so
+        // a 128-bit `long double` reaching it in a V register would be
+        // silently dropped.
         let value_loc = self.get_location(value);
         let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
             || matches!(value_loc, Loc::VReg(_) | Loc::FImm(..));
@@ -3660,18 +3651,14 @@ impl Aarch64CodeGen {
 
         // Build operand slots for asm substitution. Each `AsmOperandSlot`
         // bundles (reg, mem, size, name) so per-operand pushes can't go
-        // out of sync — see the x86_64 mirror's commit for the
-        // motivation.
+        // out of sync.
         let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
         let mut slots: Vec<crate::arch::AsmOperandSlot<Reg>> = Vec::with_capacity(operand_count);
 
         // Scratch budgets, shared by the output and input loops so two
         // operands can never be handed the same register. `Reg::scratch_regs`
-        // reserves X9/X10/X11 and `VReg::allocatable` reserves V16/V17/V18;
-        // both loops used to take the first of each unconditionally, so
-        // `"r"(a), "r"(b)` rendered `fmov x9, d0; fmov x9, d1; add x0,x9,x9`
-        // -- operand 1 destroyed, result 2*b, no diagnostic. Popped from the
-        // end so X9 and V16 go first, as before.
+        // reserves X9/X10/X11 and `VReg::allocatable` reserves V16/V17/V18.
+        // Popped from the end so X9 and V16 go first.
         let mut gp_scratch: Vec<Reg> = vec![Reg::X11, Reg::X10, Reg::X9];
         let mut v_scratch: Vec<VReg> = vec![VReg::V18, VReg::V17, VReg::V16];
         // Vector operands copied back out of their scratch after the template.
@@ -3701,12 +3688,10 @@ impl Aarch64CodeGen {
                     // label or encodable integer pc offset").
                     slots.push(mk(None, Some(format!("[{}]", asm_reg_name_64(r)))));
                 }
-                // A vector-class output. Without this arm the output loop
-                // had no notion of one at all, so a `"=w"` output took
-                // whatever the allocator gave the pseudo -- a general
-                // register -- and emitted `fmov d17, x0` around a template the
-                // assembler then rejected. The x86-64 side grew the same arm
-                // as #C139; this target was recorded as sound and was not.
+                // A vector-class output. Without this arm a `"=w"` output
+                // takes whatever the allocator gave the pseudo -- a general
+                // register -- and emits `fmov d17, x0` around a template the
+                // assembler rejects.
                 _ if Self::constraint_requires_vector(&output.constraint) => {
                     match v_scratch.pop() {
                         Some(v) => {
@@ -3952,8 +3937,8 @@ impl Aarch64CodeGen {
     /// memory-class only (`m`/`o`/`V`/`Q`) returns true; any non-
     /// memory class letter (`r`/`w`/`i`/`n`/`g`/`X`/`I`...`O` and the
     /// aarch64 class letters `S`/`Y`/`Z`) defeats the requirement
-    /// because the operand can take its non-memory form. C9 multi-
-    /// alternative `"rm"` therefore returns false (register or
+    /// because the operand can take its non-memory form. A
+    /// multi-alternative `"rm"` returns false (register or
     /// memory both work; codegen picks register if available).
     /// Move an operand's value into a scratch vector register.
     fn emit_vec_load_from_loc(
@@ -4101,9 +4086,8 @@ impl Aarch64CodeGen {
             Loc::VReg(vreg) => vreg.name_d().to_string(),
             // An immediate-class constraint takes the constant's bit pattern:
             // there is no other way to name a floating value in an assembler
-            // operand. The register and memory classes never reach here --
-            // `emit_inline_asm` materializes or diagnoses them first -- and
-            // this used to `panic!` for all three.
+            // operand. The register and memory classes never reach here;
+            // `emit_inline_asm` materializes or diagnoses them first.
             Loc::FImm(v, fp_size) => format!("#{}", v.to_bits_at_width(*fp_size)),
             Loc::Global(name) => name.clone(),
         }

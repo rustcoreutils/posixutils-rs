@@ -91,15 +91,9 @@ impl Parser<'_> {
     /// `offsetof`, `alignof`, `setjmp` and `longjmp` are not C17 keywords --
     /// the first is a macro, the second a C23 spelling, the last two ordinary
     /// library functions -- so a program may use any of them as an identifier,
-    /// and gcc accepts that. Recognising them ahead of ordinary lookup made
-    /// them impossible to *use*: `int offsetof; offsetof = 1;` declared fine
-    /// and then reported "expected '('".
-    ///
-    /// `setjmp` and `longjmp` are the exception, and only against a *function*
-    /// declaration: `<setjmp.h>` declares exactly those, and they need code
-    /// generation an ordinary call cannot produce. A declaration of any other
-    /// kind -- a variable, a parameter, a typedef -- is unambiguously not that
-    /// function.
+    /// and gcc accepts that. `setjmp` and `longjmp` are the exception, and
+    /// only against a *function* declaration: `<setjmp.h>` declares exactly
+    /// those, and they need code generation an ordinary call cannot produce.
     ///
     /// The reserved spellings (`__builtin_*`, `_Alignof`, `__alignof__`) are
     /// never displaced: C17 7.1.3 reserves them to the implementation in every
@@ -707,13 +701,11 @@ impl Parser<'_> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                // Lowered as an ordinary call to `fabsl`, not as an opcode.
-                // The opcode it used to build was `Fabs64`, whose emitter moves
-                // its argument as a `double` and calls `fabs` -- so on x86-64 it
-                // read the low eight bytes of an 80-bit x87 value, its mantissa,
-                // and `__builtin_fabsl(-3.5L)` returned 2.5e-4932. A real call
-                // gets the long-double ABI from the call path, which already
-                // carries one for `__mulxc3`.
+                // Lowered as an ordinary call to `fabsl`, not as an opcode:
+                // the `Fabs64` opcode moves its argument as a `double`, so on
+                // x86-64 it would read only the low eight bytes of an 80-bit
+                // x87 value. A real call gets the long-double ABI from the
+                // call path, which already carries one for `__mulxc3`.
                 let ld = self.types.longdouble_id;
                 Ok(self.libm_call("fabsl", ld, &[ld], arg, token_pos))
             })()),
@@ -1604,24 +1596,12 @@ impl Parser<'_> {
         )
     }
 
-    /// Declare a `_chk` entry point, so the call type-checks and returns a
-    /// value of the right width.
-    ///
-    /// The fixed parameters are counted even though their types are not
-    /// modelled: where an argument stops being fixed and starts being variadic
-    /// is an ABI question, not only a type-checking one. Apple's arm64 passes
-    /// every variadic argument on the stack while fixed ones stay in
-    /// registers, so declaring these as variadic-from-argument-zero -- which
-    /// is what an empty parameter list means -- put `__snprintf_chk`'s buffer,
-    /// length, flag and size on the stack, where it does not look for them.
     /// Reduce a predicate to 0 or 1.
     ///
     /// C17 7.12.3.6 lets `signbit` answer with *any* nonzero value, and the
     /// library entry points take it literally -- `__signbitf` returns 8,
-    /// `__signbit` 128 and `__signbitl` 512, each being the sign bit still in
-    /// place. All conforming, none matching gcc's 0/1, and the three did not
-    /// even agree with one another. Comparing against zero costs one
-    /// instruction and removes a gratuitous difference.
+    /// `__signbit` 128 and `__signbitl` 512. Comparing against zero costs one
+    /// instruction and gives gcc's 0/1.
     fn normalise_predicate(&mut self, raw: Expr, pos: Position) -> Expr {
         let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
         Self::typed_expr(
@@ -1691,13 +1671,21 @@ impl Parser<'_> {
         self.symbols.declare(sym).ok()
     }
 
+    /// Declare a `_chk` entry point, so the call type-checks and returns a
+    /// value of the right width.
+    ///
+    /// The fixed parameter count is modelled even though the types are not:
+    /// Apple's arm64 passes every variadic argument on the stack while fixed
+    /// ones stay in registers, so declaring these as variadic from argument
+    /// zero -- which is what an empty parameter list means -- misplaces
+    /// `__snprintf_chk`'s buffer, length, flag and size.
     fn declare_chk_builtin(&mut self, name: &str, ret_type: TypeId) -> Option<SymbolId> {
         // Pre-interned in `cc/kw.rs`; the identifier table is read-only here.
         let name_id = self.idents.lookup(name)?;
 
-        // (fixed parameters before the `...`, whether a `...` follows). The
-        // `v` forms take a `va_list` and are not variadic; the memory ones
-        // take a fixed argument list outright.
+        // Each entry gives (fixed parameters before the `...`, whether a
+        // `...` follows). The `v` forms take a `va_list` and are not variadic;
+        // the memory ones take a fixed argument list outright.
         let (fixed, variadic) = match name {
             "__printf_chk" => (2, true),
             "__fprintf_chk" | "__sprintf_chk" => (3, true),

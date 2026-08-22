@@ -6,18 +6,9 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Function inlining pass for c17 C17 compiler
-//
-// This pass inlines small functions at their call sites. The inlining
-// is performed at the IR level so that subsequent optimization passes
-// (InstCombine, DCE) can work on the inlined code.
-//
-// The pass:
-// 1. Analyzes all functions for inlineability
-// 2. Identifies call sites eligible for inlining
-// 3. Clones callee function bodies with remapped pseudos and basic blocks
-// 4. Replaces call instructions with the inlined code
-// 5. Removes dead static functions that were fully inlined
+// Inlines small functions at their call sites, and drops static functions
+// left with none. Performed at the IR level so that the later passes
+// (InstCombine, DCE) see the inlined code.
 //
 
 use super::{
@@ -861,7 +852,7 @@ fn clone_callee_blocks(ctx: &mut InlineContext, callee: &Function) -> Vec<BasicB
         ctx.current_callee_bb = Some(callee_bb.id);
         for insn in &callee_bb.insns {
             let cloned = clone_instruction(ctx, insn, callee);
-            // M0 invariant: a callee `Ret` lowers to `PhiSource + Br cont`.
+            // A callee `Ret` lowers to `PhiSource + Br cont`.
             // The `Br` is a terminator. If the callee block holds further
             // instructions after that `Ret` (e.g. an unreachable fallback
             // `return 0;` in `#ifdef`-fenced code, or `__builtin_unreachable`
@@ -1017,11 +1008,9 @@ fn inline_call_site(
 
                 // An aggregate that fits in one register travels *as* its
                 // value: the argument pseudo holds the data, not a pointer to
-                // it. Loading through it dereferences the data as an address --
-                // `struct { float a, b; }` became a wild pointer spelled by two
-                // floats, and the inlined body segfaulted on the first read.
-                // Anything larger does travel by address, which is why the loop
-                // below is right for those and wrong for these.
+                // it, so loading through it would dereference the data as an
+                // address. Anything larger travels by address, which is what
+                // the loop below assumes.
                 if matches!(copy.size_bytes, 1 | 2 | 4 | 8) {
                     let bits = (copy.size_bytes * 8) as u32;
                     copy_insns.push(Instruction::store(

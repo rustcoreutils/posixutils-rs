@@ -35,9 +35,8 @@ const MAX_HFA_ELEMENTS: u8 = 4;
 /// A `_Complex` is a two-member homogeneous aggregate, so the only question is
 /// how wide a member is — and that is a question about *width*, not about how
 /// the type is spelled. Apple makes `long double` a 64-bit double, so
-/// `long double _Complex` is an ordinary pair of doubles there; matching on
-/// `TypeKind::LongDouble` instead sent it by reference, disagreeing with clang
-/// about every such argument and return.
+/// `long double _Complex` is an ordinary pair of doubles there, as clang
+/// passes it.
 ///
 /// On aarch64 Linux `long double` is IEEE binary128, which occupies a whole Q
 /// register -- so `long double _Complex` is a two-element HVA in q0/q1, the
@@ -505,8 +504,7 @@ mod tests {
     /// A complex value is a two-member HFA whose element width — not whose
     /// type *name* — decides the register class. Apple's `long double` is a
     /// 64-bit double, so `long double _Complex` belongs in two D registers
-    /// like any other pair of doubles; matching on `TypeKind::LongDouble`
-    /// sent it by reference and disagreed with clang.
+    /// like any other pair of doubles, which is what clang does.
     #[test]
     fn complex_is_classified_by_element_width() {
         use crate::target::{Arch, Os, Target};

@@ -218,10 +218,8 @@ impl Aarch64CodeGen {
         let type_bits = types.size_bits(arg_type);
         let is_fp = types.is_float(arg_type);
         // An HFA arrives in the SIMD registers, so it is read out of *their*
-        // save area, one element per 16-byte slot. Aggregates used to take the
-        // integer path unconditionally -- which agreed with a caller that also
-        // sent them in general registers, and with nothing else. Now that the
-        // caller follows AAPCS64 §5.4.2 and gcc, this side has to as well.
+        // save area, one element per 16-byte slot, matching the caller's
+        // AAPCS64 §5.4.2 layout.
         let agg = VaAggKind::of(arg_type, types, &self.base.target);
 
         let ap_loc = self.get_location(ap_addr);
@@ -803,8 +801,7 @@ impl Aarch64CodeGen {
 
         // Pairs first, then a single register for any 8-byte remainder. The
         // pair step has to be gated on a *full* 16 bytes remaining: Darwin's
-        // va_list is 8 bytes, and copying it with one `stp` wrote 8 bytes past
-        // the destination, over whatever the frame held next.
+        // va_list is 8 bytes, and one `stp` would write 8 bytes past it.
         let mut offset = 0;
         while bytes - offset >= 16 {
             self.push_lir(Aarch64Inst::Ldp {

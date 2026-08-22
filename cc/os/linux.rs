@@ -24,9 +24,8 @@ const FALLBACK_GLIBC: (&str, &str) = ("2", "17");
 ///
 /// This is deliberately not a query of the *running* libc: what matters is the
 /// header set on the include path, because that is what redefines these macros
-/// mid-translation-unit. Predefining a value that disagrees with `features.h`
-/// meant every `__GLIBC_PREREQ` test performed *before* a system header was
-/// included got the wrong answer (audit #C3).
+/// mid-translation-unit, and a predefined value that disagrees with it breaks
+/// every `__GLIBC_PREREQ` test made before a system header is included.
 fn detect_glibc_version(target: &Target) -> (String, String) {
     for dir in get_include_paths(target) {
         let Ok(text) = std::fs::read_to_string(Path::new(dir).join("features.h")) else {
@@ -91,7 +90,7 @@ pub fn get_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
         // visibility here (88196-88203), so this is a deliberate divergence
         // rather than a violation -- it matches what a GCC install on a glibc
         // system effectively provides, and unsetting them breaks a great deal
-        // of code that assumes GNU extensions are visible. Recorded as #P12.
+        // of code that assumes GNU extensions are visible.
         ("_GNU_SOURCE", Some("1".into())),
         ("_DEFAULT_SOURCE", Some("1".into())),
         ("_XOPEN_SOURCE", Some("800".into())),

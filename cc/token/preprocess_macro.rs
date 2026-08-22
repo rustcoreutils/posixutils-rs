@@ -316,8 +316,7 @@ impl<'a> Preprocessor<'a> {
         is_variadic: bool,
         idents: &IdentTable,
     ) -> Vec<MacroToken> {
-        // C17 6.10.3.3p1: `##` shall occur at neither end of a replacement
-        // list. Both used to become a literal `#`/`##` token instead.
+        // C17 6.10.3.3p1: `##` shall occur at neither end of a replacement list.
         let is_paste = |t: &Token| {
             matches!(&t.value, TokenValue::Special(c)
                 if *c == SpecialToken::HashHash as u32)
@@ -428,8 +427,7 @@ impl<'a> Preprocessor<'a> {
                     }
 
                     // C17 6.10.3.2p1: in a function-like macro each `#` shall
-                    // be followed by a parameter. It used to fall through to a
-                    // literal `#` token with no diagnostic.
+                    // be followed by a parameter.
                     if is_function {
                         diag::error(
                             token.pos,
@@ -499,9 +497,7 @@ impl<'a> Preprocessor<'a> {
                         // there are trailing arguments, drop it when there are
                         // not. Lower it here so there is one mechanism rather
                         // than a second, subtly different one in the
-                        // substitution loop -- the old special case fired on
-                        // "the previous body token was `##`" alone and, when
-                        // the arguments were non-empty, never actually pasted.
+                        // substitution loop.
                         if is_variadic {
                             if let Some(comma) = Self::gnu_comma_elision(&body) {
                                 body.truncate(comma);
@@ -604,10 +600,7 @@ impl<'a> Preprocessor<'a> {
     /// reproduces a whole translation unit for `-E` with its line structure
     /// intact. This one produces one line for a human to read.
     ///
-    /// Built on `show_token` so that every token type is covered: the
-    /// hand-written match this replaces handled four of them and silently
-    /// dropped the rest, so `#error "a" 'b' L"c"` reported `#error a  and`
-    /// -- quotes stripped, two of the three operands gone.
+    /// Built on `show_token` so that every token type is covered.
     pub(super) fn tokens_to_message(&self, tokens: &[Token], idents: &IdentTable) -> String {
         let mut bytes: Vec<u8> = Vec::new();
         for token in tokens {
@@ -841,12 +834,9 @@ impl<'a> Preprocessor<'a> {
         // Unterminated: the whole file went by without a closing ')'.
         //
         // Give the tokens back rather than expanding with whatever was
-        // collected. Since expansion became a splice, the scan runs to end of
-        // file looking for that ')', so expanding anyway would substitute the
-        // rest of the translation unit into the macro and emit the result --
-        // `#define BAD f(` followed by `BAD` produced `(()+1)` and deleted
-        // everything after it. gcc leaves the macro name in place, and so does
-        // this now.
+        // collected: the scan runs to end of file looking for that ')', so
+        // expanding anyway would substitute the rest of the translation unit
+        // into the macro. gcc leaves the macro name in place, and so does this.
         if !found_closing_paren {
             crate::diag::error_args(
                 *macro_pos,
@@ -951,13 +941,12 @@ impl<'a> Preprocessor<'a> {
         out
     }
 
-    /// Expand a function-like macro
     /// C17 6.10.3p4: a function-like macro invocation must supply as many
     /// arguments as the definition has parameters (and at least that many for a
     /// variadic one).
     ///
-    /// Substitution used `args.get(idx).unwrap_or_default()`, so a missing
-    /// argument silently became empty and an extra one was silently dropped.
+    /// Substitution reads `args.get(idx).unwrap_or_default()`, so without this
+    /// check a missing argument is silently empty and an extra one dropped.
     fn check_macro_arity(&self, mac: &Macro, args: &[Vec<Token>], pos: &Position) {
         // `collect_macro_args` yields no arguments at all for `F()`. That spells
         // *one empty argument* unless the macro takes none, so recover the
@@ -1087,8 +1076,6 @@ impl<'a> Preprocessor<'a> {
                     // `#__VA_ARGS__` stringifies the *whole* variadic token
                     // sequence, commas included -- 6.10.3.1p2 makes
                     // __VA_ARGS__ that sequence, not its first element.
-                    // Taking args[idx] alone silently dropped everything
-                    // after the first comma, so `V(1,2,3)` came out `"1"`.
                     let arg = if *idx >= mac.params.len() {
                         Self::join_variadic_args(args, *idx)
                     } else {
@@ -1131,9 +1118,8 @@ impl<'a> Preprocessor<'a> {
                         // names the parameter. C17 6.10.3.1p1 replaces a
                         // parameter with the *same* fully-replaced sequence
                         // each time, so re-running the pass per occurrence
-                        // could only produce the same tokens again -- and it
-                        // dominated the cost of any macro that used a parameter
-                        // more than once.
+                        // could only produce the same tokens again, at a cost
+                        // that dominates any macro naming a parameter twice.
                         if expanded_args[*idx].is_none() {
                             let expanded = self.preprocess(arg, idents);
                             let mut out = Vec::with_capacity(expanded.len());
@@ -1195,9 +1181,7 @@ impl<'a> Preprocessor<'a> {
                     // The sequence as a whole is spaced as `__VA_ARGS__` was
                     // in the macro body -- `mt.whitespace`, the same source
                     // every other body token uses through
-                    // `macro_token_to_token`. Taking it from `pos` used the
-                    // *invocation's* spacing instead, so `#define F(...) x
-                    // __VA_ARGS__` expanded `F(*p)` to `x*p`.
+                    // `macro_token_to_token`.
                     if let Some(first) = result.get_mut(va_start) {
                         first.pos.whitespace = mt.whitespace;
                     }
@@ -1240,13 +1224,7 @@ impl<'a> Preprocessor<'a> {
         // The FIRST token of a macro expansion stands where the invocation
         // stood: it inherits both the spacing before it and whether it begins
         // a line. Body tokens carry neither, since they were written somewhere
-        // else entirely.
-        //
-        // The line flag used to be dropped, so an expansion at the start of a
-        // line ran onto the previous one in `-E` output -- `M int b;` came out
-        // as `int a; 42 int b;` where gcc breaks the line. Stringification hid
-        // that for its own case by copying the invocation position wholesale,
-        // which then made a `#x` result claim to begin a line even mid-line.
+        // else entirely. gcc's `-E` output breaks the line in the same place.
         if let Some(first) = filtered.first_mut() {
             first.pos.whitespace = pos.whitespace;
             first.pos.newline = pos.newline;
@@ -1277,13 +1255,8 @@ impl<'a> Preprocessor<'a> {
 
     /// Paste exactly two tokens.
     ///
-    /// C17 6.10.3.3p3: the result has to be a single preprocessing token, and
-    /// a paste that does not produce one is a constraint violation requiring a
-    /// diagnostic. This used to concatenate the two spellings, re-lex, and keep
-    /// every token that fell out -- so `cat(+,-)` quietly produced two tokens,
-    /// and `cat(/,/)` produced `//`, which the lexer read as a comment: both
-    /// operands and the tokens around them vanished from
-    /// `int y = 1 cat(/,/) 2;` with nothing reported.
+    /// C17 6.10.3.3p3: the result has to be a single preprocessing token, and a
+    /// paste that does not produce one is a diagnosable constraint violation.
     ///
     /// The operand *types* decide whether a paste can be valid at all, before
     /// any spelling is built. Only an identifier, a pp-number or a punctuator
@@ -1381,7 +1354,6 @@ impl<'a> Preprocessor<'a> {
         token.pos.newline = false;
         // `u8"..."` is a narrow string in every respect but its spelling, so
         // the prefix lives on the spelling flag rather than in the token type.
-        // Without it the paste produced a plain `"y"` and the `u8` vanished.
         if prefix == "u8" {
             token.spelling = Spelling::Utf8Prefix;
         }

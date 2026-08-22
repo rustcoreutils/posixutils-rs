@@ -526,11 +526,7 @@ mod tests {
     }
 
     /// The chain names every file between the diagnostic and the top, in
-    /// order. `init_included_stream` is what records it, and it had been
-    /// `#[cfg(test)]` while production registered every file with
-    /// `init_stream`, whose `include_pos` is `None` -- so `show_include_chain`
-    /// was live only in test builds and a full CPython build produced zero
-    /// "through" lines across 552 diagnostics.
+    /// order; `init_included_stream` is what records it.
     #[test]
     fn test_include_chain_is_recorded() {
         clear_streams();

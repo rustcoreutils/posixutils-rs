@@ -6,26 +6,18 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// IR validator for c17 C17 compiler
-//
-// The validator enforces structural invariants the IR is required to
-// satisfy at well-defined pipeline points (between optimization passes
+// Structural invariants the IR must satisfy between optimization passes
 // but BEFORE `lower.rs`, which intentionally introduces multi-def Copies
-// as part of φ-elimination).
+// as part of φ-elimination.
 //
 //   I1 — SINGLE-DEF SSA TARGETS
 //        Every `PseudoId` that appears as an instruction's `target` must
 //        appear as such at most once across the function. SSA single-def is
-//        what pseudo-merging passes (copyprop, CSE, GVN, SCCP) rely on; the
-//        inliner's prior multi-def Copy pattern for return-value
-//        materialization (each cloned `ret` writes the shared
-//        `%ret_target`) is what M0 replaced with a Phi join.
+//        what pseudo-merging passes (copyprop, CSE, GVN, SCCP) rely on.
 //
-//        Inline-asm output operands are intentionally excluded from I1 at
-//        M0: the linearizer emits matched/in-out constraints (`"+r"(x)`,
-//        `"0"(x)`) with one pseudo serving as both the load result and the
-//        asm output. Later milestones (M2 "Sym vs pointer pseudo", M3
-//        mem2reg) clean up that shape; I1 will extend to cover it then.
+//        Inline-asm output operands are excluded: the linearizer emits
+//        matched/in-out constraints (`"+r"(x)`, `"0"(x)`) with one pseudo
+//        serving as both the load result and the asm output.
 //
 //   I3 — TERMINATOR TARGETS REFERENCE VALID BLOCKS
 //        Every branch-style instruction (Br/Cbr/Switch) carries
@@ -160,9 +152,8 @@ impl std::error::Error for ValidationError {}
 /// Validate every function in a module. Returns the full list of violations
 /// (across all functions) when something is wrong, or `Ok(())` otherwise.
 ///
-/// Validation is intentionally non-fatal here so that debug-build callers
-/// can choose to log and continue (useful while a milestone is in flight).
-/// Production builds skip the call entirely via `cfg!(debug_assertions)`.
+/// Validation is non-fatal here so that debug-build callers can log and
+/// continue. Production builds skip the call via `cfg!(debug_assertions)`.
 pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     for func in &module.functions {
@@ -177,8 +168,8 @@ pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
     }
 }
 
-/// Validate a single function. Used by milestone tests that want to
-/// exercise the validator on hand-built IR without going through a Module.
+/// Validate a single function, for callers holding hand-built IR rather
+/// than a whole Module.
 pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     check_single_def(func, &mut errors);
@@ -195,20 +186,14 @@ pub fn validate_function(func: &Function) -> Result<(), Vec<ValidationError>> {
 
 /// I1 — every SSA target pseudo is defined exactly once.
 ///
-/// "Target" here means `insn.target` — ordinary single-result IR
-/// instructions (Copy, arithmetic, Load, Phi, PhiSource, Call, ...).
+/// "Target" means `insn.target` — ordinary single-result IR instructions
+/// (Copy, arithmetic, Load, Phi, PhiSource, Call, ...).
 ///
-/// We do NOT include `insn.asm_data.outputs[i].pseudo` here. Inline asm
-/// matched/in-out constraints (`"+r"(x)`, `"0"(x)`) are intentionally
-/// emitted by the linearizer with the same pseudo serving as both the
-/// load result and the asm's output — a documented non-SSA shape that
-/// later milestones (M2 "Sym vs pointer pseudo" and M3 mem2reg) clean
-/// up. Including asm outputs here would flag every matched-constraint
-/// asm in the existing test suite, which is out of M0's scope.
-///
-/// We also do NOT count phi-source back-pointers
-/// (`PhiSource.phi_list[i].1`) — those reference the destination Phi's
-/// target, not new definitions.
+/// `insn.asm_data.outputs[i].pseudo` is excluded: matched/in-out
+/// constraints (`"+r"(x)`, `"0"(x)`) share one pseudo between the load
+/// result and the asm output. Phi-source back-pointers
+/// (`PhiSource.phi_list[i].1`) are excluded too — they reference the
+/// destination Phi's target, not a new definition.
 fn check_single_def(func: &Function, out: &mut Vec<ValidationError>) {
     // pseudo → list of definition sites
     let mut defs: HashMap<PseudoId, Vec<(usize, usize, Opcode)>> = HashMap::new();
@@ -335,8 +320,7 @@ mod tests {
         assert!(validate_function(&func).is_ok());
     }
 
-    /// I1 violation: two `Copy` instructions share a target — the historical
-    /// inliner-multi-def-return pattern before M0.
+    /// I1 violation: two `Copy` instructions share a target.
     #[test]
     fn validate_flags_multi_def_target() {
         let mut func = fresh_func("two_arms");
@@ -361,11 +345,9 @@ mod tests {
         }
     }
 
-    /// Scope check: inline-asm outputs are NOT counted as SSA defs at M0.
-    /// The linearizer emits matched/in-out constraints (`"+r"(x)`, `"0"(x)`)
-    /// with the load result and the asm output sharing one pseudo — a
-    /// documented non-SSA shape. Later milestones (M2, M3) clean this up;
-    /// for M0 the validator must not flag the shape.
+    /// Scope check: inline-asm outputs are NOT counted as SSA defs. The
+    /// linearizer emits matched/in-out constraints (`"+r"(x)`, `"0"(x)`)
+    /// with the load result and the asm output sharing one pseudo.
     #[test]
     fn validate_does_not_flag_asm_outputs() {
         use crate::ir::{AsmConstraint, AsmData};
@@ -376,7 +358,7 @@ mod tests {
         }
         // `%2 = copy %0`
         push(&mut func, copy_insn(2, 0));
-        // Asm whose output also writes %2. Pre-M2 linearizer pattern.
+        // Asm whose output also writes %2.
         let mut asm = Instruction::new(Opcode::Asm);
         asm.asm_data = Some(Box::new(AsmData {
             template: "movl $1, %0".into(),
@@ -393,14 +375,13 @@ mod tests {
         }));
         push(&mut func, asm);
 
-        // M0 scope: asm outputs ignored; no error.
+        // Asm outputs are ignored; no error.
         assert!(validate_function(&func).is_ok());
     }
 
     /// `PhiSource.phi_list` carries a back-pointer to the destination Phi's
-    /// target pseudo, NOT a definition. It must not be counted by the
-    /// single-def check, otherwise legitimate phi-join IR (M0 output) would
-    /// fail validation.
+    /// target pseudo, NOT a definition. Counting it would fail legitimate
+    /// phi-join IR.
     #[test]
     fn validate_does_not_count_phisource_back_pointer() {
         let mut func = fresh_func("phi_back_ptr");

@@ -347,8 +347,8 @@ fn eval_binary(
             // 6.5.7p3 makes a count outside [0, width) undefined and gcc
             // folds one to 0 for `<<` while leaving `-1 >> 64` at -1, so
             // there is no single gcc answer to match; c17 diverges knowingly
-            // and consistently. What gcc has and c17 does not is the
-            // *warning* -- see #C125.
+            // and consistently. The *warning* is emitted by
+            // `check_shift_count`, where the shift's type is computed.
             let width = left
                 .typ
                 .map(|t| env.types().size_bits(t))

@@ -337,8 +337,8 @@ fn test_header_name_only_where_one_can_appear() {
     let (tokens, _) = tokenize_str("#define H <stdio.h>");
     assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
 
-    // No closing delimiter before end of line: lex it the old way rather
-    // than swallow the line, which `#if 0` blocks full of prose need.
+    // No closing delimiter before end of line: lex it as ordinary tokens
+    // rather than swallow the line, which `#if 0` blocks full of prose need.
     let (tokens, idents) = tokenize_str("#include <unterminated\nint x;");
     assert!(tokens.iter().all(|t| t.typ != TokenType::HeaderName));
     assert_eq!(show_token(&tokens[3], &idents), "<");
@@ -693,8 +693,7 @@ fn test_ucn_long_form() {
 #[test]
 fn test_ucn_forbidden_characters() {
     // C17 6.4.3p2, in both the short and long forms, and at both ends of
-    // the surrogate range -- a surrogate has no `char`, so it used to fail
-    // `char::from_u32` and be taken for "not an escape" entirely.
+    // the surrogate range.
     for src in [
         "test\\u0041bc",
         "test\\U00000041bc",
@@ -742,9 +741,7 @@ fn test_ucn_lowercase_hex() {
 }
 
 /// Translation phase 2 runs before phase 3, so a splice anywhere in or
-/// around a UCN is simply not there by the time the UCN is lexed. The
-/// UCN lookahead used to count *bytes* and the consumer to spend them as
-/// *characters*, so each splice silently ate that many source characters.
+/// around a UCN is simply not there by the time the UCN is lexed.
 #[test]
 fn test_ucn_across_line_splices() {
     // Splice immediately before the UCN: the trailing `zz` must survive.
@@ -989,10 +986,8 @@ fn test_column_saturates_on_very_long_line() {
     assert!(tokens[1].pos.col >= u16::MAX - 8);
 }
 
-/// A `%:` whose following `%` does not complete the `%:%:` digraph used to
-/// be consumed and then rewound by hand. The rewind restored `offset` and
-/// `col` but not `line`, so a splice between the two halves was counted
-/// once on the way in and again on the way out.
+/// A `%:` whose following `%` does not complete the `%:%:` digraph leaves the
+/// line count intact, a splice between the two halves included.
 #[test]
 fn test_digraph_hash_not_hashhash_keeps_line_count() {
     let (tokens, idents) = tokenize_str("%:\\\n% x\ny");

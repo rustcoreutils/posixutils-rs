@@ -49,11 +49,10 @@ impl Parser<'_> {
     /// Consume the type-qualifier run after a `*` in a declarator.
     ///
     /// C17 6.7.6.1 lets any type qualifier appear there, `_Atomic` included:
-    /// `int *_Atomic p;` declares an atomic pointer to int. Three copies of
-    /// this loop had drifted apart and only the one in `parse_declarator`
-    /// listed `_Atomic`, so the same declaration parsed inside a function and
-    /// failed at file scope -- where `_Atomic` fell through to the name
-    /// position and was taken as the identifier instead.
+    /// `int *_Atomic p;` declares an atomic pointer to int. One implementation
+    /// for every declarator path, so file scope and block scope agree; missing
+    /// `_Atomic` here lets it fall through to the name position and be taken
+    /// as the identifier.
     pub(super) fn parse_pointer_qualifiers(&mut self) -> TypeModifiers {
         let mut modifiers = TypeModifiers::empty();
         while self.peek() == TokenType::Ident {
@@ -132,10 +131,8 @@ impl Parser<'_> {
             // An abstract declarator has no identifier by construction
             // (C17 6.7.7): `void (*)(int)`, or a parameter written as a bare
             // type. Whether that is allowed is the caller's question, not a
-            // guess from the next token -- this used to be a whitelist of
-            // `)`, `[`, `(`, `,`, so a type-name ending in anything else was
-            // rejected outright. `_Generic(1, int: 11)` ends its type-name at
-            // a `:`, which was not on the list.
+            // guess from the next token: any token may follow, and
+            // `_Generic(1, int: 11)` ends its type-name at a `:`.
             (StringId::EMPTY, None, None)
         } else {
             (self.expect_declarator_name()?, None, None)
@@ -210,8 +207,6 @@ impl Parser<'_> {
                 match self.eval_const_expr(&expr) {
                     Some(n) if n >= 0 => Some(n as usize),
                     // C17 6.7.6.2p1: the size shall be greater than zero.
-                    // This used to become `None`, i.e. an incomplete array,
-                    // so `int a[-1]` was accepted and silently sized zero.
                     Some(_) => {
                         // gcc distinguishes the two, and the abstract case is
                         // the one a type-name reaches: `sizeof(char[-1])`
@@ -295,12 +290,9 @@ impl Parser<'_> {
                 result_type_id = self.derive_array_type(result_type_id, size, pos)?;
             }
 
-            // Substitute into inner declarator
-            // For int (*p)[3]: inner_decl is Pointer(Void), result_type is Array(3, int)
-            // -> Pointer(Array(3, int))
-            // For struct node *(*fp)(int): inner_decl is Pointer(Void),
-            //   result_type is Function(Pointer(struct node), [int])
-            // -> Pointer(Function(Pointer(struct node), [int]))
+            // Substitute the result type into the inner declarator: for
+            // `int (*p)[3]`, Pointer(Void) and Array(3, int) compose into
+            // Pointer(Array(3, int)).
             result_type_id = self.substitute_base_type(inner_tid, result_type_id);
         } else {
             // Simple declarator: char *arr[3]
@@ -333,12 +325,8 @@ impl Parser<'_> {
             }
         }
 
-        // Determine which function parameters to return:
-        // - For grouped declarator with inner function params: return inner_func_params
-        //   (e.g., int (*get_op(int which))(int) - inner has params)
-        // - For grouped declarator without inner params: return full_func_params
-        //   (e.g., int (name)(int lhs, int rhs) - parenthesized name followed by params)
-        // - For simple declarator with function: return full_func_params
+        // The inner declarator's parameters win when it has them, as in
+        // `int (*get_op(int which))(int)`; otherwise the outer suffix's do.
         let returned_func_params = if inner_func_params.is_some() {
             inner_func_params
         } else {
@@ -540,9 +528,8 @@ impl Parser<'_> {
             };
 
             // Keep the run-time dimensions of a variably-modified element
-            // type. Every other declarator path already carries `vla_sizes`;
-            // dropping them here is what left `int a[n][m]` indexing with a
-            // row stride of zero.
+            // type; without them `int a[n][m]` indexes with a row stride of
+            // zero.
             //
             // `vla_sizes` runs outermost-first over the whole declarator,
             // while only the element type matters after the array-to-pointer
@@ -619,12 +606,10 @@ impl Parser<'_> {
                 self.advance();
                 // C17 6.7.6.3: a parameter-type-list is a comma-separated list
                 // of parameter declarations, optionally followed by `, ...`.
-                // Nothing else may follow the comma. Falling through here let
-                // `parse_type_specifier` supply an implicit `int`, so
-                // `void g(int, );` silently declared `void(int, int)` -- and
-                // once call arity was checked, the *correct* call `g(1)`
-                // became the one rejected. (C23 permits the trailing comma;
-                // this compiler is C17.)
+                // Nothing else may follow the comma: falling through would let
+                // `parse_type_specifier` supply an implicit `int` and make
+                // `void g(int, );` a two-parameter prototype. (C23 permits the
+                // trailing comma; this compiler is C17.)
                 if self.is_special(b')') {
                     return Err(ParseError::new(
                         "expected a declaration specifier or '...' after ','".to_string(),

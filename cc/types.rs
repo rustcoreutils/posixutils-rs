@@ -6,8 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Type system for c17 C17 compiler
-// Compositional type model with interning for efficient comparison
+// Compositional type model with interning for efficient comparison.
 //
 
 use crate::float::FpFormat;
@@ -1137,15 +1136,11 @@ impl TypeTable {
     /// Spell `id` in declarator form, wrapping `decl` -- the declarator built
     /// so far, read outward from where the name would stand.
     ///
-    /// A C type reads inside-out, and building it left to right prints the
-    /// wrong type: `int *p = m;` for `int m[4][8]` used to report the pointee
-    /// as `int[8] *`, which reads as "array of pointers" -- the other type
-    /// entirely. gcc says `int (*)[8]` (#C132). #C131 fixed the *order* of an
-    /// array's extents; this is their composition with pointers and functions.
-    ///
-    /// The rule is the language's own: a pointer binds looser than an array or
-    /// function suffix, so a declarator that has reached a `*` is parenthesized
-    /// before a suffix is appended to it.
+    /// A C type reads inside-out, so a pointer binds looser than an array or
+    /// function suffix: a declarator that has reached a `*` is parenthesized
+    /// before a suffix is appended to it. gcc spells a pointer to `int[8]` as
+    /// `int (*)[8]`; built left to right it would come out `int[8] *`, which
+    /// reads as "array of pointers" -- the other type entirely.
     fn format_declarator(&self, id: TypeId, decl: String, idents: Option<&IdentTable>) -> String {
         let typ = self.get(id);
 
@@ -1204,7 +1199,7 @@ impl TypeTable {
                     // 6.7.6.3p14 puts the line at "prototype or not", not at
                     // "zero parameters": `(void)` says there are none, an empty
                     // identifier list says nothing at all. They are distinct
-                    // types (#C45), so a diagnostic must spell them apart.
+                    // types, so a diagnostic must spell them apart.
                     Some(params) if params.is_empty() && !typ.variadic => {
                         sig.push_str("void");
                     }
@@ -1582,19 +1577,16 @@ impl TypeTable {
     ///
     /// Not the same question as "was the keyword `unsigned` written" -- see
     /// [`Self::spelled_unsigned`]. Two integer types carry no `UNSIGNED`
-    /// modifier and are unsigned anyway, which is why answering from the bit
-    /// alone was wrong twice:
+    /// modifier and are unsigned anyway:
     ///
-    /// - `_Bool`. C17 6.2.5p6 lists it among the standard unsigned integer
-    ///   types and 6.3.1.2 confines its values to 0 and 1. It has no modifier
-    ///   because there is no `signed _Bool` to tell it apart from. Reading the
-    ///   bit sign-extended a `_Bool` bit-field, so `struct { _Bool f:1; }`
-    ///   with `f` set read back -1.
-    /// - Plain `char`, on a target whose `char` is unsigned. 6.2.5p15 leaves
-    ///   that implementation-defined, and it cannot be settled by stamping the
-    ///   modifier on at intern time: `char`, `signed char` and `unsigned char`
-    ///   are three distinct types, and the modifier is what `TypeKey::Basic`
-    ///   deduplicates on, so that would collapse two of them into one.
+    /// - `_Bool`: C17 6.2.5p6 lists it among the standard unsigned integer
+    ///   types, and 6.3.1.2 confines its values to 0 and 1. It carries no
+    ///   modifier because there is no `signed _Bool` to tell it apart from.
+    /// - Plain `char`, where 6.2.5p15's implementation-defined choice is
+    ///   unsigned. The modifier cannot be stamped on at intern time: `char`,
+    ///   `signed char` and `unsigned char` are three distinct types, and the
+    ///   modifier is what `TypeKey::Basic` deduplicates on, so that would
+    ///   collapse two of them into one.
     #[inline]
     pub fn is_unsigned(&self, id: TypeId) -> bool {
         let typ = self.get(id);
@@ -1631,10 +1623,10 @@ impl TypeTable {
     /// expression, the linearizer lowering one, and the constant folder, which
     /// reaches a `&TypeTable` and nothing else.
     ///
-    /// The ladder is by conversion **rank**, not by width. Those are not the
-    /// same thing: on LP64 `long` and `long long` are both 64 bits, and this
-    /// used to compare `size_bits`, so it returned whichever operand happened
-    /// to be on the left and `l + ll` could disagree with `ll + l`.
+    /// The ladder is by conversion **rank**, not by width: on LP64 `long` and
+    /// `long long` are both 64 bits, so comparing `size_bits` would answer
+    /// with whichever operand stood on the left, letting `l + ll` disagree
+    /// with `ll + l`.
     pub fn common_type(&self, left: TypeId, right: TypeId) -> TypeId {
         // Pointers and the like reach here from comparisons, where there is
         // nothing to convert: the operands already have a common type. The
@@ -1823,9 +1815,8 @@ impl TypeTable {
     /// The largest object c17 can describe, in bytes.
     ///
     /// `size_bits` answers in a `u32`, so nothing wider than `u32::MAX` bits
-    /// has a representable size. Exceeding it used to saturate in silence and
-    /// give `sizeof` a wrong answer for the whole type; the parser diagnoses
-    /// it now, and this is the bound it enforces.
+    /// has a representable size. The parser diagnoses a type that exceeds this
+    /// bound rather than letting `sizeof` saturate and answer wrongly.
     pub const MAX_OBJECT_BYTES: usize = (u32::MAX / 8) as usize;
 
     /// Get the size of a type in bytes
@@ -1851,10 +1842,9 @@ impl TypeTable {
         }
         // C17 6.2.5p27 lets an atomic type have a different alignment from its
         // unqualified version, and it must: the hardware's atomic access at
-        // width N requires N-byte alignment. `_Atomic struct S8 { int a, b; }`
-        // took the struct's natural 4, so aarch64 raised SIGBUS on the 8-byte
-        // access #C116 introduced, and x86-64 quietly performed one that was
-        // not atomic across a cache line.
+        // width N requires N-byte alignment. At the struct's natural 4,
+        // `_Atomic struct S8 { int a, b; }` gives aarch64 SIGBUS on the 8-byte
+        // access, and x86-64 one that is not atomic across a cache line.
         //
         // gcc's rule, measured on both targets: a power-of-two size up to 16
         // aligns to its own size, anything else keeps its natural alignment.
@@ -2278,11 +2268,10 @@ impl TypeTable {
             }
 
             // A zero-width bitfield is not an object: it occupies no storage
-            // and so cannot widen the union. It used to contribute its
-            // declared type's size *and* alignment here, which made
-            // `union { char c; int :0; }` four bytes where gcc gives one.
-            // The boundary it forces in a struct has no meaning in a union,
-            // where every member starts at bit zero.
+            // and so contributes neither size nor alignment to the union --
+            // gcc makes `union { char c; int :0; }` one byte. The boundary it
+            // forces in a struct has no meaning in a union, where every member
+            // starts at bit zero.
             if member.bit_width == Some(0) {
                 // Except on AAPCS64, where it still demands its type's
                 // alignment -- and, as in a struct, packing does not suppress
@@ -2336,10 +2325,9 @@ mod tests {
         assert!(!types.is_float(types.int_id));
     }
 
-    /// `transparent_union_first_member` is the guard every #C51 call site
-    /// uses, so it has to answer `None` for everything that is not a
-    /// transparent union -- an ordinary union most of all, since that is the
-    /// case the old blanket accommodation got wrong.
+    /// `transparent_union_first_member` is the guard every call site uses, so
+    /// it must answer `None` for everything that is not a transparent union --
+    /// an ordinary union most of all.
     #[test]
     fn test_transparent_union_first_member() {
         let mut types = TypeTable::new(&Target::host());
@@ -2618,7 +2606,7 @@ mod tests {
         assert_eq!(layout(&arm, Some(1), false), (8, 4));
 
         // Union: a zero-width bitfield occupies no storage, so it cannot
-        // widen the union -- it used to contribute its type's whole size.
+        // widen the union.
         assert_eq!(layout(&x86, None, true), (1, 1));
         assert_eq!(layout(&arm, None, true), (4, 4));
         assert_eq!(layout(&x86, Some(1), true), (1, 1));
@@ -2632,10 +2620,10 @@ mod tests {
         assert_eq!(types.format_type(types.uint_id, None), "unsigned int");
     }
 
-    /// A C type reads inside-out, and building the spelling left to right
-    /// prints a *different* type: `int (*)[8]` came out `int[8] *`, which
-    /// reads as "array of pointers" (#C132). Every row here was taken from
-    /// `gcc -std=c17`'s own diagnostics.
+    /// A C type reads inside-out: spelled left to right it names a
+    /// *different* type -- `int[8] *` reads as "array of pointers", not as
+    /// `int (*)[8]`. Every row here was taken from `gcc -std=c17`'s own
+    /// diagnostics.
     #[test]
     fn format_type_spells_a_declarator_not_a_suffix_chain() {
         let mut t = TypeTable::new(&Target::host());
@@ -2654,7 +2642,7 @@ mod tests {
             t.format_type(arr_of_ptr, None)
         );
 
-        // #C131's fix, still holding: outermost extent first.
+        // Outermost extent first.
         let arr48 = t.intern(Type::array(arr8, 4));
         assert_eq!(t.format_type(arr48, None), "int[4][8]");
         let ptr_to_arr48 = t.intern(Type::pointer(arr48));
@@ -2671,7 +2659,7 @@ mod tests {
         assert_eq!(t.format_type(ptr_to_f, None), "int (*)(void)");
 
         // 6.7.6.3p14: no prototype is not the same type as `(void)`, so the
-        // two must not print the same either (#C45).
+        // two must not print the same either.
         let f_noproto = t.intern(Type::function_no_prototype(t.int_id, false));
         assert_eq!(t.format_type(f_noproto, None), "int()");
         assert_ne!(t.format_type(f_void, None), t.format_type(f_noproto, None));

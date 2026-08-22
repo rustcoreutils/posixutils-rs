@@ -41,7 +41,7 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // about the target is not the fix for that.
         ("__ARM_NEON", Some("1")),
         // __ARM_NEON__ is the AArch32 spelling, and gcc does *not* define it
-        // on aarch64. c17 did, which was simply wrong.
+        // on aarch64.
         // FP support
         ("__ARM_FP", Some("14")), // VFPv3 compatible
         ("__ARM_FP16_FORMAT_IEEE", Some("1")),

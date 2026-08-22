@@ -332,13 +332,7 @@ impl Aarch64CodeGen {
         for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
             let arg_type = insn.arg_types.get(i).copied();
             let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
-            // Every HFA, one element through four. Only `count == 2` used to
-            // be recognised here, so a three- or four-element aggregate fell
-            // through to the general-register path below and went out whole in
-            // one X register while the callee read it from V0-V3 -- and it
-            // consumed an integer slot, shifting every following integer
-            // argument along.
-            //
+            // Every HFA, one element through four, goes out in V registers.
             // The exception is a single element small enough to sit in one
             // register: that arrives as an ordinary floating-point value and
             // goes out through `emit_fp_move` like any other scalar.
@@ -744,9 +738,8 @@ impl Aarch64CodeGen {
                     stack_arg.size,
                     types,
                 );
-                // From the type. A binary128 stack argument stored as a
-                // `double` lost its top half, and the fixed 8-byte stride
-                // below then put the next argument inside it.
+                // Width comes from the type, so a binary128 stack argument
+                // keeps its top half rather than taking the 8-byte stride.
                 let fp_sz = self.fp_size_from_type(stack_arg.typ, stack_arg.size, types);
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_sz,

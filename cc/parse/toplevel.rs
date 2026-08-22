@@ -221,9 +221,8 @@ impl Parser<'_> {
         // Parse type specifier
         let base_type = self.parse_type_specifier()?;
         // A declaration that stops right here declares nothing, and that --
-        // not a missing type specifier -- is what to report. `static;` used to
-        // draw "type specifier missing", blaming the half that was absent
-        // rather than the declarator that was. The `;` arms below do it.
+        // not a missing type specifier -- is what to report. The `;` arms
+        // below do it.
         if !self.is_special(b';') {
             self.check_implicit_int(decl_pos);
         }
@@ -1071,10 +1070,7 @@ impl Parser<'_> {
     ///
     /// `int a, b;` and `int f(int), g(int);` are the same grammar -- C17 6.7's
     /// *declaration-specifiers init-declarator-list* -- and a function
-    /// declarator is an ordinary member of that list. This used to live inline
-    /// in the variable path only, so a declaration whose *first* declarator
-    /// was a function ended at the function-declaration branch, which demanded
-    /// a `;` and rejected the comma.
+    /// declarator is an ordinary member of that list.
     ///
     /// Takes `base_type_id` rather than the running `typ_id`: any `*` before
     /// the first declarator belongs to that declarator alone, so in

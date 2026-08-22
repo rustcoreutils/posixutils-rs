@@ -6,10 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Optimization infrastructure for c17 C17 compiler
-//
-// This module provides the optimization pass runner and common utilities
-// used by optimization passes (InstCombine, DCE, etc.).
+// Optimization pass runner and the utilities its passes share.
 //
 
 use crate::ir::dce;
@@ -24,10 +21,8 @@ use crate::ir::{Function, Module};
 ///
 /// Built once from `-O...` and handed to *both* the optimizer and the
 /// preprocessor, so that `__OPTIMIZE__` and its siblings are derived from the
-/// value that drives behaviour rather than from a parallel copy of it. A
-/// capability macro that can disagree with the capability is exactly the
-/// failure this arrangement exists to prevent -- see the `#C163` block in
-/// `cc/tests/preprocessor/std_dialect.rs`.
+/// value that drives behaviour rather than from a parallel copy of it: a
+/// capability macro must never be able to disagree with the capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Optimization {
     /// 0-3, as in `-O0`..`-O3`. `-Og` is 1 and `-Os` is 2.
@@ -145,16 +140,9 @@ fn suppress_forwarding_bodies(module: &mut Module) {
 ///
 /// Reachable when `always_inline` is refused for a reason of its own -- a
 /// callee that also uses `va_start`, or `alloca`, is turned down in
-/// `ir::inline` before the attribute is consulted. The body was already
-/// suppressed, so the surviving call has nothing to reach.
-///
-/// The test used to be `func.emit && forwards_caller_arguments(func)`, which
-/// no function can satisfy: `suppress_forwarding_bodies` clears `emit` on
-/// exactly the set `forwards_caller_arguments` accepts, and nothing sets it
-/// back. So the guard never fired, and a forwarder the inliner had refused
-/// came out as `undefined reference to 'wrap'` from the linker with no
-/// diagnostic of its own. What is actually wrong is a surviving *call site*,
-/// so that is what this looks for. GCC reports the same situation as an error.
+/// `ir::inline` before the attribute is consulted. The body is already
+/// suppressed by then, so what is wrong is the surviving *call site*, and that
+/// is what this looks for. GCC reports the same situation as an error.
 fn check_forwarding_resolved(module: &Module) {
     let suppressed: std::collections::BTreeSet<&str> = module
         .functions
@@ -203,9 +191,7 @@ pub fn optimize_module(module: &mut Module, opt: Optimization) {
     // no-op for a module that has none.
     // A function that forwards its caller's variadic arguments has no
     // out-of-line form: what it forwards exists only at a call site. GCC emits
-    // no standalone copy of one either. Without this, `-O0` emitted a body
-    // that called through with the forwarded arguments simply missing and the
-    // count register never written -- wrong code, sitting in the object.
+    // no standalone copy of one either.
     suppress_forwarding_bodies(module);
 
     inline::run(module, opt);

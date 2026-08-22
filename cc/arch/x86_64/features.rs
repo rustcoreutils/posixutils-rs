@@ -353,8 +353,7 @@ impl X86_64CodeGen {
     /// The result pseudo is allocated like any other and can land in `%rax` --
     /// which is where the save-area pointer lives -- so an address held in a
     /// register is moved into reserved scratch before anything else is
-    /// touched. `[%rax]` as both source and destination is exactly what the
-    /// first version emitted.
+    /// touched.
     fn va_agg_dst(&mut self, dst_loc: &Loc, dst_is_addr: bool) -> Option<VaAggDst> {
         Some(match dst_loc {
             Loc::Stack(slot) => VaAggDst::Slot(*slot),
@@ -657,13 +656,8 @@ impl X86_64CodeGen {
         //    refers to, so we must load the pointer first and use *that*
         //    as the base register with offset 0.
         //
-        // The historical Loc::Stack path conflated the two: it always
-        // treated `rbp + offset` as the va_list, which is correct only for
-        // shape (1). Optimization passes (copyprop, instcombine identity
-        // folds) that eliminate the Copy that previously kept shape (2)'s
-        // pointer in a register expose the bug. Detect the pointer-in-
-        // stack-slot case explicitly and materialize the pointer into R11
-        // (reserved scratch) before delegating to the helpers.
+        // Shape (2) is detected explicitly: the pointer is materialized
+        // into R11 (reserved scratch) before delegating to the helpers.
         let is_sym = self
             .pseudos
             .iter()

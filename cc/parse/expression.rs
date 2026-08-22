@@ -24,25 +24,9 @@ const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
 const DEFAULT_INIT_CAPACITY: usize = 8;
 
 impl<'a> Parser<'a> {
-    // Expression Parsing - Precedence Chain
-    //
-    // From lowest to highest precedence:
-    // 1. comma (left-to-right)
-    // 2. assignment (right-to-left)
-    // 3. ternary/conditional (right-to-left)
-    // 4. logical-or (left-to-right)
-    // 5. logical-and (left-to-right)
-    // 6. bitwise-or (left-to-right)
-    // 7. bitwise-xor (left-to-right)
-    // 8. bitwise-and (left-to-right)
-    // 9. equality (left-to-right)
-    // 10. relational (left-to-right)
-    // 11. shift (left-to-right)
-    // 12. additive (left-to-right)
-    // 13. multiplicative (left-to-right)
-    // 14. unary (right-to-left)
-    // 15. postfix (left-to-right)
-    // 16. primary
+    // Expression parsing, one function per precedence level: the chain below
+    // runs from lowest (comma) to highest (primary), each level delegating to
+    // the next.
 
     /// Parse an expression (comma expression, lowest precedence)
     pub fn parse_expression(&mut self) -> ParseResult<Expr> {
@@ -242,8 +226,7 @@ impl<'a> Parser<'a> {
                 }
                 // A range that follows a field designator -- `.m[0 ... 3] = v`
                 // -- resolves through `resolve_designator_chain`, which yields
-                // one offset where a range names many. It used to be dropped
-                // there in silence, initializing nothing. The nested spelling
+                // one offset where a range names many. The nested spelling
                 // `.m = {[0 ... 3] = v}` does the same job and works.
                 if high.is_some() && !designators.is_empty() {
                     return Err(ParseError::new(
@@ -294,21 +277,17 @@ impl<'a> Parser<'a> {
 
         // Both arithmetic: the usual arithmetic conversions, which C17 6.5.15p5
         // sends the arms through -- the same ones the binary operators use.
-        //
-        // Delegated rather than restated. The copy that lived here compared
-        // bit *width* where C compares conversion *rank*, so `c ? (long)0 :
-        // (long long)0` came out `long` and, worse, depended on which arm was
-        // written first: the same pair spelled the other way round gave
-        // `long long`.
+        // Delegated rather than restated, so the answer follows conversion
+        // *rank* and not bit width, and does not depend on which arm was
+        // written first.
         //
         // Complex is held back deliberately. The shared version answers it
         // correctly -- `c ? z : 1.0` really is `double _Complex` -- but a
         // complex conditional does not survive codegen today: the arms carry a
         // two-register value while the merge dereferences the pseudo as an
-        // address, which segfaults, and does so at this commit with or without
-        // this change. Widening the type here would turn "quietly drops the
-        // imaginary part" into "crashes", so complex keeps the answer it had
-        // until that is fixed.
+        // address, which segfaults. Widening the type here would turn "quietly
+        // drops the imaginary part" into "crashes", so complex keeps its own
+        // answer until that is fixed.
         let complex = self.types.is_complex(then_typ) || self.types.is_complex(else_typ);
         if !complex && self.types.is_arithmetic(then_typ) && self.types.is_arithmetic(else_typ) {
             return self.usual_arithmetic_conversions(then_typ, else_typ);
@@ -408,7 +387,7 @@ impl<'a> Parser<'a> {
 
             // C17 6.5.15p3: either both arms have type void, or neither does.
             // A mismatch means one arm has no value for the expression to
-            // take, which used to compile as whichever type came first.
+            // take.
             let then_void = self.types.kind(then_typ) == TypeKind::Void;
             let else_void = self.types.kind(else_typ) == TypeKind::Void;
             if then_void != else_void {
@@ -933,9 +912,9 @@ impl<'a> Parser<'a> {
             // Try to parse as type. The size expressions of any
             // variably-modified array level ride on the node: 6.5.3.4p2 says
             // the operand is evaluated and its size computed at run time, and
-            // the interned type cannot carry either. `typeof(type-name)` now
-            // carries its own extents out, so the completeness check no longer
-            // needs the exemption it used to make for it.
+            // the interned type cannot carry either. `typeof(type-name)`
+            // carries its own extents out, so the completeness check needs no
+            // exemption for it.
             if let Some((typ, dims)) = self.try_parse_type_name_vm() {
                 self.expect_special(b')')?;
                 self.check_sizeof_operand_is_complete(typ, &dims, sizeof_pos);
@@ -1425,7 +1404,7 @@ impl<'a> Parser<'a> {
     /// Create a typed binary expression, computing result type from operands
     fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr) -> Expr {
         // C17 6.5.5-6.5.14 require operands with a value. `f() + 1` where `f`
-        // returns void has none, and used to compile.
+        // returns void has none.
         self.check_not_void(&left, left.pos);
         self.check_not_void(&right, right.pos);
 
@@ -1520,14 +1499,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Warn when a shift's constant count cannot name a bit of the value
-    /// being shifted (#C125).
+    /// being shifted.
     ///
     /// C17 6.5.7p3 makes a count that is negative, or not less than the width
     /// of the promoted left operand, undefined. c17 folds such a shift by
     /// masking the count the way the hardware does, and keeps the run-time
-    /// path in agreement -- so the *value* is as defensible as gcc's, which is
-    /// not even self-consistent (`1 << 64` folds to 0 while `-1 >> 64` stays
-    /// -1). The gap was the silence.
+    /// path in agreement, so only the diagnostic is owed.
     ///
     /// This sits with the type check rather than in the constant folder
     /// because the folder is called speculatively -- by `__builtin_constant_p`

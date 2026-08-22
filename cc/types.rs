@@ -954,7 +954,6 @@ impl TypeTable {
     }
 
     /// Get a type by ID (returns reference)
-    #[inline]
     pub fn get(&self, id: TypeId) -> &Type {
         &self.types[id.0 as usize]
     }
@@ -973,25 +972,21 @@ impl TypeTable {
 
     // Type query methods (moved from Type to TypeTable)
 
-    #[inline]
     pub fn kind(&self, id: TypeId) -> TypeKind {
         self.get(id).kind
     }
 
-    #[inline]
     pub fn modifiers(&self, id: TypeId) -> TypeModifiers {
         self.get(id).modifiers
     }
 
     /// Get the base type ID (for pointers, arrays, functions)
-    #[inline]
     pub fn base_type(&self, id: TypeId) -> Option<TypeId> {
         self.get(id).base
     }
 
     /// Look up an existing pointer type to the given base type
     /// Returns void_ptr_id if not found (since all pointers are same size)
-    #[inline]
     pub fn pointer_to(&self, base: TypeId) -> TypeId {
         // Look for an existing pointer to this base type
         let key = TypeKey::Pointer(base, 0); // No modifiers
@@ -1004,7 +999,6 @@ impl TypeTable {
 
     // Type-shape accessors
 
-    #[inline]
     pub fn array_size(&self, id: TypeId) -> Option<usize> {
         self.get(id).array_size
     }
@@ -1073,13 +1067,11 @@ impl TypeTable {
 
     /// Get function parameters
     #[cfg(test)]
-    #[inline]
     pub fn params(&self, id: TypeId) -> Option<&Vec<TypeId>> {
         self.get(id).params.as_ref()
     }
 
     #[cfg(test)]
-    #[inline]
     pub fn is_variadic(&self, id: TypeId) -> bool {
         self.get(id).variadic
     }
@@ -1278,7 +1270,6 @@ impl TypeTable {
     // Production methods (used by compiler proper)
 
     /// Check if type is an integer type
-    #[inline]
     pub fn is_integer(&self, id: TypeId) -> bool {
         matches!(
             self.get(id).kind,
@@ -1294,7 +1285,6 @@ impl TypeTable {
     }
 
     /// Check if type is a floating point type (not complex)
-    #[inline]
     pub fn is_float(&self, id: TypeId) -> bool {
         let typ = self.get(id);
         matches!(
@@ -1308,14 +1298,12 @@ impl TypeTable {
     }
 
     /// Check if type is a complex floating point type
-    #[inline]
     pub fn is_complex(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::COMPLEX)
     }
 
     /// Get the base float type for a complex type (e.g., double for double _Complex)
     /// Returns the same type if not complex
-    #[inline]
     pub fn complex_base(&self, id: TypeId) -> TypeId {
         if !self.is_complex(id) {
             return id;
@@ -1354,7 +1342,6 @@ impl TypeTable {
     }
 
     /// Get the complex type for a float base type (e.g., double → double _Complex)
-    #[inline]
     pub fn make_complex(&self, id: TypeId) -> TypeId {
         if self.is_complex(id) {
             return id;
@@ -1370,7 +1357,6 @@ impl TypeTable {
     }
 
     /// Check if type is an arithmetic type (integer, float, or complex)
-    #[inline]
     pub fn is_arithmetic(&self, id: TypeId) -> bool {
         self.is_integer(id) || self.is_float(id) || self.is_complex(id)
     }
@@ -1523,7 +1509,6 @@ impl TypeTable {
     }
 
     /// Check if type is a scalar type (arithmetic or pointer)
-    #[inline]
     pub fn is_scalar(&self, id: TypeId) -> bool {
         self.is_arithmetic(id) || self.get(id).kind == TypeKind::Pointer
     }
@@ -1587,7 +1572,6 @@ impl TypeTable {
     ///   `signed char` and `unsigned char` are three distinct types, and the
     ///   modifier is what `TypeKey::Basic` deduplicates on, so that would
     ///   collapse two of them into one.
-    #[inline]
     pub fn is_unsigned(&self, id: TypeId) -> bool {
         let typ = self.get(id);
         match typ.kind {
@@ -1610,7 +1594,6 @@ impl TypeTable {
     /// type on aarch64 and is still written `char`, and `_Bool` is unsigned
     /// and is written neither way. Using [`Self::is_unsigned`] here would make
     /// a type printer say `unsigned char` for a declaration that says `char`.
-    #[inline]
     pub fn spelled_unsigned(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
     }
@@ -1727,7 +1710,6 @@ impl TypeTable {
     }
 
     /// The unsigned type corresponding to a signed integer type.
-    #[inline]
     fn unsigned_version(&self, id: TypeId) -> TypeId {
         match self.kind(id) {
             TypeKind::Char => self.uchar_id,
@@ -1741,7 +1723,6 @@ impl TypeTable {
     }
 
     /// One of a real/complex pair, by whether the result is complex.
-    #[inline]
     fn pick_complex(&self, complex: bool, real: TypeId, cplx: TypeId) -> TypeId {
         if complex {
             cplx
@@ -1759,7 +1740,6 @@ impl TypeTable {
     /// This lives on the type table rather than on one consumer because the
     /// promotions are a prerequisite of the usual arithmetic conversions
     /// (6.3.1.8p1), and both the parser and the linearizer compute those.
-    #[inline]
     pub fn integer_promote(&self, id: TypeId) -> TypeId {
         match self.kind(id) {
             TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.int_id,

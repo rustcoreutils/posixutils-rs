@@ -114,7 +114,6 @@ impl X86_64CodeGen {
     }
 
     /// Push a LIR instruction to the buffer (deferred emission)
-    #[inline]
     pub(super) fn push_lir(&mut self, inst: X86Inst) {
         self.base.push_lir(inst);
     }
@@ -186,7 +185,6 @@ impl X86_64CodeGen {
     /// Whether `name` is a thread-local this backend must access through the
     /// FS segment. TLS lowering here is Linux-only; the other targets fall
     /// through to ordinary global access.
-    #[inline]
     fn is_tls_symbol(&self, name: &str) -> bool {
         self.tls_symbols.contains(name) && self.base.target.os == Os::Linux
     }
@@ -278,7 +276,6 @@ impl X86_64CodeGen {
     /// Check if a symbol needs GOT access
     /// - In PIC mode: all non-local symbols need GOT access (interposition)
     /// - On macOS: external symbols always need GOT access (even without PIC)
-    #[inline]
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
         // In PIC mode, all non-local symbols need GOT access because they
         // could be interposed at runtime (the default for global symbols).
@@ -295,19 +292,16 @@ impl X86_64CodeGen {
     }
 
     /// Emit .loc directive for source line tracking (delegates to base)
-    #[inline]
     fn emit_loc(&mut self, insn: &Instruction) {
         self.base.emit_loc(insn);
     }
 
     /// Emit file header (delegates to base)
-    #[inline]
     fn emit_header(&mut self) {
         self.base.emit_header();
     }
 
     /// Emit a global variable (delegates to base)
-    #[inline]
     fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         // Skip extern symbols - they're defined elsewhere
         if self.extern_symbols.contains(&global.name) {

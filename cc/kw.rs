@@ -543,7 +543,6 @@ define_keywords! {
 
 /// Check if a StringId has any of the given tag bits set.
 /// Returns false for non-keyword IDs (dynamic strings interned after keywords).
-#[inline]
 pub fn has_tag(id: StringId, mask: u32) -> bool {
     let idx = id.0 as usize;
     idx > 0 && idx <= KEYWORD_COUNT && KEYWORD_TAGS[idx - 1] & mask != 0

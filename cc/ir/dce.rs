@@ -52,7 +52,6 @@ pub fn run(func: &mut Function) -> bool {
 // Dead Code Elimination
 
 /// Check if an opcode is a "root" (has side effects, cannot be deleted).
-#[inline]
 fn is_root(op: Opcode) -> bool {
     op.has_side_effects()
 }

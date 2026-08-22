@@ -386,7 +386,6 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Convert a StringId to a &str using the string table
-    #[inline]
     pub(crate) fn str(&self, id: StringId) -> &str {
         self.strings.get(id)
     }
@@ -401,7 +400,6 @@ impl<'a> Linearizer<'a> {
     /// needs no change of its own.
     /// A label is marked verbatim, because it *is* the assembler name and must
     /// not pick up the target's own decoration; see `lir::VERBATIM_MARKER`.
-    #[inline]
     pub(crate) fn symbol_name(&self, id: SymbolId) -> String {
         let sym = self.symbols.get(id);
         match &sym.asm_label {

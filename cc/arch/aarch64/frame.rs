@@ -408,7 +408,6 @@ impl Aarch64CodeGen {
 
     /// stp/ldp signed-7-bit-scaled immediate range for `size`.
     /// Returns `(min, max, step)` in bytes.
-    #[inline]
     fn pair_offset_range(size: OperandSize) -> (i32, i32, i32) {
         match size {
             OperandSize::B32 => (-256, 252, 4),
@@ -417,7 +416,6 @@ impl Aarch64CodeGen {
     }
 
     /// True if `offset` fits the stp/ldp encoding for `size`.
-    #[inline]
     fn pair_offset_fits(offset: i32, size: OperandSize) -> bool {
         let (min, max, step) = Self::pair_offset_range(size);
         offset >= min && offset <= max && offset % step == 0

@@ -99,7 +99,6 @@ impl Aarch64CodeGen {
     /// Check if a symbol needs GOT access
     /// - In PIC mode: all external symbols need GOT access
     /// - On macOS: external symbols always need GOT access (even without PIC)
-    #[inline]
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
         // External symbols always need GOT access:
         // - On macOS: required for dynamic linking
@@ -113,7 +112,6 @@ impl Aarch64CodeGen {
     /// For local variables (negative offsets), this accounts for the
     /// register save area in varargs functions which is placed at the
     /// end of the frame (after locals).
-    #[inline]
     fn stack_offset(&self, offset: i32) -> i32 {
         if offset < 0 {
             if let FrameBase::Aligned { align, .. } = self.frame_base {
@@ -147,7 +145,6 @@ impl Aarch64CodeGen {
     /// Private and raw: callers name their frame through the typed helpers
     /// below, so that the sign is applied by the producer rather than
     /// re-derived here.
-    #[inline]
     fn stack_base_reg(&self, raw_offset: i32) -> Reg {
         match self.frame_base.reg() {
             Some(base) if raw_offset < 0 => base,
@@ -155,7 +152,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    #[inline]
     fn raw_mem(&self, raw_offset: i32, extra: i32) -> MemAddr {
         MemAddr::BaseOffset {
             base: self.stack_base_reg(raw_offset),
@@ -164,31 +160,26 @@ impl Aarch64CodeGen {
     }
 
     /// The address of a slot in the callee's own frame.
-    #[inline]
     pub(super) fn stack_mem(&self, slot: LocalSlot) -> MemAddr {
         self.raw_mem(slot.displacement(), 0)
     }
 
     /// The address of an incoming stack argument, in the caller's frame.
-    #[inline]
     fn incoming_mem(&self, off: IncomingOff) -> MemAddr {
         self.raw_mem(off.displacement(), 0)
     }
 
     /// The address of byte `byte` of the object in callee-frame slot `slot`.
-    #[inline]
     pub(super) fn stack_mem_plus(&self, slot: LocalSlot, extra: i32) -> MemAddr {
         self.raw_mem(slot.displacement(), extra)
     }
 
     /// The address of byte `byte` of an incoming stack argument.
-    #[inline]
     pub(super) fn incoming_mem_plus(&self, off: IncomingOff, extra: i32) -> MemAddr {
         self.raw_mem(off.displacement(), extra)
     }
 
     /// The address of byte `byte` of the object in stack slot `slot`.
-    #[inline]
     pub(super) fn stack_field(&self, slot: LocalSlot, byte: i32) -> MemAddr {
         self.stack_mem_plus(slot, byte)
     }
@@ -196,7 +187,6 @@ impl Aarch64CodeGen {
     /// The base register and displacement addressing whatever frame `loc`
     /// names, for the sites that materialize an address with an `add` rather
     /// than folding it into a load or store.
-    #[inline]
     pub(super) fn loc_addr_parts(&self, loc: &Loc) -> Option<(Reg, i32)> {
         let raw = match loc {
             Loc::Stack(slot) => slot.displacement(),
@@ -207,7 +197,6 @@ impl Aarch64CodeGen {
     }
 
     /// [`Self::loc_mem`] plus a byte offset into the object.
-    #[inline]
     pub(super) fn loc_mem_plus(&self, loc: &Loc, extra: i32) -> Option<MemAddr> {
         let raw = match loc {
             Loc::Stack(slot) => slot.displacement(),
@@ -221,7 +210,6 @@ impl Aarch64CodeGen {
     ///
     /// The one place that still decides between the two, so a `match` that
     /// forgets `IncomingArg` cannot quietly address the wrong frame.
-    #[inline]
     pub(super) fn loc_mem(&self, loc: &Loc) -> Option<MemAddr> {
         match loc {
             Loc::Stack(slot) => Some(self.stack_mem(*slot)),
@@ -231,13 +219,11 @@ impl Aarch64CodeGen {
     }
 
     /// Push a LIR instruction to the buffer (deferred emission)
-    #[inline]
     pub(super) fn push_lir(&mut self, inst: Aarch64Inst) {
         self.base.push_lir(inst);
     }
 
     /// Emit .loc directive for source line tracking (delegates to base)
-    #[inline]
     fn emit_loc(&mut self, insn: &Instruction) {
         self.base.emit_loc(insn);
     }
@@ -262,7 +248,6 @@ impl Aarch64CodeGen {
     }
 
     /// Emit a global variable (delegates to base)
-    #[inline]
     fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         // Skip extern symbols - they're defined elsewhere
         if self.extern_symbols.contains(&global.name) {

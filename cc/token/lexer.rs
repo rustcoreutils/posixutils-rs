@@ -750,17 +750,14 @@ const fn build_char_table() -> [u8; 256] {
 const CHAR_TABLE: [u8; 256] = build_char_table();
 
 /// Character classification via table lookup.
-#[inline(always)]
 fn char_class(c: u8) -> u8 {
     CHAR_TABLE[c as usize]
 }
 
-#[inline]
 fn is_digit(c: u8) -> bool {
     char_class(c) & DIGIT != 0
 }
 
-#[inline]
 fn is_letter_or_digit(c: u8) -> bool {
     char_class(c) & (LETTER | DIGIT) != 0
 }

@@ -653,7 +653,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    #[inline]
     pub(crate) fn str(&self, id: StringId) -> &str {
         self.idents.get(id)
     }

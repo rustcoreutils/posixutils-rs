@@ -196,12 +196,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         self.use_tls_dynamic() || is_extern
     }
 
-    #[inline]
     pub fn push_lir(&mut self, inst: I) {
         self.lir_buffer.push(inst);
     }
 
-    #[inline]
     pub fn push_directive(&mut self, dir: Directive) {
         self.lir_buffer.push(I::from_directive(dir));
     }

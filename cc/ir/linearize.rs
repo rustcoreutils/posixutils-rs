@@ -4066,6 +4066,82 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// One arm of a complex conditional, as the address of a `result_typ` value.
+    ///
+    /// The arms need not be complex themselves: `c ? 1 : z` has an `int` arm,
+    /// and C17 6.5.15p5 converts it to the common type like any other operand.
+    fn complex_arm_addr(&mut self, arm: &Expr, result_typ: TypeId) -> PseudoId {
+        if self.types.is_complex(self.expr_type(arm)) {
+            self.complex_operand_at_precision(arm, result_typ)
+        } else {
+            self.promote_real_to_complex(arm, result_typ)
+        }
+    }
+
+    /// `c ? a : b` where the result is complex, merged **by address**.
+    ///
+    /// A complex value is two floats wide, so every other site in the
+    /// linearizer passes one around as the address of its storage and reads
+    /// the halves through that. The general conditional path does not: it
+    /// phi-ed whatever `linearize_expr` returned, which for a complex operand
+    /// is a `load` of the whole 128-bit object. Consumers then took those
+    /// value bits for the address the convention promised and dereferenced
+    /// them -- `creal(c ? z : w)` died on entirely valid code.
+    ///
+    /// Kept separate from `linearize_ternary`'s general path rather than
+    /// folded into it: the phi here merges *pointers*, so it is a
+    /// pointer-width phi of `pointer_to(result_typ)`, not a `size_bits`-wide
+    /// phi of the complex type.
+    fn linearize_complex_ternary(
+        &mut self,
+        cond: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        let then_bb = self.alloc_bb();
+        let else_bb = self.alloc_bb();
+        let merge_bb = self.alloc_bb();
+
+        let cond_bool = self.linearize_condition(cond);
+        let cond_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+        self.link_bb(cond_end_bb, then_bb);
+        self.link_bb(cond_end_bb, else_bb);
+
+        let ptr_typ = self.types.pointer_to(result_typ);
+        let ptr_bits = self.target.pointer_width;
+
+        self.switch_bb(then_bb);
+        let then_val = self.complex_arm_addr(then_expr, result_typ);
+        let then_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(then_end_bb, merge_bb);
+
+        self.switch_bb(else_bb);
+        let else_val = self.complex_arm_addr(else_expr, result_typ);
+        let else_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(else_end_bb, merge_bb);
+
+        self.switch_bb(merge_bb);
+        let result = self.alloc_pseudo();
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
+        let mut phi_insn = Instruction::phi(result, ptr_typ, ptr_bits);
+        let phisrc1 =
+            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, ptr_typ, ptr_bits);
+        phi_insn.phi_list.push((then_end_bb, phisrc1));
+        let phisrc2 =
+            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, ptr_typ, ptr_bits);
+        phi_insn.phi_list.push((else_end_bb, phisrc2));
+        self.emit(phi_insn);
+
+        result
+    }
+
     pub(crate) fn linearize_ternary(
         &mut self,
         expr: &Expr,
@@ -4084,13 +4160,23 @@ impl<'a> Linearizer<'a> {
         // `__isinff128` in every object that used `isinf` on a double.
         if let Some(cond_val) = self.eval_const_expr(cond) {
             let taken = if cond_val != 0 { then_expr } else { else_expr };
+            let result_typ = self.expr_type(expr);
+            if self.types.is_complex(result_typ) {
+                return self.complex_arm_addr(taken, result_typ);
+            }
             let value = self.linearize_expr(taken);
             let taken_typ = self.expr_type(taken);
-            let result_typ = self.expr_type(expr);
             return self.emit_convert(value, taken_typ, result_typ);
         }
 
         let result_typ = self.expr_type(expr);
+
+        // A complex result travels by address, which neither path below can
+        // produce -- so it gets its own.
+        if self.types.is_complex(result_typ) {
+            return self.linearize_complex_ternary(cond, then_expr, else_expr, result_typ);
+        }
+
         let size = if self.types.kind(result_typ) == TypeKind::Function {
             64
         } else {
@@ -4166,6 +4252,67 @@ impl<'a> Linearizer<'a> {
     /// The whole point is that `a` is evaluated **once**: it supplies both the
     /// branch test and the value taken when it is true. Rewriting to
     /// `a ? a : b` in the parser would have called `f` twice in `f() ?: 0`.
+    /// `a ?: b` where the result is complex, merged **by address**.
+    ///
+    /// Two constraints meet here. `a` is evaluated exactly once -- that is the
+    /// whole point of the operator -- and a complex value travels by address,
+    /// so what is evaluated once is `a`'s *address*: it supplies the truth
+    /// test through `emit_complex_nonzero_at` and, converted to the result's
+    /// precision, the value taken when `a` is nonzero. Going back to the `Expr`
+    /// for either would evaluate `f()` twice in `f() ?: 0`.
+    fn linearize_complex_elvis(
+        &mut self,
+        cond: &Expr,
+        else_expr: &Expr,
+        cond_typ: TypeId,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        // The single evaluation, before any branch.
+        let cond_addr = self.complex_operand_addr(cond);
+        let cond_bool = self.emit_complex_nonzero_at(cond_addr, cond_typ);
+
+        let then_bb = self.alloc_bb();
+        let else_bb = self.alloc_bb();
+        let merge_bb = self.alloc_bb();
+        let cond_end_bb = self.current_bb.unwrap();
+
+        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+        self.link_bb(cond_end_bb, then_bb);
+        self.link_bb(cond_end_bb, else_bb);
+
+        let ptr_typ = self.types.pointer_to(result_typ);
+        let ptr_bits = self.target.pointer_width;
+
+        self.switch_bb(then_bb);
+        let then_val = self.complex_addr_at_precision(cond_addr, cond_typ, result_typ);
+        let then_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(then_end_bb, merge_bb);
+
+        self.switch_bb(else_bb);
+        let else_val = self.complex_arm_addr(else_expr, result_typ);
+        let else_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(else_end_bb, merge_bb);
+
+        self.switch_bb(merge_bb);
+        let result = self.alloc_pseudo();
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
+        let mut phi_insn = Instruction::phi(result, ptr_typ, ptr_bits);
+        let phisrc1 =
+            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, ptr_typ, ptr_bits);
+        phi_insn.phi_list.push((then_end_bb, phisrc1));
+        let phisrc2 =
+            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, ptr_typ, ptr_bits);
+        phi_insn.phi_list.push((else_end_bb, phisrc2));
+        self.emit(phi_insn);
+
+        result
+    }
+
     pub(crate) fn linearize_elvis(
         &mut self,
         expr: &Expr,
@@ -4183,8 +4330,17 @@ impl<'a> Linearizer<'a> {
             } else {
                 (else_expr, self.expr_type(else_expr))
             };
+            if self.types.is_complex(result_typ) {
+                return self.complex_arm_addr(taken, result_typ);
+            }
             let value = self.linearize_expr(taken);
             return self.emit_convert(value, taken_typ, result_typ);
+        }
+
+        // A complex result travels by address, and the left operand is both
+        // the truth test and the true value -- see `linearize_complex_elvis`.
+        if self.types.is_complex(result_typ) {
+            return self.linearize_complex_elvis(cond, else_expr, cond_typ, result_typ);
         }
 
         let size = if self.types.kind(result_typ) == TypeKind::Function {

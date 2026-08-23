@@ -417,3 +417,150 @@ int main(void) {
         0
     );
 }
+
+/// A conditional whose result is complex.
+///
+/// Two defects met here. The parser held complex back from the usual
+/// arithmetic conversions, so `c ? 1 : z` typed as `int` and dropped the
+/// imaginary half outright while `c ? z : 1` did not -- the arm order decided
+/// the type. And the linearizer phi-ed the arms *by value* where a complex
+/// value travels by address everywhere else, so the merged pseudo's bits were
+/// dereferenced as a pointer and every complex conditional that reached
+/// codegen died, including the arm order that already typed correctly.
+///
+/// Both operators are covered: `?:` shares the shape and additionally has to
+/// evaluate its left operand exactly once.
+#[test]
+fn c99_complex_conditional() {
+    let code = r#"
+#include <complex.h>
+
+static int calls;
+static int nz(void) { return 1; }               /* opaque: defeats folding */
+static double _Complex f(double re) { calls++; return re + 1.0 * I; }
+
+static int eq(double _Complex a, double re, double im) {
+    return __real__ a == re && __imag__ a == im;
+}
+
+int main(void) {
+    int c = nz();
+    double _Complex z = 3.0 + 4.0 * I;
+    double _Complex w = 5.0 - 6.0 * I;
+    float _Complex fz = 1.0f + 2.0f * I;
+
+    /* The type is the common type whichever arm the complex one is. */
+    if (sizeof(c ? 1 : z) != sizeof(double _Complex)) return 1;
+    if (sizeof(c ? z : 1) != sizeof(double _Complex)) return 2;
+    if (sizeof(c ? 1 : z) != sizeof(c ? z : 1)) return 3;
+    /* Mixed precision widens to the greater, again either way round. */
+    if (sizeof(c ? fz : z) != sizeof(double _Complex)) return 4;
+    if (sizeof(c ? z : fz) != sizeof(double _Complex)) return 5;
+    /* A real arm against float _Complex stays float _Complex. */
+    if (sizeof(c ? 1.0f : fz) != sizeof(float _Complex)) return 6;
+
+    /* Both halves survive the merge, on both branches. */
+    if (!eq(c ? z : w, 3.0, 4.0)) return 10;
+    if (!eq(nz() - 1 ? z : w, 5.0, -6.0)) return 11;
+
+    /* A real arm is converted, not truncated to the real part of the other. */
+    if (!eq(c ? z : 1, 3.0, 4.0)) return 12;
+    if (!eq(c ? 1 : z, 1.0, 0.0)) return 13;
+    if (!eq(nz() - 1 ? 1 : z, 3.0, 4.0)) return 14;
+
+    /* Mixed precision reads the narrow arm with its own stride. */
+    if (!eq(c ? fz : z, 1.0, 2.0)) return 15;
+    if (!eq(nz() - 1 ? fz : z, 3.0, 4.0)) return 16;
+
+    /* A constant condition takes one arm outright. */
+    if (!eq(1 ? z : w, 3.0, 4.0)) return 17;
+    if (!eq(0 ? z : w, 5.0, -6.0)) return 18;
+    if (!eq(0 ? 1 : z, 3.0, 4.0)) return 19;
+
+    /* Consumed in place rather than stored: the result must be an address the
+       caller can read halves through. */
+    if (__real__ (c ? z : w) != 3.0) return 20;
+    if (!eq((c ? z : w) + (c ? w : z), 8.0, -2.0)) return 21;
+
+    /* GNU `?:` -- same merge, and the left operand evaluated exactly once. */
+    calls = 0;
+    if (!eq(f(3.0) ?: (7.0 + 8.0 * I), 3.0, 1.0)) return 30;
+    if (calls != 1) return 31;
+
+    /* f(0.0) is 0+1i, which is nonzero: the imaginary half counts. */
+    calls = 0;
+    if (!eq(f(0.0) ?: (7.0 + 8.0 * I), 0.0, 1.0)) return 32;
+    if (calls != 1) return 33;
+
+    /* Genuinely zero, so the right operand is taken -- still one call. */
+    calls = 0;
+    if (!eq(f(0.0) - 1.0 * I ?: (7.0 + 8.0 * I), 7.0, 8.0)) return 34;
+    if (calls != 1) return 35;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_conditional", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_conditional_opt", code),
+        0
+    );
+}
+
+/// A complex conditional is merged **by address**, and the type is named.
+///
+/// The behavioural test above proves the answers; this pins the shape that
+/// makes them right. A complex value travels by address everywhere in the
+/// linearizer, so the conditional's arms must reach the merge as addresses and
+/// the phi must be pointer-wide -- exactly what `return a;` already produced.
+/// Phi-ing the loaded 128-bit value instead is what got those bits
+/// dereferenced as a pointer.
+///
+/// Also asserted here: `_Complex` is a modifier rather than a kind, so the
+/// type speller dropped it and named `double _Complex` as plain `double` --
+/// in the IR dump and, more importantly, in every diagnostic.
+#[test]
+fn c99_complex_conditional_merges_by_address() {
+    use crate::common::run_c17;
+
+    let dir = tempfile::Builder::new()
+        .prefix("c17_complex_ir_")
+        .tempdir()
+        .expect("work dir");
+    let src = dir.path().join("t.c");
+    std::fs::write(
+        &src,
+        "double _Complex pick(int c, double _Complex a, double _Complex b)\n\
+         { return c ? a : b; }\n",
+    )
+    .expect("write source");
+
+    // An explicit target so "pointer width" is a known number.
+    let r = run_c17(&[
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--dump-ir",
+        "post-linearize",
+        "-o",
+        "/dev/null",
+        &src.to_string_lossy(),
+    ]);
+    let ir = format!("{}{}", r.stdout, r.stderr);
+
+    assert!(
+        ir.contains("phi.64"),
+        "the arms merge as addresses, so the phi is pointer-wide:\n{ir}"
+    );
+    assert!(
+        !ir.contains("phi.128"),
+        "a 128-bit phi means the arms were merged by value:\n{ir}"
+    );
+    assert!(
+        !ir.contains("load.128"),
+        "neither arm should load the complex object to merge it:\n{ir}"
+    );
+    assert!(
+        ir.contains("double _Complex"),
+        "the type speller must not drop the _Complex modifier:\n{ir}"
+    );
+}

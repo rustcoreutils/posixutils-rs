@@ -1058,7 +1058,21 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let src_typ = self.expr_type(expr);
         let addr = self.complex_operand_addr(expr);
+        self.complex_addr_at_precision(addr, src_typ, complex_typ)
+    }
 
+    /// [`Self::complex_operand_at_precision`] for a value already in hand.
+    ///
+    /// `?:` evaluates its left operand exactly once and then needs it both as
+    /// the truth test and as the result, so it cannot go back to the `Expr`
+    /// for a second look. Taking the address instead keeps that single
+    /// evaluation while still sharing the conversion.
+    pub(crate) fn complex_addr_at_precision(
+        &mut self,
+        addr: PseudoId,
+        src_typ: TypeId,
+        complex_typ: TypeId,
+    ) -> PseudoId {
         let src_base = self.types.complex_base(src_typ);
         let dst_base = self.types.complex_base(complex_typ);
         if src_base == dst_base {

@@ -733,9 +733,20 @@ impl IncomingOff {
     /// argument eight bytes low whenever an odd number of eight-byte slots
     /// came before it. Both sides shared the error, so it showed only against
     /// another compiler.
+    ///
+    /// Stage C rounds the NSAA -- the next stacked-argument *address*, whose
+    /// origin is the argument area's base -- so the rounding belongs to the
+    /// offset within that area, not to the frame displacement. The two differ
+    /// by the saved FP and LR pair, and rounding the displacement directly
+    /// charged an over-aligned argument for those 16 bytes and started it a
+    /// whole alignment unit too high. Only alignment past 16 can tell the two
+    /// apart, which is why this survived: below that the base is already a
+    /// multiple of the alignment. x86-64's `IncomingOff::take` is the same
+    /// shape and had the same defect.
     pub fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> Self {
         let align = align.max(8);
-        next.0 = (next.0 + align - 1) & !(align - 1);
+        let base = IncomingOff::FIRST.0;
+        next.0 = base + (((next.0 - base) + align - 1) & !(align - 1));
         let here = *next;
         next.0 += (bytes + 7) & !7;
         here
@@ -2153,6 +2164,63 @@ impl Default for RegAlloc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stacked arguments are laid out from the argument area's base, not from
+    /// the frame displacement.
+    ///
+    /// The two differ by the saved FP and LR pair, and rounding the displacement
+    /// directly charged an over-aligned argument for those 16 bytes: an
+    /// argument wanting 32-byte alignment and arriving first went to offset 32
+    /// instead of 16, one whole alignment unit past where the caller -- which
+    /// measures from its outgoing area's own base -- had written it.
+    ///
+    /// Only alignment past 16 can tell the two bases apart, since 16 is
+    /// already a multiple of 8 and of 16. The 8 and 16 cases are asserted so
+    /// that stays true.
+    #[test]
+    fn incoming_args_are_laid_out_from_the_area_base() {
+        let first = IncomingOff::FIRST.0;
+
+        // Alignment up to the base's own: unchanged, and packed at 8.
+        let mut next = IncomingOff::FIRST;
+        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
+        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first + 8);
+        assert_eq!(
+            IncomingOff::take(&mut next, 16, 16).displacement(),
+            first + 16
+        );
+
+        // A 16-aligned argument landing on an odd 8-byte slot still rounds.
+        let mut next = IncomingOff::FIRST;
+        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
+        assert_eq!(
+            IncomingOff::take(&mut next, 16, 16).displacement(),
+            first + 16
+        );
+
+        // Past the base's alignment is where the bases diverge. Arriving
+        // first, an over-aligned argument must start *at* the base.
+        for align in [32, 64] {
+            let mut next = IncomingOff::FIRST;
+            assert_eq!(
+                IncomingOff::take(&mut next, align, align).displacement(),
+                first,
+                "an {align}-aligned argument arriving first starts at the area base"
+            );
+        }
+
+        // And after an 8-byte argument it rounds to the next multiple of its
+        // alignment measured from the base, not from the displacement.
+        for align in [32, 64] {
+            let mut next = IncomingOff::FIRST;
+            assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
+            assert_eq!(
+                IncomingOff::take(&mut next, align, align).displacement(),
+                first + align,
+                "an {align}-aligned argument rounds within the argument area"
+            );
+        }
+    }
 
     #[test]
     fn parse_gp_clobber_name_64bit_canonical() {

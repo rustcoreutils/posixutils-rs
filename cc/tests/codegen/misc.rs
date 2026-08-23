@@ -9955,3 +9955,129 @@ int main(void) {
         0
     );
 }
+
+/// A struct whose alignment exceeds the argument area's own, passed by value.
+///
+/// `IncomingOff::take` rounded the *frame displacement* up to the argument's
+/// alignment, but that displacement already carries the saved `%rbp` and the
+/// return address. So an argument wanting 32-byte alignment and arriving first
+/// went to `32(%rbp)` while the caller -- which measures from its outgoing
+/// area's own base, correctly -- had written it at `16(%rbp)`. The callee read
+/// the struct's second half and ran off its end.
+///
+/// Invisible below 32-byte alignment: 16 is already a multiple of 8 and of 16,
+/// so only an argument wanting more than the area's own alignment can tell the
+/// two bases apart. The ordinary-alignment cases are here so the fix cannot
+/// regress them.
+///
+/// Six integer arguments come first in every signature: without them the
+/// struct is passed in registers and the stack layout is never exercised.
+#[test]
+fn codegen_over_aligned_struct_passed_by_value() {
+    let code = r#"
+int printf(const char *, ...);
+
+struct A32 { _Alignas(32) double v[4]; };   /* 32 bytes, 32-aligned */
+struct A64 { _Alignas(64) double v[8]; };   /* 64 bytes, 64-aligned */
+struct P8  { double v[4]; };                /* same size, ordinary alignment */
+
+static int fill32(struct A32 *s, double b) { for (int i = 0; i < 4; i++) s->v[i] = b + i; return 0; }
+static int fill64(struct A64 *s, double b) { for (int i = 0; i < 8; i++) s->v[i] = b + i; return 0; }
+
+/* Six integer arguments exhaust the GP registers, so `x` is genuinely stacked
+   rather than passed in registers -- otherwise the layout is never exercised. */
+static int take_alone(int a, int b, int c, int d, int e, int f, struct A32 x) {
+    if (a + b + c + d + e + f != 21) return 1;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 2;
+    return 0;
+}
+
+/* Two of them: the second must start at the first's end rounded up to 32,
+   not at a further-padded address. */
+static int take_two(int a, int b, int c, int d, int e, int f,
+                    struct A32 x, struct A32 y) {
+    if (a + b + c + d + e + f != 21) return 3;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 4;
+    for (int i = 0; i < 4; i++) if (y.v[i] != 100.5 + i) return 5;
+    return 0;
+}
+
+/* A plain 8-byte-aligned stacked argument ahead of it, so the over-aligned one
+   really has to be rounded up rather than merely landing right by luck. */
+static int take_after_scalar(int a, int b, int c, int d, int e, int f,
+                             long p, struct A32 x) {
+    if (p != 77) return 6;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 7;
+    return 0;
+}
+
+/* An ordinary-alignment struct in the same position: the case that already
+   worked, kept so the fix cannot regress it. */
+static int take_plain(int a, int b, int c, int d, int e, int f,
+                      long p, struct P8 x) {
+    if (p != 77) return 8;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 9;
+    return 0;
+}
+
+static int take_64(int a, int b, int c, int d, int e, int f, struct A64 x) {
+    for (int i = 0; i < 8; i++) if (x.v[i] != 1.5 + i) return 10;
+    return 0;
+}
+
+/* Interleaved with the over-aligned one, to pin that the argument *after* it
+   is placed from the right running offset. */
+static int take_then_scalar(int a, int b, int c, int d, int e, int f,
+                            struct A32 x, long q) {
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 11;
+    if (q != 55) return 12;
+    return 0;
+}
+
+/* Eight doubles exhaust the FP registers. On aarch64 this struct is a
+   homogeneous floating-point aggregate and rides in d0-d3 otherwise, so
+   without this the stacked path is never reached on that target at all. */
+static int take_after_fps(double a, double b, double c, double d,
+                          double e, double f, double g, double h,
+                          struct A32 x) {
+    if (a + b + c + d + e + f + g + h != 36.0) return 13;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 14;
+    return 0;
+}
+
+/* The same position, ordinary alignment: a regression guard for the case that
+   already worked. */
+static int take_after_fps_plain(double a, double b, double c, double d,
+                                double e, double f, double g, double h,
+                                struct P8 x) {
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 15;
+    return 0;
+}
+
+int main(void) {
+    struct A32 x, y;
+    struct A64 big;
+    struct P8 plain;
+    fill32(&x, 1.5);
+    fill32(&y, 100.5);
+    fill64(&big, 1.5);
+    for (int i = 0; i < 4; i++) plain.v[i] = 1.5 + i;
+
+    int r;
+    if ((r = take_alone(1, 2, 3, 4, 5, 6, x)))            { printf("take_alone %d\n", r); return r; }
+    if ((r = take_two(1, 2, 3, 4, 5, 6, x, y)))           { printf("take_two %d\n", r); return r; }
+    if ((r = take_after_scalar(1, 2, 3, 4, 5, 6, 77, x))) { printf("take_after_scalar %d\n", r); return r; }
+    if ((r = take_plain(1, 2, 3, 4, 5, 6, 77, plain)))    { printf("take_plain %d\n", r); return r; }
+    if ((r = take_64(1, 2, 3, 4, 5, 6, big)))             { printf("take_64 %d\n", r); return r; }
+    if ((r = take_then_scalar(1, 2, 3, 4, 5, 6, x, 55)))  { printf("take_then_scalar %d\n", r); return r; }
+    if ((r = take_after_fps(1,2,3,4,5,6,7,8, x)))         { printf("take_after_fps %d\n", r); return r; }
+    if ((r = take_after_fps_plain(1,2,3,4,5,6,7,8, plain))){ printf("take_after_fps_plain %d\n", r); return r; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("over_aligned_struct_arg", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("over_aligned_struct_arg_opt", code),
+        0
+    );
+}

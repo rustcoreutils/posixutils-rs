@@ -1735,3 +1735,55 @@ done:
         }
     }
 }
+
+/// An `asm goto` label survives being inlined.
+///
+/// The label names a *block*, and it is the callee's block. The inliner
+/// remaps `bb_true`/`bb_false` and the pseudos inside the asm operands, but
+/// not `asm_data.goto_labels` -- so after inlining the label named whichever
+/// caller block happened to share the id. For a small callee that is the block
+/// holding the asm itself, and the branch became `b .Lmain_1` from inside
+/// `.Lmain_1`: the program jumped to its own address and hung.
+///
+/// This must be *run*, not read: the assembly was well-formed and the label
+/// was spelled correctly, which is all a text probe checks. Only executing it
+/// shows the branch going to the wrong place.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn codegen_inlined_asm_goto_branches_to_the_right_block() {
+    #[cfg(target_arch = "x86_64")]
+    let jump = "jmp %l[done]";
+    #[cfg(target_arch = "aarch64")]
+    let jump = "b %l[done]";
+
+    let code = format!(
+        r#"
+/* Small enough that the inliner takes it, which is the whole point. */
+static int taken(void) {{
+    __asm__ goto ("{jump}" : : : : done);
+    return 0;
+done:
+    return 1;
+}}
+
+/* The fallthrough arm: the asm does not branch, so the label is not used. */
+static int not_taken(void) {{
+    __asm__ goto ("" : : : : done);
+    return 0;
+done:
+    return 1;
+}}
+
+int main(void) {{
+    if (taken() != 1) return 1;
+    if (not_taken() != 0) return 2;
+    /* Twice, so a second inlining of the same callee is remapped too. */
+    if (taken() != 1) return 3;
+    if (taken() + not_taken() != 1) return 4;
+    return 0;
+}}
+"#
+    );
+    assert_eq!(compile_and_run("inlined_asm_goto", &code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("inlined_asm_goto_opt", &code), 0);
+}

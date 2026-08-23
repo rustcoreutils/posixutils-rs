@@ -875,11 +875,49 @@ pub enum FrameBase {
 }
 
 impl FrameBase {
+    /// Registers this function's inline asm claims for itself.
+    ///
+    /// Both spellings count: an explicit clobber, and a constraint letter that
+    /// pins an operand to a fixed register. Withholding the frame base from
+    /// `allocatable_regs` does not cover either -- asm pins bypass allocation
+    /// entirely, and a clobber only reaches the constraint points, which spill
+    /// *pseudos*. The frame base is not a pseudo.
+    fn asm_claimed_regs(func: &Function) -> std::collections::BTreeSet<Reg> {
+        let mut claimed = std::collections::BTreeSet::new();
+        for block in &func.blocks {
+            for insn in &block.insns {
+                if insn.op != Opcode::Asm {
+                    continue;
+                }
+                let Some(ic) = build_asm_instr_constraints_x86_64(insn) else {
+                    continue;
+                };
+                claimed.extend(ic.clobbers.iter().copied());
+                for op in &ic.operands {
+                    if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) =
+                        &op.constraint
+                    {
+                        claimed.insert(*r);
+                    }
+                }
+            }
+        }
+        claimed
+    }
+
     /// Decide from the function's declared locals.
     ///
     /// The alignment expression must stay in step with the one the `Sym` arm
     /// applies when it lays a slot out, or the frame would be padded for one
     /// alignment and addressed for another.
+    ///
+    /// The base must be callee-saved -- it has to survive the calls the
+    /// function makes -- and it must be one the function's own inline asm has
+    /// not claimed. The prologue writes it once and every local is addressed
+    /// from it for the rest of the body, so an `asm` that clobbers it or pins
+    /// an operand to it invalidates every local at a stroke: hard-coding `%rbx`
+    /// made `asm("..." ::: "rbx")` beside an over-aligned array segfault on
+    /// code gcc accepts.
     fn of(func: &Function, types: &TypeTable) -> FrameBase {
         let align = func
             .locals
@@ -892,13 +930,35 @@ impl FrameBase {
             })
             .max()
             .unwrap_or(8);
-        if align > 16 {
-            FrameBase::Aligned {
-                reg: Reg::Rbx,
-                align,
+        if align <= 16 {
+            return FrameBase::Rbp;
+        }
+
+        let claimed = Self::asm_claimed_regs(func);
+        // %rbp is the frame pointer and %rsp the stack pointer; the rest of the
+        // callee-saved set is fair game, in the order the allocator would reach
+        // for them last.
+        const CANDIDATES: [Reg; 5] = [Reg::Rbx, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+        match CANDIDATES.iter().find(|r| !claimed.contains(r)) {
+            Some(&reg) => FrameBase::Aligned { reg, align },
+            None => {
+                // Every candidate is spoken for. Refusing is the only honest
+                // answer: there is no register left to hold the aligned base,
+                // and silently reusing one would corrupt every local.
+                let pos = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.insns.iter())
+                    .find(|i| i.op == Opcode::Asm)
+                    .and_then(|i| i.pos)
+                    .unwrap_or_default();
+                crate::diag::error(
+                    pos,
+                    "inline asm claims every callee-saved register, leaving none \
+                     to address this function's over-aligned locals",
+                );
+                FrameBase::Rbp
             }
-        } else {
-            FrameBase::Rbp
         }
     }
 

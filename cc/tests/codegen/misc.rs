@@ -10202,3 +10202,48 @@ int main(void) {
         0
     );
 }
+
+/// An over-aligned frame's base register is not one the inline asm claims.
+///
+/// `FrameBase::Aligned` withholds its register from `allocatable_regs`, but
+/// inline asm bypasses allocation on both counts: a constraint letter pins an
+/// operand to a fixed register outright, and a clobber only reaches the
+/// constraint points, which spill *pseudos* -- and the frame base is not a
+/// pseudo. The prologue writes it once and every local is addressed from it
+/// for the rest of the body, so an `asm` naming it invalidated all of them at
+/// a stroke.
+///
+/// Hard-coding `%rbx` made both spellings below segfault on code gcc compiles
+/// without complaint. Asserted behaviourally rather than by naming the
+/// register the compiler ought to pick instead -- which register is free is
+/// exactly what the fix computes.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn codegen_over_aligned_frame_base_avoids_asm_registers() {
+    let code = r#"
+int main(void) {
+    __attribute__((aligned(32))) int arr[8];
+    for (int i = 0; i < 8; i++) arr[i] = i * i;
+
+    /* An explicit clobber of the register the base used to be hard-coded to. */
+    unsigned long a;
+    __asm__ volatile("movq $4660, %%rbx\n\tmovq %%rbx, %0" : "=r"(a) : : "rbx");
+
+    /* And the other spelling: a "b" constraint pins the operand to %rbx
+       without any clobber list at all. */
+    unsigned long b;
+    __asm__ volatile("movq %1, %0" : "=r"(b) : "b"(22136UL));
+
+    /* The locals must have survived both. */
+    int sum = 0;
+    for (int i = 0; i < 8; i++) sum += arr[i];
+    if (sum != 140) return 1;
+    if (a != 4660) return 2;
+    if (b != 22136) return 3;
+    if (((unsigned long)arr & 31) != 0) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("frame_base_vs_asm", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("frame_base_vs_asm_opt", code), 0);
+}

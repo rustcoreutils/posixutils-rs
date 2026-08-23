@@ -1140,6 +1140,12 @@ impl<'a> Linearizer<'a> {
         // own storage as the struct's bytes. The call-site half of this
         // decision already has no size bound; the two had drifted.
         let returns_addr_aggregate = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
+            // An aggregate that fits in one register comes back *as* a value,
+            // so its `Ret` carries one; only past 64 bits is an address handed
+            // back. Dropping this bound along with the 128-bit cap refused to
+            // inline every HFA, including `struct { float x, y; }`, which was
+            // correct before and is the common aarch64 shape.
+            && struct_size_bits > 64
             && !returns_large_struct
             && matches!(
                 get_abi_for_conv(self.current_calling_conv, self.target)

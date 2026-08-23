@@ -1856,7 +1856,13 @@ fn assemble_operand(
     // .S files need preprocessing, .s files do not.
     let asm_to_assemble = if path.ends_with(".S") {
         let temp_s = scratch_path(scratch, operand_id, stem, "s");
-        let content = std::fs::read(path)?;
+        // A BOM is stripped here for the same reason it is on every other
+        // reader: translation phase 1 has no byte for it, and `as` reads the
+        // leading 0xEF as the first character of a mnemonic. `-E` on the same
+        // file already stripped it, so without this a BOM'd `.S` preprocessed
+        // clean and failed to assemble. Only `.S` gets this -- a `.s` is handed
+        // to `as` untouched, which is what gcc does with it too.
+        let content = strip_bom(&std::fs::read(path)?).to_vec();
         let asm_config = AsmPreprocessConfig {
             optimization: args.optimization(),
             defines: &args.defines,

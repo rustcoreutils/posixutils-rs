@@ -1868,3 +1868,35 @@ fn driver_preprocess_an_assembler_operand() {
     // And still no object: -E means no compilation.
     assert!(!w.join("a.o").exists(), "-E must not assemble");
 }
+
+/// A byte-order mark on a `.S` operand is stripped before `as` sees it.
+///
+/// Every other reader strips it -- the `#include` reader, the `-E` path and
+/// the compiling path all call `strip_bom` -- but the `.S` preprocessing step
+/// read the file raw, so `as` took the leading 0xEF as the first character of
+/// a mnemonic. The tell was that `-E` on the same file was already clean:
+/// the operand preprocessed correctly and then failed to assemble.
+#[test]
+fn driver_bom_on_dot_s_operand_assembles() {
+    let w = WorkDir::new("bom_asm");
+    let src = w.write("bom.S", "\u{feff}.text\n.globl bom_fn\nbom_fn:\n\tret\n");
+    let obj = w.join("bom.o");
+
+    let r = run_c17(&["-c", &s(&src), "-o", &s(&obj)]);
+    assert!(
+        r.success && obj.exists(),
+        "a BOM'd .S must assemble:\n{}{}",
+        r.stdout,
+        r.stderr
+    );
+
+    // `-E` was already correct; assert the two paths agree rather than
+    // asserting either one's spelling.
+    let e = run_c17(&["-E", &s(&src)]);
+    assert!(e.success, "-E on a BOM'd .S failed: {}", e.stderr);
+    assert!(
+        !e.stdout.starts_with('\u{feff}'),
+        "-E must not re-emit the BOM: {:?}",
+        &e.stdout[..e.stdout.len().min(16)]
+    );
+}

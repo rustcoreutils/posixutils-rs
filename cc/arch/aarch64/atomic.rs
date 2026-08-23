@@ -23,6 +23,20 @@ enum AtomicBitOp {
     Xor,
 }
 
+// Register discipline for this file
+//
+// Every temporary here must be a scratch register -- X9, X10, X11, and the
+// linker-scratch pair X16/X17 -- plus X8 for the store-exclusive status.
+// None of those is ever handed to a pseudo by the register allocator, which
+// is the whole reason they exist (see `regalloc.rs`).
+//
+// These emitters used X0, X1 and X2, which *are* allocatable. Nothing caught
+// it while every local still went through memory: no value was live in an
+// argument register across an atomic. Once locals were promoted, the six
+// parameters of a function bracketing a `fetch_add` sat in W0-W5, and the
+// LL/SC expansion overwrote three of them -- so the addend, the loaded old
+// value and the computed new value each destroyed a live argument.
+
 impl Aarch64CodeGen {
     pub(super) fn emit_atomic_load(&mut self, insn: &Instruction) {
         let target = insn.target.expect("atomic load needs target");
@@ -32,14 +46,14 @@ impl Aarch64CodeGen {
 
         let addr_loc = self.get_location(addr);
 
-        // Load pointer value into X10 (pointer is 64-bit)
+        // Load the pointer (64-bit) into a scratch register
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
         // LDAR provides acquire semantics (sufficient for SeqCst on AArch64)
         self.push_lir(Aarch64Inst::Ldar {
             size: op_size,
             addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X0,
+            dst: Reg::X9,
         });
 
         // The instruction leaves the result in a fixed scratch register, but
@@ -48,8 +62,8 @@ impl Aarch64CodeGen {
         // reads in one expression collapsed into one -- `x + y` on two
         // _Atomic ints returned `y + y`. Move it where the allocator expects.
         let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X0) {
-            self.emit_move_to_loc(Reg::X0, &dst_loc, size.max(32));
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X9) {
+            self.emit_move_to_loc(Reg::X9, &dst_loc, size.max(32));
         }
     }
 
@@ -62,16 +76,17 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        // Load the pointer first, so a value in the same register is
+        // still readable when it is loaded next.
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
-        // Load value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X0, size);
+        // Load the value
+        self.emit_mov_to_reg(value_loc, Reg::X9, size);
 
         // STLR provides release semantics (sufficient for SeqCst on AArch64)
         self.push_lir(Aarch64Inst::Stlr {
             size: op_size,
-            src: Reg::X0,
+            src: Reg::X9,
             addr: MemAddr::Base(Reg::X10),
         });
 
@@ -92,11 +107,12 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        // Load the pointer first, so a value in the same register is
+        // still readable when it is loaded next.
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
-        // Load new value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X0, size);
+        // Load the new value
+        self.emit_mov_to_reg(value_loc, Reg::X9, size);
 
         // LL/SC loop for atomic swap
         let loop_label = self.next_unique_label("swap_loop");
@@ -106,17 +122,17 @@ impl Aarch64CodeGen {
             loop_label.clone(),
         )));
 
-        // LDAXR: Load-acquire exclusive old value into X1
+        // LDAXR: load-acquire exclusive old value
         self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
             addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X1,
+            dst: Reg::X11,
         });
 
-        // STLXR: Try to store X0 (new value), status in W8
+        // STLXR: try to store the new value; status in W8
         self.push_lir(Aarch64Inst::Stlxr {
             size: op_size,
-            src: Reg::X0,
+            src: Reg::X9,
             addr: MemAddr::Base(Reg::X10),
             status: Reg::X8,
         });
@@ -128,15 +144,15 @@ impl Aarch64CodeGen {
             target: loop_label,
         });
 
-        // Result: X1 = old value
+        // Result: the old value
         // The instruction leaves the result in a fixed scratch register, but
         // the allocator gave this pseudo its own location. Overwriting that
         // made every atomic result alias the same register, so two atomic
         // reads in one expression collapsed into one -- `x + y` on two
         // _Atomic ints returned `y + y`. Move it where the allocator expects.
         let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
-            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X11) {
+            self.emit_move_to_loc(Reg::X11, &dst_loc, size.max(32));
         }
     }
 
@@ -154,7 +170,7 @@ impl Aarch64CodeGen {
         let desired_loc = self.get_location(desired);
 
         // Load pointer to atomic variable into X10 FIRST
-        // (before other loads in case addr is in X11, X9, or X1)
+        // (before the other loads, so none of them can clobber it)
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
         // Load expected_ptr (pointer to expected value) into X11
@@ -166,8 +182,8 @@ impl Aarch64CodeGen {
             dst: Reg::X9,
         });
 
-        // Load desired value into X1
-        self.emit_mov_to_reg(desired_loc, Reg::X1, size);
+        // Load the desired value
+        self.emit_mov_to_reg(desired_loc, Reg::X17, size);
 
         // LL/SC loop for CAS
         let loop_label = self.next_unique_label("cas_loop");
@@ -179,17 +195,17 @@ impl Aarch64CodeGen {
             loop_label.clone(),
         )));
 
-        // LDAXR: Load-acquire exclusive current value into X0
+        // LDAXR: load-acquire exclusive current value
         self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
             addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X0,
+            dst: Reg::X16,
         });
 
-        // Compare current value (X0) with expected (X9)
+        // Compare the current value with the expected one
         self.push_lir(Aarch64Inst::Cmp {
             size: op_size,
-            src1: Reg::X0,
+            src1: Reg::X16,
             src2: GpOperand::Reg(Reg::X9),
         });
 
@@ -199,10 +215,10 @@ impl Aarch64CodeGen {
             target: fail_label.clone(),
         });
 
-        // STLXR: Try to store desired (X1), status in W8
+        // STLXR: try to store the desired value; status in W8
         self.push_lir(Aarch64Inst::Stlxr {
             size: op_size,
-            src: Reg::X1,
+            src: Reg::X17,
             addr: MemAddr::Base(Reg::X10),
             status: Reg::X8,
         });
@@ -218,7 +234,7 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Mov {
             size: OperandSize::B32,
             src: GpOperand::Imm(1),
-            dst: Reg::X2,
+            dst: Reg::X16,
         });
         self.push_lir(Aarch64Inst::B {
             target: done_label.clone(),
@@ -227,10 +243,11 @@ impl Aarch64CodeGen {
         // Fail label: CAS failed (value != expected)
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(fail_label)));
 
-        // Store actual value to *expected_ptr (X11 has expected_ptr)
+        // Store the actual value to *expected_ptr. This is the current
+        // value's last use, so the result may reuse its register below.
         self.push_lir(Aarch64Inst::Str {
             size: op_size,
-            src: Reg::X0,
+            src: Reg::X16,
             addr: MemAddr::Base(Reg::X11),
         });
 
@@ -238,7 +255,7 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Mov {
             size: OperandSize::B32,
             src: GpOperand::Imm(0),
-            dst: Reg::X2,
+            dst: Reg::X16,
         });
 
         // Done label
@@ -250,8 +267,8 @@ impl Aarch64CodeGen {
         // reads in one expression collapsed into one -- `x + y` on two
         // _Atomic ints returned `y + y`. Move it where the allocator expects.
         let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X2) {
-            self.emit_move_to_loc(Reg::X2, &dst_loc, size.max(32));
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X16) {
+            self.emit_move_to_loc(Reg::X16, &dst_loc, size.max(32));
         }
     }
 
@@ -266,11 +283,12 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        // Load the pointer first, so a value in the same register is
+        // still readable when it is loaded next.
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
-        // Load addend value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X0, size);
+        // Load the addend
+        self.emit_mov_to_reg(value_loc, Reg::X9, size);
 
         // LL/SC loop for fetch_add
         let loop_label = self.next_unique_label("fadd_loop");
@@ -280,25 +298,25 @@ impl Aarch64CodeGen {
             loop_label.clone(),
         )));
 
-        // LDAXR: Load-acquire exclusive old value into X1
+        // LDAXR: load-acquire exclusive old value
         self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
             addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X1,
+            dst: Reg::X11,
         });
 
-        // ADD: X2 = X1 (old) + X0 (addend)
+        // new = old + addend
         self.push_lir(Aarch64Inst::Add {
             size: op_size,
-            src1: Reg::X1,
-            src2: GpOperand::Reg(Reg::X0),
-            dst: Reg::X2,
+            src1: Reg::X11,
+            src2: GpOperand::Reg(Reg::X9),
+            dst: Reg::X16,
         });
 
-        // STLXR: Try to store X2 (new value), status in W8
+        // STLXR: try to store the new value; status in W8
         self.push_lir(Aarch64Inst::Stlxr {
             size: op_size,
-            src: Reg::X2,
+            src: Reg::X16,
             addr: MemAddr::Base(Reg::X10),
             status: Reg::X8,
         });
@@ -310,15 +328,15 @@ impl Aarch64CodeGen {
             target: loop_label,
         });
 
-        // Result: X1 = old value
+        // Result: the old value
         // The instruction leaves the result in a fixed scratch register, but
         // the allocator gave this pseudo its own location. Overwriting that
         // made every atomic result alias the same register, so two atomic
         // reads in one expression collapsed into one -- `x + y` on two
         // _Atomic ints returned `y + y`. Move it where the allocator expects.
         let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
-            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X11) {
+            self.emit_move_to_loc(Reg::X11, &dst_loc, size.max(32));
         }
     }
 
@@ -333,11 +351,12 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        // Load the pointer first, so a value in the same register is
+        // still readable when it is loaded next.
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
         // Load subtrahend value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X0, size);
+        self.emit_mov_to_reg(value_loc, Reg::X9, size);
 
         // LL/SC loop for fetch_sub
         let loop_label = self.next_unique_label("fsub_loop");
@@ -347,25 +366,25 @@ impl Aarch64CodeGen {
             loop_label.clone(),
         )));
 
-        // LDAXR: Load-acquire exclusive old value into X1
+        // LDAXR: load-acquire exclusive old value
         self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
             addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X1,
+            dst: Reg::X11,
         });
 
         // SUB: X2 = X1 (old) - X0 (subtrahend)
         self.push_lir(Aarch64Inst::Sub {
             size: op_size,
-            src1: Reg::X1,
-            src2: GpOperand::Reg(Reg::X0),
-            dst: Reg::X2,
+            src1: Reg::X11,
+            src2: GpOperand::Reg(Reg::X9),
+            dst: Reg::X16,
         });
 
-        // STLXR: Try to store X2 (new value), status in W8
+        // STLXR: try to store the new value; status in W8
         self.push_lir(Aarch64Inst::Stlxr {
             size: op_size,
-            src: Reg::X2,
+            src: Reg::X16,
             addr: MemAddr::Base(Reg::X10),
             status: Reg::X8,
         });
@@ -377,15 +396,15 @@ impl Aarch64CodeGen {
             target: loop_label,
         });
 
-        // Result: X1 = old value
+        // Result: the old value
         // The instruction leaves the result in a fixed scratch register, but
         // the allocator gave this pseudo its own location. Overwriting that
         // made every atomic result alias the same register, so two atomic
         // reads in one expression collapsed into one -- `x + y` on two
         // _Atomic ints returned `y + y`. Move it where the allocator expects.
         let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
-            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X11) {
+            self.emit_move_to_loc(Reg::X11, &dst_loc, size.max(32));
         }
     }
 
@@ -416,11 +435,12 @@ impl Aarch64CodeGen {
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
 
-        // Load pointer into X10 FIRST (before value, in case addr is in X0)
+        // Load the pointer first, so a value in the same register is
+        // still readable when it is loaded next.
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
         // Load operand value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X0, size);
+        self.emit_mov_to_reg(value_loc, Reg::X9, size);
 
         // LL/SC loop
         let loop_label = self.next_unique_label("atomic_bitop");
@@ -430,11 +450,11 @@ impl Aarch64CodeGen {
             loop_label.clone(),
         )));
 
-        // LDAXR: Load-acquire exclusive old value into X1
+        // LDAXR: load-acquire exclusive old value
         self.push_lir(Aarch64Inst::Ldaxr {
             size: op_size,
             addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X1,
+            dst: Reg::X11,
         });
 
         // Apply bitwise operation: X2 = X1 (old) op X0 (operand)
@@ -442,33 +462,33 @@ impl Aarch64CodeGen {
             AtomicBitOp::And => {
                 self.push_lir(Aarch64Inst::And {
                     size: op_size,
-                    src1: Reg::X1,
-                    src2: GpOperand::Reg(Reg::X0),
-                    dst: Reg::X2,
+                    src1: Reg::X11,
+                    src2: GpOperand::Reg(Reg::X9),
+                    dst: Reg::X16,
                 });
             }
             AtomicBitOp::Or => {
                 self.push_lir(Aarch64Inst::Orr {
                     size: op_size,
-                    src1: Reg::X1,
-                    src2: GpOperand::Reg(Reg::X0),
-                    dst: Reg::X2,
+                    src1: Reg::X11,
+                    src2: GpOperand::Reg(Reg::X9),
+                    dst: Reg::X16,
                 });
             }
             AtomicBitOp::Xor => {
                 self.push_lir(Aarch64Inst::Eor {
                     size: op_size,
-                    src1: Reg::X1,
-                    src2: GpOperand::Reg(Reg::X0),
-                    dst: Reg::X2,
+                    src1: Reg::X11,
+                    src2: GpOperand::Reg(Reg::X9),
+                    dst: Reg::X16,
                 });
             }
         }
 
-        // STLXR: Try to store X2 (new value), status in W8
+        // STLXR: try to store the new value; status in W8
         self.push_lir(Aarch64Inst::Stlxr {
             size: op_size,
-            src: Reg::X2,
+            src: Reg::X16,
             addr: MemAddr::Base(Reg::X10),
             status: Reg::X8,
         });
@@ -480,15 +500,15 @@ impl Aarch64CodeGen {
             target: loop_label,
         });
 
-        // Result: X1 = old value
+        // Result: the old value
         // The instruction leaves the result in a fixed scratch register, but
         // the allocator gave this pseudo its own location. Overwriting that
         // made every atomic result alias the same register, so two atomic
         // reads in one expression collapsed into one -- `x + y` on two
         // _Atomic ints returned `y + y`. Move it where the allocator expects.
         let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X1) {
-            self.emit_move_to_loc(Reg::X1, &dst_loc, size.max(32));
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X11) {
+            self.emit_move_to_loc(Reg::X11, &dst_loc, size.max(32));
         }
     }
 

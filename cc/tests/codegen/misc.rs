@@ -10290,3 +10290,93 @@ int main(void) {
         0
     );
 }
+
+/// A register-sized aggregate read through a pointer yields its *value*.
+///
+/// An aggregate wider than a register travels by address; one that fits travels
+/// as its value. The `Deref` lowering returned the address for a struct at
+/// every size, while a union already loaded when it fit -- two kinds, one rule,
+/// and they disagreed. A caller handed the address where the convention
+/// promised the value stored the pointer instead:
+///
+///     struct { unsigned a, b; } q = *p;   /* q got `p`, not `*p` */
+///
+/// Only initialization showed it. Assignment goes through `emit_assign`, which
+/// block-copies struct/union at every size, and member access takes the address
+/// through `linearize_lvalue` -- which is why `(*p).a`, `p->a` and `q = *p` were
+/// all correct while `struct S q = *p;` was not.
+///
+/// Found building sparse: its `dup_token` copies an eight-byte `struct
+/// position` out of a pointer, so every macro expansion produced a token whose
+/// position fields were a pointer's low bits, and the preprocessor walked off
+/// the end of `input_streams`.
+#[test]
+fn codegen_register_sized_aggregate_through_a_pointer() {
+    let code = r#"
+struct S2 { unsigned char a, b; };
+struct S4 { unsigned short a, b; };
+struct S8 { unsigned int a, b; };
+struct S16 { unsigned long a, b; };
+union U8 { unsigned int a; unsigned short b; };
+
+/* The shape sparse tripped on: bitfields packed into eight bytes. */
+struct Pos { unsigned int type:6, stream:14, newline:1, whitespace:1, pos:10;
+             unsigned int line:31, noexpand:1; };
+
+static struct S8 mk8(void) { struct S8 r; r.a = 0x1111; r.b = 0x2222; return r; }
+
+int main(void) {
+    struct S2 a2 = {1, 2}, *p2 = &a2;
+    struct S4 a4 = {3, 4}, *p4 = &a4;
+    struct S8 a8 = {5, 6}, *p8 = &a8;
+    struct S16 a16 = {7, 8}, *p16 = &a16;
+    union U8 u = {0x5555}, *pu = &u;
+
+    /* Initialization from a dereference, either side of the boundary. */
+    struct S2 q2 = *p2;   if (q2.a != 1 || q2.b != 2) return 1;
+    struct S4 q4 = *p4;   if (q4.a != 3 || q4.b != 4) return 2;
+    struct S8 q8 = *p8;   if (q8.a != 5 || q8.b != 6) return 3;
+    struct S16 q16 = *p16; if (q16.a != 7 || q16.b != 8) return 4;
+    union U8 qu = *pu;    if (qu.a != 0x5555) return 5;
+
+    /* Assignment and member access, which were already right. */
+    struct S8 r8; r8 = *p8;  if (r8.a != 5 || r8.b != 6) return 6;
+    if ((*p8).a != 5 || p8->b != 6) return 7;
+    r8 = mk8();              if (r8.a != 0x1111 || r8.b != 0x2222) return 8;
+    struct S8 s8 = mk8();    if (s8.a != 0x1111 || s8.b != 0x2222) return 9;
+
+    /* Passing and returning the dereferenced value. */
+    struct S8 t8 = *p8;
+    if (t8.a != 5) return 10;
+
+    /* Bitfields: the sparse shape. A pointer's low bits would land in
+       `stream`, so check every field survives the copy. */
+    struct Pos pos;
+    pos.type = 5; pos.stream = 2; pos.newline = 1; pos.whitespace = 1;
+    pos.pos = 9; pos.line = 12345; pos.noexpand = 0;
+    struct Pos *pp = &pos;
+    struct Pos cp = *pp;
+    if (cp.type != 5 || cp.stream != 2 || cp.newline != 1) return 11;
+    if (cp.whitespace != 1 || cp.pos != 9) return 12;
+    if (cp.line != 12345 || cp.noexpand != 0) return 13;
+
+    /* Through a second level of indirection. */
+    struct S8 **pp8 = &p8;
+    struct S8 v8 = **pp8;
+    if (v8.a != 5 || v8.b != 6) return 14;
+
+    /* An array element reached through a pointer. */
+    struct S8 arr[2] = { {10, 11}, {12, 13} };
+    struct S8 *pa = arr;
+    struct S8 w8 = *(pa + 1);
+    if (w8.a != 12 || w8.b != 13) return 15;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("reg_sized_aggregate_deref", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("reg_sized_aggregate_deref_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

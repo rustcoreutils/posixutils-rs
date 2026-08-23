@@ -140,7 +140,7 @@ fn test_parameter_stored_to_local() {
 
     // Observed before SSA conversion: the store into the parameter's local is the linearizer's job; SSA then promotes it away.
     let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The parameter should be stored to a local variable
     // Look for store instruction in the entry block
@@ -195,7 +195,7 @@ fn test_function_with_many_params() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The IR should contain references to both parameters
     assert!(ir.contains("%a"), "IR should have first param: {}", ir);
@@ -256,7 +256,7 @@ fn test_compound_assignment_deref() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The IR should have load and store for the dereferenced pointer
     assert!(
@@ -334,7 +334,7 @@ fn test_compound_assignment_index() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The IR should have load and store for the array element
     // Also should have index calculation (mul for offset)
@@ -401,7 +401,7 @@ fn test_simple_array_element_store() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have a store for the array element assignment
     assert!(
@@ -568,7 +568,7 @@ fn test_switch_basic() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     let func = &module.functions[0];
 
     // Switch should generate switch instruction
@@ -645,7 +645,7 @@ fn test_switch_with_break() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have switch and branch instructions
     assert!(
@@ -721,7 +721,7 @@ fn test_do_while_basic() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     let func = &module.functions[0];
 
     // Do-while should have at least 3 blocks: entry/body, condition, exit
@@ -808,7 +808,7 @@ fn test_do_while_with_break() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Break should generate unconditional branch
     assert!(
@@ -888,7 +888,7 @@ fn test_goto_forward() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Goto should produce unconditional branch
     assert!(
@@ -971,7 +971,7 @@ fn test_goto_backward() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have conditional branch for the if
     assert!(
@@ -1047,7 +1047,7 @@ fn test_nested_loop_break() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have setval for constant 1 (proves inner break doesn't skip x = 1 assignment)
     // After SSA conversion, the store becomes a setval + nop/copy
@@ -1137,7 +1137,7 @@ fn test_nested_loop_continue() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     let func = &module.functions[0];
 
     // Should have at least 6 blocks for nested loops
@@ -1196,7 +1196,7 @@ fn test_unary_logical_not() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Logical not should produce seteq (comparison to zero)
     assert!(
@@ -1243,7 +1243,7 @@ fn test_unary_bitwise_not() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Bitwise not should produce not instruction
     assert!(
@@ -1290,7 +1290,7 @@ fn test_unary_negate() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Negation should produce neg instruction
     assert!(
@@ -1338,7 +1338,7 @@ fn test_pre_increment() {
 
     // Observed before SSA conversion: the store of the incremented value is the linearizer's job; SSA then promotes it away.
     let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Pre-increment should produce add instruction
     assert!(
@@ -1395,7 +1395,7 @@ fn test_pointer_add_int() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Pointer addition should have multiplication for scaling
     assert!(
@@ -1461,7 +1461,7 @@ fn test_pointer_difference() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Pointer difference should have subtraction
     assert!(
@@ -1524,7 +1524,7 @@ fn test_float_add() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Float addition should produce fadd instruction
     assert!(
@@ -1579,7 +1579,7 @@ fn test_float_comparison() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Float comparison should produce fcmp instruction
     assert!(
@@ -1627,7 +1627,7 @@ fn test_float_to_int_cast() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Float-to-int cast should produce fcvts instruction
     assert!(
@@ -1675,7 +1675,7 @@ fn test_int_to_float_cast() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Int-to-float cast should produce scvtf instruction
     assert!(
@@ -1714,7 +1714,7 @@ fn test_linearize_return() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&types));
     assert!(ir.contains("ret"));
 }
 
@@ -1737,7 +1737,7 @@ fn test_linearize_if() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&types));
     assert!(ir.contains("cbr")); // Conditional branch
 }
 
@@ -1834,7 +1834,7 @@ fn test_linearize_binary_expr() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&types));
     assert!(ir.contains("mul"));
     assert!(ir.contains("add"));
 }
@@ -1878,7 +1878,7 @@ fn test_linearize_function_with_params() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     assert!(ir.contains("add"));
     assert!(ir.contains("%a"));
     assert!(ir.contains("%b"));
@@ -1908,7 +1908,7 @@ fn test_linearize_call() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     assert!(ir.contains("call"));
     assert!(ir.contains("foo"));
 }
@@ -1933,7 +1933,7 @@ fn test_linearize_comparison() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&types));
     assert!(ir.contains("setlt"));
 }
 
@@ -1958,7 +1958,7 @@ fn test_linearize_unsigned_comparison() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&types));
     // Should use unsigned comparison opcode (setb = set if below)
     assert!(
         ir.contains("setb"),
@@ -1978,7 +1978,7 @@ fn test_display_module() {
     };
 
     let module = test_linearize(&tu, &types, &strings);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&types));
 
     // Should have proper structure
     assert!(ir.contains("define"));
@@ -2081,7 +2081,7 @@ fn test_local_var_emits_load_store() {
 
     // Without SSA, should have store and load
     let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     assert!(
         ir.contains("store"),
         "Should have store instruction before SSA: {}",
@@ -2156,7 +2156,7 @@ fn test_ssa_converts_local_to_phi() {
 
     // With SSA, should have phi node at merge point
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have a phi instruction
     assert!(
@@ -2222,7 +2222,7 @@ fn test_ssa_loop_variable() {
 
     // With SSA, should have phi node at loop header
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Loop should have a phi at the condition block
     assert!(ir.contains("phi"), "Loop should have phi node: {}", ir);
@@ -2272,7 +2272,7 @@ fn test_short_circuit_and() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Short-circuit AND should have:
     // 1. A conditional branch (cbr) to skip evaluation of b if a is false
@@ -2333,7 +2333,7 @@ fn test_short_circuit_or() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Short-circuit OR should have:
     // 1. A conditional branch (cbr) to skip evaluation of b if a is true
@@ -2405,7 +2405,7 @@ fn test_ternary_pure_uses_select() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Pure ternary should use select instruction (enables cmov/csel)
     // Note: IR displays as "sel" not "select"
@@ -2481,7 +2481,7 @@ fn test_ternary_impure_uses_phi() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Impure ternary should use phi (for proper short-circuit evaluation)
     assert!(
@@ -2570,7 +2570,7 @@ fn test_ternary_with_assignment_uses_phi() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Assignment is impure, so should use phi
     assert!(
@@ -2644,7 +2644,7 @@ fn test_ternary_with_post_increment_uses_phi() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Post-increment/decrement is impure, so should use phi
     assert!(
@@ -2707,7 +2707,7 @@ fn test_string_literal_char_array_init() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have 6 store instructions (5 chars + null terminator)
     let store_count = ir.matches("store").count();
@@ -2762,7 +2762,7 @@ fn test_string_literal_char_pointer_init() {
 
     // Observed before SSA conversion: the store of the string address is the linearizer's job; SSA then promotes it away.
     let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have a store instruction for the pointer (storing the string address)
     assert!(
@@ -2920,7 +2920,7 @@ fn test_incomplete_struct_type_resolution() {
 
     // Linearize with the symbol table that has the complete struct registered
     let module = test_linearize_with_symbols(&tu, &ctx.symbols, &ctx.types, &ctx.strings);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The IR should show stores to the struct fields at proper offsets
     assert!(
@@ -3001,7 +3001,7 @@ fn test_static_local_pre_increment() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The IR should NOT contain the sentinel value %4294967295
     assert!(
@@ -3077,7 +3077,7 @@ fn test_static_local_pre_decrement() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     assert!(
         !ir.contains("%4294967295"),
@@ -3146,7 +3146,7 @@ fn test_static_local_post_increment() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     assert!(
         !ir.contains("%4294967295"),
@@ -3215,7 +3215,7 @@ fn test_static_local_post_decrement() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     assert!(
         !ir.contains("%4294967295"),
@@ -3292,7 +3292,7 @@ fn test_static_local_compound_assignment() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     assert!(
         !ir.contains("%4294967295"),
@@ -3411,7 +3411,7 @@ fn test_wide_string_literal_is_pure() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Wide strings are pure, so ternary should use select (sel in IR)
     assert!(
@@ -3672,7 +3672,7 @@ fn test_struct_deref_returns_address() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The struct dereference should NOT generate a load instruction
     // Instead, it returns the address for struct copying
@@ -4348,7 +4348,7 @@ fn test_mixed_designated_positional_struct_init() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have 3 stores for the 3 initialized fields (b, c, d)
     let store_count = ir.matches("store").count();
@@ -4445,7 +4445,7 @@ fn test_mixed_designated_positional_array_init() {
     };
 
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Should have 3 stores for the 3 initialized elements
     let store_count = ir.matches("store").count();
@@ -4597,7 +4597,7 @@ fn test_designator_chain_nested_struct_init() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     let store_count = ir.matches("store").count();
     assert!(
         store_count >= 3,
@@ -4675,7 +4675,7 @@ fn test_designator_chain_array_member_init() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     let store_count = ir.matches("store").count();
     assert!(
         store_count >= 1,
@@ -4740,7 +4740,7 @@ fn test_repeated_designator_last_wins_array() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     let store_count = ir.matches("store").count();
     assert!(
         (1..=2).contains(&store_count),
@@ -4843,7 +4843,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     let store_count = ir.matches("store").count();
     assert!(
         store_count >= 2,
@@ -4930,7 +4930,7 @@ fn test_union_first_named_member_positional_init() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
     let store_count = ir.matches("store").count();
     assert!(
         store_count >= 1,
@@ -4981,7 +4981,7 @@ fn test_valist_parameter_stored_as_pointer() {
 
     // Observed before SSA conversion: the width of the parameter's store is the linearizer's job; SSA then promotes it away.
     let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The va_list parameter should be stored with .64 (pointer size),
     // not .192 (full va_list struct size of 24 bytes = 192 bits)
@@ -5120,7 +5120,7 @@ fn test_valist_expression_decay() {
 
     // Observed before SSA conversion: the load of the va pointer is the linearizer's job; SSA then promotes it away.
     let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The cast from va_list to pointer should involve loading the va pointer
     // (since va is a parameter and is_indirect), not taking symaddr of va_list struct
@@ -5398,7 +5398,7 @@ fn test_bitfield_designated_init_local_var() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // For local variables, each bitfield should use read-modify-write pattern
     // So we should see multiple load and store pairs for the bitfield operations
@@ -5531,7 +5531,7 @@ fn test_large_struct_copy_from_array() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // For large struct copy (128 bits), we should see:
     // - Multiple 64-bit load/store pairs (at least 2 for a 128-bit struct)
@@ -5686,7 +5686,7 @@ fn test_compound_literal_zero_init_lvalue() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // The compound literal must be zero-initialized first, then the designated
     // fields are set. The code will:
@@ -5804,7 +5804,7 @@ fn test_conditional_short_circuit_arrow() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
     let module = ctx.linearize(&tu);
-    let ir = format!("{}", module);
+    let ir = format!("{}", module.display(&ctx.types));
 
     // Verify that we use control flow (cbr + phi) instead of select instruction.
     // Arrow expressions can cause UB if the pointer is NULL, so we must use
@@ -6305,7 +6305,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         stores.contains(&0) && stores.contains(&8),
         "expected 64-bit stores at offsets 0 and 8, got {:?}\n{}",
         stores,
-        module
+        module.display(&ctx.types)
     );
     assert!(
         !func
@@ -6314,7 +6314,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
             .flat_map(|b| b.insns.iter())
             .any(|i| i.op == Opcode::Store && i.size == 128),
         "a complex member must not be stored as one 128-bit value: {}",
-        module
+        module.display(&ctx.types)
     );
 }
 
@@ -6671,7 +6671,7 @@ fn test_float_condition_compares_against_zero() {
     assert!(
         has_fcmp,
         "a floating-point condition must be compared against 0.0:\n{}",
-        module
+        module.display(&ctx.types)
     );
 
     // The value handed to `cbr` must be that comparison, not the double.
@@ -6691,7 +6691,7 @@ fn test_float_condition_compares_against_zero() {
         cond_def.op,
         Opcode::FCmpONe,
         "the branch must test the comparison, not the raw value:\n{}",
-        module
+        module.display(&ctx.types)
     );
 }
 
@@ -6755,16 +6755,16 @@ fn test_complex_equality_compares_both_halves() {
         ops.iter().filter(|o| **o == Opcode::FCmpOEq).count(),
         2,
         "both halves must be compared:\n{}",
-        module
+        module.display(&ctx.types)
     );
     assert!(
         ops.contains(&Opcode::And),
         "the two half-comparisons must be combined:\n{}",
-        module
+        module.display(&ctx.types)
     );
     assert!(
         !ops.contains(&Opcode::SetEq),
         "a complex comparison must not become an integer compare:\n{}",
-        module
+        module.display(&ctx.types)
     );
 }

@@ -328,13 +328,23 @@ The driver in `cc/opt.rs` runs `inline → (instcombine + dce)*` to fixed point 
 ## Display Format
 
 ```
-define type#1 main() {
+define int main() {
 .L0:
-    %0 = setval.32 $10
-    %1 = setval.32 $20
-    %2 = add.32 %0, %1
-    ret %2
+    %1 = setval.32 $10
+    %3 = setval.32 $20
+    %4 = copy.32 %1($10)
+    %5 = copy.32 %3($20)
+    %6 = add.32 %4, %5
+    ret.32 %6
 }
 ```
 
 Format: `target = op.size src1, src2`
+
+Printing needs the pseudo and type tables, so it goes through
+`module.display(&types)` / `func.display(&types)` rather than a bare `{}`.
+Nothing else can resolve what an instruction actually holds: a `setval`'s
+constant lives in its *target pseudo*, types are `TypeId` indices, and symbols
+are `PseudoKind::Sym`. A constant or symbol operand prints as `%id($value)` /
+`%id(@name)` -- the id so the line stays linked to its definition, the payload
+because that is the part an index cannot show.

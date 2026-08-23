@@ -1023,13 +1023,27 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Promote a real scalar expression to a complex value (real=value, imag=0.0)
     /// Returns the address of the complex temp
     pub(crate) fn promote_real_to_complex(&mut self, expr: &Expr, complex_typ: TypeId) -> PseudoId {
+        let val = self.linearize_expr(expr);
+        let expr_typ = self.expr_type(expr);
+        self.promote_real_value_to_complex(val, expr_typ, complex_typ)
+    }
+
+    /// [`Self::promote_real_to_complex`] for a value already in hand.
+    ///
+    /// `a ?: b` evaluates its left operand exactly once and then needs it both
+    /// as the truth test and as the result, so it cannot go back to the `Expr`
+    /// for a second look.
+    pub(crate) fn promote_real_value_to_complex(
+        &mut self,
+        val: PseudoId,
+        val_typ: TypeId,
+        complex_typ: TypeId,
+    ) -> PseudoId {
         let base_typ = self.types.complex_base(complex_typ);
         let base_bits = self.types.size_bits(base_typ);
         let base_bytes = (base_bits / 8) as i64;
 
-        let val = self.linearize_expr(expr);
-        let expr_typ = self.expr_type(expr);
-        let converted = self.emit_convert(val, expr_typ, base_typ);
+        let converted = self.emit_convert(val, val_typ, base_typ);
 
         let result = self.alloc_local_temp(complex_typ);
         self.emit(Instruction::store(
@@ -1058,7 +1072,21 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let src_typ = self.expr_type(expr);
         let addr = self.complex_operand_addr(expr);
+        self.complex_addr_at_precision(addr, src_typ, complex_typ)
+    }
 
+    /// [`Self::complex_operand_at_precision`] for a value already in hand.
+    ///
+    /// `?:` evaluates its left operand exactly once and then needs it both as
+    /// the truth test and as the result, so it cannot go back to the `Expr`
+    /// for a second look. Taking the address instead keeps that single
+    /// evaluation while still sharing the conversion.
+    pub(crate) fn complex_addr_at_precision(
+        &mut self,
+        addr: PseudoId,
+        src_typ: TypeId,
+        complex_typ: TypeId,
+    ) -> PseudoId {
         let src_base = self.types.complex_base(src_typ);
         let dst_base = self.types.complex_base(complex_typ);
         if src_base == dst_base {

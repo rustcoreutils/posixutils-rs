@@ -1252,6 +1252,16 @@ impl TypeTable {
                     _ => result.push_str(&typ.kind.to_string()),
                 }
 
+                // `_Complex` is a modifier, not a kind, so the kind name alone
+                // spells `double _Complex` as plain `double` -- and this is
+                // what diagnostics name types with. Passing a `double
+                // _Complex` where an `int *` was wanted reported "got
+                // 'double'", naming a type the source never wrote and one that
+                // is a different size.
+                if typ.modifiers.contains(TypeModifiers::COMPLEX) {
+                    result.push_str(" _Complex");
+                }
+
                 if !decl.is_empty() {
                     // A space only where a pointer is involved: gcc writes
                     // `int *`, `int (*)[8]` and `int (*)(void)` with one, and

@@ -15,7 +15,7 @@
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
-use crate::arch::x86_64::regalloc::{Loc, Reg, XmmReg};
+use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, XmmReg};
 use crate::ir::{Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeKind, TypeTable};
@@ -70,15 +70,8 @@ pub struct X86_64CodeGen {
     pub(super) quad_constants: std::collections::BTreeMap<u128, [u8; 16]>,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     pub(super) sym_type_sizes: HashMap<PseudoId, u32>,
-    /// When true, locals are addressed via RSP instead of RBP (for dynamic stack alignment)
-    pub(super) use_rsp_locals: bool,
-    /// How far `%rsp` has been moved below the frame's resting position.
-    ///
-    /// Only matters when locals are addressed from `%rsp` -- an over-aligned
-    /// frame -- because then reserving an outgoing argument area moves the base
-    /// every local is measured from. Reading a source operand after the
-    /// reservation without this would have read the wrong slot.
-    pub(super) rsp_adjust: i32,
+    /// How this function's locals are addressed.
+    pub(super) frame_base: FrameBase,
     /// Maximum local alignment (for andq in prologue)
     pub(super) max_local_align: i32,
     /// Pseudos that are 128-bit integers (need full 16-byte copies)
@@ -106,8 +99,7 @@ impl X86_64CodeGen {
             double_constants: std::collections::BTreeMap::new(),
             quad_constants: std::collections::BTreeMap::new(),
             sym_type_sizes: HashMap::new(),
-            use_rsp_locals: false,
-            rsp_adjust: 0,
+            frame_base: FrameBase::Rbp,
             max_local_align: 16,
             int128_pseudos: HashSet::new(),
         }
@@ -120,12 +112,16 @@ impl X86_64CodeGen {
 
     /// Compute the memory address for a stack offset.
     /// In normal mode: [rbp - (offset + callee_saved_offset)]
-    /// In dynamic alignment mode: [rsp + (stack_alloc_size - offset)]
+    /// In dynamic alignment mode: [base + (stack_alloc_size - offset)]
+    ///
+    /// Nothing corrects for the outgoing-argument area here. Reserving one
+    /// moves `%rsp`, which is exactly why the aligned base is a register the
+    /// prologue sets once instead.
     pub(super) fn stack_mem(&self, offset: i32) -> MemAddr {
-        if self.use_rsp_locals {
+        if let FrameBase::Aligned { reg, .. } = self.frame_base {
             MemAddr::BaseOffset {
-                base: Reg::Rsp,
-                offset: self.stack_alloc_size - offset + self.rsp_adjust,
+                base: reg,
+                offset: self.stack_alloc_size - offset,
             }
         } else {
             MemAddr::BaseOffset {

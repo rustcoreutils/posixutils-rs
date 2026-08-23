@@ -281,15 +281,14 @@ impl<'a> Parser<'a> {
         // *rank* and not bit width, and does not depend on which arm was
         // written first.
         //
-        // Complex is held back deliberately. The shared version answers it
-        // correctly -- `c ? z : 1.0` really is `double _Complex` -- but a
-        // complex conditional does not survive codegen today: the arms carry a
-        // two-register value while the merge dereferences the pseudo as an
-        // address, which segfaults. Widening the type here would turn "quietly
-        // drops the imaginary part" into "crashes", so complex keeps its own
-        // answer until that is fixed.
-        let complex = self.types.is_complex(then_typ) || self.types.is_complex(else_typ);
-        if !complex && self.types.is_arithmetic(then_typ) && self.types.is_arithmetic(else_typ) {
+        // Complex included. It used to be held back, because the linearizer
+        // phi-ed a complex conditional's arms by value where the convention is
+        // by address, and widening the type here would have turned "quietly
+        // drops the imaginary part" into a segfault. `linearize_complex_ternary`
+        // merges by address now, so the shared answer -- `c ? 1 : z` is
+        // `double _Complex`, whichever arm the complex one is -- is the one to
+        // give.
+        if self.types.is_arithmetic(then_typ) && self.types.is_arithmetic(else_typ) {
             return self.usual_arithmetic_conversions(then_typ, else_typ);
         }
 

@@ -1868,3 +1868,101 @@ fn driver_preprocess_an_assembler_operand() {
     // And still no object: -E means no compilation.
     assert!(!w.join("a.o").exists(), "-E must not assemble");
 }
+
+/// A byte-order mark on a `.S` operand is stripped before `as` sees it.
+///
+/// Every other reader strips it -- the `#include` reader, the `-E` path and
+/// the compiling path all call `strip_bom` -- but the `.S` preprocessing step
+/// read the file raw, so `as` took the leading 0xEF as the first character of
+/// a mnemonic. The tell was that `-E` on the same file was already clean:
+/// the operand preprocessed correctly and then failed to assemble.
+#[test]
+fn driver_bom_on_dot_s_operand_assembles() {
+    let w = WorkDir::new("bom_asm");
+    let src = w.write("bom.S", "\u{feff}.text\n.globl bom_fn\nbom_fn:\n\tret\n");
+    let obj = w.join("bom.o");
+
+    let r = run_c17(&["-c", &s(&src), "-o", &s(&obj)]);
+    assert!(
+        r.success && obj.exists(),
+        "a BOM'd .S must assemble:\n{}{}",
+        r.stdout,
+        r.stderr
+    );
+
+    // `-E` was already correct; assert the two paths agree rather than
+    // asserting either one's spelling.
+    let e = run_c17(&["-E", &s(&src)]);
+    assert!(e.success, "-E on a BOM'd .S failed: {}", e.stderr);
+    assert!(
+        !e.stdout.starts_with('\u{feff}'),
+        "-E must not re-emit the BOM: {:?}",
+        &e.stdout[..e.stdout.len().min(16)]
+    );
+}
+
+/// `-M`/`-MM` writing several sources' rules into one file is refused.
+///
+/// `dependency_sink` sends every source's rule to the same path and
+/// `write_dependency_rule` truncates, so the file ended up holding only the
+/// last source's rule -- with no diagnostic. That is silently wrong in the one
+/// way a dependency file cannot afford: make sees no prerequisites for the
+/// sources whose rules were dropped and stops rebuilding them when their
+/// headers change.
+///
+/// `-o` and `-MF` are both spellings of the same single destination.
+#[test]
+fn driver_deps_refuse_several_sources_into_one_file() {
+    let w = WorkDir::new("deps_multi");
+    let a = w.write("a.c", "int a;\n");
+    let b = w.write("b.c", "int b;\n");
+    let out = w.join("out.d");
+
+    for sink in [vec!["-o"], vec!["-MF"]] {
+        for mode in ["-M", "-MM"] {
+            let dest = s(&out);
+            let mut args = vec![mode];
+            args.extend(sink.iter().copied());
+            args.push(&dest);
+            let (sa, sb) = (s(&a), s(&b));
+            args.push(&sa);
+            args.push(&sb);
+
+            let r = run_c17(&args);
+            assert!(
+                !r.success,
+                "{mode} {sink:?} with two sources must be refused, got:\n{}{}",
+                r.stdout, r.stderr
+            );
+            assert!(
+                !out.exists(),
+                "{mode} {sink:?}: refused, so no truncated file should be left behind"
+            );
+        }
+    }
+}
+
+/// One source keeps working, and so does the multi-source form that has
+/// somewhere to put every rule.
+#[test]
+fn driver_deps_allow_one_source_and_stdout() {
+    let w = WorkDir::new("deps_ok");
+    let a = w.write("a.c", "int a;\n");
+    let b = w.write("b.c", "int b;\n");
+    let out = w.join("one.d");
+
+    let r = run_c17(&["-M", "-o", &s(&out), &s(&a)]);
+    assert!(r.success, "-M -o with one source failed: {}", r.stderr);
+    let rule = std::fs::read_to_string(&out).expect("no dependency file written");
+    assert!(rule.starts_with("a.o:"), "unexpected rule: {rule:?}");
+
+    // Several sources are fine when the rules are not sharing one file:
+    // stdout takes all of them.
+    let r = run_c17(&["-M", &s(&a), &s(&b)]);
+    assert!(r.success, "-M to stdout failed: {}", r.stderr);
+    assert!(
+        r.stdout.contains("a.o:") && r.stdout.contains("b.o:"),
+        "both rules should reach stdout: {:?}",
+        r.stdout
+    );
+}

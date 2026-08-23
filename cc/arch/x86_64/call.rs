@@ -203,10 +203,6 @@ impl X86_64CodeGen {
             src: GpOperand::Imm(info.stack_bytes as i64),
             dst: Reg::Rsp,
         });
-        // Locals are addressed from %rsp when the frame is over-aligned, so
-        // every source read below has to account for the reservation just made.
-        self.rsp_adjust += info.stack_bytes;
-
         for (n, &i) in info.stack_arg_indices.iter().enumerate() {
             let base_off = info.stack_offsets[n];
             let arg = insn.src[i];
@@ -1230,9 +1226,6 @@ impl X86_64CodeGen {
 
     /// Clean up stack after call
     pub(super) fn cleanup_call_stack(&mut self, stack_cleanup: usize) {
-        // The outgoing area is gone from here on, so locals are once again
-        // where the frame layout says they are.
-        self.rsp_adjust -= stack_cleanup as i32;
         if stack_cleanup > 0 {
             self.push_lir(X86Inst::Add {
                 size: OperandSize::B64,

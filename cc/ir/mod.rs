@@ -37,7 +37,6 @@ use std::fmt;
 
 const DEFAULT_INSN_CAPACITY: usize = 32;
 const DEFAULT_CFG_EDGE_CAPACITY: usize = 4;
-const DEFAULT_DOM_CAPACITY: usize = 4;
 const DEFAULT_SRC_CAPACITY: usize = 4;
 const DEFAULT_PHI_CAPACITY: usize = 4;
 const DEFAULT_PARAM_CAPACITY: usize = 8;
@@ -1227,20 +1226,88 @@ impl Instruction {
     }
 }
 
-impl fmt::Display for Instruction {
+/// The tables an IR entity needs in order to print what it actually holds.
+///
+/// A bare `Display` impl could not reach any of them, and the dump said so:
+/// `return 42;` printed as `%0 = setval.32` with the 42 nowhere on the line,
+/// because a `SetVal`'s constant lives in its *target pseudo* and the
+/// instruction has only that pseudo's id. Types printed as `type#7` and
+/// symbols as a bare `%3` for the same reason. `ir/README.md` documented the
+/// operand form -- `%1 = setval.32 $20` -- that the compiler had never
+/// produced.
+///
+/// So the printer takes the tables. Every IR type is printed through
+/// `.display(...)` rather than `{}`, which is what makes the id resolvable.
+#[derive(Clone, Copy)]
+pub struct IrCtx<'a> {
+    types: &'a TypeTable,
+    func: Option<&'a Function>,
+}
+
+impl<'a> IrCtx<'a> {
+    /// A pseudo as what it *is*, not as its index.
+    ///
+    /// Registers, arguments and phis keep their id spelling: the id is what
+    /// makes a dump followable from definition to use. Constants and symbols
+    /// have no useful id, and printing one hid the only information they carry.
+    fn pseudo(&self, id: PseudoId) -> String {
+        match self.func.and_then(|f| f.get_pseudo(id)) {
+            Some(p) => match &p.kind {
+                // Both halves: the id keeps the line linked to the definition,
+                // the payload is the thing that was missing.
+                PseudoKind::Val(v) => format!("{}(${})", id, v),
+                PseudoKind::FVal(v) => format!("{}(${})", id, v),
+                PseudoKind::Sym(name) => format!("{}(@{})", id, name),
+                PseudoKind::Void => "VOID".to_string(),
+                PseudoKind::Undef => "UNDEF".to_string(),
+                _ => format!("{}", id),
+            },
+            None => format!("{}", id),
+        }
+    }
+
+    /// The constant a `SetVal`'s target carries, if it has one.
+    fn target_const(&self, id: PseudoId) -> Option<String> {
+        match self.func.and_then(|f| f.get_pseudo(id)).map(|p| &p.kind) {
+            Some(PseudoKind::Val(v)) => Some(format!("${}", v)),
+            Some(PseudoKind::FVal(v)) => Some(format!("${}", v)),
+            _ => None,
+        }
+    }
+
+    fn typ(&self, id: TypeId) -> String {
+        self.types.format_type(id, None)
+    }
+}
+
+/// An `Instruction` paired with the tables that make it printable.
+pub struct InstructionDisplay<'a> {
+    insn: &'a Instruction,
+    ctx: IrCtx<'a>,
+}
+
+impl Instruction {
+    /// Print this instruction against `ctx`'s tables.
+    pub fn display<'a>(&'a self, ctx: IrCtx<'a>) -> InstructionDisplay<'a> {
+        InstructionDisplay { insn: self, ctx }
+    }
+}
+
+impl fmt::Display for InstructionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (ctx, this) = (self.ctx, self.insn);
         // Format: target = op src1, src2
-        if let Some(target) = &self.target {
+        if let Some(target) = &self.insn.target {
             write!(f, "{} = ", target)?;
         }
 
-        write!(f, "{}", self.op.name())?;
+        write!(f, "{}", self.insn.op.name())?;
 
         // Size suffix (for conversions, show src_size→size)
-        if self.src_size > 0
-            && self.src_size != self.size
+        if this.src_size > 0
+            && this.src_size != this.size
             && matches!(
-                self.op,
+                this.op,
                 Opcode::Sext
                     | Opcode::Zext
                     | Opcode::Trunc
@@ -1251,94 +1318,101 @@ impl fmt::Display for Instruction {
                     | Opcode::FCvtF
             )
         {
-            write!(f, ".{}to{}", self.src_size, self.size)?;
-        } else if self.size > 0 {
-            write!(f, ".{}", self.size)?;
+            write!(f, ".{}to{}", this.src_size, this.size)?;
+        } else if this.size > 0 {
+            write!(f, ".{}", this.size)?;
         }
 
         // Operands depend on opcode
-        match self.op {
+        match this.op {
             Opcode::Br => {
-                if let Some(bb) = &self.bb_true {
+                if let Some(bb) = &this.bb_true {
                     write!(f, " {}", bb)?;
                 }
             }
             Opcode::Cbr => {
-                if let Some(cond) = self.src.first() {
-                    write!(f, " {}", cond)?;
+                if let Some(cond) = this.src.first() {
+                    write!(f, " {}", ctx.pseudo(*cond))?;
                 }
-                if let Some(bb) = &self.bb_true {
+                if let Some(bb) = &this.bb_true {
                     write!(f, ", {}", bb)?;
                 }
-                if let Some(bb) = &self.bb_false {
+                if let Some(bb) = &this.bb_false {
                     write!(f, ", {}", bb)?;
+                }
+            }
+            // The constant is in the *target*, which is the whole reason this
+            // printer takes the pseudo table.
+            Opcode::SetVal => {
+                if let Some(v) = this.target.and_then(|t| ctx.target_const(t)) {
+                    write!(f, " {}", v)?;
                 }
             }
             Opcode::Phi => {
-                for (i, (bb, pseudo)) in self.phi_list.iter().enumerate() {
+                for (i, (bb, pseudo)) in this.phi_list.iter().enumerate() {
                     if i > 0 {
                         write!(f, ",")?;
                     }
-                    write!(f, " {} ({})", pseudo, bb)?;
+                    write!(f, " {} ({})", ctx.pseudo(*pseudo), bb)?;
                 }
             }
             Opcode::PhiSource => {
-                if let Some(src) = self.src.first() {
-                    write!(f, " {}", src)?;
+                if let Some(src) = this.src.first() {
+                    write!(f, " {}", ctx.pseudo(*src))?;
                 }
-                if let Some((bb, pseudo)) = self.phi_list.first() {
+                if let Some((bb, pseudo)) = this.phi_list.first() {
                     write!(f, " (-> {}:{})", bb, pseudo)?;
                 }
             }
             Opcode::Call => {
-                if let Some(func) = &self.func_name {
+                if let Some(func) = &this.func_name {
                     write!(f, " {}", func)?;
                 }
                 write!(f, "(")?;
-                for (i, arg) in self.src.iter().enumerate() {
+                for (i, arg) in this.src.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", arg)?;
+                    write!(f, "{}", ctx.pseudo(*arg))?;
                 }
                 write!(f, ")")?;
             }
             Opcode::Switch => {
-                if let Some(val) = self.src.first() {
-                    write!(f, " {}", val)?;
+                if let Some(val) = this.src.first() {
+                    write!(f, " {}", ctx.pseudo(*val))?;
                 }
-                for (lo, hi, bb) in &self.switch_cases {
+                for (lo, hi, bb) in &this.switch_cases {
                     if lo == hi {
                         write!(f, ", {} => {}", lo, bb)?;
                     } else {
                         write!(f, ", {}..={} => {}", lo, hi, bb)?;
                     }
                 }
-                if let Some(default_bb) = &self.switch_default {
+                if let Some(default_bb) = &this.switch_default {
                     write!(f, ", default => {}", default_bb)?;
                 }
             }
             Opcode::Load | Opcode::Store => {
-                for (i, src) in self.src.iter().enumerate() {
+                for (i, src) in this.src.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     } else {
                         write!(f, " ")?;
                     }
-                    write!(f, "{}", src)?;
+                    write!(f, "{}", ctx.pseudo(*src))?;
                 }
-                if self.offset != 0 {
-                    write!(f, " + {}", self.offset)?;
+                if this.offset != 0 {
+                    write!(f, " + {}", this.offset)?;
                 }
             }
             _ => {
-                for (i, src) in self.src.iter().enumerate() {
+                for (i, src) in this.src.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     } else {
                         write!(f, " ")?;
                     }
-                    write!(f, "{}", src)?;
+                    write!(f, "{}", ctx.pseudo(*src))?;
                 }
             }
         }
@@ -1371,14 +1445,6 @@ pub struct BasicBlock {
     // ========================================================================
     // Dominator tree fields (computed by dominate.rs)
     // ========================================================================
-    /// Immediate dominator (idom) - the closest dominator in the dominator tree
-    pub idom: Option<BasicBlockId>,
-    /// Depth in dominator tree (entry is level 0)
-    pub dom_level: u32,
-    /// Blocks immediately dominated by this one (dominator tree children)
-    pub dom_children: Vec<BasicBlockId>,
-    /// Dominance frontier - blocks where this block's dominance ends
-    pub dom_frontier: Vec<BasicBlockId>,
 
     // ========================================================================
     // SSA construction fields (used during SSA conversion)
@@ -1397,10 +1463,6 @@ impl Default for BasicBlock {
             children: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
             label: None,
             addr_taken: false,
-            idom: None,
-            dom_level: 0,
-            dom_children: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
-            dom_frontier: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
             phi_map: HashMap::with_capacity(DEFAULT_PHI_CAPACITY),
         }
     }
@@ -1468,18 +1530,31 @@ impl BasicBlock {
     }
 }
 
-impl fmt::Display for BasicBlock {
+/// A `BasicBlock` paired with the tables that make its instructions printable.
+pub struct BasicBlockDisplay<'a> {
+    block: &'a BasicBlock,
+    ctx: IrCtx<'a>,
+}
+
+impl BasicBlock {
+    /// Print this block against `ctx`'s tables.
+    pub fn display<'a>(&'a self, ctx: IrCtx<'a>) -> BasicBlockDisplay<'a> {
+        BasicBlockDisplay { block: self, ctx }
+    }
+}
+
+impl fmt::Display for BasicBlockDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Label
-        if let Some(label) = &self.label {
+        if let Some(label) = &self.block.label {
             writeln!(f, "{}:", label)?;
         } else {
-            writeln!(f, "{}:", self.id)?;
+            writeln!(f, "{}:", self.block.id)?;
         }
 
         // Instructions
-        for insn in &self.insns {
-            writeln!(f, "    {}", insn)?;
+        for insn in &self.block.insns {
+            writeln!(f, "    {}", insn.display(self.ctx))?;
         }
 
         Ok(())
@@ -1520,6 +1595,20 @@ pub struct ImplicitParamCopy {
     pub size_bytes: usize,
     /// Type for the 8-byte load/store operations (typically `long`)
     pub qword_type: TypeId,
+    /// Whether the caller's argument pseudo holds an *address* of the value
+    /// rather than the value itself.
+    ///
+    /// The two kinds of parameter recorded here disagree about this, and size
+    /// alone cannot tell them apart. A register-sized aggregate travels *as*
+    /// its value, so `struct { float a, b; }` must be stored straight into the
+    /// local. A `_Complex` travels by address at **every** size, so the
+    /// eight-byte `float _Complex` -- the same size -- must be loaded through.
+    /// Deciding by size stored the pointer into the local and the inlined body
+    /// read it as a pair of floats.
+    ///
+    /// Recorded here because only the linearizer can answer it: the inliner
+    /// has no `TypeTable` to ask.
+    pub arg_is_address: bool,
 }
 
 /// A function in IR form
@@ -1543,8 +1632,6 @@ pub struct Function {
     pub next_pseudo: u32,
     /// Local variables (name -> info), used for SSA conversion
     pub locals: HashMap<String, LocalVar>,
-    /// Maximum dominator tree depth (computed by dominate.rs)
-    pub max_dom_level: u32,
     /// Is this function static (internal linkage)?
     pub is_static: bool,
     /// Whether to emit a body for this function at all.
@@ -1592,9 +1679,12 @@ pub struct Function {
     /// True when this function's `Ret` carries the *address* of the returned
     /// value rather than the value.
     ///
-    /// Two returns are shaped that way: a `_Complex` one, and an aggregate
-    /// that is nothing but a `long double`, which comes back in st(0) and so
-    /// is loaded from memory. At a call site the backend stores the returned
+    /// Three returns are shaped that way: a `_Complex` one; an aggregate that
+    /// is nothing but a `long double`, which comes back in st(0) and so is
+    /// loaded from memory; and a homogeneous floating-point aggregate, which
+    /// AAPCS64 returns in `d0`-`d3` at *any* size -- four `double`s is
+    /// thirty-two bytes and still comes back in registers. At a call site the
+    /// backend stores the returned
     /// registers into the result local, so that pseudo's slot holds the value
     /// itself; inlining drops the call and would hand the caller an address
     /// where it expects a value. Bridging the two needs the base type and
@@ -1620,7 +1710,6 @@ impl Default for Function {
             pseudos: Vec::with_capacity(DEFAULT_PSEUDO_CAPACITY),
             next_pseudo: 0,
             locals: HashMap::with_capacity(DEFAULT_LOCAL_CAPACITY),
-            max_dom_level: 0,
             is_static: false,
             emit: true,
             is_noreturn: false,
@@ -1795,44 +1884,44 @@ impl Function {
             _ => None,
         })
     }
+}
 
-    /// Check if block a dominates block b
-    #[cfg(test)]
-    pub fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
-        if a == b {
-            return true;
-        }
+/// A `Function` paired with the type table.
+pub struct FunctionDisplay<'a> {
+    func: &'a Function,
+    types: &'a TypeTable,
+}
 
-        let mut current = b;
-        while let Some(bb) = self.get_block(current) {
-            if let Some(idom) = bb.idom {
-                if idom == a {
-                    return true;
-                }
-                current = idom;
-            } else {
-                break;
-            }
-        }
-        false
+impl Function {
+    /// Print this function, resolving its pseudos and types.
+    pub fn display<'a>(&'a self, types: &'a TypeTable) -> FunctionDisplay<'a> {
+        FunctionDisplay { func: self, types }
     }
 }
 
-impl fmt::Display for Function {
+impl fmt::Display for FunctionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let func = self.func;
+        // The function is its own pseudo table: every id in its body resolves
+        // against it, and against no other function's.
+        let ctx = IrCtx {
+            types: self.types,
+            func: Some(func),
+        };
+
         // Function header
-        write!(f, "define type#{} {}(", self.return_type.0, self.name)?;
-        for (i, (name, typ)) in self.params.iter().enumerate() {
+        write!(f, "define {} {}(", ctx.typ(func.return_type), func.name)?;
+        for (i, (name, typ)) in func.params.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "type#{} %{}", typ.0, name)?;
+            write!(f, "{} %{}", ctx.typ(*typ), name)?;
         }
         writeln!(f, ") {{")?;
 
         // Basic blocks
-        for block in &self.blocks {
-            write!(f, "{}", block)?;
+        for block in &func.blocks {
+            write!(f, "{}", block.display(ctx))?;
         }
 
         writeln!(f, "}}")
@@ -2261,30 +2350,56 @@ impl Module {
     }
 }
 
-impl fmt::Display for Module {
+/// A `Module` paired with the type table.
+pub struct ModuleDisplay<'a> {
+    module: &'a Module,
+    types: &'a TypeTable,
+}
+
+impl Module {
+    /// Print this module, resolving its pseudos and types.
+    pub fn display<'a>(&'a self, types: &'a TypeTable) -> ModuleDisplay<'a> {
+        ModuleDisplay {
+            module: self,
+            types,
+        }
+    }
+}
+
+impl fmt::Display for ModuleDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A global belongs to no function, so its pseudo table is empty; its
+        // type still resolves.
+        let ctx = IrCtx {
+            types: self.types,
+            func: None,
+        };
+
         // Globals
-        for global in &self.globals {
+        for global in &self.module.globals {
             let tls_marker = if global.is_thread_local { " [tls]" } else { "" };
             match &global.init {
                 Initializer::None => {
-                    writeln!(f, "@{}: type#{}{}", global.name, global.typ.0, tls_marker)?
+                    writeln!(f, "@{}: {}{}", global.name, ctx.typ(global.typ), tls_marker)?
                 }
                 init => writeln!(
                     f,
-                    "@{}: type#{} = {}{}",
-                    global.name, global.typ.0, init, tls_marker
+                    "@{}: {} = {}{}",
+                    global.name,
+                    ctx.typ(global.typ),
+                    init,
+                    tls_marker
                 )?,
             }
         }
 
-        if !self.globals.is_empty() {
+        if !self.module.globals.is_empty() {
             writeln!(f)?;
         }
 
         // Functions
-        for func in &self.functions {
-            writeln!(f, "{}", func)?;
+        for func in &self.module.functions {
+            writeln!(f, "{}", func.display(self.types))?;
         }
 
         Ok(())
@@ -2352,7 +2467,11 @@ mod tests {
             types.int_id,
             32,
         );
-        let s = format!("{}", insn);
+        let ctx = IrCtx {
+            types: &types,
+            func: None,
+        };
+        let s = format!("{}", insn.display(ctx));
         assert!(s.contains("add"));
         assert!(s.contains("%3"));
         assert!(s.contains("%1"));
@@ -2371,6 +2490,46 @@ mod tests {
         assert!(bb.is_terminated());
     }
 
+    /// The dump shows what the IR actually holds.
+    ///
+    /// Everything asserted here was absent before the printer took the tables:
+    /// a `SetVal`'s constant lives in its target pseudo, so `return 42;`
+    /// printed as `%0 = setval.32` with the 42 nowhere on the line; types
+    /// printed as `type#7`; and a symbol operand printed as a bare index.
+    /// `ir/README.md` documented the `$20` operand form the whole time.
+    #[test]
+    fn test_display_resolves_constants_and_types() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("f", types.int_id);
+
+        // A constant pseudo, as `SetVal` builds one: the value is in the
+        // *target*, not in the instruction.
+        let k = PseudoId(0);
+        func.add_pseudo(Pseudo::val(k, 42));
+
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(
+            Instruction::new(Opcode::SetVal)
+                .with_target(k)
+                .with_type_and_size(types.int_id, 32),
+        );
+        entry.add_insn(Instruction::ret(Some(k)));
+        func.add_block(entry);
+
+        let s = format!("{}", func.display(&types));
+
+        // The constant reaches the line it defines...
+        assert!(
+            s.contains("setval.32 $42"),
+            "the constant must be printed: {s}"
+        );
+        // ...and a use keeps both the id and the value.
+        assert!(s.contains("%0($42)"), "a constant operand shows both: {s}");
+        // The return type is named, not indexed.
+        assert!(s.contains("define int f("), "types must be named: {s}");
+        assert!(!s.contains("type#"), "no raw TypeId should survive: {s}");
+    }
+
     #[test]
     fn test_function_display() {
         let types = TypeTable::new(&Target::host());
@@ -2381,7 +2540,7 @@ mod tests {
         entry.add_insn(Instruction::ret(Some(PseudoId(0))));
         func.add_block(entry);
 
-        let s = format!("{}", func);
+        let s = format!("{}", func.display(&types));
         assert!(s.contains("define"));
         assert!(s.contains("main"));
         assert!(s.contains("argc"));
@@ -2655,7 +2814,12 @@ mod tests {
         assert_eq!(insn.src[0], PseudoId(5));
         assert_eq!(insn.switch_cases.len(), 2);
         assert_eq!(insn.switch_default, Some(BasicBlockId(3)));
-        let s = format!("{}", insn);
+        let types = TypeTable::new(&Target::host());
+        let ctx = IrCtx {
+            types: &types,
+            func: None,
+        };
+        let s = format!("{}", insn.display(ctx));
         assert!(s.contains("switch"));
         assert!(s.contains("%5"));
         assert!(s.contains("default"));

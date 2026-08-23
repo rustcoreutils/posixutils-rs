@@ -836,6 +836,16 @@ fn clone_instruction(
                         let _ = match_idx;
                     }
                 }
+                // An `asm goto` label is a *block*, and it is the callee's
+                // block. Left unremapped it named whichever caller block
+                // happened to share the id, which for a small callee is the
+                // block holding the asm itself: `asm goto("b %l[done]")`
+                // inlined into a caller branched to its own address and hung.
+                // The two branch targets above are remapped for this reason;
+                // these were missed because they live inside the operand data.
+                for (bb, _) in &mut asm_data.goto_labels {
+                    *bb = ctx.remap_bb(*bb);
+                }
             }
 
             vec![new_insn]
@@ -1018,7 +1028,13 @@ fn inline_call_site(
                 // it, so loading through it would dereference the data as an
                 // address. Anything larger travels by address, which is what
                 // the loop below assumes.
-                if matches!(copy.size_bytes, 1 | 2 | 4 | 8) {
+                //
+                // Size alone does not decide it. A `_Complex` travels by
+                // address at every size, so the eight-byte `float _Complex`
+                // has to take the loop even though a same-sized struct does
+                // not -- keying on size stored the pointer into the local and
+                // the inlined body read it as a pair of floats.
+                if !copy.arg_is_address && matches!(copy.size_bytes, 1 | 2 | 4 | 8) {
                     let bits = (copy.size_bytes * 8) as u32;
                     copy_insns.push(Instruction::store(
                         call_arg,
@@ -1548,7 +1564,7 @@ mod tests {
     fn opt_at(level: u8) -> Optimization {
         Optimization::from_flag(&level.to_string()).expect("valid level")
     }
-    use crate::ir::{GlobalDef, Initializer};
+    use crate::ir::{AsmData, GlobalDef, Initializer};
     use crate::target::Target;
     use crate::types::TypeTable;
 
@@ -1921,6 +1937,86 @@ mod tests {
         assert!(
             module.functions.iter().any(|f| f.name == "arr_func"),
             "arr_func should be preserved - referenced in global array initializer"
+        );
+    }
+
+    /// An `asm goto` label is a callee block ID and must be remapped.
+    ///
+    /// `clone_instruction` remaps `bb_true`/`bb_false` and the pseudos inside
+    /// `asm_data.outputs`/`inputs`, but `goto_labels` holds `BasicBlockId`s
+    /// too and was left alone. The label then named whichever *caller* block
+    /// shared the id -- for a small callee, the block holding the asm itself,
+    /// so the inlined branch jumped to its own address and hung.
+    #[test]
+    fn test_clone_instruction_remaps_asm_goto_labels() {
+        let types = TypeTable::new(&Target::host());
+
+        let mut callee = Function::new("callee", types.int_id);
+        let mut cbb = BasicBlock::new(BasicBlockId(0));
+        cbb.insns.push(Instruction::new(Opcode::Entry));
+        cbb.insns.push(Instruction::ret(None));
+        callee.add_block(cbb);
+        // The block the label names.
+        let mut target_bb = BasicBlock::new(BasicBlockId(1));
+        target_bb.insns.push(Instruction::ret(None));
+        callee.add_block(target_bb);
+        callee.entry = BasicBlockId(0);
+
+        // The caller needs blocks of its own, and specifically one at the
+        // callee's id: that is the case the bug produced -- an unremapped
+        // label silently naming a real, unrelated caller block.
+        let mut caller = Function::new("caller", types.int_id);
+        let mut caller_bb = BasicBlock::new(BasicBlockId(0));
+        caller_bb.insns.push(Instruction::new(Opcode::Entry));
+        caller_bb.insns.push(Instruction::ret(None));
+        caller.add_block(caller_bb);
+        for id in 1..4 {
+            let mut b = BasicBlock::new(BasicBlockId(id));
+            b.insns.push(Instruction::ret(None));
+            caller.add_block(b);
+        }
+        caller.entry = BasicBlockId(0);
+        caller.next_pseudo = 100;
+
+        let mut ctx = InlineContext::new(
+            &caller,
+            &callee,
+            vec![],
+            ForwardedArgs::default(),
+            BasicBlockId(99),
+            None,
+        );
+
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.asm_data = Some(Box::new(AsmData {
+            template: "b %l[done]".to_string(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: vec![(BasicBlockId(1), "done".to_string())],
+        }));
+
+        let cloned = clone_instruction(&mut ctx, &asm, &callee);
+        assert_eq!(cloned.len(), 1);
+        let data = cloned[0]
+            .asm_data
+            .as_ref()
+            .expect("asm_data should survive cloning");
+
+        assert_eq!(data.goto_labels.len(), 1);
+        let (bb, name) = &data.goto_labels[0];
+        assert_eq!(name, "done", "the label's name is not remapped");
+        // Asserted as agreement with the remapper, not as a literal id: what
+        // matters is that the label follows the block wherever it was cloned to.
+        assert_eq!(
+            *bb,
+            ctx.remap_bb(BasicBlockId(1)),
+            "the goto label must name the *cloned* block"
+        );
+        assert_ne!(
+            *bb,
+            BasicBlockId(1),
+            "leaving the callee's id names an unrelated caller block"
         );
     }
 

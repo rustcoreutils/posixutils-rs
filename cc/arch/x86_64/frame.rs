@@ -15,7 +15,7 @@ use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{complex_fp_info, complex_sse_regs, Directive, FpSize, OperandSize, Symbol};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
-use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
+use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashSet;
@@ -168,7 +168,7 @@ impl X86_64CodeGen {
         let stack_size = alloc.stack_size();
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
         self.max_local_align = alloc.max_local_align();
-        self.use_rsp_locals = self.max_local_align > 16;
+        self.frame_base = alloc.frame_base();
         // Pad callee_saved_offset to multiple of 16 so that 16-byte-aligned
         // stack_offset values produce 16-byte-aligned final addresses.
         // rbp is 16-aligned (ABI), so -(padded_offset + aligned_stack_offset) is also aligned.
@@ -324,8 +324,7 @@ impl X86_64CodeGen {
         // aligned only if `alloc_size` is too -- and it is a 16-byte-rounded
         // total less eight bytes per pushed register, so an odd number of
         // callee-saved pushes left every over-aligned local off by eight.
-        let alloc_size = if self.use_rsp_locals {
-            let align = self.max_local_align;
+        let alloc_size = if let FrameBase::Aligned { align, .. } = self.frame_base {
             (alloc_size + align - 1) & !(align - 1)
         } else {
             alloc_size
@@ -338,14 +337,27 @@ impl X86_64CodeGen {
             });
         }
 
-        // Dynamic stack alignment for locals with alignment > 16
-        // After sub, emit andq to force RSP to the required alignment.
-        // Locals will be addressed via RSP; epilogue uses `leave` to restore RSP from RBP.
-        if self.use_rsp_locals {
+        // Dynamic stack alignment for locals with alignment > 16.
+        // After sub, emit andq to force RSP to the required alignment, then
+        // latch that value into the frame base register.
+        //
+        // The latch is the point. `%rsp` holds the right address only until
+        // something moves it -- `alloca`, which the inliner can splice into a
+        // caller that has none -- and every local was measured from it. The
+        // base register is written once here and read for the rest of the
+        // function, so a moving `%rsp` no longer reaches the locals. The
+        // epilogue restores `%rsp` from `%rbp` and pops the base back, so
+        // nothing else has to know.
+        if let FrameBase::Aligned { reg, align } = self.frame_base {
             self.push_lir(X86Inst::And {
                 size: OperandSize::B64,
-                src: GpOperand::Imm(-(self.max_local_align as i64)),
+                src: GpOperand::Imm(-(align as i64)),
                 dst: Reg::Rsp,
+            });
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::Rsp),
+                dst: GpOperand::Reg(reg),
             });
         }
 

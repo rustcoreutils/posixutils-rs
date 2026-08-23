@@ -21,7 +21,7 @@
 // everywhere.
 //
 
-use super::asm_probe::{asm_for, body_of, AARCH64_LINUX, X86_64_LINUX};
+use super::asm_probe::{asm_for, asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -1839,4 +1839,118 @@ int main(void) {
         crate::common::compile_and_run_optimized("stacked_args_all_o2", code),
         0
     );
+}
+
+/// A stacked argument is placed from the argument area's base, on both targets.
+///
+/// The behavioural test in `codegen::misc` runs on the host only, so it cannot
+/// see the other architecture's layout -- and both implementations of
+/// `IncomingOff::take` had the same defect: the rounding was applied to the
+/// frame displacement, which already carries the saved frame pointer and
+/// return address, rather than to the offset within the argument area. An
+/// over-aligned argument arriving first went one whole alignment unit past
+/// where the caller had written it.
+///
+/// The two targets need different sources to reach the case at all. On x86-64
+/// a 32-byte composite is MEMORY class and lands on the stack once the six
+/// integer registers are spent. On aarch64 that same struct is a homogeneous
+/// floating-point aggregate and travels in `d0`-`d3`, so it is only stacked
+/// once the eight FP registers are spent -- a signature of six ints stacks
+/// nothing there, and asserting against it matched the frame-base register
+/// spill at `[x29, #16]` and passed while the bug was live.
+#[test]
+fn codegen_stacked_arg_starts_at_the_argument_area_base() {
+    let src = r#"
+        struct A32 { _Alignas(32) double v[4]; };
+        /* x86-64: MEMORY class, stacked after the six GP registers. */
+        double after_ints(int a, int b, int c, int d, int e, int f,
+                          struct A32 x) {
+            return x.v[0];
+        }
+        /* aarch64: an HFA, stacked only after the eight FP registers. */
+        double after_fps(double a, double b, double c, double d,
+                         double e, double f, double g, double h,
+                         struct A32 x) {
+            return x.v[0];
+        }
+    "#;
+
+    // x86-64 addresses incoming arguments from %rbp, and the first sits just
+    // above the saved %rbp and the return address.
+    let full = asm_for("stacked_arg_base", X86_64_LINUX, src);
+    let asm = body_of(&full, "after_ints");
+    assert!(
+        asm.contains("16(%rbp)"),
+        "x86-64: the first stacked argument must be read from 16(%rbp), not \
+         padded past it:\n{asm}"
+    );
+
+    // aarch64 has no return address on the stack, so the argument area begins
+    // at the top of the callee's own frame. Asserted as agreement with the
+    // frame the prologue actually allocates rather than as a literal offset,
+    // which would only re-encode whatever the allocator happened to pick.
+    let full = asm_for("stacked_arg_base", AARCH64_LINUX, src);
+    let asm = body_of(&full, "after_fps");
+    let frame = asm
+        .lines()
+        .find_map(|l| {
+            l.split("[sp, #-")
+                .nth(1)
+                .and_then(|r| r.split(']').next())
+                .and_then(|n| n.parse::<i32>().ok())
+        })
+        .unwrap_or_else(|| panic!("no frame allocation found:\n{asm}"));
+    let base = format!("[x29, #{frame}]");
+    assert!(
+        asm.contains(&base),
+        "aarch64: the first stacked argument must be read from the argument \
+         area base {base} (the frame's own size), not padded past it:\n{asm}"
+    );
+}
+
+/// A function whose `Ret` carries an *address* is not inlined.
+///
+/// `Function::ret_is_address` exists to stop the inliner splicing across that
+/// boundary: the callee hands back a pointer to the value while a call's result
+/// slot holds the value itself, and bridging the two needs a base type and
+/// stride the optimizer has no `TypeTable` to ask for.
+///
+/// It knew about two such returns, `_Complex` and an x87 `long double`
+/// aggregate, and missed a third. AAPCS64 returns a homogeneous
+/// floating-point aggregate in `d0`-`d3` at **any** size -- four `double`s is
+/// thirty-two bytes and still comes back in registers -- but the check was
+/// gated behind the *two-register* return path, which stops at 128 bits. So
+/// every HFA past that reported a value-carrying `Ret`, the inliner spliced the
+/// body in, and the caller read the returned pointer's own storage as the
+/// struct's bytes.
+///
+/// Asserted on aarch64 only: on x86-64 a 32-byte aggregate is MEMORY class and
+/// returns through the hidden pointer, where inlining is correct and wanted.
+#[test]
+fn codegen_aarch64_hfa_returning_function_is_not_inlined() {
+    // Three and four doubles are HFAs past 128 bits. Two doubles is exactly
+    // 128 and was already handled -- kept here so the fix is pinned to the
+    // shape rather than to a size threshold that could drift again.
+    let src = r#"
+        struct H2 { double v[2]; };
+        struct H3 { double v[3]; };
+        struct H4 { double v[4]; };
+        static struct H2 mk2(double s){ struct H2 r; r.v[0]=s; r.v[1]=s+1; return r; }
+        static struct H3 mk3(double s){ struct H3 r; for (int i=0;i<3;i++) r.v[i]=s+i; return r; }
+        static struct H4 mk4(double s){ struct H4 r; for (int i=0;i<4;i++) r.v[i]=s+i; return r; }
+        double use2(double s){ struct H2 b = mk2(s); return b.v[0]+b.v[1]; }
+        double use3(double s){ struct H3 b = mk3(s); return b.v[0]+b.v[2]; }
+        double use4(double s){ struct H4 b = mk4(s); return b.v[0]+b.v[3]; }
+    "#;
+
+    let asm = asm_for_with("hfa_no_inline", AARCH64_LINUX, src, &["-O2"]);
+    for (caller, callee) in [("use2", "mk2"), ("use3", "mk3"), ("use4", "mk4")] {
+        let body = body_of(&asm, caller);
+        assert!(
+            body.contains(&format!("bl {callee}")),
+            "{caller} must still call {callee}: an HFA-returning function hands \
+             back an address, and inlining it phis that address as though it \
+             were the aggregate:\n{body}"
+        );
+    }
 }

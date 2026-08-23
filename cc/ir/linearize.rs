@@ -917,6 +917,7 @@ impl<'a> Linearizer<'a> {
         // Complex types are passed in FP registers per ABI - the prologue codegen
         // handles storing from XMM registers to local storage
         for (name, symbol_id_opt, typ, _arg_pseudo, arg_idx) in complex_params {
+            let is_complex = self.types.is_complex(typ);
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
@@ -934,6 +935,11 @@ impl<'a> Linearizer<'a> {
                     local_sym,
                     size_bytes: typ_size_bytes,
                     qword_type: self.types.long_id,
+                    // `complex_params` carries two kinds: a genuine `_Complex`,
+                    // which travels by address at every size, and a struct the
+                    // ABI puts in two FP registers, which travels by value when
+                    // it fits in one. Only the type can tell them apart.
+                    arg_is_address: is_complex,
                 });
             }
 
@@ -1129,13 +1135,30 @@ impl<'a> Linearizer<'a> {
         // value. The inliner has to know not to splice across that boundary.
         // An aggregate returned in st(0) has exactly the same shape as a
         // complex one, and missing it is a miscompile visible only at -O.
-        let returns_x87_aggregate = returns_reg_aggregate
+        //
+        // Asked of the ABI classification directly rather than through
+        // `returns_reg_aggregate`, which is the *two-register* return path and
+        // so stops at 128 bits. An HFA comes back in registers at any size --
+        // four `double`s is thirty-two bytes and still returns in d0-d3 -- so
+        // gating on that cap made every HFA past 128 bits report that its `Ret`
+        // carried a value. The inliner then spliced the body in and phi-ed the
+        // address as if it were the aggregate, and the caller read the pointer's
+        // own storage as the struct's bytes. The call-site half of this
+        // decision already has no size bound; the two had drifted.
+        let returns_addr_aggregate = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
+            // An aggregate that fits in one register comes back *as* a value,
+            // so its `Ret` carries one; only past 64 bits is an address handed
+            // back. Dropping this bound along with the 128-bit cap refused to
+            // inline every HFA, including `struct { float x, y; }`, which was
+            // correct before and is the common aarch64 shape.
+            && struct_size_bits > 64
+            && !returns_large_struct
             && matches!(
                 get_abi_for_conv(self.current_calling_conv, self.target)
                     .classify_return(func.return_type, self.types),
                 crate::abi::ArgClass::X87 { .. } | crate::abi::ArgClass::Hfa { .. }
             );
-        ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_x87_aggregate;
+        ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_addr_aggregate;
 
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
@@ -3082,8 +3105,30 @@ impl<'a> Linearizer<'a> {
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.
-                arg_types_vec.push(arg_type);
-                self.complex_operand_addr(a)
+                //
+                // Converted to the parameter's own precision first. A complex
+                // value is read with its base type's stride, so handing a
+                // `float _Complex` to a `double _Complex` parameter without
+                // converting had the callee read an 8-byte-strided pair out of
+                // 4-byte-strided storage: `1.0f + 2.0f*I` arrived as `2+1i`.
+                // The type recorded for the ABI has to move with it, or the
+                // classification is made for a width that is no longer there.
+                let param_typ = formal_param_types
+                    .as_ref()
+                    .and_then(|params| params.get(arg_idx).copied())
+                    .filter(|pt| self.types.is_complex(*pt));
+                match param_typ {
+                    Some(pt) => {
+                        arg_types_vec.push(pt);
+                        self.complex_operand_at_precision(a, pt)
+                    }
+                    // No prototype, or a variadic argument: nothing says what
+                    // precision the callee wants, so it travels as written.
+                    None => {
+                        arg_types_vec.push(arg_type);
+                        self.complex_operand_addr(a)
+                    }
+                }
             } else if arg_kind == TypeKind::Array {
                 // Array decay to pointer (C99 6.3.2.1)
                 // This applies to both fixed-size arrays and VLAs
@@ -4066,6 +4111,82 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// One arm of a complex conditional, as the address of a `result_typ` value.
+    ///
+    /// The arms need not be complex themselves: `c ? 1 : z` has an `int` arm,
+    /// and C17 6.5.15p5 converts it to the common type like any other operand.
+    fn complex_arm_addr(&mut self, arm: &Expr, result_typ: TypeId) -> PseudoId {
+        if self.types.is_complex(self.expr_type(arm)) {
+            self.complex_operand_at_precision(arm, result_typ)
+        } else {
+            self.promote_real_to_complex(arm, result_typ)
+        }
+    }
+
+    /// `c ? a : b` where the result is complex, merged **by address**.
+    ///
+    /// A complex value is two floats wide, so every other site in the
+    /// linearizer passes one around as the address of its storage and reads
+    /// the halves through that. The general conditional path does not: it
+    /// phi-ed whatever `linearize_expr` returned, which for a complex operand
+    /// is a `load` of the whole 128-bit object. Consumers then took those
+    /// value bits for the address the convention promised and dereferenced
+    /// them -- `creal(c ? z : w)` died on entirely valid code.
+    ///
+    /// Kept separate from `linearize_ternary`'s general path rather than
+    /// folded into it: the phi here merges *pointers*, so it is a
+    /// pointer-width phi of `pointer_to(result_typ)`, not a `size_bits`-wide
+    /// phi of the complex type.
+    fn linearize_complex_ternary(
+        &mut self,
+        cond: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        let then_bb = self.alloc_bb();
+        let else_bb = self.alloc_bb();
+        let merge_bb = self.alloc_bb();
+
+        let cond_bool = self.linearize_condition(cond);
+        let cond_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+        self.link_bb(cond_end_bb, then_bb);
+        self.link_bb(cond_end_bb, else_bb);
+
+        let ptr_typ = self.types.pointer_to(result_typ);
+        let ptr_bits = self.target.pointer_width;
+
+        self.switch_bb(then_bb);
+        let then_val = self.complex_arm_addr(then_expr, result_typ);
+        let then_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(then_end_bb, merge_bb);
+
+        self.switch_bb(else_bb);
+        let else_val = self.complex_arm_addr(else_expr, result_typ);
+        let else_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(else_end_bb, merge_bb);
+
+        self.switch_bb(merge_bb);
+        let result = self.alloc_pseudo();
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
+        let mut phi_insn = Instruction::phi(result, ptr_typ, ptr_bits);
+        let phisrc1 =
+            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, ptr_typ, ptr_bits);
+        phi_insn.phi_list.push((then_end_bb, phisrc1));
+        let phisrc2 =
+            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, ptr_typ, ptr_bits);
+        phi_insn.phi_list.push((else_end_bb, phisrc2));
+        self.emit(phi_insn);
+
+        result
+    }
+
     pub(crate) fn linearize_ternary(
         &mut self,
         expr: &Expr,
@@ -4084,13 +4205,23 @@ impl<'a> Linearizer<'a> {
         // `__isinff128` in every object that used `isinf` on a double.
         if let Some(cond_val) = self.eval_const_expr(cond) {
             let taken = if cond_val != 0 { then_expr } else { else_expr };
+            let result_typ = self.expr_type(expr);
+            if self.types.is_complex(result_typ) {
+                return self.complex_arm_addr(taken, result_typ);
+            }
             let value = self.linearize_expr(taken);
             let taken_typ = self.expr_type(taken);
-            let result_typ = self.expr_type(expr);
             return self.emit_convert(value, taken_typ, result_typ);
         }
 
         let result_typ = self.expr_type(expr);
+
+        // A complex result travels by address, which neither path below can
+        // produce -- so it gets its own.
+        if self.types.is_complex(result_typ) {
+            return self.linearize_complex_ternary(cond, then_expr, else_expr, result_typ);
+        }
+
         let size = if self.types.kind(result_typ) == TypeKind::Function {
             64
         } else {
@@ -4166,6 +4297,91 @@ impl<'a> Linearizer<'a> {
     /// The whole point is that `a` is evaluated **once**: it supplies both the
     /// branch test and the value taken when it is true. Rewriting to
     /// `a ? a : b` in the parser would have called `f` twice in `f() ?: 0`.
+    /// `a ?: b` where the *result* is complex, merged **by address**.
+    ///
+    /// Two constraints meet here. `a` is evaluated exactly once -- that is the
+    /// whole point of the operator -- and a complex value travels by address,
+    /// so for a complex `a` what is evaluated once is its *address*: it
+    /// supplies the truth test through `emit_complex_nonzero_at` and,
+    /// converted to the result's precision, the value taken when `a` is
+    /// nonzero. Going back to the `Expr` for either would evaluate `f()` twice
+    /// in `f() ?: 0`.
+    ///
+    /// `a` itself need not be complex. Only the *result* is, and it is complex
+    /// as soon as either operand is: `d ?: z` has a `double` left operand and a
+    /// `double _Complex` result. Taking a real `a`'s address as though it were
+    /// a complex object read the neighbouring stack slot as the imaginary half
+    /// -- and for an rvalue, `rvalue_addr` hands back the value's own bits, so
+    /// `g() ?: z` dereferenced a `double` as a pointer.
+    fn linearize_complex_elvis(
+        &mut self,
+        cond: &Expr,
+        else_expr: &Expr,
+        cond_typ: TypeId,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        // The single evaluation, before any branch. A complex operand is
+        // carried by address; a real one is an ordinary value, and converting
+        // it is left to the true arm so nothing sits between the comparison
+        // and the branch that consumes it.
+        let cond_complex = self.types.is_complex(cond_typ);
+        let evaluated = if cond_complex {
+            self.complex_operand_addr(cond)
+        } else {
+            self.linearize_expr(cond)
+        };
+        let cond_bool = if cond_complex {
+            self.emit_complex_nonzero_at(evaluated, cond_typ)
+        } else {
+            self.emit_compare_zero(evaluated, cond_typ)
+        };
+
+        let then_bb = self.alloc_bb();
+        let else_bb = self.alloc_bb();
+        let merge_bb = self.alloc_bb();
+        let cond_end_bb = self.current_bb.unwrap();
+
+        self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));
+        self.link_bb(cond_end_bb, then_bb);
+        self.link_bb(cond_end_bb, else_bb);
+
+        let ptr_typ = self.types.pointer_to(result_typ);
+        let ptr_bits = self.target.pointer_width;
+
+        self.switch_bb(then_bb);
+        let then_val = if cond_complex {
+            self.complex_addr_at_precision(evaluated, cond_typ, result_typ)
+        } else {
+            self.promote_real_value_to_complex(evaluated, cond_typ, result_typ)
+        };
+        let then_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(then_end_bb, merge_bb);
+
+        self.switch_bb(else_bb);
+        let else_val = self.complex_arm_addr(else_expr, result_typ);
+        let else_end_bb = self.current_bb.unwrap();
+        self.emit(Instruction::br(merge_bb));
+        self.link_bb(else_end_bb, merge_bb);
+
+        self.switch_bb(merge_bb);
+        let result = self.alloc_pseudo();
+        let phi_pseudo = Pseudo::phi(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(phi_pseudo);
+        }
+        let mut phi_insn = Instruction::phi(result, ptr_typ, ptr_bits);
+        let phisrc1 =
+            self.emit_phi_source(then_end_bb, then_val, result, merge_bb, ptr_typ, ptr_bits);
+        phi_insn.phi_list.push((then_end_bb, phisrc1));
+        let phisrc2 =
+            self.emit_phi_source(else_end_bb, else_val, result, merge_bb, ptr_typ, ptr_bits);
+        phi_insn.phi_list.push((else_end_bb, phisrc2));
+        self.emit(phi_insn);
+
+        result
+    }
+
     pub(crate) fn linearize_elvis(
         &mut self,
         expr: &Expr,
@@ -4183,8 +4399,17 @@ impl<'a> Linearizer<'a> {
             } else {
                 (else_expr, self.expr_type(else_expr))
             };
+            if self.types.is_complex(result_typ) {
+                return self.complex_arm_addr(taken, result_typ);
+            }
             let value = self.linearize_expr(taken);
             return self.emit_convert(value, taken_typ, result_typ);
+        }
+
+        // A complex result travels by address, and the left operand is both
+        // the truth test and the true value -- see `linearize_complex_elvis`.
+        if self.types.is_complex(result_typ) {
+            return self.linearize_complex_elvis(cond, else_expr, cond_typ, result_typ);
         }
 
         let size = if self.types.kind(result_typ) == TypeKind::Function {

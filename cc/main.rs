@@ -418,7 +418,7 @@ fn should_dump_ir(args: &Args, stage: &str) -> bool {
 }
 
 /// Dump IR at a named pipeline stage.
-fn dump_ir(args: &Args, module: &ir::Module, stage: &str) {
+fn dump_ir(args: &Args, module: &ir::Module, types: &types::TypeTable, stage: &str) {
     if !should_dump_ir(args, stage) {
         return;
     }
@@ -427,11 +427,11 @@ fn dump_ir(args: &Args, module: &ir::Module, stage: &str) {
         Some(name) => {
             for func in &module.functions {
                 if func.name == *name {
-                    print!("{}", func);
+                    print!("{}", func.display(types));
                 }
             }
         }
-        None => print!("{}", module),
+        None => print!("{}", module.display(types)),
     }
 }
 
@@ -1151,7 +1151,7 @@ fn process_file(
         .ok()
         .map(|p| p.to_string_lossy().to_string());
 
-    dump_ir(args, &module, "post-linearize");
+    dump_ir(args, &module, &types, "post-linearize");
 
     // A `destructor` on Mach-O is an `atexit` registration rather than a
     // table entry; see `ir::mach_o_dtors`. Runs before mapping so the calls it
@@ -1166,7 +1166,7 @@ fn process_file(
     // Hardware mapping pass — centralized target-specific lowering decisions
     arch::mapping::run_mapping(&mut module, &types, target);
 
-    dump_ir(args, &module, "post-mapping");
+    dump_ir(args, &module, &types, "post-mapping");
 
     // Expand thread-local accesses for the dynamic TLS model. Must run before
     // `optimize_module`, because register allocation is downstream of it and
@@ -1180,14 +1180,14 @@ fn process_file(
         types.void_ptr_id,
     );
 
-    dump_ir(args, &module, "post-tls");
+    dump_ir(args, &module, &types, "post-tls");
 
     // Optimize IR. Called even at -O0, where the only pass that does anything
     // is inlining of `__attribute__((always_inline))` functions, which gcc
     // honours with optimization off.
     opt::optimize_module(&mut module, args.optimization());
 
-    dump_ir(args, &module, "post-opt");
+    dump_ir(args, &module, &types, "post-opt");
 
     if args.dump_ir.is_some() && !should_dump_ir(args, "post-lower") {
         return Ok(Compiled::Nothing);
@@ -1196,7 +1196,7 @@ fn process_file(
     // Lower IR (phi elimination, etc.)
     ir::lower::lower_module(&mut module);
 
-    dump_ir(args, &module, "post-lower");
+    dump_ir(args, &module, &types, "post-lower");
 
     if args.dump_ir.is_some() {
         return Ok(Compiled::Nothing);
@@ -1856,7 +1856,13 @@ fn assemble_operand(
     // .S files need preprocessing, .s files do not.
     let asm_to_assemble = if path.ends_with(".S") {
         let temp_s = scratch_path(scratch, operand_id, stem, "s");
-        let content = std::fs::read(path)?;
+        // A BOM is stripped here for the same reason it is on every other
+        // reader: translation phase 1 has no byte for it, and `as` reads the
+        // leading 0xEF as the first character of a mnemonic. `-E` on the same
+        // file already stripped it, so without this a BOM'd `.S` preprocessed
+        // clean and failed to assemble. Only `.S` gets this -- a `.s` is handed
+        // to `as` untouched, which is what gcc does with it too.
+        let content = strip_bom(&std::fs::read(path)?).to_vec();
         let asm_config = AsmPreprocessConfig {
             optimization: args.optimization(),
             defines: &args.defines,
@@ -2108,6 +2114,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gettext("-o applies only to the last source operand with -c"),
             source_count
         ));
+    }
+
+    // `-M`/`-MM` is the one combination that cannot be reduced to a warning.
+    // The other two leave *something* usable behind -- the last object, or the
+    // concatenated `-E` text -- but a dependency file is read by make, and a
+    // `.d` holding only the last source's rule is silently wrong: make sees no
+    // prerequisites for the others and stops rebuilding them. There is no
+    // partial answer worth writing, so refuse instead. `-MF` names the same
+    // single file for the same reason, and `-o` also stands in for it here
+    // (`dependency_sink`), so both spellings are caught.
+    let deps_to_one_file =
+        args.deps_file.is_some() || args.output.as_deref().is_some_and(|p| p != "-");
+    if args.dependencies_replace_output() && deps_to_one_file && source_count > 1 {
+        eprintln!(
+            "c17: {} ({})",
+            gettext("cannot write the dependency rules for several sources to one file"),
+            source_count
+        );
+        std::process::exit(1);
     }
 
     // -E is the other unspecified combination, and it resolves the other way:

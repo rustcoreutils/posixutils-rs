@@ -9859,3 +9859,434 @@ int main(void) {
         0
     );
 }
+
+/// An over-aligned local keeps its address when `%rsp` moves under it.
+///
+/// A local wanting more than 16-byte alignment cannot be reached from `%rbp`,
+/// which the ABI only guarantees to 16, so the prologue rounds a base up and
+/// addresses every local from that. x86-64 used `%rsp` itself as that base --
+/// correct at the instant the prologue's `andq` runs, and wrong from the first
+/// thing that moves it. `alloca` moves it, and the locals shifted out from
+/// under their own addresses: the store of one local landed on top of another.
+///
+/// Both ways in are covered. The caller need not contain an `alloca` of its
+/// own -- the inliner splices callees that do into callers that do not -- and
+/// the direct form was broken at every optimization level, not just where
+/// inlining runs.
+#[test]
+fn codegen_over_aligned_locals_survive_alloca() {
+    let code = r#"
+int printf(const char *, ...);
+
+static int use(int n) {
+    char *p = __builtin_alloca(n);
+    for (int i = 0; i < n; i++) p[i] = (char)i;
+    int s = 0;
+    for (int i = 0; i < n; i++) s += p[i];
+    return s;
+}
+
+int many(int a,int b,int c,int d,int e,int f,int g,int h,int i,int j) {
+    return a + b*2 + c*3 + d*4 + e*5 + f*6 + g*7 + h*8 + i*9 + j*10;
+}
+
+/* The alloca arrives by inlining: this function's source has none. */
+static int inlined_form(void) {
+    _Alignas(32) int buf[8];
+    for (int i = 0; i < 8; i++) buf[i] = 1000 + i;
+    int t = use(16);
+    if (t != 120) return -1;
+    for (int i = 0; i < 8; i++) if (buf[i] != 1000 + i) return -2;
+    return 0;
+}
+
+/* The alloca is written here, and sits beside the over-aligned local. */
+static int direct_form(int n) {
+    _Alignas(64) long a[8];
+    _Alignas(32) int b[8];
+    for (int i = 0; i < 8; i++) { a[i] = 1000 + i; b[i] = 2000 + i; }
+
+    char *p = __builtin_alloca(n);
+    for (int i = 0; i < n; i++) p[i] = (char)i;
+
+    /* The alignment the source asked for actually held. */
+    if (((unsigned long)a & 63) != 0) return -1;
+    if (((unsigned long)b & 31) != 0) return -2;
+
+    /* A call needing stack arguments, placed after the alloca: reserving the
+       outgoing area moves %rsp again. */
+    if (many(1,2,3,4,5,6,7,8,9,10) != 385) return -3;
+
+    int s = 0;
+    for (int i = 0; i < n; i++) s += p[i];
+    if (s != n * (n - 1) / 2) return -4;
+
+    for (int i = 0; i < 8; i++) if (a[i] != 1000 + i) return -5;
+    for (int i = 0; i < 8; i++) if (b[i] != 2000 + i) return -6;
+    return 0;
+}
+
+/* A variably-modified local moves %rsp the same way an alloca does. */
+static int vla_form(int n) {
+    _Alignas(32) double d[4];
+    for (int i = 0; i < 4; i++) d[i] = i + 0.5;
+    int vla[n];
+    for (int i = 0; i < n; i++) vla[i] = 3000 + i;
+    if (((unsigned long)d & 31) != 0) return -1;
+    long sv = 0;
+    for (int i = 0; i < n; i++) sv += vla[i];
+    if (sv != (long)n * 3000 + (long)n * (n - 1) / 2) return -2;
+    for (int i = 0; i < 4; i++) if (d[i] != i + 0.5) return -3;
+    return 0;
+}
+
+int main(void) {
+    if (inlined_form() != 0) return 1;
+    if (direct_form(16) != 0) return 2;
+    if (direct_form(64) != 0) return 3;
+    if (vla_form(5) != 0) return 4;
+    if (vla_form(9) != 0) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("over_aligned_alloca", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("over_aligned_alloca_opt", code),
+        0
+    );
+}
+
+/// A struct whose alignment exceeds the argument area's own, passed by value.
+///
+/// `IncomingOff::take` rounded the *frame displacement* up to the argument's
+/// alignment, but that displacement already carries the saved `%rbp` and the
+/// return address. So an argument wanting 32-byte alignment and arriving first
+/// went to `32(%rbp)` while the caller -- which measures from its outgoing
+/// area's own base, correctly -- had written it at `16(%rbp)`. The callee read
+/// the struct's second half and ran off its end.
+///
+/// Invisible below 32-byte alignment: 16 is already a multiple of 8 and of 16,
+/// so only an argument wanting more than the area's own alignment can tell the
+/// two bases apart. The ordinary-alignment cases are here so the fix cannot
+/// regress them.
+///
+/// Six integer arguments come first in every signature: without them the
+/// struct is passed in registers and the stack layout is never exercised.
+#[test]
+fn codegen_over_aligned_struct_passed_by_value() {
+    let code = r#"
+int printf(const char *, ...);
+
+struct A32 { _Alignas(32) double v[4]; };   /* 32 bytes, 32-aligned */
+struct A64 { _Alignas(64) double v[8]; };   /* 64 bytes, 64-aligned */
+struct P8  { double v[4]; };                /* same size, ordinary alignment */
+
+static int fill32(struct A32 *s, double b) { for (int i = 0; i < 4; i++) s->v[i] = b + i; return 0; }
+static int fill64(struct A64 *s, double b) { for (int i = 0; i < 8; i++) s->v[i] = b + i; return 0; }
+
+/* Six integer arguments exhaust the GP registers, so `x` is genuinely stacked
+   rather than passed in registers -- otherwise the layout is never exercised. */
+static int take_alone(int a, int b, int c, int d, int e, int f, struct A32 x) {
+    if (a + b + c + d + e + f != 21) return 1;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 2;
+    return 0;
+}
+
+/* Two of them: the second must start at the first's end rounded up to 32,
+   not at a further-padded address. */
+static int take_two(int a, int b, int c, int d, int e, int f,
+                    struct A32 x, struct A32 y) {
+    if (a + b + c + d + e + f != 21) return 3;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 4;
+    for (int i = 0; i < 4; i++) if (y.v[i] != 100.5 + i) return 5;
+    return 0;
+}
+
+/* A plain 8-byte-aligned stacked argument ahead of it, so the over-aligned one
+   really has to be rounded up rather than merely landing right by luck. */
+static int take_after_scalar(int a, int b, int c, int d, int e, int f,
+                             long p, struct A32 x) {
+    if (p != 77) return 6;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 7;
+    return 0;
+}
+
+/* An ordinary-alignment struct in the same position: the case that already
+   worked, kept so the fix cannot regress it. */
+static int take_plain(int a, int b, int c, int d, int e, int f,
+                      long p, struct P8 x) {
+    if (p != 77) return 8;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 9;
+    return 0;
+}
+
+static int take_64(int a, int b, int c, int d, int e, int f, struct A64 x) {
+    for (int i = 0; i < 8; i++) if (x.v[i] != 1.5 + i) return 10;
+    return 0;
+}
+
+/* Interleaved with the over-aligned one, to pin that the argument *after* it
+   is placed from the right running offset. */
+static int take_then_scalar(int a, int b, int c, int d, int e, int f,
+                            struct A32 x, long q) {
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 11;
+    if (q != 55) return 12;
+    return 0;
+}
+
+/* Eight doubles exhaust the FP registers. On aarch64 this struct is a
+   homogeneous floating-point aggregate and rides in d0-d3 otherwise, so
+   without this the stacked path is never reached on that target at all. */
+static int take_after_fps(double a, double b, double c, double d,
+                          double e, double f, double g, double h,
+                          struct A32 x) {
+    if (a + b + c + d + e + f + g + h != 36.0) return 13;
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 14;
+    return 0;
+}
+
+/* The same position, ordinary alignment: a regression guard for the case that
+   already worked. */
+static int take_after_fps_plain(double a, double b, double c, double d,
+                                double e, double f, double g, double h,
+                                struct P8 x) {
+    for (int i = 0; i < 4; i++) if (x.v[i] != 1.5 + i) return 15;
+    return 0;
+}
+
+int main(void) {
+    struct A32 x, y;
+    struct A64 big;
+    struct P8 plain;
+    fill32(&x, 1.5);
+    fill32(&y, 100.5);
+    fill64(&big, 1.5);
+    for (int i = 0; i < 4; i++) plain.v[i] = 1.5 + i;
+
+    int r;
+    if ((r = take_alone(1, 2, 3, 4, 5, 6, x)))            { printf("take_alone %d\n", r); return r; }
+    if ((r = take_two(1, 2, 3, 4, 5, 6, x, y)))           { printf("take_two %d\n", r); return r; }
+    if ((r = take_after_scalar(1, 2, 3, 4, 5, 6, 77, x))) { printf("take_after_scalar %d\n", r); return r; }
+    if ((r = take_plain(1, 2, 3, 4, 5, 6, 77, plain)))    { printf("take_plain %d\n", r); return r; }
+    if ((r = take_64(1, 2, 3, 4, 5, 6, big)))             { printf("take_64 %d\n", r); return r; }
+    if ((r = take_then_scalar(1, 2, 3, 4, 5, 6, x, 55)))  { printf("take_then_scalar %d\n", r); return r; }
+    if ((r = take_after_fps(1,2,3,4,5,6,7,8, x)))         { printf("take_after_fps %d\n", r); return r; }
+    if ((r = take_after_fps_plain(1,2,3,4,5,6,7,8, plain))){ printf("take_after_fps_plain %d\n", r); return r; }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("over_aligned_struct_arg", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("over_aligned_struct_arg_opt", code),
+        0
+    );
+}
+
+/// An aggregate returned in registers, read back after the returning function
+/// is inlined.
+///
+/// A `Ret` can carry the *address* of the returned value rather than the value,
+/// and `Function::ret_is_address` exists to keep the inliner from splicing
+/// across that boundary. It knew about `_Complex` and about an x87 `long
+/// double` aggregate, and missed a third shape: AAPCS64 returns a homogeneous
+/// floating-point aggregate in registers at **any** size -- four `double`s is
+/// thirty-two bytes and still comes back in `d0`-`d3` -- but the check was
+/// gated behind the two-register return path, which stops at 128 bits.
+///
+/// So on aarch64 every HFA past 128 bits was inlined, and the continuation
+/// phi-ed the returned *address* as though it were the aggregate. The caller
+/// then read the pointer's own storage as the struct's bytes and got a
+/// denormal. Only at -O2, because that is where the inliner's size threshold
+/// admits these functions.
+///
+/// Sizes either side of the old 128-bit cap are covered, along with the
+/// non-HFA aggregates of the same sizes -- those return through the hidden
+/// pointer, where inlining is correct and must keep working.
+#[test]
+fn codegen_inlined_register_returned_aggregate() {
+    let code = r#"
+struct H2 { double v[2]; };     /* HFA, 16 bytes -- at the old cap    */
+struct H3 { double v[3]; };     /* HFA, 24 bytes -- past it           */
+struct H4 { double v[4]; };     /* HFA, 32 bytes -- past it           */
+struct F4 { float  v[4]; };     /* HFA of floats, 16 bytes            */
+struct L2 { long   v[2]; };     /* not an HFA, 16 bytes               */
+struct L4 { long   v[4]; };     /* not an HFA, 32 bytes -- sret       */
+struct M  { long a; double b; };/* mixed, 16 bytes                    */
+
+static struct H2 mk2(double s){ struct H2 r; for(int i=0;i<2;i++) r.v[i]=s+i; return r; }
+static struct H3 mk3(double s){ struct H3 r; for(int i=0;i<3;i++) r.v[i]=s+i; return r; }
+static struct H4 mk4(double s){ struct H4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct F4 mkf(float  s){ struct F4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct L2 mkl2(long  s){ struct L2 r; for(int i=0;i<2;i++) r.v[i]=s+i; return r; }
+static struct L4 mkl4(long  s){ struct L4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct M  mkm(long a, double b){ struct M r; r.a=a; r.b=b; return r; }
+
+/* Each check is its own small function, and `noinline` keeps it that way.
+   That is the point: the defect needs the *maker* inlined into its caller, and
+   the inliner's growth limit declines to do that inside a caller that has
+   already absorbed several. Folding these into main hides the bug entirely --
+   the first version of this test did, and passed on aarch64 while it was live. */
+__attribute__((noinline)) static int c2(double s){
+    struct H2 b = mk2(s);
+    for (int i = 0; i < 2; i++) if (b.v[i] != s + i) return 1;
+    return 0; }
+__attribute__((noinline)) static int c3(double s){
+    struct H3 b = mk3(s);
+    for (int i = 0; i < 3; i++) if (b.v[i] != s + i) return 2;
+    return 0; }
+__attribute__((noinline)) static int c4(double s){
+    struct H4 b = mk4(s);
+    for (int i = 0; i < 4; i++) if (b.v[i] != s + i) return 3;
+    return 0; }
+__attribute__((noinline)) static int cf(float s){
+    struct F4 b = mkf(s);
+    for (int i = 0; i < 4; i++) if (b.v[i] != s + i) return 4;
+    return 0; }
+__attribute__((noinline)) static int cl2(long s){
+    struct L2 b = mkl2(s);
+    for (int i = 0; i < 2; i++) if (b.v[i] != s + i) return 5;
+    return 0; }
+__attribute__((noinline)) static int cl4(long s){
+    struct L4 b = mkl4(s);
+    for (int i = 0; i < 4; i++) if (b.v[i] != s + i) return 6;
+    return 0; }
+__attribute__((noinline)) static int cm(void){
+    struct M b = mkm(7, 2.5);
+    if (b.a != 7 || b.b != 2.5) return 7;
+    return 0; }
+
+/* Each maker below is called from exactly one place. A maker with several
+   call sites is judged differently by the inliner's growth heuristic and stops
+   being inlined at all, which takes the defect with it. */
+static struct H4 mk4b(double s){ struct H4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct H3 mk3b(double s){ struct H3 r; for(int i=0;i<3;i++) r.v[i]=s+i; return r; }
+static struct H4 mk4c(double s){ struct H4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct H4 mk4d(double s){ struct H4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+
+/* Consumed in place rather than stored to a named local. */
+__attribute__((noinline)) static int cdirect(double s){
+    if (mk4b(s).v[2] != s + 2) return 8;
+    return 0; }
+__attribute__((noinline)) static int cdirect3(double s){
+    if (mk3b(s).v[1] != s + 1) return 9;
+    return 0; }
+
+/* Two live at once: each return site needs its own destination. */
+__attribute__((noinline)) static int ctwo(void){
+    struct H4 a = mk4c(10.5), b = mk4d(20.5);
+    if (a.v[0] != 10.5 || b.v[0] != 20.5) return 10;
+    if (a.v[3] != 13.5 || b.v[3] != 23.5) return 11;
+    return 0; }
+
+int main(void) {
+    int r;
+    if ((r = c2(1.5)))    return r;
+    if ((r = c3(1.5)))    return r;
+    if ((r = c4(1.5)))    return r;
+    if ((r = cf(1.5f)))   return r;
+    if ((r = cl2(10)))    return r;
+    if ((r = cl4(10)))    return r;
+    if ((r = cm()))       return r;
+    if ((r = cdirect(1.5))) return r;
+    if ((r = cdirect3(1.5))) return r;
+    if ((r = ctwo()))     return r;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("inlined_reg_return_aggregate", code, &[]),
+        0
+    );
+    // Explicitly -O2: `compile_and_run_optimized` builds at -O1, and the
+    // inliner's size threshold only admits these makers at -O2, so the helper
+    // alone never reaches the defect.
+    assert_eq!(
+        compile_and_run(
+            "inlined_reg_return_aggregate_o2",
+            code,
+            &["-O2".to_string()]
+        ),
+        0
+    );
+}
+
+/// An over-aligned frame's base register is not one the inline asm claims.
+///
+/// `FrameBase::Aligned` withholds its register from `allocatable_regs`, but
+/// inline asm bypasses allocation on both counts: a constraint letter pins an
+/// operand to a fixed register outright, and a clobber only reaches the
+/// constraint points, which spill *pseudos* -- and the frame base is not a
+/// pseudo. The prologue writes it once and every local is addressed from it
+/// for the rest of the body, so an `asm` naming it invalidated all of them at
+/// a stroke.
+///
+/// Hard-coding `%rbx` made both spellings below segfault on code gcc compiles
+/// without complaint. Asserted behaviourally rather than by naming the
+/// register the compiler ought to pick instead -- which register is free is
+/// exactly what the fix computes.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn codegen_over_aligned_frame_base_avoids_asm_registers() {
+    let code = r#"
+int main(void) {
+    __attribute__((aligned(32))) int arr[8];
+    for (int i = 0; i < 8; i++) arr[i] = i * i;
+
+    /* An explicit clobber of the register the base used to be hard-coded to. */
+    unsigned long a;
+    __asm__ volatile("movq $4660, %%rbx\n\tmovq %%rbx, %0" : "=r"(a) : : "rbx");
+
+    /* And the other spelling: a "b" constraint pins the operand to %rbx
+       without any clobber list at all. */
+    unsigned long b;
+    __asm__ volatile("movq %1, %0" : "=r"(b) : "b"(22136UL));
+
+    /* The locals must have survived both. */
+    int sum = 0;
+    for (int i = 0; i < 8; i++) sum += arr[i];
+    if (sum != 140) return 1;
+    if (a != 4660) return 2;
+    if (b != 22136) return 3;
+    if (((unsigned long)arr & 31) != 0) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("frame_base_vs_asm", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("frame_base_vs_asm_opt", code), 0);
+}
+
+/// The aarch64 twin of `codegen_over_aligned_frame_base_avoids_asm_registers`.
+///
+/// `FrameBase::Aligned` hard-coded x19 there for the same reason x86-64
+/// hard-coded `%rbx`, and with the same consequence: the prologue writes the
+/// base once and every local is addressed from it, so an `asm` clobbering it
+/// invalidated all of them. gcc compiles this without complaint.
+///
+/// Separate from the x86-64 test rather than one test with a `cfg`-selected
+/// template, because the two need different asm and aarch64 has no constraint
+/// letter that pins a general register -- only the clobber spelling applies.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn codegen_over_aligned_frame_base_avoids_asm_registers_aarch64() {
+    let code = r#"
+int main(void) {
+    __attribute__((aligned(32))) int arr[8];
+    for (int i = 0; i < 8; i++) arr[i] = i * i;
+
+    unsigned long a;
+    __asm__ volatile("mov x19, #4660\n\tmov %0, x19" : "=r"(a) : : "x19");
+
+    int sum = 0;
+    for (int i = 0; i < 8; i++) sum += arr[i];
+    if (sum != 140) return 1;
+    if (a != 4660) return 2;
+    if (((unsigned long)arr & 31) != 0) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("frame_base_vs_asm_a64", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("frame_base_vs_asm_a64_opt", code),
+        0
+    );
+}

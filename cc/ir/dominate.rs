@@ -15,15 +15,88 @@
 use super::{BasicBlockId, Function};
 use std::collections::{HashMap, HashSet};
 
+/// The dominator tree of one function, as of the moment it was computed.
+///
+/// This used to live on the IR itself -- `idom`, `dom_level`, `dom_children`
+/// and `dom_frontier` on every `BasicBlock`, `max_dom_level` on the
+/// `Function` -- computed once during linearization and never recomputed.
+/// Inlining splices whole CFGs into callers and DCE deletes blocks, both
+/// afterwards, so from that point the fields described a control-flow graph
+/// that no longer existed. It was not a live defect only because nothing
+/// downstream read them; the first pass that did -- GVN or LICM, next on the
+/// roadmap -- would have read stale data and miscompiled silently.
+///
+/// Holding the answer in a value returned by the query makes that
+/// unrepresentable: a `DomTree` is a snapshot, a pass that changes the CFG
+/// drops it, and code that needs one asks again. There is no field to forget
+/// to invalidate.
+#[derive(Debug, Clone, Default)]
+pub struct DomTree {
+    /// Position of each block in the parallel vectors below.
+    index: HashMap<BasicBlockId, usize>,
+    idom: Vec<Option<BasicBlockId>>,
+    level: Vec<u32>,
+    children: Vec<Vec<BasicBlockId>>,
+    max_level: u32,
+}
+
+impl DomTree {
+    fn slot(&self, id: BasicBlockId) -> Option<usize> {
+        self.index.get(&id).copied()
+    }
+
+    /// The closest strict dominator of `id`, or `None` for the entry block and
+    /// for anything unreachable.
+    pub fn idom(&self, id: BasicBlockId) -> Option<BasicBlockId> {
+        self.slot(id).and_then(|i| self.idom[i])
+    }
+
+    /// Depth of `id` in the dominator tree; the entry block is 0.
+    pub fn level(&self, id: BasicBlockId) -> u32 {
+        self.slot(id).map(|i| self.level[i]).unwrap_or(0)
+    }
+
+    /// The blocks `id` immediately dominates.
+    pub fn children(&self, id: BasicBlockId) -> &[BasicBlockId] {
+        match self.slot(id) {
+            Some(i) => &self.children[i],
+            None => &[],
+        }
+    }
+
+    /// The deepest level in the tree.
+    pub fn max_level(&self) -> u32 {
+        self.max_level
+    }
+
+    /// Whether `a` dominates `b`.
+    #[cfg(test)]
+    pub fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
+        if a == b {
+            return true;
+        }
+        let mut current = b;
+        while let Some(idom) = self.idom(current) {
+            if idom == a {
+                return true;
+            }
+            current = idom;
+        }
+        false
+    }
+}
+
 const DEFAULT_POSTORDER_CAPACITY: usize = 16;
 const DEFAULT_IDF_CAPACITY: usize = 8;
 
 // Reverse Postorder Computation
 
 /// Compute reverse postorder numbering for all blocks.
-/// Returns a vector of block IDs in reverse postorder, and updates each block
-/// with its postorder number (stored temporarily in dom_level for now).
-fn compute_postorder(func: &mut Function) -> Vec<BasicBlockId> {
+///
+/// Returns the block IDs in reverse postorder. It used to also stash each
+/// block's postorder number in `dom_level` "temporarily"; nothing ever read
+/// that, and the level computation below overwrote it.
+fn compute_postorder(func: &Function) -> Vec<BasicBlockId> {
     let mut visited = HashSet::with_capacity(DEFAULT_POSTORDER_CAPACITY);
     let mut postorder = Vec::with_capacity(DEFAULT_POSTORDER_CAPACITY);
 
@@ -49,19 +122,6 @@ fn compute_postorder(func: &mut Function) -> Vec<BasicBlockId> {
 
     dfs(func, func.entry, &mut visited, &mut postorder);
 
-    // Assign postorder numbers
-    let mut postorder_map = HashMap::with_capacity(postorder.len());
-    for (i, &bb_id) in postorder.iter().enumerate() {
-        postorder_map.insert(bb_id, i as u32);
-    }
-
-    // Store postorder numbers in blocks (temporarily in dom_level)
-    for bb in &mut func.blocks {
-        if let Some(&nr) = postorder_map.get(&bb.id) {
-            bb.dom_level = nr;
-        }
-    }
-
     // Reverse to get reverse postorder
     postorder.reverse();
     postorder
@@ -74,20 +134,30 @@ fn compute_postorder(func: &mut Function) -> Vec<BasicBlockId> {
 /// Uses the algorithm from:
 /// "A simple, fast dominance algorithm" by K. D. Cooper, T. J. Harvey, and K. Kennedy
 ///
-/// This populates:
-/// - `bb.idom` - immediate dominator for each block
-/// - `bb.dom_level` - depth in dominator tree
-/// - `bb.dom_children` - blocks immediately dominated by this block
-pub fn domtree_build(func: &mut Function) {
+/// The result is returned rather than written into the blocks, so it cannot
+/// outlive the CFG it describes -- see [`DomTree`].
+pub fn domtree_build(func: &Function) -> DomTree {
+    let mut dom = DomTree {
+        index: func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, bb)| (bb.id, i))
+            .collect(),
+        idom: vec![None; func.blocks.len()],
+        level: vec![0; func.blocks.len()],
+        children: vec![Vec::new(); func.blocks.len()],
+        max_level: 0,
+    };
     if func.blocks.is_empty() {
-        return;
+        return dom;
     }
 
     // Step 1: Compute reverse postorder
     let rpo = compute_postorder(func);
     let size = rpo.len();
     if size == 0 {
-        return;
+        return dom;
     }
 
     // Create postorder number lookup
@@ -176,14 +246,8 @@ pub fn domtree_build(func: &mut Function) {
         nr_to_bb.insert(nr, bb_id);
     }
 
-    // Clear old dominator info
-    for bb in &mut func.blocks {
-        bb.idom = None;
-        bb.dom_children.clear();
-    }
-
     // Set idom links
-    for bb in &mut func.blocks {
+    for (i, bb) in func.blocks.iter().enumerate() {
         if bb.id == entry {
             continue;
         }
@@ -196,102 +260,39 @@ pub fn domtree_build(func: &mut Function) {
             if idom_nr != bb_nr {
                 // Map back to BasicBlockId
                 if let Some(&idom_id) = nr_to_bb.get(&idom_nr) {
-                    bb.idom = Some(idom_id);
+                    dom.idom[i] = Some(idom_id);
                 }
             }
         }
     }
 
     // Build dom_children lists
-    let idom_pairs: Vec<(BasicBlockId, BasicBlockId)> = func
-        .blocks
-        .iter()
-        .filter_map(|bb| bb.idom.map(|idom| (idom, bb.id)))
-        .collect();
-
-    for (idom_id, child_id) in idom_pairs {
-        if let Some(idom_bb) = func.get_block_mut(idom_id) {
-            idom_bb.dom_children.push(child_id);
+    for (i, bb) in func.blocks.iter().enumerate() {
+        if let Some(idom_id) = dom.idom[i] {
+            if let Some(&slot) = dom.index.get(&idom_id) {
+                dom.children[slot].push(bb.id);
+            }
         }
     }
 
-    // Compute dominator tree levels
-    // Entry is level 0, children are level+1
-    let mut max_level = 0u32;
+    // Compute dominator tree levels.
+    // Entry is level 0, children are level+1. Walking in reverse postorder
+    // means a block's idom already has its final level.
     for &bb_id in &rpo {
         let level = if bb_id == entry {
             0
         } else {
-            let idom_level = func
-                .get_block(bb_id)
-                .and_then(|bb| bb.idom)
-                .and_then(|idom_id| func.get_block(idom_id))
-                .map(|bb| bb.dom_level)
-                .unwrap_or(0);
-            idom_level + 1
+            dom.idom(bb_id).map(|i| dom.level(i)).unwrap_or(0) + 1
         };
-
-        if let Some(bb) = func.get_block_mut(bb_id) {
-            bb.dom_level = level;
+        if let Some(&slot) = dom.index.get(&bb_id) {
+            dom.level[slot] = level;
         }
-
-        if level > max_level {
-            max_level = level;
+        if level > dom.max_level {
+            dom.max_level = level;
         }
     }
 
-    func.max_dom_level = max_level;
-}
-
-// Dominance Frontier Computation
-
-/// Compute the dominance frontier for all blocks.
-///
-/// The dominance frontier of a block B is the set of blocks where B's dominance ends.
-/// More precisely: DF(B) = {D | B dominates a predecessor of D, but B does not strictly dominate D}
-///
-/// Uses the algorithm from Cytron et al.
-pub fn compute_dominance_frontiers(func: &mut Function) {
-    // Clear existing frontiers
-    for bb in &mut func.blocks {
-        bb.dom_frontier.clear();
-    }
-
-    // For each block
-    let block_ids: Vec<BasicBlockId> = func.blocks.iter().map(|bb| bb.id).collect();
-
-    for &bb_id in &block_ids {
-        // Get block's parents
-        let parents: Vec<BasicBlockId> = func
-            .get_block(bb_id)
-            .map(|bb| bb.parents.clone())
-            .unwrap_or_default();
-
-        // If block has multiple predecessors (join point)
-        if parents.len() >= 2 {
-            // Get block's immediate dominator
-            let idom = func.get_block(bb_id).and_then(|bb| bb.idom);
-
-            // For each predecessor
-            for pred_id in parents {
-                // Walk up the dominator tree from pred until we reach idom
-                let mut runner = Some(pred_id);
-                while runner.is_some() && runner != idom {
-                    let runner_id = runner.unwrap();
-
-                    // Add bb_id to runner's dominance frontier
-                    if let Some(runner_bb) = func.get_block_mut(runner_id) {
-                        if !runner_bb.dom_frontier.contains(&bb_id) {
-                            runner_bb.dom_frontier.push(bb_id);
-                        }
-                    }
-
-                    // Move up to idom
-                    runner = func.get_block(runner_id).and_then(|bb| bb.idom);
-                }
-            }
-        }
-    }
+    dom
 }
 
 // Iterated Dominance Frontier (IDF) Computation
@@ -341,8 +342,8 @@ impl LevelQueue {
 ///
 /// Uses the linear time algorithm from:
 /// "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
-pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId> {
-    if func.max_dom_level == 0 && func.blocks.len() > 1 {
+pub fn idf_compute(func: &Function, dom: &DomTree, alpha: &[BasicBlockId]) -> Vec<BasicBlockId> {
+    if dom.max_level() == 0 && func.blocks.len() > 1 {
         // Dominator tree not built
         return Vec::new();
     }
@@ -352,12 +353,12 @@ pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId>
     let mut in_alpha: HashSet<BasicBlockId> = alpha.iter().copied().collect();
     let mut idf = Vec::with_capacity(DEFAULT_IDF_CAPACITY);
 
-    let mut queue = LevelQueue::new(func.max_dom_level);
+    let mut queue = LevelQueue::new(dom.max_level());
 
     // Initialize: put all alpha blocks in the queue
     for &bb_id in alpha {
-        if let Some(bb) = func.get_block(bb_id) {
-            queue.push(bb_id, bb.dom_level);
+        if func.get_block(bb_id).is_some() {
+            queue.push(bb_id, dom.level(bb_id));
         }
     }
 
@@ -365,7 +366,7 @@ pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId>
     while let Some(x) = queue.pop() {
         visited.insert(x);
 
-        let x_level = func.get_block(x).map(|bb| bb.dom_level).unwrap_or(0);
+        let x_level = dom.level(x);
 
         // Get children (successors) of x
         let children: Vec<BasicBlockId> = func
@@ -375,13 +376,12 @@ pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId>
 
         for y in children {
             // Skip if y is dominated by x (not a J-edge)
-            let y_idom = func.get_block(y).and_then(|bb| bb.idom);
-            if y_idom == Some(x) {
+            if dom.idom(y) == Some(x) {
                 continue;
             }
 
             // y must be at same or lower level than x to be in DF
-            let y_level = func.get_block(y).map(|bb| bb.dom_level).unwrap_or(0);
+            let y_level = dom.level(y);
             if y_level > x_level {
                 continue;
             }
@@ -399,10 +399,7 @@ pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId>
         }
 
         // Visit dominator tree children
-        let dom_children: Vec<BasicBlockId> = func
-            .get_block(x)
-            .map(|bb| bb.dom_children.clone())
-            .unwrap_or_default();
+        let dom_children: Vec<BasicBlockId> = dom.children(x).to_vec();
 
         for child in dom_children {
             if !visited.contains(&child) {
@@ -410,6 +407,7 @@ pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId>
                 // For proper IDF, we need to visit subtree
                 visit_domtree(
                     func,
+                    dom,
                     child,
                     x_level,
                     &mut visited,
@@ -428,6 +426,7 @@ pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId>
 #[allow(clippy::too_many_arguments)]
 fn visit_domtree(
     func: &Function,
+    dom: &DomTree,
     bb_id: BasicBlockId,
     curr_level: u32,
     visited: &mut HashSet<BasicBlockId>,
@@ -446,13 +445,12 @@ fn visit_domtree(
 
     for y in children {
         // Skip if y is dominated by bb_id (not a J-edge)
-        let y_idom = func.get_block(y).and_then(|bb| bb.idom);
-        if y_idom == Some(bb_id) {
+        if dom.idom(y) == Some(bb_id) {
             continue;
         }
 
         // y must be at same or lower level
-        let y_level = func.get_block(y).map(|bb| bb.dom_level).unwrap_or(0);
+        let y_level = dom.level(y);
         if y_level > curr_level {
             continue;
         }
@@ -468,15 +466,12 @@ fn visit_domtree(
     }
 
     // Recurse into dominator tree children
-    let dom_children: Vec<BasicBlockId> = func
-        .get_block(bb_id)
-        .map(|bb| bb.dom_children.clone())
-        .unwrap_or_default();
+    let dom_children: Vec<BasicBlockId> = dom.children(bb_id).to_vec();
 
     for child in dom_children {
         if !visited.contains(&child) {
             visit_domtree(
-                func, child, curr_level, visited, in_idf, in_alpha, idf, queue,
+                func, dom, child, curr_level, visited, in_idf, in_alpha, idf, queue,
             );
         }
     }
@@ -531,132 +526,89 @@ mod tests {
 
     #[test]
     fn test_domtree_build() {
-        let mut func = make_test_cfg();
-        domtree_build(&mut func);
+        let func = make_test_cfg();
+        let dom = domtree_build(&func);
 
         // Entry should have no idom
-        let entry = func.get_block(BasicBlockId(0)).unwrap();
-        assert!(entry.idom.is_none());
-        assert_eq!(entry.dom_level, 0);
+        assert!(dom.idom(BasicBlockId(0)).is_none());
+        assert_eq!(dom.level(BasicBlockId(0)), 0);
 
         // bb1 and bb2 should have entry as idom
-        let bb1 = func.get_block(BasicBlockId(1)).unwrap();
-        assert_eq!(bb1.idom, Some(BasicBlockId(0)));
-        assert_eq!(bb1.dom_level, 1);
+        assert_eq!(dom.idom(BasicBlockId(1)), Some(BasicBlockId(0)));
+        assert_eq!(dom.level(BasicBlockId(1)), 1);
 
-        let bb2 = func.get_block(BasicBlockId(2)).unwrap();
-        assert_eq!(bb2.idom, Some(BasicBlockId(0)));
-        assert_eq!(bb2.dom_level, 1);
+        assert_eq!(dom.idom(BasicBlockId(2)), Some(BasicBlockId(0)));
+        assert_eq!(dom.level(BasicBlockId(2)), 1);
 
         // merge should have entry as idom (not bb1 or bb2)
-        let merge = func.get_block(BasicBlockId(3)).unwrap();
-        assert_eq!(merge.idom, Some(BasicBlockId(0)));
-        assert_eq!(merge.dom_level, 1);
+        assert_eq!(dom.idom(BasicBlockId(3)), Some(BasicBlockId(0)));
+        assert_eq!(dom.level(BasicBlockId(3)), 1);
 
         // exit should have merge as idom
-        let exit = func.get_block(BasicBlockId(4)).unwrap();
-        assert_eq!(exit.idom, Some(BasicBlockId(3)));
-        assert_eq!(exit.dom_level, 2);
-    }
-
-    #[test]
-    fn test_dominance_frontiers() {
-        let mut func = make_test_cfg();
-        domtree_build(&mut func);
-        compute_dominance_frontiers(&mut func);
-
-        // bb1's DF should be {merge} - bb1 dominates itself but not merge
-        let bb1 = func.get_block(BasicBlockId(1)).unwrap();
-        assert!(bb1.dom_frontier.contains(&BasicBlockId(3)));
-
-        // bb2's DF should be {merge}
-        let bb2 = func.get_block(BasicBlockId(2)).unwrap();
-        assert!(bb2.dom_frontier.contains(&BasicBlockId(3)));
-
-        // merge's DF should be empty
-        let merge = func.get_block(BasicBlockId(3)).unwrap();
-        assert!(merge.dom_frontier.is_empty());
+        assert_eq!(dom.idom(BasicBlockId(4)), Some(BasicBlockId(3)));
+        assert_eq!(dom.level(BasicBlockId(4)), 2);
     }
 
     #[test]
     fn test_idf_compute() {
-        let mut func = make_test_cfg();
-        domtree_build(&mut func);
+        let func = make_test_cfg();
+        let dom = domtree_build(&func);
 
         // IDF of {bb1} should be {merge}
-        let idf = idf_compute(&func, &[BasicBlockId(1)]);
+        let idf = idf_compute(&func, &dom, &[BasicBlockId(1)]);
         assert!(idf.contains(&BasicBlockId(3)));
 
         // IDF of {bb1, bb2} should be {merge}
-        let idf2 = idf_compute(&func, &[BasicBlockId(1), BasicBlockId(2)]);
+        let idf2 = idf_compute(&func, &dom, &[BasicBlockId(1), BasicBlockId(2)]);
         assert!(idf2.contains(&BasicBlockId(3)));
     }
 
     #[test]
     fn test_dominates() {
-        let mut func = make_test_cfg();
-        domtree_build(&mut func);
+        let func = make_test_cfg();
+        let dom = domtree_build(&func);
 
         // Entry dominates everything
-        assert!(func.dominates(BasicBlockId(0), BasicBlockId(0)));
-        assert!(func.dominates(BasicBlockId(0), BasicBlockId(1)));
-        assert!(func.dominates(BasicBlockId(0), BasicBlockId(2)));
-        assert!(func.dominates(BasicBlockId(0), BasicBlockId(3)));
-        assert!(func.dominates(BasicBlockId(0), BasicBlockId(4)));
+        assert!(dom.dominates(BasicBlockId(0), BasicBlockId(0)));
+        assert!(dom.dominates(BasicBlockId(0), BasicBlockId(1)));
+        assert!(dom.dominates(BasicBlockId(0), BasicBlockId(2)));
+        assert!(dom.dominates(BasicBlockId(0), BasicBlockId(3)));
+        assert!(dom.dominates(BasicBlockId(0), BasicBlockId(4)));
 
-        // bb1 only dominates itself
-        assert!(func.dominates(BasicBlockId(1), BasicBlockId(1)));
-        assert!(!func.dominates(BasicBlockId(1), BasicBlockId(3)));
-        assert!(!func.dominates(BasicBlockId(1), BasicBlockId(4)));
+        // bb1 dominates only itself
+        assert!(dom.dominates(BasicBlockId(1), BasicBlockId(1)));
+        assert!(!dom.dominates(BasicBlockId(1), BasicBlockId(3)));
+        assert!(!dom.dominates(BasicBlockId(1), BasicBlockId(4)));
 
         // merge dominates exit
-        assert!(func.dominates(BasicBlockId(3), BasicBlockId(4)));
-        assert!(!func.dominates(BasicBlockId(3), BasicBlockId(1)));
+        assert!(dom.dominates(BasicBlockId(3), BasicBlockId(4)));
+        assert!(!dom.dominates(BasicBlockId(3), BasicBlockId(1)));
     }
 
-    /// Test that domtree_build handles unreachable blocks gracefully.
-    /// Unreachable blocks have predecessors that weren't visited during DFS.
+    /// A tree is a snapshot: it describes the CFG it was built from.
+    ///
+    /// This is the property the old design could not have. The dominator data
+    /// lived on the blocks, was computed once during linearization, and was
+    /// never recomputed -- so after inlining spliced a CFG in or DCE deleted a
+    /// block, every reader got an answer about a graph that no longer existed.
+    /// Now the answer is a value, and asking again after the change is the
+    /// only way to get one.
     #[test]
-    fn test_domtree_with_unreachable_block() {
-        // Create a CFG with an unreachable block:
+    fn test_domtree_is_a_snapshot_of_the_cfg_it_was_built_from() {
+        let mut func = make_test_cfg();
+        let before = domtree_build(&func);
+        assert_eq!(before.idom(BasicBlockId(4)), Some(BasicBlockId(3)));
 
-        let types = TypeTable::new(&Target::host());
-        let mut func = Function::new("test", types.void_id);
+        // Re-route the exit so entry reaches it directly: exit's immediate
+        // dominator is now the entry, not the merge.
+        func.get_block_mut(BasicBlockId(0)).unwrap().children = vec![BasicBlockId(4)];
+        func.get_block_mut(BasicBlockId(4)).unwrap().parents = vec![BasicBlockId(0)];
 
-        let mut entry = BasicBlock::new(BasicBlockId(0));
-        entry.children = vec![BasicBlockId(1)];
-        entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::br(BasicBlockId(1)));
+        let after = domtree_build(&func);
+        assert_eq!(after.idom(BasicBlockId(4)), Some(BasicBlockId(0)));
 
-        let mut bb1 = BasicBlock::new(BasicBlockId(1));
-        // bb1 has both entry AND unreachable as predecessors
-        bb1.parents = vec![BasicBlockId(0), BasicBlockId(3)];
-        bb1.children = vec![BasicBlockId(2)];
-        bb1.add_insn(Instruction::br(BasicBlockId(2)));
-
-        let mut exit = BasicBlock::new(BasicBlockId(2));
-        exit.parents = vec![BasicBlockId(1)];
-        exit.add_insn(Instruction::ret(None));
-
-        // Unreachable block - not reachable from entry
-        let mut unreachable = BasicBlock::new(BasicBlockId(3));
-        unreachable.children = vec![BasicBlockId(1)];
-        unreachable.add_insn(Instruction::br(BasicBlockId(1)));
-
-        func.entry = BasicBlockId(0);
-        func.blocks = vec![entry, bb1, exit, unreachable];
-        func.rebuild_block_idx();
-
-        domtree_build(&mut func);
-
-        // Verify the reachable blocks have correct dominators
-        let entry_block = func.get_block(BasicBlockId(0)).unwrap();
-        assert!(entry_block.idom.is_none());
-
-        let bb1_block = func.get_block(BasicBlockId(1)).unwrap();
-        assert_eq!(bb1_block.idom, Some(BasicBlockId(0)));
-
-        let exit_block = func.get_block(BasicBlockId(2)).unwrap();
-        assert_eq!(exit_block.idom, Some(BasicBlockId(1)));
+        // The old tree still answers about the old graph -- it is a value, not
+        // a view, so nothing about it silently changed underneath.
+        assert_eq!(before.idom(BasicBlockId(4)), Some(BasicBlockId(3)));
     }
 }

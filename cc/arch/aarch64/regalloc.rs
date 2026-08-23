@@ -291,6 +291,36 @@ impl FrameBase {
     /// expression must stay in step with the one the Sym arm applies when it
     /// lays the slot out, or the frame would be padded for one alignment and
     /// addressed for another.
+    /// Registers this function's inline asm claims for itself.
+    ///
+    /// Both spellings count: an explicit clobber, and a constraint that pins an
+    /// operand to a fixed register. Withholding the frame base from
+    /// `allocatable_regs` covers neither -- an asm pin bypasses allocation, and
+    /// a clobber reaches only the constraint points, which spill *pseudos*. The
+    /// frame base is not a pseudo.
+    fn asm_claimed_regs(func: &Function) -> std::collections::BTreeSet<Reg> {
+        let mut claimed = std::collections::BTreeSet::new();
+        for block in &func.blocks {
+            for insn in &block.insns {
+                if insn.op != Opcode::Asm {
+                    continue;
+                }
+                let Some(ic) = build_asm_instr_constraints_aarch64(insn) else {
+                    continue;
+                };
+                claimed.extend(ic.clobbers.iter().copied());
+                for op in &ic.operands {
+                    if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) =
+                        &op.constraint
+                    {
+                        claimed.insert(*r);
+                    }
+                }
+            }
+        }
+        claimed
+    }
+
     fn of(func: &Function, types: &TypeTable) -> FrameBase {
         let align = func
             .locals
@@ -303,13 +333,50 @@ impl FrameBase {
             })
             .max()
             .unwrap_or(8);
-        if align > 16 {
-            FrameBase::Aligned {
-                reg: Reg::X19,
-                align,
+        if align <= 16 {
+            return FrameBase::Fp;
+        }
+
+        // The base must be callee-saved -- it has to survive the calls this
+        // function makes -- and it must be one the function's own inline asm
+        // has not named. The prologue writes it once and every local is
+        // addressed from it for the rest of the body, so an `asm` that clobbers
+        // it invalidates every local at a stroke: hard-coding x19 made
+        // `asm("..." ::: "x19")` beside an over-aligned array segfault on code
+        // gcc accepts.
+        let claimed = Self::asm_claimed_regs(func);
+        const CANDIDATES: [Reg; 10] = [
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+        ];
+        match CANDIDATES.iter().find(|r| !claimed.contains(r)) {
+            Some(&reg) => FrameBase::Aligned { reg, align },
+            None => {
+                // Nothing left to hold the aligned base. Refusing is the only
+                // honest answer; reusing a claimed register would corrupt every
+                // local in the function.
+                let pos = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.insns.iter())
+                    .find(|i| i.op == Opcode::Asm)
+                    .and_then(|i| i.pos)
+                    .unwrap_or_default();
+                crate::diag::error(
+                    pos,
+                    "inline asm claims every callee-saved register, leaving none \
+                     to address this function's over-aligned locals",
+                );
+                FrameBase::Fp
             }
-        } else {
-            FrameBase::Fp
         }
     }
 
@@ -733,9 +800,20 @@ impl IncomingOff {
     /// argument eight bytes low whenever an odd number of eight-byte slots
     /// came before it. Both sides shared the error, so it showed only against
     /// another compiler.
+    ///
+    /// Stage C rounds the NSAA -- the next stacked-argument *address*, whose
+    /// origin is the argument area's base -- so the rounding belongs to the
+    /// offset within that area, not to the frame displacement. The two differ
+    /// by the saved FP and LR pair, and rounding the displacement directly
+    /// charged an over-aligned argument for those 16 bytes and started it a
+    /// whole alignment unit too high. Only alignment past 16 can tell the two
+    /// apart, which is why this survived: below that the base is already a
+    /// multiple of the alignment. x86-64's `IncomingOff::take` is the same
+    /// shape and had the same defect.
     pub fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> Self {
         let align = align.max(8);
-        next.0 = (next.0 + align - 1) & !(align - 1);
+        let base = IncomingOff::FIRST.0;
+        next.0 = base + (((next.0 - base) + align - 1) & !(align - 1));
         let here = *next;
         next.0 += (bytes + 7) & !7;
         here
@@ -2153,6 +2231,63 @@ impl Default for RegAlloc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stacked arguments are laid out from the argument area's base, not from
+    /// the frame displacement.
+    ///
+    /// The two differ by the saved FP and LR pair, and rounding the displacement
+    /// directly charged an over-aligned argument for those 16 bytes: an
+    /// argument wanting 32-byte alignment and arriving first went to offset 32
+    /// instead of 16, one whole alignment unit past where the caller -- which
+    /// measures from its outgoing area's own base -- had written it.
+    ///
+    /// Only alignment past 16 can tell the two bases apart, since 16 is
+    /// already a multiple of 8 and of 16. The 8 and 16 cases are asserted so
+    /// that stays true.
+    #[test]
+    fn incoming_args_are_laid_out_from_the_area_base() {
+        let first = IncomingOff::FIRST.0;
+
+        // Alignment up to the base's own: unchanged, and packed at 8.
+        let mut next = IncomingOff::FIRST;
+        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
+        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first + 8);
+        assert_eq!(
+            IncomingOff::take(&mut next, 16, 16).displacement(),
+            first + 16
+        );
+
+        // A 16-aligned argument landing on an odd 8-byte slot still rounds.
+        let mut next = IncomingOff::FIRST;
+        assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
+        assert_eq!(
+            IncomingOff::take(&mut next, 16, 16).displacement(),
+            first + 16
+        );
+
+        // Past the base's alignment is where the bases diverge. Arriving
+        // first, an over-aligned argument must start *at* the base.
+        for align in [32, 64] {
+            let mut next = IncomingOff::FIRST;
+            assert_eq!(
+                IncomingOff::take(&mut next, align, align).displacement(),
+                first,
+                "an {align}-aligned argument arriving first starts at the area base"
+            );
+        }
+
+        // And after an 8-byte argument it rounds to the next multiple of its
+        // alignment measured from the base, not from the displacement.
+        for align in [32, 64] {
+            let mut next = IncomingOff::FIRST;
+            assert_eq!(IncomingOff::take(&mut next, 8, 8).displacement(), first);
+            assert_eq!(
+                IncomingOff::take(&mut next, align, align).displacement(),
+                first + align,
+                "an {align}-aligned argument rounds within the argument area"
+            );
+        }
+    }
 
     #[test]
     fn parse_gp_clobber_name_64bit_canonical() {

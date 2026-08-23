@@ -848,6 +848,127 @@ pub struct RegAlloc {
     live_out: Vec<HashSet<PseudoId>>,
     /// Maximum alignment requirement of any local variable (for dynamic stack alignment)
     max_local_align: i32,
+    /// How this function's locals are addressed.
+    frame_base: FrameBase,
+}
+
+/// How a function's locals are addressed.
+///
+/// The aarch64 allocator carries the same decision under the same name, and
+/// for the same reason: `%rbp`/`x29` is only guaranteed 16-byte aligned, so a
+/// local wanting more has to be reached from a base the prologue rounds up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBase {
+    /// The frame pointer. Every local is satisfied by the stack's own
+    /// alignment, so no register is spent.
+    Rbp,
+    /// `reg` holds the locals area's `align`-rounded start, and every local is
+    /// addressed from there. `reg` must not be allocatable.
+    ///
+    /// A register rather than `%rsp` itself, which is what this used to be.
+    /// `%rsp` is the right *value* -- the prologue's `andq` puts it exactly
+    /// here -- but it does not stay that value: `alloca` subtracts from it, and
+    /// every local in the function then moved out from under its own address.
+    /// A function needs no `alloca` of its own to be hit, because the inliner
+    /// splices callees that have one into callers that do not.
+    Aligned { reg: Reg, align: i32 },
+}
+
+impl FrameBase {
+    /// Registers this function's inline asm claims for itself.
+    ///
+    /// Both spellings count: an explicit clobber, and a constraint letter that
+    /// pins an operand to a fixed register. Withholding the frame base from
+    /// `allocatable_regs` does not cover either -- asm pins bypass allocation
+    /// entirely, and a clobber only reaches the constraint points, which spill
+    /// *pseudos*. The frame base is not a pseudo.
+    fn asm_claimed_regs(func: &Function) -> std::collections::BTreeSet<Reg> {
+        let mut claimed = std::collections::BTreeSet::new();
+        for block in &func.blocks {
+            for insn in &block.insns {
+                if insn.op != Opcode::Asm {
+                    continue;
+                }
+                let Some(ic) = build_asm_instr_constraints_x86_64(insn) else {
+                    continue;
+                };
+                claimed.extend(ic.clobbers.iter().copied());
+                for op in &ic.operands {
+                    if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) =
+                        &op.constraint
+                    {
+                        claimed.insert(*r);
+                    }
+                }
+            }
+        }
+        claimed
+    }
+
+    /// Decide from the function's declared locals.
+    ///
+    /// The alignment expression must stay in step with the one the `Sym` arm
+    /// applies when it lays a slot out, or the frame would be padded for one
+    /// alignment and addressed for another.
+    ///
+    /// The base must be callee-saved -- it has to survive the calls the
+    /// function makes -- and it must be one the function's own inline asm has
+    /// not claimed. The prologue writes it once and every local is addressed
+    /// from it for the rest of the body, so an `asm` that clobbers it or pins
+    /// an operand to it invalidates every local at a stroke: hard-coding `%rbx`
+    /// made `asm("..." ::: "rbx")` beside an over-aligned array segfault on
+    /// code gcc accepts.
+    fn of(func: &Function, types: &TypeTable) -> FrameBase {
+        let align = func
+            .locals
+            .values()
+            .map(|local| {
+                local
+                    .explicit_align
+                    .map(|a| a as i32)
+                    .unwrap_or_else(|| (types.alignment(local.typ) as i32).max(8))
+            })
+            .max()
+            .unwrap_or(8);
+        if align <= 16 {
+            return FrameBase::Rbp;
+        }
+
+        let claimed = Self::asm_claimed_regs(func);
+        // %rbp is the frame pointer and %rsp the stack pointer; the rest of the
+        // callee-saved set is fair game, in the order the allocator would reach
+        // for them last.
+        const CANDIDATES: [Reg; 5] = [Reg::Rbx, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+        match CANDIDATES.iter().find(|r| !claimed.contains(r)) {
+            Some(&reg) => FrameBase::Aligned { reg, align },
+            None => {
+                // Every candidate is spoken for. Refusing is the only honest
+                // answer: there is no register left to hold the aligned base,
+                // and silently reusing one would corrupt every local.
+                let pos = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.insns.iter())
+                    .find(|i| i.op == Opcode::Asm)
+                    .and_then(|i| i.pos)
+                    .unwrap_or_default();
+                crate::diag::error(
+                    pos,
+                    "inline asm claims every callee-saved register, leaving none \
+                     to address this function's over-aligned locals",
+                );
+                FrameBase::Rbp
+            }
+        }
+    }
+
+    /// The register held back from allocation, if any.
+    pub fn reg(self) -> Option<Reg> {
+        match self {
+            FrameBase::Rbp => None,
+            FrameBase::Aligned { reg, .. } => Some(reg),
+        }
+    }
 }
 
 /// Bytes reserved at the bottom of the locals area for the x87 scratch.
@@ -879,9 +1000,24 @@ impl IncomingOff {
 
     /// Reserve `bytes` for an argument of alignment `align`, returning where it
     /// starts and leaving `next` past its end.
+    ///
+    /// The rounding is applied to the offset **within the argument area**, not
+    /// to the `%rbp` displacement. They are not the same thing: the
+    /// displacement already carries the saved `%rbp` and the return address, so
+    /// rounding it directly charged an over-aligned argument for that 16 bytes
+    /// and started it a whole alignment unit too high. A 32-byte-aligned struct
+    /// arriving first went to `32(%rbp)` while the caller -- which measures
+    /// from the outgoing area's own base, correctly -- had written it at
+    /// `16(%rbp)`, so the callee read the second half of the struct and ran off
+    /// its end.
+    ///
+    /// It went unnoticed because it is invisible below 32-byte alignment: 16 is
+    /// already a multiple of 8 and of 16, so only an argument wanting more than
+    /// the area's own alignment can tell the two bases apart.
     fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> i32 {
         let align = align.max(8);
-        next.0 = (next.0 + align - 1) & !(align - 1);
+        let base = IncomingOff::FIRST.0;
+        next.0 = base + (((next.0 - base) + align - 1) & !(align - 1));
         let here = next.0;
         next.0 += (bytes + 7) & !7;
         here
@@ -911,6 +1047,7 @@ impl RegAlloc {
             live_in: Vec::new(),
             live_out: Vec::new(),
             max_local_align: 8,
+            frame_base: FrameBase::Rbp,
         }
     }
 
@@ -921,6 +1058,14 @@ impl RegAlloc {
         types: &TypeTable,
     ) -> crate::arch::regalloc::LocationMap<Loc> {
         self.reset_state();
+        // Before anything is coloured: the frame base claims a register, and
+        // every palette below has to be built without it.
+        self.frame_base = FrameBase::of(func, types);
+        if let Some(base) = self.frame_base.reg() {
+            self.free_regs.retain(|r| *r != base);
+            // The prologue writes it, so the function must save it.
+            self.used_callee_saved.push(base);
+        }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
@@ -1855,7 +2000,8 @@ impl RegAlloc {
         //       and the value would be lost).
         //   (c) NB: in-loop is NOT a forbidden constraint, only a
         //       preference (soft) — see preferred_palette below.
-        let caller_saved: Vec<Reg> = Reg::allocatable()
+        let allocatable = self.allocatable_regs();
+        let caller_saved: Vec<Reg> = allocatable
             .iter()
             .copied()
             .filter(|r| !r.is_callee_saved())
@@ -1899,7 +2045,7 @@ impl RegAlloc {
         // the prologue/epilogue when not needed).
         let caller_first: Vec<Reg> = {
             let mut v = caller_saved.clone();
-            for &r in Reg::allocatable() {
+            for &r in &allocatable {
                 if r.is_callee_saved() {
                     v.push(r);
                 }
@@ -1907,7 +2053,7 @@ impl RegAlloc {
             v
         };
         let callee_first: Vec<Reg> = {
-            let mut v: Vec<Reg> = Reg::allocatable()
+            let mut v: Vec<Reg> = allocatable
                 .iter()
                 .copied()
                 .filter(|r| r.is_callee_saved())
@@ -1924,7 +2070,7 @@ impl RegAlloc {
         let result = greedy_color(
             &graph,
             &order,
-            Reg::allocatable(),
+            &allocatable,
             &pre_colored,
             &forbidden,
             |v| {
@@ -2177,6 +2323,27 @@ impl RegAlloc {
         self.max_local_align
     }
 
+    /// How this function's locals are addressed.
+    pub fn frame_base(&self) -> FrameBase {
+        self.frame_base
+    }
+
+    /// The registers this function may colour with: the machine's allocatable
+    /// set, less whatever the frame has claimed for its base.
+    ///
+    /// Every consumer must come through here rather than reading
+    /// `Reg::allocatable()` -- the colourer builds its own preference orders,
+    /// and withholding the base from `free_regs` alone left it free to hand
+    /// out the very register the prologue overwrites.
+    fn allocatable_regs(&self) -> Vec<Reg> {
+        let claimed = self.frame_base.reg();
+        Reg::allocatable()
+            .iter()
+            .copied()
+            .filter(|r| Some(*r) != claimed)
+            .collect()
+    }
+
     /// Get callee-saved registers that need to be preserved
     pub fn callee_saved_used(&self) -> &[Reg] {
         &self.used_callee_saved
@@ -2192,6 +2359,57 @@ impl Default for RegAlloc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stacked arguments are laid out from the argument area's base, not from
+    /// the frame displacement.
+    ///
+    /// The two differ by the saved `%rbp` and the return address, and rounding the displacement
+    /// directly charged an over-aligned argument for those 16 bytes: an
+    /// argument wanting 32-byte alignment and arriving first went to offset 32
+    /// instead of 16, one whole alignment unit past where the caller -- which
+    /// measures from its outgoing area's own base -- had written it.
+    ///
+    /// Only alignment past 16 can tell the two bases apart, since 16 is
+    /// already a multiple of 8 and of 16. The 8 and 16 cases are asserted so
+    /// that stays true.
+    #[test]
+    fn incoming_args_are_laid_out_from_the_area_base() {
+        let first = IncomingOff::FIRST.0;
+
+        // Alignment up to the base's own: unchanged, and packed at 8.
+        let mut next = IncomingOff::FIRST;
+        assert_eq!(IncomingOff::take(&mut next, 8, 8), first);
+        assert_eq!(IncomingOff::take(&mut next, 8, 8), first + 8);
+        assert_eq!(IncomingOff::take(&mut next, 16, 16), first + 16);
+
+        // A 16-aligned argument landing on an odd 8-byte slot still rounds.
+        let mut next = IncomingOff::FIRST;
+        assert_eq!(IncomingOff::take(&mut next, 8, 8), first);
+        assert_eq!(IncomingOff::take(&mut next, 16, 16), first + 16);
+
+        // Past the base's alignment is where the bases diverge. Arriving
+        // first, an over-aligned argument must start *at* the base.
+        for align in [32, 64] {
+            let mut next = IncomingOff::FIRST;
+            assert_eq!(
+                IncomingOff::take(&mut next, align, align),
+                first,
+                "an {align}-aligned argument arriving first starts at the area base"
+            );
+        }
+
+        // And after an 8-byte argument it rounds to the next multiple of its
+        // alignment measured from the base, not from the displacement.
+        for align in [32, 64] {
+            let mut next = IncomingOff::FIRST;
+            assert_eq!(IncomingOff::take(&mut next, 8, 8), first);
+            assert_eq!(
+                IncomingOff::take(&mut next, align, align),
+                first + align,
+                "an {align}-aligned argument rounds within the argument area"
+            );
+        }
+    }
 
     #[test]
     fn parse_gp_clobber_name_64bit_canonical() {

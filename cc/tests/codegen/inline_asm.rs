@@ -1676,3 +1676,114 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("asm_two_gp_operands", code, &[]), 0);
 }
+
+/// An `asm goto` label reference is spelled the way its definition is.
+///
+/// A function whose identifier holds an extended character needs its local
+/// labels quoted, and `Label::name()` quotes them. The aarch64 operand builder
+/// hand-rolled `format!(".L{}_{}", ...)` instead, so the branch the template
+/// expanded to named `.Lf\u{e9}_1` while the block that defines it was emitted
+/// as `".Lf\u{e9}_1"` -- two spellings of one label, which the assembler reads
+/// as an undefined symbol.
+///
+/// Asserted as agreement rather than as a literal: the test does not care
+/// whether the label is quoted, only that both sites agree.
+#[test]
+fn codegen_asm_goto_label_matches_its_definition() {
+    use crate::codegen::asm_probe::{asm_for, AARCH64_LINUX, X86_64_LINUX};
+
+    let code = "
+int f\u{e9}(int x) {
+    __asm__ goto (\"b %l[done]\" : : : : done);
+    return 0;
+done:
+    return 1;
+}
+";
+
+    for triple in [AARCH64_LINUX, X86_64_LINUX] {
+        let asm = asm_for("asm_goto_label_quoting", triple, code);
+
+        // Every local label this function defines, exactly as written.
+        let defined: Vec<&str> = asm
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_suffix(':'))
+            .filter(|l| l.contains(".L") && l.contains("f\u{e9}"))
+            .collect();
+        assert!(
+            !defined.is_empty(),
+            "{triple}: no local labels defined:\n{asm}"
+        );
+
+        // Every branch target naming one of this function's local labels.
+        for line in asm.lines().map(str::trim) {
+            let Some(rest) = line
+                .strip_prefix("b ")
+                .or_else(|| line.strip_prefix("jmp "))
+            else {
+                continue;
+            };
+            let target = rest.trim();
+            if !target.contains("f\u{e9}") {
+                continue;
+            }
+            assert!(
+                defined.contains(&target),
+                "{triple}: branch to {target} but the definitions are {defined:?}:\n{asm}"
+            );
+        }
+    }
+}
+
+/// An `asm goto` label survives being inlined.
+///
+/// The label names a *block*, and it is the callee's block. The inliner
+/// remaps `bb_true`/`bb_false` and the pseudos inside the asm operands, but
+/// not `asm_data.goto_labels` -- so after inlining the label named whichever
+/// caller block happened to share the id. For a small callee that is the block
+/// holding the asm itself, and the branch became `b .Lmain_1` from inside
+/// `.Lmain_1`: the program jumped to its own address and hung.
+///
+/// This must be *run*, not read: the assembly was well-formed and the label
+/// was spelled correctly, which is all a text probe checks. Only executing it
+/// shows the branch going to the wrong place.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn codegen_inlined_asm_goto_branches_to_the_right_block() {
+    #[cfg(target_arch = "x86_64")]
+    let jump = "jmp %l[done]";
+    #[cfg(target_arch = "aarch64")]
+    let jump = "b %l[done]";
+
+    let code = format!(
+        r#"
+/* Small enough that the inliner takes it, which is the whole point. */
+static int taken(void) {{
+    __asm__ goto ("{jump}" : : : : done);
+    return 0;
+done:
+    return 1;
+}}
+
+/* The fallthrough arm: the asm does not branch, so the label is not used. */
+static int not_taken(void) {{
+    __asm__ goto ("" : : : : done);
+    return 0;
+done:
+    return 1;
+}}
+
+int main(void) {{
+    if (taken() != 1) return 1;
+    if (not_taken() != 0) return 2;
+    /* Twice, so a second inlining of the same callee is remapped too. */
+    if (taken() != 1) return 3;
+    if (taken() + not_taken() != 1) return 4;
+    return 0;
+}}
+"#
+    );
+    assert_eq!(compile_and_run("inlined_asm_goto", &code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("inlined_asm_goto_opt", &code), 0);
+}

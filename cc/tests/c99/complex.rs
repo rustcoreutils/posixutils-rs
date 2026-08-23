@@ -417,3 +417,352 @@ int main(void) {
         0
     );
 }
+
+/// A conditional whose result is complex.
+///
+/// Two defects met here. The parser held complex back from the usual
+/// arithmetic conversions, so `c ? 1 : z` typed as `int` and dropped the
+/// imaginary half outright while `c ? z : 1` did not -- the arm order decided
+/// the type. And the linearizer phi-ed the arms *by value* where a complex
+/// value travels by address everywhere else, so the merged pseudo's bits were
+/// dereferenced as a pointer and every complex conditional that reached
+/// codegen died, including the arm order that already typed correctly.
+///
+/// Both operators are covered: `?:` shares the shape and additionally has to
+/// evaluate its left operand exactly once.
+#[test]
+fn c99_complex_conditional() {
+    let code = r#"
+#include <complex.h>
+
+static int calls;
+static int nz(void) { return 1; }               /* opaque: defeats folding */
+static double _Complex f(double re) { calls++; return re + 1.0 * I; }
+
+static int eq(double _Complex a, double re, double im) {
+    return __real__ a == re && __imag__ a == im;
+}
+
+int main(void) {
+    int c = nz();
+    double _Complex z = 3.0 + 4.0 * I;
+    double _Complex w = 5.0 - 6.0 * I;
+    float _Complex fz = 1.0f + 2.0f * I;
+
+    /* The type is the common type whichever arm the complex one is. */
+    if (sizeof(c ? 1 : z) != sizeof(double _Complex)) return 1;
+    if (sizeof(c ? z : 1) != sizeof(double _Complex)) return 2;
+    if (sizeof(c ? 1 : z) != sizeof(c ? z : 1)) return 3;
+    /* Mixed precision widens to the greater, again either way round. */
+    if (sizeof(c ? fz : z) != sizeof(double _Complex)) return 4;
+    if (sizeof(c ? z : fz) != sizeof(double _Complex)) return 5;
+    /* A real arm against float _Complex stays float _Complex. */
+    if (sizeof(c ? 1.0f : fz) != sizeof(float _Complex)) return 6;
+
+    /* Both halves survive the merge, on both branches. */
+    if (!eq(c ? z : w, 3.0, 4.0)) return 10;
+    if (!eq(nz() - 1 ? z : w, 5.0, -6.0)) return 11;
+
+    /* A real arm is converted, not truncated to the real part of the other. */
+    if (!eq(c ? z : 1, 3.0, 4.0)) return 12;
+    if (!eq(c ? 1 : z, 1.0, 0.0)) return 13;
+    if (!eq(nz() - 1 ? 1 : z, 3.0, 4.0)) return 14;
+
+    /* Mixed precision reads the narrow arm with its own stride. */
+    if (!eq(c ? fz : z, 1.0, 2.0)) return 15;
+    if (!eq(nz() - 1 ? fz : z, 3.0, 4.0)) return 16;
+
+    /* A constant condition takes one arm outright. */
+    if (!eq(1 ? z : w, 3.0, 4.0)) return 17;
+    if (!eq(0 ? z : w, 5.0, -6.0)) return 18;
+    if (!eq(0 ? 1 : z, 3.0, 4.0)) return 19;
+
+    /* Consumed in place rather than stored: the result must be an address the
+       caller can read halves through. */
+    if (__real__ (c ? z : w) != 3.0) return 20;
+    if (!eq((c ? z : w) + (c ? w : z), 8.0, -2.0)) return 21;
+
+    /* GNU `?:` -- same merge, and the left operand evaluated exactly once. */
+    calls = 0;
+    if (!eq(f(3.0) ?: (7.0 + 8.0 * I), 3.0, 1.0)) return 30;
+    if (calls != 1) return 31;
+
+    /* f(0.0) is 0+1i, which is nonzero: the imaginary half counts. */
+    calls = 0;
+    if (!eq(f(0.0) ?: (7.0 + 8.0 * I), 0.0, 1.0)) return 32;
+    if (calls != 1) return 33;
+
+    /* Genuinely zero, so the right operand is taken -- still one call. */
+    calls = 0;
+    if (!eq(f(0.0) - 1.0 * I ?: (7.0 + 8.0 * I), 7.0, 8.0)) return 34;
+    if (calls != 1) return 35;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_conditional", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_conditional_opt", code),
+        0
+    );
+}
+
+/// A complex conditional is merged **by address**, and the type is named.
+///
+/// The behavioural test above proves the answers; this pins the shape that
+/// makes them right. A complex value travels by address everywhere in the
+/// linearizer, so the conditional's arms must reach the merge as addresses and
+/// the phi must be pointer-wide -- exactly what `return a;` already produced.
+/// Phi-ing the loaded 128-bit value instead is what got those bits
+/// dereferenced as a pointer.
+///
+/// Also asserted here: `_Complex` is a modifier rather than a kind, so the
+/// type speller dropped it and named `double _Complex` as plain `double` --
+/// in the IR dump and, more importantly, in every diagnostic.
+#[test]
+fn c99_complex_conditional_merges_by_address() {
+    use crate::common::run_c17;
+
+    let dir = tempfile::Builder::new()
+        .prefix("c17_complex_ir_")
+        .tempdir()
+        .expect("work dir");
+    let src = dir.path().join("t.c");
+    std::fs::write(
+        &src,
+        "double _Complex pick(int c, double _Complex a, double _Complex b)\n\
+         { return c ? a : b; }\n",
+    )
+    .expect("write source");
+
+    // An explicit target so "pointer width" is a known number.
+    let r = run_c17(&[
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--dump-ir",
+        "post-linearize",
+        "-o",
+        "/dev/null",
+        &src.to_string_lossy(),
+    ]);
+    let ir = format!("{}{}", r.stdout, r.stderr);
+
+    assert!(
+        ir.contains("phi.64"),
+        "the arms merge as addresses, so the phi is pointer-wide:\n{ir}"
+    );
+    assert!(
+        !ir.contains("phi.128"),
+        "a 128-bit phi means the arms were merged by value:\n{ir}"
+    );
+    assert!(
+        !ir.contains("load.128"),
+        "neither arm should load the complex object to merge it:\n{ir}"
+    );
+    assert!(
+        ir.contains("double _Complex"),
+        "the type speller must not drop the _Complex modifier:\n{ir}"
+    );
+}
+
+/// GNU `a ?: b` where only the *result* is complex.
+///
+/// The complex path was dispatched on the result type but then assumed the
+/// left operand was complex too. It need not be: the result is complex as soon
+/// as *either* operand is, so `d ?: z` has a `double` left operand and a
+/// `double _Complex` result.
+///
+/// Taking a real operand's address as though it were a complex object read the
+/// neighbouring stack slot as the imaginary half, and for an rvalue
+/// `rvalue_addr` hands back the value's own bits -- so `g() ?: z`
+/// dereferenced a `double` as a pointer and died. The truth test was wrong too:
+/// an `int` whose bits happen to spell `-0.0f` compared equal to zero.
+#[test]
+fn c99_complex_elvis_with_a_real_left_operand() {
+    let code = r#"
+#include <complex.h>
+
+static int calls;
+static double g(double v) { calls++; return v; }
+
+static int eq(double _Complex a, double re, double im) {
+    return __real__ a == re && __imag__ a == im;
+}
+
+int main(void) {
+    double _Complex z = 7.0 + 8.0 * I;
+
+    /* A real lvalue: the imaginary half must be zero, not the next slot. */
+    double d = 3.0;
+    if (!eq(d ?: z, 3.0, 0.0)) return 1;
+    if (sizeof(d ?: z) != sizeof(double _Complex)) return 2;
+
+    /* An integer lvalue, converted to the result's base type. */
+    int iv = 7;
+    if (!eq(iv ?: z, 7.0, 0.0)) return 3;
+
+    /* INT_MIN's bit pattern is -0.0f: a float compare against zero on the
+       raw bits would call this false and take the wrong arm. */
+    int neg = -2147483647 - 1;
+    if (!eq(neg ?: z, (double)neg, 0.0)) return 4;
+
+    /* A real *rvalue* has no address of its own to take. */
+    calls = 0;
+    if (!eq(g(2.5) ?: z, 2.5, 0.0)) return 5;
+    if (calls != 1) return 6;
+
+    /* Zero takes the right-hand operand -- still exactly one evaluation. */
+    calls = 0;
+    if (!eq(g(0.0) ?: z, 7.0, 8.0)) return 7;
+    if (calls != 1) return 8;
+
+    /* A complex left operand still works: the arm that already existed. */
+    calls = 0;
+    if (!eq(z ?: (1.0 + 2.0 * I), 7.0, 8.0)) return 9;
+
+    /* Mixed precision, real left operand. Checked in `float _Complex` rather
+       than through `eq`: passing a `float _Complex` argument to a
+       `double _Complex` parameter is separately broken, and routing through
+       it would test that instead of this. */
+    float _Complex fz = 1.0f + 2.0f * I;
+    float ff = 4.0f;
+    float _Complex fr = ff ?: fz;
+    if (__real__ fr != 4.0f || __imag__ fr != 0.0f) return 10;
+    if (sizeof(ff ?: fz) != sizeof(float _Complex)) return 11;
+
+    float fzero = 0.0f;
+    fr = fzero ?: fz;
+    if (__real__ fr != 1.0f || __imag__ fr != 2.0f) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_elvis_real_left", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_elvis_real_left_opt", code),
+        0
+    );
+}
+
+/// A complex value crossing a call boundary is converted to the precision the
+/// other side declared.
+///
+/// A complex value is read with its base type's stride, so the two sides must
+/// agree on which base type that is. Assignment, initialization and the binary
+/// operators all went through `complex_operand_at_precision`; the **argument**
+/// and **return** paths did not, and handed the storage over unconverted. A
+/// `float _Complex` given to a `double _Complex` parameter had the callee read
+/// an 8-byte-strided pair out of 4-byte-strided memory, so `1.0f + 2.0f*I`
+/// arrived as `2+1i` -- and the wider directions read past the object.
+#[test]
+fn c99_complex_precision_crosses_calls() {
+    let code = r#"
+#include <complex.h>
+
+static int eq(double re, double im, double want_re, double want_im) {
+    return re == want_re && im == want_im;
+}
+
+static int take_d(double _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
+static int take_f(float _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
+static int take_ld(long double _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
+
+/* noinline so the argument really crosses a call; the inlined form is
+   covered separately below. */
+__attribute__((noinline)) static int ni_d(double _Complex a) { return take_d(a); }
+__attribute__((noinline)) static int ni_f(float _Complex a) { return take_f(a); }
+
+static double _Complex widen(float _Complex x) { return x; }
+static float _Complex narrow(double _Complex x) { return x; }
+
+int main(void) {
+    float _Complex f = 1.0f + 2.0f * I;
+    double _Complex d = 1.0 + 2.0 * I;
+    long double _Complex l = 1.0L + 2.0L * I;
+
+    /* Every precision into every parameter width. */
+    if (!take_d(f)) return 1;
+    if (!take_d(d)) return 2;
+    if (!take_d(l)) return 3;
+    if (!take_f(d)) return 4;
+    if (!take_f(f)) return 5;
+    if (!take_f(l)) return 6;
+    if (!take_ld(f)) return 7;
+    if (!take_ld(d)) return 8;
+    if (!take_ld(l)) return 9;
+
+    /* Across a call the optimizer cannot fold away. */
+    if (!ni_d(f)) return 10;
+    if (!ni_f(d)) return 11;
+
+    /* Returns convert too, in both directions. */
+    double _Complex w = widen(f);
+    if (!eq(__real__ w, __imag__ w, 1.0, 2.0)) return 12;
+    float _Complex n = narrow(d);
+    if (!eq(__real__ n, __imag__ n, 1.0, 2.0)) return 13;
+
+    /* The paths that already worked, kept as regression guards. */
+    double _Complex a = f;
+    if (!eq(__real__ a, __imag__ a, 1.0, 2.0)) return 14;
+    double _Complex s = f + d;
+    if (!eq(__real__ s, __imag__ s, 2.0, 4.0)) return 15;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_precision_calls", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_precision_calls_opt", code),
+        0
+    );
+}
+
+/// An inlined function's `_Complex` parameter is copied through its address.
+///
+/// The implicit parameter copies that stand in for the backend prologue decide
+/// by *size* whether the caller's argument pseudo holds the value or a pointer
+/// to it. That is right for an aggregate -- `struct { float a, b; }` fits in a
+/// register and travels as its value -- and wrong for a `_Complex`, which
+/// travels by address at every size. The eight-byte `float _Complex` is exactly
+/// the same size as that struct, so it took the by-value path and the inlined
+/// body read the pointer as a pair of floats.
+///
+/// Only at -O2, where the inliner's threshold admits these functions.
+#[test]
+fn c99_inlined_complex_param_is_copied_through_its_address() {
+    let code = r#"
+#include <complex.h>
+
+/* Each taker has one call site: several change the inliner's answer. */
+static int t_f(float _Complex a) { return __real__ a == 1.0f && __imag__ a == 2.0f; }
+static int t_d(double _Complex a) { return __real__ a == 1.0 && __imag__ a == 2.0; }
+static int t_ld(long double _Complex a) { return __real__ a == 1.0L && __imag__ a == 2.0L; }
+
+/* The register-sized aggregate that must keep travelling by value. */
+struct F2 { float a, b; };
+static int t_s(struct F2 s) { return s.a == 1.0f && s.b == 2.0f; }
+
+int main(void) {
+    float _Complex f = 1.0f + 2.0f * I;
+    double _Complex d = 1.0 + 2.0 * I;
+    long double _Complex l = 1.0L + 2.0L * I;
+    struct F2 s;
+    s.a = 1.0f;
+    s.b = 2.0f;
+
+    if (!t_f(f)) return 1;
+    if (!t_d(d)) return 2;
+    if (!t_ld(l)) return 3;
+    if (!t_s(s)) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_inlined_complex_param", code, &[]), 0);
+    // Explicitly -O2: `compile_and_run_optimized` builds at -O1, and the
+    // inliner's size threshold only admits these functions at -O2, so the
+    // helper alone never reaches the defect.
+    assert_eq!(
+        compile_and_run("c99_inlined_complex_param_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

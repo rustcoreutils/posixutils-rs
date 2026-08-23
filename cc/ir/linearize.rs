@@ -1169,10 +1169,18 @@ impl<'a> Linearizer<'a> {
             // For struct/union types, we'll copy to a local later
             // so member access works properly
             let param_kind = self.types.kind(param.typ);
-            if param_kind == TypeKind::VaList {
+            if param_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                 // va_list parameters are special: due to array-to-pointer decay at call site,
                 // the actual value passed is a pointer to the va_list struct, not the struct itself.
                 // We'll handle this after function setup.
+                //
+                // Only where `va_list` is an array type. Where it is already a
+                // pointer -- Apple aarch64 -- nothing decays: the parameter
+                // *is* the va_list object, so it takes the ordinary scalar
+                // path and gets a slot of its own. `va_arg` needs that slot's
+                // address to advance it; handing it the pointer value instead
+                // made the first `va_arg` dereference the first variadic
+                // argument as though it were an address.
                 valist_params.push((name, param.symbol, param.typ, pseudo_id));
             } else if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
                 // Medium structs (9-16 bytes) with all-SSE classification are
@@ -1822,7 +1830,11 @@ impl<'a> Linearizer<'a> {
                     // va_list parameters are special: the parameter value IS already a pointer
                     // to the va_list structure (due to array-to-pointer decay at call site).
                     // Return the pointer value directly instead of spilling.
-                    if type_kind == TypeKind::VaList {
+                    //
+                    // Again only where `va_list` is an array. Where it is a
+                    // pointer, the object's address is the slot's, so the
+                    // parameter has to spill like any other.
+                    if type_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                         return param_pseudo;
                     }
 
@@ -2127,6 +2139,14 @@ impl<'a> Linearizer<'a> {
         // scalar path reinterpreted the address the complex value travels by
         // as the value itself, so `(double) z` produced a number in the range
         // of a pointer bit pattern.
+        // `_Bool` is the exception: 6.3.1.2 converts by comparing against 0,
+        // and for a complex value that comparison is against `0.0 + 0.0i`, so
+        // the imaginary half decides the answer too. Keeping only the real
+        // part here made `(_Bool)(0.0 + 3.0i)` false.
+        if self.types.is_complex(src_type) && self.types.kind(cast_type) == TypeKind::Bool {
+            return self.emit_complex_nonzero(inner_expr);
+        }
+
         if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
             return self.emit_complex_to_real(inner_expr, cast_type);
         }
@@ -2996,6 +3016,14 @@ impl<'a> Linearizer<'a> {
         for (arg_idx, a) in args.iter().enumerate() {
             let mut arg_type = self.expr_type(a);
             let arg_kind = self.types.kind(arg_type);
+            // Computed before the dispatch below so the complex-argument arm
+            // can be skipped for a `_Bool` parameter without re-borrowing.
+            let bool_param_for_complex_arg = formal_param_types
+                .as_ref()
+                .and_then(|params| params.get(arg_idx).copied())
+                .filter(|pt| {
+                    self.types.is_complex(arg_type) && self.types.kind(*pt) == TypeKind::Bool
+                });
             let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
                 && self.types.size_bits(arg_type) > 64
             {
@@ -3044,6 +3072,13 @@ impl<'a> Linearizer<'a> {
                 // hands back the temporary's address, so both cases are the
                 // same call.
                 self.linearize_lvalue(a)
+            } else if bool_param_for_complex_arg.is_some() {
+                // A complex argument bound to a `_Bool` parameter converts by
+                // comparing against zero, so it must not take the
+                // pass-the-address arm below -- see `complex_to_bool`.
+                let pt = bool_param_for_complex_arg.unwrap();
+                arg_types_vec.push(pt);
+                self.emit_complex_nonzero(a)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.
@@ -3525,6 +3560,26 @@ impl<'a> Linearizer<'a> {
                 64,
             ));
             result
+        } else if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+            && (self.types.is_complex(left_typ) || self.types.is_complex(right_typ))
+        {
+            // Equality on complex operands compares both halves. The arm below
+            // keys off the *result* type, which for a comparison is `int`, so
+            // this fell through to the scalar path -- where `is_float` is
+            // false for a complex type, so it emitted an integer compare over
+            // a 128-bit operand and answered from the real half alone.
+            let common = self.types.common_type(left_typ, right_typ);
+            let left_addr = if self.types.is_complex(left_typ) {
+                self.complex_operand_at_precision(left, common)
+            } else {
+                self.promote_real_to_complex(left, common)
+            };
+            let right_addr = if self.types.is_complex(right_typ) {
+                self.complex_operand_at_precision(right, common)
+            } else {
+                self.promote_real_to_complex(right, common)
+            };
+            self.emit_complex_equality(op, left_addr, right_addr, common)
         } else if self.types.is_complex(result_typ) {
             // Complex arithmetic: expand to real/imaginary operations
             // For complex types, we need addresses to load real/imag parts
@@ -3778,9 +3833,19 @@ impl<'a> Linearizer<'a> {
             return final_result;
         }
 
+        // `!z` on a complex operand is `z == 0`, and a complex value is zero
+        // only when both halves are. `emit_unary` compares a single value
+        // against a single zero, which cannot express that, so the negation is
+        // built from the shared truth-value conversion instead.
+        let operand_typ = self.expr_type(operand);
+        if op == UnaryOp::Not && self.types.is_complex(operand_typ) {
+            let nonzero = self.emit_complex_nonzero(operand);
+            let int_typ = self.types.int_id;
+            return self.emit_unary(UnaryOp::Not, nonzero, int_typ);
+        }
+
         let src = self.linearize_expr(operand);
         let result_typ = self.expr_type(expr);
-        let operand_typ = self.expr_type(operand);
         // For logical NOT, use operand type for comparison size
         let typ = if op == UnaryOp::Not {
             operand_typ
@@ -4034,9 +4099,7 @@ impl<'a> Linearizer<'a> {
 
         if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) && size <= 64 {
             // Pure: use Select instruction (enables cmov/csel)
-            let cond_val = self.linearize_expr(cond);
-            let cond_typ = self.expr_type(cond);
-            let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+            let cond_bool = self.linearize_condition(cond);
             let mut then_val = self.linearize_expr(then_expr);
             let mut else_val = self.linearize_expr(else_expr);
 
@@ -4056,9 +4119,7 @@ impl<'a> Linearizer<'a> {
             let else_bb = self.alloc_bb();
             let merge_bb = self.alloc_bb();
 
-            let cond_val = self.linearize_expr(cond);
-            let cond_typ = self.expr_type(cond);
-            let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+            let cond_bool = self.linearize_condition(cond);
             let cond_end_bb = self.current_bb.unwrap();
 
             self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));

@@ -115,19 +115,43 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit_sret_return(e, sret_ptr, self.struct_return_size);
                     } else if let Some(ret_type) = self.two_reg_return_type {
                         self.emit_two_reg_return(e, ret_type);
-                    } else if self.types.is_complex(expr_typ) {
+                    } else if let Some(b) = self.complex_to_bool(e, func_ret_type) {
+                        // Ahead of the complex arm below: that one keys off the
+                        // *expression* being complex and returns its address,
+                        // which for a `_Bool` function returned the address as
+                        // the answer.
+                        let typ_size = self.types.size_bits(func_ret_type);
+                        self.emit(Instruction::ret_typed(Some(b), func_ret_type, typ_size));
+                    } else if self.types.is_complex(expr_typ)
+                        && self.types.is_complex(func_ret_type)
+                    {
                         let addr = self.complex_operand_addr(e);
                         let typ_size = self.types.size_bits(func_ret_type);
                         self.emit(Instruction::ret_typed(Some(addr), func_ret_type, typ_size));
+                    } else if self.types.is_complex(expr_typ) {
+                        // A complex value returned from a real-typed function
+                        // keeps its real part (C17 6.3.1.7p2). This arm used to
+                        // be reached on the expression's type alone, so it
+                        // returned the *address* the complex travels by as the
+                        // answer -- `double f(double _Complex z){return z;}`
+                        // gave a pointer bit pattern.
+                        let real = self.emit_complex_to_real(e, func_ret_type);
+                        let typ_size = self.types.size_bits(func_ret_type);
+                        self.emit(Instruction::ret_typed(Some(real), func_ret_type, typ_size));
                     } else {
-                        let val = self.linearize_expr(e);
-                        // Convert expression value to function's return type if needed
-                        let converted_val = if expr_typ != func_ret_type
-                            && self.types.kind(func_ret_type) != TypeKind::Void
-                        {
-                            self.emit_convert(val, expr_typ, func_ret_type)
-                        } else {
-                            val
+                        let converted_val = match self.complex_to_bool(e, func_ret_type) {
+                            Some(b) => b,
+                            None => {
+                                let val = self.linearize_expr(e);
+                                // Convert to the function's return type if needed
+                                if expr_typ != func_ret_type
+                                    && self.types.kind(func_ret_type) != TypeKind::Void
+                                {
+                                    self.emit_convert(val, expr_typ, func_ret_type)
+                                } else {
+                                    val
+                                }
+                            }
                         };
                         // Function types decay to pointers when returned
                         let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
@@ -299,6 +323,40 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
 
+            // C17 6.2.2p4: an identifier declared `extern` inside a function
+            // refers to an object with external linkage; it declares no
+            // storage of its own. A function declared in a block has external
+            // linkage too (6.2.2p5), spelled `extern` or not.
+            //
+            // Falling through to the automatic-storage path below gave both a
+            // stack slot and, worse, an entry in `self.locals`, which is what
+            // every later reference consults -- so `extern int g;` read the
+            // frame instead of `g`, and writes through it never reached the
+            // object. Leaving the name out of `self.locals` is the whole fix:
+            // `linearize_ident` and the store paths already treat an unknown
+            // name as a global.
+            //
+            // The file-scope twin in `linearize_init.rs` has always done this.
+            let is_block_scope_function = self.types.kind(typ) == TypeKind::Function;
+            if declarator.storage_class.contains(TypeModifiers::EXTERN) || is_block_scope_function {
+                // Mirror the file-scope path: record the reference so codegen
+                // reaches the object the way an undefined symbol must be
+                // reached -- through the GOT on macOS, and through the TLS
+                // sequence for `extern _Thread_local`. A name this unit also
+                // defines is not external, so it is left alone.
+                let name = self.symbol_name(declarator.symbol).to_string();
+                if !is_block_scope_function && !self.module.globals.iter().any(|g| g.name == name) {
+                    self.module.extern_symbols.insert(name.clone());
+                    if declarator
+                        .storage_class
+                        .contains(TypeModifiers::THREAD_LOCAL)
+                    {
+                        self.module.extern_tls_symbols.insert(name);
+                    }
+                }
+                continue;
+            }
+
             // Check if this is a VLA (Variable Length Array).
             //
             // Run-time extents alone do not make one: in `int (*p)[n]` they
@@ -426,10 +484,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64);
                     } else {
                         // Simple scalar initializer
-                        let val = self.linearize_expr(init);
-                        // Convert the value to the target type (important for _Bool normalization)
                         let init_type = self.expr_type(init);
-                        let converted = self.emit_convert(val, init_type, typ);
+                        let converted = match self.complex_to_bool(init, typ) {
+                            Some(b) => b,
+                            None => {
+                                let val = self.linearize_expr(init);
+                                // Convert the value to the target type
+                                // (important for _Bool normalization)
+                                self.emit_convert(val, init_type, typ)
+                            }
+                        };
                         let size = self.types.size_bits(typ);
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
@@ -1067,7 +1131,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     pub(crate) fn linearize_if(&mut self, cond: &Expr, then_stmt: &Stmt, else_stmt: Option<&Stmt>) {
-        let cond_val = self.linearize_expr(cond);
+        let cond_val = self.linearize_condition(cond);
 
         let then_bb = self.alloc_bb();
         let else_bb = self.alloc_bb();
@@ -1119,7 +1183,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Condition block
         self.switch_bb(cond_bb);
-        let cond_val = self.linearize_expr(cond);
+        let cond_val = self.linearize_condition(cond);
         // After linearizing condition, current_bb may be different from cond_bb
         // (e.g., if condition contains short-circuit operators like && or ||).
         // Link the CURRENT block to body_bb and exit_bb.
@@ -1183,7 +1247,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Condition block
         self.switch_bb(cond_bb);
-        let cond_val = self.linearize_expr(cond);
+        let cond_val = self.linearize_condition(cond);
         // After linearizing condition, current_bb may be different from cond_bb
         // (e.g., if condition contains short-circuit operators like && or ||).
         // Link the CURRENT block to body_bb and exit_bb.
@@ -1233,7 +1297,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Condition block
         self.switch_bb(cond_bb);
         if let Some(cond_expr) = cond {
-            let cond_val = self.linearize_expr(cond_expr);
+            let cond_val = self.linearize_condition(cond_expr);
             // After linearizing condition, current_bb may be different from cond_bb
             // (e.g., if condition contains short-circuit operators like && or ||).
             // Link the CURRENT block to body_bb and exit_bb.
@@ -2193,7 +2257,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.continue_targets.pop();
 
                 self.switch_bb(cond_bb);
-                let cond_val = self.linearize_expr(cond);
+                let cond_val = self.linearize_condition(cond);
                 if let Some(cond_end_bb) = self.current_bb {
                     self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
                     self.link_bb(cond_end_bb, body_bb);
@@ -2216,7 +2280,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
 
                 self.switch_bb(cond_bb);
-                let cond_val = self.linearize_expr(cond);
+                let cond_val = self.linearize_condition(cond);
                 if let Some(cond_end_bb) = self.current_bb {
                     self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
                     self.link_bb(cond_end_bb, body_bb);
@@ -2272,7 +2336,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                 self.switch_bb(cond_bb);
                 if let Some(cond_expr) = cond {
-                    let cond_val = self.linearize_expr(cond_expr);
+                    let cond_val = self.linearize_condition(cond_expr);
                     if let Some(cond_end_bb) = self.current_bb {
                         self.emit(Instruction::cbr(cond_val, body_bb, exit_bb));
                         self.link_bb(cond_end_bb, body_bb);
@@ -2341,7 +2405,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     merge_bb
                 };
 
-                let cond_val = self.linearize_expr(cond);
+                let cond_val = self.linearize_condition(cond);
                 if let Some(current) = self.current_bb {
                     self.emit(Instruction::cbr(cond_val, then_bb, else_bb));
                     self.link_bb(current, then_bb);

@@ -3793,6 +3793,52 @@ fn diagnostics_shared_constant_folder_answers_alike() {
 /// it -- `(unsigned)-1 % 7u` was 4294967295 rather than 3, and a cast did not
 /// convert at all: `(unsigned char)-1` was -1, `(short)70000` was 70000. Each
 /// value below is gcc's. Recorded at #C126.
+/// The folder has to read a constant at the operand's width, in the
+/// signedness the *opcode* implies. An `i128` in the IR holds whatever bit
+/// pattern the front end built -- `(int)0xFFFFFFFFu` emits no instruction at
+/// all, so the constant still reads 4294967295 while every consumer now
+/// treats it as a signed `int`.
+///
+/// Division, remainder and the ordering comparisons are the operations that
+/// notice: unlike add/sub/mul they are not congruent modulo 2^n, so they read
+/// the whole value and its sign. Everything here is correct at `-O0` and was
+/// wrong at `-O`, which is what localizes it to the folder.
+#[test]
+fn diagnostics_signed_constants_fold_at_their_own_width() {
+    let code = "int main(void) {\n\
+         /* signed division and remainder of a same-width cast constant */\n\
+         if ((int)0xFFFFFFFFu / 2 != 0) return 1;\n\
+         if ((int)0xFFFFFFFFu % 3 != -1) return 2;\n\
+         if ((int)0x80000000u / 2 != -1073741824) return 3;\n\
+         if ((int)0x80000000u % 7 != -2) return 4;\n\
+         /* the same value, spelled as a negative literal, must agree */\n\
+         if ((-1) / 2 != 0) return 5;\n\
+         if ((-1) % 3 != -1) return 6;\n\
+         /* signed ordering comparisons */\n\
+         if (!((int)0xFFFFFFFFu < 0)) return 7;\n\
+         if (!((int)0xFFFFFFFFu <= -1)) return 8;\n\
+         if (!((int)0xFFFFFFFFu == -1)) return 9;\n\
+         if ((int)0xFFFFFFFFu > 0) return 10;\n\
+         if ((int)0xFFFFFFFFu >= 0) return 11;\n\
+         /* unsigned operators on the same bits must stay unsigned */\n\
+         if (0xFFFFFFFFu / 2u != 2147483647u) return 12;\n\
+         if (0xFFFFFFFFu % 3u != 0u) return 13;\n\
+         if (0xFFFFFFFFu < 1u) return 14;\n\
+         if (!(0xFFFFFFFFu > 1u)) return 15;\n\
+         /* 64-bit, where the narrowing is not to 32 */\n\
+         if ((long long)0xFFFFFFFFFFFFFFFFull / 2 != 0) return 16;\n\
+         if ((long long)0xFFFFFFFFFFFFFFFFull < 0 ? 0 : 1) return 17;\n\
+         /* narrower operands promote to int before dividing */\n\
+         if ((signed char)-1 / 2 != 0) return 18;\n\
+         if ((short)-1 % 3 != -1) return 19;\n\
+         return 0;\n\
+         }\n";
+    assert_eq!(
+        compile_and_run("signed_constants_fold_at_their_own_width", code, &[]),
+        0
+    );
+}
+
 #[test]
 fn diagnostics_constants_fold_at_their_own_width() {
     assert_eq!(

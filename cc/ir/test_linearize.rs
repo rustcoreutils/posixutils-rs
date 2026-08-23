@@ -138,7 +138,8 @@ fn test_parameter_stored_to_local() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the store into the parameter's local is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // The parameter should be stored to a local variable
@@ -1335,7 +1336,8 @@ fn test_pre_increment() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the store of the incremented value is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // Pre-increment should produce add instruction
@@ -2758,7 +2760,8 @@ fn test_string_literal_char_pointer_init() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the store of the string address is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // Should have a store instruction for the pointer (storing the string address)
@@ -4976,7 +4979,8 @@ fn test_valist_parameter_stored_as_pointer() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the width of the parameter's store is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // The va_list parameter should be stored with .64 (pointer size),
@@ -5114,7 +5118,8 @@ fn test_valist_expression_decay() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the load of the va pointer is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // The cast from va_list to pointer should involve loading the va pointer
@@ -5985,14 +5990,11 @@ fn test_atomic_compound_assign_uses_fetch_add() {
         1,
         "expected exactly one AtomicFetchAdd"
     );
-    // The non-atomic control emits load / add / store. The atomic version
-    // must emit neither the load nor the store -- one instruction replaces
-    // all three. (A plain Store remains in both: the parameter prologue.)
-    let (_c, control) = compound_module(AssignOp::AddAssign, false);
-    assert!(
-        count_op(&control, Opcode::Load) > 0,
-        "control should load the object"
-    );
+    // One instruction replaces the load / add / store the plain shape would
+    // need, so neither a plain Load nor a plain Store of the object may
+    // survive. Asserted directly rather than by differencing against the
+    // non-atomic control: the control's object is promotable, so SSA leaves
+    // it with no memory operations at all to difference against.
     assert_eq!(
         count_op(&module, Opcode::Load),
         0,
@@ -6000,8 +6002,17 @@ fn test_atomic_compound_assign_uses_fetch_add() {
     );
     assert_eq!(
         count_op(&module, Opcode::Store),
-        count_op(&control, Opcode::Store) - 1,
-        "the object's store must have become atomic"
+        1,
+        "the one plain Store left is the parameter prologue; the object's own \
+         store must have become atomic"
+    );
+    // The control is what makes the above mean something: the same function
+    // without `_Atomic` gets no atomic operation at all.
+    let (_c, control) = compound_module(AssignOp::AddAssign, false);
+    assert_eq!(
+        count_op(&control, Opcode::AtomicFetchAdd),
+        0,
+        "the non-atomic control must not become atomic"
     );
 
     // The operation is sequentially consistent and carries the object's width.
@@ -6081,12 +6092,17 @@ fn test_atomic_plain_assign_uses_atomic_store() {
     let (_ctx, module) = compound_module(AssignOp::Assign, true);
     assert_eq!(count_op(&module, Opcode::AtomicStore), 1);
 
-    let (_c, control) = compound_module(AssignOp::Assign, false);
     assert_eq!(
         count_op(&module, Opcode::Store),
-        count_op(&control, Opcode::Store) - 1,
-        "the object's store must have become atomic (the remaining plain \
-         Store is the parameter prologue, present in both)"
+        1,
+        "the one plain Store left is the parameter prologue; the object's own \
+         store must have become atomic"
+    );
+    let (_c, control) = compound_module(AssignOp::Assign, false);
+    assert_eq!(
+        count_op(&control, Opcode::AtomicStore),
+        0,
+        "the non-atomic control must not become atomic"
     );
 }
 
@@ -6522,4 +6538,233 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
         calls[0].src
     );
     assert_eq!(calls[0].arg_types.len(), calls[0].src.len());
+}
+
+/// A declaration inside a function body with `extern` declares no object: it
+/// refers to one with external linkage (C17 6.2.2p4). Falling through to the
+/// automatic-storage path gave it a stack slot *and* an entry in the
+/// linearizer's local map, and the local map is what every later reference
+/// consults -- so the read went to the frame instead of to the global.
+#[test]
+fn test_block_scope_extern_declares_no_local() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let g_sym = ctx.var("g", int_type);
+
+    // int test(void) { extern int g; return g; }
+    let body = Stmt::Block(vec![
+        BlockItem::Declaration(Declaration {
+            declarators: vec![crate::parse::ast::InitDeclarator {
+                symbol_attrs: Default::default(),
+                pos: Position::default(),
+                symbol: g_sym,
+                typ: int_type,
+                storage_class: crate::types::TypeModifiers::EXTERN,
+                init: None,
+                vla_sizes: vec![],
+                explicit_align: None,
+            }],
+        }),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+            g_sym, int_type,
+        ))))),
+    ]);
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![],
+        body,
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
+    let f = &module.functions[0];
+
+    assert!(
+        f.locals.is_empty(),
+        "an extern declaration must allocate no local: {:?}",
+        f.locals.keys().collect::<Vec<_>>()
+    );
+
+    // The reference must reach a bare-named global symbol, not the mangled
+    // `g.<id>` spelling a block-scope local would get.
+    let syms: Vec<&str> = f
+        .pseudos
+        .iter()
+        .filter_map(|p| match &p.kind {
+            crate::ir::PseudoKind::Sym(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        syms.contains(&"g"),
+        "the reference should name the global `g`, got {:?}",
+        syms
+    );
+    assert!(
+        !syms.iter().any(|s| s.starts_with("g.")),
+        "no mangled local should be created, got {:?}",
+        syms
+    );
+    assert!(
+        module.extern_symbols.contains("g"),
+        "the name must be recorded as external so codegen reaches it through \
+         the GOT on macOS, got {:?}",
+        module.extern_symbols
+    );
+}
+
+/// A branch condition has to be compared against zero the way its type says,
+/// not fed to `cbr` as a bit pattern. For a `double` that means `FCmpONe`
+/// against `0.0`, so `-0.0` is false; feeding the raw value tested the bit
+/// pattern, and `-0.0`'s is not zero.
+#[test]
+fn test_float_condition_compares_against_zero() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let dbl_type = ctx.types.double_id;
+    let d_sym = ctx.var("d", dbl_type);
+
+    // int test(double d) { if (d) return 1; return 0; }
+    let body = Stmt::Block(vec![
+        BlockItem::Statement(Box::new(Stmt::If {
+            cond: Expr::var_typed(d_sym, dbl_type),
+            then_stmt: Box::new(Stmt::Return(Some(Expr::int(1, &ctx.types)))),
+            else_stmt: None,
+        })),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
+    ]);
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(d_sym),
+            typ: dbl_type,
+            vm_dims: vec![],
+        }],
+        body,
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
+    let f = &module.functions[0];
+
+    let has_fcmp = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .any(|i| i.op == Opcode::FCmpONe);
+    assert!(
+        has_fcmp,
+        "a floating-point condition must be compared against 0.0:\n{}",
+        module
+    );
+
+    // The value handed to `cbr` must be that comparison, not the double.
+    let cbr = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .find(|i| i.op == Opcode::Cbr)
+        .expect("no conditional branch");
+    let cond_def = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .find(|i| i.target == Some(cbr.src[0]))
+        .expect("condition has no definition");
+    assert_eq!(
+        cond_def.op,
+        Opcode::FCmpONe,
+        "the branch must test the comparison, not the raw value:\n{}",
+        module
+    );
+}
+
+/// Equality on complex operands compares both halves. The complex arm of
+/// `linearize_binary` keyed off the *result* type, which for a comparison is
+/// `int`, so `a == b` fell into the scalar path and answered from whatever
+/// the low half held.
+#[test]
+fn test_complex_equality_compares_both_halves() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let complex_double = ctx.types.complex_double_id;
+    let a_sym = ctx.var("a", complex_double);
+    let b_sym = ctx.var("b", complex_double);
+
+    // int test(double _Complex a, double _Complex b) { return a == b; }
+    let cmp = Expr::typed_unpositioned(
+        ExprKind::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::var_typed(a_sym, complex_double)),
+            right: Box::new(Expr::var_typed(b_sym, complex_double)),
+        },
+        int_type,
+    );
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![
+            Parameter {
+                symbol: Some(a_sym),
+                typ: complex_double,
+                vm_dims: vec![],
+            },
+            Parameter {
+                symbol: Some(b_sym),
+                typ: complex_double,
+                vm_dims: vec![],
+            },
+        ],
+        body: Stmt::Return(Some(cmp)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
+    let f = &module.functions[0];
+    let ops: Vec<Opcode> = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .map(|i| i.op)
+        .collect();
+
+    assert_eq!(
+        ops.iter().filter(|o| **o == Opcode::FCmpOEq).count(),
+        2,
+        "both halves must be compared:\n{}",
+        module
+    );
+    assert!(
+        ops.contains(&Opcode::And),
+        "the two half-comparisons must be combined:\n{}",
+        module
+    );
+    assert!(
+        !ops.contains(&Opcode::SetEq),
+        "a complex comparison must not become an integer compare:\n{}",
+        module
+    );
 }

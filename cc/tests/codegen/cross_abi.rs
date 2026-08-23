@@ -89,13 +89,58 @@ fn codegen_aarch64_register_complex_param_is_not_reloaded_from_a_pointer() {
             body
         );
         assert!(
-            !body.contains("[x0]") && !body.contains("[x0,"),
+            !dereferences_x0_before_defining_it(body),
             "{}: a register-passed complex must not be reloaded through X0 — \
              that register holds no argument here:\n{}",
             func,
             body
         );
     }
+}
+
+#[test]
+fn x0_dereference_probe_still_catches_the_original_defect() {
+    // The shape the guard exists for: X0 dereferenced with nothing having
+    // written it, which is the incoming-pointer reload.
+    assert!(dereferences_x0_before_defining_it(
+        "_re_f:\n    str s0, [x29, #24]\n    ldr s0, [x0]\n    ret\n"
+    ));
+    // X0 computed from the frame first, then used: correct, and must pass.
+    assert!(!dereferences_x0_before_defining_it(
+        "_re_f:\n    str s0, [x29, #24]\n    add x0, x29, #24\n    ldr s0, [x0]\n    ret\n"
+    ));
+    // A load through X0 that also defines it is still a first-use read.
+    assert!(dereferences_x0_before_defining_it(
+        "_re_f:\n    ldr x0, [x0]\n    ret\n"
+    ));
+}
+
+/// Does this body read through X0 before anything has put a value in it?
+///
+/// The defect being guarded against is dereferencing an incoming pointer that
+/// was never passed. Asserting on the mere presence of `[x0]` cannot say that:
+/// X0 is an ordinary scratch register here, so once the body has computed an
+/// address into it -- `add x0, x29, #24` -- loading through it is exactly
+/// right. What must never happen is the dereference coming *first*.
+fn dereferences_x0_before_defining_it(body: &str) -> bool {
+    for line in body.lines() {
+        let insn = line.trim();
+        if insn.is_empty() || insn.starts_with('.') || insn.ends_with(':') {
+            continue;
+        }
+        let operands = insn.split_once(char::is_whitespace).map(|(_, o)| o);
+        if insn.contains("[x0]") || insn.contains("[x0,") {
+            return true;
+        }
+        // Destination is the first operand on every aarch64 instruction that
+        // writes a register.
+        if let Some(first) = operands.and_then(|o| o.split(',').next()) {
+            if first.trim() == "x0" {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// The x86_64 side of the same classification, so the two conventions are

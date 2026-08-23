@@ -270,3 +270,150 @@ int main(void)
     assert_eq!(compile_and_run("c99_real_imag", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("c99_real_imag_opt", code), 0);
 }
+
+/// Converting a value to a truth value has to respect its type. Two ways it
+/// did not:
+///
+/// A complex value is nonzero when *either* half is (C17 6.3.1.2 via
+/// 6.5.3.3p5), but the condition reached `cbr` as a single 128-bit value and
+/// only the low half -- the real part -- was tested.
+///
+/// A floating-point value is compared against `0.0`, not against its bit
+/// pattern, so `-0.0` is false. It was reaching an *integer* compare against
+/// an integer zero, and `-0.0`'s bit pattern is not zero.
+///
+/// `!` and `(_Bool)` were already right, which is what made the split
+/// visible: there are several independent conversions and only some of them
+/// looked at the type.
+#[test]
+fn c99_truth_value_respects_the_type() {
+    let code = r#"
+/* Opaque to the optimizer, so the condition is a real run-time value. */
+static double neg_zero(void) { return -0.0; }
+static double _Complex mkc(double r, double i) {
+    double _Complex z = r;
+    __imag__ z = i;
+    return z;
+}
+static int take_bool(_Bool b) { return (int)b; }
+static _Bool ret_bool(double _Complex z) { return z; }
+static double _Complex both_zero_v(void) { return mkc(0.0, 0.0); }
+/* A complex value returned from a real-typed function keeps its real part
+   (C17 6.3.1.7p2), rather than the address it travels by. */
+static double real_of(double _Complex z) { return z; }
+
+int main(void) {
+    /* ---- floating point: -0.0 is false ---- */
+    double n = neg_zero();
+    if (n) return 1;
+    if (n && 1) return 2;
+    if (n || 0) return 3;
+    if (!n != 1) return 4;
+    if ((int)(_Bool)n != 0) return 5;
+    if (n ? 1 : 0) return 6;
+    while (n) return 7;
+    for (; n; ) return 8;
+    { int hit = 0; switch (1) { case 1: while (n) { hit = 1; break; } } if (hit) return 9; }
+
+    /* a nonzero double is still true */
+    double h = 0.5;
+    if (!h) return 10;
+    if (!(h && 1)) return 11;
+
+    /* ---- complex: either half counts ---- */
+    double _Complex imag_only = mkc(0.0, 3.0);
+    if (!imag_only) return 20;
+    if (!(imag_only && 1)) return 21;
+    if (!(imag_only || 0)) return 22;
+    if (!imag_only != 0) return 23;
+    if ((int)(_Bool)imag_only != 1) return 24;
+    if (!(imag_only ? 1 : 0)) return 25;
+    { int hit = 0; while (imag_only) { hit = 1; break; } if (!hit) return 26; }
+    { int hit = 0; for (; imag_only; ) { hit = 1; break; } if (!hit) return 27; }
+    { int hit = 0; switch (1) { case 1: while (imag_only) { hit = 1; break; } } if (!hit) return 28; }
+    /* every spelling of the conversion, not just the cast */
+    { _Bool b = imag_only; if ((int)b != 1) return 29; }
+    { _Bool b; b = imag_only; if ((int)b != 1) return 60; }
+    { if (take_bool(imag_only) != 1) return 61; }
+    { if (ret_bool(imag_only) != 1) return 62; }
+    { _Bool b = both_zero_v(); if ((int)b != 0) return 63; }
+
+    double _Complex real_only = mkc(3.0, 0.0);
+    if (!real_only) return 30;
+
+    double _Complex both_zero = mkc(0.0, 0.0);
+    if (both_zero) return 40;
+    if ((int)(_Bool)both_zero != 0) return 41;
+    if (!both_zero != 1) return 42;
+
+    /* -0.0 in both halves is still zero */
+    double _Complex neg_zeros = mkc(-0.0, -0.0);
+    if (neg_zeros) return 50;
+    if ((int)(_Bool)neg_zeros != 0) return 51;
+
+    if (real_of(mkc(4.0, 9.0)) != 4.0) return 70;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_truth_value", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("c99_truth_value_opt", code), 0);
+}
+
+/// Only `==` and `!=` are defined on complex operands, and both have to look
+/// at both halves. The complex arm of `linearize_binary` keyed off the
+/// *result* type, which for a comparison is `int`, so equality fell into the
+/// scalar path and compared whatever the low half held.
+#[test]
+fn c99_complex_equality_compares_both_halves() {
+    let code = r#"
+static double _Complex mkc(double r, double i) {
+    double _Complex z = r;
+    __imag__ z = i;
+    return z;
+}
+
+int main(void) {
+    double _Complex a = mkc(1.0, 2.0);
+    double _Complex same = mkc(1.0, 2.0);
+    double _Complex imag_differs = mkc(1.0, 9.0);
+    double _Complex real_differs = mkc(7.0, 2.0);
+    double _Complex both_differ = mkc(7.0, 9.0);
+
+    if (!(a == same)) return 1;
+    if (a == imag_differs) return 2;
+    if (a == real_differs) return 3;
+    if (a == both_differ) return 4;
+
+    if (a != same) return 5;
+    if (!(a != imag_differs)) return 6;
+    if (!(a != real_differs)) return 7;
+    if (!(a != both_differ)) return 8;
+
+    /* against a real operand: the imaginary half must still count */
+    if (!(mkc(0.0, 0.0) == 0)) return 9;
+    if (mkc(0.0, 3.0) == 0) return 10;
+    if (!(mkc(0.0, 3.0) != 0)) return 11;
+    if (!(mkc(5.0, 0.0) == 5)) return 12;
+    if (mkc(5.0, 1.0) == 5) return 13;
+
+    /* -0.0 compares equal to 0.0 */
+    if (!(mkc(-0.0, -0.0) == mkc(0.0, 0.0))) return 14;
+
+    /* float _Complex, so the base width is not the pointer width */
+    float _Complex f = 1.0f;
+    __imag__ f = 2.0f;
+    float _Complex g = 1.0f;
+    __imag__ g = 3.0f;
+    if (f == g) return 15;
+    if (!(f != g)) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_equality", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_equality_opt", code),
+        0
+    );
+}

@@ -61,3 +61,10 @@ unicode-width = "0.2"
 # Allow `cfg(coverage)` which is set by cargo-llvm-cov during coverage builds
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
+[profile.release]
+# One codegen unit per crate. The workspace is ~140 binary crates, so
+# crate-level parallelism already saturates a builder; splitting each crate
+# into the default 16 units only adds per-crate LLVM overhead. Measured on a
+# 4-core runner (cold `cargo test --release --no-run`, 3 runs each): 142.5s
+# default vs 116.9s here, with binaries ~13% smaller.
+codegen-units = 1

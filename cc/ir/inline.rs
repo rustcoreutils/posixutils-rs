@@ -344,7 +344,13 @@ struct InlineContext {
     /// Callee function name (for name mangling)
     callee_name: String,
     /// Set of local variable names from callee (these need to be renamed)
-    callee_locals: HashSet<String>,
+    /// The callee's local-variable `Sym` pseudos, by identity.
+    ///
+    /// Not by name: a parameter is registered under its bare name, and a
+    /// global reached through a block-scope `extern` carries the same name.
+    /// Keyed by name, such a global was taken for a local and mangled into
+    /// `callee_inlineN_g`, which then failed to link.
+    callee_local_syms: HashSet<PseudoId>,
 
     /// Callee block currently being cloned. Set per-block by
     /// `clone_callee_blocks` so the Ret handling in `clone_instruction` can
@@ -395,8 +401,9 @@ impl InlineContext {
         // (the list may not contain all pseudo IDs, e.g., phi nodes from SSA)
         let max_bb = caller.blocks.iter().map(|b| b.id.0).max().unwrap_or(0);
 
-        // Collect callee's local variable names - these need to be renamed
-        let callee_locals: HashSet<String> = callee.locals.keys().cloned().collect();
+        // Collect the callee's local variable pseudos - these need renaming
+        let callee_local_syms: HashSet<PseudoId> =
+            callee.locals.values().map(|local| local.sym).collect();
 
         Self {
             pseudo_map: HashMap::with_capacity(DEFAULT_REMAP_CAPACITY),
@@ -410,7 +417,7 @@ impl InlineContext {
             return_target,
             inline_id: next_inline_id(),
             callee_name: callee.name.clone(),
-            callee_locals,
+            callee_local_syms,
             current_callee_bb: None,
             ret_arms: Vec::new(),
             ret_typ: None,
@@ -471,7 +478,7 @@ impl InlineContext {
             // Global symbols: ensure same name maps to same ID across multiple inlinings
             // This is critical when a function is inlined multiple times and references
             // the same global variable - all references must point to the same pseudo
-            Some(PseudoKind::Sym(name)) if !self.callee_locals.contains(name) => {
+            Some(PseudoKind::Sym(name)) if !self.callee_local_syms.contains(&callee_id) => {
                 if let Some(&existing_id) = self.global_sym_map.get(name) {
                     self.pseudo_map.insert(callee_id, existing_id);
                     return existing_id;
@@ -506,7 +513,7 @@ impl InlineContext {
             }
             PseudoKind::Sym(name) => {
                 // Only mangle local variable names - keep global symbols unchanged
-                if self.callee_locals.contains(name) {
+                if self.callee_local_syms.contains(&callee_pseudo.id) {
                     let new_name =
                         format!("{}_inline{}_{}", self.callee_name, self.inline_id, name);
                     PseudoKind::Sym(new_name)

@@ -115,10 +115,25 @@ See #C55 in `cc/audit.md`.
 ### Stack frames are larger than gcc's
 
 CPython hardcodes `C_RECURSION_LIMIT 10000` (`Include/cpython/pystate.h`),
-tuned to gcc's frame sizes. Twelve of its test files deliberately recurse to
-that limit and blow the default 8 MB stack under c17 before the counter trips;
-they pass with `ulimit -s 65536`. Not a miscompile, but a real quality gap —
-and the acceptance gate has to raise the stack to measure correctness.
+tuned to gcc's frame sizes. Test files that deliberately recurse to that limit
+blow the default 8 MB stack under c17 before the counter trips; they pass with
+`ulimit -s 65536`. Not a miscompile, but a real quality gap — and the
+acceptance gate has to raise the stack to measure correctness.
+
+Reduced, not closed. Promoting single-block locals out of memory (`ir/ssa.rs`)
+took the count from the twelve recorded here to five: `test_call`, `test_descr`,
+`test_io`, `test_isinstance`, `test_userdict` (measured 2026-08-23, -O2, default
+8 MB stack; the other 473 files pass). Two things still inflate every frame and
+are the place to look next:
+
+- `arch/x86_64/frame.rs` `zero_stack_frame` emits a `rep stosq` over the whole
+  frame in *every* prologue, plus six register shuffles around it — even for a
+  function with no locals at all. It is a workaround for narrow values stored
+  to 8-byte slots and reloaded at wider widths, so it cannot simply be deleted;
+  fixing the store/reload width mismatch would retire it.
+- Every local occupies at least 8 bytes and slots are never reused
+  (`arch/*/regalloc.rs`, `size.max(8)` with `reusable = false`), so a 4-byte
+  `int` costs 8.
 
 ### R10 reserved globally for division scratch
 
@@ -378,11 +393,15 @@ access as `%fs:(%rax)`.
 
 The compiler uses SSA-form IR. Already implemented passes (see `cc/ir/`):
 
-- `instcombine` — constant folding, algebraic simplification
+- `instcombine` — constant folding, algebraic simplification. Constants are
+  resolved through `Copy` chains (`ConstMap`), so folding crosses a promoted
+  local rather than stopping at it
 - `dce` — mark-sweep DCE, fold-cbr-to-trivially-unreachable, unreachable-block removal
 - `inline` — function inlining (module-level)
 
-`cc/opt.rs` runs `inline → (instcombine + dce)*` to fixed point.
+`cc/opt.rs` runs `inline → (instcombine + dce)*` to fixed point. Promotion of
+locals out of memory is not in that pipeline: `ir/ssa.rs` + `ir/mem2reg.rs`
+run once during linearization, at every `-O` level.
 
 ### Future passes (not yet implemented)
 

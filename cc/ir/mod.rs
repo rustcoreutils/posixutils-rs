@@ -1687,6 +1687,17 @@ impl Function {
         }
     }
 
+    /// Rebuild the pseudo index after bulk mutation of `self.pseudos`.
+    ///
+    /// `pseudo_idx` maps an id to a *position*, so removing any element
+    /// invalidates every later entry, not just the removed one.
+    pub fn rebuild_pseudo_idx(&mut self) {
+        self.pseudo_idx.clear();
+        for (idx, pseudo) in self.pseudos.iter().enumerate() {
+            self.pseudo_idx.insert(pseudo.id, idx);
+        }
+    }
+
     /// Add a local variable
     #[allow(clippy::too_many_arguments)]
     pub fn add_local(
@@ -1715,6 +1726,26 @@ impl Function {
     /// Get a local variable
     pub fn get_local(&self, name: &str) -> Option<&LocalVar> {
         self.locals.get(name)
+    }
+
+    /// The local variable that `sym` *is*, if it is one.
+    ///
+    /// Asking `locals` by name cannot answer this: a parameter is registered
+    /// under its bare name, and a global reached through a block-scope
+    /// `extern` gets its own pseudo carrying the same name, so a name matches
+    /// two different objects. Only block-scope locals are mangled `name.<id>`
+    /// and so cannot collide. Answering by pseudo identity is what keeps a
+    /// global from being handed the parameter's stack slot.
+    ///
+    /// `ir/ssa.rs` and `ir/tls.rs` both carry their own version of this
+    /// reasoning; this is the shared form.
+    pub fn local_of(&self, sym: PseudoId) -> Option<&LocalVar> {
+        self.get_pseudo(sym)
+            .and_then(|p| match &p.kind {
+                PseudoKind::Sym(name) => self.locals.get(name),
+                _ => None,
+            })
+            .filter(|local| local.sym == sym)
     }
 
     /// Allocate a new pseudo ID

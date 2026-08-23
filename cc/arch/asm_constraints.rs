@@ -9,12 +9,12 @@
 // GCC-style inline-asm constraint vocabulary and parser.
 //
 // This module sits alongside `cc/arch/regalloc.rs::ConstraintPoint`.
-// The existing ConstraintPoint mechanism (a per-instruction set of
+// The ConstraintPoint mechanism (a per-instruction set of
 // hard-clobbered physical registers plus an "involved pseudos"
 // exemption set) is enough to express opcode-level hardware clobbers
 // like x86_64 idiv → {RAX, RDX} or shifts → {RCX}, plus the
 // inline-asm clobber list and the caller-saved set across libc-call-
-// emitting opcodes (sourced in commit `0f58a71c`).
+// emitting opcodes.
 //
 // It is *not* enough to express the *per-operand* shape of GCC's
 // inline-asm constraint strings:
@@ -26,14 +26,6 @@
 //   * `"&=r"(t)` — operand t is an early-clobber output (allocator
 //                  must keep it disjoint from every input)
 //   * `"m"(p)`  — operand p must be a memory operand
-//
-// `InstrConstraints<R>` collects per-operand `OperandConstraint`s,
-// the hard clobber set, and a `memory_barrier` flag. C2 introduces
-// the vocabulary and parser; C3 wires the allocator to consume
-// `OperandConstraint::{Fixed, Match, Mem, EarlyClobber}` and the
-// memory barrier. Until then, `InstrConstraints` lowers to the
-// existing `ConstraintPoint` so the allocator's behaviour is
-// unchanged.
 
 use crate::ir::PseudoId;
 
@@ -64,8 +56,8 @@ pub enum OperandConstraint<R> {
     /// one of these alternatives. The list is non-empty,
     /// deduplicated, and flattened (no nested `Alternatives`).
     /// The allocator picks the cheapest fit at lowering time based
-    /// on what the operand's actual location can satisfy. C9 scope:
-    /// alternatives are restricted to `Any` / `Mem` / `Imm` only —
+    /// on what the operand's actual location can satisfy.
+    /// Alternatives are restricted to `Any` / `Mem` / `Imm` only —
     /// `Fixed` and `Match` cannot appear inside `Alternatives`
     /// (mixing pin-to-physreg or pin-to-other-operand with "or
     /// memory" makes no sense and GCC rejects it too).
@@ -91,8 +83,8 @@ pub enum OperandKind {
     EarlyClobber,
 }
 
-/// Per-instruction operand+clobber constraints. Lowers to
-/// `ConstraintPoint` for the C2 commit; C3 consumes it directly.
+/// Per-instruction operand+clobber constraints, lowered to
+/// `ConstraintPoint`.
 #[derive(Debug, Clone)]
 pub struct InstrConstraints<R> {
     /// Per-operand constraint, in the order the operands appear
@@ -101,9 +93,9 @@ pub struct InstrConstraints<R> {
     /// Hard clobbers in addition to whatever the operands imply.
     pub clobbers: Vec<R>,
     /// True iff the inline asm declared a `"memory"` clobber.
-    /// C3 enforces the strict semantics: every memory-promoted
-    /// value's live range is treated as crossing the barrier, so
-    /// stores are flushed before the asm and reloads issued after.
+    /// Under its strict semantics every memory-promoted value's live
+    /// range crosses the barrier, so stores are flushed before the asm
+    /// and reloads issued after.
     pub memory_barrier: bool,
 }
 
@@ -446,9 +438,7 @@ mod tests {
         ));
     }
 
-    // ========================================================================
-    // C9 — Multi-alternative constraints
-    // ========================================================================
+    // Multi-alternative constraints
 
     fn alternative_kinds<R: Copy>(c: &OperandConstraint<R>) -> Vec<&'static str> {
         match c {
@@ -552,8 +542,8 @@ mod tests {
 
     #[test]
     fn single_char_fixed_still_works() {
-        // C2/C3 behavior preserved: single-char Fixed letters still
-        // produce `OperandConstraint::Fixed(_)`, not Alternatives.
+        // Single-char Fixed letters produce `OperandConstraint::Fixed(_)`,
+        // not Alternatives.
         let (_, c) = parse_constraint_with_classes::<Fake>("=a", fake_map, |_| None).unwrap();
         assert!(matches!(c, OperandConstraint::Fixed(Fake::A)));
     }
@@ -564,9 +554,7 @@ mod tests {
         assert!(matches!(c, OperandConstraint::Match(0)));
     }
 
-    // ========================================================================
-    // C10 — Per-arch class letters
-    // ========================================================================
+    // Per-arch class letters
 
     /// A fake class-letter mapper for the parser tests: `J` → `Any`
     /// (register-class synonym), `K` → `Imm`. Lets us exercise the

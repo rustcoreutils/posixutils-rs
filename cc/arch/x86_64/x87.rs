@@ -34,8 +34,7 @@ impl X86_64CodeGen {
     ///
     /// `fild`/`fld` have no register form, so an immediate or a general
     /// register has to go through memory. The region is reserved by
-    /// [`X87_SCRATCH_BYTES`]; addressing it by hand is what let it alias the
-    /// first local.
+    /// [`X87_SCRATCH_BYTES`]; never address it by hand.
     fn x87_scratch_addr(&self) -> MemAddr {
         MemAddr::BaseOffset {
             base: Reg::Rbp,
@@ -498,8 +497,6 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Get memory address for x87 operand.
-    /// Long doubles are always in memory per System V AMD64 ABI.
     /// Materialize the *address* of a pseudo's storage into a register.
     ///
     /// A stack slot means one of two things: for a symbol pseudo the slot is

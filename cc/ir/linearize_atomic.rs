@@ -51,7 +51,7 @@ impl Linearizer<'_> {
     /// width that is not a machine integer size -- would need the lock-based
     /// fallbacks in libatomic, which this compiler does not link.
     ///
-    /// An aggregate of a machine width qualifies (#C116). Its members are
+    /// An aggregate of a machine width qualifies. Its members are
     /// irrelevant: what the hardware needs is a width and an address, and gcc
     /// lowers `_Atomic struct S { int a; }` to a plain 4-byte access for the
     /// same reason. The instruction operates on the bits through the integer
@@ -98,9 +98,8 @@ impl Linearizer<'_> {
     /// their ordinary path unchanged. For an atomic type that cannot be
     /// operated on lock-free this emits a diagnostic and returns `None`:
     /// gcc's equivalent emits calls to `__atomic_load`/`__atomic_store`, which
-    /// then fail to link without `-latomic`, and a compile-time error naming
-    /// the type is a better outcome than either a link failure or the silent
-    /// non-atomic copy this used to produce.
+    /// then fail to link without `-latomic`; a compile-time error naming the
+    /// type is a better outcome than a link failure.
     pub(crate) fn atomic_lvalue(&mut self, expr: &Expr) -> Option<AtomicLvalue> {
         let typ = expr.typ?;
         if !self.is_atomic_type(typ) {
@@ -125,10 +124,10 @@ impl Linearizer<'_> {
         if !self.is_lock_free(typ) {
             // Warn and fall through to the ordinary (non-atomic) path.
             //
-            // An error here was a source-compatibility regression: gcc lowers
+            // An error here would be a source-compatibility break: gcc lowers
             // an 8-byte `_Atomic struct` to a single lock-free cmpxchg with no
-            // libatomic reference, so code that built with gcc -- and with c17
-            // before the atomic operators landed -- stopped compiling.
+            // libatomic reference, so code that builds with gcc must build
+            // here too.
             //
             // What is left here is what libatomic exists for: `long double`,
             // `__int128`, complex, and any width that is not a machine integer

@@ -6,10 +6,8 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Dead Code Elimination (DCE) pass for c17 C17 compiler
-//
-// This pass removes instructions whose results are never used.
-// It uses a mark-sweep algorithm:
+// Dead Code Elimination: removes instructions whose results are never
+// used, by mark-sweep:
 // 1. Mark "root" instructions (those with side effects)
 // 2. Transitively mark all instructions that roots depend on
 // 3. Delete all unmarked instructions
@@ -30,9 +28,7 @@ const DEFAULT_USE_CAPACITY: usize = 4;
 const DEFAULT_LIVE_CAPACITY: usize = 64;
 const DEFAULT_REACHABLE_CAPACITY: usize = 16;
 
-// ============================================================================
 // Main Entry Point
-// ============================================================================
 
 /// Run the DCE pass on a function.
 /// Returns true if any changes were made.
@@ -53,12 +49,9 @@ pub fn run(func: &mut Function) -> bool {
     changed
 }
 
-// ============================================================================
 // Dead Code Elimination
-// ============================================================================
 
 /// Check if an opcode is a "root" (has side effects, cannot be deleted).
-#[inline]
 fn is_root(op: Opcode) -> bool {
     op.has_side_effects()
 }
@@ -178,9 +171,7 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
     changed
 }
 
-// ============================================================================
 // Unreachable Block Optimization
-// ============================================================================
 
 /// Identify blocks that are *trivially unreachable* — i.e., entering the
 /// block immediately leads to undefined behavior with no observable work.
@@ -268,9 +259,7 @@ fn fold_branches_to_unreachable(func: &mut Function) -> bool {
     changed
 }
 
-// ============================================================================
 // Unreachable Block Removal
-// ============================================================================
 
 /// Compute the set of reachable block IDs starting from entry.
 fn compute_reachable(func: &Function) -> HashSet<BasicBlockId> {
@@ -305,7 +294,6 @@ fn compute_reachable(func: &Function) -> HashSet<BasicBlockId> {
     reachable
 }
 
-/// Remove unreachable blocks from the function.
 fn remove_unreachable_blocks(func: &mut Function) -> bool {
     let reachable = compute_reachable(func);
     let before = func.blocks.len();
@@ -332,10 +320,6 @@ fn remove_unreachable_blocks(func: &mut Function) -> bool {
 
     func.blocks.len() < before
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

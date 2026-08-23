@@ -88,17 +88,15 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
     ) {
-        // No assertion about the pushback being empty here. It used to say so,
-        // on the premise that file provenance implies nothing is pending --
-        // which stopped being true once recovery began unreading file tokens.
-        // What the line-oriented helpers below actually need is that this token
-        // came from the file, which is what the caller already checked.
+        // No assertion about the pushback being empty here: recovery unreads
+        // file tokens, so something may well be pending. What the line-oriented
+        // helpers below need is that this token came from the file, which the
+        // caller already checked.
 
         // C17 6.10p7: a `#` alone on a line is the null directive and has no
         // effect. Check before consuming, because the next token belongs to the
-        // *next* line — taking it unconditionally treated that line's first
-        // token as a directive name and then `skip_to_eol` ate the rest of it,
-        // silently deleting a line of source.
+        // *next* line: taking it unconditionally would treat that line's first
+        // token as a directive name and delete the rest of the line.
         match iter.peek() {
             None => return,
             Some(next) if next.pos.newline => return,
@@ -128,10 +126,7 @@ impl<'a> Preprocessor<'a> {
             None => {
                 // A number where a directive name belongs is the GCC
                 // linemarker `# N "file" flags` -- the form `c17 -E` writes
-                // and POSIX 87981 makes a `.i` operand. It used to be
-                // swallowed whole, which is why every diagnostic about a
-                // preprocessed file cited the position in the preprocessed
-                // text rather than the original.
+                // and POSIX 87981 makes a `.i` operand.
                 if directive_token.typ == TokenType::Number && !self.is_skipping() {
                     self.handle_linemarker(iter, &directive_token);
                     return;
@@ -184,8 +179,7 @@ impl<'a> Preprocessor<'a> {
             // `#ident` and `#sccs` carry a version string for the object file.
             // c17 records nothing, but they are directives it knows, so they
             // are consumed rather than reported as unknown -- GCC is silent
-            // about both, and `survives_preprocessing` names them, which was
-            // untrue while they fell through to the arm below.
+            // about both, and `survives_preprocessing` names them.
             crate::kw::PP_IDENT | crate::kw::SCCS => self.skip_to_eol(iter),
             _ => {
                 // Unknown directive.
@@ -193,8 +187,7 @@ impl<'a> Preprocessor<'a> {
                 // In assembly, `#` introduces a comment, so a line that names
                 // no directive is prose rather than a mistake -- `# save the
                 // frame pointer` is ordinary in a `.S` file. GCC is silent
-                // about those, and warning on each one buried real
-                // diagnostics.
+                // about those.
                 if !self.is_skipping() && self.lexer_mode != LexerMode::Assembly {
                     let name = idents.get_opt(directive_id).unwrap_or("unknown");
                     diag::warning_args(
@@ -272,9 +265,8 @@ impl<'a> Preprocessor<'a> {
     /// A directive's operand cannot be on the next line. There is no newline
     /// token in the stream, so a bare `next()` silently reaches into the
     /// following line and `skip_to_eol` then eats the rest of it -- deleting a
-    /// line of source. The same check already guards the directive *name* in
-    /// `handle_directive`; this is that check applied to the operands, where it
-    /// was missing.
+    /// line of source. The same check guards the directive *name* in
+    /// `handle_directive`; this is that check applied to the operands.
     fn next_on_line(&self, iter: &mut TokenCursor) -> Option<Token> {
         match iter.peek() {
             Some(token) if !token.pos.newline => iter.next(),
@@ -313,7 +305,7 @@ impl<'a> Preprocessor<'a> {
     ///
     /// C17 6.10p1 gives `#else` and `#endif` no operands at all, and gcc warns
     /// about anything after them -- usually a stale `#endif MACRO` left from
-    /// before comments were the convention. These used to be eaten in silence.
+    /// before comments were the convention.
     fn warn_extra_tokens(&self, iter: &mut TokenCursor, directive: &str) {
         if iter.peek().is_some_and(|t| !t.pos.newline) {
             let pos = iter.peek().map(|t| t.pos).unwrap_or_default();
@@ -346,7 +338,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Handle #define
     pub(super) fn handle_define(
         &mut self,
         iter: &mut TokenCursor,
@@ -441,11 +432,7 @@ impl<'a> Preprocessor<'a> {
                                 TokenValue::Ident(id) => {
                                     if let Some(param_name) = idents.get_opt(*id) {
                                         // C17 6.10.3p6: the parameters have to
-                                        // be distinct. A repeat used to be
-                                        // pushed anyway, and since substitution
-                                        // matches the *first* one by name,
-                                        // `#define F(a,a) a` silently made
-                                        // `F(1,2)` expand to `1`.
+                                        // be distinct.
                                         if params.iter().any(|p| p.name == param_name) {
                                             diag::error_args(
                                                 param_tok.pos,
@@ -462,9 +449,7 @@ impl<'a> Preprocessor<'a> {
                                         ident_immediately_before = true;
                                     }
                                 }
-                                // Anything else cannot be a parameter. This was
-                                // a bare `_ => {}`, so `#define H(x + y) x`
-                                // quietly defined a two-parameter macro.
+                                // Anything else cannot be a parameter.
                                 _ => {
                                     diag::error_args(
                                         param_tok.pos,
@@ -531,7 +516,6 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(mac);
     }
 
-    /// Handle #undef
     fn handle_undef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
@@ -545,7 +529,6 @@ impl<'a> Preprocessor<'a> {
         self.skip_to_eol(iter);
     }
 
-    /// Handle #ifdef
     fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
         // Nesting is tracked in a dead branch, but the operand is not
         // examined there: gcc skips it entirely, and junk inside an `#if 0`
@@ -570,16 +553,8 @@ impl<'a> Preprocessor<'a> {
         self.push_conditional(take_branch, pos);
     }
 
-    /// Handle #ifndef
     fn handle_ifndef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
-        // Nesting is tracked in a dead branch, but the operand is not
-        // examined there: gcc skips it entirely, and junk inside an `#if 0`
-        // is common enough that diagnosing it would reject working code.
-        //
-        // A malformed operand still pushes a group, so the matching `#endif`
-        // closes something and one bad directive does not cascade into a run
-        // of "#endif without #if". The group is skipped, since nothing was
-        // established about the name.
+        // Same rule as `handle_ifdef` for a dead branch and a malformed operand.
         let name = if self.is_skipping() {
             self.skip_to_eol(iter);
             None
@@ -595,7 +570,6 @@ impl<'a> Preprocessor<'a> {
         self.push_conditional(take_branch, pos);
     }
 
-    /// Handle #if
     fn handle_if(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
         let value = if self.is_skipping() {
@@ -609,14 +583,12 @@ impl<'a> Preprocessor<'a> {
         self.push_conditional(value, pos);
     }
 
-    /// Handle #elif
     fn handle_elif(&mut self, iter: &mut TokenCursor, idents: &mut IdentTable, pos: Position) {
         let tokens = self.collect_to_eol(iter);
 
         // C17 6.10.1: a group runs `#if`, then any `#elif`s, then at most one
-        // `#else`. Neither of these was checked, so a stray `#elif` did nothing
-        // and an `#elif` after `#else` silently turned the group `Done`,
-        // truncating the `#else` body it had already started emitting.
+        // `#else`. Both are checked here: a stray `#elif`, and an `#elif`
+        // after `#else`.
         let should_eval = match self.cond_stack.last() {
             None => {
                 diag::error(pos, &gettext("#elif without #if"));
@@ -658,7 +630,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Handle #else
     fn handle_else(&mut self, iter: &mut TokenCursor, pos: Position) {
         self.warn_extra_tokens(iter, "else");
 
@@ -690,7 +661,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Handle #endif
     fn handle_endif(&mut self, iter: &mut TokenCursor, pos: Position) {
         self.warn_extra_tokens(iter, "endif");
         if self.cond_stack.pop().is_none() {
@@ -698,7 +668,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Handle #include
     fn handle_include(
         &mut self,
         iter: &mut TokenCursor,
@@ -869,12 +838,8 @@ impl<'a> Preprocessor<'a> {
         }
 
         // `-I` and the system directories are one ordered search path, indexed
-        // as one. They are stored separately, and `#include_next` used to
-        // resume in `system_include_paths` only -- so a header found through
-        // `-I` had no index to resume from, fell back to index 0 of the system
-        // list, and never saw the rest of the `-I` directories. gcc finds
-        // `ib/n.h` for an `#include_next <n.h>` written in `ia/n.h` under
-        // `-Iia -Iib`; this reported "file not found".
+        // as one. They are stored separately, so `#include_next` resumes by an
+        // index that spans both halves.
         let start_index = if is_include_next {
             self.current_include_path_index.map(|i| i + 1).unwrap_or(0)
         } else {
@@ -896,9 +861,8 @@ impl<'a> Preprocessor<'a> {
 
         // Bundled headers stand in for the compiler's own include directory,
         // so they come after the user's search paths — a project that ships
-        // its own limits.h or stddef.h must win. They used to be consulted
-        // before any filesystem search, which silently shadowed those.
-        // #include_next skips them entirely.
+        // its own limits.h or stddef.h must win. #include_next skips them
+        // entirely.
         if !is_include_next && self.use_builtin_headers {
             if let Some(content) = builtin_headers::get_builtin_header(filename) {
                 return Some((IncludeSource::Builtin(content), None));
@@ -928,10 +892,7 @@ impl<'a> Preprocessor<'a> {
     ///
     /// Requires all of: nothing before the opening directive; `#ifndef X` or
     /// `#if !defined X` immediately followed by `#define X`; and the `#endif`
-    /// that closes *that* group being the last token in the file. The last of
-    /// those is what the previous implementation could not check -- it stopped
-    /// scanning at the first token of the body -- so a header with code after
-    /// its `#endif` was treated as fully guarded and lost that code.
+    /// that closes *that* group being the last token in the file.
     ///
     /// It also rejects the conditional-default idiom, `#ifndef FOO / #define
     /// FOO 1 / #endif / #define BAR 2`, for the same reason: something follows
@@ -1043,7 +1004,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Include a file
     pub(super) fn include_file(
         &mut self,
         path: &Path,
@@ -1065,8 +1025,7 @@ impl<'a> Preprocessor<'a> {
 
         // A file already read to the end, found to be one guarded group, and
         // whose guard is still defined, would contribute nothing. Checked
-        // before the file is even opened, which is where the old text scan
-        // could not be: it had to read and re-scan on every include.
+        // before the file is even opened.
         if let Some(guard) = self.guarded_files.get(&canonical) {
             if self.is_defined(guard) {
                 return;
@@ -1173,8 +1132,7 @@ impl<'a> Preprocessor<'a> {
         self.current_dir = saved_dir;
         // Whatever the file left open, it left open. The stack is swapped out
         // around an inclusion so a header cannot close one of the includer's
-        // groups, which also meant an unterminated `#if` in a header was
-        // discarded here rather than reported.
+        // groups; what it leaves open is reported here.
         self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
         self.current_include_path_index = saved_include_path_index;
@@ -1233,13 +1191,11 @@ impl<'a> Preprocessor<'a> {
         self.current_dir = saved_dir;
         // Whatever the file left open, it left open. The stack is swapped out
         // around an inclusion so a header cannot close one of the includer's
-        // groups, which also meant an unterminated `#if` in a header was
-        // discarded here rather than reported.
+        // groups; what it leaves open is reported here.
         self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
     }
 
-    /// Handle #error
     fn handle_error(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
@@ -1251,7 +1207,6 @@ impl<'a> Preprocessor<'a> {
         diag::error_args(*pos, "#error {0}", &[&msg.to_string()]);
     }
 
-    /// Handle #warning
     fn handle_warning(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
@@ -1263,7 +1218,6 @@ impl<'a> Preprocessor<'a> {
         diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
     }
 
-    /// Handle #pragma
     fn handle_pragma(
         &mut self,
         iter: &mut TokenCursor,
@@ -1296,10 +1250,8 @@ impl<'a> Preprocessor<'a> {
                         // A directive handler pulls its own tokens, so they
                         // never pass the remap in the main loop. Attribute the
                         // position once, here, rather than at the one use that
-                        // needed it: `parse_pack_body` reports five diagnostics
-                        // from this position, and leaving it physical made a
-                        // malformed pragma cite the `.i` while the error on the
-                        // very next line cited the original file.
+                        // needs it: `parse_pack_body` reports five diagnostics
+                        // from this position.
                         let pos = self.remap_pos(token.pos);
                         iter.next(); // consume "pack"
                         if let Some(action) = self.parse_pack_pragma(iter, idents, pos) {
@@ -1389,9 +1341,8 @@ impl<'a> Preprocessor<'a> {
         emit_verbatim(self, output);
     }
 
-    /// Handle _Pragma operator (C99)
-    /// _Pragma("string") is equivalent to #pragma string
-    /// Since we ignore most pragmas anyway, this just consumes the tokens
+    /// Handle the `_Pragma` operator (C99 6.10.9): `_Pragma("string")` is
+    /// equivalent to `#pragma string`.
     pub(super) fn handle_pragma_operator(
         &mut self,
         iter: &mut TokenCursor,
@@ -1449,7 +1400,6 @@ impl<'a> Preprocessor<'a> {
         // Successfully consumed _Pragma("...")
     }
 
-    /// Handle #line directive
     fn handle_line(
         &mut self,
         iter: &mut TokenCursor,
@@ -1469,7 +1419,6 @@ impl<'a> Preprocessor<'a> {
         }
 
         // C17 6.10.4p3: the operand is a digit sequence in [1, 2147483647].
-        // These used to return silently, so a typo just did nothing.
         let line_num = match &tokens[0].value {
             TokenValue::Number(n) => match n.parse::<u32>() {
                 Ok(num) if (1..=2147483647).contains(&num) => num,
@@ -1528,7 +1477,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Evaluate __has_include
     pub(super) fn eval_has_include(&self, args: &[Vec<Token>], idents: &IdentTable) -> bool {
         if args.is_empty() {
             return false;

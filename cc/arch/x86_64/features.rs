@@ -169,7 +169,7 @@ impl X86_64CodeGen {
     }
 
     /// Helper for emit_va_arg: emit integer path for va_arg
-    pub(super) fn emit_va_arg_int(
+    fn emit_va_arg_int(
         &mut self,
         ap_base: Reg,
         ap_base_offset: i32,
@@ -353,8 +353,7 @@ impl X86_64CodeGen {
     /// The result pseudo is allocated like any other and can land in `%rax` --
     /// which is where the save-area pointer lives -- so an address held in a
     /// register is moved into reserved scratch before anything else is
-    /// touched. `[%rax]` as both source and destination is exactly what the
-    /// first version emitted.
+    /// touched.
     fn va_agg_dst(&mut self, dst_loc: &Loc, dst_is_addr: bool) -> Option<VaAggDst> {
         Some(match dst_loc {
             Loc::Stack(slot) => VaAggDst::Slot(*slot),
@@ -436,12 +435,6 @@ impl X86_64CodeGen {
     }
 
     /// Read an aggregate argument, per SysV AMD64 §3.5.7.
-    ///
-    /// Every aggregate used to go through [`Self::emit_va_arg_int`], which
-    /// pulls one value of the type's whole width out of the general-register
-    /// save area. For anything the classifier put in SSE registers that is
-    /// unrelated data -- `struct { float a, b, c, d; }` arrives in `xmm0` and
-    /// `xmm1` and came back as whatever the integer area happened to hold.
     ///
     /// An aggregate in registers is *not* contiguous in the save area: its
     /// eightbytes are taken from the general and SSE areas independently, and
@@ -663,13 +656,8 @@ impl X86_64CodeGen {
         //    refers to, so we must load the pointer first and use *that*
         //    as the base register with offset 0.
         //
-        // The historical Loc::Stack path conflated the two: it always
-        // treated `rbp + offset` as the va_list, which is correct only for
-        // shape (1). Optimization passes (copyprop, instcombine identity
-        // folds) that eliminate the Copy that previously kept shape (2)'s
-        // pointer in a register expose the bug. Detect the pointer-in-
-        // stack-slot case explicitly and materialize the pointer into R11
-        // (reserved scratch) before delegating to the helpers.
+        // Shape (2) is detected explicitly: the pointer is materialized
+        // into R11 (reserved scratch) before delegating to the helpers.
         let is_sym = self
             .pseudos
             .iter()
@@ -991,9 +979,7 @@ impl X86_64CodeGen {
         }
     }
 
-    // =========================================================================
     // Byte-swapping builtins
-    // =========================================================================
 
     /// Emit byte-swap instruction for 16/32/64-bit values
     pub(super) fn emit_bswap(&mut self, insn: &Instruction, swap_size: BswapSize) {
@@ -1336,9 +1322,7 @@ impl X86_64CodeGen {
         }
     }
 
-    // ========================================================================
     // setjmp/longjmp/alloca support
-    // ========================================================================
 
     /// Emit setjmp(env) - saves execution context
     /// System V AMD64 ABI: env in RDI, returns int in EAX

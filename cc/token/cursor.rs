@@ -27,19 +27,15 @@ pub(super) enum Provenance {
 
 /// A token stream that can be pushed back onto.
 ///
-/// This replaces a `Peekable<vec::IntoIter<Token>>`, and reads the same way --
-/// `next()`, `peek()`, `for t in cursor.by_ref()` -- so that the directive
-/// handlers did not have to change shape. What it adds is
-/// [`push_expansion`](Self::push_expansion): the substituted body of a macro
-/// goes back in front of the cursor instead of into the output, so rescanning
+/// [`push_expansion`](Self::push_expansion) puts the substituted body of a
+/// macro back in front of the cursor instead of into the output, so rescanning
 /// is just the same loop reading on, and an expansion that ends mid-call can
 /// finish it from the rest of the file.
 ///
 /// The pushback is one flat stack, not a stack of streams with an end marker
-/// between them. That matters: `CALL(ADD)(10,32)` leaves `ADD_func` in the
-/// pushback with its `(10, 32)` still in the file, so a `peek()` that stopped
-/// at an exhausted expansion instead of falling through to the file would not
-/// find the argument list.
+/// between them: `CALL(ADD)(10,32)` leaves `ADD_func` in the pushback with its
+/// `(10, 32)` still in the file, so a `peek()` has to fall through to the file
+/// to find the argument list.
 pub(super) struct TokenCursor {
     /// The file, in order.
     main: std::vec::IntoIter<Token>,
@@ -136,9 +132,8 @@ impl Iterator for TokenCursor {
                 // invocation stood, and the token they land on is the
                 // expansion's first -- unless the expansion was empty, in
                 // which case it is the next token of the *file*, which already
-                // knows where it stands. Overwriting made an empty expansion
-                // swallow the following line break: `#define E` with `A E` on
-                // one line and `B c` on the next came out as `A B c`.
+                // knows where it stands. Overwriting would make an empty
+                // expansion swallow the following line break.
                 token.pos.whitespace |= whitespace;
                 token.pos.newline |= newline;
                 Some(token)

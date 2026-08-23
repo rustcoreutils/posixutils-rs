@@ -487,8 +487,7 @@ impl Abi for SysVAmd64Abi {
         //                            it indirectly instead, which keeps the
         //                            value correct within a translation unit
         //                            without inventing an x87 register pair
-        //                            the rest of the backend cannot model. See
-        //                            #C2 in cc/audit.md.
+        //                            the rest of the backend cannot model.
         if types.is_complex(ty) {
             let base_ty = types.complex_base(ty);
             if types.kind(base_ty) == TypeKind::LongDouble {

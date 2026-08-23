@@ -16,9 +16,7 @@ use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, Pseu
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
 
-// ============================================================================
 // Shared Helper Types
-// ============================================================================
 
 /// Unary integer operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,9 +33,7 @@ pub enum BswapSize {
     B64,
 }
 
-// ============================================================================
 // Constants
-// ============================================================================
 
 /// c17 version string for assembly header
 pub const C17_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -103,9 +99,7 @@ pub fn escape_string(s: &str) -> String {
     result
 }
 
-// ============================================================================
 // CodeGenBase - Generic Code Generation Infrastructure
-// ============================================================================
 
 /// Common code generation state shared between all architectures.
 /// Generic over the LIR instruction type I, enabling type-safe architecture-specific
@@ -202,14 +196,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         self.use_tls_dynamic() || is_extern
     }
 
-    /// Push a LIR instruction to the buffer
-    #[inline]
     pub fn push_lir(&mut self, inst: I) {
         self.lir_buffer.push(inst);
     }
 
-    /// Push a directive (convenience method)
-    #[inline]
     pub fn push_directive(&mut self, dir: Directive) {
         self.lir_buffer.push(I::from_directive(dir));
     }
@@ -301,7 +291,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
-    /// Emit a global variable definition
     pub fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
         let size = types.size_bits(global.typ) / 8;
         let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
@@ -431,11 +420,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// format: 2 is `_Float16`, 4 is binary32, 8 is binary64, and 16 is
     /// whatever `long double` means here -- binary128 on aarch64, an x87
     /// 80-bit extended padded to 16 bytes on x86_64.
-    ///
-    /// Both wide cases used to fall through to a bare `.quad` of the `f64`
-    /// encoding: half the object went unemitted (while `.size` still claimed
-    /// 16, so the next symbol's bytes were read as the tail), and the bits
-    /// that were emitted meant a different number in the wider format.
     fn emit_float_initializer(&mut self, val: FloatVal, size: usize) {
         match size {
             2 => {
@@ -752,9 +736,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     }
 }
 
-// ============================================================================
 // Inline Assembly Support
-// ============================================================================
 
 /// Trait for architecture-specific inline asm operand formatting.
 /// Implementations provide register formatting specific to their architecture.
@@ -1011,9 +993,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
     result
 }
 
-// ============================================================================
 // CodeGenerator Trait
-// ============================================================================
 
 /// Trait for architecture-specific code generators
 pub trait CodeGenerator {

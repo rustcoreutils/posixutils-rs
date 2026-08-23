@@ -6,9 +6,8 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Dominator tree computation for c17 C17 compiler
+// Dominator tree computation.
 //
-// Algorithms used:
 // - Dominator tree: "A simple, fast dominance algorithm" by Cooper, Harvey, Kennedy
 // - IDF computation: "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
 //
@@ -19,9 +18,7 @@ use std::collections::{HashMap, HashSet};
 const DEFAULT_POSTORDER_CAPACITY: usize = 16;
 const DEFAULT_IDF_CAPACITY: usize = 8;
 
-// ============================================================================
 // Reverse Postorder Computation
-// ============================================================================
 
 /// Compute reverse postorder numbering for all blocks.
 /// Returns a vector of block IDs in reverse postorder, and updates each block
@@ -70,9 +67,7 @@ fn compute_postorder(func: &mut Function) -> Vec<BasicBlockId> {
     postorder
 }
 
-// ============================================================================
 // Dominator Tree Construction (Cooper et al.)
-// ============================================================================
 
 /// Build the dominator tree for a function.
 ///
@@ -248,9 +243,7 @@ pub fn domtree_build(func: &mut Function) {
     func.max_dom_level = max_level;
 }
 
-// ============================================================================
 // Dominance Frontier Computation
-// ============================================================================
 
 /// Compute the dominance frontier for all blocks.
 ///
@@ -301,9 +294,7 @@ pub fn compute_dominance_frontiers(func: &mut Function) {
     }
 }
 
-// ============================================================================
 // Iterated Dominance Frontier (IDF) Computation
-// ============================================================================
 
 /// Priority queue based on dominator tree level (higher level = higher priority).
 /// Used by the Sreedhar-Gao algorithm.
@@ -350,13 +341,6 @@ impl LevelQueue {
 ///
 /// Uses the linear time algorithm from:
 /// "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
-///
-/// # Arguments
-/// * `func` - The function (must have dominator tree built)
-/// * `alpha` - The set of defining blocks
-///
-/// # Returns
-/// * Vector of blocks in the IDF
 pub fn idf_compute(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId> {
     if func.max_dom_level == 0 && func.blocks.len() > 1 {
         // Dominator tree not built
@@ -498,10 +482,6 @@ fn visit_domtree(
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,16 +491,6 @@ mod tests {
 
     fn make_test_cfg() -> Function {
         // Create a simple CFG:
-        //       entry(0)
-        //       /     \
-        //      v       v
-        //    bb1(1)   bb2(2)
-        //       \     /
-        //        v   v
-        //       merge(3)
-        //          |
-        //          v
-        //        exit(4)
 
         let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.void_id);
@@ -649,18 +619,6 @@ mod tests {
     #[test]
     fn test_domtree_with_unreachable_block() {
         // Create a CFG with an unreachable block:
-        //       entry(0)
-        //          |
-        //          v
-        //        bb1(1)
-        //          |
-        //          v
-        //        exit(2)
-        //
-        //    unreachable(3) <-- has edge from nowhere reachable
-        //          |
-        //          v
-        //        bb1(1) <-- unreachable points TO bb1, making bb1 have unreachable as predecessor
 
         let types = TypeTable::new(&Target::host());
         let mut func = Function::new("test", types.void_id);
@@ -689,7 +647,6 @@ mod tests {
         func.blocks = vec![entry, bb1, exit, unreachable];
         func.rebuild_block_idx();
 
-        // This should not panic - the fix skips predecessors not reached during DFS
         domtree_build(&mut func);
 
         // Verify the reachable blocks have correct dominators

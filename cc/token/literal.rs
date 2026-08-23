@@ -133,9 +133,7 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
             }
             let oct: String = chars[i..i + oct_chars].iter().collect();
             // `\777` is 511, which is not a byte. C leaves it undefined and gcc
-            // takes the low eight bits; parsing straight into `u8` failed and
-            // silently produced NUL instead, so `'\777'` was 0 where gcc gives
-            // 255.
+            // takes the low eight bits, so `'\777'` is 255.
             let val = u32::from_str_radix(&oct, 8).unwrap_or(0) as u8;
             (Escaped::Byte(val), oct_chars)
         }

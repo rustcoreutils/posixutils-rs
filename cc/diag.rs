@@ -15,9 +15,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-// ============================================================================
 // Source Position
-// ============================================================================
 
 /// Source position tracking for tokens and diagnostics.
 ///
@@ -40,7 +38,6 @@ pub struct Position {
 }
 
 impl Position {
-    /// Create a new position
     pub fn new(stream: u16, line: u32, col: u16) -> Self {
         Self {
             stream,
@@ -71,9 +68,7 @@ impl fmt::Display for Position {
     }
 }
 
-// ============================================================================
 // Stream (Input Source)
-// ============================================================================
 
 /// Input stream information for tracking source files and includes.
 #[derive(Debug, Clone)]
@@ -94,7 +89,6 @@ pub struct Stream {
 }
 
 impl Stream {
-    /// Create a new stream for a file
     pub fn new(name: String) -> Self {
         Self {
             name,
@@ -104,7 +98,6 @@ impl Stream {
         }
     }
 
-    /// Create a stream for an included file
     pub fn included(name: String, include_pos: Position) -> Self {
         Self {
             name,
@@ -115,9 +108,7 @@ impl Stream {
     }
 }
 
-// ============================================================================
 // Stream Registry (Global)
-// ============================================================================
 
 /// Stream registry for managing all input files
 #[derive(Debug, Default)]
@@ -126,12 +117,10 @@ pub struct StreamRegistry {
 }
 
 impl StreamRegistry {
-    /// Create a new empty registry
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Add a new stream, returning its ID
     pub fn add(&mut self, name: String) -> u16 {
         let id = self.streams.len() as u16;
         self.streams.push(Stream::new(name));
@@ -163,19 +152,16 @@ impl StreamRegistry {
         self.streams.get(id as usize).is_some_and(|s| s.is_system)
     }
 
-    /// Add a stream for an included file
     pub fn add_included(&mut self, name: String, include_pos: Position) -> u16 {
         let id = self.streams.len() as u16;
         self.streams.push(Stream::included(name, include_pos));
         id
     }
 
-    /// Get stream by ID
     pub fn get(&self, id: u16) -> Option<&Stream> {
         self.streams.get(id as usize)
     }
 
-    /// Get stream name by ID
     pub fn get_name(&self, id: u16) -> Option<&str> {
         self.streams.get(id as usize).map(|s| s.name.as_str())
     }
@@ -218,7 +204,6 @@ thread_local! {
     pub static STREAMS: RefCell<StreamRegistry> = RefCell::new(StreamRegistry::new());
 }
 
-/// Initialize a new stream, returning its ID
 pub fn init_stream(name: &str) -> u16 {
     STREAMS.with(|s| s.borrow_mut().add(name.to_string()))
 }
@@ -233,7 +218,6 @@ pub fn set_stream_system(id: u16, is_system: bool) {
     STREAMS.with(|s| s.borrow_mut().set_system(id, is_system));
 }
 
-/// Initialize a stream for an included file
 pub fn init_included_stream(name: &str, include_pos: Position) -> u16 {
     STREAMS.with(|s| s.borrow_mut().add_included(name.to_string(), include_pos))
 }
@@ -261,13 +245,11 @@ pub fn stream_name(id: u16) -> String {
     })
 }
 
-/// Get previous stream in include chain
 #[cfg(test)]
 pub fn stream_prev(id: u16) -> Option<u16> {
     STREAMS.with(|s| s.borrow().prev_stream(id))
 }
 
-/// Clear all streams (call at start of new compilation)
 pub fn clear_streams() {
     STREAMS.with(|s| s.borrow_mut().clear());
 }
@@ -284,9 +266,7 @@ pub fn get_all_stream_names() -> Vec<String> {
     })
 }
 
-// ============================================================================
 // Error Tracking
-// ============================================================================
 
 /// Error phase flag
 pub const ERROR_CURR_PHASE: u32 = 1;
@@ -332,23 +312,19 @@ pub fn warnings_suppressed() -> bool {
     SUPPRESS_WARNINGS.load(Ordering::Relaxed)
 }
 
-/// Get current error state
 pub fn has_error() -> u32 {
     HAS_ERROR.load(Ordering::Relaxed)
 }
 
-/// Set error flag
 fn set_error(flag: u32) {
     HAS_ERROR.fetch_or(flag, Ordering::Relaxed);
 }
 
-/// Get error count
 #[cfg(test)]
 pub fn error_count() -> u32 {
     ERROR_COUNT.load(Ordering::Relaxed)
 }
 
-/// Get warning count
 #[cfg(test)]
 pub fn warning_count() -> u32 {
     WARNING_COUNT.load(Ordering::Relaxed)
@@ -366,9 +342,7 @@ pub fn reset_counts() {
     HAS_ERROR.store(0, Ordering::Relaxed);
 }
 
-// ============================================================================
 // Diagnostic Output
-// ============================================================================
 
 /// Diagnostic severity level
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,7 +367,6 @@ impl DiagLevel {
     }
 }
 
-/// Build include chain message for nested includes
 fn show_include_chain(stream_id: u16) -> Option<String> {
     STREAMS.with(|s| {
         let streams = s.borrow();
@@ -426,7 +399,6 @@ fn prettify_path(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Output a diagnostic message
 fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
     // Track errors/warnings
     match level {
@@ -493,16 +465,12 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
     };
 }
 
-// ============================================================================
 // Public Diagnostic Functions
-// ============================================================================
 
-/// Print a warning message
 pub fn warning(pos: Position, msg: &str) {
     do_diag(DiagLevel::Warning, pos, msg);
 }
 
-/// Print an error message
 pub fn error(pos: Position, msg: &str) {
     do_diag(DiagLevel::Error, pos, msg);
 }
@@ -535,10 +503,6 @@ pub fn error_plural(pos: Position, singular: &str, plural: &str, n: usize, args:
     );
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,11 +526,7 @@ mod tests {
     }
 
     /// The chain names every file between the diagnostic and the top, in
-    /// order. `init_included_stream` is what records it, and it had been
-    /// `#[cfg(test)]` while production registered every file with
-    /// `init_stream`, whose `include_pos` is `None` -- so `show_include_chain`
-    /// was live only in test builds and a full CPython build produced zero
-    /// "through" lines across 552 diagnostics.
+    /// order; `init_included_stream` is what records it.
     #[test]
     fn test_include_chain_is_recorded() {
         clear_streams();

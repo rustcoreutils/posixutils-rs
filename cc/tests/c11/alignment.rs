@@ -448,3 +448,85 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c11_alignment_aarch64_over", code, &[]), 0);
 }
+
+/// A typedef's declared alignment must reach both the typedef'd type and any
+/// object of it, whichever position the alignment specifier is written in, and
+/// `_Alignof` on an object must answer the object's declared alignment rather
+/// than its type's.
+///
+/// Every check here diverged from gcc before the fix:
+///
+///   * a *trailing* `__attribute__((aligned(N)))` on a typedef was dropped --
+///     the typedef binding read `pending_alignas`, which never holds an
+///     attribute written after the declarator;
+///   * a *pointer-grouped* typedef (`typedef int *(T)[4]`) dropped even a
+///     leading one, because that grouped-declarator path skipped the merge;
+///   * `_Alignof(obj)` reported the alignment of `obj`'s type, ignoring the
+///     `_Alignas` or `aligned` on the object itself.
+#[test]
+fn c11_alignment_typedef_and_object_alignof() {
+    let code = r#"
+/* Trailing attribute on a typedef. */
+typedef int T_trail[4] __attribute__((aligned(64)));
+/* Leading attribute on a pointer-grouped typedef. */
+__attribute__((aligned(64))) typedef int *(T_ptrgrp)[4];
+/* Leading attribute, ungrouped. */
+__attribute__((aligned(64))) typedef int T_lead[4];
+/* Leading attribute, plain-grouped. */
+__attribute__((aligned(64))) typedef int (T_grp)[4];
+
+T_trail o_trail;
+T_ptrgrp o_ptrgrp;
+T_lead o_lead;
+T_grp o_grp;
+
+/* Objects carrying their own alignment, in both spellings. */
+_Alignas(64) int v_as[4];
+int v_attr[4] __attribute__((aligned(64)));
+
+int main(void) {
+    if (_Alignof(T_trail) != 64) return 1;
+    if (_Alignof(T_ptrgrp) != 64) return 2;
+    if (_Alignof(T_lead) != 64) return 3;
+    if (_Alignof(T_grp) != 64) return 4;
+    if ((unsigned long)(void *)o_trail % 64) return 5;
+    if ((unsigned long)(void *)o_ptrgrp % 64) return 6;
+    if ((unsigned long)(void *)o_lead % 64) return 7;
+    if ((unsigned long)(void *)o_grp % 64) return 8;
+    if (_Alignof(v_as) != 64) return 9;
+    if (_Alignof(v_attr) != 64) return 10;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c11_alignment_typedef_and_object_alignof", code, &[]),
+        0
+    );
+}
+
+/// The same alignments must survive a block scope, where the declaration goes
+/// through `parse_declaration_and_bind_impl` rather than `parse_external_decl`.
+/// That is a third copy of the same rule and it had drifted the same way.
+#[test]
+fn c11_alignment_typedef_at_block_scope() {
+    let code = r#"
+int main(void) {
+    typedef int L_trail[4] __attribute__((aligned(64)));
+    __attribute__((aligned(64))) typedef int L_lead[4];
+    static L_trail lo_trail;
+    static L_lead lo_lead;
+    _Alignas(64) static int lv[4];
+
+    if (_Alignof(L_trail) != 64) return 1;
+    if (_Alignof(L_lead) != 64) return 2;
+    if ((unsigned long)(void *)lo_trail % 64) return 3;
+    if ((unsigned long)(void *)lo_lead % 64) return 4;
+    if (_Alignof(lv) != 64) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c11_alignment_typedef_at_block_scope", code, &[]),
+        0
+    );
+}

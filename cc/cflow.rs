@@ -28,9 +28,7 @@ use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::process::ExitCode;
 
-// ============================================================================
 // CLI
-// ============================================================================
 
 #[derive(Parser)]
 #[command(version, about = gettext("cflow - generate a C-language flowgraph"))]
@@ -65,9 +63,7 @@ struct Args {
     files: Vec<String>,
 }
 
-// ============================================================================
 // Function Definition Info
-// ============================================================================
 
 /// What kind of global a graph node describes.
 ///
@@ -198,9 +194,7 @@ impl CallGraph {
     }
 }
 
-// ============================================================================
 // AST Walking
-// ============================================================================
 
 /// Walk an expression to find function calls
 fn extract_calls_from_expr(
@@ -615,9 +609,7 @@ fn declarator_line(lines: &[&str], start_line: u32, name: &str) -> u32 {
     start_line
 }
 
-// ============================================================================
 // lex / yacc Input
-// ============================================================================
 
 /// C source generated from a `.l` or `.y` operand, plus the temporary directory
 /// holding it (dropped, and so cleaned up, when this goes out of scope).
@@ -693,9 +685,7 @@ fn generate_from_grammar(file: &str, ext: &str) -> io::Result<GeneratedSource> {
     Ok(GeneratedSource { _dir: dir, path })
 }
 
-// ============================================================================
 // Object File Processing
-// ============================================================================
 
 /// Map a section name to the "location counter" POSIX asks for.
 ///
@@ -849,9 +839,7 @@ fn process_object_file(path: &str, graph: &mut CallGraph, buffer: &[u8]) -> io::
     Ok(())
 }
 
-// ============================================================================
 // File Processing
-// ============================================================================
 
 fn process_file(
     path: &str,
@@ -1054,9 +1042,7 @@ fn process_file(
     Ok(())
 }
 
-// ============================================================================
 // Output
-// ============================================================================
 
 /// Print flowgraph starting from a root function
 fn print_flowgraph(
@@ -1147,9 +1133,7 @@ fn print_reverse_flowgraph(graph: &CallGraph) {
     }
 }
 
-// ============================================================================
 // Main
-// ============================================================================
 
 fn main() -> ExitCode {
     plib::diag::init_locale("cflow");

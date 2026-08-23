@@ -22,9 +22,7 @@ impl Aarch64CodeGen {
     /// `long double` is the interesting one: Apple makes it a 64-bit `double`,
     /// while the AAPCS64 base standard makes it IEEE binary128 in a whole Q
     /// register. Deciding from the type table's width rather than from
-    /// `target.os` keeps one source of truth -- previously this returned
-    /// `Double` unconditionally, so on Linux the codegen loaded and stored 64
-    /// bits of a 128-bit object (#H4).
+    /// `target.os` keeps one source of truth.
     pub(super) fn fp_size_from_type(
         &self,
         typ: Option<TypeId>,
@@ -664,11 +662,10 @@ impl Aarch64CodeGen {
 impl Aarch64CodeGen {
     /// Store a floating-point value through an address operand.
     ///
-    /// aarch64's `emit_store` had no floating-point dispatch at all, unlike
-    /// x86_64's. A `long double` store therefore reached `emit_struct_store`,
-    /// whose operand match ends in `_ => return`, and vanished -- so `g = y`
-    /// on a 128-bit global emitted no instruction (#H4). This mirrors
-    /// `emit_fp_load`.
+    /// This is `emit_store`'s floating-point dispatch, mirroring
+    /// `emit_fp_load`. Without it a `long double` store reaches
+    /// `emit_struct_store`, whose operand match ends in `_ => return`,
+    /// and vanishes.
     pub(super) fn emit_fp_store(&mut self, insn: &Instruction, types: &TypeTable) {
         let (addr, value) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&a), Some(&v)) => (a, v),

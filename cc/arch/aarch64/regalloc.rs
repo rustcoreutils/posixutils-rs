@@ -45,9 +45,7 @@ use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-// ============================================================================
 // AArch64 Register Definitions
-// ============================================================================
 
 /// AArch64 physical registers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -169,7 +167,6 @@ impl Reg {
         }
     }
 
-    /// Get register name for a given bit size
     pub fn name_for_size(&self, bits: u32) -> &'static str {
         match bits {
             8 | 16 | 32 => self.name32(),
@@ -177,7 +174,6 @@ impl Reg {
         }
     }
 
-    /// Is this a callee-saved register?
     pub fn is_callee_saved(&self) -> bool {
         matches!(
             self,
@@ -334,9 +330,7 @@ impl FrameBase {
     }
 }
 
-// ============================================================================
 // AArch64 Floating-Point Register Definitions
-// ============================================================================
 
 /// AArch64 SIMD/FP registers (V0-V31, accessed as D0-D31 for double, S0-S31 for float)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -682,18 +676,14 @@ impl VReg {
     }
 }
 
-// ============================================================================
 // Operand - Location of a value (register or memory)
-// ============================================================================
 
 /// A slot in the **callee's** frame -- a local, a spill slot, or an alloca.
 ///
 /// Held as the negative displacement the backend expects, and only mintable by
-/// [`LocalSlot::alloc`], which does the negation. The two frame spaces used to
-/// be told apart by the *sign* of a bare `i32`; a refactor moved that negation
-/// into a pair of closures and updated only one, so the store side wrote to the
-/// caller's frame while the load side read the callee's. Both were valid
-/// `i32`s. Making them different types is what stops that recurring.
+/// [`LocalSlot::alloc`], which does the negation. A distinct type, rather than
+/// a signed `i32`, keeps the callee's frame from being confused with the
+/// caller's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalSlot(i32);
 
@@ -734,7 +724,6 @@ impl IncomingOff {
     /// The first incoming stack argument, just above the saved FP and LR.
     pub const FIRST: IncomingOff = IncomingOff(16);
 
-    /// This argument's offset, advancing `next` past it.
     /// Reserve `bytes` for an argument whose type wants `align`-byte
     /// alignment, and hand back where it starts.
     ///
@@ -770,11 +759,8 @@ pub enum Loc {
     /// when the frame has one.
     ///
     /// Carries a [`LocalSlot`] rather than a bare `i32` so it cannot be
-    /// confused with [`Loc::IncomingArg`]. The two used to share this variant
-    /// and be told apart by the *sign*, which is how one refactor moved the
-    /// negation into a pair of closures, updated only one, and had the store
-    /// side write the caller's frame while the load side read the callee's --
-    /// both perfectly valid `i32`s. See #C34 in `cc/audit.md`.
+    /// confused with [`Loc::IncomingArg`]: both frame spaces are perfectly
+    /// valid `i32`s, and only the type tells them apart.
     Stack(LocalSlot),
     /// An incoming stack argument, in the **caller's** frame: at +16 past the
     /// saved FP and LR, growing upwards.
@@ -787,9 +773,7 @@ pub enum Loc {
     Global(String),
 }
 
-// ============================================================================
 // Register Allocator (Linear Scan)
-// ============================================================================
 
 /// Information about an argument spilled from a caller-saved register to stack
 #[derive(Debug, Clone)]
@@ -801,16 +785,11 @@ pub struct SpilledArg {
     /// The FP register the argument originally arrived in (if FP arg)
     pub from_fp_reg: Option<VReg>,
     /// The slot it was spilled to.
-    ///
-    /// Typed, because this is the value the M4 regression corrupted: the shared
-    /// helper hands the same raw counter to the location closure and to this
-    /// record, each of which used to negate it independently, and one did not.
     pub to_stack_offset: LocalSlot,
     /// Bytes the value occupies.
     ///
     /// A `long double` is binary128 here, so an FP argument spilled across a
-    /// call needs all sixteen; the prologue used to store eight unconditionally
-    /// and the value came back with its top half missing.
+    /// call needs all sixteen bytes, not a fixed eight.
     pub bytes: i32,
 }
 
@@ -829,7 +808,7 @@ fn fp_arg_bytes(func: &Function, pseudo: PseudoId, types: &TypeTable) -> i32 {
 
 /// Map a single-letter GCC operand-constraint Fixed-register letter
 /// to the corresponding aarch64 GP register. AAPCS64 has no
-/// "specific register" constraint letters in the C2 vocabulary;
+/// "specific register" constraint letters in this vocabulary;
 /// all aarch64 inline-asm register operands use `"r"` (Any GP) or
 /// `"w"` (Any V), both of which `parse_constraint` handles directly
 /// without consulting this table. So the current resolver returns
@@ -844,7 +823,7 @@ pub fn parse_aarch64_fixed_letter(_letter: char) -> Option<Reg> {
 /// Map a single-letter AAPCS64 operand-constraint *class* letter to
 /// an `OperandConstraint`.
 ///
-/// Covered letters (C10 scope):
+/// Covered letters:
 /// - `I` — 12-bit positive immediate for ADD/SUB/MOVZ/MOVN.
 /// - `J` — negative `I` (the value `-x` where `x` matches `I`).
 /// - `K` — 32-bit logical (bitfield) immediate.
@@ -923,9 +902,9 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
 /// Special tokens (`"memory"`, `"cc"`) are filtered out — see x86_64
 /// `get_constraint_info` documentation for the rationale.
 pub fn get_constraint_info_aarch64(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
-    // Inline-asm path (C2 lowering) — also folds in any C5
-    // scratch-clobber predicate hit, so inline asm in a dirty
-    // opcode position carries both sets of clobbers.
+    // Inline-asm path — also folds in any scratch-clobber predicate
+    // hit, so inline asm in a dirty opcode position carries both sets
+    // of clobbers.
     if insn.op == Opcode::Asm {
         let ic = build_asm_instr_constraints_aarch64(insn)?;
         let (mut clobbers, involved) =
@@ -1041,29 +1020,6 @@ fn opcode_clobbers_aarch64_scratches(op: Opcode) -> bool {
     )
 }
 
-// ============================================================================
-// C5 status — AArch64 codegen scratch freeing deferred.
-// ============================================================================
-//
-// Same story as x86_64's C4 (see the deferred-freeing block in
-// `cc/arch/x86_64/regalloc.rs`). The per-IR-opcode constraint
-// declarations above are the future-extension point for freeing
-// X9 / X10 / X11 (and eventually X16 / X17), but the codegen
-// paths that use these scratches across instruction boundaries
-// (function prologue, callee-saved save/restore, the pair-address
-// legalizer's X16 materialization, int128 lo/hi shuttle) all
-// require either a wholesale codegen refactor or a pre-IR
-// scratch-declaration table before adding the registers to
-// `Reg::allocatable()` is safe.
-//
-// V16 / V17 / V18 (FP scratches in `cc/arch/aarch64/float.rs`)
-// additionally need V-bank ConstraintPoint plumbing through
-// `color_vreg_bank` — same prerequisite the x86_64 XMM14/XMM15
-// freeing has on `color_xmm_bank`.
-//
-// This commit ships the predicate + integration so the eventual
-// freeing change is just `Reg::allocatable()` modification.
-
 /// Build the per-operand `InstrConstraints` view of an inline-asm
 /// instruction. Mirror of `build_asm_instr_constraints_x86_64`.
 pub fn build_asm_instr_constraints_aarch64(
@@ -1106,7 +1062,7 @@ pub fn build_asm_instr_constraints_aarch64(
 /// Walk a function's inline-asm instructions and collect
 /// `(operand_pseudo, fixed_reg)` pairs. Mirror of
 /// `collect_asm_fixed_precolors_x86_64`. AAPCS64 currently has no
-/// Fixed letters in C2 scope, so this function always returns an
+/// Fixed letters in scope, so this function always returns an
 /// empty map today — but the plumbing is wired through
 /// `color_gp_bank` for symmetry and so that when a future
 /// constraint vocabulary expansion brings Fixed letters in scope
@@ -1146,7 +1102,7 @@ pub fn lower_instr_constraints_to_constraint_point_aarch64(
             OperandConstraint::Fixed(r) => clobbers.push(*r),
             OperandConstraint::Match(_idx) => { /* C3: coalescing edge */ }
             OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {}
-            // C9 multi-alternative — see x86_64 mirror.
+            // Multi-alternative — see the x86_64 mirror.
             OperandConstraint::Alternatives(_) => {}
         }
         if matches!(op.kind, OperandKind::EarlyClobber) { /* C3: extra interference */ }
@@ -1399,8 +1355,6 @@ impl RegAlloc {
                         // stack, NSRN is set to 8 and every later
                         // floating-point argument follows it there — unlike
                         // System V, which leaves the unused registers free.
-                        // (The prologue still does not copy a spilled HFA into
-                        // its local; that is #H13.)
                         fp_arg_idx = fp_arg_regs.len();
                     }
                 }
@@ -1525,8 +1479,7 @@ impl RegAlloc {
             |pseudo, from_reg, to_stack_offset| {
                 // The shared helper hands both closures the same raw counter.
                 // `LocalSlot` applies the sign once, so this record and the
-                // location cannot disagree about which frame they name -- the
-                // M4 regression was exactly that disagreement.
+                // location cannot disagree about which frame they name.
                 spilled_args.push(SpilledArg {
                     pseudo,
                     from_gp_reg: Some(from_reg),
@@ -1637,7 +1590,7 @@ impl RegAlloc {
         }
     }
 
-    /// M6 chordal coloring + M7 Belady eviction, AArch64 mirror of the
+    /// Chordal coloring plus Belady eviction, AArch64 mirror of the
     /// x86_64 `run_chordal_color` in `cc/arch/x86_64/regalloc.rs`.
     ///
     /// Phases:
@@ -1939,7 +1892,7 @@ impl RegAlloc {
             },
         );
 
-        // -------- M7 Belady eviction --------
+        // -------- Belady eviction --------
         let uses = crate::arch::regalloc::compute_use_positions(func);
         let mut colors = result.colors;
         let mut final_spilled: std::collections::BTreeSet<PseudoId> =

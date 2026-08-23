@@ -49,9 +49,7 @@ use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-// ============================================================================
 // x86-64 Register Definitions
-// ============================================================================
 
 /// x86-64 physical registers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -164,7 +162,6 @@ impl Reg {
         }
     }
 
-    /// Get register name for a given bit size
     pub fn name_for_size(&self, bits: u32) -> &'static str {
         match bits {
             8 => self.name8(),
@@ -174,7 +171,6 @@ impl Reg {
         }
     }
 
-    /// Is this a callee-saved register?
     pub fn is_callee_saved(&self) -> bool {
         matches!(
             self,
@@ -227,9 +223,7 @@ impl Reg {
     }
 }
 
-// ============================================================================
 // Register Constraints (LLVM-style constraint-aware allocation)
-// ============================================================================
 
 /// Register constraints for an instruction.
 /// Used by the register allocator to avoid assigning pseudos to registers
@@ -324,14 +318,11 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
 /// already forbids R10/R11 alongside every other caller-saved
 /// register.
 fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
-    // **Infrastructure only — see the documentation at
-    // `R10_R11_FREEING_DEFERRED` below for why R10/R11 are still
-    // in the reserved-scratch list.** This predicate is the
-    // future-extension point: when the codegen refactor that
-    // moves scratch declarations off hardcoded R10/R11 lands,
-    // adding R10/R11 to `Reg::allocatable()` will start producing
-    // ConstraintPoint forbiddings without changing
-    // `get_constraint_info`.
+    // **Infrastructure only — see the note below on inter-instruction
+    // scratch use for why R10/R11 are still in the reserved-scratch
+    // list.** This predicate is the extension point: adding R10/R11 to
+    // `Reg::allocatable()` starts producing ConstraintPoint forbiddings
+    // without changing `get_constraint_info`.
     //
     // Conservative coverage: every opcode whose codegen helper
     // touches a non-trivial code path is included. Excluded
@@ -361,50 +352,11 @@ fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
     )
 }
 
-// ============================================================================
-// C4 status — R10/R11 freeing deferred.
-// ============================================================================
-//
-// The C4 milestone intended to add R10/R11 to `Reg::allocatable()`
-// so the chordal allocator could place pseudos in them when their
-// live range doesn't cross an opcode whose codegen helper uses them
-// as scratch. The constraint declaration `opcode_clobbers_r10_r11`
-// above is the infrastructure that *would* make the allocator
-// respect those clobbers.
-//
-// In practice the per-IR-opcode constraint model is **not
-// sufficient**. Inter-instruction codegen paths use R10/R11 in
-// ways no IR-instruction-level constraint can express:
-//
-// 1. `emit_prologue` saves rdi/rcx into R10/R11 around the
-//    `rep stosq` that zeroes the local frame.
-// 2. `emit_variadic_save_area` shuttles arg regs through R10/R11.
-// 3. `spill_args_across_calls` codegen restores spilled args
-//    via R10/R11 in the prologue.
-// 4. Several FP and struct lowerings use R10/R11 between LIR
-//    pushes that span more than one IR instruction's worth of
-//    LIR output.
-//
-// Empirical proof: adding R10/R11 to `Reg::allocatable()` even
-// with `opcode_clobbers_r10_r11` returning `true` for everything
-// but the 7 truly-trivial opcodes still segfaults CPython's
-// `_bootstrap_python` at deepfreeze generation. The crash site
-// (`ucs1lib_default_find`) is in code whose codegen exercises one
-// of the inter-instruction paths.
-//
-// Genuine freeing requires either:
-// - **Codegen refactor**: every `emit_*` helper takes an
-//   allocator-supplied scratch register. Prologue/epilogue/
-//   variadic-save also route through the allocator. Estimated
-//   4000–8000 LOC change.
-// - **Pre-IR scratch-declaration table**: every helper publishes
-//   its scratch needs into a side table the allocator consults
-//   before liveness analysis; ConstraintPoints get added for
-//   prologue/epilogue positions. Estimated 1500–2500 LOC.
-//
-// Both are multi-session milestones in their own right. C4 ships
-// the constraint-declaration infrastructure that enables either
-// approach without lock-in.
+// The per-IR-opcode constraint model is **not sufficient** on its own:
+// R10/R11 stay reserved because the prologue's `rep stosq`, the
+// variadic save area, the spilled-arg restore, and several
+// multi-instruction FP and struct lowerings all use them across
+// IR-instruction boundaries.
 
 /// Opcodes whose x86_64 codegen lowering invokes an external function
 /// (libc or otherwise) and therefore clobbers caller-saved registers.
@@ -417,12 +369,6 @@ fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
 ///   signbit-double libc call (features.rs:1407+)
 /// - `Memset` / `Memcpy` / `Memmove` → libc memset/memcpy/memmove
 ///   (features.rs:1214+)
-///
-/// Before this list existed, the chordal allocator (M6+M7) had a
-/// latent bug: live FP pseudos in the same block as a `Signbit64`
-/// would be allocated to XMM regs that the emitted libc call
-/// clobbered. Linear scan never used those XMM regs (pop'd from
-/// end of palette) so the bug was invisible until M6.
 pub fn is_call_like_x86_64(op: Opcode) -> bool {
     matches!(
         op,
@@ -442,9 +388,9 @@ pub fn is_call_like_x86_64(op: Opcode) -> bool {
 /// Map a single-letter GCC operand-constraint Fixed-register letter
 /// to the corresponding x86_64 GP register.
 ///
-/// The C2 vocabulary covers `a` (rax), `b` (rbx), `c` (rcx), `d`
-/// (rdx), `S` (rsi), `D` (rdi). C10 adds the class-letter resolver
-/// `parse_x86_64_class_letter` for `q`/`R`/`l` (treated as `Any`)
+/// The vocabulary covers `a` (rax), `b` (rbx), `c` (rcx), `d`
+/// (rdx), `S` (rsi), `D` (rdi). The class-letter resolver
+/// `parse_x86_64_class_letter` takes `q`/`R`/`l` (treated as `Any`)
 /// and the constant-range letters `I`/`J`/`K`/`L`/`M`/`N`/`O`/`X`
 /// (treated as `Imm`).
 pub fn parse_x86_64_fixed_letter(letter: char) -> Option<Reg> {
@@ -464,7 +410,7 @@ pub fn parse_x86_64_fixed_letter(letter: char) -> Option<Reg> {
 /// constant range; they're distinct from `parse_x86_64_fixed_letter`
 /// which pins to one specific register.
 ///
-/// Covered letters (C10 scope):
+/// Covered letters:
 /// - `q` — class of registers usable for 8-bit operations. On modern
 ///   x86_64 every GP register has a low-byte alias, so we widen this
 ///   to `Any` GP register.
@@ -522,26 +468,6 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     })
 }
 
-/// Get constraint info for an instruction (used by shared compute_live_intervals).
-/// Returns (clobbered_registers, involved_pseudos) if constraints apply, None otherwise.
-///
-/// Sources:
-/// - **Opcode-level hardware constraints** (`opcode_constraints`):
-///   division clobbers Rax/Rdx; shifts clobber Rcx; vaarg clobbers
-///   Rax/Rcx; mul (int128 path) clobbers Rax/Rdx.
-/// - **Inline-asm explicit clobbers** (`Opcode::Asm`): the parser
-///   collected the asm's clobber list into `AsmData.clobbers`. Named
-///   GP registers in that list become hard clobbers at the asm
-///   position. Special tokens (`"memory"`, `"cc"`) are not GP
-///   register clobbers and are filtered out here — `"memory"` gets
-///   full barrier semantics in C3 via `InstrConstraints.memory_barrier`;
-///   `"cc"` is a no-op for our allocator since we don't track
-///   condition-code liveness.
-///
-/// `involved_pseudos` includes the instruction's target + sources so
-/// they may legally occupy a clobbered register if needed (the
-/// operand exemption — see `pseudos_interfere` documentation). VaArg
-/// is the exception: its sources must NOT alias the clobbered regs.
 /// Build the per-operand `InstrConstraints` view of an inline-asm
 /// instruction. Walks `AsmData.outputs` + `AsmData.inputs` + the
 /// clobber list and produces a single structured value. Returns
@@ -551,8 +477,8 @@ fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
 /// Constraint-string parse errors are reported by `c17`'s front end
 /// at IR-construction time (the parser already accepts these
 /// strings). Here we treat a parse error as "ignore this operand" —
-/// the existing inline-asm codegen continues to use the raw constraint
-/// string for letters this C2 vocabulary doesn't cover yet.
+/// the inline-asm codegen falls back to the raw constraint string
+/// for letters this vocabulary does not cover.
 pub fn build_asm_instr_constraints_x86_64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
@@ -570,9 +496,7 @@ pub fn build_asm_instr_constraints_x86_64(
         ) {
             // Default-kind from the parser is correct for inputs and
             // matches GCC for outputs (`=` and `+` modifiers come
-            // through the string). Explicit override only needed if
-            // the parser's heuristic mismatches an output we know is
-            // a Def — leave to C3 if it shows up.
+            // through the string).
             operands.push(OperandSpec {
                 pseudo: ac.pseudo,
                 kind,
@@ -597,10 +521,9 @@ pub fn build_asm_instr_constraints_x86_64(
 
 /// Lower a richer `InstrConstraints` down to the
 /// `(clobbers, involved_pseudos)` shape the current `ConstraintPoint`
-/// mechanism understands. The C2 commit keeps `InstrConstraints` as
-/// a pass-through; the chordal allocator still drives entirely off
-/// the lowered `ConstraintPoint`. C3 will start consuming
-/// `InstrConstraints.operands` and `memory_barrier` directly.
+/// mechanism understands. `InstrConstraints` is a pass-through; the
+/// chordal allocator drives entirely off the lowered
+/// `ConstraintPoint`.
 pub fn lower_instr_constraints_to_constraint_point(
     ic: &crate::arch::asm_constraints::InstrConstraints<Reg>,
     insn: &Instruction,
@@ -609,37 +532,30 @@ pub fn lower_instr_constraints_to_constraint_point(
 
     let mut clobbers = ic.clobbers.clone();
     for op in &ic.operands {
-        // The C2 lowering only uses Fixed (-> implicit clobber) and
+        // The lowering only uses Fixed (-> implicit clobber) and
         // EarlyClobber kind (-> implicit clobber). The other variants
-        // are recognised here for completeness and for C3, which
-        // consumes them directly off `InstrConstraints` instead of
-        // going through `ConstraintPoint`.
+        // are recognised here for completeness.
         match &op.constraint {
             OperandConstraint::Fixed(r) => clobbers.push(*r),
             OperandConstraint::Match(_idx) => { /* C3: coalescing edge */ }
             OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {}
-            // C9 multi-alternative — by construction the
-            // alternatives are restricted to Any/Mem/Imm (no Fixed
-            // or Match), so none impose an allocator clobber. The
-            // allocator picks the most flexible interpretation
-            // (register class) and the codegen later observes the
-            // operand's actual location to choose register vs
-            // memory vs immediate syntax. C9b wires the codegen
-            // side; this lowering is the no-op until then.
+            // Multi-alternative — by construction the alternatives
+            // are restricted to Any/Mem/Imm (no Fixed or Match), so
+            // none impose an allocator clobber. The allocator picks
+            // the most flexible interpretation (register class) and
+            // the codegen later observes the operand's actual
+            // location to choose register vs memory vs immediate.
             OperandConstraint::Alternatives(_) => {}
         }
         // Early-clobber outputs are written before all inputs are
         // read, so the allocator must keep them disjoint from every
-        // input. C3 implements this as per-operand forbidden edges;
-        // C2 cannot express it through ConstraintPoint.
+        // input.
         if matches!(op.kind, OperandKind::EarlyClobber) { /* C3: extra interference */ }
     }
-    // `memory_barrier` is parsed and stored on `InstrConstraints`
-    // but its strict semantics (force a barrier on every memory-
-    // promoted pseudo) require allocator awareness that arrives in
-    // C3. C1 already treats inline-asm memory clobber as a clobber
-    // list entry the allocator otherwise ignores (`parse_gp_clobber_name`
-    // returns None for the string `"memory"`).
+    // `memory_barrier` is parsed and stored on `InstrConstraints`.
+    // An inline-asm memory clobber is a clobber list entry the
+    // allocator otherwise ignores (`parse_gp_clobber_name` returns
+    // None for the string `"memory"`).
     let _ = ic.memory_barrier;
     clobbers.sort();
     clobbers.dedup();
@@ -668,8 +584,7 @@ pub fn lower_instr_constraints_to_constraint_point(
 /// The codegen's "move-into-fixed-register-around-asm" path stays
 /// in place as a fallback — if pre-coloring conflicts with an
 /// earlier ABI pin and the allocator can't honor it, the codegen
-/// still emits the corrective move. C3 just lets the allocator
-/// honor the constraint *cleanly* in the common case.
+/// still emits the corrective move.
 pub fn collect_asm_fixed_precolors_x86_64(func: &Function) -> BTreeMap<PseudoId, Reg> {
     let mut out = BTreeMap::new();
     for block in &func.blocks {
@@ -694,22 +609,18 @@ pub fn collect_asm_fixed_precolors_x86_64(func: &Function) -> BTreeMap<PseudoId,
 }
 
 pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId>)> {
-    // Inline asm: route through the C2 per-operand constraint
-    // vocabulary and lower the result back to ConstraintPoint so the
-    // chordal allocator behaves exactly as it did under C1. C3
-    // switches the allocator to consume `InstrConstraints` directly.
+    // Inline asm: route through the per-operand constraint vocabulary
+    // and lower the result back to ConstraintPoint for the chordal
+    // allocator.
     if insn.op == Opcode::Asm {
         let ic = build_asm_instr_constraints_x86_64(insn)?;
         let (mut clobbers, involved) = lower_instr_constraints_to_constraint_point(&ic, insn);
-        // C4 R10/R11 scratch clobbers apply to the inline-asm path
+        // The R10/R11 scratch clobbers apply to the inline-asm path
         // too: `emit_inline_asm` in `cc/arch/x86_64/codegen.rs` uses
         // R10/R11 to shuffle operands into Fixed-letter registers,
         // remap allocated regs that collide with the reserved-scratch
         // set (`find_temp_reg` falls back to R10 / R11), and host
-        // input/output spill helpers around the asm body. Today
-        // R10/R11 are reserved-scratch so this augmentation is
-        // a no-op; when C4's freeing lands the augmentation becomes
-        // load-bearing for inline asm just like for the IR ops below.
+        // input/output spill helpers around the asm body.
         if opcode_clobbers_r10_r11(insn.op) {
             clobbers.push(Reg::R10);
             clobbers.push(Reg::R11);
@@ -722,7 +633,7 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
         return Some((clobbers, involved));
     }
 
-    // Opcode-level hardware constraints, plus the C4 R10/R11 scratch
+    // Opcode-level hardware constraints, plus the R10/R11 scratch
     // clobbers for any opcode whose codegen helper uses them.
     let constraints = opcode_constraints(insn.op);
     let needs_r10_r11 = opcode_clobbers_r10_r11(insn.op);
@@ -754,9 +665,7 @@ pub fn get_constraint_info(insn: &Instruction) -> Option<(Vec<Reg>, Vec<PseudoId
     Some((clobbers, involved))
 }
 
-// ============================================================================
 // XMM Register Definitions (SSE/FP)
-// ============================================================================
 
 /// x86-64 XMM registers for floating-point operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -841,9 +750,7 @@ impl XmmReg {
     }
 }
 
-// ============================================================================
 // Operand - Location of a value (register or memory)
-// ============================================================================
 
 /// Location of a value
 #[derive(Debug, Clone, PartialEq)]
@@ -891,9 +798,7 @@ pub struct SpilledXmmArg {
     pub size: FpSize,
 }
 
-// ============================================================================
 // Register Allocator (Linear Scan)
-// ============================================================================
 
 /// Simple linear scan register allocator for x86-64
 pub struct RegAlloc {
@@ -925,9 +830,7 @@ pub struct RegAlloc {
     ///
     /// Such a parameter is given a *local* sixteen-byte slot as its location,
     /// because that is where the prologue copies it to; the caller's offset has
-    /// nowhere else to live. The prologue used to recompute it with a second
-    /// counter of its own that only this one case advanced, so it disagreed
-    /// with the real layout as soon as any other argument was stacked.
+    /// nowhere else to live, and the prologue must not recompute it.
     int128_incoming: BTreeMap<PseudoId, i32>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
@@ -951,12 +854,9 @@ pub struct RegAlloc {
 ///
 /// `x87.rs` needs a fixed address to stage an immediate or a general register
 /// through on its way into the FPU -- `fild` and `fld` have no register form.
-/// That address used to be `-(callee_saved_offset + 8)(%rbp)`, which no one
-/// had reserved: slot offsets start at zero, so it landed squarely on the
-/// first local. For a `long double` first local it overwrote bytes 8 and 9 --
-/// the sign and exponent -- and turned `1.0L` into `2^-16382`, which prints as
-/// `0.0`. Reserving the region here is what makes the address the allocator's
-/// to give and the scratch's to keep.
+/// Reserving the region here makes that address the allocator's to give and
+/// the scratch's to keep; an unreserved address lands on the first local,
+/// because slot offsets start at zero.
 ///
 /// See [`X86_64CodeGen::x87_scratch_addr`].
 pub(super) const X87_SCRATCH_BYTES: i32 = 16;
@@ -966,13 +866,9 @@ pub(super) const X87_SCRATCH_BYTES: i32 = 16;
 ///
 /// SysV AMD64 §3.2.3 places each stacked argument at an address rounded up to
 /// `max(8, alignof(type))`, so an argument's own alignment decides where it
-/// begins, not just the running total. This used to be a bare `i32` that every
-/// arm advanced by a size and none rounded up, which put a stacked `__int128`
-/// or `long double` after an odd number of eight-byte arguments eight bytes
-/// low -- the callee read the argument before it.
-///
-/// aarch64 learned the same lesson in #C42a; `IncomingOff::take` there is the
-/// same shape.
+/// begins, not just the running total. A distinct type keeps every arm going
+/// through `IncomingOff::take`, which applies the rounding; aarch64's
+/// `IncomingOff::take` is the same shape.
 #[derive(Clone, Copy)]
 struct IncomingOff(i32);
 
@@ -1238,10 +1134,9 @@ impl RegAlloc {
         // 16 = saved rbp (8) + return address (8)
         let mut stack_arg_offset = IncomingOff::FIRST;
 
-        // M1: use the shared AbiLowering helper for sret detection and
-        // O(1) Arg(n) → pseudo lookup. The classification dispatch below
-        // retains the original inline type-kind checks to guarantee
-        // byte-identical codegen with the pre-M1 implementation.
+        // The shared AbiLowering helper does sret detection and O(1)
+        // Arg(n) → pseudo lookup; the classification dispatch below keeps
+        // its own inline type-kind checks.
         let lowering = AbiLowering::new(func, types);
         let arg_idx_offset = lowering.arg_idx_offset;
 
@@ -1260,11 +1155,9 @@ impl RegAlloc {
             };
             // `kind()` answers the *base* kind for a complex type, so without
             // the guard `long double _Complex` satisfies this and takes the
-            // sixteen-byte branch below -- advancing the incoming cursor by
-            // half of its thirty-two, so every stack parameter after it was
-            // read sixteen bytes low. The COMPLEX_X87 branch meant for it is
-            // further down, and had been unreachable. Both sibling sites, in
-            // `call.rs` and `codegen.rs`, already exclude complex here.
+            // sixteen-byte branch below rather than the COMPLEX_X87 branch
+            // further down that is meant for its thirty-two. Both sibling
+            // sites, in `call.rs` and `codegen.rs`, exclude complex too.
             let is_longdouble =
                 types.kind(*typ) == crate::types::TypeKind::LongDouble && !types.is_complex(*typ);
             let is_fp = types.is_float(*typ);
@@ -1716,7 +1609,7 @@ impl RegAlloc {
         intervals.iter().find(|i| i.pseudo == p)
     }
 
-    /// M6 chordal coloring with stub M7 (spill-on-fail).
+    /// Chordal coloring, with spill-on-fail for uncolorable vertices.
     ///
     /// Three phases:
     ///   1. Pre-pass: route non-register-allocated pseudos to their
@@ -1749,8 +1642,7 @@ impl RegAlloc {
         for interval in &intervals {
             // Intervals come pre-sorted by start position from
             // compute_live_intervals, so this monotonic expiration
-            // recovers the linear-scan-era slot-reuse behavior the
-            // chordal sweep would otherwise lose.
+            // keeps slot reuse available to the chordal sweep.
             crate::arch::regalloc::expire_stack_intervals(
                 &mut self.active_stack,
                 &mut self.free_stack_slots,
@@ -1820,19 +1712,6 @@ impl RegAlloc {
                             // interval of a Sym pseudo only captures
                             // its direct Store/Load/SymAddr uses,
                             // not the lifetime of register pseudos
-                            // that derive their values from the
-                            // slot. Linear scan allocated slot
-                            // offsets monotonically and so happened
-                            // not to reuse Sym slots in conflicting
-                            // ways; chordal coloring exposes the
-                            // gap. CPython `_warnings.o::init_filters`
-                            // and `flowgraph.o::_PyCfgBuilder_Addop`
-                            // both miscompiled on the Sym-slot reuse
-                            // pattern even with the
-                            // [[interval-overlap fix]] (the Sym's
-                            // IR interval ends before the derived
-                            // register pseudo's lifetime does, so
-                            // interval-overlap reports no conflict).
                             //
                             // Future fix: extend the Sym's interval
                             // to cover all derived register pseudos'
@@ -1927,7 +1806,7 @@ impl RegAlloc {
         }
         for (pid, reg) in collect_asm_fixed_precolors_x86_64(func) {
             // Only pre-color if the pseudo is a GP candidate. The
-            // C2 lowering already routes Fixed-operand registers
+            // lowering already routes Fixed-operand registers
             // into the ConstraintPoint clobber set, so even if
             // pre-coloring is skipped here the operand remains
             // exempt via `involved_pseudos`.
@@ -2053,7 +1932,7 @@ impl RegAlloc {
             },
         );
 
-        // -------- M7 Belady eviction --------
+        // -------- Belady eviction --------
         // For each pseudo the greedy pass couldn't place, look at its
         // colored neighbors. If a neighbor's next-use is STRICTLY
         // further than the failing pseudo's, hand the neighbor's
@@ -2130,8 +2009,6 @@ impl RegAlloc {
             }
         }
 
-        // -------- M9b post-coloring Copy coalescing --------
-        //
         // For each `Opcode::Copy { target: t, src: [s] }` in the
         // function, try to migrate `t`'s location to `s`'s location
         // (so the Copy becomes identity and M9a elides it). Skip if:
@@ -2146,10 +2023,6 @@ impl RegAlloc {
         //   move would create a conflict)
         // - `t`'s forbidden set contains `s`'s register (the
         //   constraint system reserved that register against `t`)
-        //
-        // Naive non-Briggs heuristic: per-candidate decision, no
-        // global degree analysis. Cargo + CPython gates catch any
-        // mis-coloring.
         let candidates = crate::arch::regalloc::find_copy_coalesce_candidates(func);
         for (t, s) in candidates {
             if !gp_candidates.contains(&t) || !gp_candidates.contains(&s) {
@@ -2193,18 +2066,6 @@ impl RegAlloc {
                 self.used_callee_saved.push(s_reg);
             }
         }
-        // Process spill commits in interval.start order with
-        // monotonic expiration. Earlier (M6+M7 v1) drained everything
-        // with `usize::MAX` then relied on `pseudos_interfere` to
-        // gate reuse — but that check uses block-level live_in/out
-        // sets which miss within-block interference. A spilled
-        // register pseudo whose lifetime sits entirely inside one
-        // block has empty live_in/out projections and was happily
-        // assigned to a slot owned by a Sym pseudo still alive in
-        // the same block (root cause of the CPython
-        // `PyThread_acquire_lock_timed` miscompile — slot reused for
-        // `_PyTime_Add` result while `thelock` was still live).
-        //
         // The monotonic sweep mirrors linear scan's invariant: a
         // slot is only freed once the owning interval has ended,
         // and a new interval's start ≥ the freed slot's owner's
@@ -2365,7 +2226,7 @@ mod tests {
     fn parse_gp_clobber_name_unknown() {
         // Special tokens and non-GP names return None — the asm
         // clobber walker filters them out silently. "memory" / "cc"
-        // get other treatment (C3 memory barrier; cc is a no-op).
+        // get other treatment (memory barrier; cc is a no-op).
         assert_eq!(parse_gp_clobber_name("memory"), None);
         assert_eq!(parse_gp_clobber_name("cc"), None);
         assert_eq!(parse_gp_clobber_name("xmm0"), None);
@@ -2454,18 +2315,6 @@ mod arg_location_tests {
     }
 
     /// Where an `Arg` pseudo lives must be where the ABI actually puts it.
-    ///
-    /// This is the check for the hazard recorded as regalloc "Bug 3": that
-    /// `get_location(Arg(0))` answered `Loc::Stack(+8)` -- the saved
-    /// return-address slot -- for an argument that arrives in `%rdi`. Nothing
-    /// read that answer, because every use of an `Arg` went through a `Copy`
-    /// the allocator had placed in a register; folding those away is exactly
-    /// what copy propagation, CSE, GVN and SCCP do, which is why the note
-    /// forbade all four.
-    ///
-    /// A positive `Loc::Stack` is the specific shape that was wrong: on this
-    /// target the callee's own frame is addressed at negative offsets, and the
-    /// caller's incoming area has its own variant.
     #[test]
     fn arg_pseudos_land_where_the_abi_puts_them() {
         let types = TypeTable::new(&Target::host());

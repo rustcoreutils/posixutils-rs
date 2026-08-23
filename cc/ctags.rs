@@ -27,9 +27,7 @@ use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
-// ============================================================================
 // CLI
-// ============================================================================
 
 #[derive(Parser)]
 #[command(version, about = gettext("ctags - create a tags file"))]
@@ -51,9 +49,7 @@ struct Args {
     files: Vec<String>,
 }
 
-// ============================================================================
 // Tag Entry
-// ============================================================================
 
 /// A tag entry representing a definition location
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,9 +98,7 @@ impl TagEntry {
     }
 }
 
-// ============================================================================
 // Source File Processing
-// ============================================================================
 
 /// Get the line content for a given line number (1-based)
 fn get_line_content(lines: &[String], line_num: u32) -> String {
@@ -119,16 +113,12 @@ fn get_line_content(lines: &[String], line_num: u32) -> String {
 fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntry>> {
     let mut tags = Vec::new();
 
-    // Read file content once, one `char` per source byte.
-    //
-    // `String::from_utf8_lossy` was wrong here even though it kept the file's
-    // tags: it replaces every invalid byte with U+FFFD, and those bytes end up
-    // inside the emitted `/^...$/` search pattern — which then no longer
-    // matches the line it points at, so the editor lands nowhere. Mapping each
-    // byte to the char of the same value round-trips exactly (see
-    // `bytes_from_latin1` at the write side), and it means the pattern is
-    // reproduced byte-for-byte regardless of the source's encoding, which is
-    // the behavior LC_CTYPE would otherwise have to select.
+    // Read file content once, one `char` per source byte: `from_utf8_lossy`
+    // would replace each invalid byte with U+FFFD, which lands inside the
+    // emitted `/^...$/` search pattern and stops it matching the line it points
+    // at. Mapping each byte to the char of the same value round-trips exactly
+    // (see `bytes_from_latin1` at the write side), so the pattern is reproduced
+    // byte-for-byte whatever the source's encoding.
     let raw = fs::read(path)?;
     let content: String = raw.iter().map(|&b| b as char).collect();
     let lines: Vec<String> = content.lines().map(String::from).collect();
@@ -343,9 +333,7 @@ fn extract_macro_tags(lines: &[String], path: &str, tags: &mut Vec<TagEntry>) {
     }
 }
 
-// ============================================================================
 // Main
-// ============================================================================
 
 fn main() -> ExitCode {
     plib::diag::init_locale("ctags");

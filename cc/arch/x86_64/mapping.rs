@@ -124,14 +124,6 @@ impl X86_64Mapper {
                 }
             }
             // Float16 <-> integer, converted through `float`.
-            //
-            // These used to emit one direct libcall each -- `__fixhfsi`,
-            // `__floatsihf` and their long/unsigned siblings -- and libgcc
-            // defines not one of them, so valid C failed to link. They also
-            // chose the helper by `dst_size <= 32`, which handed a 128-bit
-            // operand the 64-bit helper and would have read half of it.
-            // Going through `float` fixes both: see
-            // `expand_float16_int_convert`.
             Opcode::FCvtS | Opcode::FCvtU => {
                 if types.kind(insn.src_typ?) != TypeKind::Float16 {
                     return None;
@@ -183,9 +175,7 @@ mod tests {
         }
     }
 
-    // ========================================================================
     // Int128 div/mod
-    // ========================================================================
 
     #[test]
     fn test_x86_64_int128_divs() {
@@ -302,9 +292,7 @@ mod tests {
         assert_legal(&mapper.map_insn(&insn, &mut ctx));
     }
 
-    // ========================================================================
     // Int128 expand
-    // ========================================================================
 
     #[test]
     fn test_x86_64_int128_add_expands() {
@@ -329,9 +317,7 @@ mod tests {
         assert_expand(&mapper.map_insn(&insn, &mut ctx));
     }
 
-    // ========================================================================
     // Int128↔float conversion
-    // ========================================================================
 
     #[test]
     fn test_x86_64_int128_to_float() {
@@ -521,9 +507,7 @@ mod tests {
         assert_legal(&mapper.map_insn(&insn, &mut ctx));
     }
 
-    // ========================================================================
     // Int128 constant shifts
-    // ========================================================================
 
     #[test]
     fn test_x86_64_int128_const_shl_expands() {
@@ -622,9 +606,7 @@ mod tests {
         assert_legal(&mapper.map_insn(&insn, &mut ctx));
     }
 
-    // ========================================================================
     // Float16 conversions
-    // ========================================================================
 
     #[test]
     fn test_x86_64_float16_to_float_conversion() {
@@ -677,9 +659,7 @@ mod tests {
     }
 
     /// A `_Float16` <-> integer conversion goes through `float`, because
-    /// libgcc implements no half<->integer helper at all. These used to assert
-    /// a single direct call to `__fixhfsi` and its siblings -- the symbols that
-    /// made valid C fail to link.
+    /// libgcc implements no half<->integer helper at all.
     #[test]
     fn test_x86_64_float16_int_conversions_go_through_float() {
         let target = Target::new(Arch::X86_64, Os::Linux);
@@ -776,8 +756,7 @@ mod tests {
     /// A 128-bit operand builds its own libcall inside the expansion rather
     /// than leaving a `float` <-> `__int128` conversion for a later pass:
     /// `map_function` does not re-map a replacement. Picking the helper by
-    /// `dst_size <= 32`, as the old code did, handed a 128-bit operand the
-    /// 64-bit `__fixhfdi` / `__floatdihf` and would have read half of it.
+    /// `dst_size <= 32` would hand it the 64-bit `__fixhfdi`/`__floatdihf`.
     #[test]
     fn test_x86_64_float16_int128_conversions_use_the_128_bit_helper() {
         let target = Target::new(Arch::X86_64, Os::Linux);

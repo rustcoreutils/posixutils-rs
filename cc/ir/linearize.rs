@@ -6,8 +6,7 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Linearizer for c17 C17 compiler
-// Converts AST to SSA-form IR with basic blocks and typed pseudo-registers
+// Converts the AST to SSA-form IR: basic blocks and typed pseudo-registers.
 //
 
 use super::mem2reg::mem2reg;
@@ -196,9 +195,7 @@ pub(crate) struct StaticLocalInfo {
     pub(crate) typ: TypeId,
 }
 
-// ============================================================================
 // Linearizer
-// ============================================================================
 
 /// Linearizer context for converting AST to IR
 pub struct Linearizer<'a> {
@@ -300,7 +297,6 @@ pub struct Linearizer<'a> {
 }
 
 impl<'a> Linearizer<'a> {
-    /// Create a new linearizer
     pub fn new(
         symbols: &'a SymbolTable,
         types: &'a TypeTable,
@@ -390,7 +386,6 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Convert a StringId to a &str using the string table
-    #[inline]
     pub(crate) fn str(&self, id: StringId) -> &str {
         self.strings.get(id)
     }
@@ -405,7 +400,6 @@ impl<'a> Linearizer<'a> {
     /// needs no change of its own.
     /// A label is marked verbatim, because it *is* the assembler name and must
     /// not pick up the target's own decoration; see `lir::VERBATIM_MARKER`.
-    #[inline]
     pub(crate) fn symbol_name(&self, id: SymbolId) -> String {
         let sym = self.symbols.get(id);
         match &sym.asm_label {
@@ -444,7 +438,6 @@ impl<'a> Linearizer<'a> {
             .is_some_and(|s| s.has_non_inline_decl)
     }
 
-    /// Linearize a translation unit
     pub fn linearize(&mut self, tu: &TranslationUnit) -> Module {
         for item in &tu.items {
             match item {
@@ -729,9 +722,7 @@ impl<'a> Linearizer<'a> {
         self.get_or_create_bb(id);
     }
 
-    // ========================================================================
     // Function linearization
-    // ========================================================================
 
     /// Whether a return value of this type comes back through a hidden
     /// pointer (sret) rather than in registers.
@@ -753,10 +744,8 @@ impl<'a> Linearizer<'a> {
         if matches!(class, crate::abi::ArgClass::Hfa { .. }) {
             // An HFA comes back in one V register per element, up to four, so
             // size does not enter into it: `struct { double a, b, c, d; }` is
-            // thirty-two bytes and still returns in V0-V3. The size rule below
-            // used to claim it, on the grounds that nothing implemented a
-            // three- or four-register HFA return -- which was true until both
-            // ends of the aarch64 return path learned to count elements.
+            // thirty-two bytes and still returns in V0-V3, never through the
+            // size rule below.
             return false;
         }
         if self.types.size_bits(typ) > self.target.max_aggregate_register_bits {
@@ -770,15 +759,251 @@ impl<'a> Linearizer<'a> {
         matches!(class, crate::abi::ArgClass::Indirect { .. })
     }
 
-    pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
-        // Set current position for debug info (function definition location)
-        self.current_pos = Some(func.pos);
+    /// va_list parameters arrive as pointers -- array decay happened at the
+    /// call site -- so what goes to the local is the pointer value.
+    fn store_valist_params(
+        &mut self,
+        valist_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)>,
+    ) {
+        // Handle va_list parameters: store the pointer value (not the struct)
+        for (name, symbol_id_opt, typ, arg_pseudo) in valist_params {
+            // va_list params are passed as pointers due to array decay at call site.
+            // Store the pointer value (8 bytes) to a local.
+            let ptr_type = self.types.pointer_to(typ);
+            let local_sym = self.alloc_pseudo();
+            let sym = Pseudo::sym(local_sym, name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym);
+                func.add_local(&name, local_sym, ptr_type, false, false, None, None);
+            }
+            let ptr_size = self.types.size_bits(ptr_type);
+            self.emit(Instruction::store(
+                arg_pseudo, local_sym, 0, ptr_type, ptr_size,
+            ));
+            if let Some(symbol_id) = symbol_id_opt {
+                self.insert_local(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ, // Keep original va_list type for type checking
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vm_row_dims: vec![],
+                        // va_list param: the slot holds a pointer to the
+                        // caller's va_list, array decay having happened at
+                        // the call site.
+                        storage: Storage::Indirect(ptr_type),
+                    },
+                );
+            }
+        }
+    }
 
-        // C17 6.8.6.1p1, before anything is lowered: entering the scope of a
-        // variably modified identifier without executing its declaration
-        // leaves the object's size never computed.
-        self.check_jumps_into_variably_modified_scopes(&func.body);
+    /// Copy struct parameters into local storage so member access works.
+    fn store_struct_params(
+        &mut self,
+        struct_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)>,
+    ) {
+        // Copy struct parameters to local storage so member access works
+        for (name, symbol_id_opt, typ, arg_pseudo) in struct_params {
+            // Create a symbol pseudo for this local variable (its address)
+            let local_sym = self.alloc_pseudo();
+            let sym = Pseudo::sym(local_sym, name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym);
+                let mods = self.types.modifiers(typ);
+                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
+            }
 
+            let typ_size = self.types.size_bits(typ);
+            let is_aarch64 = self.target.arch == crate::target::Arch::Aarch64;
+            // MEMORY class: the caller left the bytes in the incoming argument
+            // area, so `arg_pseudo` names storage rather than pointing at it.
+            // Over sixteen bytes that is every aggregate; at or below, only one
+            // whose eightbyte holds a `long double`. On aarch64 every struct
+            // parameter still arrives as a pointer, so the deref path below is
+            // the right one there.
+            // Exactly the test the caller uses when it decides to push the
+            // bytes, so the two cannot drift: `long double _Complex` is
+            // COMPLEX_X87 and travels in memory too, and asking only about
+            // struct kinds sent it down the pointer path the caller had not
+            // taken.
+            let arrived_by_value =
+                !is_aarch64 && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
+            if arrived_by_value {
+                // Passed by value on the stack. `arg_pseudo` is an IncomingArg
+                // naming the struct data; take its address, then copy each
+                // 8-byte chunk.
+                let ptr_type = self.types.pointer_to(typ);
+                let addr_pseudo = self.alloc_reg_pseudo();
+                self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
+
+                let struct_size = typ_size / 8;
+                let mut offset = 0i64;
+                while offset < struct_size as i64 {
+                    let temp = self.alloc_reg_pseudo();
+                    self.emit(Instruction::load(
+                        temp,
+                        addr_pseudo,
+                        offset,
+                        self.types.long_id,
+                        64,
+                    ));
+                    self.emit(Instruction::store(
+                        temp,
+                        local_sym,
+                        offset,
+                        self.types.long_id,
+                        64,
+                    ));
+                    offset += 8;
+                }
+            } else if typ_size > 64 {
+                // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
+                // Copy each 8-byte chunk through pointer dereference.
+                let struct_size = typ_size / 8;
+                let mut offset = 0i64;
+                while offset < struct_size as i64 {
+                    let temp = self.alloc_reg_pseudo();
+                    self.emit(Instruction::load(
+                        temp,
+                        arg_pseudo,
+                        offset,
+                        self.types.long_id,
+                        64,
+                    ));
+                    self.emit(Instruction::store(
+                        temp,
+                        local_sym,
+                        offset,
+                        self.types.long_id,
+                        64,
+                    ));
+                    offset += 8;
+                }
+            } else {
+                // Small struct: arg_pseudo contains the value directly
+                self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
+            }
+
+            // Register as a local variable (only if named parameter)
+            if let Some(symbol_id) = symbol_id_opt {
+                self.insert_local(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ,
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vm_row_dims: vec![],
+                        storage: Storage::InSlot,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Complex parameters arrive in FP registers and the backend prologue
+    /// stores them, so no store is emitted here -- only the local, and the
+    /// `implicit_param_copies` record the inliner needs to do the same job
+    /// when there is no prologue to run.
+    fn store_complex_params(
+        &mut self,
+        complex_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId, u32)>,
+    ) {
+        // Setup local storage for complex parameters
+        // Complex types are passed in FP registers per ABI - the prologue codegen
+        // handles storing from XMM registers to local storage
+        for (name, symbol_id_opt, typ, _arg_pseudo, arg_idx) in complex_params {
+            // Create a symbol pseudo for this local variable (its address)
+            let local_sym = self.alloc_pseudo();
+            let sym = Pseudo::sym(local_sym, name.clone());
+            let typ_size_bytes = (self.types.size_bits(typ) / 8) as usize;
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym);
+                let mods = self.types.modifiers(typ);
+                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
+                // Record for inliner: the backend prologue fills this local from
+                // registers; the inliner must generate an explicit copy instead.
+                func.implicit_param_copies.push(super::ImplicitParamCopy {
+                    arg_index: arg_idx,
+                    local_sym,
+                    size_bytes: typ_size_bytes,
+                    qword_type: self.types.long_id,
+                });
+            }
+
+            // Don't emit a store here - the prologue codegen handles storing
+            // from XMM0+XMM1/XMM2+XMM3/etc to local storage
+
+            // Register as a local variable for name lookup (only if named parameter)
+            if let Some(symbol_id) = symbol_id_opt {
+                self.insert_local(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ,
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vm_row_dims: vec![],
+                        storage: Storage::InSlot,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Store scalar parameters into local storage, so that a parameter
+    /// reassigned inside a branch still gets its phi nodes at the merge.
+    fn store_scalar_params(
+        &mut self,
+        scalar_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)>,
+    ) {
+        // Store scalar parameters to local storage for SSA-correct reassignment handling
+        // This ensures that if a parameter is reassigned inside a branch, phi nodes
+        // are properly inserted at merge points.
+        for (name, symbol_id_opt, typ, arg_pseudo) in scalar_params {
+            // Create a symbol pseudo for this local variable (its address)
+            let local_sym = self.alloc_pseudo();
+            let sym = Pseudo::sym(local_sym, name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym);
+                let mods = self.types.modifiers(typ);
+                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
+                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
+                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
+            }
+
+            // Store the incoming argument value to the local
+            let typ_size = self.types.size_bits(typ);
+            self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
+
+            // Register as a local variable for name lookup (only if named parameter)
+            if let Some(symbol_id) = symbol_id_opt {
+                self.insert_local(
+                    symbol_id,
+                    LocalVarInfo {
+                        sym: local_sym,
+                        typ,
+                        vla_size_sym: None,
+                        vla_elem_type: None,
+                        vm_row_dims: vec![],
+                        storage: Storage::InSlot,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Clear the per-function state carried on the linearizer.
+    ///
+    /// `static_locals` is deliberately not cleared: it persists across
+    /// functions.
+    fn reset_for_function(&mut self, func: &FunctionDef) {
         // Reset per-function state
         self.next_pseudo = 0;
         self.next_bb = 0;
@@ -800,6 +1025,18 @@ impl<'a> Linearizer<'a> {
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
         // Note: static_locals is NOT cleared - it persists across functions
+    }
+
+    pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
+        // Set current position for debug info (function definition location)
+        self.current_pos = Some(func.pos);
+
+        // C17 6.8.6.1p1, before anything is lowered: entering the scope of a
+        // variably modified identifier without executing its declaration
+        // leaves the object's size never computed.
+        self.check_jumps_into_variably_modified_scopes(&func.body);
+
+        self.reset_for_function(func);
 
         // Create function - use storage class from FunctionDef
         let modifiers = self.types.modifiers(func.return_type);
@@ -943,11 +1180,9 @@ impl<'a> Linearizer<'a> {
                 // through complex_params so the codegen handles the register split.
                 let size = self.types.size_bits(param.typ);
                 // An HFA arrives in one register per element whatever its
-                // size, and the prologue is what writes them into the local --
-                // so it must not also get the small-struct store below. A
-                // two-element half-precision HFA is four bytes, and used to get
-                // both: the store overwrote the halves the prologue had just
-                // put there.
+                // size, and the prologue writes them into the local -- so it
+                // must not also get the small-struct store below, which would
+                // overwrite what the prologue just put there.
                 let is_hfa_param = {
                     let abi = get_abi_for_conv(self.current_calling_conv, self.target);
                     matches!(
@@ -969,11 +1204,8 @@ impl<'a> Linearizer<'a> {
                                     && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
                         ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
                         // Two eightbytes of any classes -- both integer, or one
-                        // of each -- arrive in two registers. AAPCS64 §5.4.2
-                        // C.10 and SysV AMD64 §3.2.3 agree on this; aarch64
-                        // used to be excluded here and passed such a composite
-                        // as a pointer, which disagreed with gcc in both
-                        // directions and segfaulted when gcc was the caller.
+                        // of each -- arrive in two registers on both targets:
+                        // AAPCS64 §5.4.2 C.10 and SysV AMD64 §3.2.3 agree.
                         let reg_pair = matches!(
                             class,
                             crate::abi::ArgClass::Direct { ref classes, .. }
@@ -1040,216 +1272,13 @@ impl<'a> Linearizer<'a> {
         // Entry instruction
         self.emit(Instruction::new(Opcode::Entry));
 
-        // Handle va_list parameters: store the pointer value (not the struct)
-        for (name, symbol_id_opt, typ, arg_pseudo) in valist_params {
-            // va_list params are passed as pointers due to array decay at call site.
-            // Store the pointer value (8 bytes) to a local.
-            let ptr_type = self.types.pointer_to(typ);
-            let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, ptr_type, false, false, None, None);
-            }
-            let ptr_size = self.types.size_bits(ptr_type);
-            self.emit(Instruction::store(
-                arg_pseudo, local_sym, 0, ptr_type, ptr_size,
-            ));
-            if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ, // Keep original va_list type for type checking
-                        vla_size_sym: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        // va_list param: the slot holds a pointer to the
-                        // caller's va_list, array decay having happened at
-                        // the call site.
-                        storage: Storage::Indirect(ptr_type),
-                    },
-                );
-            }
-        }
+        self.store_valist_params(valist_params);
 
-        // Copy struct parameters to local storage so member access works
-        for (name, symbol_id_opt, typ, arg_pseudo) in struct_params {
-            // Create a symbol pseudo for this local variable (its address)
-            let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
-                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
-            }
+        self.store_struct_params(struct_params);
 
-            let typ_size = self.types.size_bits(typ);
-            let is_aarch64 = self.target.arch == crate::target::Arch::Aarch64;
-            // MEMORY class: the caller left the bytes in the incoming argument
-            // area, so `arg_pseudo` names storage rather than pointing at it.
-            // Over sixteen bytes that is every aggregate; at or below, only one
-            // whose eightbyte holds a `long double`. On aarch64 every struct
-            // parameter still arrives as a pointer, so the deref path below is
-            // the right one there.
-            // Exactly the test the caller uses when it decides to push the
-            // bytes, so the two cannot drift: `long double _Complex` is
-            // COMPLEX_X87 and travels in memory too, and asking only about
-            // struct kinds sent it down the pointer path the caller had not
-            // taken.
-            let arrived_by_value =
-                !is_aarch64 && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
-            if arrived_by_value {
-                // Passed by value on the stack. `arg_pseudo` is an IncomingArg
-                // naming the struct data; take its address, then copy each
-                // 8-byte chunk.
-                let ptr_type = self.types.pointer_to(typ);
-                let addr_pseudo = self.alloc_reg_pseudo();
-                self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
+        self.store_complex_params(complex_params);
 
-                let struct_size = typ_size / 8;
-                let mut offset = 0i64;
-                while offset < struct_size as i64 {
-                    let temp = self.alloc_reg_pseudo();
-                    self.emit(Instruction::load(
-                        temp,
-                        addr_pseudo,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    self.emit(Instruction::store(
-                        temp,
-                        local_sym,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    offset += 8;
-                }
-            } else if typ_size > 64 {
-                // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
-                // Copy each 8-byte chunk through pointer dereference.
-                let struct_size = typ_size / 8;
-                let mut offset = 0i64;
-                while offset < struct_size as i64 {
-                    let temp = self.alloc_reg_pseudo();
-                    self.emit(Instruction::load(
-                        temp,
-                        arg_pseudo,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    self.emit(Instruction::store(
-                        temp,
-                        local_sym,
-                        offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    offset += 8;
-                }
-            } else {
-                // Small struct: arg_pseudo contains the value directly
-                self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
-            }
-
-            // Register as a local variable (only if named parameter)
-            if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
-            }
-        }
-
-        // Setup local storage for complex parameters
-        // Complex types are passed in FP registers per ABI - the prologue codegen
-        // handles storing from XMM registers to local storage
-        for (name, symbol_id_opt, typ, _arg_pseudo, arg_idx) in complex_params {
-            // Create a symbol pseudo for this local variable (its address)
-            let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            let typ_size_bytes = (self.types.size_bits(typ) / 8) as usize;
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
-                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
-                // Record for inliner: the backend prologue fills this local from
-                // registers; the inliner must generate an explicit copy instead.
-                func.implicit_param_copies.push(super::ImplicitParamCopy {
-                    arg_index: arg_idx,
-                    local_sym,
-                    size_bytes: typ_size_bytes,
-                    qword_type: self.types.long_id,
-                });
-            }
-
-            // Don't emit a store here - the prologue codegen handles storing
-            // from XMM0+XMM1/XMM2+XMM3/etc to local storage
-
-            // Register as a local variable for name lookup (only if named parameter)
-            if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
-            }
-        }
-
-        // Store scalar parameters to local storage for SSA-correct reassignment handling
-        // This ensures that if a parameter is reassigned inside a branch, phi nodes
-        // are properly inserted at merge points.
-        for (name, symbol_id_opt, typ, arg_pseudo) in scalar_params {
-            // Create a symbol pseudo for this local variable (its address)
-            let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                let mods = self.types.modifiers(typ);
-                let is_volatile = mods.contains(TypeModifiers::VOLATILE);
-                let is_atomic = mods.contains(TypeModifiers::ATOMIC);
-                func.add_local(&name, local_sym, typ, is_volatile, is_atomic, None, None);
-            }
-
-            // Store the incoming argument value to the local
-            let typ_size = self.types.size_bits(typ);
-            self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
-
-            // Register as a local variable for name lookup (only if named parameter)
-            if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
-            }
-        }
+        self.store_scalar_params(scalar_params);
 
         // Record the extents of any variably-modified parameter, now that
         // every parameter is stored to a local and so nameable by a later
@@ -1306,8 +1335,8 @@ impl<'a> Linearizer<'a> {
             if let Some(ref mut ir_func) = self.current_func {
                 ssa_convert(ir_func, self.types);
                 // Note: ssa_convert sets ir_func.next_pseudo to account for phi nodes
-                // M3: drop func.locals entries whose Sym is now unused so the
-                // backend regalloc no longer allocates a stack slot for them.
+                // Drop func.locals entries whose Sym is now unused, so the
+                // backend regalloc allocates no stack slot for them.
                 mem2reg(ir_func);
             }
         } else {
@@ -1326,9 +1355,7 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    // ========================================================================
     // Statement linearization
-    // ========================================================================
 
     /// Emit large struct return via hidden pointer (sret)
     pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, struct_size: u32) {
@@ -1434,9 +1461,7 @@ impl<'a> Linearizer<'a> {
         self.emit(ret_insn);
     }
 
-    // ========================================================================
     // Expression linearization
-    // ========================================================================
 
     /// Get the type of an expression.
     /// PANICS if expression has no type - type evaluation pass must run first.
@@ -1695,7 +1720,6 @@ impl<'a> Linearizer<'a> {
     ///   lowers to a temp holding a pointer to the value, which is the answer
     ///   as it stands.
     ///
-    /// Each caller used to pick one of these by hand, and they did not agree.
     /// Both ways of being wrong are silent and fatal: asking an rvalue for its
     /// lvalue yields a bogus pointer, and handing a consumer the value's own
     /// bits gets them dereferenced as an address. Which crash you got depended
@@ -2355,9 +2379,8 @@ impl<'a> Linearizer<'a> {
     /// A variably-modified pointee reports a compile-time size of 0, so the
     /// stride has to come from the object's recorded extents. Every place
     /// that scales by a pointee's size goes through here -- `p[i]`, `p + i`,
-    /// `p - q`, `++p`, `p++`, `p += i` -- because each of them used to work it
-    /// out separately, and fixing three of the six left the other three
-    /// stepping nowhere.
+    /// `p - q`, `++p`, `p++`, `p += i` -- rather than each working it out
+    /// separately.
     pub(crate) fn pointer_step_bytes(&mut self, ptr_expr: &Expr, ptr_typ: TypeId) -> PseudoId {
         if let Some(stride) = self.vm_index_stride(ptr_expr) {
             return stride;
@@ -2834,14 +2857,9 @@ impl<'a> Linearizer<'a> {
         let struct_size_bits = self.types.size_bits(typ);
         let returns_large_struct = self.returns_via_hidden_pointer(typ);
         // An aggregate that comes back in registers still needs somewhere to
-        // land, and the backend writes the registers into this local. The
-        // upper bound used to be two eightbytes -- hence the old name
-        // `returns_reg_aggregate` -- which was every such case until an HFA
-        // of three or four `double`s stopped going through the hidden
-        // pointer: at twenty-four bytes it had no local, so the result pseudo
-        // held nothing and its first use dereferenced a zero. It can now be
-        // as many as four registers, so the name says registers rather than
-        // two.
+        // land, and the backend writes the registers into this local. There is
+        // no upper size bound: an HFA of four `double`s is thirty-two bytes
+        // and still returns in registers, not through the hidden pointer.
         let returns_reg_aggregate = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && struct_size_bits > 64
             && !returns_large_struct;
@@ -3022,9 +3040,9 @@ impl<'a> Linearizer<'a> {
                     }
                 }
                 // A struct argument travels by address. `linearize_lvalue`
-                // now materializes an rvalue -- a call returning a struct --
-                // and hands back the temporary's address, so both cases are
-                // the same call; this used to open-code the rvalue half.
+                // materializes an rvalue -- a call returning a struct -- and
+                // hands back the temporary's address, so both cases are the
+                // same call.
                 self.linearize_lvalue(a)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
@@ -3070,17 +3088,9 @@ impl<'a> Linearizer<'a> {
                         let param_is_fp = self.types.is_float(param_type);
 
                         let needs_convert =
-                            // Integer widening (e.g., int→long, long→__int128).
-                            //
-                            // The size bounds this test used to carry --
-                            // `arg_size <= 32 && param_size <= 64` -- were
-                            // written when int→long was the only widening
-                            // there was, and they silently excluded every
-                            // 128-bit parameter. An `int` argument then
-                            // reached an `__int128` parameter unconverted, so
-                            // the callee read a register pair of which only
-                            // half had been written. Widening is decided by
-                            // the two sizes; nothing about it stops at 64.
+                            // Integer widening (int→long, long→__int128, ...),
+                            // decided by the two sizes alone: nothing about it
+                            // stops at 64 bits.
                             (arg_is_int && param_is_int && arg_size < param_size)
                             // FP size mismatch (float→double, long double→double, etc.)
                             || (arg_is_fp && param_is_fp && arg_size != param_size)
@@ -3101,13 +3111,11 @@ impl<'a> Linearizer<'a> {
                 // Both halves have to happen here. The formal-parameter
                 // conversion above is guarded by `arg_idx < params.len()`, and
                 // a variadic argument is by definition at or past that bound,
-                // so it never runs for these -- an earlier comment claimed
-                // integers were "already handled above", which was false and is
-                // what left `printf("%02x", (unsigned char)c)` printing
-                // ffffff80 for a negative `signed char` (audit #C5). The cast
-                // itself emits no IR, because emit_convert short-circuits
-                // same-size integer conversions, so without an explicit
-                // promotion the pseudo still holds the sign-extended load.
+                // so it never runs for these. The cast itself emits no IR
+                // either, because emit_convert short-circuits same-size integer
+                // conversions -- without an explicit promotion the pseudo still
+                // holds the sign-extended load, and `printf("%02x", (unsigned
+                // char)c)` prints ffffff80 for a negative `signed char`.
                 if let Some(va_start) = variadic_arg_start {
                     if arg_idx >= va_start {
                         let promoted = match self.types.kind(arg_type) {
@@ -3970,17 +3978,14 @@ impl<'a> Linearizer<'a> {
 
     /// Convert one arm of a conditional expression to the expression's type.
     ///
-    /// C17 6.5.15p5 gives the whole expression the arms' common type, so an arm
-    /// whose own type differs has to be converted. The test used to ask whether
-    /// the arm was a *narrower integer*, which left a `float` arm feeding a
-    /// `double` result alone: a 32-bit pattern reached a 64-bit `Select`, and
-    /// `pick() ? f() : d0()` with `float f()` evaluated to 0.0.
+    /// C17 6.5.15p5 gives the whole expression the arms' common type, so *any*
+    /// arm whose own type differs has to be converted -- a `float` arm feeding
+    /// a `double` result as much as a narrower integer one.
     ///
     /// `emit_convert` already no-ops on an identical kind and size, so the only
     /// thing left to exclude is a type there is nothing to convert between --
-    /// `void`, a struct, a pointer. Complex is excluded too, deliberately: it
-    /// was not converted before either, and widening it is a separate question
-    /// from this one.
+    /// `void`, a struct, a pointer. Complex is excluded deliberately: widening
+    /// it is a separate question from this one.
     fn convert_conditional_arm(
         &mut self,
         val: crate::ir::PseudoId,
@@ -4361,9 +4366,7 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_va_op(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
-            // ================================================================
             // Variadic function support (va_* builtins)
-            // ================================================================
             ExprKind::VaStart { ap, last_param } => {
                 // va_start(ap, last_param)
                 // Get address of ap (it's an lvalue)
@@ -4462,9 +4465,7 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_builtin(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
-            // ================================================================
             // Byte-swapping builtins
-            // ================================================================
             ExprKind::Bswap16 { arg } => {
                 let arg_val = self.linearize_expr(arg);
                 let result = self.alloc_pseudo();
@@ -4504,9 +4505,7 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            // ================================================================
             // Count trailing zeros builtins
-            // ================================================================
             ExprKind::Ctz { arg } => {
                 // __builtin_ctz - counts trailing zeros in unsigned int (32-bit)
                 let arg_val = self.linearize_expr(arg);
@@ -4535,9 +4534,7 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            // ================================================================
             // Count leading zeros builtins
-            // ================================================================
             ExprKind::Clz { arg } => {
                 // __builtin_clz - counts leading zeros in unsigned int (32-bit)
                 let arg_val = self.linearize_expr(arg);
@@ -4569,9 +4566,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::Clrsb { arg } => self.linearize_clrsb(arg, 32),
             ExprKind::Clrsbl { arg } | ExprKind::Clrsbll { arg } => self.linearize_clrsb(arg, 64),
 
-            // ================================================================
             // Population count builtins
-            // ================================================================
             ExprKind::Popcount { arg } => {
                 // __builtin_popcount - counts set bits in unsigned int (32-bit)
                 let arg_val = self.linearize_expr(arg);
@@ -4846,9 +4841,7 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_c11_atomic(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
-            // ================================================================
             // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
-            // ================================================================
             ExprKind::C11AtomicInit { ptr, val } => {
                 self.emit_c11_atomic_builtin(Opcode::AtomicStore, ptr, Some(val), None)
             }
@@ -4967,7 +4960,7 @@ impl<'a> Linearizer<'a> {
     /// conversion is not value-preserving -- a negative operand with an
     /// unsigned destination, or an `unsigned __int128` one with a signed
     /// destination -- the answer follows the converted value rather than the
-    /// mathematical one. See #C62 in `cc/audit.md`.
+    /// mathematical one.
     fn linearize_checked_arith_wide(
         &mut self,
         op: crate::parse::ast::CheckedOp,
@@ -5065,6 +5058,284 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// `__builtin_*_overflow`: compute exactly, store the wrapped result, and
+    /// answer whether wrapping lost anything.
+    fn linearize_checked_arith(
+        &mut self,
+        op: &crate::parse::ast::CheckedOp,
+        a: &Expr,
+        b: &Expr,
+        res: &Expr,
+    ) -> PseudoId {
+        let a_typ = self.expr_type(a);
+        let b_typ = self.expr_type(b);
+        let res_ptr_typ = self.expr_type(res);
+        let dst_typ = self
+            .types
+            .base_type(res_ptr_typ)
+            .unwrap_or(self.types.int_id);
+
+        let all_unsigned = self.types.is_unsigned(a_typ)
+            && self.types.is_unsigned(b_typ)
+            && self.types.is_unsigned(dst_typ);
+        // A difference can be negative even when every operand is
+        // unsigned, and negative is exactly the unrepresentable case
+        // for an unsigned destination. Computing it in an unsigned
+        // `wide` wraps it instead, and then nothing downstream can see
+        // it: `exact < 0` is never true in unsigned arithmetic, and
+        // with `wide == dst_typ` the narrow fast path reports a hard
+        // "no overflow". `__builtin_sub_overflow(0u, 1u, &u128)`
+        // answered 0 where gcc answers 1.
+        //
+        // A sum or product of unsigned operands still needs the
+        // unsigned range: two 64-bit values can exceed the signed
+        // 128-bit maximum. A difference cannot -- it needs one bit
+        // more than the wider operand, and both are under 128 here --
+        // so signing it costs nothing.
+        let subtracting = matches!(op, crate::parse::ast::CheckedOp::Sub);
+        let wide = if all_unsigned && !subtracting {
+            self.types.uint128_id
+        } else {
+            self.types.int128_id
+        };
+
+        let av = self.linearize_expr(a);
+        let bv = self.linearize_expr(b);
+        let addr = self.linearize_expr(res);
+
+        let aw = self.emit_convert(av, a_typ, wide);
+        let bw = self.emit_convert(bv, b_typ, wide);
+        let bin = match op {
+            crate::parse::ast::CheckedOp::Add => BinaryOp::Add,
+            crate::parse::ast::CheckedOp::Sub => BinaryOp::Sub,
+            crate::parse::ast::CheckedOp::Mul => BinaryOp::Mul,
+        };
+        if self.types.size_bits(dst_typ) >= 128 {
+            // A 128-bit destination has no wider type to compute in,
+            // so "did narrowing lose anything" would compare a value
+            // to itself -- `linearize_checked_arith_wide` below
+            // examines the result directly instead. Where the
+            // computation in `wide` is nevertheless exact, the check
+            // becomes "is the exact value representable at all". The
+            // two differ for a negative operand with an unsigned
+            // destination: `__builtin_add_overflow(-1, 5u, &u128)` is
+            // 4, not 2^128-1 + 5.
+            //
+            // Exactness is not "narrower than the destination":
+            // `(u64)-1 * (u64)-1` is just under 2^128, which fits
+            // `unsigned __int128` but *not* `__int128`, so the exact
+            // computation would itself wrap. Count magnitude bits --
+            // `w` for an unsigned operand, `w-1` for a signed one --
+            // and require the result to fit `wide`.
+            let magnitude_bits = |t: TypeId| {
+                let w = self.types.size_bits(t);
+                if self.types.is_unsigned(t) {
+                    w
+                } else {
+                    w - 1
+                }
+            };
+            let (ma, mb) = (magnitude_bits(a_typ), magnitude_bits(b_typ));
+            let room = if self.types.is_unsigned(wide) {
+                128
+            } else {
+                127
+            };
+            let exact_fits = match op {
+                crate::parse::ast::CheckedOp::Mul => ma + mb <= room,
+                // A sum or difference needs one bit more than the wider
+                // operand, i.e. `ma.max(mb) + 1 <= room`.
+                _ => ma.max(mb) < room,
+            };
+            if self.types.size_bits(a_typ) < 128 && self.types.size_bits(b_typ) < 128 && exact_fits
+            {
+                let exact = self.emit_binary(bin, aw, bw, wide, wide);
+                let dst_size = self.types.size_bits(dst_typ);
+                let narrowed = self.emit_convert(exact, wide, dst_typ);
+                self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+                // `wide` is unsigned only when the destination is too,
+                // so the two agree except when a signed exact value has
+                // to land in an unsigned destination -- where the
+                // negatives are precisely the unrepresentable ones.
+                return if wide == dst_typ {
+                    self.emit_const(0, self.types.int_id)
+                } else {
+                    let zero = self.emit_const(0, wide);
+                    self.emit_binary(BinaryOp::Lt, exact, zero, self.types.int_id, wide)
+                };
+            }
+            let a128 = self.emit_convert(av, a_typ, dst_typ);
+            let b128 = self.emit_convert(bv, b_typ, dst_typ);
+            return self.linearize_checked_arith_wide(*op, a128, b128, addr, dst_typ);
+        }
+
+        let exact = self.emit_binary(bin, aw, bw, wide, wide);
+
+        let narrowed = self.emit_convert(exact, wide, dst_typ);
+        let dst_size = self.types.size_bits(dst_typ);
+        self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
+
+        let back = self.emit_convert(narrowed, dst_typ, wide);
+        self.emit_binary(BinaryOp::Ne, exact, back, self.types.int_id, wide)
+    }
+
+    /// `sizeof expr`.  Folds to a constant unless the operand is a VLA, whose
+    /// size is only known at run time.
+    fn linearize_sizeof_expr(&mut self, inner_expr: &Expr) -> PseudoId {
+        // Check if this is a VLA variable - need runtime sizeof
+        if let ExprKind::Ident(symbol_id) = &inner_expr.kind {
+            if let Some(info) = self.locals.get(symbol_id).cloned() {
+                if let (Some(size_sym), Some(elem_type)) = (info.vla_size_sym, info.vla_elem_type) {
+                    // VLA: compute sizeof at runtime as num_elements * sizeof(element)
+                    let result_typ = self.types.ulong_id;
+                    let elem_size = self.types.size_bytes(elem_type) as i64;
+
+                    // Load the stored number of elements
+                    let num_elements = self.alloc_pseudo();
+                    let load_insn = Instruction::load(num_elements, size_sym, 0, result_typ, 64);
+                    self.emit(load_insn);
+
+                    // Multiply by element size
+                    let elem_size_const = self.emit_const(elem_size as i128, result_typ);
+                    let result = self.alloc_pseudo();
+                    let mul_insn = Instruction::new(Opcode::Mul)
+                        .with_target(result)
+                        .with_src(num_elements)
+                        .with_src(elem_size_const)
+                        .with_size(64)
+                        .with_type(result_typ);
+                    self.emit(mul_insn);
+                    return result;
+                }
+            }
+        }
+
+        // `sizeof(a[0])` on a variably-modified array: the row size is
+        // only known at run time, and the type reports 0.
+        if let Some(size) = self.vm_sizeof_expr(inner_expr) {
+            return size;
+        }
+
+        // Non-VLA: compute size at compile time
+        let inner_typ = self.expr_type(inner_expr);
+        let size = self.types.size_bits(inner_typ) / 8;
+        // sizeof returns size_t, which is unsigned long in our implementation
+        let result_typ = self.types.ulong_id;
+        self.emit_const(size as i128, result_typ)
+    }
+
+    /// GNU `&&label`: the address of a label, for a computed goto.
+    fn linearize_label_addr(&mut self, name: &StringId, expr: &Expr) -> PseudoId {
+        let label = self.str(*name).to_string();
+        // Outside a function there is no block to name, and
+        // `get_or_create_label` would unwrap a `None` current
+        // function -- an ICE on `void *g = &&L;` at file scope.
+        if self.current_func.is_none() {
+            crate::diag::error_args(
+                expr.pos,
+                "label '{0}' referenced outside of any function",
+                &[&label],
+            );
+            return self.emit_const(0, self.types.void_ptr_id);
+        }
+        let bb = self.get_or_create_label(&label);
+        let sym = format!(".L{}_{}", self.current_func_name, bb.0);
+        let sym_pseudo = self.alloc_pseudo();
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(Pseudo::sym(sym_pseudo, sym));
+        }
+        // The label is a branch target for every indirect goto in this
+        // function, and the CFG has to say so or DCE deletes the block.
+        self.addr_taken_labels.push(bb);
+        self.label_addr_refs.push((label.clone(), expr.pos));
+        if let Some(func) = &mut self.current_func {
+            func.takes_label_addr = true;
+        }
+        let dst = self.alloc_pseudo();
+        let void_ptr = self.types.void_ptr_id;
+        self.emit(Instruction::sym_addr(dst, sym_pseudo, void_ptr));
+        dst
+    }
+
+    /// `offsetof(type, member)`, walking the designator path.
+    fn linearize_offsetof(&mut self, type_id: &TypeId, path: &[OffsetOfPath]) -> PseudoId {
+        // __builtin_offsetof(type, member-designator)
+        // Compute the byte offset of the member within the struct
+        let mut offset: u64 = 0;
+        let mut current_type = *type_id;
+
+        for element in path {
+            match element {
+                OffsetOfPath::Field(field_id) => {
+                    // Look up the field in the current struct type
+                    let struct_type = self.resolve_struct_type(current_type);
+                    let member_info = self
+                        .types
+                        .find_member(struct_type, *field_id)
+                        .expect("offsetof: field not found in struct type");
+                    offset += member_info.offset as u64;
+                    current_type = member_info.typ;
+                }
+                OffsetOfPath::Index(index) => {
+                    // Array indexing: offset += index * sizeof(element)
+                    let elem_type = self
+                        .types
+                        .base_type(current_type)
+                        .expect("offsetof: array index on non-array type");
+                    let elem_size = self.types.size_bytes(elem_type);
+                    offset += (*index as u64) * (elem_size as u64);
+                    current_type = elem_type;
+                }
+            }
+        }
+
+        // Return the offset as a constant
+        self.emit_const(offset as i128, self.types.ulong_id)
+    }
+
+    /// The recorded extent of a variably-modified typedef, one level in.
+    fn linearize_vm_typedef_extent(&mut self, symbol_id: &SymbolId, level: &u32) -> PseudoId {
+        let ulong = self.types.ulong_id;
+        let dim = self
+            .vm_typedef_dims
+            .get(symbol_id)
+            .and_then(|dims| dims.get(*level as usize))
+            .copied();
+        match dim {
+            Some(VmDim::Const(n)) => self.emit_const(n as i128, ulong),
+            Some(VmDim::Sym(sym)) => {
+                let loaded = self.alloc_pseudo();
+                self.emit(Instruction::load(loaded, sym, 0, ulong, 64));
+                loaded
+            }
+            // The typedef's own declaration is always linearized
+            // before any use of it can be: a use is in its scope, and
+            // scope begins at the declarator. Nothing measurable is
+            // left to do if that ever fails to hold.
+            None => self.emit_const(0, ulong),
+        }
+    }
+
+    /// `__builtin_complex(real, imag)`.
+    fn linearize_builtin_complex(&mut self, real: &Expr, imag: &Expr, expr: &Expr) -> PseudoId {
+        // __builtin_complex(real, imag) - construct complex value
+        let complex_typ = self.expr_type(expr);
+        let base_typ = self.types.complex_base(complex_typ);
+        let base_bits = self.types.size_bits(base_typ);
+        let base_bytes = (base_bits / 8) as i64;
+
+        let real_val = self.linearize_expr(real);
+        let imag_val = self.linearize_expr(imag);
+
+        // Allocate local to hold the complex value, return its address
+        let result = self.alloc_local_temp(complex_typ);
+        self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
+        self.emit(Instruction::store(
+            imag_val, result, base_bytes, base_typ, base_bits,
+        ));
+        result
+    }
+
     pub(crate) fn linearize_expr(&mut self, expr: &Expr) -> PseudoId {
         // Set current position for debug info
         self.current_pos = Some(expr.pos);
@@ -5107,37 +5378,7 @@ impl<'a> Linearizer<'a> {
             // exactly this spelling -- `Label::name()` -- and both backends
             // already lower a leading-`.` global to a pc-relative address, so
             // this needs no opcode of its own.
-            ExprKind::LabelAddr(name) => {
-                let label = self.str(*name).to_string();
-                // Outside a function there is no block to name, and
-                // `get_or_create_label` would unwrap a `None` current
-                // function -- an ICE on `void *g = &&L;` at file scope.
-                if self.current_func.is_none() {
-                    crate::diag::error_args(
-                        expr.pos,
-                        "label '{0}' referenced outside of any function",
-                        &[&label],
-                    );
-                    return self.emit_const(0, self.types.void_ptr_id);
-                }
-                let bb = self.get_or_create_label(&label);
-                let sym = format!(".L{}_{}", self.current_func_name, bb.0);
-                let sym_pseudo = self.alloc_pseudo();
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(Pseudo::sym(sym_pseudo, sym));
-                }
-                // The label is a branch target for every indirect goto in this
-                // function, and the CFG has to say so or DCE deletes the block.
-                self.addr_taken_labels.push(bb);
-                self.label_addr_refs.push((label.clone(), expr.pos));
-                if let Some(func) = &mut self.current_func {
-                    func.takes_label_addr = true;
-                }
-                let dst = self.alloc_pseudo();
-                let void_ptr = self.types.void_ptr_id;
-                self.emit(Instruction::sym_addr(dst, sym_pseudo, void_ptr));
-                dst
-            }
+            ExprKind::LabelAddr(name) => self.linearize_label_addr(name, expr),
 
             // One extent of a variably modified `typedef`, evaluated when the
             // typedef's declaration was reached and stored in a hidden local
@@ -5145,25 +5386,7 @@ impl<'a> Linearizer<'a> {
             // `typedef int T[n]; n = 100; T a;` giving `a` the extent `n` had
             // at the typedef.
             ExprKind::VmTypedefExtent(symbol_id, level) => {
-                let ulong = self.types.ulong_id;
-                let dim = self
-                    .vm_typedef_dims
-                    .get(symbol_id)
-                    .and_then(|dims| dims.get(*level as usize))
-                    .copied();
-                match dim {
-                    Some(VmDim::Const(n)) => self.emit_const(n as i128, ulong),
-                    Some(VmDim::Sym(sym)) => {
-                        let loaded = self.alloc_pseudo();
-                        self.emit(Instruction::load(loaded, sym, 0, ulong, 64));
-                        loaded
-                    }
-                    // The typedef's own declaration is always linearized
-                    // before any use of it can be: a use is in its scope, and
-                    // scope begins at the declarator. Nothing measurable is
-                    // left to do if that ever fails to hold.
-                    None => self.emit_const(0, ulong),
-                }
+                self.linearize_vm_typedef_extent(symbol_id, level)
             }
 
             // `__builtin_add_overflow(a, b, res)` and its siblings.
@@ -5178,127 +5401,7 @@ impl<'a> Linearizer<'a> {
             // Signedness of the wide type follows the operands: a product of
             // two 64-bit unsigned values can exceed the signed 128-bit range,
             // so all-unsigned operands compute unsigned.
-            ExprKind::CheckedArith { op, a, b, res } => {
-                let a_typ = self.expr_type(a);
-                let b_typ = self.expr_type(b);
-                let res_ptr_typ = self.expr_type(res);
-                let dst_typ = self
-                    .types
-                    .base_type(res_ptr_typ)
-                    .unwrap_or(self.types.int_id);
-
-                let all_unsigned = self.types.is_unsigned(a_typ)
-                    && self.types.is_unsigned(b_typ)
-                    && self.types.is_unsigned(dst_typ);
-                // A difference can be negative even when every operand is
-                // unsigned, and negative is exactly the unrepresentable case
-                // for an unsigned destination. Computing it in an unsigned
-                // `wide` wraps it instead, and then nothing downstream can see
-                // it: `exact < 0` is never true in unsigned arithmetic, and
-                // with `wide == dst_typ` the narrow fast path reports a hard
-                // "no overflow". `__builtin_sub_overflow(0u, 1u, &u128)`
-                // answered 0 where gcc answers 1.
-                //
-                // A sum or product of unsigned operands still needs the
-                // unsigned range: two 64-bit values can exceed the signed
-                // 128-bit maximum. A difference cannot -- it needs one bit
-                // more than the wider operand, and both are under 128 here --
-                // so signing it costs nothing.
-                let subtracting = matches!(op, crate::parse::ast::CheckedOp::Sub);
-                let wide = if all_unsigned && !subtracting {
-                    self.types.uint128_id
-                } else {
-                    self.types.int128_id
-                };
-
-                let av = self.linearize_expr(a);
-                let bv = self.linearize_expr(b);
-                let addr = self.linearize_expr(res);
-
-                let aw = self.emit_convert(av, a_typ, wide);
-                let bw = self.emit_convert(bv, b_typ, wide);
-                let bin = match op {
-                    crate::parse::ast::CheckedOp::Add => BinaryOp::Add,
-                    crate::parse::ast::CheckedOp::Sub => BinaryOp::Sub,
-                    crate::parse::ast::CheckedOp::Mul => BinaryOp::Mul,
-                };
-                // Nothing here is wider than 128 bits, so "compute exactly,
-                // then see whether it survived the narrowing" has nothing to
-                // compare against once the destination is that wide: it tested
-                // a value against itself and always answered "no overflow".
-                // At that width the result has to be examined directly.
-                if self.types.size_bits(dst_typ) >= 128 {
-                    // ...unless both operands are *narrower* than 128 bits, in
-                    // which case the computation in `wide` is still exact: a
-                    // sum or difference of two 64-bit values needs 65 bits and
-                    // a product 128, both of which fit. Only the *check* has to
-                    // change, from "did narrowing lose anything" to "is the
-                    // exact value representable at all" -- and the two differ
-                    // exactly where #C62 was wrong, a negative operand with an
-                    // unsigned destination. `__builtin_add_overflow(-1, 5u,
-                    // &u128)` is 4 and does not overflow; converting the
-                    // operands to the destination first made it 2^128-1 + 5 and
-                    // reported that it did.
-                    // "Narrower than the destination" is not enough on its
-                    // own: `(u64)-1 * (u64)-1` is just under 2^128, which fits
-                    // `unsigned __int128` but *not* `__int128`, so the exact
-                    // computation would itself wrap and the check would pass a
-                    // value it never saw. Count magnitude bits instead -- `w`
-                    // for an unsigned operand, `w-1` for a signed one -- and
-                    // require the result to fit `wide`.
-                    let magnitude_bits = |t: TypeId| {
-                        let w = self.types.size_bits(t);
-                        if self.types.is_unsigned(t) {
-                            w
-                        } else {
-                            w - 1
-                        }
-                    };
-                    let (ma, mb) = (magnitude_bits(a_typ), magnitude_bits(b_typ));
-                    let room = if self.types.is_unsigned(wide) {
-                        128
-                    } else {
-                        127
-                    };
-                    let exact_fits = match op {
-                        crate::parse::ast::CheckedOp::Mul => ma + mb <= room,
-                        // A sum or difference needs one bit more than the wider
-                        // operand, i.e. `ma.max(mb) + 1 <= room`.
-                        _ => ma.max(mb) < room,
-                    };
-                    if self.types.size_bits(a_typ) < 128
-                        && self.types.size_bits(b_typ) < 128
-                        && exact_fits
-                    {
-                        let exact = self.emit_binary(bin, aw, bw, wide, wide);
-                        let dst_size = self.types.size_bits(dst_typ);
-                        let narrowed = self.emit_convert(exact, wide, dst_typ);
-                        self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
-                        // `wide` is unsigned only when the destination is too,
-                        // so the two agree except when a signed exact value has
-                        // to land in an unsigned destination -- where the
-                        // negatives are precisely the unrepresentable ones.
-                        return if wide == dst_typ {
-                            self.emit_const(0, self.types.int_id)
-                        } else {
-                            let zero = self.emit_const(0, wide);
-                            self.emit_binary(BinaryOp::Lt, exact, zero, self.types.int_id, wide)
-                        };
-                    }
-                    let a128 = self.emit_convert(av, a_typ, dst_typ);
-                    let b128 = self.emit_convert(bv, b_typ, dst_typ);
-                    return self.linearize_checked_arith_wide(*op, a128, b128, addr, dst_typ);
-                }
-
-                let exact = self.emit_binary(bin, aw, bw, wide, wide);
-
-                let narrowed = self.emit_convert(exact, wide, dst_typ);
-                let dst_size = self.types.size_bits(dst_typ);
-                self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
-
-                let back = self.emit_convert(narrowed, dst_typ, wide);
-                self.emit_binary(BinaryOp::Ne, exact, back, self.types.int_id, wide)
-            }
+            ExprKind::CheckedArith { op, a, b, res } => self.linearize_checked_arith(op, a, b, res),
 
             ExprKind::IntLit(val) => {
                 let typ = self.expr_type(expr);
@@ -5403,51 +5506,7 @@ impl<'a> Linearizer<'a> {
                 self.emit_const(size as i128, result_typ)
             }
 
-            ExprKind::SizeofExpr(inner_expr) => {
-                // Check if this is a VLA variable - need runtime sizeof
-                if let ExprKind::Ident(symbol_id) = &inner_expr.kind {
-                    if let Some(info) = self.locals.get(symbol_id).cloned() {
-                        if let (Some(size_sym), Some(elem_type)) =
-                            (info.vla_size_sym, info.vla_elem_type)
-                        {
-                            // VLA: compute sizeof at runtime as num_elements * sizeof(element)
-                            let result_typ = self.types.ulong_id;
-                            let elem_size = self.types.size_bytes(elem_type) as i64;
-
-                            // Load the stored number of elements
-                            let num_elements = self.alloc_pseudo();
-                            let load_insn =
-                                Instruction::load(num_elements, size_sym, 0, result_typ, 64);
-                            self.emit(load_insn);
-
-                            // Multiply by element size
-                            let elem_size_const = self.emit_const(elem_size as i128, result_typ);
-                            let result = self.alloc_pseudo();
-                            let mul_insn = Instruction::new(Opcode::Mul)
-                                .with_target(result)
-                                .with_src(num_elements)
-                                .with_src(elem_size_const)
-                                .with_size(64)
-                                .with_type(result_typ);
-                            self.emit(mul_insn);
-                            return result;
-                        }
-                    }
-                }
-
-                // `sizeof(a[0])` on a variably-modified array: the row size is
-                // only known at run time, and the type reports 0.
-                if let Some(size) = self.vm_sizeof_expr(inner_expr) {
-                    return size;
-                }
-
-                // Non-VLA: compute size at compile time
-                let inner_typ = self.expr_type(inner_expr);
-                let size = self.types.size_bits(inner_typ) / 8;
-                // sizeof returns size_t, which is unsigned long in our implementation
-                let result_typ = self.types.ulong_id;
-                self.emit_const(size as i128, result_typ)
-            }
+            ExprKind::SizeofExpr(inner_expr) => self.linearize_sizeof_expr(inner_expr),
 
             ExprKind::AlignofType(typ) => {
                 let align = self.types.alignment(*typ);
@@ -5516,40 +5575,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Setjmp { .. }
             | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
 
-            ExprKind::OffsetOf { type_id, path } => {
-                // __builtin_offsetof(type, member-designator)
-                // Compute the byte offset of the member within the struct
-                let mut offset: u64 = 0;
-                let mut current_type = *type_id;
-
-                for element in path {
-                    match element {
-                        OffsetOfPath::Field(field_id) => {
-                            // Look up the field in the current struct type
-                            let struct_type = self.resolve_struct_type(current_type);
-                            let member_info = self
-                                .types
-                                .find_member(struct_type, *field_id)
-                                .expect("offsetof: field not found in struct type");
-                            offset += member_info.offset as u64;
-                            current_type = member_info.typ;
-                        }
-                        OffsetOfPath::Index(index) => {
-                            // Array indexing: offset += index * sizeof(element)
-                            let elem_type = self
-                                .types
-                                .base_type(current_type)
-                                .expect("offsetof: array index on non-array type");
-                            let elem_size = self.types.size_bytes(elem_type);
-                            offset += (*index as u64) * (elem_size as u64);
-                            current_type = elem_type;
-                        }
-                    }
-                }
-
-                // Return the offset as a constant
-                self.emit_const(offset as i128, self.types.ulong_id)
-            }
+            ExprKind::OffsetOf { type_id, path } => self.linearize_offsetof(type_id, path),
 
             ExprKind::C11AtomicInit { .. }
             | ExprKind::C11AtomicLoad { .. }
@@ -5579,22 +5605,7 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::BuiltinComplex { real, imag } => {
-                // __builtin_complex(real, imag) - construct complex value
-                let complex_typ = self.expr_type(expr);
-                let base_typ = self.types.complex_base(complex_typ);
-                let base_bits = self.types.size_bits(base_typ);
-                let base_bytes = (base_bits / 8) as i64;
-
-                let real_val = self.linearize_expr(real);
-                let imag_val = self.linearize_expr(imag);
-
-                // Allocate local to hold the complex value, return its address
-                let result = self.alloc_local_temp(complex_typ);
-                self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
-                self.emit(Instruction::store(
-                    imag_val, result, base_bytes, base_typ, base_bits,
-                ));
-                result
+                self.linearize_builtin_complex(real, imag, expr)
             }
         }
     }
@@ -5620,11 +5631,8 @@ impl<'a> Linearizer<'a> {
     }
 }
 
-// ============================================================================
 // Public API
-// ============================================================================
 
-/// Linearize an AST to IR
 pub fn linearize(
     tu: &TranslationUnit,
     symbols: &SymbolTable,

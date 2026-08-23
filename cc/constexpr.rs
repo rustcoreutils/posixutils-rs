@@ -189,9 +189,6 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
         ExprKind::SizeofExpr(inner) => {
             // `sizeof a` where `a` is a variable-length array is computed at
             // run time (6.5.3.4p2) and is not an integer constant expression.
-            // `SizeofType` grew this guard; this arm did not, so `case sizeof a:`
-            // folded to 0 -- `size_bits` reports 0 for an array with no extent --
-            // and the case label was silently accepted with the wrong value.
             //
             // A `TypeId` for `int[n]` is indistinguishable from one for `int[]`,
             // so the question has to be asked of the levels, not the size.
@@ -350,8 +347,8 @@ fn eval_binary(
             // 6.5.7p3 makes a count outside [0, width) undefined and gcc
             // folds one to 0 for `<<` while leaving `-1 >> 64` at -1, so
             // there is no single gcc answer to match; c17 diverges knowingly
-            // and consistently. What gcc has and c17 does not is the
-            // *warning* -- see #C125.
+            // and consistently. The *warning* is emitted by
+            // `check_shift_count`, where the shift's type is computed.
             let width = left
                 .typ
                 .map(|t| env.types().size_bits(t))

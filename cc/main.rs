@@ -2116,6 +2116,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    // `-M`/`-MM` is the one combination that cannot be reduced to a warning.
+    // The other two leave *something* usable behind -- the last object, or the
+    // concatenated `-E` text -- but a dependency file is read by make, and a
+    // `.d` holding only the last source's rule is silently wrong: make sees no
+    // prerequisites for the others and stops rebuilding them. There is no
+    // partial answer worth writing, so refuse instead. `-MF` names the same
+    // single file for the same reason, and `-o` also stands in for it here
+    // (`dependency_sink`), so both spellings are caught.
+    let deps_to_one_file =
+        args.deps_file.is_some() || args.output.as_deref().is_some_and(|p| p != "-");
+    if args.dependencies_replace_output() && deps_to_one_file && source_count > 1 {
+        eprintln!(
+            "c17: {} ({})",
+            gettext("cannot write the dependency rules for several sources to one file"),
+            source_count
+        );
+        std::process::exit(1);
+    }
+
     // -E is the other unspecified combination, and it resolves the other way:
     // the operands share one output stream, so they concatenate rather than
     // overwrite. Still worth saying, since a makefile expecting one .i per

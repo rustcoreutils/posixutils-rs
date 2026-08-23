@@ -223,6 +223,10 @@ impl X86_64CodeGen {
         if self.base.emit_unwind_tables {
             self.push_lir(X86Inst::Directive(Directive::CfiEndProc));
         }
+
+        // `.size f, .-f`: without it the symbol records st_size = 0 and a
+        // debugger cannot tell which function owns an address inside it.
+        self.push_lir(X86Inst::Directive(Directive::size_to_here(&func.name)));
     }
 
     /// Emit function header directives (text section, visibility, type, label, CFI start)
@@ -263,6 +267,11 @@ impl X86_64CodeGen {
 
         // Function label
         self.push_lir(X86Inst::Directive(Directive::global_label(name)));
+
+        // The line the prologue belongs to, before the procedure starts --
+        // otherwise the function's entry address has no row in the line table
+        // and a debugger cannot place a breakpoint on the function at all.
+        self.base.emit_function_entry_loc(func);
 
         // CFI: Start procedure (enables stack unwinding for this function)
         if self.base.emit_unwind_tables {

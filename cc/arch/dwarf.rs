@@ -131,8 +131,16 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
     // DW_AT_comp_dir (compilation directory)
     base.push_directive(Directive::Asciz(comp_dir.to_string()));
 
-    // DW_AT_stmt_list (offset into .debug_line, 0 to reference start)
-    base.push_directive(Directive::Long(0));
+    // DW_AT_stmt_list: this unit's own line program.
+    //
+    // A relocatable reference, not a literal 0. The assembler builds one line
+    // program per object from the `.loc` directives, and the linker packs them
+    // into `.debug_line` one after another -- so only the first object's
+    // program sits at offset 0. Every unit claiming 0 made every unit share the
+    // first one's line table: in a 56-unit link of sparse, exactly one file
+    // resolved to source lines and the other 55 reported none, which reads
+    // like missing debug info rather than a misdirected offset.
+    base.push_directive(Directive::LongSym(Symbol::local(".Ldebug_line0")));
 
     // DW_AT_low_pc (start of code)
     // Use 0 for data-only files with no code section
@@ -152,4 +160,10 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
 
     // End label for unit length computation
     base.push_directive(Directive::local_label(".Ldebug_info_end"));
+
+    // The label `DW_AT_stmt_list` names. Entering the section is enough to
+    // anchor it at the start of this object's contribution; the assembler
+    // appends the line program it builds from the `.loc` directives after it.
+    base.push_directive(Directive::DebugLine);
+    base.push_directive(Directive::local_label(".Ldebug_line0"));
 }

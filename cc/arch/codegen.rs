@@ -266,6 +266,37 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         false
     }
 
+    /// Emit the `.loc` that covers a function's prologue.
+    ///
+    /// `emit_loc` runs per instruction as the blocks are emitted, so the first
+    /// `.loc` of a function landed *after* the prologue -- and a function's
+    /// entry address then had no row in the line table at all. `break f` asks
+    /// for exactly that address, so gdb answered "No line number information
+    /// available" and gave up on the whole function, even though every later
+    /// address in it was covered.
+    ///
+    /// gcc emits the opening line before `.cfi_startproc` for this reason. The
+    /// position comes from the first instruction that carries one, which is the
+    /// same position the old first `.loc` used; `emit_loc`'s own de-duplication
+    /// keeps it from being repeated once the blocks start.
+    pub fn emit_function_entry_loc(&mut self, func: &Function) {
+        if !self.emit_debug {
+            return;
+        }
+        let Some(pos) = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .find_map(|i| i.pos.as_ref())
+        else {
+            return;
+        };
+        let file = pos.stream + 1; // DWARF file indices start at 1
+        self.push_directive(Directive::loc(file.into(), pos.line, pos.col.into()));
+        self.last_debug_line = pos.line;
+        self.last_debug_file = file;
+    }
+
     /// `.weak` and visibility for symbols this unit only declares.
     ///
     /// A defined symbol carries these on its own definition; a declared one has

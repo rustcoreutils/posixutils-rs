@@ -356,17 +356,25 @@ fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
-    let val1 = consts.get(src1);
-    let val2 = consts.get(src2);
+    // Read at the operand's own width, in the signedness the opcode implies --
+    // the same discipline `simplify_shift` uses. Division is not congruent
+    // modulo 2^n the way add/sub/mul are: it reads the whole value and its
+    // sign, so `(int)0xFFFFFFFFu` arriving as 4294967295 rather than -1
+    // answered 2147483647 where C says 0.
+    let signed = insn.op == Opcode::DivS;
+    let size = insn.size.max(1);
+    let val1 = consts.get(src1).map(|v| at_width(v, size, signed));
+    let val2 = consts.get(src2).map(|v| at_width(v, size, signed));
 
     match (val1, val2) {
         // Constant folding: a / b -> (a / b) (avoid div by zero)
         (Some(a), Some(b)) if b != 0 => {
-            if insn.op == Opcode::DivS {
-                Simplification::FoldToConst(a.wrapping_div(b))
+            let folded = if signed {
+                a.wrapping_div(b)
             } else {
-                Simplification::FoldToConst((a as u128).wrapping_div(b as u128) as i128)
-            }
+                (a as u128).wrapping_div(b as u128) as i128
+            };
+            Simplification::FoldToConst(at_width(folded, size, signed))
         }
 
         // Algebraic: x / 1 -> x
@@ -388,17 +396,21 @@ fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
-    let val1 = consts.get(src1);
-    let val2 = consts.get(src2);
+    // Same width and signedness discipline as `simplify_div`.
+    let signed = insn.op == Opcode::ModS;
+    let size = insn.size.max(1);
+    let val1 = consts.get(src1).map(|v| at_width(v, size, signed));
+    let val2 = consts.get(src2).map(|v| at_width(v, size, signed));
 
     match (val1, val2) {
         // Constant folding: a % b -> (a % b) (avoid mod by zero)
         (Some(a), Some(b)) if b != 0 => {
-            if insn.op == Opcode::ModS {
-                Simplification::FoldToConst(a.wrapping_rem(b))
+            let folded = if signed {
+                a.wrapping_rem(b)
             } else {
-                Simplification::FoldToConst((a as u128).wrapping_rem(b as u128) as i128)
-            }
+                (a as u128).wrapping_rem(b as u128) as i128
+            };
+            Simplification::FoldToConst(at_width(folded, size, signed))
         }
 
         // Algebraic: 0 % x -> 0
@@ -592,6 +604,13 @@ struct CmpInfo {
     identity_result: i128,
     /// Constant comparison function
     compare: fn(i128, i128) -> bool,
+    /// How to read the operands at their own width before comparing.
+    ///
+    /// The opcode is the only thing that carries this: `SetLt`/`Le`/`Gt`/`Ge`
+    /// are the signed forms and `SetB`/`Be`/`A`/`Ae` the unsigned ones.
+    /// `SetEq`/`SetNe` do not care which, as long as both sides are read the
+    /// same way -- but they do care about the width.
+    signed: bool,
 }
 
 /// Get comparison info for the given opcode
@@ -600,42 +619,52 @@ fn get_cmp_info(op: Opcode) -> Option<CmpInfo> {
         Opcode::SetEq => Some(CmpInfo {
             identity_result: 1,
             compare: |a, b| a == b,
+            signed: true,
         }),
         Opcode::SetNe => Some(CmpInfo {
             identity_result: 0,
             compare: |a, b| a != b,
+            signed: true,
         }),
         Opcode::SetLt => Some(CmpInfo {
             identity_result: 0,
             compare: |a, b| a < b,
+            signed: true,
         }),
         Opcode::SetLe => Some(CmpInfo {
             identity_result: 1,
             compare: |a, b| a <= b,
+            signed: true,
         }),
         Opcode::SetGt => Some(CmpInfo {
             identity_result: 0,
             compare: |a, b| a > b,
+            signed: true,
         }),
         Opcode::SetGe => Some(CmpInfo {
             identity_result: 1,
             compare: |a, b| a >= b,
+            signed: true,
         }),
         Opcode::SetB => Some(CmpInfo {
             identity_result: 0,
             compare: |a, b| (a as u128) < (b as u128),
+            signed: false,
         }),
         Opcode::SetBe => Some(CmpInfo {
             identity_result: 1,
             compare: |a, b| (a as u128) <= (b as u128),
+            signed: false,
         }),
         Opcode::SetA => Some(CmpInfo {
             identity_result: 0,
             compare: |a, b| (a as u128) > (b as u128),
+            signed: false,
         }),
         Opcode::SetAe => Some(CmpInfo {
             identity_result: 1,
             compare: |a, b| (a as u128) >= (b as u128),
+            signed: false,
         }),
         _ => None,
     }
@@ -665,11 +694,18 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap) -> Simplification 
     let val2 = consts.get(src2);
 
     if let (Some(a), Some(b)) = (val1, val2) {
-        // Deliberately *not* re-read at `insn.size`: for a Set* that is the
-        // width of the i32/_Bool result, not of the operands -- a `_Bool`
-        // cast lowers to `setne.8` over two 32-bit values. Both sides arrive
-        // canonical at their own width from `ConstMap`, which is what makes
-        // them comparable.
+        // `insn.size` is the width of the *result* at one of the four Set*
+        // construction sites -- a `_Bool` conversion lowers to `setne.8` over
+        // two 32-bit operands -- and that site is the only one that records
+        // the operand width, in `src_size`. Preferring `src_size` when it is
+        // set is right at all four.
+        let size = if insn.src_size != 0 {
+            insn.src_size
+        } else {
+            insn.size.max(1)
+        };
+        let a = at_width(a, size, info.signed);
+        let b = at_width(b, size, info.signed);
         return Simplification::FoldToConst(if (info.compare)(a, b) { 1 } else { 0 });
     }
 
@@ -1735,5 +1771,138 @@ mod tests {
         let mut func = make_test_func_with_insns(insns, pseudos);
         run(&mut func);
         assert!(crate::ir::validate::validate_function(&func).is_ok());
+    }
+
+    /// Division reads the whole value and its sign, so the operand has to be
+    /// read at its own width first. `(int)0xFFFFFFFFu` emits no conversion
+    /// instruction, so the constant still holds 4294967295 where the opcode
+    /// means -1.
+    #[test]
+    fn test_signed_div_reads_operands_at_their_width() {
+        let int_id = int_type();
+        let insns = vec![Instruction::binop(
+            Opcode::DivS,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            int_id,
+            32,
+        )];
+        let pseudos = vec![
+            Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
+            Pseudo::val(PseudoId(1), 2),
+            Pseudo::reg(PseudoId(2), 0),
+        ];
+        let mut func = make_test_func_with_insns(insns, pseudos);
+        assert!(run(&mut func));
+        let d = insn_at(&func, 0);
+        assert_eq!(d.op, Opcode::Copy);
+        assert_eq!(func.const_val(d.src[0]), Some(0), "-1 / 2 is 0");
+    }
+
+    #[test]
+    fn test_signed_mod_reads_operands_at_their_width() {
+        let int_id = int_type();
+        let insns = vec![Instruction::binop(
+            Opcode::ModS,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            int_id,
+            32,
+        )];
+        let pseudos = vec![
+            Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
+            Pseudo::val(PseudoId(1), 3),
+            Pseudo::reg(PseudoId(2), 0),
+        ];
+        let mut func = make_test_func_with_insns(insns, pseudos);
+        assert!(run(&mut func));
+        let m = insn_at(&func, 0);
+        assert_eq!(func.const_val(m.src[0]), Some(-1), "-1 % 3 is -1");
+    }
+
+    /// The unsigned opcodes must keep reading the same bits as unsigned.
+    #[test]
+    fn test_unsigned_div_stays_unsigned() {
+        let uint_id = TypeTable::new(&Target::host()).uint_id;
+        let insns = vec![Instruction::binop(
+            Opcode::DivU,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            uint_id,
+            32,
+        )];
+        let pseudos = vec![
+            Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
+            Pseudo::val(PseudoId(1), 2),
+            Pseudo::reg(PseudoId(2), 0),
+        ];
+        let mut func = make_test_func_with_insns(insns, pseudos);
+        assert!(run(&mut func));
+        let d = insn_at(&func, 0);
+        assert_eq!(
+            func.const_val(d.src[0]),
+            Some(2147483647),
+            "0xFFFFFFFF / 2 unsigned is 2147483647"
+        );
+    }
+
+    /// A signed ordering comparison folded on the raw bits answered backwards.
+    #[test]
+    fn test_signed_comparison_reads_operands_at_their_width() {
+        let int_id = int_type();
+        let insns = vec![Instruction::binop(
+            Opcode::SetLt,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            int_id,
+            32,
+        )];
+        let pseudos = vec![
+            Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
+            Pseudo::val(PseudoId(1), 0),
+            Pseudo::reg(PseudoId(2), 0),
+        ];
+        let mut func = make_test_func_with_insns(insns, pseudos);
+        assert!(run(&mut func));
+        let c = insn_at(&func, 0);
+        assert_eq!(func.const_val(c.src[0]), Some(1), "-1 < 0 is true");
+    }
+
+    /// `insn.size` on a Set* is the width of its own result. The `_Bool`
+    /// conversion is the site that proves it: `setne.8` over two 32-bit
+    /// operands, with the operand width recorded in `src_size`. Reading
+    /// `size` there would compare only the low 8 bits, making `(_Bool)256`
+    /// false.
+    #[test]
+    fn test_comparison_prefers_src_size_when_set() {
+        let int_id = int_type();
+        let bool_id = TypeTable::new(&Target::host()).bool_id;
+        let mut insn = Instruction::binop(
+            Opcode::SetNe,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            bool_id,
+            8,
+        );
+        insn.src_size = 32;
+        insn.src_typ = Some(int_id);
+        let pseudos = vec![
+            Pseudo::val(PseudoId(0), 256),
+            Pseudo::val(PseudoId(1), 0),
+            Pseudo::reg(PseudoId(2), 0),
+        ];
+        let mut func = make_test_func_with_insns(vec![insn], pseudos);
+        assert!(run(&mut func));
+        let c = insn_at(&func, 0);
+        assert_eq!(
+            func.const_val(c.src[0]),
+            Some(1),
+            "256 != 0 is true; reading only the low 8 bits would say false"
+        );
     }
 }

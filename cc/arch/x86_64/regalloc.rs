@@ -848,6 +848,67 @@ pub struct RegAlloc {
     live_out: Vec<HashSet<PseudoId>>,
     /// Maximum alignment requirement of any local variable (for dynamic stack alignment)
     max_local_align: i32,
+    /// How this function's locals are addressed.
+    frame_base: FrameBase,
+}
+
+/// How a function's locals are addressed.
+///
+/// The aarch64 allocator carries the same decision under the same name, and
+/// for the same reason: `%rbp`/`x29` is only guaranteed 16-byte aligned, so a
+/// local wanting more has to be reached from a base the prologue rounds up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBase {
+    /// The frame pointer. Every local is satisfied by the stack's own
+    /// alignment, so no register is spent.
+    Rbp,
+    /// `reg` holds the locals area's `align`-rounded start, and every local is
+    /// addressed from there. `reg` must not be allocatable.
+    ///
+    /// A register rather than `%rsp` itself, which is what this used to be.
+    /// `%rsp` is the right *value* -- the prologue's `andq` puts it exactly
+    /// here -- but it does not stay that value: `alloca` subtracts from it, and
+    /// every local in the function then moved out from under its own address.
+    /// A function needs no `alloca` of its own to be hit, because the inliner
+    /// splices callees that have one into callers that do not.
+    Aligned { reg: Reg, align: i32 },
+}
+
+impl FrameBase {
+    /// Decide from the function's declared locals.
+    ///
+    /// The alignment expression must stay in step with the one the `Sym` arm
+    /// applies when it lays a slot out, or the frame would be padded for one
+    /// alignment and addressed for another.
+    fn of(func: &Function, types: &TypeTable) -> FrameBase {
+        let align = func
+            .locals
+            .values()
+            .map(|local| {
+                local
+                    .explicit_align
+                    .map(|a| a as i32)
+                    .unwrap_or_else(|| (types.alignment(local.typ) as i32).max(8))
+            })
+            .max()
+            .unwrap_or(8);
+        if align > 16 {
+            FrameBase::Aligned {
+                reg: Reg::Rbx,
+                align,
+            }
+        } else {
+            FrameBase::Rbp
+        }
+    }
+
+    /// The register held back from allocation, if any.
+    pub fn reg(self) -> Option<Reg> {
+        match self {
+            FrameBase::Rbp => None,
+            FrameBase::Aligned { reg, .. } => Some(reg),
+        }
+    }
 }
 
 /// Bytes reserved at the bottom of the locals area for the x87 scratch.
@@ -911,6 +972,7 @@ impl RegAlloc {
             live_in: Vec::new(),
             live_out: Vec::new(),
             max_local_align: 8,
+            frame_base: FrameBase::Rbp,
         }
     }
 
@@ -921,6 +983,14 @@ impl RegAlloc {
         types: &TypeTable,
     ) -> crate::arch::regalloc::LocationMap<Loc> {
         self.reset_state();
+        // Before anything is coloured: the frame base claims a register, and
+        // every palette below has to be built without it.
+        self.frame_base = FrameBase::of(func, types);
+        if let Some(base) = self.frame_base.reg() {
+            self.free_regs.retain(|r| *r != base);
+            // The prologue writes it, so the function must save it.
+            self.used_callee_saved.push(base);
+        }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
@@ -1855,7 +1925,8 @@ impl RegAlloc {
         //       and the value would be lost).
         //   (c) NB: in-loop is NOT a forbidden constraint, only a
         //       preference (soft) — see preferred_palette below.
-        let caller_saved: Vec<Reg> = Reg::allocatable()
+        let allocatable = self.allocatable_regs();
+        let caller_saved: Vec<Reg> = allocatable
             .iter()
             .copied()
             .filter(|r| !r.is_callee_saved())
@@ -1899,7 +1970,7 @@ impl RegAlloc {
         // the prologue/epilogue when not needed).
         let caller_first: Vec<Reg> = {
             let mut v = caller_saved.clone();
-            for &r in Reg::allocatable() {
+            for &r in &allocatable {
                 if r.is_callee_saved() {
                     v.push(r);
                 }
@@ -1907,7 +1978,7 @@ impl RegAlloc {
             v
         };
         let callee_first: Vec<Reg> = {
-            let mut v: Vec<Reg> = Reg::allocatable()
+            let mut v: Vec<Reg> = allocatable
                 .iter()
                 .copied()
                 .filter(|r| r.is_callee_saved())
@@ -1924,7 +1995,7 @@ impl RegAlloc {
         let result = greedy_color(
             &graph,
             &order,
-            Reg::allocatable(),
+            &allocatable,
             &pre_colored,
             &forbidden,
             |v| {
@@ -2175,6 +2246,27 @@ impl RegAlloc {
     /// Get the maximum alignment requirement of any local variable
     pub fn max_local_align(&self) -> i32 {
         self.max_local_align
+    }
+
+    /// How this function's locals are addressed.
+    pub fn frame_base(&self) -> FrameBase {
+        self.frame_base
+    }
+
+    /// The registers this function may colour with: the machine's allocatable
+    /// set, less whatever the frame has claimed for its base.
+    ///
+    /// Every consumer must come through here rather than reading
+    /// `Reg::allocatable()` -- the colourer builds its own preference orders,
+    /// and withholding the base from `free_regs` alone left it free to hand
+    /// out the very register the prologue overwrites.
+    fn allocatable_regs(&self) -> Vec<Reg> {
+        let claimed = self.frame_base.reg();
+        Reg::allocatable()
+            .iter()
+            .copied()
+            .filter(|r| Some(*r) != claimed)
+            .collect()
     }
 
     /// Get callee-saved registers that need to be preserved

@@ -9859,3 +9859,99 @@ int main(void) {
         0
     );
 }
+
+/// An over-aligned local keeps its address when `%rsp` moves under it.
+///
+/// A local wanting more than 16-byte alignment cannot be reached from `%rbp`,
+/// which the ABI only guarantees to 16, so the prologue rounds a base up and
+/// addresses every local from that. x86-64 used `%rsp` itself as that base --
+/// correct at the instant the prologue's `andq` runs, and wrong from the first
+/// thing that moves it. `alloca` moves it, and the locals shifted out from
+/// under their own addresses: the store of one local landed on top of another.
+///
+/// Both ways in are covered. The caller need not contain an `alloca` of its
+/// own -- the inliner splices callees that do into callers that do not -- and
+/// the direct form was broken at every optimization level, not just where
+/// inlining runs.
+#[test]
+fn codegen_over_aligned_locals_survive_alloca() {
+    let code = r#"
+int printf(const char *, ...);
+
+static int use(int n) {
+    char *p = __builtin_alloca(n);
+    for (int i = 0; i < n; i++) p[i] = (char)i;
+    int s = 0;
+    for (int i = 0; i < n; i++) s += p[i];
+    return s;
+}
+
+int many(int a,int b,int c,int d,int e,int f,int g,int h,int i,int j) {
+    return a + b*2 + c*3 + d*4 + e*5 + f*6 + g*7 + h*8 + i*9 + j*10;
+}
+
+/* The alloca arrives by inlining: this function's source has none. */
+static int inlined_form(void) {
+    _Alignas(32) int buf[8];
+    for (int i = 0; i < 8; i++) buf[i] = 1000 + i;
+    int t = use(16);
+    if (t != 120) return -1;
+    for (int i = 0; i < 8; i++) if (buf[i] != 1000 + i) return -2;
+    return 0;
+}
+
+/* The alloca is written here, and sits beside the over-aligned local. */
+static int direct_form(int n) {
+    _Alignas(64) long a[8];
+    _Alignas(32) int b[8];
+    for (int i = 0; i < 8; i++) { a[i] = 1000 + i; b[i] = 2000 + i; }
+
+    char *p = __builtin_alloca(n);
+    for (int i = 0; i < n; i++) p[i] = (char)i;
+
+    /* The alignment the source asked for actually held. */
+    if (((unsigned long)a & 63) != 0) return -1;
+    if (((unsigned long)b & 31) != 0) return -2;
+
+    /* A call needing stack arguments, placed after the alloca: reserving the
+       outgoing area moves %rsp again. */
+    if (many(1,2,3,4,5,6,7,8,9,10) != 385) return -3;
+
+    int s = 0;
+    for (int i = 0; i < n; i++) s += p[i];
+    if (s != n * (n - 1) / 2) return -4;
+
+    for (int i = 0; i < 8; i++) if (a[i] != 1000 + i) return -5;
+    for (int i = 0; i < 8; i++) if (b[i] != 2000 + i) return -6;
+    return 0;
+}
+
+/* A variably-modified local moves %rsp the same way an alloca does. */
+static int vla_form(int n) {
+    _Alignas(32) double d[4];
+    for (int i = 0; i < 4; i++) d[i] = i + 0.5;
+    int vla[n];
+    for (int i = 0; i < n; i++) vla[i] = 3000 + i;
+    if (((unsigned long)d & 31) != 0) return -1;
+    long sv = 0;
+    for (int i = 0; i < n; i++) sv += vla[i];
+    if (sv != (long)n * 3000 + (long)n * (n - 1) / 2) return -2;
+    for (int i = 0; i < 4; i++) if (d[i] != i + 0.5) return -3;
+    return 0;
+}
+
+int main(void) {
+    if (inlined_form() != 0) return 1;
+    if (direct_form(16) != 0) return 2;
+    if (direct_form(64) != 0) return 3;
+    if (vla_form(5) != 0) return 4;
+    if (vla_form(9) != 0) return 5;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("over_aligned_alloca", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("over_aligned_alloca_opt", code),
+        0
+    );
+}

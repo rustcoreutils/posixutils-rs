@@ -15,7 +15,7 @@
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
-use crate::arch::x86_64::regalloc::{Loc, Reg, XmmReg};
+use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, XmmReg};
 use crate::ir::{Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeKind, TypeTable};
@@ -70,8 +70,8 @@ pub struct X86_64CodeGen {
     pub(super) quad_constants: std::collections::BTreeMap<u128, [u8; 16]>,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     pub(super) sym_type_sizes: HashMap<PseudoId, u32>,
-    /// When true, locals are addressed via RSP instead of RBP (for dynamic stack alignment)
-    pub(super) use_rsp_locals: bool,
+    /// How this function's locals are addressed.
+    pub(super) frame_base: FrameBase,
     /// How far `%rsp` has been moved below the frame's resting position.
     ///
     /// Only matters when locals are addressed from `%rsp` -- an over-aligned
@@ -106,7 +106,7 @@ impl X86_64CodeGen {
             double_constants: std::collections::BTreeMap::new(),
             quad_constants: std::collections::BTreeMap::new(),
             sym_type_sizes: HashMap::new(),
-            use_rsp_locals: false,
+            frame_base: FrameBase::Rbp,
             rsp_adjust: 0,
             max_local_align: 16,
             int128_pseudos: HashSet::new(),
@@ -120,12 +120,17 @@ impl X86_64CodeGen {
 
     /// Compute the memory address for a stack offset.
     /// In normal mode: [rbp - (offset + callee_saved_offset)]
-    /// In dynamic alignment mode: [rsp + (stack_alloc_size - offset)]
+    /// In dynamic alignment mode: [base + (stack_alloc_size - offset)]
+    ///
+    /// `rsp_adjust` applies only to the `%rbp` form's counterpart in the
+    /// outgoing-argument path, never here: the aligned base is a register the
+    /// prologue sets once and nothing moves, which is the whole reason it is
+    /// not `%rsp`.
     pub(super) fn stack_mem(&self, offset: i32) -> MemAddr {
-        if self.use_rsp_locals {
+        if let FrameBase::Aligned { reg, .. } = self.frame_base {
             MemAddr::BaseOffset {
-                base: Reg::Rsp,
-                offset: self.stack_alloc_size - offset + self.rsp_adjust,
+                base: reg,
+                offset: self.stack_alloc_size - offset,
             }
         } else {
             MemAddr::BaseOffset {

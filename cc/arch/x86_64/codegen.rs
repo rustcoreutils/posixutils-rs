@@ -72,13 +72,6 @@ pub struct X86_64CodeGen {
     pub(super) sym_type_sizes: HashMap<PseudoId, u32>,
     /// How this function's locals are addressed.
     pub(super) frame_base: FrameBase,
-    /// How far `%rsp` has been moved below the frame's resting position.
-    ///
-    /// Only matters when locals are addressed from `%rsp` -- an over-aligned
-    /// frame -- because then reserving an outgoing argument area moves the base
-    /// every local is measured from. Reading a source operand after the
-    /// reservation without this would have read the wrong slot.
-    pub(super) rsp_adjust: i32,
     /// Maximum local alignment (for andq in prologue)
     pub(super) max_local_align: i32,
     /// Pseudos that are 128-bit integers (need full 16-byte copies)
@@ -107,7 +100,6 @@ impl X86_64CodeGen {
             quad_constants: std::collections::BTreeMap::new(),
             sym_type_sizes: HashMap::new(),
             frame_base: FrameBase::Rbp,
-            rsp_adjust: 0,
             max_local_align: 16,
             int128_pseudos: HashSet::new(),
         }
@@ -122,10 +114,9 @@ impl X86_64CodeGen {
     /// In normal mode: [rbp - (offset + callee_saved_offset)]
     /// In dynamic alignment mode: [base + (stack_alloc_size - offset)]
     ///
-    /// `rsp_adjust` applies only to the `%rbp` form's counterpart in the
-    /// outgoing-argument path, never here: the aligned base is a register the
-    /// prologue sets once and nothing moves, which is the whole reason it is
-    /// not `%rsp`.
+    /// Nothing corrects for the outgoing-argument area here. Reserving one
+    /// moves `%rsp`, which is exactly why the aligned base is a register the
+    /// prologue sets once instead.
     pub(super) fn stack_mem(&self, offset: i32) -> MemAddr {
         if let FrameBase::Aligned { reg, .. } = self.frame_base {
             MemAddr::BaseOffset {

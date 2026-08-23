@@ -21,7 +21,7 @@
 // everywhere.
 //
 
-use super::asm_probe::{asm_for, body_of, AARCH64_LINUX, X86_64_LINUX};
+use super::asm_probe::{asm_for, asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 
 /// AAPCS64 passes a `_Complex` as a two-element HFA, so it occupies **two**
 /// V registers and the next floating-point parameter starts after both.
@@ -1906,4 +1906,51 @@ fn codegen_stacked_arg_starts_at_the_argument_area_base() {
         "aarch64: the first stacked argument must be read from the argument \
          area base {base} (the frame's own size), not padded past it:\n{asm}"
     );
+}
+
+/// A function whose `Ret` carries an *address* is not inlined.
+///
+/// `Function::ret_is_address` exists to stop the inliner splicing across that
+/// boundary: the callee hands back a pointer to the value while a call's result
+/// slot holds the value itself, and bridging the two needs a base type and
+/// stride the optimizer has no `TypeTable` to ask for.
+///
+/// It knew about two such returns, `_Complex` and an x87 `long double`
+/// aggregate, and missed a third. AAPCS64 returns a homogeneous
+/// floating-point aggregate in `d0`-`d3` at **any** size -- four `double`s is
+/// thirty-two bytes and still comes back in registers -- but the check was
+/// gated behind the *two-register* return path, which stops at 128 bits. So
+/// every HFA past that reported a value-carrying `Ret`, the inliner spliced the
+/// body in, and the caller read the returned pointer's own storage as the
+/// struct's bytes.
+///
+/// Asserted on aarch64 only: on x86-64 a 32-byte aggregate is MEMORY class and
+/// returns through the hidden pointer, where inlining is correct and wanted.
+#[test]
+fn codegen_aarch64_hfa_returning_function_is_not_inlined() {
+    // Three and four doubles are HFAs past 128 bits. Two doubles is exactly
+    // 128 and was already handled -- kept here so the fix is pinned to the
+    // shape rather than to a size threshold that could drift again.
+    let src = r#"
+        struct H2 { double v[2]; };
+        struct H3 { double v[3]; };
+        struct H4 { double v[4]; };
+        static struct H2 mk2(double s){ struct H2 r; r.v[0]=s; r.v[1]=s+1; return r; }
+        static struct H3 mk3(double s){ struct H3 r; for (int i=0;i<3;i++) r.v[i]=s+i; return r; }
+        static struct H4 mk4(double s){ struct H4 r; for (int i=0;i<4;i++) r.v[i]=s+i; return r; }
+        double use2(double s){ struct H2 b = mk2(s); return b.v[0]+b.v[1]; }
+        double use3(double s){ struct H3 b = mk3(s); return b.v[0]+b.v[2]; }
+        double use4(double s){ struct H4 b = mk4(s); return b.v[0]+b.v[3]; }
+    "#;
+
+    let asm = asm_for_with("hfa_no_inline", AARCH64_LINUX, src, &["-O2"]);
+    for (caller, callee) in [("use2", "mk2"), ("use3", "mk3"), ("use4", "mk4")] {
+        let body = body_of(&asm, caller);
+        assert!(
+            body.contains(&format!("bl {callee}")),
+            "{caller} must still call {callee}: an HFA-returning function hands \
+             back an address, and inlining it phis that address as though it \
+             were the aggregate:\n{body}"
+        );
+    }
 }

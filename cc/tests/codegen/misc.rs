@@ -10081,3 +10081,124 @@ int main(void) {
         0
     );
 }
+
+/// An aggregate returned in registers, read back after the returning function
+/// is inlined.
+///
+/// A `Ret` can carry the *address* of the returned value rather than the value,
+/// and `Function::ret_is_address` exists to keep the inliner from splicing
+/// across that boundary. It knew about `_Complex` and about an x87 `long
+/// double` aggregate, and missed a third shape: AAPCS64 returns a homogeneous
+/// floating-point aggregate in registers at **any** size -- four `double`s is
+/// thirty-two bytes and still comes back in `d0`-`d3` -- but the check was
+/// gated behind the two-register return path, which stops at 128 bits.
+///
+/// So on aarch64 every HFA past 128 bits was inlined, and the continuation
+/// phi-ed the returned *address* as though it were the aggregate. The caller
+/// then read the pointer's own storage as the struct's bytes and got a
+/// denormal. Only at -O2, because that is where the inliner's size threshold
+/// admits these functions.
+///
+/// Sizes either side of the old 128-bit cap are covered, along with the
+/// non-HFA aggregates of the same sizes -- those return through the hidden
+/// pointer, where inlining is correct and must keep working.
+#[test]
+fn codegen_inlined_register_returned_aggregate() {
+    let code = r#"
+struct H2 { double v[2]; };     /* HFA, 16 bytes -- at the old cap    */
+struct H3 { double v[3]; };     /* HFA, 24 bytes -- past it           */
+struct H4 { double v[4]; };     /* HFA, 32 bytes -- past it           */
+struct F4 { float  v[4]; };     /* HFA of floats, 16 bytes            */
+struct L2 { long   v[2]; };     /* not an HFA, 16 bytes               */
+struct L4 { long   v[4]; };     /* not an HFA, 32 bytes -- sret       */
+struct M  { long a; double b; };/* mixed, 16 bytes                    */
+
+static struct H2 mk2(double s){ struct H2 r; for(int i=0;i<2;i++) r.v[i]=s+i; return r; }
+static struct H3 mk3(double s){ struct H3 r; for(int i=0;i<3;i++) r.v[i]=s+i; return r; }
+static struct H4 mk4(double s){ struct H4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct F4 mkf(float  s){ struct F4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct L2 mkl2(long  s){ struct L2 r; for(int i=0;i<2;i++) r.v[i]=s+i; return r; }
+static struct L4 mkl4(long  s){ struct L4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct M  mkm(long a, double b){ struct M r; r.a=a; r.b=b; return r; }
+
+/* Each check is its own small function, and `noinline` keeps it that way.
+   That is the point: the defect needs the *maker* inlined into its caller, and
+   the inliner's growth limit declines to do that inside a caller that has
+   already absorbed several. Folding these into main hides the bug entirely --
+   the first version of this test did, and passed on aarch64 while it was live. */
+__attribute__((noinline)) static int c2(double s){
+    struct H2 b = mk2(s);
+    for (int i = 0; i < 2; i++) if (b.v[i] != s + i) return 1;
+    return 0; }
+__attribute__((noinline)) static int c3(double s){
+    struct H3 b = mk3(s);
+    for (int i = 0; i < 3; i++) if (b.v[i] != s + i) return 2;
+    return 0; }
+__attribute__((noinline)) static int c4(double s){
+    struct H4 b = mk4(s);
+    for (int i = 0; i < 4; i++) if (b.v[i] != s + i) return 3;
+    return 0; }
+__attribute__((noinline)) static int cf(float s){
+    struct F4 b = mkf(s);
+    for (int i = 0; i < 4; i++) if (b.v[i] != s + i) return 4;
+    return 0; }
+__attribute__((noinline)) static int cl2(long s){
+    struct L2 b = mkl2(s);
+    for (int i = 0; i < 2; i++) if (b.v[i] != s + i) return 5;
+    return 0; }
+__attribute__((noinline)) static int cl4(long s){
+    struct L4 b = mkl4(s);
+    for (int i = 0; i < 4; i++) if (b.v[i] != s + i) return 6;
+    return 0; }
+__attribute__((noinline)) static int cm(void){
+    struct M b = mkm(7, 2.5);
+    if (b.a != 7 || b.b != 2.5) return 7;
+    return 0; }
+
+/* Each maker below is called from exactly one place. A maker with several
+   call sites is judged differently by the inliner's growth heuristic and stops
+   being inlined at all, which takes the defect with it. */
+static struct H4 mk4b(double s){ struct H4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct H3 mk3b(double s){ struct H3 r; for(int i=0;i<3;i++) r.v[i]=s+i; return r; }
+static struct H4 mk4c(double s){ struct H4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+static struct H4 mk4d(double s){ struct H4 r; for(int i=0;i<4;i++) r.v[i]=s+i; return r; }
+
+/* Consumed in place rather than stored to a named local. */
+__attribute__((noinline)) static int cdirect(double s){
+    if (mk4b(s).v[2] != s + 2) return 8;
+    return 0; }
+__attribute__((noinline)) static int cdirect3(double s){
+    if (mk3b(s).v[1] != s + 1) return 9;
+    return 0; }
+
+/* Two live at once: each return site needs its own destination. */
+__attribute__((noinline)) static int ctwo(void){
+    struct H4 a = mk4c(10.5), b = mk4d(20.5);
+    if (a.v[0] != 10.5 || b.v[0] != 20.5) return 10;
+    if (a.v[3] != 13.5 || b.v[3] != 23.5) return 11;
+    return 0; }
+
+int main(void) {
+    int r;
+    if ((r = c2(1.5)))    return r;
+    if ((r = c3(1.5)))    return r;
+    if ((r = c4(1.5)))    return r;
+    if ((r = cf(1.5f)))   return r;
+    if ((r = cl2(10)))    return r;
+    if ((r = cl4(10)))    return r;
+    if ((r = cm()))       return r;
+    if ((r = cdirect(1.5))) return r;
+    if ((r = cdirect3(1.5))) return r;
+    if ((r = ctwo()))     return r;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("inlined_reg_return_aggregate", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("inlined_reg_return_aggregate_opt", code),
+        0
+    );
+}

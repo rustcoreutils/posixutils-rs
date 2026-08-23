@@ -1665,9 +1665,12 @@ pub struct Function {
     /// True when this function's `Ret` carries the *address* of the returned
     /// value rather than the value.
     ///
-    /// Two returns are shaped that way: a `_Complex` one, and an aggregate
-    /// that is nothing but a `long double`, which comes back in st(0) and so
-    /// is loaded from memory. At a call site the backend stores the returned
+    /// Three returns are shaped that way: a `_Complex` one; an aggregate that
+    /// is nothing but a `long double`, which comes back in st(0) and so is
+    /// loaded from memory; and a homogeneous floating-point aggregate, which
+    /// AAPCS64 returns in `d0`-`d3` at *any* size -- four `double`s is
+    /// thirty-two bytes and still comes back in registers. At a call site the
+    /// backend stores the returned
     /// registers into the result local, so that pseudo's slot holds the value
     /// itself; inlining drops the call and would hand the caller an address
     /// where it expects a value. Bridging the two needs the base type and

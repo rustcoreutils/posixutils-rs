@@ -1129,13 +1129,24 @@ impl<'a> Linearizer<'a> {
         // value. The inliner has to know not to splice across that boundary.
         // An aggregate returned in st(0) has exactly the same shape as a
         // complex one, and missing it is a miscompile visible only at -O.
-        let returns_x87_aggregate = returns_reg_aggregate
+        //
+        // Asked of the ABI classification directly rather than through
+        // `returns_reg_aggregate`, which is the *two-register* return path and
+        // so stops at 128 bits. An HFA comes back in registers at any size --
+        // four `double`s is thirty-two bytes and still returns in d0-d3 -- so
+        // gating on that cap made every HFA past 128 bits report that its `Ret`
+        // carried a value. The inliner then spliced the body in and phi-ed the
+        // address as if it were the aggregate, and the caller read the pointer's
+        // own storage as the struct's bytes. The call-site half of this
+        // decision already has no size bound; the two had drifted.
+        let returns_addr_aggregate = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
+            && !returns_large_struct
             && matches!(
                 get_abi_for_conv(self.current_calling_conv, self.target)
                     .classify_return(func.return_type, self.types),
                 crate::abi::ArgClass::X87 { .. } | crate::abi::ArgClass::Hfa { .. }
             );
-        ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_x87_aggregate;
+        ir_func.ret_is_address = self.types.is_complex(func.return_type) || returns_addr_aggregate;
 
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage

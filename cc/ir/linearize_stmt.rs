@@ -299,6 +299,40 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
 
+            // C17 6.2.2p4: an identifier declared `extern` inside a function
+            // refers to an object with external linkage; it declares no
+            // storage of its own. A function declared in a block has external
+            // linkage too (6.2.2p5), spelled `extern` or not.
+            //
+            // Falling through to the automatic-storage path below gave both a
+            // stack slot and, worse, an entry in `self.locals`, which is what
+            // every later reference consults -- so `extern int g;` read the
+            // frame instead of `g`, and writes through it never reached the
+            // object. Leaving the name out of `self.locals` is the whole fix:
+            // `linearize_ident` and the store paths already treat an unknown
+            // name as a global.
+            //
+            // The file-scope twin in `linearize_init.rs` has always done this.
+            let is_block_scope_function = self.types.kind(typ) == TypeKind::Function;
+            if declarator.storage_class.contains(TypeModifiers::EXTERN) || is_block_scope_function {
+                // Mirror the file-scope path: record the reference so codegen
+                // reaches the object the way an undefined symbol must be
+                // reached -- through the GOT on macOS, and through the TLS
+                // sequence for `extern _Thread_local`. A name this unit also
+                // defines is not external, so it is left alone.
+                let name = self.symbol_name(declarator.symbol).to_string();
+                if !is_block_scope_function && !self.module.globals.iter().any(|g| g.name == name) {
+                    self.module.extern_symbols.insert(name.clone());
+                    if declarator
+                        .storage_class
+                        .contains(TypeModifiers::THREAD_LOCAL)
+                    {
+                        self.module.extern_tls_symbols.insert(name);
+                    }
+                }
+                continue;
+            }
+
             // Check if this is a VLA (Variable Length Array).
             //
             // Run-time extents alone do not make one: in `int (*p)[n]` they

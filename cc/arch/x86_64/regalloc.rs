@@ -1698,7 +1698,11 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::Sym(name) => {
-                        if let Some(local_var) = func.locals.get(name) {
+                        // By identity, not by name: a global reached through a
+                        // block-scope `extern` carries the same bare name as a
+                        // parameter, and answering by name gave the global the
+                        // parameter's slot instead of `Loc::Global`.
+                        if let Some(local_var) = func.local_of(interval.pseudo) {
                             let size = (types.size_bits(local_var.typ) / 8) as i32;
                             let size = size.max(8);
                             let natural_align = types.alignment(local_var.typ) as i32;

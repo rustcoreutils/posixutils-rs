@@ -1659,7 +1659,8 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::Sym(name) => {
-                        if let Some(local) = func.locals.get(name) {
+                        // By identity, not by name -- see the x86_64 mirror.
+                        if let Some(local) = func.local_of(interval.pseudo) {
                             let size = (types.size_bits(local.typ) / 8) as i32;
                             let size = size.max(8);
                             let natural_align = types.alignment(local.typ) as i32;

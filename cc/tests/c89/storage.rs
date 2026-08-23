@@ -211,3 +211,118 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c89_storage_mega", code, &[]), 0);
 }
+
+/// A declaration inside a function body with `extern` declares no object: it
+/// refers to one with external linkage (C17 6.2.2p4). c17 used to fall through
+/// to the ordinary automatic-storage path and give it a stack slot, so reads
+/// returned whatever the frame held and writes never reached the real object.
+/// No shadowing is required to see it.
+#[test]
+fn c89_block_scope_extern_refers_to_the_global() {
+    let code = r#"
+int g = 5;
+long long wide = 1234567890123LL;
+double dg = 2.5;
+int arr[3] = {7, 8, 9};
+
+int read_in_function_body(void) { extern int g; return g; }
+int read_in_nested_block(void)  { { extern int g; return g; } }
+int read_without_extern(void)   { return g; }
+
+int write_through_extern(void)  { { extern int g; g = 42; } return 0; }
+
+long long read_wide(void) { extern long long wide; return wide; }
+double read_double(void)  { extern double dg; return dg; }
+int read_array(void)      { extern int arr[3]; return arr[0] + arr[1] + arr[2]; }
+
+/* The address must be the global's, not a slot's. */
+int *addr_of_extern(void) { extern int g; return &g; }
+
+/* A block-scope extern whose name is shadowed by a parameter still names the
+   global; the parameter is untouched. */
+int shadowed(int g) {
+    g = 1;
+    { extern int g; g = 77; }
+    return g;                 /* the parameter */
+}
+
+/* The same, with the parameter's address taken so it cannot be promoted out
+   of memory. It then keeps a stack slot registered under its bare name, which
+   is what a same-named global's symbol collides with in the register
+   allocator -- a distinct failure from the one above. */
+int *keep;
+int shadowed_addr_taken(int g) {
+    keep = &g;
+    *keep = 1;
+    { extern int g; g = 88; }
+    return *keep;             /* the parameter */
+}
+
+int main(void) {
+    if (read_in_function_body() != 5) return 1;
+    if (read_in_nested_block()  != 5) return 2;
+    if (read_without_extern()   != 5) return 3;
+
+    write_through_extern();
+    if (g != 42) return 4;
+    g = 5;
+
+    if (read_wide() != 1234567890123LL) return 5;
+    if (read_double() != 2.5) return 6;
+    if (read_array() != 24) return 7;
+
+    if (addr_of_extern() != &g) return 8;
+
+    if (shadowed(3) != 1) return 9;
+    if (g != 77) return 10;
+
+    g = 5;
+    if (shadowed_addr_taken(3) != 1) return 11;
+    if (g != 88) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c89_block_scope_extern", code, &[]), 0);
+}
+
+/// A function declared inside a function body has external linkage whether or
+/// not `extern` is spelled, so it must not get a stack slot either. Calling it
+/// worked regardless -- calls resolve by name -- but using it as a value took
+/// the address of the slot.
+#[test]
+fn c89_block_scope_function_declaration_is_not_an_object() {
+    let code = r#"
+int target(void) { return 77; }
+
+int call_after_extern_decl(void) { extern int target(void); return target(); }
+int call_after_plain_decl(void)  { int target(void); return target(); }
+
+int via_pointer(void) {
+    extern int target(void);
+    int (*p)(void) = target;
+    return p();
+}
+int via_address(void) {
+    int target(void);
+    int (*p)(void) = &target;
+    return p();
+}
+int pointer_identity(void) {
+    extern int target(void);
+    int (*a)(void) = target;
+    int (*b)(void) = &target;
+    return a == b && a == target;
+}
+
+int main(void) {
+    if (call_after_extern_decl() != 77) return 1;
+    if (call_after_plain_decl()  != 77) return 2;
+    if (via_pointer()            != 77) return 3;
+    if (via_address()            != 77) return 4;
+    if (!pointer_identity())          return 5;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c89_block_scope_fn_decl", code, &[]), 0);
+}

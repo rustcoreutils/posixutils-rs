@@ -157,11 +157,11 @@ impl X86_64CodeGen {
         // Build sym type size map for emit_store to distinguish struct fields from scalars
         self.sym_type_sizes.clear();
         for pseudo in &func.pseudos {
-            if let PseudoKind::Sym(name) = &pseudo.kind {
-                if let Some(local_var) = func.locals.get(name) {
-                    self.sym_type_sizes
-                        .insert(pseudo.id, types.size_bits(local_var.typ));
-                }
+            // By identity: a global whose name collides with a parameter's
+            // would otherwise be recorded with the parameter's type size.
+            if let Some(local_var) = func.local_of(pseudo.id) {
+                self.sym_type_sizes
+                    .insert(pseudo.id, types.size_bits(local_var.typ));
             }
         }
 

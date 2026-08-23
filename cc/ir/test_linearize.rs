@@ -6539,3 +6539,84 @@ fn test_va_arg_pack_becomes_a_flag_not_an_argument() {
     );
     assert_eq!(calls[0].arg_types.len(), calls[0].src.len());
 }
+
+/// A declaration inside a function body with `extern` declares no object: it
+/// refers to one with external linkage (C17 6.2.2p4). Falling through to the
+/// automatic-storage path gave it a stack slot *and* an entry in the
+/// linearizer's local map, and the local map is what every later reference
+/// consults -- so the read went to the frame instead of to the global.
+#[test]
+fn test_block_scope_extern_declares_no_local() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let g_sym = ctx.var("g", int_type);
+
+    // int test(void) { extern int g; return g; }
+    let body = Stmt::Block(vec![
+        BlockItem::Declaration(Declaration {
+            declarators: vec![crate::parse::ast::InitDeclarator {
+                symbol_attrs: Default::default(),
+                pos: Position::default(),
+                symbol: g_sym,
+                typ: int_type,
+                storage_class: crate::types::TypeModifiers::EXTERN,
+                init: None,
+                vla_sizes: vec![],
+                explicit_align: None,
+            }],
+        }),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
+            g_sym, int_type,
+        ))))),
+    ]);
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![],
+        body,
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
+    let f = &module.functions[0];
+
+    assert!(
+        f.locals.is_empty(),
+        "an extern declaration must allocate no local: {:?}",
+        f.locals.keys().collect::<Vec<_>>()
+    );
+
+    // The reference must reach a bare-named global symbol, not the mangled
+    // `g.<id>` spelling a block-scope local would get.
+    let syms: Vec<&str> = f
+        .pseudos
+        .iter()
+        .filter_map(|p| match &p.kind {
+            crate::ir::PseudoKind::Sym(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        syms.contains(&"g"),
+        "the reference should name the global `g`, got {:?}",
+        syms
+    );
+    assert!(
+        !syms.iter().any(|s| s.starts_with("g.")),
+        "no mangled local should be created, got {:?}",
+        syms
+    );
+    assert!(
+        module.extern_symbols.contains("g"),
+        "the name must be recorded as external so codegen reaches it through \
+         the GOT on macOS, got {:?}",
+        module.extern_symbols
+    );
+}

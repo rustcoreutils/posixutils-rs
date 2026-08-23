@@ -716,3 +716,53 @@ int main(void) {
         0
     );
 }
+
+/// An inlined function's `_Complex` parameter is copied through its address.
+///
+/// The implicit parameter copies that stand in for the backend prologue decide
+/// by *size* whether the caller's argument pseudo holds the value or a pointer
+/// to it. That is right for an aggregate -- `struct { float a, b; }` fits in a
+/// register and travels as its value -- and wrong for a `_Complex`, which
+/// travels by address at every size. The eight-byte `float _Complex` is exactly
+/// the same size as that struct, so it took the by-value path and the inlined
+/// body read the pointer as a pair of floats.
+///
+/// Only at -O2, where the inliner's threshold admits these functions.
+#[test]
+fn c99_inlined_complex_param_is_copied_through_its_address() {
+    let code = r#"
+#include <complex.h>
+
+/* Each taker has one call site: several change the inliner's answer. */
+static int t_f(float _Complex a) { return __real__ a == 1.0f && __imag__ a == 2.0f; }
+static int t_d(double _Complex a) { return __real__ a == 1.0 && __imag__ a == 2.0; }
+static int t_ld(long double _Complex a) { return __real__ a == 1.0L && __imag__ a == 2.0L; }
+
+/* The register-sized aggregate that must keep travelling by value. */
+struct F2 { float a, b; };
+static int t_s(struct F2 s) { return s.a == 1.0f && s.b == 2.0f; }
+
+int main(void) {
+    float _Complex f = 1.0f + 2.0f * I;
+    double _Complex d = 1.0 + 2.0 * I;
+    long double _Complex l = 1.0L + 2.0L * I;
+    struct F2 s;
+    s.a = 1.0f;
+    s.b = 2.0f;
+
+    if (!t_f(f)) return 1;
+    if (!t_d(d)) return 2;
+    if (!t_ld(l)) return 3;
+    if (!t_s(s)) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_inlined_complex_param", code, &[]), 0);
+    // Explicitly -O2: `compile_and_run_optimized` builds at -O1, and the
+    // inliner's size threshold only admits these functions at -O2, so the
+    // helper alone never reaches the defect.
+    assert_eq!(
+        compile_and_run("c99_inlined_complex_param_o2", code, &["-O2".to_string()]),
+        0
+    );
+}

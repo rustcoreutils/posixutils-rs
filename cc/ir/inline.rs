@@ -1028,7 +1028,13 @@ fn inline_call_site(
                 // it, so loading through it would dereference the data as an
                 // address. Anything larger travels by address, which is what
                 // the loop below assumes.
-                if matches!(copy.size_bytes, 1 | 2 | 4 | 8) {
+                //
+                // Size alone does not decide it. A `_Complex` travels by
+                // address at every size, so the eight-byte `float _Complex`
+                // has to take the loop even though a same-sized struct does
+                // not -- keying on size stored the pointer into the local and
+                // the inlined body read it as a pair of floats.
+                if !copy.arg_is_address && matches!(copy.size_bytes, 1 | 2 | 4 | 8) {
                     let bits = (copy.size_bytes * 8) as u32;
                     copy_insns.push(Instruction::store(
                         call_arg,

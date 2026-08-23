@@ -917,6 +917,7 @@ impl<'a> Linearizer<'a> {
         // Complex types are passed in FP registers per ABI - the prologue codegen
         // handles storing from XMM registers to local storage
         for (name, symbol_id_opt, typ, _arg_pseudo, arg_idx) in complex_params {
+            let is_complex = self.types.is_complex(typ);
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             let sym = Pseudo::sym(local_sym, name.clone());
@@ -934,6 +935,11 @@ impl<'a> Linearizer<'a> {
                     local_sym,
                     size_bytes: typ_size_bytes,
                     qword_type: self.types.long_id,
+                    // `complex_params` carries two kinds: a genuine `_Complex`,
+                    // which travels by address at every size, and a struct the
+                    // ABI puts in two FP registers, which travels by value when
+                    // it fits in one. Only the type can tell them apart.
+                    arg_is_address: is_complex,
                 });
             }
 

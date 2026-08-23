@@ -1595,6 +1595,20 @@ pub struct ImplicitParamCopy {
     pub size_bytes: usize,
     /// Type for the 8-byte load/store operations (typically `long`)
     pub qword_type: TypeId,
+    /// Whether the caller's argument pseudo holds an *address* of the value
+    /// rather than the value itself.
+    ///
+    /// The two kinds of parameter recorded here disagree about this, and size
+    /// alone cannot tell them apart. A register-sized aggregate travels *as*
+    /// its value, so `struct { float a, b; }` must be stored straight into the
+    /// local. A `_Complex` travels by address at **every** size, so the
+    /// eight-byte `float _Complex` -- the same size -- must be loaded through.
+    /// Deciding by size stored the pointer into the local and the inlined body
+    /// read it as a pair of floats.
+    ///
+    /// Recorded here because only the linearizer can answer it: the inliner
+    /// has no `TypeTable` to ask.
+    pub arg_is_address: bool,
 }
 
 /// A function in IR form

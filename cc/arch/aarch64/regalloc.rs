@@ -291,6 +291,36 @@ impl FrameBase {
     /// expression must stay in step with the one the Sym arm applies when it
     /// lays the slot out, or the frame would be padded for one alignment and
     /// addressed for another.
+    /// Registers this function's inline asm claims for itself.
+    ///
+    /// Both spellings count: an explicit clobber, and a constraint that pins an
+    /// operand to a fixed register. Withholding the frame base from
+    /// `allocatable_regs` covers neither -- an asm pin bypasses allocation, and
+    /// a clobber reaches only the constraint points, which spill *pseudos*. The
+    /// frame base is not a pseudo.
+    fn asm_claimed_regs(func: &Function) -> std::collections::BTreeSet<Reg> {
+        let mut claimed = std::collections::BTreeSet::new();
+        for block in &func.blocks {
+            for insn in &block.insns {
+                if insn.op != Opcode::Asm {
+                    continue;
+                }
+                let Some(ic) = build_asm_instr_constraints_aarch64(insn) else {
+                    continue;
+                };
+                claimed.extend(ic.clobbers.iter().copied());
+                for op in &ic.operands {
+                    if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) =
+                        &op.constraint
+                    {
+                        claimed.insert(*r);
+                    }
+                }
+            }
+        }
+        claimed
+    }
+
     fn of(func: &Function, types: &TypeTable) -> FrameBase {
         let align = func
             .locals
@@ -303,13 +333,50 @@ impl FrameBase {
             })
             .max()
             .unwrap_or(8);
-        if align > 16 {
-            FrameBase::Aligned {
-                reg: Reg::X19,
-                align,
+        if align <= 16 {
+            return FrameBase::Fp;
+        }
+
+        // The base must be callee-saved -- it has to survive the calls this
+        // function makes -- and it must be one the function's own inline asm
+        // has not named. The prologue writes it once and every local is
+        // addressed from it for the rest of the body, so an `asm` that clobbers
+        // it invalidates every local at a stroke: hard-coding x19 made
+        // `asm("..." ::: "x19")` beside an over-aligned array segfault on code
+        // gcc accepts.
+        let claimed = Self::asm_claimed_regs(func);
+        const CANDIDATES: [Reg; 10] = [
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+        ];
+        match CANDIDATES.iter().find(|r| !claimed.contains(r)) {
+            Some(&reg) => FrameBase::Aligned { reg, align },
+            None => {
+                // Nothing left to hold the aligned base. Refusing is the only
+                // honest answer; reusing a claimed register would corrupt every
+                // local in the function.
+                let pos = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.insns.iter())
+                    .find(|i| i.op == Opcode::Asm)
+                    .and_then(|i| i.pos)
+                    .unwrap_or_default();
+                crate::diag::error(
+                    pos,
+                    "inline asm claims every callee-saved register, leaving none \
+                     to address this function's over-aligned locals",
+                );
+                FrameBase::Fp
             }
-        } else {
-            FrameBase::Fp
         }
     }
 

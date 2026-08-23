@@ -10197,8 +10197,15 @@ int main(void) {
         compile_and_run("inlined_reg_return_aggregate", code, &[]),
         0
     );
+    // Explicitly -O2: `compile_and_run_optimized` builds at -O1, and the
+    // inliner's size threshold only admits these makers at -O2, so the helper
+    // alone never reaches the defect.
     assert_eq!(
-        compile_and_run_optimized("inlined_reg_return_aggregate_opt", code),
+        compile_and_run(
+            "inlined_reg_return_aggregate_o2",
+            code,
+            &["-O2".to_string()]
+        ),
         0
     );
 }
@@ -10246,4 +10253,40 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("frame_base_vs_asm", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("frame_base_vs_asm_opt", code), 0);
+}
+
+/// The aarch64 twin of `codegen_over_aligned_frame_base_avoids_asm_registers`.
+///
+/// `FrameBase::Aligned` hard-coded x19 there for the same reason x86-64
+/// hard-coded `%rbx`, and with the same consequence: the prologue writes the
+/// base once and every local is addressed from it, so an `asm` clobbering it
+/// invalidated all of them. gcc compiles this without complaint.
+///
+/// Separate from the x86-64 test rather than one test with a `cfg`-selected
+/// template, because the two need different asm and aarch64 has no constraint
+/// letter that pins a general register -- only the clobber spelling applies.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn codegen_over_aligned_frame_base_avoids_asm_registers_aarch64() {
+    let code = r#"
+int main(void) {
+    __attribute__((aligned(32))) int arr[8];
+    for (int i = 0; i < 8; i++) arr[i] = i * i;
+
+    unsigned long a;
+    __asm__ volatile("mov x19, #4660\n\tmov %0, x19" : "=r"(a) : : "x19");
+
+    int sum = 0;
+    for (int i = 0; i < 8; i++) sum += arr[i];
+    if (sum != 140) return 1;
+    if (a != 4660) return 2;
+    if (((unsigned long)arr & 31) != 0) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("frame_base_vs_asm_a64", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("frame_base_vs_asm_a64_opt", code),
+        0
+    );
 }

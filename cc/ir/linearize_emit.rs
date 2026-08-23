@@ -1450,6 +1450,46 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// `left == right` / `left != right` for complex operands.
+    ///
+    /// Two complex values are equal when both halves are (C17 6.5.9): the
+    /// halves are compared with the floating-point predicates, so `-0.0`
+    /// equals `0.0` and a NaN half compares unequal to everything, and the two
+    /// results are combined with `And` for `==` and `Or` for `!=`.
+    pub(crate) fn emit_complex_equality(
+        &mut self,
+        op: BinaryOp,
+        left_addr: PseudoId,
+        right_addr: PseudoId,
+        complex_typ: TypeId,
+    ) -> PseudoId {
+        let (lre, lim, base_typ, base_bits) = self.load_complex_halves(left_addr, complex_typ);
+        let (rre, rim, _, _) = self.load_complex_halves(right_addr, complex_typ);
+
+        let (half_op, combine) = if op == BinaryOp::Eq {
+            (Opcode::FCmpOEq, Opcode::And)
+        } else {
+            (Opcode::FCmpONe, Opcode::Or)
+        };
+
+        let real_cmp = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            half_op, real_cmp, lre, rre, base_typ, base_bits,
+        ));
+        let imag_cmp = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            half_op, imag_cmp, lim, rim, base_typ, base_bits,
+        ));
+
+        let result = self.alloc_pseudo();
+        let int_typ = self.types.int_id;
+        let int_bits = self.types.size_bits(int_typ);
+        self.emit(Instruction::binop(
+            combine, result, real_cmp, imag_cmp, int_typ, int_bits,
+        ));
+        result
+    }
+
     /// `expr` converted to `_Bool`, when the source is complex.
     ///
     /// `None` when this does not apply, so a caller can fall through to its

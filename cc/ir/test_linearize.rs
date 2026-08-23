@@ -6694,3 +6694,77 @@ fn test_float_condition_compares_against_zero() {
         module
     );
 }
+
+/// Equality on complex operands compares both halves. The complex arm of
+/// `linearize_binary` keyed off the *result* type, which for a comparison is
+/// `int`, so `a == b` fell into the scalar path and answered from whatever
+/// the low half held.
+#[test]
+fn test_complex_equality_compares_both_halves() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let complex_double = ctx.types.complex_double_id;
+    let a_sym = ctx.var("a", complex_double);
+    let b_sym = ctx.var("b", complex_double);
+
+    // int test(double _Complex a, double _Complex b) { return a == b; }
+    let cmp = Expr::typed_unpositioned(
+        ExprKind::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::var_typed(a_sym, complex_double)),
+            right: Box::new(Expr::var_typed(b_sym, complex_double)),
+        },
+        int_type,
+    );
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![
+            Parameter {
+                symbol: Some(a_sym),
+                typ: complex_double,
+                vm_dims: vec![],
+            },
+            Parameter {
+                symbol: Some(b_sym),
+                typ: complex_double,
+                vm_dims: vec![],
+            },
+        ],
+        body: Stmt::Return(Some(cmp)),
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
+    let f = &module.functions[0];
+    let ops: Vec<Opcode> = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .map(|i| i.op)
+        .collect();
+
+    assert_eq!(
+        ops.iter().filter(|o| **o == Opcode::FCmpOEq).count(),
+        2,
+        "both halves must be compared:\n{}",
+        module
+    );
+    assert!(
+        ops.contains(&Opcode::And),
+        "the two half-comparisons must be combined:\n{}",
+        module
+    );
+    assert!(
+        !ops.contains(&Opcode::SetEq),
+        "a complex comparison must not become an integer compare:\n{}",
+        module
+    );
+}

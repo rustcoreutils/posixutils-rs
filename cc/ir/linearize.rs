@@ -3548,6 +3548,26 @@ impl<'a> Linearizer<'a> {
                 64,
             ));
             result
+        } else if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+            && (self.types.is_complex(left_typ) || self.types.is_complex(right_typ))
+        {
+            // Equality on complex operands compares both halves. The arm below
+            // keys off the *result* type, which for a comparison is `int`, so
+            // this fell through to the scalar path -- where `is_float` is
+            // false for a complex type, so it emitted an integer compare over
+            // a 128-bit operand and answered from the real half alone.
+            let common = self.types.common_type(left_typ, right_typ);
+            let left_addr = if self.types.is_complex(left_typ) {
+                self.complex_operand_at_precision(left, common)
+            } else {
+                self.promote_real_to_complex(left, common)
+            };
+            let right_addr = if self.types.is_complex(right_typ) {
+                self.complex_operand_at_precision(right, common)
+            } else {
+                self.promote_real_to_complex(right, common)
+            };
+            self.emit_complex_equality(op, left_addr, right_addr, common)
         } else if self.types.is_complex(result_typ) {
             // Complex arithmetic: expand to real/imaginary operations
             // For complex types, we need addresses to load real/imag parts

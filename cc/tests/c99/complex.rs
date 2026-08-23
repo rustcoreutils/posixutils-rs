@@ -359,3 +359,61 @@ int main(void) {
     assert_eq!(compile_and_run("c99_truth_value", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("c99_truth_value_opt", code), 0);
 }
+
+/// Only `==` and `!=` are defined on complex operands, and both have to look
+/// at both halves. The complex arm of `linearize_binary` keyed off the
+/// *result* type, which for a comparison is `int`, so equality fell into the
+/// scalar path and compared whatever the low half held.
+#[test]
+fn c99_complex_equality_compares_both_halves() {
+    let code = r#"
+static double _Complex mkc(double r, double i) {
+    double _Complex z = r;
+    __imag__ z = i;
+    return z;
+}
+
+int main(void) {
+    double _Complex a = mkc(1.0, 2.0);
+    double _Complex same = mkc(1.0, 2.0);
+    double _Complex imag_differs = mkc(1.0, 9.0);
+    double _Complex real_differs = mkc(7.0, 2.0);
+    double _Complex both_differ = mkc(7.0, 9.0);
+
+    if (!(a == same)) return 1;
+    if (a == imag_differs) return 2;
+    if (a == real_differs) return 3;
+    if (a == both_differ) return 4;
+
+    if (a != same) return 5;
+    if (!(a != imag_differs)) return 6;
+    if (!(a != real_differs)) return 7;
+    if (!(a != both_differ)) return 8;
+
+    /* against a real operand: the imaginary half must still count */
+    if (!(mkc(0.0, 0.0) == 0)) return 9;
+    if (mkc(0.0, 3.0) == 0) return 10;
+    if (!(mkc(0.0, 3.0) != 0)) return 11;
+    if (!(mkc(5.0, 0.0) == 5)) return 12;
+    if (mkc(5.0, 1.0) == 5) return 13;
+
+    /* -0.0 compares equal to 0.0 */
+    if (!(mkc(-0.0, -0.0) == mkc(0.0, 0.0))) return 14;
+
+    /* float _Complex, so the base width is not the pointer width */
+    float _Complex f = 1.0f;
+    __imag__ f = 2.0f;
+    float _Complex g = 1.0f;
+    __imag__ g = 3.0f;
+    if (f == g) return 15;
+    if (!(f != g)) return 16;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_equality", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_equality_opt", code),
+        0
+    );
+}

@@ -1687,6 +1687,17 @@ impl Function {
         }
     }
 
+    /// Rebuild the pseudo index after bulk mutation of `self.pseudos`.
+    ///
+    /// `pseudo_idx` maps an id to a *position*, so removing any element
+    /// invalidates every later entry, not just the removed one.
+    pub fn rebuild_pseudo_idx(&mut self) {
+        self.pseudo_idx.clear();
+        for (idx, pseudo) in self.pseudos.iter().enumerate() {
+            self.pseudo_idx.insert(pseudo.id, idx);
+        }
+    }
+
     /// Add a local variable
     #[allow(clippy::too_many_arguments)]
     pub fn add_local(

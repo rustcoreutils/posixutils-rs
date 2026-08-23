@@ -13,7 +13,7 @@
 use super::dominate::{compute_dominance_frontiers, domtree_build, idf_compute};
 use super::{BasicBlockId, Function, InsnRef, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 const DEFAULT_SSA_RENAME_CAPACITY: usize = 32;
 const DEFAULT_SSA_PHI_CAPACITY: usize = 16;
@@ -24,8 +24,14 @@ const DEFAULT_SSA_PHI_CAPACITY: usize = 16;
 struct SsaConverter<'a> {
     func: &'a mut Function,
 
-    /// Variables marked for renaming (name -> type)
-    to_rename: HashSet<String>,
+    /// Variables marked for renaming, name -> the local's `Sym` pseudo.
+    ///
+    /// Keyed by name because `phi_map` and `DefStack` are, but carrying the
+    /// pseudo so a use can be matched by identity. A parameter is registered
+    /// in `func.locals` under its bare name while a global reached through a
+    /// block-scoped `extern` gets its own pseudo with the *same* name, so a
+    /// name alone does not identify the variable being renamed.
+    to_rename: HashMap<String, PseudoId>,
 
     /// All inserted phi nodes for later processing
     all_phis: Vec<(BasicBlockId, usize)>, // (block, instruction index)
@@ -77,7 +83,7 @@ impl<'a> SsaConverter<'a> {
 
         Self {
             func,
-            to_rename: HashSet::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
+            to_rename: HashMap::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
             all_phis: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
             dead_stores: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
             next_pseudo_id: max_pseudo_id + 1,
@@ -125,8 +131,23 @@ struct VarInfo {
     use_count: usize,
     /// Is the address of this variable taken?
     addr_taken: bool,
-    /// Is all usage in a single block?
-    single_block: Option<BasicBlockId>,
+}
+
+/// Does `insn` mention `id` in any operand position at all?
+///
+/// Every place a `PseudoId` can be written down, so that a symbol reaching an
+/// opcode this pass does not model reads as an escape rather than as nothing.
+fn references_pseudo(insn: &Instruction, id: PseudoId) -> bool {
+    insn.src.contains(&id)
+        || insn.target == Some(id)
+        || insn.indirect_target == Some(id)
+        || insn.phi_list.iter().any(|&(_, p)| p == id)
+        || insn.asm_data.as_ref().is_some_and(|d| {
+            d.inputs
+                .iter()
+                .chain(d.outputs.iter())
+                .any(|c| c.pseudo == id)
+        })
 }
 
 /// Analyze a variable to determine if it can be promoted to SSA.
@@ -147,68 +168,59 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
         ..Default::default()
     };
 
-    let mut seen_block: Option<BasicBlockId> = None;
-    let mut same_block = true;
-
     // Scan all instructions looking for uses of this variable
     for bb in &func.blocks {
         for insn in &bb.insns {
-            match insn.op {
-                Opcode::Store => {
-                    // Store: check if storing to this variable
-                    if !insn.src.is_empty() && insn.src[0] == sym_id {
-                        info.store_count += 1;
-                        info.use_count += 1;
+            // A Load or Store naming the variable as its *address* is an
+            // access to it; anywhere else the pseudo appears, it is the
+            // address itself being handed to something that will keep it.
+            let accesses = matches!(insn.op, Opcode::Store | Opcode::Load)
+                && !insn.src.is_empty()
+                && insn.src[0] == sym_id;
 
-                        if !info.def_blocks.contains(&bb.id) {
-                            info.def_blocks.push(bb.id);
-                        }
-
-                        if same_block {
-                            if let Some(prev) = seen_block {
-                                if prev != bb.id {
-                                    same_block = false;
-                                }
-                            } else {
-                                seen_block = Some(bb.id);
-                            }
-                        }
-                    }
-                }
-                Opcode::Load => {
-                    // Load: check if loading from this variable
-                    if !insn.src.is_empty() && insn.src[0] == sym_id {
-                        info.use_count += 1;
-
-                        if same_block {
-                            if let Some(prev) = seen_block {
-                                if prev != bb.id {
-                                    same_block = false;
-                                }
-                            } else {
-                                seen_block = Some(bb.id);
-                            }
-                        }
-                    }
-                }
-                Opcode::SymAddr
-                    // Address taken - can't promote.
-                    // SymAddr has the symbol in src[0], not target.
-                    if !insn.src.is_empty() && insn.src[0] == sym_id =>
-                {
+            if !accesses {
+                // Fail closed. This arm used to recognize only `SymAddr` and
+                // ignore every other opcode, which made promotability a
+                // whitelist: an opcode that took the symbol directly -- a
+                // `Call` returning a complex value into `__cret_N`, an asm
+                // operand -- was neither counted as a use nor treated as an
+                // escape, so its store could be deleted out from under it.
+                if references_pseudo(insn, sym_id) {
                     info.addr_taken = true;
                 }
-                _ => {}
+                continue;
+            }
+
+            // Promotion replaces the whole variable with one SSA value, so
+            // every access has to be the whole variable. A `_Complex` local
+            // is stored as two halves at offsets 0 and 8 and read back by a
+            // single 128-bit load at offset 0; forwarding the last store into
+            // that load hands over the imaginary half alone.
+            if insn.offset != 0 || insn.size != info.size {
+                return None;
+            }
+
+            // The address may not also appear as a value operand -- that
+            // stores the variable's own address somewhere.
+            if insn.src[1..].contains(&sym_id) {
+                info.addr_taken = true;
+                continue;
+            }
+
+            info.use_count += 1;
+
+            if insn.op == Opcode::Store {
+                info.store_count += 1;
+
+                if !info.def_blocks.contains(&bb.id) {
+                    info.def_blocks.push(bb.id);
+                }
             }
         }
     }
 
     if info.addr_taken {
         return None;
-    }
-
-    if same_block {
-        info.single_block = seen_block;
     }
 
     Some(info)
@@ -352,7 +364,7 @@ fn rename_insn(
                 let var_name = converter.func.sym_name_of(addr);
 
                 if let Some(name) = var_name {
-                    if converter.to_rename.contains(name) {
+                    if converter.to_rename.get(name) == Some(&addr) {
                         // Get the value being stored
                         let val = insn.src[1];
 
@@ -374,7 +386,7 @@ fn rename_insn(
                 let var_name = converter.func.sym_name_of(addr);
 
                 if let Some(name) = var_name {
-                    if converter.to_rename.contains(name) {
+                    if converter.to_rename.get(name) == Some(&addr) {
                         // Get the reaching definition
                         let val = lookup_var(converter.func, bb_id, name, def_stack)
                             .unwrap_or_else(|| converter.undef_pseudo());
@@ -498,13 +510,18 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
 
         // For each predecessor, find the reaching definition and create PhiSource
         for pred_id in preds {
-            let val = lookup_var_in_pred(converter.func, pred_id, &var_name).unwrap_or_else(|| {
-                let id = PseudoId(converter.next_pseudo_id);
-                converter.next_pseudo_id += 1;
-                let pseudo = Pseudo::undef(id);
-                converter.func.add_pseudo(pseudo);
-                id
-            });
+            let sym = match converter.to_rename.get(&var_name) {
+                Some(&s) => s,
+                None => continue,
+            };
+            let val =
+                lookup_var_in_pred(converter.func, pred_id, &var_name, sym).unwrap_or_else(|| {
+                    let id = PseudoId(converter.next_pseudo_id);
+                    converter.next_pseudo_id += 1;
+                    let pseudo = Pseudo::undef(id);
+                    converter.func.add_pseudo(pseudo);
+                    id
+                });
 
             // Allocate PhiSource target pseudo
             let phisrc_pseudo = converter.alloc_phi();
@@ -543,7 +560,12 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
 ///
 /// When filling the phi operand from .L2, we need %new (the stored value),
 /// not the phi target. So we check stores BEFORE checking phis.
-fn lookup_var_in_pred(func: &Function, bb_id: BasicBlockId, var: &str) -> Option<PseudoId> {
+fn lookup_var_in_pred(
+    func: &Function,
+    bb_id: BasicBlockId,
+    var: &str,
+    sym: PseudoId,
+) -> Option<PseudoId> {
     // Walk up the dominator tree from this predecessor looking for a definition
     let mut current = bb_id;
 
@@ -553,17 +575,11 @@ fn lookup_var_in_pred(func: &Function, bb_id: BasicBlockId, var: &str) -> Option
         // Check for store in this block (walking backwards) FIRST
         // This is important for back-edges: the store happens after the phi
         for insn in bb.insns.iter().rev() {
-            if insn.op == Opcode::Store && insn.src.len() >= 2 {
-                let addr = insn.src[0];
-
-                // Check if this is a store to our variable
-                if let Some(pseudo) = func.get_pseudo(addr) {
-                    if let PseudoKind::Sym(name) = &pseudo.kind {
-                        if name == var {
-                            return Some(insn.src[1]);
-                        }
-                    }
-                }
+            // Matched by pseudo identity, not by name: a global reached
+            // through a block-scoped `extern` carries the same name as a
+            // parameter that shadows it, and its store is not ours.
+            if insn.op == Opcode::Store && insn.src.len() >= 2 && insn.src[0] == sym {
+                return Some(insn.src[1]);
             }
         }
 
@@ -621,19 +637,28 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
 
     for var_name in &local_names {
         if let Some(var_info) = analyze_variable(converter.func, types, var_name) {
-            // Skip if all usage is in a single block (no phi needed)
-            if var_info.single_block.is_some() {
-                // Could do local rewriting here but skip for now
-                continue;
-            }
-
             // Skip if no stores
             if var_info.store_count == 0 {
                 continue;
             }
 
+            // A variable used entirely within one block takes this same path
+            // rather than a fast path of its own. For straight-line code the
+            // iterated dominance frontier is empty, so `insert_phi_nodes`
+            // inserts nothing and `DefStack` alone carries the reaching
+            // definition down the block. For a local declared inside a loop
+            // body the frontier is *not* empty, and the phi is not optional:
+            // reading the variable before writing it reads the previous
+            // iteration. A linear single-block rewrite would have to detect
+            // that case and decline it; the general algorithm just places the
+            // phi at the loop header and is right by construction.
+
             // Mark for renaming
-            converter.to_rename.insert(var_name.clone());
+            let sym = match converter.func.get_local(var_name) {
+                Some(local) => local.sym,
+                None => continue,
+            };
+            converter.to_rename.insert(var_name.clone(), sym);
 
             // Insert phi nodes at IDF
             insert_phi_nodes(&mut converter, var_name, &var_info);
@@ -1148,6 +1173,328 @@ mod tests {
         assert!(
             !handler0_phisrcs.is_empty(),
             "handler0 block should have PhiSource instructions"
+        );
+    }
+
+    // Single-block promotion
+    //
+    // `ssa_convert` used to decline any variable whose uses all sat in one
+    // block, which left every scalar in straight-line code in memory. These
+    // cover the promotion and the four guards that make it safe.
+
+    /// `int x = 1; int y = x; return y;` -- one block, no phi needed.
+    fn make_straight_line_cfg(types: &TypeTable) -> Function {
+        let int_id = types.int_id;
+        let mut func = Function::new("test", int_id);
+
+        let x_sym = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
+        func.add_local(
+            "x",
+            x_sym,
+            int_id,
+            false,
+            false,
+            Some(BasicBlockId(0)),
+            None,
+        );
+
+        let val1 = PseudoId(1);
+        func.add_pseudo(Pseudo::val(val1, 1));
+        let loaded = PseudoId(2);
+        func.add_pseudo(Pseudo::reg(loaded, 0));
+
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::load(loaded, x_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::ret(Some(loaded)));
+
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+        func.rebuild_block_idx();
+        func
+    }
+
+    #[test]
+    fn test_single_block_local_is_promoted() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_straight_line_cfg(&types);
+        ssa_convert(&mut func, &types);
+
+        let entry = func.get_block(BasicBlockId(0)).unwrap();
+        assert!(
+            entry.insns.iter().all(|i| i.op != Opcode::Load),
+            "the load should have become a copy: {:?}",
+            entry.insns.iter().map(|i| i.op).collect::<Vec<_>>()
+        );
+        assert!(
+            entry.insns.iter().all(|i| i.op != Opcode::Store),
+            "the store should have been killed"
+        );
+        // No phi is needed, and none should be paid for.
+        assert!(
+            entry.insns.iter().all(|i| i.op != Opcode::Phi),
+            "a straight-line block needs no phi"
+        );
+
+        // The copy must carry the stored value, not an undef.
+        let copy = entry.insns.iter().find(|i| i.op == Opcode::Copy).unwrap();
+        assert_eq!(copy.src, vec![PseudoId(1)]);
+    }
+
+    #[test]
+    fn test_promoted_single_block_local_loses_its_stack_slot() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_straight_line_cfg(&types);
+        ssa_convert(&mut func, &types);
+        crate::ir::mem2reg::mem2reg(&mut func);
+
+        assert!(
+            func.get_local("x").is_none(),
+            "a promoted local must leave func.locals so no slot is allocated"
+        );
+        // The orphaned Sym pseudo goes too: the inliner treats a Sym that is
+        // not in the callee's locals as a global.
+        assert!(
+            func.get_pseudo(PseudoId(0)).is_none(),
+            "the promoted local's Sym pseudo must be pruned"
+        );
+    }
+
+    /// A `_Complex` local is written as two halves at offsets 0 and 8 and
+    /// read back by one 128-bit load at offset 0. Promoting it would forward
+    /// the last store -- the imaginary half -- into that load.
+    #[test]
+    fn test_split_width_access_is_not_promoted() {
+        let types = TypeTable::new(&Target::host());
+        let int_id = types.int_id;
+        let mut func = Function::new("test", int_id);
+
+        let z_sym = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(z_sym, "z".to_string()));
+        // Declared 64 bits wide, but accessed at 32 and at an offset.
+        let wide = types.long_id;
+        func.add_local("z", z_sym, wide, false, false, Some(BasicBlockId(0)), None);
+
+        let lo = PseudoId(1);
+        func.add_pseudo(Pseudo::val(lo, 3));
+        let hi = PseudoId(2);
+        func.add_pseudo(Pseudo::val(hi, 0));
+        let out = PseudoId(3);
+        func.add_pseudo(Pseudo::reg(out, 0));
+
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::store(lo, z_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::store(hi, z_sym, 8, int_id, 32));
+        entry.add_insn(Instruction::load(out, z_sym, 0, wide, 64));
+        entry.add_insn(Instruction::ret(Some(out)));
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+        func.rebuild_block_idx();
+
+        assert!(
+            analyze_variable(&func, &types, "z").is_none(),
+            "a variable accessed at a width other than its own must not promote"
+        );
+
+        ssa_convert(&mut func, &types);
+        let entry = func.get_block(BasicBlockId(0)).unwrap();
+        assert_eq!(
+            entry.insns.iter().filter(|i| i.op == Opcode::Store).count(),
+            2,
+            "neither half-store may be killed"
+        );
+        assert!(
+            entry.insns.iter().any(|i| i.op == Opcode::Load),
+            "the wide load must still read memory"
+        );
+    }
+
+    /// The use scan used to recognize only Store/Load/SymAddr and ignore
+    /// every other opcode, so a symbol handed to something else was neither
+    /// a use nor an escape -- and its store could be deleted underneath it.
+    #[test]
+    fn test_symbol_reaching_an_unmodelled_opcode_is_an_escape() {
+        let types = TypeTable::new(&Target::host());
+        let int_id = types.int_id;
+        let mut func = Function::new("test", int_id);
+
+        let x_sym = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
+        func.add_local(
+            "x",
+            x_sym,
+            int_id,
+            false,
+            false,
+            Some(BasicBlockId(0)),
+            None,
+        );
+        let val1 = PseudoId(1);
+        func.add_pseudo(Pseudo::val(val1, 1));
+        let ret = PseudoId(2);
+        func.add_pseudo(Pseudo::reg(ret, 0));
+
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, 32));
+        // A call taking the symbol directly as an argument.
+        let mut call = Instruction::new(Opcode::Call);
+        call.target = Some(ret);
+        call.src = vec![x_sym];
+        call.func_name = Some("g".to_string());
+        entry.add_insn(call);
+        entry.add_insn(Instruction::ret(Some(ret)));
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+        func.rebuild_block_idx();
+
+        assert!(
+            analyze_variable(&func, &types, "x").is_none(),
+            "a symbol reaching an unmodelled opcode must count as address-taken"
+        );
+    }
+
+    /// A parameter is registered under its bare name; a global reached
+    /// through a block-scoped `extern` gets its own pseudo with the *same*
+    /// name. Renaming on the name alone would capture the global's store.
+    #[test]
+    fn test_same_named_global_is_not_captured() {
+        let types = TypeTable::new(&Target::host());
+        let int_id = types.int_id;
+        let mut func = Function::new("test", int_id);
+
+        let local_sym = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(local_sym, "v".to_string()));
+        func.add_local(
+            "v",
+            local_sym,
+            int_id,
+            false,
+            false,
+            Some(BasicBlockId(0)),
+            None,
+        );
+
+        // A distinct pseudo, same name: the global.
+        let global_sym = PseudoId(1);
+        func.add_pseudo(Pseudo::sym(global_sym, "v".to_string()));
+
+        let one = PseudoId(2);
+        func.add_pseudo(Pseudo::val(one, 1));
+        let two = PseudoId(3);
+        func.add_pseudo(Pseudo::val(two, 2));
+        let out = PseudoId(4);
+        func.add_pseudo(Pseudo::reg(out, 0));
+
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::store(one, local_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::store(two, global_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::load(out, local_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::ret(Some(out)));
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+        func.rebuild_block_idx();
+
+        ssa_convert(&mut func, &types);
+
+        let entry = func.get_block(BasicBlockId(0)).unwrap();
+        // The global's store must survive untouched.
+        let global_stores = entry
+            .insns
+            .iter()
+            .filter(|i| i.op == Opcode::Store && i.src.first() == Some(&global_sym))
+            .count();
+        assert_eq!(global_stores, 1, "the global's store must not be killed");
+
+        // And the local must read back 1, not the global's 2.
+        let copy = entry.insns.iter().find(|i| i.op == Opcode::Copy).unwrap();
+        assert_eq!(
+            copy.src,
+            vec![one],
+            "the load must take the local's value, not the same-named global's"
+        );
+    }
+
+    /// A local declared inside a loop body has all its uses in one block,
+    /// but reading it before writing it reads the previous iteration -- so
+    /// the phi at the loop header is not optional.
+    #[test]
+    fn test_loop_body_local_gets_a_header_phi() {
+        let types = TypeTable::new(&Target::host());
+        let int_id = types.int_id;
+        let mut func = Function::new("test", int_id);
+
+        let t_sym = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(t_sym, "t".to_string()));
+        func.add_local(
+            "t",
+            t_sym,
+            int_id,
+            false,
+            false,
+            Some(BasicBlockId(1)),
+            None,
+        );
+        let cond = PseudoId(1);
+        func.add_pseudo(Pseudo::val(cond, 1));
+        let loaded = PseudoId(2);
+        func.add_pseudo(Pseudo::reg(loaded, 0));
+        let stored = PseudoId(3);
+        func.add_pseudo(Pseudo::val(stored, 7));
+
+        // entry -> header -> body -> header, header -> exit
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.children = vec![BasicBlockId(1)];
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::br(BasicBlockId(1)));
+
+        let mut header = BasicBlock::new(BasicBlockId(1));
+        header.parents = vec![BasicBlockId(0), BasicBlockId(2)];
+        header.children = vec![BasicBlockId(2), BasicBlockId(3)];
+        header.add_insn(Instruction::cbr(cond, BasicBlockId(2), BasicBlockId(3)));
+
+        // Body reads t before writing it: the previous iteration's value.
+        let mut body = BasicBlock::new(BasicBlockId(2));
+        body.parents = vec![BasicBlockId(1)];
+        body.children = vec![BasicBlockId(1)];
+        body.add_insn(Instruction::load(loaded, t_sym, 0, int_id, 32));
+        body.add_insn(Instruction::store(stored, t_sym, 0, int_id, 32));
+        body.add_insn(Instruction::br(BasicBlockId(1)));
+
+        let mut exit = BasicBlock::new(BasicBlockId(3));
+        exit.parents = vec![BasicBlockId(1)];
+        exit.add_insn(Instruction::ret(Some(cond)));
+
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry, header, body, exit];
+        func.rebuild_block_idx();
+
+        ssa_convert(&mut func, &types);
+
+        let header = func.get_block(BasicBlockId(1)).unwrap();
+        assert!(
+            header.insns.iter().any(|i| i.op == Opcode::Phi),
+            "a loop-body local read before written needs a phi at the header"
+        );
+
+        // The body's load must resolve to that phi, not to the store that
+        // follows it and not to an undef.
+        let phi_target = header
+            .insns
+            .iter()
+            .find(|i| i.op == Opcode::Phi)
+            .and_then(|i| i.target)
+            .unwrap();
+        let body = func.get_block(BasicBlockId(2)).unwrap();
+        let copy = body.insns.iter().find(|i| i.op == Opcode::Copy).unwrap();
+        assert_eq!(
+            copy.src,
+            vec![phi_target],
+            "the read-before-write must take the header phi"
         );
     }
 }

@@ -100,6 +100,38 @@ pub fn count_in_body(asm: &str, func: &str, needle: &str) -> usize {
     body_of(asm, func).matches(needle).count()
 }
 
+/// Bytes of stack frame function `func` reserves in its prologue.
+///
+/// `None` means the prologue reserves nothing -- either no allocation at all,
+/// or an allocation this parser does not recognize. Callers should assert on
+/// the number rather than on its absence, so an unrecognized spelling reads as
+/// "no claim" instead of as a passing test.
+///
+/// Frame size is the property this file otherwise cannot see: whether a local
+/// was promoted out of memory is invisible to a program's exit status, because
+/// the answer comes out the same either way. Only the prologue tells you.
+///
+/// Recognizes the x86-64 `subq $N, %rsp` and the aarch64 `sub sp, sp, #N`.
+pub fn frame_size(asm: &str, func: &str) -> Option<i64> {
+    let body = body_of(asm, func);
+    for line in body.lines() {
+        let line = line.trim();
+        // x86-64: subq $112, %rsp
+        if let Some(rest) = line.strip_prefix("subq $") {
+            if let Some((imm, dst)) = rest.split_once(',') {
+                if dst.trim() == "%rsp" {
+                    return imm.trim().parse().ok();
+                }
+            }
+        }
+        // aarch64: sub sp, sp, #112
+        if let Some(rest) = line.strip_prefix("sub sp, sp, #") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod verbose_asm {
     use super::asm_for_with;

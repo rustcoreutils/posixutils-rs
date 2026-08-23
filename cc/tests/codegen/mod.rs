@@ -17,5 +17,6 @@ mod cross_abi;
 mod inline_asm;
 mod misc;
 mod pic;
+mod promotion;
 mod regalloc;
 mod sections;

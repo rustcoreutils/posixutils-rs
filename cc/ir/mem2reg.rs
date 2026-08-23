@@ -34,6 +34,25 @@ pub fn mem2reg(func: &mut Function) {
             }
         }
     }
-    func.locals
-        .retain(|_, local| referenced.contains(&local.sym));
+    let mut dropped: HashSet<PseudoId> = HashSet::new();
+    func.locals.retain(|_, local| {
+        let keep = referenced.contains(&local.sym);
+        if !keep {
+            dropped.insert(local.sym);
+        }
+        keep
+    });
+
+    if dropped.is_empty() {
+        return;
+    }
+
+    // Drop the orphaned `Sym` pseudos too. Nothing refers to them, but they
+    // are still named: the inliner treats a `Sym` that is not in the callee's
+    // locals as a *global* and clones it into the caller under its original,
+    // unmangled name (`i`, `t`, ...), and `arch/*/regalloc.rs` resolves a
+    // `Sym` by looking its name up in `func.locals`. Leaving a promoted
+    // local's pseudo behind puts a plausible-looking global in both paths.
+    func.pseudos.retain(|p| !dropped.contains(&p.id));
+    func.rebuild_pseudo_idx();
 }

@@ -138,7 +138,8 @@ fn test_parameter_stored_to_local() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the store into the parameter's local is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // The parameter should be stored to a local variable
@@ -1335,7 +1336,8 @@ fn test_pre_increment() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the store of the incremented value is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // Pre-increment should produce add instruction
@@ -2758,7 +2760,8 @@ fn test_string_literal_char_pointer_init() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the store of the string address is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // Should have a store instruction for the pointer (storing the string address)
@@ -4976,7 +4979,8 @@ fn test_valist_parameter_stored_as_pointer() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the width of the parameter's store is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // The va_list parameter should be stored with .64 (pointer size),
@@ -5114,7 +5118,8 @@ fn test_valist_expression_decay() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    let module = ctx.linearize(&tu);
+    // Observed before SSA conversion: the load of the va pointer is the linearizer's job; SSA then promotes it away.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module);
 
     // The cast from va_list to pointer should involve loading the va pointer
@@ -5985,14 +5990,11 @@ fn test_atomic_compound_assign_uses_fetch_add() {
         1,
         "expected exactly one AtomicFetchAdd"
     );
-    // The non-atomic control emits load / add / store. The atomic version
-    // must emit neither the load nor the store -- one instruction replaces
-    // all three. (A plain Store remains in both: the parameter prologue.)
-    let (_c, control) = compound_module(AssignOp::AddAssign, false);
-    assert!(
-        count_op(&control, Opcode::Load) > 0,
-        "control should load the object"
-    );
+    // One instruction replaces the load / add / store the plain shape would
+    // need, so neither a plain Load nor a plain Store of the object may
+    // survive. Asserted directly rather than by differencing against the
+    // non-atomic control: the control's object is promotable, so SSA leaves
+    // it with no memory operations at all to difference against.
     assert_eq!(
         count_op(&module, Opcode::Load),
         0,
@@ -6000,8 +6002,17 @@ fn test_atomic_compound_assign_uses_fetch_add() {
     );
     assert_eq!(
         count_op(&module, Opcode::Store),
-        count_op(&control, Opcode::Store) - 1,
-        "the object's store must have become atomic"
+        1,
+        "the one plain Store left is the parameter prologue; the object's own \
+         store must have become atomic"
+    );
+    // The control is what makes the above mean something: the same function
+    // without `_Atomic` gets no atomic operation at all.
+    let (_c, control) = compound_module(AssignOp::AddAssign, false);
+    assert_eq!(
+        count_op(&control, Opcode::AtomicFetchAdd),
+        0,
+        "the non-atomic control must not become atomic"
     );
 
     // The operation is sequentially consistent and carries the object's width.
@@ -6081,12 +6092,17 @@ fn test_atomic_plain_assign_uses_atomic_store() {
     let (_ctx, module) = compound_module(AssignOp::Assign, true);
     assert_eq!(count_op(&module, Opcode::AtomicStore), 1);
 
-    let (_c, control) = compound_module(AssignOp::Assign, false);
     assert_eq!(
         count_op(&module, Opcode::Store),
-        count_op(&control, Opcode::Store) - 1,
-        "the object's store must have become atomic (the remaining plain \
-         Store is the parameter prologue, present in both)"
+        1,
+        "the one plain Store left is the parameter prologue; the object's own \
+         store must have become atomic"
+    );
+    let (_c, control) = compound_module(AssignOp::Assign, false);
+    assert_eq!(
+        count_op(&control, Opcode::AtomicStore),
+        0,
+        "the non-atomic control must not become atomic"
     );
 }
 

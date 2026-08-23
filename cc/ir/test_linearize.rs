@@ -6620,3 +6620,77 @@ fn test_block_scope_extern_declares_no_local() {
         module.extern_symbols
     );
 }
+
+/// A branch condition has to be compared against zero the way its type says,
+/// not fed to `cbr` as a bit pattern. For a `double` that means `FCmpONe`
+/// against `0.0`, so `-0.0` is false; feeding the raw value tested the bit
+/// pattern, and `-0.0`'s is not zero.
+#[test]
+fn test_float_condition_compares_against_zero() {
+    let mut ctx = TestContext::new();
+    let test_id = ctx.str("test");
+    let int_type = ctx.int_type();
+    let dbl_type = ctx.types.double_id;
+    let d_sym = ctx.var("d", dbl_type);
+
+    // int test(double d) { if (d) return 1; return 0; }
+    let body = Stmt::Block(vec![
+        BlockItem::Statement(Box::new(Stmt::If {
+            cond: Expr::var_typed(d_sym, dbl_type),
+            then_stmt: Box::new(Stmt::Return(Some(Expr::int(1, &ctx.types)))),
+            else_stmt: None,
+        })),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
+    ]);
+    let func = FunctionDef {
+        attrs: Default::default(),
+        return_type: int_type,
+        name: test_id,
+        params: vec![Parameter {
+            symbol: Some(d_sym),
+            typ: dbl_type,
+            vm_dims: vec![],
+        }],
+        body,
+        pos: test_pos(),
+        is_static: false,
+        is_inline: false,
+        calling_conv: crate::abi::CallingConv::default(),
+    };
+    let tu = TranslationUnit {
+        items: vec![ExternalDecl::FunctionDef(func)],
+    };
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
+    let f = &module.functions[0];
+
+    let has_fcmp = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .any(|i| i.op == Opcode::FCmpONe);
+    assert!(
+        has_fcmp,
+        "a floating-point condition must be compared against 0.0:\n{}",
+        module
+    );
+
+    // The value handed to `cbr` must be that comparison, not the double.
+    let cbr = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .find(|i| i.op == Opcode::Cbr)
+        .expect("no conditional branch");
+    let cond_def = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insns.iter())
+        .find(|i| i.target == Some(cbr.src[0]))
+        .expect("condition has no definition");
+    assert_eq!(
+        cond_def.op,
+        Opcode::FCmpONe,
+        "the branch must test the comparison, not the raw value:\n{}",
+        module
+    );
+}

@@ -1370,10 +1370,138 @@ impl<'a> super::linearize::Linearizer<'a> {
         result_sym
     }
 
+    /// The two halves of a complex value held at `addr`.
+    ///
+    /// Every complex operation needs this and each one used to spell it out;
+    /// the offsets and the base type have to agree or the halves come back
+    /// swapped or mis-sized.
+    pub(crate) fn load_complex_halves(
+        &mut self,
+        addr: PseudoId,
+        complex_typ: TypeId,
+    ) -> (PseudoId, PseudoId, TypeId, u32) {
+        let base_typ = self.types.complex_base(complex_typ);
+        let base_bits = self.types.size_bits(base_typ);
+        let real = self.alloc_pseudo();
+        self.emit(Instruction::load(real, addr, 0, base_typ, base_bits));
+        let imag = self.alloc_pseudo();
+        self.emit(Instruction::load(
+            imag,
+            addr,
+            (base_bits / 8) as i64,
+            base_typ,
+            base_bits,
+        ));
+        (real, imag, base_typ, base_bits)
+    }
+
+    /// `expr != 0` for a complex operand: true when *either* half is nonzero.
+    ///
+    /// C17 6.3.1.2 converts to `_Bool` by comparing against 0, and 6.5.3.3p5
+    /// defines `!` in those terms; for a complex value that comparison is
+    /// against `0.0 + 0.0i`, so the imaginary half counts. Compared with
+    /// `FCmpONe` rather than by OR-ing the bit patterns, so `-0.0 + -0.0i`
+    /// comes out false.
+    pub(crate) fn emit_complex_nonzero(&mut self, expr: &Expr) -> PseudoId {
+        let complex_typ = self.expr_type(expr);
+        let addr = self.complex_operand_addr(expr);
+        self.emit_complex_nonzero_at(addr, complex_typ)
+    }
+
+    /// `!= 0` for the complex value at `addr`.
+    pub(crate) fn emit_complex_nonzero_at(
+        &mut self,
+        addr: PseudoId,
+        complex_typ: TypeId,
+    ) -> PseudoId {
+        let (real, imag, base_typ, base_bits) = self.load_complex_halves(addr, complex_typ);
+
+        let zero = self.emit_fconst(FloatVal::ZERO, base_typ);
+        let real_nz = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::FCmpONe,
+            real_nz,
+            real,
+            zero,
+            base_typ,
+            base_bits,
+        ));
+        let imag_nz = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::FCmpONe,
+            imag_nz,
+            imag,
+            zero,
+            base_typ,
+            base_bits,
+        ));
+
+        let result = self.alloc_pseudo();
+        let int_typ = self.types.int_id;
+        let int_bits = self.types.size_bits(int_typ);
+        self.emit(Instruction::binop(
+            Opcode::Or,
+            result,
+            real_nz,
+            imag_nz,
+            int_typ,
+            int_bits,
+        ));
+        result
+    }
+
+    /// `expr` converted to `_Bool`, when the source is complex.
+    ///
+    /// `None` when this does not apply, so a caller can fall through to its
+    /// ordinary conversion. Handed the *expression* rather than a value on
+    /// purpose: a complex operand is sometimes materialized as its two halves
+    /// and sometimes as a pointer to them, and only re-addressing the
+    /// expression tells the two apart. The backends have no 128-bit compare
+    /// either, so the ordinary path silently narrowed to the real half.
+    pub(crate) fn complex_to_bool(&mut self, expr: &Expr, target_typ: TypeId) -> Option<PseudoId> {
+        let src_typ = self.expr_type(expr);
+        if self.types.is_complex(src_typ) && self.types.kind(target_typ) == TypeKind::Bool {
+            return Some(self.emit_complex_nonzero(expr));
+        }
+        None
+    }
+
+    /// Turn `expr` into the 0/1 truth value a branch or logical operator wants.
+    ///
+    /// The single place that answers "is this nonzero", so the answer cannot
+    /// differ between `if`, `while`, `&&`, `!` and a `_Bool` conversion. It
+    /// used to: statement conditions handed the raw value to `cbr` with no
+    /// comparison at all, which tests a bit pattern, while `emit_compare_zero`
+    /// compared against an *integer* zero whatever the operand's type. Both
+    /// made `-0.0` true, and both read a complex value as its real half.
+    pub(crate) fn linearize_condition(&mut self, cond: &Expr) -> PseudoId {
+        let typ = self.expr_type(cond);
+        if self.types.is_complex(typ) {
+            return self.emit_complex_nonzero(cond);
+        }
+        let val = self.linearize_expr(cond);
+        self.emit_compare_zero(val, typ)
+    }
+
+    /// `val != 0`, read the way `operand_typ` says to read it.
     pub(crate) fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: TypeId) -> PseudoId {
         let result = self.alloc_pseudo();
-        let zero = self.emit_const(0, operand_typ);
         let size = self.types.size_bits(operand_typ);
+        // A float is compared against 0.0, not against its bit pattern:
+        // -0.0 is zero and every NaN is not.
+        if self.types.is_float(operand_typ) {
+            let zero = self.emit_fconst(FloatVal::ZERO, operand_typ);
+            self.emit(Instruction::binop(
+                Opcode::FCmpONe,
+                result,
+                val,
+                zero,
+                operand_typ,
+                size,
+            ));
+            return result;
+        }
+        let zero = self.emit_const(0, operand_typ);
         self.emit(Instruction::binop(
             Opcode::SetNe,
             result,
@@ -1396,9 +1524,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let merge_bb = self.alloc_bb();
 
         // Evaluate LHS
-        let left_typ = self.expr_type(left);
-        let left_val = self.linearize_expr(left);
-        let left_bool = self.emit_compare_zero(left_val, left_typ);
+        let left_bool = self.linearize_condition(left);
 
         // Emit the short-circuit value (0) BEFORE the branch, while still in LHS block
         // This value will be used if we short-circuit (LHS is false)
@@ -1415,9 +1541,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // eval_b_bb: Evaluate RHS
         self.switch_bb(eval_b_bb);
-        let right_typ = self.expr_type(right);
-        let right_val = self.linearize_expr(right);
-        let right_bool = self.emit_compare_zero(right_val, right_typ);
+        let right_bool = self.linearize_condition(right);
 
         // Get the actual block where RHS evaluation ended (may differ from eval_b_bb
         // if RHS contains nested control flow like another &&/||)
@@ -1460,9 +1584,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let merge_bb = self.alloc_bb();
 
         // Evaluate LHS
-        let left_typ = self.expr_type(left);
-        let left_val = self.linearize_expr(left);
-        let left_bool = self.emit_compare_zero(left_val, left_typ);
+        let left_bool = self.linearize_condition(left);
 
         // Emit the short-circuit value (1) BEFORE the branch, while still in LHS block
         // This value will be used if we short-circuit (LHS is true)
@@ -1479,9 +1601,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // eval_b_bb: Evaluate RHS
         self.switch_bb(eval_b_bb);
-        let right_typ = self.expr_type(right);
-        let right_val = self.linearize_expr(right);
-        let right_bool = self.emit_compare_zero(right_val, right_typ);
+        let right_bool = self.linearize_condition(right);
 
         // Get the actual block where RHS evaluation ended (may differ from eval_b_bb
         // if RHS contains nested control flow like another &&/||)
@@ -1673,7 +1793,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             return target_addr;
         }
 
-        let rhs = self.linearize_expr(value);
+        // A complex right-hand side assigned to a `_Bool` needs the
+        // expression, not its value -- see `complex_to_bool`. Already the
+        // target type when it fires, so the conversion below is skipped.
+        let bool_rhs = match op {
+            AssignOp::Assign => self.complex_to_bool(value, target_typ),
+            _ => None,
+        };
+        let rhs = match bool_rhs {
+            Some(b) => b,
+            None => self.linearize_expr(value),
+        };
 
         // Check for pointer compound assignment (p += n or p -= n)
         let is_ptr_arith = self.types.kind(target_typ) == TypeKind::Pointer
@@ -1698,6 +1828,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 64,
             ));
             scaled
+        } else if bool_rhs.is_some() {
+            rhs
         } else {
             self.emit_convert(rhs, value_typ, target_typ)
         };

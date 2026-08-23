@@ -2127,6 +2127,14 @@ impl<'a> Linearizer<'a> {
         // scalar path reinterpreted the address the complex value travels by
         // as the value itself, so `(double) z` produced a number in the range
         // of a pointer bit pattern.
+        // `_Bool` is the exception: 6.3.1.2 converts by comparing against 0,
+        // and for a complex value that comparison is against `0.0 + 0.0i`, so
+        // the imaginary half decides the answer too. Keeping only the real
+        // part here made `(_Bool)(0.0 + 3.0i)` false.
+        if self.types.is_complex(src_type) && self.types.kind(cast_type) == TypeKind::Bool {
+            return self.emit_complex_nonzero(inner_expr);
+        }
+
         if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
             return self.emit_complex_to_real(inner_expr, cast_type);
         }
@@ -2996,6 +3004,14 @@ impl<'a> Linearizer<'a> {
         for (arg_idx, a) in args.iter().enumerate() {
             let mut arg_type = self.expr_type(a);
             let arg_kind = self.types.kind(arg_type);
+            // Computed before the dispatch below so the complex-argument arm
+            // can be skipped for a `_Bool` parameter without re-borrowing.
+            let bool_param_for_complex_arg = formal_param_types
+                .as_ref()
+                .and_then(|params| params.get(arg_idx).copied())
+                .filter(|pt| {
+                    self.types.is_complex(arg_type) && self.types.kind(*pt) == TypeKind::Bool
+                });
             let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
                 && self.types.size_bits(arg_type) > 64
             {
@@ -3044,6 +3060,13 @@ impl<'a> Linearizer<'a> {
                 // hands back the temporary's address, so both cases are the
                 // same call.
                 self.linearize_lvalue(a)
+            } else if bool_param_for_complex_arg.is_some() {
+                // A complex argument bound to a `_Bool` parameter converts by
+                // comparing against zero, so it must not take the
+                // pass-the-address arm below -- see `complex_to_bool`.
+                let pt = bool_param_for_complex_arg.unwrap();
+                arg_types_vec.push(pt);
+                self.emit_complex_nonzero(a)
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.
@@ -3778,9 +3801,19 @@ impl<'a> Linearizer<'a> {
             return final_result;
         }
 
+        // `!z` on a complex operand is `z == 0`, and a complex value is zero
+        // only when both halves are. `emit_unary` compares a single value
+        // against a single zero, which cannot express that, so the negation is
+        // built from the shared truth-value conversion instead.
+        let operand_typ = self.expr_type(operand);
+        if op == UnaryOp::Not && self.types.is_complex(operand_typ) {
+            let nonzero = self.emit_complex_nonzero(operand);
+            let int_typ = self.types.int_id;
+            return self.emit_unary(UnaryOp::Not, nonzero, int_typ);
+        }
+
         let src = self.linearize_expr(operand);
         let result_typ = self.expr_type(expr);
-        let operand_typ = self.expr_type(operand);
         // For logical NOT, use operand type for comparison size
         let typ = if op == UnaryOp::Not {
             operand_typ
@@ -4034,9 +4067,7 @@ impl<'a> Linearizer<'a> {
 
         if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) && size <= 64 {
             // Pure: use Select instruction (enables cmov/csel)
-            let cond_val = self.linearize_expr(cond);
-            let cond_typ = self.expr_type(cond);
-            let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+            let cond_bool = self.linearize_condition(cond);
             let mut then_val = self.linearize_expr(then_expr);
             let mut else_val = self.linearize_expr(else_expr);
 
@@ -4056,9 +4087,7 @@ impl<'a> Linearizer<'a> {
             let else_bb = self.alloc_bb();
             let merge_bb = self.alloc_bb();
 
-            let cond_val = self.linearize_expr(cond);
-            let cond_typ = self.expr_type(cond);
-            let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
+            let cond_bool = self.linearize_condition(cond);
             let cond_end_bb = self.current_bb.unwrap();
 
             self.emit(Instruction::cbr(cond_bool, then_bb, else_bb));

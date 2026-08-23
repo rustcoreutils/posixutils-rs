@@ -4818,3 +4818,19 @@ fn diagnostics_alignas_legal_contexts_still_compile() {
         "__attribute__((aligned(64))) void f(void) {}\n",
     );
 }
+
+/// A diagnostic names a complex type as the source wrote it.
+///
+/// `_Complex` is a `TypeModifiers` bit, not a `TypeKind`, and the type speller
+/// printed only the kind -- so a `double _Complex` was reported as `double`:
+/// a type the source never wrote, and one of a different size. The reader is
+/// told the argument is a `double` and cannot see what is wrong with it.
+#[test]
+fn diag_complex_type_is_named_in_full() {
+    compile_expect_error(
+        "complex_type_named",
+        "void f(int *p);\n\
+         int main(void){ double _Complex z = 1.0; f(z); return 0; }\n",
+        "double _Complex",
+    );
+}

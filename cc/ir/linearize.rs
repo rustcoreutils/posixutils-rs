@@ -1169,10 +1169,18 @@ impl<'a> Linearizer<'a> {
             // For struct/union types, we'll copy to a local later
             // so member access works properly
             let param_kind = self.types.kind(param.typ);
-            if param_kind == TypeKind::VaList {
+            if param_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                 // va_list parameters are special: due to array-to-pointer decay at call site,
                 // the actual value passed is a pointer to the va_list struct, not the struct itself.
                 // We'll handle this after function setup.
+                //
+                // Only where `va_list` is an array type. Where it is already a
+                // pointer -- Apple aarch64 -- nothing decays: the parameter
+                // *is* the va_list object, so it takes the ordinary scalar
+                // path and gets a slot of its own. `va_arg` needs that slot's
+                // address to advance it; handing it the pointer value instead
+                // made the first `va_arg` dereference the first variadic
+                // argument as though it were an address.
                 valist_params.push((name, param.symbol, param.typ, pseudo_id));
             } else if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
                 // Medium structs (9-16 bytes) with all-SSE classification are
@@ -1822,7 +1830,11 @@ impl<'a> Linearizer<'a> {
                     // va_list parameters are special: the parameter value IS already a pointer
                     // to the va_list structure (due to array-to-pointer decay at call site).
                     // Return the pointer value directly instead of spilling.
-                    if type_kind == TypeKind::VaList {
+                    //
+                    // Again only where `va_list` is an array. Where it is a
+                    // pointer, the object's address is the slot's, so the
+                    // parameter has to spill like any other.
+                    if type_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                         return param_pseudo;
                     }
 

@@ -125,7 +125,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                     } else if self.types.is_complex(expr_typ)
                         && self.types.is_complex(func_ret_type)
                     {
-                        let addr = self.complex_operand_addr(e);
+                        // At the return type's precision, for the reason the
+                        // argument path converts: the caller reads the result
+                        // with the *declared* base type's stride, so returning
+                        // a `float _Complex` from a `double _Complex` function
+                        // unconverted handed back 4-byte-strided storage to be
+                        // read 8 bytes at a time.
+                        let addr = self.complex_operand_at_precision(e, func_ret_type);
                         let typ_size = self.types.size_bits(func_ret_type);
                         self.emit(Instruction::ret_typed(Some(addr), func_ret_type, typ_size));
                     } else if self.types.is_complex(expr_typ) {

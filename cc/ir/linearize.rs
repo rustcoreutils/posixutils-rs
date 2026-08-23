@@ -3099,8 +3099,30 @@ impl<'a> Linearizer<'a> {
             } else if self.types.is_complex(arg_type) {
                 // Complex types: pass address, codegen loads real/imag into XMM registers
                 // Type stays as complex (not pointer) so codegen knows it's complex.
-                arg_types_vec.push(arg_type);
-                self.complex_operand_addr(a)
+                //
+                // Converted to the parameter's own precision first. A complex
+                // value is read with its base type's stride, so handing a
+                // `float _Complex` to a `double _Complex` parameter without
+                // converting had the callee read an 8-byte-strided pair out of
+                // 4-byte-strided storage: `1.0f + 2.0f*I` arrived as `2+1i`.
+                // The type recorded for the ABI has to move with it, or the
+                // classification is made for a width that is no longer there.
+                let param_typ = formal_param_types
+                    .as_ref()
+                    .and_then(|params| params.get(arg_idx).copied())
+                    .filter(|pt| self.types.is_complex(*pt));
+                match param_typ {
+                    Some(pt) => {
+                        arg_types_vec.push(pt);
+                        self.complex_operand_at_precision(a, pt)
+                    }
+                    // No prototype, or a variadic argument: nothing says what
+                    // precision the callee wants, so it travels as written.
+                    None => {
+                        arg_types_vec.push(arg_type);
+                        self.complex_operand_addr(a)
+                    }
+                }
             } else if arg_kind == TypeKind::Array {
                 // Array decay to pointer (C99 6.3.2.1)
                 // This applies to both fixed-size arrays and VLAs

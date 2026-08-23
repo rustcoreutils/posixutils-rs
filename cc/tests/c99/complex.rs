@@ -643,3 +643,76 @@ int main(void) {
         0
     );
 }
+
+/// A complex value crossing a call boundary is converted to the precision the
+/// other side declared.
+///
+/// A complex value is read with its base type's stride, so the two sides must
+/// agree on which base type that is. Assignment, initialization and the binary
+/// operators all went through `complex_operand_at_precision`; the **argument**
+/// and **return** paths did not, and handed the storage over unconverted. A
+/// `float _Complex` given to a `double _Complex` parameter had the callee read
+/// an 8-byte-strided pair out of 4-byte-strided memory, so `1.0f + 2.0f*I`
+/// arrived as `2+1i` -- and the wider directions read past the object.
+#[test]
+fn c99_complex_precision_crosses_calls() {
+    let code = r#"
+#include <complex.h>
+
+static int eq(double re, double im, double want_re, double want_im) {
+    return re == want_re && im == want_im;
+}
+
+static int take_d(double _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
+static int take_f(float _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
+static int take_ld(long double _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
+
+/* noinline so the argument really crosses a call; the inlined form is
+   covered separately below. */
+__attribute__((noinline)) static int ni_d(double _Complex a) { return take_d(a); }
+__attribute__((noinline)) static int ni_f(float _Complex a) { return take_f(a); }
+
+static double _Complex widen(float _Complex x) { return x; }
+static float _Complex narrow(double _Complex x) { return x; }
+
+int main(void) {
+    float _Complex f = 1.0f + 2.0f * I;
+    double _Complex d = 1.0 + 2.0 * I;
+    long double _Complex l = 1.0L + 2.0L * I;
+
+    /* Every precision into every parameter width. */
+    if (!take_d(f)) return 1;
+    if (!take_d(d)) return 2;
+    if (!take_d(l)) return 3;
+    if (!take_f(d)) return 4;
+    if (!take_f(f)) return 5;
+    if (!take_f(l)) return 6;
+    if (!take_ld(f)) return 7;
+    if (!take_ld(d)) return 8;
+    if (!take_ld(l)) return 9;
+
+    /* Across a call the optimizer cannot fold away. */
+    if (!ni_d(f)) return 10;
+    if (!ni_f(d)) return 11;
+
+    /* Returns convert too, in both directions. */
+    double _Complex w = widen(f);
+    if (!eq(__real__ w, __imag__ w, 1.0, 2.0)) return 12;
+    float _Complex n = narrow(d);
+    if (!eq(__real__ n, __imag__ n, 1.0, 2.0)) return 13;
+
+    /* The paths that already worked, kept as regression guards. */
+    double _Complex a = f;
+    if (!eq(__real__ a, __imag__ a, 1.0, 2.0)) return 14;
+    double _Complex s = f + d;
+    if (!eq(__real__ s, __imag__ s, 2.0, 4.0)) return 15;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_precision_calls", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_precision_calls_opt", code),
+        0
+    );
+}

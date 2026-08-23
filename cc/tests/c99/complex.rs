@@ -564,3 +564,82 @@ fn c99_complex_conditional_merges_by_address() {
         "the type speller must not drop the _Complex modifier:\n{ir}"
     );
 }
+
+/// GNU `a ?: b` where only the *result* is complex.
+///
+/// The complex path was dispatched on the result type but then assumed the
+/// left operand was complex too. It need not be: the result is complex as soon
+/// as *either* operand is, so `d ?: z` has a `double` left operand and a
+/// `double _Complex` result.
+///
+/// Taking a real operand's address as though it were a complex object read the
+/// neighbouring stack slot as the imaginary half, and for an rvalue
+/// `rvalue_addr` hands back the value's own bits -- so `g() ?: z`
+/// dereferenced a `double` as a pointer and died. The truth test was wrong too:
+/// an `int` whose bits happen to spell `-0.0f` compared equal to zero.
+#[test]
+fn c99_complex_elvis_with_a_real_left_operand() {
+    let code = r#"
+#include <complex.h>
+
+static int calls;
+static double g(double v) { calls++; return v; }
+
+static int eq(double _Complex a, double re, double im) {
+    return __real__ a == re && __imag__ a == im;
+}
+
+int main(void) {
+    double _Complex z = 7.0 + 8.0 * I;
+
+    /* A real lvalue: the imaginary half must be zero, not the next slot. */
+    double d = 3.0;
+    if (!eq(d ?: z, 3.0, 0.0)) return 1;
+    if (sizeof(d ?: z) != sizeof(double _Complex)) return 2;
+
+    /* An integer lvalue, converted to the result's base type. */
+    int iv = 7;
+    if (!eq(iv ?: z, 7.0, 0.0)) return 3;
+
+    /* INT_MIN's bit pattern is -0.0f: a float compare against zero on the
+       raw bits would call this false and take the wrong arm. */
+    int neg = -2147483647 - 1;
+    if (!eq(neg ?: z, (double)neg, 0.0)) return 4;
+
+    /* A real *rvalue* has no address of its own to take. */
+    calls = 0;
+    if (!eq(g(2.5) ?: z, 2.5, 0.0)) return 5;
+    if (calls != 1) return 6;
+
+    /* Zero takes the right-hand operand -- still exactly one evaluation. */
+    calls = 0;
+    if (!eq(g(0.0) ?: z, 7.0, 8.0)) return 7;
+    if (calls != 1) return 8;
+
+    /* A complex left operand still works: the arm that already existed. */
+    calls = 0;
+    if (!eq(z ?: (1.0 + 2.0 * I), 7.0, 8.0)) return 9;
+
+    /* Mixed precision, real left operand. Checked in `float _Complex` rather
+       than through `eq`: passing a `float _Complex` argument to a
+       `double _Complex` parameter is separately broken, and routing through
+       it would test that instead of this. */
+    float _Complex fz = 1.0f + 2.0f * I;
+    float ff = 4.0f;
+    float _Complex fr = ff ?: fz;
+    if (__real__ fr != 4.0f || __imag__ fr != 0.0f) return 10;
+    if (sizeof(ff ?: fz) != sizeof(float _Complex)) return 11;
+
+    float fzero = 0.0f;
+    fr = fzero ?: fz;
+    if (__real__ fr != 1.0f || __imag__ fr != 2.0f) return 12;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_complex_elvis_real_left", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_complex_elvis_real_left_opt", code),
+        0
+    );
+}

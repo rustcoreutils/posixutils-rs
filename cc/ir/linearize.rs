@@ -4263,14 +4263,22 @@ impl<'a> Linearizer<'a> {
     /// The whole point is that `a` is evaluated **once**: it supplies both the
     /// branch test and the value taken when it is true. Rewriting to
     /// `a ? a : b` in the parser would have called `f` twice in `f() ?: 0`.
-    /// `a ?: b` where the result is complex, merged **by address**.
+    /// `a ?: b` where the *result* is complex, merged **by address**.
     ///
     /// Two constraints meet here. `a` is evaluated exactly once -- that is the
     /// whole point of the operator -- and a complex value travels by address,
-    /// so what is evaluated once is `a`'s *address*: it supplies the truth
-    /// test through `emit_complex_nonzero_at` and, converted to the result's
-    /// precision, the value taken when `a` is nonzero. Going back to the `Expr`
-    /// for either would evaluate `f()` twice in `f() ?: 0`.
+    /// so for a complex `a` what is evaluated once is its *address*: it
+    /// supplies the truth test through `emit_complex_nonzero_at` and,
+    /// converted to the result's precision, the value taken when `a` is
+    /// nonzero. Going back to the `Expr` for either would evaluate `f()` twice
+    /// in `f() ?: 0`.
+    ///
+    /// `a` itself need not be complex. Only the *result* is, and it is complex
+    /// as soon as either operand is: `d ?: z` has a `double` left operand and a
+    /// `double _Complex` result. Taking a real `a`'s address as though it were
+    /// a complex object read the neighbouring stack slot as the imaginary half
+    /// -- and for an rvalue, `rvalue_addr` hands back the value's own bits, so
+    /// `g() ?: z` dereferenced a `double` as a pointer.
     fn linearize_complex_elvis(
         &mut self,
         cond: &Expr,
@@ -4278,9 +4286,21 @@ impl<'a> Linearizer<'a> {
         cond_typ: TypeId,
         result_typ: TypeId,
     ) -> PseudoId {
-        // The single evaluation, before any branch.
-        let cond_addr = self.complex_operand_addr(cond);
-        let cond_bool = self.emit_complex_nonzero_at(cond_addr, cond_typ);
+        // The single evaluation, before any branch. A complex operand is
+        // carried by address; a real one is an ordinary value, and converting
+        // it is left to the true arm so nothing sits between the comparison
+        // and the branch that consumes it.
+        let cond_complex = self.types.is_complex(cond_typ);
+        let evaluated = if cond_complex {
+            self.complex_operand_addr(cond)
+        } else {
+            self.linearize_expr(cond)
+        };
+        let cond_bool = if cond_complex {
+            self.emit_complex_nonzero_at(evaluated, cond_typ)
+        } else {
+            self.emit_compare_zero(evaluated, cond_typ)
+        };
 
         let then_bb = self.alloc_bb();
         let else_bb = self.alloc_bb();
@@ -4295,7 +4315,11 @@ impl<'a> Linearizer<'a> {
         let ptr_bits = self.target.pointer_width;
 
         self.switch_bb(then_bb);
-        let then_val = self.complex_addr_at_precision(cond_addr, cond_typ, result_typ);
+        let then_val = if cond_complex {
+            self.complex_addr_at_precision(evaluated, cond_typ, result_typ)
+        } else {
+            self.promote_real_value_to_complex(evaluated, cond_typ, result_typ)
+        };
         let then_end_bb = self.current_bb.unwrap();
         self.emit(Instruction::br(merge_bb));
         self.link_bb(then_end_bb, merge_bb);

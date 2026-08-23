@@ -282,12 +282,15 @@ asm_data                - inline assembly
 id: BasicBlockId        - unique ID (.L{n})
 insns: Vec<Instruction> - instruction sequence
 parents/children        - CFG edges
-idom                    - immediate dominator
-dom_level               - dominator tree depth
-dom_children            - dominated blocks
-dom_frontier            - dominance frontier
 phi_map                 - var name -> phi index
 ```
+
+Dominator information is deliberately **not** here. It is an analysis result,
+not block content: `dominate::domtree_build(func)` returns a `DomTree` that
+describes the CFG as it was when asked. Storing it on the block -- computed
+once during linearization, never recomputed -- meant inlining and DCE left it
+describing a graph that no longer existed, waiting for the first pass that
+read it.
 
 ### Function
 

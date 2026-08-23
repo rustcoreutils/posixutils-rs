@@ -10,7 +10,7 @@
 // frontiers, then renaming to complete the construction.
 //
 
-use super::dominate::{compute_dominance_frontiers, domtree_build, idf_compute};
+use super::dominate::{domtree_build, idf_compute, DomTree};
 use super::{BasicBlockId, Function, InsnRef, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
@@ -23,6 +23,13 @@ const DEFAULT_SSA_PHI_CAPACITY: usize = 16;
 /// State for SSA conversion
 struct SsaConverter<'a> {
     func: &'a mut Function,
+
+    /// The dominator tree of `func`, as of the start of conversion.
+    ///
+    /// Held here rather than on the blocks so it cannot outlive the CFG it
+    /// describes -- see [`DomTree`]. Conversion inserts phis but does not add
+    /// or remove blocks or edges, so one snapshot is good for the whole run.
+    dom: DomTree,
 
     /// Variables marked for renaming, name -> the local's `Sym` pseudo.
     ///
@@ -47,7 +54,7 @@ struct SsaConverter<'a> {
 }
 
 impl<'a> SsaConverter<'a> {
-    fn new(func: &'a mut Function) -> Self {
+    fn new(func: &'a mut Function, dom: DomTree) -> Self {
         // Find the maximum pseudo ID and reg number currently in use
         // Must scan BOTH func.pseudos AND all instruction targets/sources,
         // since alloc_pseudo() in the linearizer doesn't add to func.pseudos
@@ -83,6 +90,7 @@ impl<'a> SsaConverter<'a> {
 
         Self {
             func,
+            dom,
             to_rename: HashMap::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
             all_phis: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
             dead_stores: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
@@ -229,7 +237,7 @@ fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Optio
 /// Insert phi nodes for a variable at its iterated dominance frontier.
 fn insert_phi_nodes(converter: &mut SsaConverter, var_name: &str, var_info: &VarInfo) {
     // Compute IDF of definition blocks
-    let idf = idf_compute(converter.func, &var_info.def_blocks);
+    let idf = idf_compute(converter.func, &converter.dom, &var_info.def_blocks);
 
     // Insert phi node at each IDF block.
     for bb_id in idf {
@@ -306,6 +314,7 @@ impl DefStack {
 /// Lookup the current definition of a variable, walking up the dominator tree.
 fn lookup_var(
     func: &Function,
+    dom: &DomTree,
     bb_id: BasicBlockId,
     var: &str,
     def_stack: &DefStack,
@@ -326,7 +335,7 @@ fn lookup_var(
         }
 
         // Move to immediate dominator
-        if let Some(idom) = bb.idom {
+        if let Some(idom) = dom.idom(bb.id) {
             current = idom;
         } else {
             break;
@@ -388,8 +397,9 @@ fn rename_insn(
                 if let Some(name) = var_name {
                     if converter.to_rename.get(name) == Some(&addr) {
                         // Get the reaching definition
-                        let val = lookup_var(converter.func, bb_id, name, def_stack)
-                            .unwrap_or_else(|| converter.undef_pseudo());
+                        let val =
+                            lookup_var(converter.func, &converter.dom, bb_id, name, def_stack)
+                                .unwrap_or_else(|| converter.undef_pseudo());
 
                         // Replace load with the value
                         if insn.target.is_some() {
@@ -440,11 +450,7 @@ fn rename_block(converter: &mut SsaConverter, bb_id: BasicBlockId, def_stack: &m
     }
 
     // Get dominated children
-    let dom_children: Vec<BasicBlockId> = converter
-        .func
-        .get_block(bb_id)
-        .map(|bb| bb.dom_children.clone())
-        .unwrap_or_default();
+    let dom_children: Vec<BasicBlockId> = converter.dom.children(bb_id).to_vec();
 
     // Recurse into dominated children
     for child in dom_children {
@@ -514,8 +520,8 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
                 Some(&s) => s,
                 None => continue,
             };
-            let val =
-                lookup_var_in_pred(converter.func, pred_id, &var_name, sym).unwrap_or_else(|| {
+            let val = lookup_var_in_pred(converter.func, &converter.dom, pred_id, &var_name, sym)
+                .unwrap_or_else(|| {
                     let id = PseudoId(converter.next_pseudo_id);
                     converter.next_pseudo_id += 1;
                     let pseudo = Pseudo::undef(id);
@@ -562,6 +568,7 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
 /// not the phi target. So we check stores BEFORE checking phis.
 fn lookup_var_in_pred(
     func: &Function,
+    dom: &DomTree,
     bb_id: BasicBlockId,
     var: &str,
     sym: PseudoId,
@@ -591,7 +598,7 @@ fn lookup_var_in_pred(
         }
 
         // Move to immediate dominator
-        current = bb.idom?;
+        current = dom.idom(bb.id)?;
     }
 }
 
@@ -622,11 +629,14 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
         return;
     }
 
-    // Phase 0: Build dominator tree
-    domtree_build(func);
-    compute_dominance_frontiers(func);
+    // Phase 0: Build dominator tree.
+    //
+    // No dominance frontiers: `idf_compute` is Sreedhar-Gao, which walks the
+    // dominator tree by level and never reads a precomputed frontier. One was
+    // computed for every function anyway, and the result was discarded.
+    let dom = domtree_build(func);
 
-    let mut converter = SsaConverter::new(func);
+    let mut converter = SsaConverter::new(func, dom);
 
     // Phase 1: Analyze variables and insert phi nodes. Process local
     // names in sorted order so phi pseudo IDs are stable across runs
@@ -783,22 +793,16 @@ mod tests {
     #[test]
     fn test_domtree_built() {
         let types = TypeTable::new(&Target::host());
-        let mut func = make_simple_if_cfg(&types);
-        domtree_build(&mut func);
+        let func = make_simple_if_cfg(&types);
+        let dom = domtree_build(&func);
 
         // Entry should be the root (no idom)
-        let entry = func.get_block(BasicBlockId(0)).unwrap();
-        assert!(entry.idom.is_none());
+        assert!(dom.idom(BasicBlockId(0)).is_none());
 
         // Then, else, and merge should all have entry as idom
-        let then_bb = func.get_block(BasicBlockId(1)).unwrap();
-        assert_eq!(then_bb.idom, Some(BasicBlockId(0)));
-
-        let else_bb = func.get_block(BasicBlockId(2)).unwrap();
-        assert_eq!(else_bb.idom, Some(BasicBlockId(0)));
-
-        let merge = func.get_block(BasicBlockId(3)).unwrap();
-        assert_eq!(merge.idom, Some(BasicBlockId(0)));
+        assert_eq!(dom.idom(BasicBlockId(1)), Some(BasicBlockId(0)));
+        assert_eq!(dom.idom(BasicBlockId(2)), Some(BasicBlockId(0)));
+        assert_eq!(dom.idom(BasicBlockId(3)), Some(BasicBlockId(0)));
     }
 
     // Verifies that SSA conversion correctly finds max pseudo ID from

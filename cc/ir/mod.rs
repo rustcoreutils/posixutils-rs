@@ -37,7 +37,6 @@ use std::fmt;
 
 const DEFAULT_INSN_CAPACITY: usize = 32;
 const DEFAULT_CFG_EDGE_CAPACITY: usize = 4;
-const DEFAULT_DOM_CAPACITY: usize = 4;
 const DEFAULT_SRC_CAPACITY: usize = 4;
 const DEFAULT_PHI_CAPACITY: usize = 4;
 const DEFAULT_PARAM_CAPACITY: usize = 8;
@@ -1446,14 +1445,6 @@ pub struct BasicBlock {
     // ========================================================================
     // Dominator tree fields (computed by dominate.rs)
     // ========================================================================
-    /// Immediate dominator (idom) - the closest dominator in the dominator tree
-    pub idom: Option<BasicBlockId>,
-    /// Depth in dominator tree (entry is level 0)
-    pub dom_level: u32,
-    /// Blocks immediately dominated by this one (dominator tree children)
-    pub dom_children: Vec<BasicBlockId>,
-    /// Dominance frontier - blocks where this block's dominance ends
-    pub dom_frontier: Vec<BasicBlockId>,
 
     // ========================================================================
     // SSA construction fields (used during SSA conversion)
@@ -1472,10 +1463,6 @@ impl Default for BasicBlock {
             children: Vec::with_capacity(DEFAULT_CFG_EDGE_CAPACITY),
             label: None,
             addr_taken: false,
-            idom: None,
-            dom_level: 0,
-            dom_children: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
-            dom_frontier: Vec::with_capacity(DEFAULT_DOM_CAPACITY),
             phi_map: HashMap::with_capacity(DEFAULT_PHI_CAPACITY),
         }
     }
@@ -1631,8 +1618,6 @@ pub struct Function {
     pub next_pseudo: u32,
     /// Local variables (name -> info), used for SSA conversion
     pub locals: HashMap<String, LocalVar>,
-    /// Maximum dominator tree depth (computed by dominate.rs)
-    pub max_dom_level: u32,
     /// Is this function static (internal linkage)?
     pub is_static: bool,
     /// Whether to emit a body for this function at all.
@@ -1708,7 +1693,6 @@ impl Default for Function {
             pseudos: Vec::with_capacity(DEFAULT_PSEUDO_CAPACITY),
             next_pseudo: 0,
             locals: HashMap::with_capacity(DEFAULT_LOCAL_CAPACITY),
-            max_dom_level: 0,
             is_static: false,
             emit: true,
             is_noreturn: false,
@@ -1882,27 +1866,6 @@ impl Function {
             PseudoKind::Sym(name) => Some(name.as_str()),
             _ => None,
         })
-    }
-
-    /// Check if block a dominates block b
-    #[cfg(test)]
-    pub fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
-        if a == b {
-            return true;
-        }
-
-        let mut current = b;
-        while let Some(bb) = self.get_block(current) {
-            if let Some(idom) = bb.idom {
-                if idom == a {
-                    return true;
-                }
-                current = idom;
-            } else {
-                break;
-            }
-        }
-        false
     }
 }
 

@@ -834,17 +834,18 @@ impl<'a> super::linearize::Linearizer<'a> {
                 if type_kind == TypeKind::Function {
                     return src;
                 }
-                // For struct types, always return the address — struct member
-                // access requires an address for offset-based field access.
-                if type_kind == TypeKind::Struct {
-                    return src;
-                }
-                // For large union types (> 64 bits), return the address.
-                // For small unions (<= 64 bits), LOAD the value — unions are
-                // accessed as whole values, not via member offsets, and
-                // returning the pointer causes callers to store the pointer
-                // instead of the union value.
-                if type_kind == TypeKind::Union && size > 64 {
+                // An aggregate wider than a register travels by address; one
+                // that fits travels *as* its value. Both kinds, on the same
+                // rule: a struct returned the address at every size while a
+                // union already loaded when it fit, and the disagreement was
+                // the bug. A caller handed the address where the convention
+                // promised the value stored the pointer instead --
+                // `struct { unsigned a, b; } q = *p;` put `p` into `q`.
+                //
+                // Member access is unaffected: `(*p).f` and `p->f` take the
+                // address through `linearize_lvalue`, not through here, which
+                // is why the union half of this has worked all along.
+                if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64 {
                     return src;
                 }
                 self.emit(Instruction::load(result, src, 0, typ, size));

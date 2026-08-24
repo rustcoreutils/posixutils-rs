@@ -2208,3 +2208,124 @@ fn test_vi_starts_on_the_first_line() {
     editor.open(path.to_str().unwrap()).unwrap();
     assert_eq!(editor.get_cursor().line, 1);
 }
+
+// ============================================================================
+// Counts and registers reach the operator
+// ============================================================================
+//
+// The parser computes `cmd.count` as count1*count2, which POSIX requires
+// ("2d3w" deletes six words), but set `motion.count` to count2 alone -- and
+// the operator+motion path reads only the motion's count. The doubled forms
+// (`dd`, `yy`, `cc`) read `cmd.count` and were always right, which is why the
+// discrepancy went unnoticed.
+
+#[test]
+fn test_count_before_operator_applies_to_the_motion() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two three four\n");
+    editor.execute_keys("2dw").unwrap();
+    assert_eq!(editor.get_buffer_text(), "three four\n");
+}
+
+#[test]
+fn test_counts_before_and_after_operator_multiply() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("a b c d e f g\n");
+    editor.execute_keys("2d3w").unwrap();
+    assert_eq!(editor.get_buffer_text(), "g\n");
+}
+
+#[test]
+fn test_count_before_operator_applies_to_yank() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two three\n");
+    editor.execute_keys("2yw").unwrap();
+    assert_eq!(
+        editor.get_unnamed_register().map(|r| r.text.as_str()),
+        Some("one two ")
+    );
+}
+
+/// `p` and `P` dropped `cmd.register` on the floor, so `"ap` always pasted
+/// the unnamed register. `put_after` already accepted a register.
+#[test]
+fn test_put_uses_the_named_register() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\nbeta\n");
+    editor.execute_keys("\"ayy").unwrap();
+    editor.execute_keys("j").unwrap();
+    editor.execute_keys("\"add").unwrap();
+    editor.execute_keys("\"ap").unwrap();
+    assert_eq!(editor.get_buffer_text(), "alpha\nbeta\n");
+}
+
+#[test]
+fn test_put_before_uses_the_named_register() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\n");
+    editor.execute_keys("\"byy").unwrap();
+    editor.execute_keys("j\"bP").unwrap();
+    assert_eq!(editor.get_buffer_text(), "one\none\ntwo\n");
+}
+
+/// A named register survives an intervening unnamed delete.
+#[test]
+fn test_named_register_is_not_clobbered_by_an_unnamed_delete() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("keep\ntrash\ntail\n");
+    editor.execute_keys("\"kyy").unwrap();
+    editor.execute_keys("jdd").unwrap();
+    editor.execute_keys("\"kp").unwrap();
+    assert!(
+        editor.get_buffer_text().matches("keep").count() == 2,
+        "expected the k register to still hold \"keep\": {:?}",
+        editor.get_buffer_text()
+    );
+}
+
+/// `x`, `X`, `D` and `Y` wrote straight to the small-delete or unnamed
+/// register, bypassing `Registers::delete`/`yank` and so ignoring `"x`.
+/// `yy` honoured it, which made `"ayy` and `"aY` disagree.
+#[test]
+fn test_delete_char_uses_the_named_register() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abc\n");
+    editor.execute_keys("\"qx").unwrap();
+    assert_eq!(editor.get_register('q').map(|r| r.text.as_str()), Some("a"));
+}
+
+#[test]
+fn test_delete_char_before_uses_the_named_register() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abc\n");
+    editor.execute_keys("$\"qX").unwrap();
+    assert_eq!(editor.get_register('q').map(|r| r.text.as_str()), Some("b"));
+}
+
+#[test]
+fn test_delete_to_end_of_line_uses_the_named_register() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world\n");
+    editor.execute_keys("ll\"qD").unwrap();
+    assert_eq!(
+        editor.get_register('q').map(|r| r.text.as_str()),
+        Some("llo world")
+    );
+}
+
+#[test]
+fn test_yank_lines_shorthand_agrees_with_yy() {
+    let mut a = Editor::new_headless();
+    a.set_buffer_text("one\ntwo\n");
+    a.execute_keys("\"qyy").unwrap();
+
+    let mut b = Editor::new_headless();
+    b.set_buffer_text("one\ntwo\n");
+    b.execute_keys("\"qY").unwrap();
+
+    assert_eq!(
+        a.get_register('q').map(|r| r.text.as_str()),
+        b.get_register('q').map(|r| r.text.as_str()),
+        "`Y` must be `yy`"
+    );
+}

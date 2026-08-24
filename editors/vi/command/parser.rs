@@ -351,8 +351,13 @@ impl CommandParser {
         }
 
         if let Some(m) = self.motion {
-            let motion_count = if self.has_count2 { self.count2 } else { 1 };
-            let mut motion = MotionCommand::new(m).with_count(motion_count);
+            // The motion carries the *product*, not just the count typed after
+            // the operator.  POSIX multiplies the two ("2d3w" deletes six
+            // words), and the operator+motion path reads only this count --
+            // so passing count2 alone made `2dw` delete one word and `2d3w`
+            // delete three.  The doubled forms (`dd`, `yy`, `cc`) read
+            // `cmd.count` instead, which is why they were always right.
+            let mut motion = MotionCommand::new(m).with_count(count);
             if let Some(c) = self.char_arg {
                 motion = motion.with_char(c);
             }

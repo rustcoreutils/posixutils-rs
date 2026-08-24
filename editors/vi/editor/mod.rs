@@ -1421,8 +1421,11 @@ impl Editor {
                 }
                 if !deleted.is_empty() {
                     self.undo.record_delete(pos, &deleted, false);
+                    // Through the register policy, not straight to the
+                    // small-delete slot: writing there directly is what made
+                    // `"qx` ignore the register the user named.
                     self.registers
-                        .set_small_delete(RegisterContent::new(deleted, false));
+                        .delete(cmd.register, RegisterContent::new(deleted, false), true);
                 }
             }
             'X' => {
@@ -1439,8 +1442,11 @@ impl Editor {
                     // Calculate the starting position for undo
                     start_pos.column = start_pos.column.saturating_sub(del_text.len());
                     self.undo.record_delete(start_pos, &del_text, false);
-                    self.registers
-                        .set_small_delete(RegisterContent::new(del_text, false));
+                    self.registers.delete(
+                        cmd.register,
+                        RegisterContent::new(del_text, false),
+                        true,
+                    );
                 }
             }
             'd' => {
@@ -1462,10 +1468,10 @@ impl Editor {
             }
             // Put commands
             'p' => {
-                self.execute_put(false, count)?;
+                self.execute_put(false, count, cmd.register)?;
             }
             'P' => {
-                self.execute_put(true, count)?;
+                self.execute_put(true, count, cmd.register)?;
             }
             // Undo
             // POSIX: `u` reverses the last command that modified the buffer,
@@ -1577,7 +1583,7 @@ impl Editor {
                 let deleted = self.buffer.delete_to_end_of_line();
                 if !deleted.is_empty() {
                     self.registers
-                        .set_small_delete(RegisterContent::new(deleted, false));
+                        .delete(cmd.register, RegisterContent::new(deleted, false), true);
                 }
             }
             // Shift left/right operators
@@ -1637,7 +1643,16 @@ impl Editor {
             }
             // Yank line (alias for yy)
             'Y' => {
-                self.execute_yank_lines(count)?;
+                // `Y` is `yy`.  It had its own implementation that wrote
+                // straight to the unnamed register, so `"aY` and `"ayy`
+                // disagreed; build the equivalent command instead.
+                let mut yank_cmd = crate::command::ParsedCommand::new('y')
+                    .with_count(count, cmd.has_count)
+                    .with_motion(crate::command::MotionCommand::new('y').with_count(count));
+                if let Some(r) = cmd.register {
+                    yank_cmd = yank_cmd.with_register(r);
+                }
+                self.execute_yank(&yank_cmd)?;
             }
             // Repeat substitution
             '&' => {
@@ -1719,7 +1734,10 @@ impl Editor {
                     if count > 1 {
                         cmd.count = count;
                         if let Some(ref mut mot) = cmd.motion {
-                            mot.count = 1; // Reset motion count when using new count
+                            // The motion now carries the full count, so the
+                            // repeat has to overwrite it rather than reset it
+                            // to 1 and rely on cmd.count.
+                            mot.count = count;
                         }
                     }
                     // Execute the saved command (but don't save it again)
@@ -2145,13 +2163,16 @@ impl Editor {
     }
 
     /// Execute put command.
-    fn execute_put(&mut self, before: bool, count: usize) -> Result<()> {
+    fn execute_put(&mut self, before: bool, count: usize, register: Option<char>) -> Result<()> {
         use crate::command::{put_after, put_before};
 
+        // `put_after`/`put_before` already default to the unnamed register, so
+        // hardcoding `None` here was the only thing stopping `"ap` from
+        // reaching the register the user named.
         let result = if before {
-            put_before(&mut self.buffer, &self.registers, None, count)?
+            put_before(&mut self.buffer, &self.registers, register, count)?
         } else {
-            put_after(&mut self.buffer, &self.registers, None, count)?
+            put_after(&mut self.buffer, &self.registers, register, count)?
         };
 
         self.buffer.set_cursor(result.cursor);
@@ -4096,29 +4117,6 @@ impl Editor {
         if let Ok(res) = result {
             self.buffer.set_cursor(res.position);
         }
-        Ok(())
-    }
-
-    /// Yank lines (for Y command).
-    fn execute_yank_lines(&mut self, count: usize) -> Result<()> {
-        let start_line = self.buffer.cursor().line;
-        if start_line > self.buffer.line_count() {
-            // Empty buffer: nothing to yank, and the arithmetic below would
-            // report a negative line count.
-            return Ok(());
-        }
-        let end_line = (start_line + count.max(1) - 1).min(self.buffer.line_count());
-
-        let mut text = String::new();
-        for line_num in start_line..=end_line {
-            if let Some(line) = self.buffer.line(line_num) {
-                text.push_str(line.content());
-                text.push('\n');
-            }
-        }
-
-        self.registers.set_unnamed(RegisterContent::new(text, true));
-        self.set_message(&format!("{} lines yanked", end_line - start_line + 1));
         Ok(())
     }
 

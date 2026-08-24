@@ -9,7 +9,7 @@
 
 //! Edit buffer implementation using a line-based structure.
 
-use super::line::Line;
+use super::line::{ceil_char_boundary, floor_char_boundary, Line};
 use super::position::{BufferMode, Position, Range};
 use crate::error::{Result, ViError};
 
@@ -22,6 +22,19 @@ pub struct Buffer {
     cursor: Position,
     /// Whether the buffer has been modified.
     modified: bool,
+}
+
+/// Snap a character-mode span to character boundaries: the start rounds down
+/// and the end rounds up, so the span never bisects a character from either
+/// side.
+///
+/// Range endpoints are built freely by callers and never pass through the
+/// cursor, so the cursor invariant does not cover them -- this is the second
+/// place a mid-character offset could reach a slice.
+fn snap_span(line: &Line, start: usize, end: usize) -> (usize, usize) {
+    let end = ceil_char_boundary(line.content(), end);
+    let start = floor_char_boundary(line.content(), start.min(end));
+    (start, end)
 }
 
 impl Buffer {
@@ -99,7 +112,11 @@ impl Buffer {
     }
 
     /// Get a mutable reference to a line (1-indexed).
-    pub fn line_mut(&mut self, line_num: usize) -> Option<&mut Line> {
+    ///
+    /// Private: handing out `&mut Line` lets a caller edit text without the
+    /// buffer noticing, so such an edit sets neither the modified flag nor an
+    /// undo record.  Mutate through the `&mut self` methods below instead.
+    fn line_mut(&mut self, line_num: usize) -> Option<&mut Line> {
         if line_num == 0 || line_num > self.lines.len() {
             None
         } else {
@@ -112,12 +129,6 @@ impl Buffer {
         self.line(self.cursor.line)
     }
 
-    /// Get the current line mutably.
-    pub fn current_line_mut(&mut self) -> Option<&mut Line> {
-        let line_num = self.cursor.line;
-        self.line_mut(line_num)
-    }
-
     /// Get the character under the cursor.
     pub fn char_at_cursor(&self) -> Option<char> {
         self.current_line()
@@ -127,17 +138,8 @@ impl Buffer {
     /// Set cursor position, clamping to valid bounds.
     pub fn set_cursor(&mut self, pos: Position) {
         self.cursor.line = pos.line.clamp(1, self.line_count().max(1));
-
-        if let Some(line) = self.line(self.cursor.line) {
-            let max_col = if line.is_empty() {
-                0
-            } else {
-                line.last_char_offset()
-            };
-            self.cursor.column = pos.column.min(max_col);
-        } else {
-            self.cursor.column = 0;
-        }
+        self.cursor.column = pos.column;
+        self.clamp_column();
     }
 
     /// Set cursor line (1-indexed), clamping to valid bounds.
@@ -159,7 +161,7 @@ impl Buffer {
     pub fn set_column_for_insert(&mut self, column: usize) {
         if let Some(line) = self.line(self.cursor.line) {
             // In insert mode, allow cursor at line.len() (one past last char)
-            self.cursor.column = column.min(line.len());
+            self.cursor.column = line.snap_column(column.min(line.len()));
         } else {
             self.cursor.column = 0;
         }
@@ -167,6 +169,10 @@ impl Buffer {
 
     /// Clamp column to valid position on current line.
     /// For normal mode: cursor must be ON a character.
+    ///
+    /// Snapping is what makes a mid-character cursor unrepresentable: `min`
+    /// alone only lowers an out-of-range column, so any caller that computed
+    /// one by byte arithmetic left it intact for the next slice to panic on.
     fn clamp_column(&mut self) {
         if let Some(line) = self.line(self.cursor.line) {
             let max_col = if line.is_empty() {
@@ -174,7 +180,7 @@ impl Buffer {
             } else {
                 line.last_char_offset()
             };
-            self.cursor.column = self.cursor.column.min(max_col);
+            self.cursor.column = line.snap_column(self.cursor.column.min(max_col));
         } else {
             self.cursor.column = 0;
         }
@@ -183,7 +189,8 @@ impl Buffer {
     /// Move cursor to first non-blank on current line.
     pub fn move_to_first_non_blank(&mut self) {
         if let Some(line) = self.line(self.cursor.line) {
-            self.cursor.column = line.first_non_blank();
+            let col = line.first_non_blank();
+            self.set_column(col);
         }
     }
 
@@ -443,8 +450,7 @@ impl Buffer {
                 if range.start.line == range.end.line {
                     // Single line
                     if let Some(line) = self.line(range.start.line) {
-                        let start = range.start.column.min(line.len());
-                        let end = range.end.column.min(line.len());
+                        let (start, end) = snap_span(line, range.start.column, range.end.column);
                         line.content()[start..end].to_string()
                     } else {
                         String::new()
@@ -455,7 +461,7 @@ impl Buffer {
 
                     // First line (from column to end)
                     if let Some(line) = self.line(range.start.line) {
-                        let start = range.start.column.min(line.len());
+                        let start = line.snap_column(range.start.column.min(line.len()));
                         result.push_str(&line.content()[start..]);
                         result.push('\n');
                     }
@@ -470,7 +476,7 @@ impl Buffer {
 
                     // Last line (from start to column)
                     if let Some(line) = self.line(range.end.line) {
-                        let end = range.end.column.min(line.len());
+                        let end = ceil_char_boundary(line.content(), range.end.column);
                         result.push_str(&line.content()[..end]);
                     }
 
@@ -496,8 +502,7 @@ impl Buffer {
                 if range.start.line == range.end.line {
                     // Single line deletion
                     if let Some(line) = self.line_mut(range.start.line) {
-                        let start = range.start.column.min(line.len());
-                        let end = range.end.column.min(line.len());
+                        let (start, end) = snap_span(line, range.start.column, range.end.column);
                         line.delete_range(start, end);
                         self.modified = true;
                     }
@@ -508,14 +513,14 @@ impl Buffer {
 
                     // Get the parts to keep
                     let prefix = if let Some(line) = self.lines.get(start_line_idx) {
-                        let col = range.start.column.min(line.len());
+                        let col = line.snap_column(range.start.column.min(line.len()));
                         line.content()[..col].to_string()
                     } else {
                         String::new()
                     };
 
                     let suffix = if let Some(line) = self.lines.get(end_line_idx) {
-                        let col = range.end.column.min(line.len());
+                        let col = ceil_char_boundary(line.content(), range.end.column);
                         line.content()[col..].to_string()
                     } else {
                         String::new()

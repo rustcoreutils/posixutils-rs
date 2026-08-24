@@ -3968,14 +3968,23 @@ impl Editor {
     /// Replace character at cursor (r command).
     fn replace_char(&mut self, c: char) {
         let cursor = self.buffer.cursor();
-        if let Some(line) = self.buffer.line_mut(cursor.line) {
-            let col = cursor.column;
-            if col < line.len() {
-                // Delete char at cursor and insert new one
-                line.delete_char(col);
-                line.insert_char(col, c);
-            }
+        let Some(line) = self.buffer.line(cursor.line) else {
+            return;
+        };
+        let col = cursor.column;
+        if col >= line.len() {
+            return;
         }
+        // Rebuild through `replace_line` rather than reaching in with
+        // `line_mut`, which edits behind the buffer's back: `r` set neither
+        // the modified flag nor any undo record, so `rX` then `:q` exited
+        // with no warning and the edit was simply lost.
+        let end = line.next_char_offset(col).unwrap_or(line.len());
+        let mut updated = String::with_capacity(line.len());
+        updated.push_str(&line.content()[..col]);
+        updated.push(c);
+        updated.push_str(&line.content()[end..]);
+        let _ = self.buffer.replace_line(cursor.line, &updated);
     }
 
     /// Toggle case of character at cursor (~ command).
@@ -3994,13 +4003,28 @@ impl Editor {
             } else {
                 c
             };
-            if let Some(line) = self.buffer.line_mut(cursor.line) {
-                let col = cursor.column;
-                line.delete_char(col);
-                line.insert_char(col, toggled);
-                // Move right if possible
-                if col + 1 < line.len() {
-                    self.buffer.set_cursor(Position::new(cursor.line, col + 1));
+            let Some(line) = self.buffer.line(cursor.line) else {
+                return;
+            };
+            let col = cursor.column;
+            let end = line.next_char_offset(col).unwrap_or(line.len());
+            let mut updated = String::with_capacity(line.len());
+            updated.push_str(&line.content()[..col]);
+            updated.push(toggled);
+            updated.push_str(&line.content()[end..]);
+            let _ = self.buffer.replace_line(cursor.line, &updated);
+
+            // Advance by the width of the character just written, not by one
+            // byte: `col + 1` landed inside the next character on any line
+            // with multi-byte text.  The replacement may differ in width from
+            // what it replaced, so measure it in `updated`.
+            let next = self
+                .buffer
+                .line(cursor.line)
+                .and_then(|l| l.next_char_offset(col));
+            if let Some(next) = next {
+                if next < updated.len() {
+                    self.buffer.set_cursor(Position::new(cursor.line, next));
                 }
             }
         }

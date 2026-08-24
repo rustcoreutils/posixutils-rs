@@ -1696,3 +1696,107 @@ fn test_ex_delete_and_yank_reject_zero_count() {
         );
     }
 }
+
+// ============================================================================
+// Phase 8 — the cursor and every range endpoint stay on a character boundary
+// ============================================================================
+//
+// `Position::column` is a 0-indexed *byte* offset (buffer/position.rs), which
+// is what the renderer assumes too. But `clamp_column` normalised with a bare
+// `min()`, which lowers an out-of-range column and otherwise leaves it alone --
+// so a mid-character byte offset was representable, and the next slice panicked.
+
+#[test]
+fn test_multibyte_toggle_case_does_not_panic() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("héllo\n");
+    // Three toggles, each advancing one *character*: h, é, l.
+    editor.execute_keys("~~~").unwrap();
+    assert_eq!(editor.get_buffer_text(), "HÉLlo\n");
+}
+
+#[test]
+fn test_multibyte_substitute_char_does_not_panic() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("éx\n");
+    editor.execute_keys("sZ\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "Zx\n");
+}
+
+#[test]
+fn test_multibyte_change_word_does_not_panic() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("café x\n");
+    editor.execute_keys("cwZ\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "Z x\n");
+}
+
+/// `p` used to back the cursor up one *byte* to land on the last character it
+/// pasted, leaving it inside a multi-byte character; the next `x` then panicked
+/// in `String::remove`.
+#[test]
+fn test_multibyte_put_then_delete_does_not_panic() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("aébc\n");
+    editor.execute_keys("lxp").unwrap();
+    editor.execute_keys("x").unwrap();
+    assert!(
+        editor.get_buffer_text().is_char_boundary(0),
+        "buffer must remain valid UTF-8"
+    );
+}
+
+/// Whatever the keys, the cursor must never be left inside a character.
+#[test]
+fn test_cursor_stays_on_a_character_boundary() {
+    // `p`/`P` need something in the unnamed register, so they yank first.
+    for keys in [
+        "$", "0", "w", "b", "e", "x", "X", "~", "A!\x1b", "iZ\x1b", "dw", "de", "D", "ywp", "ywP",
+        "yyp", "dwp",
+    ] {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text("héllo wörld — naïve\n");
+        editor.execute_keys("ll").unwrap();
+        editor
+            .execute_keys(keys)
+            .unwrap_or_else(|e| panic!("{:?} errored: {}", keys, e));
+
+        let text = editor.get_buffer_text();
+        let cursor = editor.get_cursor();
+        let line = text.lines().nth(cursor.line - 1).unwrap_or("");
+        assert!(
+            line.is_char_boundary(cursor.column.min(line.len())),
+            "{:?} left the cursor at byte {} of {:?}, mid-character",
+            keys,
+            cursor.column,
+            line
+        );
+    }
+}
+
+/// `r` and `~` reached into the buffer through `line_mut`, which bypasses the
+/// dirty flag as well as undo -- so `rX` then `:q` exited with no warning and
+/// the edit was lost silently.
+#[test]
+fn test_replace_char_marks_buffer_modified() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello\n");
+    editor.execute_keys("rX").unwrap();
+    editor.execute_keys(":q\n").unwrap();
+    assert!(
+        !editor.should_quit(),
+        "`r` must mark the buffer modified so `:q` warns"
+    );
+}
+
+#[test]
+fn test_toggle_case_marks_buffer_modified() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello\n");
+    editor.execute_keys("~").unwrap();
+    editor.execute_keys(":q\n").unwrap();
+    assert!(
+        !editor.should_quit(),
+        "`~` must mark the buffer modified so `:q` warns"
+    );
+}

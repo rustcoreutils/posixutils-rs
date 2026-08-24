@@ -95,9 +95,7 @@ impl Editor {
         }
 
         // Replace the first line with the joined result
-        if let Some(line) = self.buffer.line_mut(start) {
-            *line = Line::from(result.as_str());
-        }
+        let _ = self.buffer.replace_line(start, &result);
 
         self.buffer.set_line(start);
 

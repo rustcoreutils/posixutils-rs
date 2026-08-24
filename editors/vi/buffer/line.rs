@@ -9,6 +9,59 @@
 
 //! Line abstraction for the edit buffer.
 
+/// Round `byte_offset` down to the nearest character boundary, clamping to the
+/// end of `content`.
+///
+/// This is the primitive the cursor model was missing.  Normalising a column
+/// with a bare `min()` lowers an out-of-range offset but leaves an in-range
+/// one alone, so a mid-character offset stayed representable and the next
+/// slice panicked.  (`str::floor_char_boundary` is still unstable in the
+/// Rust version this crate targets.)
+pub fn floor_char_boundary(content: &str, byte_offset: usize) -> usize {
+    let mut offset = byte_offset.min(content.len());
+    while offset > 0 && !content.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+/// Round `byte_offset` up to the nearest character boundary, clamping to the
+/// end of `content`.
+///
+/// Used for the *end* of a character-mode range, so that a range never
+/// bisects a character from either side.
+pub fn ceil_char_boundary(content: &str, byte_offset: usize) -> usize {
+    let mut offset = byte_offset.min(content.len());
+    while offset < content.len() && !content.is_char_boundary(offset) {
+        offset += 1;
+    }
+    offset
+}
+
+/// Byte offset of the character after the one starting at `byte_offset`, or
+/// `None` at (or past) the end of `content`.
+///
+/// Replaces the `+ 1` that assumed every character is one byte wide.
+pub fn next_char_boundary(content: &str, byte_offset: usize) -> Option<usize> {
+    let start = floor_char_boundary(content, byte_offset);
+    content[start..]
+        .chars()
+        .next()
+        .map(|c| start + c.len_utf8())
+}
+
+/// Byte offset of the character before the one at `byte_offset`, or `None` at
+/// the start of `content`.
+///
+/// Replaces the `saturating_sub(1)` that assumed every character is one byte.
+pub fn prev_char_boundary(content: &str, byte_offset: usize) -> Option<usize> {
+    let end = floor_char_boundary(content, byte_offset);
+    content[..end]
+        .chars()
+        .next_back()
+        .map(|c| end - c.len_utf8())
+}
+
 /// Find character index for byte offset in string.
 ///
 /// Returns the index of the first character whose byte offset is >= the given byte offset,
@@ -127,8 +180,34 @@ impl Line {
     }
 
     /// Get a character at the given byte offset.
+    ///
+    /// `str::get` yields `None` rather than panicking on a mid-character
+    /// offset, so a release build degrades instead of aborting; the assertion
+    /// makes the caller's mistake loud in tests.
     pub fn char_at(&self, offset: usize) -> Option<char> {
-        self.content[offset..].chars().next()
+        debug_assert!(
+            self.content
+                .is_char_boundary(offset.min(self.content.len())),
+            "char_at({}) is inside a character of {:?}",
+            offset,
+            self.content
+        );
+        self.content.get(offset..).and_then(|s| s.chars().next())
+    }
+
+    /// Round a byte offset down to a character boundary within this line.
+    pub fn snap_column(&self, offset: usize) -> usize {
+        floor_char_boundary(&self.content, offset)
+    }
+
+    /// Byte offset of the character after the one at `offset`.
+    pub fn next_char_offset(&self, offset: usize) -> Option<usize> {
+        next_char_boundary(&self.content, offset)
+    }
+
+    /// Byte offset of the character before the one at `offset`.
+    pub fn prev_char_offset(&self, offset: usize) -> Option<usize> {
+        prev_char_boundary(&self.content, offset)
     }
 
     /// Get the byte offset of the last character, or 0 if empty.
@@ -179,19 +258,30 @@ impl Line {
 
     /// Insert a character at the given byte offset.
     pub fn insert_char(&mut self, offset: usize, c: char) {
-        self.content.insert(offset, c);
+        debug_assert!(self
+            .content
+            .is_char_boundary(offset.min(self.content.len())));
+        self.content.insert(self.snap_column(offset), c);
     }
 
     /// Insert a string at the given byte offset.
     pub fn insert_str(&mut self, offset: usize, s: &str) {
-        self.content.insert_str(offset, s);
+        debug_assert!(self
+            .content
+            .is_char_boundary(offset.min(self.content.len())));
+        let at = self.snap_column(offset);
+        self.content.insert_str(at, s);
     }
 
     /// Delete a character at the given byte offset.
     /// Returns the deleted character.
     pub fn delete_char(&mut self, offset: usize) -> Option<char> {
-        if offset < self.content.len() {
-            Some(self.content.remove(offset))
+        debug_assert!(self
+            .content
+            .is_char_boundary(offset.min(self.content.len())));
+        let at = self.snap_column(offset);
+        if at < self.content.len() {
+            Some(self.content.remove(at))
         } else {
             None
         }
@@ -199,8 +289,9 @@ impl Line {
 
     /// Delete a range of bytes.
     pub fn delete_range(&mut self, start: usize, end: usize) -> String {
-        let end = end.min(self.content.len());
-        let start = start.min(end);
+        // Snap outward so a range can never bisect a character.
+        let end = ceil_char_boundary(&self.content, end);
+        let start = floor_char_boundary(&self.content, start.min(end));
         self.content.drain(start..end).collect()
     }
 
@@ -217,7 +308,11 @@ impl Line {
     /// Split the line at the given byte offset.
     /// Returns the portion after the split point.
     pub fn split_off(&mut self, offset: usize) -> Line {
-        let rest = self.content.split_off(offset);
+        debug_assert!(self
+            .content
+            .is_char_boundary(offset.min(self.content.len())));
+        let at = self.snap_column(offset);
+        let rest = self.content.split_off(at);
         Line { content: rest }
     }
 

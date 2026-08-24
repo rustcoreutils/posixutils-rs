@@ -2194,6 +2194,25 @@ impl Editor {
         self.execute_motion(mot).map(|r| r.position)
     }
 
+    /// Line number for a screen-relative motion (`H`, `M`, `L`).
+    ///
+    /// Extracted so the operator form dispatches the same way as the bare
+    /// form; `dH` and `dL` used to fall through to "no motion" and silently
+    /// do nothing.
+    fn screen_relative_line(&self, which: char, count: usize) -> usize {
+        let top = self.screen.top_line();
+        let rows = self.terminal.size().rows as usize;
+        let target = match which {
+            'H' => top + count.saturating_sub(1),
+            'M' => top + rows / 2,
+            // -2 for the status line, `count` lines up from the bottom.
+            _ => (top + rows.saturating_sub(2))
+                .saturating_sub(count.saturating_sub(1))
+                .max(top),
+        };
+        target.min(self.buffer.line_count()).max(1)
+    }
+
     /// Run a motion, keeping its classification.
     ///
     /// The dispatcher used to discard everything but the position, so no
@@ -2238,6 +2257,56 @@ impl Editor {
             ')' => motion::move_sentence_forward(&self.buffer, mot.count).ok(),
             '|' => motion::move_to_column(&self.buffer, mot.count, self.options.tabstop).ok(),
             '%' => motion::find_matching_bracket(&self.buffer).ok(),
+            // Screen-relative: line-wise, and the cursor settles on the first
+            // non-blank (POSIX, vi, "Move to Top/Middle/Bottom of Screen").
+            'H' | 'M' | 'L' => {
+                let line = self.screen_relative_line(mot.motion, mot.count);
+                Some(
+                    motion::MotionResult::pos(Position::new(line, 0))
+                        .linewise()
+                        .with_first_non_blank(),
+                )
+            }
+            // Line-wise, to the first non-blank (POSIX, vi, "Move to
+            // First Non-Blank on Next/Previous Line", and `_` for the
+            // current line).
+            '+' | '\r' | '\n' => {
+                let line = (self.buffer.cursor().line + mot.count).min(self.buffer.line_count());
+                Some(
+                    motion::MotionResult::pos(Position::new(line, 0))
+                        .linewise()
+                        .with_first_non_blank(),
+                )
+            }
+            '-' => {
+                let line = self.buffer.cursor().line.saturating_sub(mot.count).max(1);
+                Some(
+                    motion::MotionResult::pos(Position::new(line, 0))
+                        .linewise()
+                        .with_first_non_blank(),
+                )
+            }
+            '_' => {
+                let line = (self.buffer.cursor().line + mot.count.saturating_sub(1))
+                    .min(self.buffer.line_count());
+                Some(
+                    motion::MotionResult::pos(Position::new(line, 0))
+                        .linewise()
+                        .with_first_non_blank(),
+                )
+            }
+            // A mark: `'` addresses the line and is line-wise, `` ` ``
+            // addresses the character and is exclusive.
+            '\'' | '`' => {
+                let pos = mot.char_arg.and_then(|name| self.mark_position(name))?;
+                Some(if mot.motion == '\'' {
+                    motion::MotionResult::pos(Position::new(pos.line, 0))
+                        .linewise()
+                        .with_first_non_blank()
+                } else {
+                    motion::MotionResult::pos(pos)
+                })
+            }
             _ => None,
         }
     }
@@ -3488,14 +3557,17 @@ impl Editor {
         Ok(())
     }
 
+    /// Where a mark points, if it is set.
+    fn mark_position(&self, name: char) -> Option<Position> {
+        if !name.is_ascii_lowercase() {
+            return None;
+        }
+        self.marks[(name as u8 - b'a') as usize]
+    }
+
     /// Go to a mark.
     fn goto_mark(&mut self, name: char, first_non_blank: bool) -> Result<()> {
-        let pos = if name.is_ascii_lowercase() {
-            let idx = (name as u8 - b'a') as usize;
-            self.marks[idx].ok_or(ViError::MarkNotSet(name))?
-        } else {
-            return Err(ViError::MarkNotSet(name));
-        };
+        let pos = self.mark_position(name).ok_or(ViError::MarkNotSet(name))?;
 
         self.buffer.set_cursor(pos);
         if first_non_blank {

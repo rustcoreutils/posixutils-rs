@@ -2815,3 +2815,113 @@ fn test_change_word_on_a_non_blank_keeps_the_following_blanks() {
     editor.execute_keys("cwZ\x1b").unwrap();
     assert_eq!(editor.get_buffer_text(), "Z   two\n");
 }
+
+/// Every motion the parser accepts after an operator must actually be
+/// dispatched. `execute_motion` fell through to `None` for a dozen of them,
+/// so `dH`, `d+`, `d'a` and friends silently did nothing at all -- the worst
+/// outcome, since the user sees no diagnostic.
+#[test]
+fn test_every_parseable_motion_works_as_an_operator_target() {
+    let setup = "one\ntwo\nthree\nfour\nfive\nsix\n";
+    let cases: &[(&str, &str)] = &[
+        ("dH", "from the top of the screen"),
+        ("dL", "to the bottom of the screen"),
+        ("dM", "to the middle of the screen"),
+        ("d+", "to the next line"),
+        ("d-", "to the previous line"),
+        ("d_", "the current line"),
+        ("d'a", "to a marked line"),
+        ("d`a", "to a marked position"),
+        ("d|", "to a column"),
+    ];
+
+    let mut silent = Vec::new();
+    for (keys, what) in cases {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text(setup);
+        // Sit in the middle and set mark `a` on the first line, so backward
+        // and mark motions have somewhere to go.
+        editor.execute_keys("ma").unwrap();
+        editor.execute_keys("jjl").unwrap();
+
+        let before = editor.get_buffer_text();
+        let outcome = editor.execute_keys(keys);
+        if outcome.is_ok() && editor.get_buffer_text() == before {
+            silent.push(format!("{:?} ({}) did nothing", keys, what));
+        }
+    }
+    assert!(
+        silent.is_empty(),
+        "{} motions are silent no-ops after an operator:\n  {}",
+        silent.len(),
+        silent.join("\n  ")
+    );
+}
+
+/// The newly dispatched motions must produce the *right* region, not merely
+/// a non-empty one.
+#[test]
+fn test_line_relative_motions_are_linewise_as_operator_targets() {
+    let setup = "one\ntwo\nthree\nfour\n";
+
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(setup);
+    editor.execute_keys("jl").unwrap();
+    editor.execute_keys("d+").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "one\nfour\n",
+        "`d+` deletes the current line and the next, whole"
+    );
+
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(setup);
+    editor.execute_keys("jjl").unwrap();
+    editor.execute_keys("d-").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "one\nfour\n",
+        "`d-` deletes the current line and the previous, whole"
+    );
+
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(setup);
+    editor.execute_keys("jl").unwrap();
+    editor.execute_keys("d_").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "one\nthree\nfour\n",
+        "`d_` deletes just the current line"
+    );
+}
+
+#[test]
+fn test_mark_motions_as_operator_targets() {
+    let setup = "one\ntwo\nthree\nfour\n";
+
+    // `'a` addresses the line, so the region is whole lines.
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(setup);
+    editor.execute_keys("ma").unwrap();
+    editor.execute_keys("jj").unwrap();
+    editor.execute_keys("d'a").unwrap();
+    assert_eq!(editor.get_buffer_text(), "four\n");
+
+    // A backtick mark addresses the character, so the region is exclusive.
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abcdef\n");
+    editor.execute_keys("ll").unwrap();
+    editor.execute_keys("ma").unwrap();
+    editor.execute_keys("$").unwrap();
+    editor.execute_keys("d`a").unwrap();
+    assert_eq!(editor.get_buffer_text(), "abf\n");
+}
+
+/// An unset mark is an error, not a silent no-op on the whole buffer.
+#[test]
+fn test_operator_with_an_unset_mark_changes_nothing() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\n");
+    let _ = editor.execute_keys("d'z");
+    assert_eq!(editor.get_buffer_text(), "one\ntwo\n");
+}

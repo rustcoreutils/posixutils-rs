@@ -494,10 +494,17 @@ impl Editor {
     /// Open a file for editing.
     pub fn open(&mut self, path: &str) -> Result<()> {
         let path_buf = PathBuf::from(path);
-        self.buffer = read_file(&path_buf)?;
-        self.files.set_current_file(Some(path_buf.clone()));
-        // Update shell executor with current/alternate files
+        // Read before anything is replaced, so a failure leaves the editor as
+        // it was rather than half-switched to a file it could not open.
+        let new_buffer = read_file(&path_buf)?;
+
+        // Capture the outgoing file *before* `set_current_file` replaces it:
+        // reading it afterwards gave the file being opened, so `#` in a shell
+        // command expanded to the same thing as `%`.
         let old_current = self.shell_current_file();
+
+        self.buffer = new_buffer;
+        self.files.set_current_file(Some(path_buf.clone()));
         self.shell
             .set_current_file(Some(path_buf.to_string_lossy().into_owned()));
         if old_current.is_some() {
@@ -914,10 +921,16 @@ impl Editor {
                 return Ok(());
             }
             Key::Ctrl('^') => {
-                // Edit alternate file
-                if let Some(alt) = self.files.alternate_file() {
+                // Edit the alternate file. This discards the buffer, so it
+                // needs the same warning `:e` gives -- it used to open
+                // unconditionally and the unsaved work went with it.
+                if self.buffer.is_modified() {
+                    self.set_error("No write since last change");
+                } else if let Some(alt) = self.files.alternate_file() {
                     let path = alt.to_string_lossy().to_string();
-                    let _ = self.open(&path);
+                    if let Err(e) = self.open(&path) {
+                        self.set_error(&e.to_string());
+                    }
                 } else {
                     self.set_error("No alternate file");
                 }

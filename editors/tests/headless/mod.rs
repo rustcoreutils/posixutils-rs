@@ -3043,3 +3043,61 @@ fn test_first_non_blank_on_an_all_blank_line() {
         "an all-blank line has no non-blank, so `^` stays on the last character"
     );
 }
+
+/// `#` in a shell command expands to the alternate file. `open` captured the
+/// "previous" current file *after* `set_current_file` had already replaced
+/// it, so `#` expanded to the file just opened -- the same as `%`.
+#[test]
+fn test_alternate_file_expands_to_the_previous_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.txt");
+    let second = dir.path().join("second.txt");
+    std::fs::write(&first, "one\n").unwrap();
+    std::fs::write(&second, "two\n").unwrap();
+
+    let mut editor = Editor::new_headless();
+    editor.open(first.to_str().unwrap()).unwrap();
+    editor.open(second.to_str().unwrap()).unwrap();
+
+    editor.execute_keys(":r !echo #\n").unwrap();
+    let text = editor.get_buffer_text();
+    assert!(
+        text.contains("first.txt"),
+        "`#` must be the alternate (previous) file, got {:?}",
+        text
+    );
+    assert!(
+        !text.contains("second.txt"),
+        "`#` must not be the current file, got {:?}",
+        text
+    );
+}
+
+/// Ctrl-^ edits the alternate file, which discards the buffer. POSIX requires
+/// the same warning as `:e`; it opened unconditionally and the unsaved work
+/// went with it.
+#[test]
+fn test_ctrl_caret_warns_before_discarding_a_modified_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.txt");
+    let second = dir.path().join("second.txt");
+    std::fs::write(&first, "one\n").unwrap();
+    std::fs::write(&second, "two\n").unwrap();
+
+    let mut editor = Editor::new_headless();
+    editor.open(first.to_str().unwrap()).unwrap();
+    editor.open(second.to_str().unwrap()).unwrap();
+    editor.execute_keys("iEDITED\x1b").unwrap();
+
+    editor.execute_keys("\x1e").unwrap(); // Ctrl-^
+    assert!(
+        editor.get_buffer_text().contains("EDITED"),
+        "the modified buffer must survive; got {:?}",
+        editor.get_buffer_text()
+    );
+    assert!(
+        editor.is_error_message(),
+        "expected a warning, got {:?}",
+        editor.get_message()
+    );
+}

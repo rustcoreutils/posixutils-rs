@@ -2131,3 +2131,51 @@ fn test_ed_global_substitute_does_not_reanchor_caret() {
 fn test_ed_global_substitute_still_anchors_dollar() {
     ed_test("a\nabc\n.\ns/$/!/g\n1,$p\nQ\n", "abc!\n");
 }
+
+/// POSIX (ed, ASYNCHRONOUS EVENTS): on SIGHUP, if the buffer is modified, ed
+/// writes it to `ed.hup` in the current directory before exiting.
+///
+/// The handler was installed with `libc::signal`, whose BSD semantics include
+/// SA_RESTART, so the flag it set was never observed while ed sat blocked
+/// reading a command -- and on a hangup no further command is coming, so the
+/// buffer was simply lost.
+#[test]
+fn test_ed_writes_ed_hup_on_sighup() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(plib::testing::get_binary_path("ed"))
+        .arg("-s")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ed");
+
+    // Modify the buffer, then leave ed blocked waiting for the next command.
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"a\nHUP_ME\n.\n").unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+    // Let the signal land before the EOF: if stdin closes first, ed processes
+    // the EOF as an ordinary quit and never sees the hangup.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // A real hangup takes the terminal with it, so close stdin too -- that is
+    // what ends the pending read (`BufRead::read_line` retries EINTR itself).
+    drop(stdin);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let hup = dir.path().join("ed.hup");
+    let body = fs::read_to_string(&hup).unwrap_or_default();
+    assert!(
+        body.contains("HUP_ME"),
+        "SIGHUP must write the modified buffer to ed.hup; got {:?}",
+        body
+    );
+}

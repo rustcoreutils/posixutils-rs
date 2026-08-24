@@ -48,24 +48,33 @@ extern "C" fn sighup_handler(_signum: libc::c_int) {
     SIGHUP_RECEIVED.store(true, Ordering::SeqCst);
 }
 
+/// Install `handler` for `signum` *without* `SA_RESTART`.
+///
+/// `libc::signal` has BSD semantics on the platforms this targets, and those
+/// include `SA_RESTART`: the kernel restarts an interrupted read rather than
+/// returning `EINTR`, so a signal arriving while ed waits for a command was
+/// not noticed until the user typed something.  For SIGHUP there is no such
+/// keystroke coming, so the buffer ed is meant to save to `ed.hup` went with
+/// the process instead.
+fn install(signum: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0; // deliberately not SA_RESTART
+        libc::sigaction(signum, &action, std::ptr::null_mut());
+    }
+}
+
 /// Set up signal handlers per POSIX requirements for ed.
 fn setup_signals() {
+    // SIGQUIT: Ignore (POSIX requirement). No handler runs, so the restart
+    // semantics that matter above do not apply.
     unsafe {
-        // SIGQUIT: Ignore (POSIX requirement)
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
-
-        // SIGINT: Set flag to be checked in main loop
-        libc::signal(
-            libc::SIGINT,
-            sigint_handler as *const () as libc::sighandler_t,
-        );
-
-        // SIGHUP: Set flag to save buffer and exit
-        libc::signal(
-            libc::SIGHUP,
-            sighup_handler as *const () as libc::sighandler_t,
-        );
     }
+    install(libc::SIGINT, sigint_handler);
+    install(libc::SIGHUP, sighup_handler);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

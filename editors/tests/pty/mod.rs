@@ -586,3 +586,69 @@ fn test_pty_ex_visual_honours_address_and_count() {
         "expected `4vi3` to leave the cursor on line 4"
     );
 }
+
+/// POSIX requires vi to preserve a modified buffer on SIGHUP/SIGTERM.
+///
+/// The handlers were installed with `libc::signal`, whose BSD semantics
+/// include SA_RESTART: an interrupted `read` is restarted by the kernel
+/// rather than returning EINTR, so the visual loop -- which services signals
+/// only when a read comes back interrupted -- never noticed the flag and the
+/// unsaved buffer went with the process.
+#[test]
+fn test_pty_vi_preserves_the_buffer_on_sigterm() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("hup.txt");
+    fs::write(&file_path, "alpha\n").unwrap();
+
+    // Isolate the recovery directory: vi puts recovery files under $TMPDIR.
+    let recover_home = tempdir().unwrap();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 25,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
+    cmd.arg(&file_path);
+    cmd.env("TERM", "vt100");
+    cmd.env("TMPDIR", recover_home.path());
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    spawn_reader_drain(reader);
+    let mut writer = pair.master.take_writer().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    // Modify the buffer, then leave vi blocked in a read.
+    write_keys(&mut writer, "oPRESERVE_ME\x1b");
+    thread::sleep(Duration::from_millis(300));
+
+    let pid = child.process_id().expect("child pid") as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    wait_with_timeout(&mut child, Duration::from_secs(5));
+
+    // The recovery file lives under $TMPDIR/vi.recover.<uid>/.
+    let dir = recover_home
+        .path()
+        .join(format!("vi.recover.{}", unsafe { libc::getuid() }));
+    let found = fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| fs::read_to_string(e.path()).ok())
+                .any(|body| body.contains("PRESERVE_ME"))
+        })
+        .unwrap_or(false);
+
+    assert!(
+        found,
+        "SIGTERM must preserve the modified buffer; nothing recoverable in {:?}",
+        dir
+    );
+}

@@ -1733,13 +1733,27 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
             self.print_prompt()?;
 
-            let line = match self.read_line()? {
-                Some(l) => l,
-                None => {
+            let line = match self.read_line() {
+                Ok(Some(l)) => l,
+                Ok(None) => {
+                    // A hangup closes the terminal, so the pending read ends
+                    // in EOF rather than EINTR -- and `BufRead::read_line`
+                    // retries EINTR internally anyway.  Check for the hangup
+                    // before treating the EOF as a `q`, or the buffer ed is
+                    // required to save to `ed.hup` is discarded instead.
+                    if self.check_sighup() {
+                        break;
+                    }
                     // POSIX: end-of-file is equivalent to a `q` command.
                     self.handle_eof()?;
                     break;
                 }
+                // A signal interrupted the read.  Go back to the top of the
+                // loop so the SIGHUP and SIGINT checks there can run --
+                // propagating the error instead meant a hangup left `run`
+                // without ever saving the buffer to `ed.hup`.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             };
 
             // Check signals again after potentially blocking on input

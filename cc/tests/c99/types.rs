@@ -1605,7 +1605,8 @@ int main(void)
 /// no macOS equivalent -- the system compiler cannot find it there either, so
 /// this is a missing header rather than anything cc could parse.  What the
 /// header exercises is covered on every platform by
-/// `c99_vector_size_storage` above, which reproduces its shape inline.
+/// `c99_vector_size_has_a_vector_s_storage` above, which reproduces its shape
+/// inline.
 #[test]
 fn c99_link_h_compiles() {
     let code = r#"

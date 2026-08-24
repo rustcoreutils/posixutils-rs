@@ -85,7 +85,9 @@ pub fn word_end(buffer: &Buffer, pos: Position) -> Position {
     }
 
     let content = line.content();
-    let start_col = pos.column.min(content.len().saturating_sub(1));
+    // `len() - 1` is inside the final character whenever it is multi-byte;
+    // `last_char_offset` is the boundary-correct equivalent.
+    let start_col = pos.column.min(line.last_char_offset());
 
     let current_char = content[start_col..].chars().next().unwrap_or(' ');
     let is_current_word = is_word_char(current_char);
@@ -128,9 +130,7 @@ pub fn next_word_start(buffer: &Buffer, pos: Position) -> Option<Position> {
         if line_num == pos.line {
             // Skip current word/punct/blanks
             let mut in_initial = true;
-            let start_char = content[col.min(content.len().saturating_sub(1))..]
-                .chars()
-                .next();
+            let start_char = content[col.min(line.last_char_offset())..].chars().next();
             let initial_word = start_char.map(is_word_char).unwrap_or(false);
             let initial_punct = start_char.map(is_punct).unwrap_or(false);
 

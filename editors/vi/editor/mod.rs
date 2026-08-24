@@ -1338,11 +1338,17 @@ impl Editor {
                 self.buffer.move_to_first_non_blank();
             }
             'L' => {
-                // Move to bottom of screen
+                // Move to bottom of screen, `count` lines up from it.
                 let size = self.terminal.size();
                 let top = self.screen.top_line();
-                let bottom = top + size.rows as usize - 2 - count + 1; // -2 for status line
-                let target = bottom.min(self.buffer.line_count());
+                // -2 for the status line.  Saturating: a count larger than the
+                // window used to underflow, which aborts in debug and wraps to
+                // a huge line number in release.
+                let bottom = top + (size.rows as usize).saturating_sub(2);
+                let target = bottom
+                    .saturating_sub(count.saturating_sub(1))
+                    .max(top)
+                    .min(self.buffer.line_count());
                 self.buffer.set_line(target);
                 self.buffer.move_to_first_non_blank();
             }
@@ -4049,7 +4055,12 @@ impl Editor {
     /// Yank lines (for Y command).
     fn execute_yank_lines(&mut self, count: usize) -> Result<()> {
         let start_line = self.buffer.cursor().line;
-        let end_line = (start_line + count - 1).min(self.buffer.line_count());
+        if start_line > self.buffer.line_count() {
+            // Empty buffer: nothing to yank, and the arithmetic below would
+            // report a negative line count.
+            return Ok(());
+        }
+        let end_line = (start_line + count.max(1) - 1).min(self.buffer.line_count());
 
         let mut text = String::new();
         for line_num in start_line..=end_line {
@@ -4131,7 +4142,9 @@ impl Editor {
             return None;
         }
 
-        let col = cursor.column.min(content.len().saturating_sub(1));
+        // Boundary-correct: `len() - 1` lands inside a trailing multi-byte
+        // character.
+        let col = cursor.column.min(line.last_char_offset());
         let chars: Vec<char> = content.chars().collect();
 
         // Check if cursor is on a word character

@@ -1800,3 +1800,74 @@ fn test_toggle_case_marks_buffer_modified() {
         "`~` must mark the buffer modified so `:q` warns"
     );
 }
+
+/// The vi counterpart of ed's malformed-command corpus: drive the editor with
+/// generated key sequences over multi-byte text and assert it neither panics
+/// nor corrupts the buffer.
+///
+/// Deterministic (fixed-seed LCG, no `rand` dependency), so any failure is
+/// reproducible from the reported case.  The committed case count is sized to
+/// keep the suite fast; raising it to 200_000 with sequences of up to 40 keys
+/// is what turned up the `L`, `Y` and text-object defects fixed alongside it,
+/// and is clean at that depth.
+#[test]
+fn test_generated_keys_over_multibyte_text_never_panic() {
+    // Excludes anything that can reach the filesystem or the shell: ':' (ex
+    // commands), 'Z' (ZZ writes the file), and '!' -- the filter operator,
+    // which with '>' and Enter in the alphabet runs shell redirections and
+    // really does litter the working directory.
+    const KEYS: &[char] = &[
+        'h', 'j', 'k', 'l', 'w', 'W', 'b', 'B', 'e', 'E', '0', '^', '$', 'G', 'H', 'L', 'M', '%',
+        '|', '(', ')', '{', '}', 'x', 'X', 'D', 'J', 'p', 'P', 'u', '.', '~', 'd', 'y', 'c', 's',
+        'r', 'a', 'i', 'A', 'I', 'o', 'O', 'R', 'f', 't', 'F', 'T', 'n', 'N', '1', '2', '3', 'é',
+        'ö', '\x1b', '\x1b', '"', 'q', 'm', '\'', '`', 'Y', 'C', 'S', '_', '+', '-', '\n', '\t',
+        '\x7f', '&', 'g', '[', ']', '<', '>',
+    ];
+    const SEEDS: &[&str] = &[
+        "héllo wörld — naïve\nsecond ligne aé\nthird\n",
+        "αβγ δεζ\nηθι\n",
+        "\ta\tb\n\né\n",
+        "one\ntwo\nthree\n",
+        "",
+        "é",
+        "\n\n\n",
+        "   \n\ta\n",
+    ];
+
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+
+    for case in 0..5000 {
+        let seed = SEEDS[next() % SEEDS.len()];
+        let len = 1 + next() % 40;
+        let keys: String = (0..len).map(|_| KEYS[next() % KEYS.len()]).collect();
+
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text(seed);
+        // Errors are fine (many sequences are invalid); panics are not.
+        let _ = editor.execute_keys(&keys);
+        // Always leave insert mode, so the next assertion sees a settled state.
+        let _ = editor.execute_keys("\x1b");
+
+        let text = editor.get_buffer_text();
+        let cursor = editor.get_cursor();
+        let line = text
+            .lines()
+            .nth(cursor.line.saturating_sub(1))
+            .unwrap_or("");
+        assert!(
+            line.is_char_boundary(cursor.column.min(line.len())),
+            "case {} keys {:?} on {:?}: cursor at byte {} is mid-character in {:?}",
+            case,
+            keys,
+            seed,
+            cursor.column,
+            line
+        );
+    }
+}

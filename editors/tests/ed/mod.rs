@@ -2055,3 +2055,65 @@ fn test_ed_global_change_with_continued_input_still_works() {
         "ZZZ\nZZZ\nbar\n",
     );
 }
+
+// ============================================================================
+// Phase 7 — marks follow their line
+// ============================================================================
+//
+// POSIX (ed, `k`) says only that `k` marks the addressed line; it does not say
+// what happens to a mark when that line is later moved, or when lines are
+// added or removed above it. Historical ed stores the buffer as a linked list
+// and marks as node pointers, so the mark follows its text for free. This
+// implementation stores line *numbers* and renumbered them in `delete` only,
+// so after `1m$` a mark silently denoted a different line of text -- the worst
+// of the options, since it is neither correct nor visibly broken.
+//
+// Every expectation below was cross-checked against /bin/ed on this machine.
+
+/// The marked line moves; the mark goes with it.
+#[test]
+fn test_ed_mark_follows_moved_line() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1m$\n'ap\nQ\n", "C\n");
+}
+
+/// A copy above the mark shifts it down; the copy itself is unmarked.
+#[test]
+fn test_ed_mark_survives_copy_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1t0\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_insert_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1i\nNEW\n.\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_append_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1a\nNEW\n.\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_delete_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1d\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_join_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1,2j\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_change_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1c\nX\nY\n.\n'ap\nQ\n", "C\n");
+}
+
+/// A mark whose line no longer exists is an error, not a silent wrong answer.
+#[test]
+fn test_ed_mark_on_deleted_line_is_error() {
+    ed_test_code("a\nA\nB\nC\n.\n3ka\n3d\n'ap\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_mark_on_changed_line_is_error() {
+    ed_test_code("a\nA\nB\nC\n.\n3ka\n3c\nX\n.\n'ap\nQ\n", "?\n", 1);
+}

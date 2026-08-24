@@ -1859,3 +1859,67 @@ fn test_ed_x_command_is_not_recognized() {
         "a rejected `x` must not write"
     );
 }
+
+// ============================================================================
+// Phase 4 — the quit warning must re-arm
+// ============================================================================
+//
+// POSIX (ed, DESCRIPTION): ed warns when `e` or `q` would destroy a modified
+// buffer, "and shall continue in command mode with the current line number
+// unchanged. If the `e` or `q` command is repeated with no intervening
+// command, ed shall exit." The flag was set once and never cleared, so any
+// later `q` exited silently no matter how much had been edited since.
+
+#[test]
+fn test_ed_quit_warning_rearms_after_intervening_command() {
+    // First `q` warns. `1p` intervenes. The second `q` must warn again rather
+    // than discarding "bar".
+    ed_test_code("a\nfoo\n.\nq\n1p\nq\nQ\n", "?\nfoo\n?\n", 1);
+}
+
+/// The other half of the same sentence: repeated with *no* intervening
+/// command, the second `q` exits.
+#[test]
+fn test_ed_quit_repeated_without_intervening_command_exits() {
+    ed_test_code("a\nfoo\n.\nq\nq\n", "?\n", 1);
+}
+
+/// A command that errors is still an intervening command.
+#[test]
+fn test_ed_quit_warning_rearms_after_failed_command() {
+    ed_test_code("a\nfoo\n.\nq\nZ\nq\nQ\n", "?\n?\n?\n", 1);
+}
+
+/// Editing after the warning re-arms it, so the edit cannot be lost silently.
+#[test]
+fn test_ed_quit_warning_rearms_after_further_editing() {
+    ed_test_code("a\nfoo\n.\nq\na\nbar\n.\nq\nQ\n", "?\n?\n", 1);
+}
+
+/// The generic re-arm subsumes the old per-command clears after `e` and `w`,
+/// but only because every editing command is itself an intervening command.
+/// Pin that: force-edit, edit again, then `q` must still warn.
+#[test]
+fn test_ed_quit_warning_rearms_after_force_edit_then_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    fs::write(&target, "orig\n").unwrap();
+
+    let (code, out, _err) = ed_in_dir(dir.path(), &["-s"], "a\nfoo\n.\nE f.txt\na\nbar\n.\nq\nQ\n");
+    assert_eq!(code, 1);
+    assert_eq!(out, "?\n", "the q after re-editing must warn, not exit");
+}
+
+/// Likewise after a successful write: writing clears `modified`, so `q` exits
+/// on its own merits rather than on a stale flag.
+#[test]
+fn test_ed_quit_after_write_exits_without_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out, _err) = ed_in_dir(dir.path(), &["-s"], "a\nfoo\n.\nw out.txt\nq\n");
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "foo\n"
+    );
+}

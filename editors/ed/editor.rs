@@ -458,11 +458,21 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         match parse(&full_line) {
             Ok(cmd) => {
+                // POSIX (ed, DESCRIPTION): ed exits on a repeated `e`/`q`
+                // only when the repeat has "no intervening command", so any
+                // other command re-arms the warning.  Without this the flag
+                // latched on the first warning and every later `q` discarded
+                // the buffer silently, however much had been edited since.
+                if !matches!(cmd, Command::Quit(_) | Command::Edit(..)) {
+                    self.quit_warning_given = false;
+                }
                 if let Err(e) = self.execute_command(cmd) {
                     self.print_error(&e)?;
                 }
             }
             Err(e) => {
+                // A command that failed to parse still intervened.
+                self.quit_warning_given = false;
                 self.print_error(&e)?;
             }
         }
@@ -556,7 +566,6 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     let bytes = self.buf.read_file(&path)?;
                     self.print_bytes(bytes)?;
                 }
-                self.quit_warning_given = false;
                 Ok(())
             }
             Command::Filename(filename) => {
@@ -699,7 +708,6 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     }
                     self.print_bytes(bytes)?;
                 }
-                self.quit_warning_given = false;
                 // Only on success: a failed write leaves the buffer unsaved,
                 // so quitting would be exactly the data loss `wq` prevents.
                 if quit {

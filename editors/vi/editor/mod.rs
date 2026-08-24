@@ -2000,8 +2000,8 @@ impl Editor {
             } else {
                 // d + motion
                 let start = self.buffer.cursor();
-                if let Some(res) = self.execute_motion(mot) {
-                    let range = self.operator_region(start, &res);
+                let res = self.execute_motion(mot);
+                if let Some(range) = self.operator_region(start, mot, res.as_ref()) {
                     let result =
                         delete(&mut self.buffer, range, &mut self.registers, cmd.register)?;
                     self.record_removal(range, &result);
@@ -2029,8 +2029,8 @@ impl Editor {
             } else {
                 // y + motion
                 let start = self.buffer.cursor();
-                if let Some(res) = self.execute_motion(mot) {
-                    let range = self.operator_region(start, &res);
+                let res = self.execute_motion(mot);
+                if let Some(range) = self.operator_region(start, mot, res.as_ref()) {
                     let _ = yank(&self.buffer, range, &mut self.registers, cmd.register);
                 }
             }
@@ -2134,8 +2134,7 @@ impl Editor {
                 } else {
                     self.execute_motion(mot)
                 };
-                if let Some(res) = res {
-                    let range = self.operator_region(start, &res);
+                if let Some(range) = self.operator_region(start, mot, res.as_ref()) {
                     self.undo.begin_group();
                     let result =
                         change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
@@ -2361,11 +2360,37 @@ impl Editor {
     fn operator_region(
         &self,
         start: Position,
-        res: &crate::command::motion::MotionResult,
-    ) -> Range {
+        mot: &crate::command::MotionCommand,
+        res: Option<&crate::command::motion::MotionResult>,
+    ) -> Option<Range> {
         use crate::command::motion::MotionClass;
 
-        match res.class {
+        // POSIX (vi, "Delete"): "If the motion command is `w` or `W`, and the
+        // last word on the line is being deleted, the region shall end at the
+        // last character of the line."  So `dw` never joins lines -- and on
+        // the last word of the last line it still deletes that word, even
+        // though `w` itself reports failure there because it cannot advance.
+        let word_runs_off_the_line = match res {
+            None => true,
+            Some(r) => {
+                r.class == MotionClass::Exclusive
+                    && (r.position.line != start.line || r.position.column <= start.column)
+            }
+        };
+        if matches!(mot.motion, 'w' | 'W') && word_runs_off_the_line {
+            let end_col = self.buffer.line(start.line).map(|l| l.len()).unwrap_or(0);
+            if end_col <= start.column {
+                return None;
+            }
+            return Some(Range::new(
+                start,
+                Position::new(start.line, end_col),
+                BufferMode::Character,
+            ));
+        }
+
+        let res = res?;
+        Some(match res.class {
             MotionClass::Linewise => Range::lines(start, res.position),
             MotionClass::Inclusive => {
                 // Extend past the character the motion landed on. Only
@@ -2384,7 +2409,7 @@ impl Editor {
                 Range::new(start, end, BufferMode::Character)
             }
             MotionClass::Exclusive => Range::new(start, res.position, BufferMode::Character),
-        }
+        })
     }
 
     /// Execute filter operator (! with motion).

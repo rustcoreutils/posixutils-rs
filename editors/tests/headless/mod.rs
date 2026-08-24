@@ -3101,3 +3101,37 @@ fn test_ctrl_caret_warns_before_discarding_a_modified_buffer() {
         editor.get_message()
     );
 }
+
+/// POSIX (vi, "Delete"): "If the motion command is `w` or `W`, and the last
+/// word on the line is being deleted, the region shall end at the last
+/// character of the line."
+///
+/// `w` on the last word has nowhere to advance to within the line, so the
+/// region came out empty and `dw` deleted nothing at all.
+#[test]
+fn test_delete_word_on_the_last_word_of_a_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two\n");
+    editor.execute_keys("wdw").unwrap();
+    assert_eq!(editor.get_buffer_text(), "one \n");
+}
+
+/// The same rule keeps `dw` from joining lines.
+#[test]
+fn test_delete_word_does_not_join_lines() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two\nthree four\n");
+    editor.execute_keys("wdw").unwrap();
+    assert_eq!(editor.get_buffer_text(), "one \nthree four\n");
+}
+
+#[test]
+fn test_yank_word_on_the_last_word_of_a_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two\nthree\n");
+    editor.execute_keys("wyw").unwrap();
+    assert_eq!(
+        editor.get_unnamed_register().map(|r| r.text.as_str()),
+        Some("two")
+    );
+}

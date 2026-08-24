@@ -185,3 +185,80 @@ fn codegen_debug_variable_locations_use_the_real_base() {
         );
     }
 }
+
+/// No two variables in one function answer to the same name.
+///
+/// `debug_name` strips the linearizer's uniquing suffix so a debugger shows
+/// `c` rather than `c.4`. But there are no `DW_TAG_lexical_block` DIEs yet, so
+/// every local and parameter is a sibling directly under the subprogram -- and
+/// once two of them are shadowed into the same `DW_AT_name`, a debugger has to
+/// pick one. gdb picks the last, so `print x` where the *outer* `x` is in scope
+/// answered with the inner one's value: a wrong answer, silently, on ordinary C.
+///
+/// Where a name collides the suffix is kept, so each DIE names one variable.
+/// That is not what a debugger should ideally show -- lexical blocks are the
+/// real answer -- but no variable answers to a name that means another.
+#[test]
+fn codegen_debug_shadowed_variables_get_distinct_names() {
+    let src = r#"
+        int sink(int *p);
+        int f(int x) {
+            int y = 1;
+            sink(&x);
+            sink(&y);
+            {
+                int y = 2;      /* shadows the outer y */
+                sink(&y);
+                {
+                    int y = 3;  /* and again */
+                    sink(&y);
+                }
+            }
+            return y;
+        }
+    "#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("debug_shadow", triple, src, &["-g", "-O0"]);
+        // Every name the DIEs carry, in emission order.
+        let names: Vec<&str> = asm
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix(".asciz \""))
+            .filter_map(|l| l.strip_suffix('"'))
+            .collect();
+        let ys: Vec<&&str> = names.iter().filter(|n| n.starts_with('y')).collect();
+        assert!(
+            ys.len() >= 2,
+            "{triple}: expected several shadowed `y`s among {names:?}"
+        );
+        let mut uniq = ys.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            ys.len(),
+            "{triple}: shadowed variables must not share a DW_AT_name; got {ys:?}"
+        );
+    }
+}
+
+/// A name that is not shadowed keeps its plain spelling.
+///
+/// The disambiguation above must not cost the ordinary case its readable
+/// names -- `c`, not `c.4`.
+#[test]
+fn codegen_debug_unshadowed_names_are_plain() {
+    let src = r#"
+        int sink(int *p);
+        int f(void) { int counter = 7; sink(&counter); return counter; }
+    "#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("debug_plain_name", triple, src, &["-g", "-O0"]);
+        assert!(
+            asm.contains(".asciz \"counter\""),
+            "{triple}: an unshadowed local should be named plainly:\n{asm}"
+        );
+    }
+}

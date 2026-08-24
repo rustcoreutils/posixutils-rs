@@ -485,7 +485,37 @@ fn emit_fn_die<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, f: &FnDie, dies:
         type_ref(base, &r);
     }
 
-    for v in &f.vars {
+    // Two variables may share a source name: an inner block shadowing an outer
+    // one, or a local shadowing a parameter. Their DIEs are siblings here --
+    // there are no `DW_TAG_lexical_block` DIEs yet to nest them in -- and two
+    // siblings with the same `DW_AT_name` leave a debugger to pick one. gdb
+    // picks the last, so `print x` at a point where the *outer* `x` is in
+    // scope answered with the inner one's value: a wrong answer, silently.
+    //
+    // Where a name collides, every DIE carrying it keeps the linearizer's
+    // uniquing suffix instead, so `x.4` and `x.9` name one variable each. That
+    // is not what a debugger should show -- the real fix is lexical blocks --
+    // but every variable stays reachable and none of them answers to a name
+    // that means another.
+    let display: Vec<&str> = {
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for v in &f.vars {
+            *seen.entry(debug_name(&v.name)).or_insert(0) += 1;
+        }
+        f.vars
+            .iter()
+            .map(|v| {
+                let short = debug_name(&v.name);
+                if seen.get(short).copied().unwrap_or(0) > 1 {
+                    v.name.as_str()
+                } else {
+                    short
+                }
+            })
+            .collect()
+    };
+
+    for (v, name) in f.vars.iter().zip(display) {
         // Without a type DIE there is nothing for a debugger to interpret the
         // bytes as, so the variable is left out rather than described wrongly.
         let Some(ty) = dies.label(v.typ) else {
@@ -498,7 +528,7 @@ fn emit_fn_die<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, f: &FnDie, dies:
             (false, false) => ABBREV_VAR_NOLOC,
         };
         base.push_directive(Directive::Uleb128(code));
-        base.push_directive(Directive::Asciz(debug_name(&v.name).to_string()));
+        base.push_directive(Directive::Asciz(name.to_string()));
         base.push_directive(Directive::Byte(1)); // DW_AT_decl_file
         base.push_directive(Directive::Long(v.decl_line as i64));
         type_ref(base, &ty);

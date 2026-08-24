@@ -106,32 +106,45 @@ impl InputReader {
     }
 
     /// Parse CSI (Control Sequence Introducer) sequences: ESC [
+    ///
+    /// Consumes the whole sequence per ECMA-48: any number of parameter bytes
+    /// (0x30-0x3F) and intermediate bytes (0x20-0x2F), then exactly one final
+    /// byte (0x40-0x7E).
+    ///
+    /// Stopping at the first byte that was not a digit or `~` left the rest of
+    /// the sequence in the input stream, where it was read as ordinary
+    /// commands: a Ctrl-Right arrow (`ESC [ 1 ; 5 C`) delivered `5C`, which
+    /// changes to the end of the line -- a destructive edit from a cursor key.
     fn parse_csi_sequence(&mut self) -> Result<Key> {
-        let b = self.read_byte()?;
+        let mut params: Vec<u8> = Vec::new();
+        let final_byte = loop {
+            let b = self.read_byte()?;
+            match b {
+                0x30..=0x3F => params.push(b),
+                0x20..=0x2F => {} // intermediate bytes: consumed, unused
+                0x40..=0x7E => break b,
+                // Not part of a CSI sequence at all; give up rather than
+                // consume unbounded input.
+                _ => return Ok(Key::Unknown),
+            }
+        };
 
-        match b {
+        // The leading numeric parameter, if there is one.
+        let num = params
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .fold(0u8, |acc, b| {
+                acc.saturating_mul(10).saturating_add(b - b'0')
+            });
+
+        match final_byte {
             b'A' => Ok(Key::Up),
             b'B' => Ok(Key::Down),
             b'C' => Ok(Key::Right),
             b'D' => Ok(Key::Left),
             b'H' => Ok(Key::Home),
             b'F' => Ok(Key::End),
-            b'1'..=b'9' => {
-                // Could be function key or other
-                let mut num = b - b'0';
-                loop {
-                    let next = self.read_byte()?;
-                    match next {
-                        b'0'..=b'9' => {
-                            num = num.saturating_mul(10).saturating_add(next - b'0');
-                        }
-                        b'~' => {
-                            return Ok(self.csi_number_to_key(num));
-                        }
-                        _ => return Ok(Key::Unknown),
-                    }
-                }
-            }
+            b'~' => Ok(self.csi_number_to_key(num)),
             _ => Ok(Key::Unknown),
         }
     }
@@ -185,8 +198,12 @@ impl InputReader {
             *byte = self.read_byte()?;
         }
 
-        let s = std::str::from_utf8(&bytes[..len])
-            .map_err(|_| ViError::InvalidCommand("Invalid UTF-8 sequence".to_string()))?;
+        // An undecodable byte is bad input, not a reason to end the session:
+        // propagating the error unwound out of the visual loop and exited vi
+        // *without* preserving the buffer.
+        let Ok(s) = std::str::from_utf8(&bytes[..len]) else {
+            return Ok(Key::Unknown);
+        };
 
         if let Some(c) = s.chars().next() {
             Ok(Key::Char(c))

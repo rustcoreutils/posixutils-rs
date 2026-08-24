@@ -3131,7 +3131,10 @@ impl Editor {
     fn execute_shell_command(&mut self, command: &str) -> Result<()> {
         let warn = self.options.warn && self.buffer.is_modified();
 
-        // Temporarily restore terminal to cooked mode
+        // Temporarily restore terminal to cooked mode.  Remember whether it
+        // was raw to begin with: ex never is, and re-enabling unconditionally
+        // left it raw afterwards, where it stopped delivering whole lines.
+        let was_raw = self.terminal.is_raw_mode();
         self.terminal.disable_raw_mode()?;
 
         if warn {
@@ -3158,8 +3161,10 @@ impl Editor {
             let _ = io::stdin().read(&mut buf);
         }
 
-        // Re-enable raw mode
-        self.terminal.enable_raw_mode()?;
+        // Restore raw mode only if it was raw before.
+        if was_raw {
+            self.terminal.enable_raw_mode()?;
+        }
 
         // Force full screen redraw
         self.terminal.clear_screen()?;
@@ -3185,7 +3190,12 @@ impl Editor {
         // #V18: the child inherits our stdin now (#X23), so it must not find
         // the terminal in raw mode. `execute_shell_command` already brackets
         // its child this way; this path did not.
-        let was_raw = self.terminal.disable_raw_mode().is_ok();
+        // `disable_raw_mode` reports success whether or not it had anything
+        // to do, so `.is_ok()` was always true -- in ex, which is never raw,
+        // that switched the terminal *into* raw mode and it stopped
+        // delivering whole lines.
+        let was_raw = self.terminal.is_raw_mode();
+        self.terminal.disable_raw_mode()?;
         let output = self.shell.execute_capture(command);
         if was_raw {
             let _ = self.terminal.enable_raw_mode();

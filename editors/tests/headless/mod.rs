@@ -2925,3 +2925,57 @@ fn test_operator_with_an_unset_mark_changes_nothing() {
     let _ = editor.execute_keys("d'z");
     assert_eq!(editor.get_buffer_text(), "one\ntwo\n");
 }
+
+/// Filtering a buffer through a command writes all of the input before
+/// reading any of the output. Once the child's output fills the pipe buffer
+/// (~64 KB) it blocks writing, while the editor is still blocked writing its
+/// input -- both wait for the other and the editor hangs.
+///
+/// Run on a worker thread so a regression fails the suite instead of hanging
+/// it.
+#[test]
+fn test_shell_filter_does_not_deadlock_on_a_large_buffer() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Comfortably past a pipe buffer in both directions.
+        let text: String = (0..20_000)
+            .map(|i| format!("line {} of filler text\n", i))
+            .collect();
+        let expected_lines = text.lines().count();
+
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text(&text);
+        let r = editor
+            .execute_keys(":%!cat\n")
+            .map(|()| (editor.get_buffer_text().lines().count(), expected_lines));
+        let _ = tx.send(r);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(Ok((got, want))) => assert_eq!(got, want, "cat must round-trip every line"),
+        Ok(Err(e)) => panic!("filter failed: {}", e),
+        Err(_) => panic!("`:%!cat` deadlocked on a buffer larger than the pipe buffer"),
+    }
+}
+
+/// A filter that exits without reading all its input gives the writer EPIPE.
+/// That is the command's choice, not an editor error.
+#[test]
+fn test_shell_filter_tolerates_a_command_that_stops_reading() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let text: String = (0..20_000).map(|i| format!("line {}\n", i)).collect();
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text(&text);
+        let r = editor
+            .execute_keys(":%!head -1\n")
+            .map(|()| editor.get_buffer_text());
+        let _ = tx.send(r);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(Ok(text)) => assert_eq!(text.trim_end(), "line 0"),
+        Ok(Err(e)) => panic!("a filter that stops reading must not be an error: {}", e),
+        Err(_) => panic!("`:%!head -1` deadlocked"),
+    }
+}

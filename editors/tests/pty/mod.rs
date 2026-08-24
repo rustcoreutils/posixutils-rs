@@ -652,3 +652,169 @@ fn test_pty_vi_preserves_the_buffer_on_sigterm() {
         dir
     );
 }
+
+/// `:!command` puts the terminal back in cooked mode for the child and then
+/// restores it. It restored unconditionally, and `disable_raw_mode` reports
+/// success whether or not it had anything to do -- so in ex, which is never
+/// in raw mode, the "restore" put the terminal *into* raw mode. The tty then
+/// stopped translating CR and delivering whole lines, and the next command
+/// never arrived: the session hung.
+#[test]
+fn test_pty_ex_is_not_left_in_raw_mode_after_a_shell_command() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("raw.txt");
+    fs::write(&file_path, "alpha\nbeta\n").unwrap();
+
+    // `ex` is a sibling symlink of the vi binary.
+    let ex_path = Path::new(env!("CARGO_BIN_EXE_vi"))
+        .parent()
+        .unwrap()
+        .join("ex");
+    if !ex_path.exists() {
+        return; // build script could not create the symlink; nothing to test
+    }
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 25,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(ex_path);
+    cmd.arg(&file_path);
+    cmd.env("TERM", "vt100");
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    spawn_reader_drain(reader);
+    let mut writer = pair.master.take_writer().unwrap();
+
+    thread::sleep(Duration::from_millis(400));
+    write_keys(&mut writer, "!echo hi\r");
+    thread::sleep(Duration::from_millis(400));
+    // The shell path prompts "Press ENTER ... to continue" and consumes one
+    // byte, so answer that before sending the next command.
+    write_keys(&mut writer, "\r");
+    thread::sleep(Duration::from_millis(200));
+    // If the terminal was left raw, this CR is never translated to a newline
+    // and ex waits for a line that will not arrive.
+    write_keys(&mut writer, "q!\r");
+
+    // `wait_with_timeout` returns quietly on timeout, so assert on the exit.
+    let start = std::time::Instant::now();
+    let mut exited = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill();
+    }
+    assert!(
+        exited,
+        "ex did not act on `q!` after a shell command -- the terminal was \
+         left in raw mode, so the CR never arrived as a line"
+    );
+}
+
+/// A parameterized cursor key must be consumed whole.
+///
+/// `parse_csi_sequence` stopped at the first byte that was not a digit or
+/// `~`, leaving the rest in the input stream to be read as ordinary commands:
+/// Ctrl-Right (`ESC [ 1 ; 5 C`) delivered `5C`, and `C` changes to the end of
+/// the line -- a destructive edit produced by pressing an arrow key.
+#[test]
+fn test_pty_vi_parameterized_cursor_key_does_not_edit() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("csi.txt");
+    fs::write(&file_path, "alpha beta gamma\n").unwrap();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 25,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
+    cmd.arg(&file_path);
+    cmd.env("TERM", "vt100");
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    spawn_reader_drain(reader);
+    let mut writer = pair.master.take_writer().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    // Ctrl-Right, twice.
+    write_keys(&mut writer, "\x1b[1;5C\x1b[1;5C");
+    thread::sleep(Duration::from_millis(200));
+    write_keys(&mut writer, ":wq\r");
+    wait_with_timeout(&mut child, Duration::from_secs(5));
+
+    let saved = fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        saved, "alpha beta gamma\n",
+        "a cursor key must not change the buffer"
+    );
+}
+
+/// An undecodable byte is bad input, not a reason to end the session.
+#[test]
+fn test_pty_vi_survives_invalid_utf8_input() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("bad.txt");
+    fs::write(&file_path, "alpha\n").unwrap();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 25,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
+    cmd.arg(&file_path);
+    cmd.env("TERM", "vt100");
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    spawn_reader_drain(reader);
+    let mut writer = pair.master.take_writer().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    // A lone continuation byte and a truncated two-byte sequence.
+    writer.write_all(&[0xC3, 0x28]).unwrap();
+    writer.flush().unwrap();
+    thread::sleep(Duration::from_millis(200));
+    // vi must still be here to act on this. No leading ESC: the reader takes
+    // the byte after an ESC as part of an escape sequence, so it would eat
+    // the `o`.
+    write_keys(&mut writer, "oZ\x1b");
+    thread::sleep(Duration::from_millis(200));
+    write_keys(&mut writer, ":wq\r");
+    wait_with_timeout(&mut child, Duration::from_secs(5));
+
+    let saved = fs::read_to_string(&file_path).unwrap();
+    assert!(
+        saved.contains('Z'),
+        "vi must survive undecodable input and still save; got {:?}",
+        saved
+    );
+}

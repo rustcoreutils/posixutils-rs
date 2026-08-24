@@ -14,9 +14,8 @@ use binrw::{binrw, BinReaderExt, BinWrite, Endian};
 #[cfg(target_os = "linux")]
 use libc::sa_family_t;
 use libc::{
-    addrinfo, getaddrinfo, gethostname, getpid, getpwuid, getservbyname, getuid, ioctl, signal,
-    sockaddr_in, winsize, AF_INET, AI_CANONNAME, SIGINT, SIGPIPE, SIGQUIT, SOCK_DGRAM,
-    STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
+    gethostname, getpid, getpwuid, getservbyname, getuid, ioctl, signal, winsize, AF_INET, SIGINT,
+    SIGPIPE, SIGQUIT, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
 };
 
 use std::{
@@ -26,12 +25,12 @@ use std::{
     mem::{size_of, zeroed},
     net::{
         self, AddrParseError, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener,
-        TcpStream, UdpSocket,
+        TcpStream, ToSocketAddrs, UdpSocket,
     },
     os::fd::AsRawFd,
     os::unix::net::UnixDatagram,
     path::{Path, PathBuf},
-    process, ptr,
+    process,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, LazyLock, Mutex},
     thread,
@@ -1425,29 +1424,16 @@ fn get_addrs(
     my_machine_name: &str,
     his_machine_name: &str,
 ) -> Result<(Ipv4Addr, Ipv4Addr, u16), std::io::Error> {
-    let lhost = CString::new(my_machine_name)?;
-    let rhost = CString::new(his_machine_name)?;
     let service = CString::new("ntalk")?;
     let protocol = CString::new("udp")?;
 
     msg.pid = unsafe { getpid() };
 
-    let hints = addrinfo {
-        ai_family: AF_INET, // IPv4 only
-        ai_socktype: SOCK_DGRAM,
-        ai_flags: AI_CANONNAME,
-        ai_protocol: 0,
-        ai_addrlen: 0,
-        ai_canonname: ptr::null_mut(),
-        ai_addr: ptr::null_mut(),
-        ai_next: ptr::null_mut(),
-    };
-
-    let my_machine_addr = resolve_address(&lhost, &hints, my_machine_name)?;
+    let my_machine_addr = resolve_address(my_machine_name)?;
 
     // If the remote machine is different from the local one, resolve its IP address as well.
-    let his_machine_addr = if rhost != lhost {
-        resolve_address(&rhost, &hints, his_machine_name)?
+    let his_machine_addr = if his_machine_name != my_machine_name {
+        resolve_address(his_machine_name)?
     } else {
         my_machine_addr
     };
@@ -1458,82 +1444,45 @@ fn get_addrs(
     Ok((my_machine_addr, his_machine_addr, daemon_port))
 }
 
-/// Resolves the IP address for a given host using the specified hints for address resolution.
+/// Resolves the IPv4 address for a given host.
 ///
 /// # Arguments
 ///
-/// * `host` - A `CString` representing the hostname to resolve.
-/// * `hints` - A reference to an `addrinfo` structure providing hints for the resolution process.
-/// * `host_name` - A string representing the hostname (for error reporting).
+/// * `host` - The hostname or address literal to resolve, also used for error
+///   reporting.
 ///
 /// # Returns
 ///
-/// Returns `Result<Ipv4Addr, io::Error>` containing the resolved IPv4 address on success, or an error if resolution fails.
-fn resolve_address(
-    host: &CString,
-    hints: &addrinfo,
-    host_name: &str,
-) -> Result<Ipv4Addr, io::Error> {
-    let mut res: *mut addrinfo = ptr::null_mut();
-    let err = unsafe { getaddrinfo(host.as_ptr(), ptr::null(), hints, &mut res) };
-
-    if err != 0 {
-        return Err(io::Error::new(
+/// Returns `Result<Ipv4Addr, io::Error>` containing the resolved IPv4 address
+/// on success, or an error if resolution fails.
+fn resolve_address(host: &str) -> Result<Ipv4Addr, io::Error> {
+    // `ToSocketAddrs` is getaddrinfo(3) with the allocation, the freeaddrinfo,
+    // and the sockaddr decoding handled by std, so this needs no unsafe and
+    // cannot leak the resolver's list. Port 0 because only the address is
+    // wanted here; talk's ports come from the service database and from the
+    // daemon's reply.
+    let addrs = (host, 0u16).to_socket_addrs().map_err(|e| {
+        io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "Error resolving address for {}: {}",
-                host_name,
-                unsafe { CStr::from_ptr(libc::gai_strerror(err)) }.to_string_lossy()
-            ),
-        ));
-    }
+            format!("Error resolving address for {}: {}", host, e),
+        )
+    })?;
 
-    // getaddrinfo allocates the list; it must be released on every path out of
-    // this function, including the not-found error below.
-    struct AddrInfoList(*mut addrinfo);
-    impl Drop for AddrInfoList {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { libc::freeaddrinfo(self.0) };
-            }
-        }
-    }
-    let list = AddrInfoList(res);
-
-    let mut addr = Ipv4Addr::UNSPECIFIED;
-    let mut ai = list.0;
-    while !ai.is_null() {
-        // SAFETY: `ai` is non-null here, and every `ai_next` in the chain is
-        // either null or points at an entry owned by `list`, which outlives
-        // this loop.
-        let ai_ref = unsafe { &*ai };
-
-        // Only trust `ai_addr` when the entry claims AF_INET *and* actually
-        // carries a large enough socket address. Casting on the family alone
-        // would read past the allocation if a resolver returned a shorter one.
-        if ai_ref.ai_family == AF_INET
-            && !ai_ref.ai_addr.is_null()
-            && ai_ref.ai_addrlen as usize >= size_of::<sockaddr_in>()
-        {
-            // Copy rather than forming a `&sockaddr_in`: the buffer belongs to
-            // libc and carries no alignment guarantee for that type.
-            // SAFETY: non-null and at least `sockaddr_in` bytes long, per the
-            // condition above.
-            let sockaddr = unsafe { ptr::read_unaligned(ai_ref.ai_addr as *const sockaddr_in) };
-            addr = Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr));
-            break;
-        }
-        ai = ai_ref.ai_next;
-    }
-
-    if addr == Ipv4Addr::UNSPECIFIED {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Address not found for {}", host_name),
-        ));
-    }
-
-    Ok(addr)
+    // The talk control message carries an Osockaddr, which is IPv4-only, so
+    // any IPv6 result is unusable. The wildcard address is no better: it names
+    // no peer to send to. Both are skipped rather than returned.
+    addrs
+        .filter_map(|addr| match addr {
+            SocketAddr::V4(v4) => Some(*v4.ip()),
+            SocketAddr::V6(_) => None,
+        })
+        .find(|ip| !ip.is_unspecified())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Address not found for {}", host),
+            )
+        })
 }
 
 /// Retrieves the port number for a given service and protocol by querying the system's service database.
@@ -2536,6 +2485,31 @@ mod tests {
         render("abc\n\x7f\x15", &mut win);
         let mut win = Window::new(0, 0, 0);
         render("x\n", &mut win);
+    }
+
+    /// `resolve_address` must map a name to its IPv4 address.
+    ///
+    /// These pin the contract that survived the move off the hand-rolled
+    /// getaddrinfo walk, so a future change cannot quietly alter which address
+    /// a name resolves to.
+    #[test]
+    fn test_resolve_address_literal_and_loopback() {
+        assert_eq!(resolve_address("127.0.0.1").unwrap(), Ipv4Addr::LOCALHOST);
+
+        // /etc/hosts, so no DNS traffic and no network dependency.
+        assert_eq!(resolve_address("localhost").unwrap(), Ipv4Addr::LOCALHOST);
+    }
+
+    /// talk's wire protocol carries only sockaddr_in, so an address with no
+    /// IPv4 form is a NotFound error rather than a silent 0.0.0.0.
+    #[test]
+    fn test_resolve_address_rejects_ipv6_only() {
+        let err = resolve_address("::1").expect_err("::1 has no IPv4 form");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        // The wildcard address names no peer, so it is not a usable result.
+        let err = resolve_address("0.0.0.0").expect_err("0.0.0.0 names no peer");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

@@ -2117,3 +2117,17 @@ fn test_ed_mark_on_deleted_line_is_error() {
 fn test_ed_mark_on_changed_line_is_error() {
     ed_test_code("a\nA\nB\nC\n.\n3ka\n3c\nX\n.\n'ap\nQ\n", "?\n", 1);
 }
+
+/// `^` anchors to the start of the line, so a global substitute must not
+/// re-anchor it at each restart. `s/^/> /g` produced "> a> b> c> " because
+/// `Regex::captures_at` searched the remaining substring without telling the
+/// regex engine that it was no longer at a beginning of line.
+#[test]
+fn test_ed_global_substitute_does_not_reanchor_caret() {
+    ed_test("a\nabc\n.\ns/^/> /g\n1,$p\nQ\n", "> abc\n");
+}
+
+#[test]
+fn test_ed_global_substitute_still_anchors_dollar() {
+    ed_test("a\nabc\n.\ns/$/!/g\n1,$p\nQ\n", "abc!\n");
+}

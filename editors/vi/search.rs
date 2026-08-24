@@ -16,7 +16,7 @@
 //! - N repeat in opposite direction
 //! - Pattern matching with BRE (Basic Regular Expressions)
 
-use crate::buffer::{Buffer, Position};
+use crate::buffer::{floor_char_boundary, next_char_boundary, Buffer, Position};
 use crate::error::{Result, ViError};
 use crate::options::Options;
 use plib::regex::{Match, Regex, RegexFlags};
@@ -179,17 +179,17 @@ impl SearchState {
             if let Some(line) = buffer.line(line_num) {
                 let content = line.content();
                 let search_start = if line_num == start_line {
-                    // Start after current position
-                    char_to_byte_offset(content, start_col + 1)
+                    // Start after the character under the cursor.
+                    next_char_boundary(content, start_col).unwrap_or(content.len())
                 } else {
                     0
                 };
 
-                if search_start < content.len() {
+                // `<=`, not `<`: an empty line has search_start == len == 0,
+                // and a pattern like `^$` matches exactly there.
+                if search_start <= content.len() {
                     if let Some(mat) = regex.find(&content[search_start..]) {
-                        let byte_pos = search_start + mat.start;
-                        let char_pos = byte_to_char_offset(content, byte_pos);
-                        return Ok(Position::new(line_num, char_pos));
+                        return Ok(Position::new(line_num, search_start + mat.start));
                     }
                 }
             }
@@ -201,8 +201,7 @@ impl SearchState {
                 if let Some(line) = buffer.line(line_num) {
                     let content = line.content();
                     if let Some(mat) = regex.find(content) {
-                        let char_pos = byte_to_char_offset(content, mat.start);
-                        return Ok(Position::new(line_num, char_pos));
+                        return Ok(Position::new(line_num, mat.start));
                     }
                 }
             }
@@ -210,11 +209,10 @@ impl SearchState {
             // Check start line before the starting column
             if let Some(line) = buffer.line(start_line) {
                 let content = line.content();
-                let search_end = char_to_byte_offset(content, start_col);
+                let search_end = floor_char_boundary(content, start_col);
                 if search_end > 0 {
                     if let Some(mat) = regex.find(&content[..search_end]) {
-                        let char_pos = byte_to_char_offset(content, mat.start);
-                        return Ok(Position::new(start_line, char_pos));
+                        return Ok(Position::new(start_line, mat.start));
                     }
                 }
             }
@@ -237,7 +235,7 @@ impl SearchState {
             if let Some(line) = buffer.line(line_num) {
                 let content = line.content();
                 let search_end = if line_num == start_line {
-                    char_to_byte_offset(content, start_col)
+                    floor_char_boundary(content, start_col)
                 } else {
                     content.len()
                 };
@@ -245,8 +243,7 @@ impl SearchState {
                 // Find last match before search_end
                 if search_end > 0 {
                     if let Some(pos) = find_last_match(regex, &content[..search_end]) {
-                        let char_pos = byte_to_char_offset(content, pos);
-                        return Ok(Position::new(line_num, char_pos));
+                        return Ok(Position::new(line_num, pos));
                     }
                 }
             }
@@ -259,8 +256,7 @@ impl SearchState {
                 if let Some(line) = buffer.line(line_num) {
                     let content = line.content();
                     if let Some(pos) = find_last_match(regex, content) {
-                        let char_pos = byte_to_char_offset(content, pos);
-                        return Ok(Position::new(line_num, char_pos));
+                        return Ok(Position::new(line_num, pos));
                     }
                 }
             }
@@ -268,12 +264,10 @@ impl SearchState {
             // Check start line after the starting column
             if let Some(line) = buffer.line(start_line) {
                 let content = line.content();
-                let search_start = char_to_byte_offset(content, start_col + 1);
+                let search_start = next_char_boundary(content, start_col).unwrap_or(content.len());
                 if search_start < content.len() {
                     if let Some(pos) = find_last_match(regex, &content[search_start..]) {
-                        let byte_pos = search_start + pos;
-                        let char_pos = byte_to_char_offset(content, byte_pos);
-                        return Ok(Position::new(start_line, char_pos));
+                        return Ok(Position::new(start_line, search_start + pos));
                     }
                 }
             }
@@ -411,19 +405,6 @@ fn build_replacement(template: &str, input: &str, matches: &[Match], prev: &str)
     }
 
     result
-}
-
-/// Convert character offset to byte offset.
-fn char_to_byte_offset(s: &str, char_offset: usize) -> usize {
-    s.char_indices()
-        .nth(char_offset)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
-}
-
-/// Convert byte offset to character offset.
-fn byte_to_char_offset(s: &str, byte_offset: usize) -> usize {
-    s[..byte_offset.min(s.len())].chars().count()
 }
 
 /// Substitute engine for :s command.
@@ -870,18 +851,6 @@ mod tests {
             SearchDirection::Backward.opposite(),
             SearchDirection::Forward
         );
-    }
-
-    #[test]
-    fn test_byte_char_offset_conversion() {
-        let s = "héllo";
-        assert_eq!(char_to_byte_offset(s, 0), 0);
-        assert_eq!(char_to_byte_offset(s, 1), 1);
-        assert_eq!(char_to_byte_offset(s, 2), 3); // 'é' is 2 bytes
-
-        assert_eq!(byte_to_char_offset(s, 0), 0);
-        assert_eq!(byte_to_char_offset(s, 1), 1);
-        assert_eq!(byte_to_char_offset(s, 3), 2);
     }
 
     #[test]

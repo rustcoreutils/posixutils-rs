@@ -1871,3 +1871,98 @@ fn test_generated_keys_over_multibyte_text_never_panic() {
         );
     }
 }
+
+// ============================================================================
+// Phase 9 — search reports byte offsets like everything else
+// ============================================================================
+//
+// `Position::column` is a byte offset everywhere in the editor, but
+// `search_forward`/`search_backward` both read `from.column` as a character
+// index and returned a character index in the same field. On any line with
+// multi-byte text before the match the cursor therefore landed short, and the
+// snapping added with the cursor invariant hid it as a silent off-by-N.
+
+#[test]
+fn test_search_forward_reports_a_byte_column() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("aé bcd\n");
+    editor.execute_keys("/bcd\n").unwrap();
+    // a=0, é=1..2, space=3, b=4.
+    assert_eq!(editor.get_cursor().column, 4);
+}
+
+#[test]
+fn test_search_backward_reports_a_byte_column() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("aé bcd é xy\n");
+    editor.execute_keys("$?bcd\n").unwrap();
+    assert_eq!(editor.get_cursor().column, 4);
+}
+
+/// The cursor lands on the match, so deleting a word there deletes the match.
+#[test]
+fn test_search_then_operate_hits_the_match() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("aé bcd\n");
+    editor.execute_keys("/bcd\n").unwrap();
+    // The cursor is on the match, so `D` truncates exactly at it.
+    editor.execute_keys("D").unwrap();
+    assert_eq!(editor.get_buffer_text(), "aé \n");
+}
+
+/// An empty line has nothing after the search start, and the "is there room
+/// to search" guard used a strict `<` -- so `/^$/` could never match one.
+#[test]
+fn test_search_finds_an_empty_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\n\nthree\n");
+    editor.execute_keys("/^$\n").unwrap();
+    assert_eq!(editor.get_cursor().line, 2);
+}
+
+#[test]
+fn test_search_next_and_previous_on_multibyte_lines() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("aé x\nbö x\ncü x\n");
+    // Each line is "<ascii><2-byte> x", so the x sits at byte 4, not char 3.
+    editor.execute_keys("/x\n").unwrap();
+    assert_eq!(
+        (editor.get_cursor().line, editor.get_cursor().column),
+        (1, 4)
+    );
+    editor.execute_keys("n").unwrap();
+    assert_eq!(
+        (editor.get_cursor().line, editor.get_cursor().column),
+        (2, 4)
+    );
+    editor.execute_keys("n").unwrap();
+    assert_eq!(
+        (editor.get_cursor().line, editor.get_cursor().column),
+        (3, 4)
+    );
+    editor.execute_keys("N").unwrap();
+    assert_eq!(
+        (editor.get_cursor().line, editor.get_cursor().column),
+        (2, 4)
+    );
+}
+
+/// `^` anchors to the start of the *line*, so a global substitute must not
+/// re-anchor it at each restart: `:s/^/> /g` inserts one prefix, not one per
+/// character.
+#[test]
+fn test_global_substitute_does_not_reanchor_caret() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abc\n");
+    editor.execute_keys(":s/^/> /g\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "> abc\n");
+}
+
+/// Likewise `$`.
+#[test]
+fn test_global_substitute_does_not_reanchor_dollar() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abc\n");
+    editor.execute_keys(":s/$/!/g\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "abc!\n");
+}

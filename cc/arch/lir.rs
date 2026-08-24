@@ -756,6 +756,12 @@ pub enum Directive {
 
     /// .quad symbol - emit 64-bit symbol address (for relocations)
     QuadSym(Symbol),
+    /// A relocatable four-byte symbol reference: `.long sym`.
+    ///
+    /// Needed for DWARF section offsets, which are 32-bit even on a 64-bit
+    /// target -- `DW_AT_stmt_list` names this unit's line program, and the
+    /// linker has to relocate it as the units are combined.
+    LongSym(Symbol),
 
     /// .quad symbol+offset - emit 64-bit symbol address with offset (for member pointers)
     QuadSymOffset(Symbol, i64),
@@ -768,6 +774,8 @@ pub enum Directive {
 
     /// .cfi_endproc - end procedure CFI
     CfiEndProc,
+    /// `.size sym, .-sym` -- see [`Directive::size_to_here`].
+    SizeToHere { sym: Symbol },
 
     /// .cfi_def_cfa register, offset - set CFA to register + offset
     CfiDefCfa { reg: String, offset: i32 },
@@ -798,6 +806,10 @@ pub enum Directive {
 
     /// .section .debug_abbrev (ELF) or __DWARF,__debug_abbrev (Mach-O)
     DebugAbbrev,
+    /// The `.debug_line` section. Only ever entered to place the label that
+    /// `DW_AT_stmt_list` names -- the line program itself is built by the
+    /// assembler from the `.loc` directives.
+    DebugLine,
 
     /// .uleb128 value - unsigned LEB128 encoding for DWARF
     Uleb128(u64),
@@ -893,6 +905,18 @@ impl Directive {
         Directive::Size {
             sym: Symbol::global(name),
             size,
+        }
+    }
+
+    /// `.size sym, .-sym`: the symbol runs from its label to here.
+    ///
+    /// A function's size is not known when its label is emitted, so it is
+    /// spelled as the distance to the current position rather than a number.
+    /// Without it the symbol records `st_size = 0`, and a debugger asked about
+    /// an address inside the function cannot tell which function owns it.
+    pub fn size_to_here(name: impl Into<String>) -> Self {
+        Directive::SizeToHere {
+            sym: Symbol::global(name),
         }
     }
 
@@ -1102,6 +1126,13 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".size {}, {}", sym.format_for_target(target), size);
                 }
             }
+            Directive::SizeToHere { sym } => {
+                // ELF only - Mach-O has no .size
+                if !matches!(target.os, Os::MacOS) {
+                    let name = sym.format_for_target(target);
+                    let _ = writeln!(out, ".size {}, .-{}", name, name);
+                }
+            }
             Directive::Comm { sym, size, align } => {
                 // macOS uses log2(alignment) for .comm, Linux uses byte alignment
                 let align_value = match target.os {
@@ -1196,6 +1227,9 @@ impl EmitAsm for Directive {
             Directive::QuadSym(sym) => {
                 let _ = writeln!(out, "    .quad {}", sym.format_for_target(target));
             }
+            Directive::LongSym(sym) => {
+                let _ = writeln!(out, "    .long {}", sym.format_for_target(target));
+            }
             Directive::QuadSymOffset(sym, offset) => {
                 if *offset >= 0 {
                     let _ = writeln!(
@@ -1254,6 +1288,15 @@ impl EmitAsm for Directive {
                 _ => {
                     // ELF format
                     let _ = writeln!(out, ".section .debug_abbrev,\"\",@progbits");
+                }
+            },
+            Directive::DebugLine => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section __DWARF,__debug_line,regular,debug");
+                }
+                _ => {
+                    // ELF format
+                    let _ = writeln!(out, ".section .debug_line,\"\",@progbits");
                 }
             },
             Directive::Uleb128(v) => {

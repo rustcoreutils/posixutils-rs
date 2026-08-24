@@ -136,6 +136,13 @@ pub struct CodeGenBase<I: LirInst> {
     /// buffer lets `emit_all` append it to the line it has just written,
     /// without a new field on either enum or a change to any `emit` arm.
     pub lir_comments: std::collections::HashMap<usize, String>,
+    /// What `-g` needs to say about each function: its extent, and the
+    /// parameters and locals inside it with where they live.
+    ///
+    /// Collected as the functions are emitted, because that is the only point
+    /// at which a variable's home is known -- the register allocator's decision
+    /// is per-function and is not kept afterwards.
+    pub fn_dies: Vec<super::dwarf::FnDie>,
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -153,6 +160,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             shared_mode: false,
             verbose_asm: false,
             lir_comments: std::collections::HashMap::new(),
+            fn_dies: Vec::new(),
         }
     }
 

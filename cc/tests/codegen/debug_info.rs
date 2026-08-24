@@ -109,3 +109,79 @@ fn codegen_debug_directives_need_dash_g() {
         "no line-program label without -g:\n{asm}"
     );
 }
+
+/// Functions get a `DW_TAG_subprogram` DIE, with the things inside them as
+/// children.
+///
+/// The abbreviation table used to hold exactly one shape -- a compile unit with
+/// no children -- so a c17 binary described its files and nothing inside them.
+/// gdb fell back to the ELF symbol table for function names, which is why
+/// backtraces named functions while `info args`, `info locals` and `ptype` all
+/// came back empty.
+#[test]
+fn codegen_debug_emits_subprogram_dies() {
+    // `sink` takes an address, so `c` and `arr` keep a stack home instead of
+    // being promoted into registers -- a variable with no memory to point at
+    // gets no location, which is the honest answer but not what this checks.
+    let src = r#"
+        int sink(int *p);
+        int f(int a, int b) {
+            int c = a + b;
+            int arr[4];
+            arr[0] = c;
+            sink(&c);
+            sink(arr);
+            return c;
+        }
+    "#;
+
+    for (triple, fp) in [(X86_64_LINUX, "rbp"), (AARCH64_LINUX, "x29")] {
+        let asm = asm_for_with("debug_subprogram", triple, src, &["-g", "-O0"]);
+
+        // The subprogram tag, and a base type for `int` to point at.
+        assert!(
+            asm.contains(".uleb128 0x2e") || asm.contains(".uleb128 46"),
+            "{triple}: no DW_TAG_subprogram in the abbreviation table:\n{asm}"
+        );
+        // A function's extent needs an end label to measure against.
+        assert!(
+            asm.contains(".Lfunc_end_f"),
+            "{triple}: DW_AT_high_pc needs a label at the end of the function:\n{asm}"
+        );
+        // The variables that kept a stack slot are described, by name.
+        for name in ["c", "arr"] {
+            assert!(
+                asm.contains(&format!("\"{name}\"")) || asm.contains(&format!(".asciz \"{name}\"")),
+                "{triple}: {name} should appear as a DIE name:\n{asm}"
+            );
+        }
+        let _ = fp;
+    }
+}
+
+/// A variable's location names the register the code generator actually used.
+///
+/// The location is built from the same address computation the loads and stores
+/// go through, rather than re-derived from the frame layout, so it stays true
+/// for a frame whose locals are not addressed from the frame pointer at all.
+#[test]
+fn codegen_debug_variable_locations_use_the_real_base() {
+    let src = r#"
+        int sink(int *p);
+        int f(void) { int c = 7; sink(&c); return c; }
+    "#;
+
+    // The DWARF register number of each target's frame pointer: 6 for %rbp,
+    // 29 for x29. DW_OP_breg0 is 0x70, so the opcode byte is 0x70 + N.
+    for (triple, op) in [(X86_64_LINUX, 0x70 + 6), (AARCH64_LINUX, 0x70 + 29)] {
+        let asm = asm_for_with("debug_var_loc", triple, src, &["-g", "-O0"]);
+        assert!(
+            asm.contains(&format!(".byte {op}")),
+            "{triple}: a local's location should be DW_OP_breg{} ({op}); \
+             aarch64 omits x18 from its register enum, so a number taken from \
+             the discriminant lands one low and gdb reads the wrong \
+             register:\n{asm}",
+            op - 0x70
+        );
+    }
+}

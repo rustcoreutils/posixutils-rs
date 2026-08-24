@@ -171,6 +171,32 @@ impl Reg {
         }
     }
 
+    /// This register's DWARF number, for debug location expressions.
+    ///
+    /// The System V AMD64 psABI fixes the mapping (figure 3.36) and it is not
+    /// the encoding order: `%rbx` is 3 and `%rcx` is 2, where the instruction
+    /// encoding has them the other way round.
+    pub fn dwarf_number(&self) -> u16 {
+        match self {
+            Reg::Rax => 0,
+            Reg::Rdx => 1,
+            Reg::Rcx => 2,
+            Reg::Rbx => 3,
+            Reg::Rsi => 4,
+            Reg::Rdi => 5,
+            Reg::Rbp => 6,
+            Reg::Rsp => 7,
+            Reg::R8 => 8,
+            Reg::R9 => 9,
+            Reg::R10 => 10,
+            Reg::R11 => 11,
+            Reg::R12 => 12,
+            Reg::R13 => 13,
+            Reg::R14 => 14,
+            Reg::R15 => 15,
+        }
+    }
+
     pub fn is_callee_saved(&self) -> bool {
         matches!(
             self,

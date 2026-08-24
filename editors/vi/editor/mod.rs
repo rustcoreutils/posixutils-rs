@@ -3218,8 +3218,14 @@ impl Editor {
             self.shell.execute(command)
         };
 
-        // Wait for user to press Enter before returning
-        if result.is_ok() {
+        // Wait for the user to read the output before the screen is redrawn.
+        //
+        // Only in visual mode on a real terminal -- `was_raw` is true exactly
+        // then.  In ex there is no redraw to wait for and no user to prompt,
+        // and the read *consumes a byte of the command stream*: it swallowed
+        // the `q` of a following `q!`, leaving a bare `!`, which starts an
+        // interactive shell and hangs the session.
+        if was_raw && result.is_ok() {
             use std::io::{self, Read, Write};
             print!("\nPress ENTER or type command to continue");
             io::stdout().flush()?;
@@ -3230,10 +3236,10 @@ impl Editor {
         // Restore raw mode only if it was raw before.
         if was_raw {
             self.terminal.enable_raw_mode()?;
+            // Force full screen redraw. Only meaningful in visual mode; in ex
+            // it would write escape sequences into the command output.
+            self.terminal.clear_screen()?;
         }
-
-        // Force full screen redraw
-        self.terminal.clear_screen()?;
 
         match result {
             Ok(output) => {
@@ -3372,14 +3378,19 @@ impl Editor {
             }
         }
 
-        // Temporarily restore terminal
+        // Temporarily restore terminal to cooked mode, remembering whether it
+        // was raw: ex never is, and re-enabling unconditionally left it raw.
+        let was_raw = self.terminal.is_raw_mode();
         self.terminal.disable_raw_mode()?;
         println!(); // Blank line before output
 
         let result = self.shell.write_to(command, &text);
 
-        // Wait for user to press Enter
-        if result.is_ok() {
+        // Wait for the user to read the output before the screen is redrawn --
+        // visual mode only.  In ex there is no redraw and no user, and the
+        // read consumes a byte of the *command stream*: see
+        // `execute_shell_command`.
+        if was_raw && result.is_ok() {
             use std::io::{self, Read, Write};
             print!("\nPress ENTER or type command to continue");
             io::stdout().flush()?;
@@ -3387,9 +3398,10 @@ impl Editor {
             let _ = io::stdin().read(&mut buf);
         }
 
-        // Re-enable raw mode
-        self.terminal.enable_raw_mode()?;
-        self.terminal.clear_screen()?;
+        if was_raw {
+            self.terminal.enable_raw_mode()?;
+            self.terminal.clear_screen()?;
+        }
 
         match result {
             Ok(output) => {

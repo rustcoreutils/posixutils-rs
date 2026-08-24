@@ -1507,3 +1507,66 @@ fn test_ex_copy_to_current_appends_at_the_end() {
 fn test_ex_starts_on_the_last_line_of_a_single_line_file() {
     ex_test_with_file("only\n", ".=\nq!\n", "1\n");
 }
+
+/// The "Press ENTER ... to continue" pause after a shell escape exists so a
+/// visual-mode user can read the output before vi redraws the screen. It ran
+/// in ex too, where it consumed a byte of the *command stream*: after
+/// `!true`, the `1` of a following `1p` was swallowed, and swallowing the `q`
+/// of a `q!` left a bare `!` behind -- the interactive shell, which takes the
+/// terminal and hangs the session.
+///
+/// Two lines, so a stolen `1` is visible: without it `p` prints the current
+/// line, which is the last one appended.
+#[test]
+fn test_ex_shell_escape_does_not_consume_the_next_command() {
+    let (out, _) = ex_output(&["-s"], "a\nalpha\nbeta\n.\n!true\n1p\nq!\n");
+    assert!(
+        out.contains("alpha"),
+        "`1p` after `!` must still address line 1, got {out:?}"
+    );
+    assert!(
+        !out.contains("beta"),
+        "the `1` of `1p` was consumed by the ENTER pause, got {out:?}"
+    );
+}
+
+#[test]
+fn test_ex_shell_write_does_not_consume_the_next_command() {
+    let (out, _) = ex_output(&["-s"], "a\nalpha\nbeta\n.\n1w !cat >/dev/null\n1p\nq!\n");
+    assert!(
+        out.contains("alpha") && !out.contains("beta"),
+        "`1p` after `w !` must still address line 1, got {out:?}"
+    );
+}
+
+/// And ex must not prompt at all: there is no screen to redraw and no user.
+#[test]
+fn test_ex_shell_escape_does_not_prompt_for_enter() {
+    let (out, _) = ex_output(&["-s"], "a\nalpha\n.\n!true\nq!\n");
+    assert!(
+        !out.contains("Press ENTER"),
+        "ex must not prompt after a shell escape, got {out:?}"
+    );
+}
+
+/// `:shell` (and a bare `!`) start an interactive shell. Without a terminal
+/// there is nothing for it to be interactive with: it inherits the editor's
+/// piped stdin, competes for the controlling terminal and stops, which reads
+/// as the editor hanging. It must refuse instead.
+#[test]
+fn test_ex_interactive_shell_without_a_terminal_is_refused() {
+    let (_, err) = ex_output(&["-s"], "sh\nq!\n");
+    assert!(
+        err.contains("terminal"),
+        "expected a diagnostic rather than a hang, got {err:?}"
+    );
+}
+
+#[test]
+fn test_ex_bare_bang_without_a_terminal_is_refused() {
+    let (_, err) = ex_output(&["-s"], "!\nq!\n");
+    assert!(
+        err.contains("terminal"),
+        "expected a diagnostic rather than a hang, got {err:?}"
+    );
+}

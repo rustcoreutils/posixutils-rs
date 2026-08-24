@@ -290,6 +290,18 @@ impl ShellExecutor {
     ///
     /// This is used for `:shell` - spawn interactive shell.
     pub fn interactive(&mut self) -> Result<ShellOutput> {
+        // An interactive shell needs a terminal to be interactive *with*.
+        // Started without one it inherits the editor's piped stdin, competes
+        // for the controlling terminal and stops -- which reads as the editor
+        // hanging, with no diagnostic and no way back.  Refusing is the only
+        // useful answer.
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Err(ViError::ShellError(
+                "cannot start an interactive shell without a terminal".to_string(),
+            ));
+        }
+
         // POSIX: `:shell` invokes the shell as an interactive shell (-i).
         let status = Command::new(&self.shell)
             .arg("-i")

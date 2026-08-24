@@ -1008,12 +1008,27 @@ impl Editor {
 
     /// Enter insert mode.
     fn enter_insert(&mut self, kind: InsertKind) {
-        if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind, &self.options) {
-            // An insert session is one command. When an operator opened a group
-            // already (c/s/S/C), this call is a no-op and the operator's removal
-            // and the typed text end up in the same group, so one `u` reverses
-            // the whole change.
-            self.undo.begin_group();
+        // An insert session is one command. When an operator opened a group
+        // already (c/s/S/C), this call is a no-op and the operator's removal
+        // and the typed text end up in the same group, so one `u` reverses
+        // the whole change.
+        self.undo.begin_group();
+
+        // `o` and `O` create their line inside `enter_insert_mode`, which used
+        // to run before the group existed -- so `oZ` then `u` removed the `Z`
+        // and left the blank line behind.  Record that line as part of the
+        // session.
+        let opens_a_line = matches!(kind, InsertKind::OpenBelow | InsertKind::OpenAbove);
+        let line = self.buffer.cursor().line;
+        let entered = if opens_a_line {
+            self.splice_around(line, line, |ed| {
+                enter_insert_mode(&mut ed.buffer, kind, &ed.options)
+            })
+        } else {
+            enter_insert_mode(&mut self.buffer, kind, &self.options)
+        };
+
+        if let Ok(mut state) = entered {
             // Carry the terminal's erase/kill characters and the previous
             // insertion into the session (#V12, #V15).
             state.erase_char = self.terminal.erase_char();
@@ -1021,6 +1036,10 @@ impl Editor {
             state.previous_insert = self.previous_insert.clone();
             self.mode = Mode::Insert(kind);
             self.insert_state = Some(state);
+        } else {
+            // Nothing will close the group otherwise, and a leaked group
+            // swallows every later change into the same `u`.
+            self.undo.end_group();
         }
     }
 
@@ -1412,42 +1431,56 @@ impl Editor {
             }
             // Delete commands
             'x' => {
-                let pos = self.buffer.cursor();
-                let mut deleted = String::new();
-                for _ in 0..count {
-                    if let Some(c) = self.buffer.delete_char() {
-                        deleted.push(c);
+                // Snapshot the line rather than record a flat delete: with a
+                // count that runs off the end of the line the cursor is
+                // clamped part-way through the loop, so the recorded position
+                // no longer described the text and `u` put it back displaced.
+                let line = self.buffer.cursor().line;
+                let register = cmd.register;
+                self.splice_around(line, line, |ed| {
+                    let mut deleted = String::new();
+                    for _ in 0..count {
+                        if let Some(c) = ed.buffer.delete_char() {
+                            deleted.push(c);
+                        }
                     }
-                }
-                if !deleted.is_empty() {
-                    self.undo.record_delete(pos, &deleted, false);
-                    // Through the register policy, not straight to the
-                    // small-delete slot: writing there directly is what made
-                    // `"qx` ignore the register the user named.
-                    self.registers
-                        .delete(cmd.register, RegisterContent::new(deleted, false), true);
-                }
+                    if !deleted.is_empty() {
+                        // Through the register policy, not straight to the
+                        // small-delete slot: writing there directly is what
+                        // made `"qx` ignore the register the user named.
+                        ed.registers
+                            .delete(register, RegisterContent::new(deleted, false), true);
+                    }
+                    Ok(())
+                })?;
             }
             'X' => {
-                let mut deleted = String::new();
-                let mut start_pos = self.buffer.cursor();
-                for _ in 0..count {
-                    if let Some(c) = self.buffer.delete_char_before() {
-                        deleted.push(c);
+                // POSIX (vi, "Delete Character Before Cursor"): "If there are
+                // no characters before the cursor in the line, it shall be an
+                // error."  It used `delete_char_before`, which joins with the
+                // previous line -- right for an insert-mode backspace, wrong
+                // here -- so `X` at column 0 silently merged two lines and no
+                // within-line undo record could express it.
+                let line = self.buffer.cursor().line;
+                let register = cmd.register;
+                self.splice_around(line, line, |ed| {
+                    let mut deleted = String::new();
+                    for _ in 0..count {
+                        if ed.buffer.cursor().column == 0 {
+                            break;
+                        }
+                        if let Some(c) = ed.buffer.delete_char_before() {
+                            deleted.push(c);
+                        }
                     }
-                }
-                if !deleted.is_empty() {
-                    // Reverse the deleted string since we accumulated in reverse order
-                    let del_text: String = deleted.chars().rev().collect();
-                    // Calculate the starting position for undo
-                    start_pos.column = start_pos.column.saturating_sub(del_text.len());
-                    self.undo.record_delete(start_pos, &del_text, false);
-                    self.registers.delete(
-                        cmd.register,
-                        RegisterContent::new(del_text, false),
-                        true,
-                    );
-                }
+                    if !deleted.is_empty() {
+                        // Accumulated in reverse order.
+                        let del_text: String = deleted.chars().rev().collect();
+                        ed.registers
+                            .delete(register, RegisterContent::new(del_text, false), true);
+                    }
+                    Ok(())
+                })?;
             }
             'd' => {
                 self.execute_delete(cmd)?;
@@ -1574,17 +1607,26 @@ impl Editor {
             }
             // Toggle case
             '~' => {
+                // One command, one undo: without the group each toggled
+                // character was its own change, so `2~` needed two `u`s.
+                self.undo.begin_group();
                 for _ in 0..count {
                     self.toggle_case();
                 }
+                self.undo.end_group();
             }
             // Delete to end of line
             'D' => {
-                let deleted = self.buffer.delete_to_end_of_line();
-                if !deleted.is_empty() {
-                    self.registers
-                        .delete(cmd.register, RegisterContent::new(deleted, false), true);
-                }
+                let line = self.buffer.cursor().line;
+                let register = cmd.register;
+                self.splice_around(line, line, |ed| {
+                    let deleted = ed.buffer.delete_to_end_of_line();
+                    if !deleted.is_empty() {
+                        ed.registers
+                            .delete(register, RegisterContent::new(deleted, false), true);
+                    }
+                    Ok(())
+                })?;
             }
             // Shift left/right operators
             '>' | '<' => {
@@ -1718,6 +1760,10 @@ impl Editor {
                                 false,
                             );
                         }
+                        // `enter_insert` opened a group and this path never
+                        // closed it, so every later change joined that stale
+                        // group and one `u` reversed the rest of the session.
+                        self.undo.end_group();
                     }
                     // Clamp cursor to valid position
                     let pos = self.buffer.cursor();
@@ -1834,6 +1880,51 @@ impl Editor {
         Ok(())
     }
 
+    /// Run `f`, recording whatever it did to the run of lines starting at
+    /// `first` as a single undoable change.
+    ///
+    /// `apply_inverse` rebuilds by position and length without checking what
+    /// is there, so a mutation that records nothing does not merely fail to
+    /// undo: the next `u` pops an unrelated older change and destroys whatever
+    /// now occupies its position (audit #V19).  Snapshotting the affected run
+    /// before and after means the caller does not have to describe its edit at
+    /// all, which is what makes this usable for the commands whose hand-built
+    /// records were wrong or missing -- `:m`, `:t`, `:j`, `:pu`, the shifts,
+    /// `p`/`P`, `r` and `~`.
+    ///
+    /// `last` is the last line the edit is expected to touch; pass a
+    /// contiguous superset when the affected region is not contiguous, as
+    /// `:m` needs.
+    pub(super) fn splice_around<T>(
+        &mut self,
+        first: usize,
+        last: usize,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let first = first.max(1);
+        let snapshot = |ed: &Self, upto: usize| -> Vec<String> {
+            (first..=upto)
+                .filter_map(|n| ed.buffer.line(n).map(|l| l.content().to_string()))
+                .collect()
+        };
+
+        let before_total = self.buffer.line_count();
+        let old = snapshot(self, last.min(before_total));
+
+        let result = f(self)?;
+
+        // The run may have grown or shrunk; follow the change in line count.
+        let delta = self.buffer.line_count() as isize - before_total as isize;
+        let new_last = (last as isize + delta).max(first as isize - 1) as usize;
+        let new = snapshot(self, new_last.min(self.buffer.line_count()));
+
+        if old != new {
+            self.undo
+                .record_replace_lines(Position::new(first, 0), &old, &new);
+        }
+        Ok(result)
+    }
+
     /// Record what an operator removed, so `u` can put it back.
     ///
     /// Every operator that removes text must call this: `apply_inverse` rebuilds
@@ -1940,8 +2031,12 @@ impl Editor {
         };
 
         self.undo.begin_group();
-        let result = change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
-        self.record_removal(range, &result);
+        // Snapshot rather than `record_removal`, for the reason given in the
+        // `cc` branch: `S` empties its lines instead of removing them.
+        let register = cmd.register;
+        let result = self.splice_around(range.start.line, range.end.line, |ed| {
+            change(&mut ed.buffer, range, &mut ed.registers, register)
+        })?;
         self.buffer.set_cursor(result.cursor);
         if result.enter_insert {
             self.enter_insert(if cmd.command == 'S' {
@@ -1967,8 +2062,14 @@ impl Editor {
                 // The operator and the insert session it opens are one command,
                 // so a single `u` reverses both.
                 self.undo.begin_group();
-                let result = change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
-                self.record_removal(range, &result);
+                // A snapshot, not `record_removal`: `change_lines` *empties*
+                // the first line rather than removing it, so recording a
+                // linewise delete made `u` re-insert the original lines and
+                // leave the emptied one behind as a stray blank.
+                let register = cmd.register;
+                let result = self.splice_around(start_line, end_line, |ed| {
+                    change(&mut ed.buffer, range, &mut ed.registers, register)
+                })?;
                 self.buffer.set_cursor(result.cursor);
                 if result.enter_insert {
                     self.enter_insert(InsertKind::Change);
@@ -2023,6 +2124,16 @@ impl Editor {
 
     /// Execute shift command (> or <).
     fn execute_shift(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
+        // `shift_right`/`shift_left` report no affected text, so there is
+        // nothing for a hand-built undo record to describe -- snapshot the
+        // rewritten run instead.
+        let first = self.buffer.cursor().line;
+        let last = (first + cmd.count.max(1) - 1).min(self.buffer.line_count());
+        let cmd = cmd.clone();
+        self.splice_around(first, last.max(first), |ed| ed.execute_shift_inner(&cmd))
+    }
+
+    fn execute_shift_inner(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
         use crate::command::{shift_left, shift_right};
 
         if let Some(mot) = &cmd.motion {
@@ -2164,6 +2275,19 @@ impl Editor {
 
     /// Execute put command.
     fn execute_put(&mut self, before: bool, count: usize, register: Option<char>) -> Result<()> {
+        // Like the shifts, `put_after`/`put_before` report no affected text.
+        let line = self.buffer.cursor().line;
+        self.splice_around(line, line, |ed| {
+            ed.execute_put_inner(before, count, register)
+        })
+    }
+
+    fn execute_put_inner(
+        &mut self,
+        before: bool,
+        count: usize,
+        register: Option<char>,
+    ) -> Result<()> {
         use crate::command::{put_after, put_before};
 
         // `put_after`/`put_before` already default to the unnamed register, so
@@ -3224,6 +3348,9 @@ impl Editor {
         // deleted its text.
         let mut pending: Vec<Option<usize>> = matching_lines.into_iter().map(Some).collect();
 
+        // POSIX (ex, `undo`, 95443) makes a global a single command, so one
+        // `u` must reverse all of it -- not just the last line it touched.
+        self.undo.begin_group();
         self.buffer.begin_line_tracking();
         for idx in 0..pending.len() {
             let Some(line_num) = pending[idx] else {
@@ -3249,6 +3376,7 @@ impl Editor {
             }
         }
         self.buffer.end_line_tracking();
+        self.undo.end_group();
 
         Ok(())
     }
@@ -4041,6 +4169,14 @@ impl Editor {
 
     /// Replace character at cursor (r command).
     fn replace_char(&mut self, c: char) {
+        let line = self.buffer.cursor().line;
+        let _ = self.splice_around(line, line, |ed| {
+            ed.replace_char_inner(c);
+            Ok(())
+        });
+    }
+
+    fn replace_char_inner(&mut self, c: char) {
         let cursor = self.buffer.cursor();
         let Some(line) = self.buffer.line(cursor.line) else {
             return;
@@ -4063,6 +4199,14 @@ impl Editor {
 
     /// Toggle case of character at cursor (~ command).
     fn toggle_case(&mut self) {
+        let line = self.buffer.cursor().line;
+        let _ = self.splice_around(line, line, |ed| {
+            ed.toggle_case_inner();
+            Ok(())
+        });
+    }
+
+    fn toggle_case_inner(&mut self) {
         let cursor = self.buffer.cursor();
         let char_at = self
             .buffer

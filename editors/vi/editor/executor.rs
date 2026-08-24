@@ -28,6 +28,27 @@ impl Editor {
         count: Option<usize>,
         force: bool,
     ) -> Result<()> {
+        // `:j` reaches at least one line past its start (that is the whole
+        // point), and a count extends it further -- so the snapshot span has
+        // to cover the joined-away lines, not just the addressed range.
+        let (first, last) = if range.explicit {
+            self.resolve_range(range)?
+        } else {
+            let cur = self.buffer.cursor().line;
+            (cur, cur)
+        };
+        let span_end = last.max(first + 1).max(first + count.unwrap_or(0));
+        self.splice_around(first, span_end.min(self.buffer.line_count()), |ed| {
+            ed.execute_ex_join_inner(range, count, force)
+        })
+    }
+
+    fn execute_ex_join_inner(
+        &mut self,
+        range: &AddressRange,
+        count: Option<usize>,
+        force: bool,
+    ) -> Result<()> {
         let current = self.buffer.cursor().line;
 
         // Range/count interaction per ex.md §95043-95057.
@@ -110,6 +131,11 @@ impl Editor {
         line: Option<usize>,
         register: Option<char>,
     ) -> Result<()> {
+        let at = line.unwrap_or(self.buffer.cursor().line).max(1);
+        self.splice_around(at, at, |ed| ed.execute_ex_put_inner(line, register))
+    }
+
+    fn execute_ex_put_inner(&mut self, line: Option<usize>, register: Option<char>) -> Result<()> {
         let target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
         let reg = register.unwrap_or('"');
 
@@ -128,6 +154,19 @@ impl Editor {
 
     /// Execute :copy command - copy lines to destination.
     pub(super) fn execute_ex_copy(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
+        let (first, last) = self.affected_span(range, dest)?;
+        self.splice_around(first, last, |ed| ed.execute_ex_copy_inner(range, dest))
+    }
+
+    /// The contiguous run of lines a `:copy`/`:move` can disturb: the source
+    /// range and the destination together.
+    fn affected_span(&self, range: &AddressRange, dest: &Address) -> Result<(usize, usize)> {
+        let (start, end) = self.resolve_range(range)?;
+        let d = dest.resolve(&self.addr_ctx_allow_zero())?;
+        Ok((start.min(d.saturating_add(1)).max(1), end.max(d)))
+    }
+
+    fn execute_ex_copy_inner(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
         // Resolved here, not at parse time: `$`, `.` and a search all depend
         // on the buffer.  `allow_zero` because the destination names the line
         // to insert *after*, so 0 means "before the first line".
@@ -158,6 +197,11 @@ impl Editor {
 
     /// Execute :move command - move lines to destination.
     pub(super) fn execute_ex_move(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
+        let (first, last) = self.affected_span(range, dest)?;
+        self.splice_around(first, last, |ed| ed.execute_ex_move_inner(range, dest))
+    }
+
+    fn execute_ex_move_inner(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
         let current = self.buffer.cursor().line;
         let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
         let dest = dest.resolve(&self.addr_ctx_allow_zero_at(current))?;
@@ -387,6 +431,17 @@ impl Editor {
         range: &AddressRange,
         count: Option<usize>,
     ) -> Result<()> {
+        let (first, last) = self.resolve_range(range)?;
+        self.splice_around(first, last, |ed| {
+            ed.execute_ex_shift_left_inner(range, count)
+        })
+    }
+
+    fn execute_ex_shift_left_inner(
+        &mut self,
+        range: &AddressRange,
+        count: Option<usize>,
+    ) -> Result<()> {
         let (start, end) = self.resolve_range(range)?;
         let shift_amount = count.unwrap_or(1) * self.options.shiftwidth;
 
@@ -416,6 +471,17 @@ impl Editor {
 
     /// Execute :> command - shift lines right.
     pub(super) fn execute_ex_shift_right(
+        &mut self,
+        range: &AddressRange,
+        count: Option<usize>,
+    ) -> Result<()> {
+        let (first, last) = self.resolve_range(range)?;
+        self.splice_around(first, last, |ed| {
+            ed.execute_ex_shift_right_inner(range, count)
+        })
+    }
+
+    fn execute_ex_shift_right_inner(
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
@@ -578,6 +644,19 @@ impl Editor {
 
     /// Execute ex delete command (:d).
     pub(super) fn execute_ex_delete(
+        &mut self,
+        range: &AddressRange,
+        register: Option<char>,
+        count: Option<usize>,
+    ) -> Result<()> {
+        let (start, end) = self.resolve_range(range)?;
+        let last = end_from_count(start, end, count, self.buffer.line_count())?;
+        self.splice_around(start, last, |ed| {
+            ed.execute_ex_delete_inner(range, register, count)
+        })
+    }
+
+    fn execute_ex_delete_inner(
         &mut self,
         range: &AddressRange,
         register: Option<char>,

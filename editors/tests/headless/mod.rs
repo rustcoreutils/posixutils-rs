@@ -2329,3 +2329,357 @@ fn test_yank_lines_shorthand_agrees_with_yy() {
         "`Y` must be `yy`"
     );
 }
+
+// ============================================================================
+// Undo: every command that changes the buffer must be undoable
+// ============================================================================
+//
+// `apply_inverse` rebuilds by position and length without checking what is
+// actually there, so a mutation that records nothing does not merely fail to
+// undo -- the next `u` pops an unrelated older change and destroys whatever
+// now sits at its position (the warning on `record_removal`, audit #V19).
+//
+// `check_undoable` is therefore a check on the *absence* of that hazard: if a
+// command changed the buffer, one `u` must put it back exactly.
+
+/// Returns `Err(reason)` if `keys` changed the buffer and `u` did not restore
+/// it, or if `keys` changed nothing at all (so the case proves nothing).
+fn check_undoable(setup: &str, keys: &str) -> Result<(), String> {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(setup);
+    let before = editor.get_buffer_text();
+
+    editor
+        .execute_keys(keys)
+        .map_err(|e| format!("{:?} errored: {}", keys, e))?;
+    // Leave insert mode, so the change is complete.
+    let _ = editor.execute_keys("\x1b");
+    let after = editor.get_buffer_text();
+    if after == before {
+        return Err(format!("{:?} did not change the buffer", keys));
+    }
+
+    editor
+        .execute_keys("u")
+        .map_err(|e| format!("{:?} then u errored: {}", keys, e))?;
+    let undone = editor.get_buffer_text();
+    if undone != before {
+        return Err(format!(
+            "{:?}: u gave {:?}, expected {:?} (after the edit it was {:?})",
+            keys, undone, before, after
+        ));
+    }
+    Ok(())
+}
+
+const UNDO_SETUP: &str = "alpha beta\ngamma delta\nepsilon zeta\n";
+
+/// Run every case and report all the failures at once, so one broken command
+/// does not hide the rest.
+fn assert_all_undoable(cases: &[&str]) {
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|keys| check_undoable(UNDO_SETUP, keys).err())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} commands are not undoable:\n  {}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n  ")
+    );
+}
+
+#[test]
+fn test_undo_restores_character_edits() {
+    assert_all_undoable(&[
+        "x", "3x", "llX", "rZ", "~", "sZ", "cwZ", "CZ", "iZ", "AZ", "IZ", "aZ",
+    ]);
+}
+
+#[test]
+fn test_undo_restores_line_edits() {
+    assert_all_undoable(&["dd", "2dd", "dw", "de", "cc", "S", "J", "oZ", "OZ", "D"]);
+}
+
+#[test]
+fn test_undo_restores_put_and_shift() {
+    // Only single commands here: `ddp` is two, and one `u` correctly undoes
+    // just the put -- see test_undo_of_a_sequence_unwinds_one_command_at_a_time.
+    assert_all_undoable(&["yyp", "yyP", "yy2p", ">>", "2>>"]);
+}
+
+/// `<` needs something to remove, so it gets its own indented setup.
+#[test]
+fn test_undo_restores_shift_left() {
+    let setup = "\talpha\n\tbeta\n";
+    for keys in ["<<", "2<<"] {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text(setup);
+        editor.execute_keys(keys).unwrap();
+        assert_ne!(
+            editor.get_buffer_text(),
+            setup,
+            "{:?} changed nothing",
+            keys
+        );
+        editor.execute_keys("u").unwrap();
+        assert_eq!(editor.get_buffer_text(), setup, "{:?} did not undo", keys);
+    }
+}
+
+/// POSIX `u` is its own inverse: the first undoes the last command, the
+/// second puts it back. So after `dd` `p`, one `u` reverses the put and a
+/// second replays it -- it does not keep walking back through the history.
+#[test]
+fn test_undo_reverses_only_the_last_command_and_is_its_own_inverse() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(UNDO_SETUP);
+    editor.execute_keys("ddp").unwrap();
+    let after_put = editor.get_buffer_text();
+    assert_eq!(after_put, "gamma delta\nalpha beta\nepsilon zeta\n");
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "gamma delta\nepsilon zeta\n",
+        "the first u must undo the put, not the whole sequence"
+    );
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        after_put,
+        "the second u must put it back"
+    );
+}
+
+#[test]
+fn test_undo_restores_ex_edits() {
+    assert_all_undoable(&[
+        ":2d\n",
+        ":1,2d\n",
+        ":s/alpha/ZZ/\n",
+        ":1,2j\n",
+        ":1t2\n",
+        ":1m2\n",
+        ":1,2>\n",
+        ":g/a/s/a/Z/\n",
+    ]);
+}
+
+/// `:pu` needs a register to put from, and `:<` something to unindent.
+#[test]
+fn test_undo_restores_ex_put_and_shift_left() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(UNDO_SETUP);
+    editor.execute_keys("yy").unwrap();
+    let before = editor.get_buffer_text();
+    editor.execute_keys(":2pu\n").unwrap();
+    assert_ne!(editor.get_buffer_text(), before);
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text(), before);
+
+    let indented = "\talpha\n\tbeta\n";
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(indented);
+    editor.execute_keys(":1,2<\n").unwrap();
+    assert_ne!(editor.get_buffer_text(), indented);
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text(), indented);
+}
+
+#[test]
+fn test_undo_restores_operator_and_motion_edits() {
+    assert_all_undoable(&[
+        "dw", "2dw", "d$", "de", "dj", "cwZ", "c$Z", "ceZ", "yyp", "3x",
+        // These need the cursor off the very start of the buffer to have
+        // anything to act on.
+        "jdk", "ll2X", "lld0",
+    ]);
+}
+
+#[test]
+fn test_undo_restores_repeated_and_counted_edits() {
+    assert_all_undoable(&["3rZ", "2~", "2dd", "3>>", "2J", "2sZ"]);
+}
+
+/// `.` after an insert used to re-enter insert mode without ever closing the
+/// group it opened, so every later change joined that stale group and one `u`
+/// reversed the rest of the session.
+#[test]
+fn test_undo_after_dot_repeat_reverses_only_the_last_command() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(UNDO_SETUP);
+    editor.execute_keys("iX\x1b").unwrap();
+    editor.execute_keys(".").unwrap();
+    let after_repeat = editor.get_buffer_text();
+
+    editor.execute_keys("dd").unwrap();
+    assert_ne!(editor.get_buffer_text(), after_repeat);
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        after_repeat,
+        "u after `.` must reverse the dd alone, not the whole session"
+    );
+}
+
+/// The same hazard through an ex command.
+#[test]
+fn test_undo_after_ex_command_reverses_only_that_command() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text(UNDO_SETUP);
+    editor.execute_keys("iX\x1b").unwrap();
+    let after_insert = editor.get_buffer_text();
+
+    editor.execute_keys(":2d\n").unwrap();
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text(), after_insert);
+}
+
+/// A global is one command: one `u` reverses every line it touched.
+#[test]
+fn test_undo_after_global_reverses_the_whole_command() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("Xa\nXb\nXc\nd\n");
+    editor.execute_keys(":g/X/d\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "d\n");
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text(), "Xa\nXb\nXc\nd\n");
+}
+
+/// Generated sweep over complete single commands: whatever a command does to
+/// the buffer, one `u` must put back exactly.
+///
+/// This is the standing check that a new mutation path cannot be added without
+/// recording undo -- the failure mode being not a missing undo but a
+/// *destructive* one, since `apply_inverse` rebuilds by position and length
+/// without looking at what is there.
+#[test]
+fn test_generated_single_commands_are_undoable() {
+    // Each entry is one complete command, so `u` reverses exactly it.
+    const COMMANDS: &[&str] = &[
+        "x",
+        "2x",
+        "X",
+        "3X",
+        "rZ",
+        "2rZ",
+        "~",
+        "3~",
+        "D",
+        "J",
+        "2J",
+        "dd",
+        "2dd",
+        "3dd",
+        "dw",
+        "2dw",
+        "de",
+        "d$",
+        "dj",
+        "dk",
+        "d0",
+        "cwZ",
+        "ceZ",
+        "c$Z",
+        "cc",
+        "2cc",
+        "sZ",
+        "2sZ",
+        "S",
+        "iZ",
+        "aZ",
+        "IZ",
+        "AZ",
+        "oZ",
+        "OZ",
+        "CZ",
+        ">>",
+        "2>>",
+        "<<",
+        "p",
+        "P",
+        "2p",
+        ":d\n",
+        ":1,2d\n",
+        ":j\n",
+        ":s/a/Z/\n",
+        ":s/a/Z/g\n",
+        ":1t2\n",
+        ":1m3\n",
+        ":>\n",
+        ":<\n",
+        ":pu\n",
+        ":g/a/s/a/Z/\n",
+        ":v/a/s/e/Z/\n",
+        ":1,3>\n",
+    ];
+    // Indented and varied, so `<<`, `p` and the shifts all have something to do.
+    const SETUPS: &[&str] = &[
+        "\talpha beta\n\tgamma delta\n\tepsilon zeta\neta theta\n",
+        "one\ntwo\nthree\nfour\nfive\n",
+        "  a\n\tb\n c\nd\n",
+    ];
+
+    let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+
+    let mut failures = Vec::new();
+    for _ in 0..3000 {
+        let setup = SETUPS[next() % SETUPS.len()];
+        let keys = COMMANDS[next() % COMMANDS.len()];
+        // A cursor somewhere other than the very start, so the backward and
+        // upward commands have something to act on.
+        let lead = ["", "j", "jl", "jjll", "l", "G", "jj"][next() % 7];
+
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text(setup);
+        // Fill the unnamed register so `p`/`P`/`:pu` are not no-ops.
+        let _ = editor.execute_keys("yy");
+        let _ = editor.execute_keys(lead);
+        let before = editor.get_buffer_text();
+
+        if editor.execute_keys(keys).is_err() {
+            continue; // an invalid command here is not an undo failure
+        }
+        let _ = editor.execute_keys("\x1b");
+        if editor.get_buffer_text() == before {
+            continue; // nothing to undo
+        }
+
+        if editor.execute_keys("u").is_err() {
+            failures.push(format!("{:?} after {:?}: u errored", keys, lead));
+            continue;
+        }
+        if editor.get_buffer_text() != before {
+            failures.push(format!(
+                "{:?} after {:?} on {:?}: u gave {:?}, expected {:?}",
+                keys,
+                lead,
+                setup,
+                editor.get_buffer_text(),
+                before
+            ));
+        }
+    }
+    failures.dedup();
+    assert!(
+        failures.is_empty(),
+        "{} commands did not undo cleanly:\n  {}",
+        failures.len(),
+        failures
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}

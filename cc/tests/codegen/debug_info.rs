@@ -109,3 +109,156 @@ fn codegen_debug_directives_need_dash_g() {
         "no line-program label without -g:\n{asm}"
     );
 }
+
+/// Functions get a `DW_TAG_subprogram` DIE, with the things inside them as
+/// children.
+///
+/// The abbreviation table used to hold exactly one shape -- a compile unit with
+/// no children -- so a c17 binary described its files and nothing inside them.
+/// gdb fell back to the ELF symbol table for function names, which is why
+/// backtraces named functions while `info args`, `info locals` and `ptype` all
+/// came back empty.
+#[test]
+fn codegen_debug_emits_subprogram_dies() {
+    // `sink` takes an address, so `c` and `arr` keep a stack home instead of
+    // being promoted into registers -- a variable with no memory to point at
+    // gets no location, which is the honest answer but not what this checks.
+    let src = r#"
+        int sink(int *p);
+        int f(int a, int b) {
+            int c = a + b;
+            int arr[4];
+            arr[0] = c;
+            sink(&c);
+            sink(arr);
+            return c;
+        }
+    "#;
+
+    for (triple, fp) in [(X86_64_LINUX, "rbp"), (AARCH64_LINUX, "x29")] {
+        let asm = asm_for_with("debug_subprogram", triple, src, &["-g", "-O0"]);
+
+        // The subprogram tag, and a base type for `int` to point at.
+        assert!(
+            asm.contains(".uleb128 0x2e") || asm.contains(".uleb128 46"),
+            "{triple}: no DW_TAG_subprogram in the abbreviation table:\n{asm}"
+        );
+        // A function's extent needs an end label to measure against.
+        assert!(
+            asm.contains(".Lfunc_end_f"),
+            "{triple}: DW_AT_high_pc needs a label at the end of the function:\n{asm}"
+        );
+        // The variables that kept a stack slot are described, by name.
+        for name in ["c", "arr"] {
+            assert!(
+                asm.contains(&format!("\"{name}\"")) || asm.contains(&format!(".asciz \"{name}\"")),
+                "{triple}: {name} should appear as a DIE name:\n{asm}"
+            );
+        }
+        let _ = fp;
+    }
+}
+
+/// A variable's location names the register the code generator actually used.
+///
+/// The location is built from the same address computation the loads and stores
+/// go through, rather than re-derived from the frame layout, so it stays true
+/// for a frame whose locals are not addressed from the frame pointer at all.
+#[test]
+fn codegen_debug_variable_locations_use_the_real_base() {
+    let src = r#"
+        int sink(int *p);
+        int f(void) { int c = 7; sink(&c); return c; }
+    "#;
+
+    // The DWARF register number of each target's frame pointer: 6 for %rbp,
+    // 29 for x29. DW_OP_breg0 is 0x70, so the opcode byte is 0x70 + N.
+    for (triple, op) in [(X86_64_LINUX, 0x70 + 6), (AARCH64_LINUX, 0x70 + 29)] {
+        let asm = asm_for_with("debug_var_loc", triple, src, &["-g", "-O0"]);
+        assert!(
+            asm.contains(&format!(".byte {op}")),
+            "{triple}: a local's location should be DW_OP_breg{} ({op}); \
+             aarch64 omits x18 from its register enum, so a number taken from \
+             the discriminant lands one low and gdb reads the wrong \
+             register:\n{asm}",
+            op - 0x70
+        );
+    }
+}
+
+/// No two variables in one function answer to the same name.
+///
+/// `debug_name` strips the linearizer's uniquing suffix so a debugger shows
+/// `c` rather than `c.4`. But there are no `DW_TAG_lexical_block` DIEs yet, so
+/// every local and parameter is a sibling directly under the subprogram -- and
+/// once two of them are shadowed into the same `DW_AT_name`, a debugger has to
+/// pick one. gdb picks the last, so `print x` where the *outer* `x` is in scope
+/// answered with the inner one's value: a wrong answer, silently, on ordinary C.
+///
+/// Where a name collides the suffix is kept, so each DIE names one variable.
+/// That is not what a debugger should ideally show -- lexical blocks are the
+/// real answer -- but no variable answers to a name that means another.
+#[test]
+fn codegen_debug_shadowed_variables_get_distinct_names() {
+    let src = r#"
+        int sink(int *p);
+        int f(int x) {
+            int y = 1;
+            sink(&x);
+            sink(&y);
+            {
+                int y = 2;      /* shadows the outer y */
+                sink(&y);
+                {
+                    int y = 3;  /* and again */
+                    sink(&y);
+                }
+            }
+            return y;
+        }
+    "#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("debug_shadow", triple, src, &["-g", "-O0"]);
+        // Every name the DIEs carry, in emission order.
+        let names: Vec<&str> = asm
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix(".asciz \""))
+            .filter_map(|l| l.strip_suffix('"'))
+            .collect();
+        let ys: Vec<&&str> = names.iter().filter(|n| n.starts_with('y')).collect();
+        assert!(
+            ys.len() >= 2,
+            "{triple}: expected several shadowed `y`s among {names:?}"
+        );
+        let mut uniq = ys.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            ys.len(),
+            "{triple}: shadowed variables must not share a DW_AT_name; got {ys:?}"
+        );
+    }
+}
+
+/// A name that is not shadowed keeps its plain spelling.
+///
+/// The disambiguation above must not cost the ordinary case its readable
+/// names -- `c`, not `c.4`.
+#[test]
+fn codegen_debug_unshadowed_names_are_plain() {
+    let src = r#"
+        int sink(int *p);
+        int f(void) { int counter = 7; sink(&counter); return counter; }
+    "#;
+
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("debug_plain_name", triple, src, &["-g", "-O0"]);
+        assert!(
+            asm.contains(".asciz \"counter\""),
+            "{triple}: an unshadowed local should be named plainly:\n{asm}"
+        );
+    }
+}

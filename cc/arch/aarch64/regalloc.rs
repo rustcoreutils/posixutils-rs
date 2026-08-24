@@ -174,6 +174,52 @@ impl Reg {
         }
     }
 
+    /// This register's DWARF number, for debug location expressions.
+    ///
+    /// AAPCS64 numbers `x0`-`x30` as 0-30 and `sp` as 31. Spelled out rather
+    /// than taken from the discriminant: **x18 is absent from this enum** --
+    /// it is platform-reserved and the compiler never allocates it -- so every
+    /// variant after `X17` sits one below its register number. Reading the
+    /// discriminant made the frame pointer `x29` come out as 28, and gdb
+    /// resolved every local against the wrong register.
+    pub fn dwarf_number(&self) -> u16 {
+        match self {
+            Reg::X0 => 0,
+            Reg::X1 => 1,
+            Reg::X2 => 2,
+            Reg::X3 => 3,
+            Reg::X4 => 4,
+            Reg::X5 => 5,
+            Reg::X6 => 6,
+            Reg::X7 => 7,
+            Reg::X8 => 8,
+            Reg::X9 => 9,
+            Reg::X10 => 10,
+            Reg::X11 => 11,
+            Reg::X12 => 12,
+            Reg::X13 => 13,
+            Reg::X14 => 14,
+            Reg::X15 => 15,
+            Reg::X16 => 16,
+            Reg::X17 => 17,
+            Reg::X19 => 19,
+            Reg::X20 => 20,
+            Reg::X21 => 21,
+            Reg::X22 => 22,
+            Reg::X23 => 23,
+            Reg::X24 => 24,
+            Reg::X25 => 25,
+            Reg::X26 => 26,
+            Reg::X27 => 27,
+            Reg::X28 => 28,
+            Reg::X29 => 29,
+            Reg::X30 => 30,
+            Reg::SP => 31,
+            // The zero register has no DWARF number; nothing is ever located
+            // relative to it.
+            Reg::Xzr => 31,
+        }
+    }
     pub fn is_callee_saved(&self) -> bool {
         matches!(
             self,

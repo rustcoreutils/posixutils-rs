@@ -219,9 +219,72 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiEndProc));
         }
 
+        // The label `DW_AT_high_pc` names, before `.size` so it marks the end
+        // of the code rather than a point after the directive.
+        if self.base.emit_debug {
+            let end = format!(".Lfunc_end_{}", self.base.current_fn);
+            self.push_lir(Aarch64Inst::Directive(Directive::local_label(&end)));
+            self.collect_fn_die(func, types, end);
+        }
+
         // `.size f, .-f`: without it the symbol records st_size = 0 and a
         // debugger cannot tell which function owns an address inside it.
         self.push_lir(Aarch64Inst::Directive(Directive::size_to_here(&func.name)));
+    }
+
+    /// Record what `-g` has to say about this function.
+    ///
+    /// Only here can it be said: a variable's home is the register allocator's
+    /// answer for *this* function, and `self.locations` is overwritten by the
+    /// next one. A local with no stack slot -- promoted to a register, or gone
+    /// entirely -- gets no location rather than a made-up one.
+    fn collect_fn_die(&mut self, func: &Function, types: &TypeTable, end_label: String) {
+        let params: std::collections::HashSet<&str> =
+            func.params.iter().map(|(n, _)| n.as_str()).collect();
+        let mut names: Vec<&String> = func.locals.keys().collect();
+        names.sort();
+
+        let mut vars = Vec::new();
+        for name in names {
+            let local = &func.locals[name];
+            // Compiler-introduced storage has no name a debugger should show.
+            if name.starts_with("__") || name.starts_with('.') {
+                continue;
+            }
+            let loc = self
+                .locations
+                .get(local.sym)
+                .and_then(|l| self.loc_addr_parts(&l))
+                .map(|(reg, off)| crate::arch::dwarf::VarLocation {
+                    reg: reg.dwarf_number(),
+                    offset: off as i64,
+                });
+            vars.push(crate::arch::dwarf::VarDie {
+                name: name.clone(),
+                typ: local.typ,
+                decl_line: 0,
+                is_param: params.contains(name.as_str()),
+                loc,
+            });
+        }
+
+        let ret_typ = (types.kind(func.return_type) != TypeKind::Void).then_some(func.return_type);
+        let decl_line = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .find_map(|i| i.pos.as_ref())
+            .map(|p| p.line)
+            .unwrap_or(0);
+
+        self.base.fn_dies.push(crate::arch::dwarf::FnDie {
+            name: func.name.clone(),
+            external: !func.is_static,
+            decl_line,
+            end_label,
+            ret_typ,
+            vars,
+        });
     }
 
     /// Emit function header directives (text section, visibility, alignment, label, CFI start)

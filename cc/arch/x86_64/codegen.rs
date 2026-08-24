@@ -1503,14 +1503,15 @@ impl CodeGenerator for X86_64CodeGen {
             };
 
             super::super::dwarf::generate_abbrev_table(&mut self.base);
-            super::super::dwarf::generate_debug_info(
-                &mut self.base,
-                &producer,
+            let fns = std::mem::take(&mut self.base.fn_dies);
+            let unit = super::super::dwarf::UnitInfo {
+                producer: &producer,
                 source_name,
                 comp_dir,
-                low_pc,
-                high_pc,
-            );
+                low_pc_label: low_pc,
+                high_pc_label: high_pc,
+            };
+            super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
 
         // Emit .note.GNU-stack section to mark stack as non-executable (ELF only)

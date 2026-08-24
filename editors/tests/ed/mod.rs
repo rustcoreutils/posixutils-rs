@@ -77,7 +77,7 @@ fn test_ed_insert_and_print() {
 fn test_ed_number_command() {
     ed_test(
         "a\nline one\nline two\n.\n1,$n\nQ\n",
-        "     1\tline one\n     2\tline two\n",
+        "1\tline one\n2\tline two\n",
     );
 }
 
@@ -550,7 +550,7 @@ fn test_ed_number_range() {
     // Number command on range
     ed_test(
         "a\nfirst\nsecond\nthird\n.\n1,3n\nQ\n",
-        "     1\tfirst\n     2\tsecond\n     3\tthird\n",
+        "1\tfirst\n2\tsecond\n3\tthird\n",
     );
 }
 
@@ -672,7 +672,7 @@ fn test_ed_substitute_with_number() {
     // s command with n flag prints with line number
     ed_test(
         "a\nhello world\n.\n1s/world/everyone/n\nQ\n",
-        "     1\thello everyone\n",
+        "1\thello everyone\n",
     );
 }
 
@@ -867,10 +867,7 @@ fn test_ed_global_delete_all_matches() {
 #[test]
 fn test_ed_global_number_matches() {
     // g/pattern/n should print matching lines with numbers
-    ed_test(
-        "a\nfoo\nbar\nfoo\n.\ng/foo/n\nQ\n",
-        "     1\tfoo\n     3\tfoo\n",
-    );
+    ed_test("a\nfoo\nbar\nfoo\n.\ng/foo/n\nQ\n", "1\tfoo\n3\tfoo\n");
 }
 
 #[test]
@@ -2178,4 +2175,20 @@ fn test_ed_writes_ed_hup_on_sighup() {
         "SIGHUP must write the modified buffer to ed.hup; got {:?}",
         body
     );
+}
+
+/// POSIX (ed, `n`): "shall write the line number, followed by a <tab>,
+/// followed by the line". The line number was padded into a six-character
+/// field, which is the `ex` convention, not ed's -- cross-checked against
+/// /bin/ed, which writes "1<tab>text".
+#[test]
+fn test_ed_number_format_is_number_tab_line() {
+    ed_test("a\nfirst\nsecond\n.\n1,2n\nQ\n", "1\tfirst\n2\tsecond\n");
+}
+
+/// The `n` flag on `s` and inside `g` uses the same format.
+#[test]
+fn test_ed_number_flag_format_matches() {
+    ed_test("a\nxa\n.\ns/x/y/n\nQ\n", "1\tya\n");
+    ed_test("a\nxa\nxb\n.\ng/x/n\nQ\n", "1\txa\n2\txb\n");
 }

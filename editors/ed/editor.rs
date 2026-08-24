@@ -833,7 +833,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     PrintMode::Numbered => {
                         // Remove trailing newline for formatting, then add it back
                         let content = line.trim_end_matches('\n');
-                        writeln!(self.writer, "{:6}\t{}", i, content)?;
+                        writeln!(self.writer, "{}\t{}", i, content)?;
                     }
                     PrintMode::List => {
                         // POSIX: Show non-printable characters in unambiguous form
@@ -1062,7 +1062,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             if let Some(line) = self.buf.get_line(last_matched_line) {
                 let content = line.trim_end_matches('\n');
                 if numbered {
-                    writeln!(self.writer, "{:6}\t{}", last_matched_line, content)?;
+                    writeln!(self.writer, "{}\t{}", last_matched_line, content)?;
                 } else if list {
                     // Use POSIX-compliant list format
                     for ch in content.chars() {
@@ -1429,7 +1429,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     "n" => {
                         if let Some(line) = self.buf.get_line(self.buf.cur_line) {
                             let content = line.trim_end_matches('\n');
-                            writeln!(self.writer, "{:6}\t{}", self.buf.cur_line, content)?;
+                            writeln!(self.writer, "{}\t{}", self.buf.cur_line, content)?;
                         }
                         last_successful_line = self.buf.cur_line;
                     }

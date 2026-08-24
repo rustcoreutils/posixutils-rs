@@ -1992,3 +1992,66 @@ fn test_ed_substitute_valid_flag_combinations() {
     ed_test("a\nx x x\n.\ns/x/y/gp\nQ\n", "y y y\n");
     ed_test("a\nx x x\n.\ns/x/y/g\n1p\nQ\n", "y y y\n");
 }
+
+// ============================================================================
+// Phase 6 — a/i/c in a `g` command list
+// ============================================================================
+//
+// POSIX (ed, `g`): "The a, i, and c commands and associated input are
+// permitted; the '.' terminating input mode can be omitted if it would be the
+// last line of the command list." So the text comes from the *command list*,
+// and a bare `a` at the end of the list has no text: it appends nothing.
+//
+// Every expectation below was cross-checked against /bin/ed on this machine.
+
+/// A bare `a` used to fall through to `execute_command`, which does not edit
+/// -- it sets `in_input_mode` and waits for stdin that the global loop never
+/// supplies. The pending command was overwritten on each match, and the mode
+/// leaked out of the global so the *following* script lines were swallowed as
+/// input text.
+#[test]
+fn test_ed_global_bare_append_appends_nothing() {
+    ed_test("a\nfoo\nfoo\n.\ng/foo/a\n1,$p\nQ\n", "foo\nfoo\n");
+}
+
+#[test]
+fn test_ed_global_bare_insert_inserts_nothing() {
+    ed_test("a\nfoo\nbar\n.\ng/foo/i\n1,$p\nQ\n", "foo\nbar\n");
+}
+
+/// `c` with zero replacement lines deletes the addressed line.
+#[test]
+fn test_ed_global_bare_change_deletes_matching_lines() {
+    ed_test("a\nfoo\nbar\n.\ng/foo/c\n1,$p\nQ\n", "bar\n");
+}
+
+/// The mode must not leak: commands after the global still run as commands.
+#[test]
+fn test_ed_global_bare_append_does_not_swallow_later_commands() {
+    ed_test("a\nfoo\nfoo\n.\ng/foo/a\n1,$p\n2p\nQ\n", "foo\nfoo\nfoo\n");
+}
+
+/// The command list is classified by parsing it, not by scanning for the
+/// first letter -- which mistook the `a` of an address for an append command.
+#[test]
+fn test_ed_global_command_list_with_regex_address_is_not_an_append() {
+    ed_test("a\nx\nabc\ny\n.\ng/x/.,/abc/d\n1,$p\nQ\n", "y\n");
+}
+
+/// Multi-line command lists arrive by backslash continuation, and those
+/// already worked -- pin them so the classifier change cannot regress them.
+#[test]
+fn test_ed_global_append_with_continued_input_still_works() {
+    ed_test(
+        "a\nfoo\nbar\n.\ng/foo/a\\\nXXX\n.\n1,$p\nQ\n",
+        "XXX\nfoo\nXXX\nbar\n",
+    );
+}
+
+#[test]
+fn test_ed_global_change_with_continued_input_still_works() {
+    ed_test(
+        "a\nfoo\nbar\n.\ng/foo/c\\\nZZZ\n.\n1,$p\nQ\n",
+        "ZZZ\nZZZ\nbar\n",
+    );
+}

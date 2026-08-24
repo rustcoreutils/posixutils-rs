@@ -24,33 +24,16 @@ struct GlobalCommand {
     input_lines: Vec<String>,
 }
 
-/// Find the command character in a line (skipping address prefix).
-fn find_command_char(line: &str) -> Option<char> {
-    // Skip leading whitespace and address components
-    // Look for first command letter
-    for ch in line.chars() {
-        if ch.is_ascii_alphabetic() {
-            return Some(ch);
-        }
-        // Continue past address components
-        if ch.is_ascii_digit()
-            || ch == '.'
-            || ch == '$'
-            || ch == '\''
-            || ch == '/'
-            || ch == '?'
-            || ch == '+'
-            || ch == '-'
-            || ch == ','
-            || ch == ';'
-            || ch.is_whitespace()
-        {
-            continue;
-        }
-        // Stop at other characters
-        break;
-    }
-    None
+/// Whether a `g`/`v` command-list entry is one of the input-taking commands
+/// (`a`, `i`, `c`), whose text comes from the command list itself.
+///
+/// Classifying by "first alphabetic character" mistook part of an address for
+/// the command: `.,/abc/d` reported `a`, so a delete looked like an append.
+fn is_input_command(line: &str) -> bool {
+    matches!(
+        parse(line),
+        Ok(Command::Append(_) | Command::Insert(_) | Command::Change(..))
+    )
 }
 
 /// Parse a global command list string into individual commands.
@@ -68,9 +51,7 @@ fn parse_global_command_list(commands: &str) -> Vec<GlobalCommand> {
         }
 
         // Check if this is an a, i, or c command (possibly with address prefix)
-        let cmd_char = find_command_char(line);
-
-        if matches!(cmd_char, Some('a') | Some('i') | Some('c')) {
+        if is_input_command(line) {
             // Collect input lines until '.' or end of list
             let mut input_lines = Vec::new();
             i += 1;
@@ -529,6 +510,15 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             Command::Append(ref addr)
             | Command::Insert(ref addr)
             | Command::Change(ref addr, _) => {
+                // Input mode is driven by the main loop, which does not run
+                // inside `g`/`v`.  The global path handles a/i/c itself; if
+                // one ever reaches here the mode would latch with nothing to
+                // service it, so refuse rather than leak it to the caller.
+                if self.buf.is_in_global() {
+                    return Err(EdError::Generic(
+                        "a/i/c cannot enter input mode inside a global command".to_string(),
+                    ));
+                }
                 // Validate address before entering input mode
                 self.resolve_address(addr)?;
                 if let Command::Change(_, ref addr2) = cmd {
@@ -1408,12 +1398,15 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
                 let cmd = gc.command.trim();
 
-                // Check if this is a/i/c with embedded input
-                let cmd_char = find_command_char(cmd);
-                if matches!(cmd_char, Some('a') | Some('i') | Some('c'))
-                    && !gc.input_lines.is_empty()
-                {
-                    // Execute a/i/c with embedded input directly
+                // a/i/c take their text from the command list, so run them
+                // here even when that text is empty.  POSIX lets the `.` be
+                // omitted when it would be the last line of the list, which
+                // makes a bare `a` an append of nothing.  Falling through to
+                // `execute_command` instead set `in_input_mode` with nothing
+                // to service it: only the last match took effect, and the
+                // mode leaked out of the global and ate the following
+                // commands as input text.
+                if is_input_command(cmd) {
                     self.execute_input_command_with_lines(cmd, &gc.input_lines)?;
                     last_successful_line = self.buf.cur_line;
                     continue;

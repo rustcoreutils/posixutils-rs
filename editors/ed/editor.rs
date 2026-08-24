@@ -666,7 +666,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     Err(EdError::Generic("nothing to undo".to_string()))
                 }
             }
-            Command::Write(addr1, addr2, filename, append) => {
+            Command::Write {
+                addr1,
+                addr2,
+                filename,
+                append,
+                quit,
+            } => {
                 let (start, end) = self.resolve_range(&addr1, &addr2)?;
                 let path = filename.as_ref().unwrap_or(&self.buf.pathname);
                 if path.is_empty() {
@@ -694,18 +700,11 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     self.print_bytes(bytes)?;
                 }
                 self.quit_warning_given = false;
-                Ok(())
-            }
-            Command::WriteQuit(addr1, addr2, filename) => {
-                let (start, end) = self.resolve_range(&addr1, &addr2)?;
-                let path = filename.as_ref().unwrap_or(&self.buf.pathname);
-                if path.is_empty() {
-                    return Err(EdError::NoFilename);
+                // Only on success: a failed write leaves the buffer unsaved,
+                // so quitting would be exactly the data loss `wq` prevents.
+                if quit {
+                    self.should_quit = true;
                 }
-                let path = path.clone();
-                let bytes = self.buf.write_to_file(start, end, &path)?;
-                self.print_bytes(bytes)?;
-                self.should_quit = true;
                 Ok(())
             }
             Command::LineNumber(addr) => {

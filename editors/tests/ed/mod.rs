@@ -1727,3 +1727,135 @@ fn test_ed_move_onto_self_is_error() {
 fn test_ed_move_dest_just_before_range_is_noop() {
     ed_test("a\n1\n2\n3\n.\n2,3m1\n1,$p\nQ\n", "1\n2\n3\n");
 }
+
+// ============================================================================
+// Phase 3 — `w` / `wq` / `Wq`
+// ============================================================================
+
+/// Run `ed` with a real working directory, so a test can assert on the files it
+/// did (and did not) create. `run_test` leaves the child in the harness's cwd.
+fn ed_in_dir(dir: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String, String) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(plib::testing::get_binary_path("ed"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ed");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait for ed");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `wq` must write the whole buffer to the remembered pathname and exit.
+///
+/// The tokenizer takes everything after the command letter as one blob, so
+/// `wq` used to parse as `w` with the filename `"q"`: it wrote the buffer to a
+/// junk file, left the real file untouched, and did not quit -- silent data
+/// loss with exit 0.
+#[test]
+fn test_ed_wq_writes_remembered_file_and_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    fs::write(&target, "hello\n").unwrap();
+
+    let (code, _out, err) = ed_in_dir(dir.path(), &["-s", "f.txt"], "1a\nworld\n.\nwq\n");
+
+    assert_eq!(code, 0, "wq should succeed; stderr: {}", err);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "hello\nworld\n");
+    assert!(
+        !dir.path().join("q").exists(),
+        "wq must not create a file named 'q'"
+    );
+}
+
+#[test]
+fn test_ed_wq_with_filename_writes_there_and_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, _out, err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nwq out.txt\n");
+
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "hello\n"
+    );
+    assert!(!dir.path().join("q out.txt").exists());
+}
+
+/// `W` is the append-writing form, so `Wq` appends and quits.
+#[test]
+fn test_ed_uppercase_wq_appends_and_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    fs::write(&target, "first\n").unwrap();
+
+    let (code, _out, err) = ed_in_dir(dir.path(), &["-s"], "a\nsecond\n.\nWq f.txt\n");
+
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "first\nsecond\n");
+}
+
+/// The distinction is literal adjacency: `wq` is write-quit, `w q` writes a
+/// file that happens to be named `q` and stays in command mode.
+#[test]
+fn test_ed_w_space_q_writes_a_file_named_q_without_quitting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out, err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nw q\n1p\nQ\n");
+
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert_eq!(fs::read_to_string(dir.path().join("q")).unwrap(), "hello\n");
+    assert_eq!(
+        out, "hello\n",
+        "`w q` must not quit -- the following 1p should still run"
+    );
+}
+
+/// POSIX (ed, `w`): with no pathname given and none remembered, it is an error.
+#[test]
+fn test_ed_wq_without_remembered_pathname_is_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out, _err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nwq\nQ\n");
+
+    assert_eq!(code, 1);
+    assert!(out.starts_with('?'), "expected '?', got {:?}", out);
+    assert!(
+        !dir.path().join("q").exists(),
+        "a failed wq must not create a file"
+    );
+}
+
+/// `x` used to be a second, degraded spelling of write-quit. GNU and BSD both
+/// define `x` as something else entirely (put the cut buffer), and POSIX
+/// defines neither -- so with a real `wq`, shipping a third meaning is worse
+/// than answering '?'.
+#[test]
+fn test_ed_x_command_is_not_recognized() {
+    // Give ed a remembered pathname, so `x` would succeed if it still meant
+    // write-quit -- otherwise this passes for the unrelated NoFilename reason.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    fs::write(&target, "hello\n").unwrap();
+
+    let (code, out, _err) = ed_in_dir(dir.path(), &["-s", "f.txt"], "1a\nworld\n.\nx\nQ\n");
+
+    assert_eq!(code, 1);
+    assert!(out.starts_with('?'), "expected '?', got {:?}", out);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "hello\n",
+        "a rejected `x` must not write"
+    );
+}

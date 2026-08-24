@@ -323,7 +323,12 @@ impl Line {
 
     /// Find the first non-blank character offset.
     pub fn first_non_blank(&self) -> usize {
-        self.content.find(|c: char| !c.is_whitespace()).unwrap_or(0)
+        // On an all-blank line there is no non-blank to move to, so the
+        // cursor stays on the last character.  Falling back to 0 sent `^` to
+        // the *start* of a line of indentation, which is where `0` goes.
+        self.content
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or_else(|| self.last_char_offset())
     }
 
     /// Check if character at offset is a word character.
@@ -464,8 +469,13 @@ mod tests {
         let line = Line::from("hello");
         assert_eq!(line.first_non_blank(), 0);
 
+        // No non-blank: the cursor stays on the last character rather than
+        // jumping to column 0, which is where `0` goes and `^` does not.
         let line = Line::from("   ");
-        assert_eq!(line.first_non_blank(), 0); // No non-blank found
+        assert_eq!(line.first_non_blank(), 2);
+
+        let line = Line::from("");
+        assert_eq!(line.first_non_blank(), 0);
     }
 
     #[test]

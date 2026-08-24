@@ -197,7 +197,12 @@ impl Options {
         self.scroll = self.window / 2;
     }
 
-    /// Parse and apply a :set command argument.
+    /// Parse and apply a `:set` command argument.
+    ///
+    /// POSIX (ex, `set`): `set [option[=[value]] ...]` -- the arguments are
+    /// <blank>-separated, which is how an ordinary `.exrc` line is written.
+    /// The whole argument used to be treated as one option name, so
+    /// `set ai number` reported an unknown option called "ai number".
     pub fn set(&mut self, arg: &str) -> Result<Option<String>> {
         let arg = arg.trim();
 
@@ -209,6 +214,32 @@ impl Options {
         // Handle empty - show changed options
         if arg.is_empty() {
             return Ok(Some(self.show_changed()));
+        }
+
+        // Several options on one line: apply each, and collect whatever any
+        // of them asked to report.
+        if arg.split_whitespace().count() > 1 {
+            let mut reports = Vec::new();
+            for one in arg.split_whitespace() {
+                if let Some(msg) = self.set_one(one)? {
+                    reports.push(msg);
+                }
+            }
+            return Ok(if reports.is_empty() {
+                None
+            } else {
+                Some(reports.join("  "))
+            });
+        }
+
+        self.set_one(arg)
+    }
+
+    /// Parse and apply a single `:set` argument.
+    fn set_one(&mut self, arg: &str) -> Result<Option<String>> {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return Ok(None);
         }
 
         // Handle "no" prefix for boolean options

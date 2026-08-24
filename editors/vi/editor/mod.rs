@@ -1600,8 +1600,36 @@ impl Editor {
             // Replace char
             'r' => {
                 if let Some(c) = cmd.char_arg {
-                    for _ in 0..count {
-                        self.replace_char(c);
+                    // `count` *successive* characters, each replaced by `c`.
+                    // Calling the single-character replace repeatedly without
+                    // advancing rewrote the same character every time, so
+                    // `3rZ` changed one character rather than three.
+                    let line = self.buffer.cursor().line;
+                    let start = self.buffer.cursor().column;
+                    let remaining = self
+                        .buffer
+                        .line(line)
+                        .map(|l| l.content()[start..].chars().count())
+                        .unwrap_or(0);
+                    // POSIX: a count larger than the characters left on the
+                    // line is an error, and the line is unchanged.
+                    if count > remaining {
+                        self.set_error("Not enough characters on the line");
+                    } else {
+                        self.undo.begin_group();
+                        for i in 0..count {
+                            self.replace_char(c);
+                            if i + 1 < count {
+                                let col = self.buffer.cursor().column;
+                                let next =
+                                    self.buffer.line(line).and_then(|l| l.next_char_offset(col));
+                                match next {
+                                    Some(n) => self.buffer.set_column(n),
+                                    None => break,
+                                }
+                            }
+                        }
+                        self.undo.end_group();
                     }
                 }
             }

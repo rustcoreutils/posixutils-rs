@@ -1430,9 +1430,10 @@ fn test_line_first_non_blank() {
     let line = Line::from("   hello");
     assert_eq!(line.first_non_blank(), 3);
 
-    // For blank line, returns 0 (unwrap_or(0))
+    // An all-blank line has no non-blank, so the cursor stays on the last
+    // character; column 0 is where `0` goes, not `^`.
     let blank = Line::from("     ");
-    assert_eq!(blank.first_non_blank(), 0);
+    assert_eq!(blank.first_non_blank(), 4);
 }
 
 // ============================================================================

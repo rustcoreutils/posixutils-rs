@@ -2979,3 +2979,67 @@ fn test_shell_filter_tolerates_a_command_that_stops_reading() {
         Err(_) => panic!("`:%!head -1` deadlocked"),
     }
 }
+
+// ============================================================================
+// Remaining conformance items
+// ============================================================================
+
+/// POSIX (ex, `set`): "set [option[=[value]] ...]" -- the arguments are
+/// <blank>-separated, which is how an ordinary .exrc line is written.
+#[test]
+fn test_set_accepts_several_options_on_one_line() {
+    let mut editor = Editor::new_headless();
+    editor.execute_keys(":set ai number\n").unwrap();
+    assert!(editor.options().autoindent, "ai should be on");
+    assert!(editor.options().number, "number should be on");
+    assert!(
+        !editor.is_error_message(),
+        "unexpected error: {:?}",
+        editor.get_message()
+    );
+}
+
+#[test]
+fn test_set_accepts_several_options_with_values() {
+    let mut editor = Editor::new_headless();
+    editor.execute_keys(":set sw=4 ts=2 ai\n").unwrap();
+    assert_eq!(editor.options().shiftwidth, 4);
+    assert_eq!(editor.options().tabstop, 2);
+    assert!(editor.options().autoindent);
+}
+
+/// `r` with a count replaces that many characters, each with the same one.
+/// It called the single-character replace `count` times without moving, so
+/// `3rx` rewrote the same character three times.
+#[test]
+fn test_replace_char_with_a_count_replaces_that_many() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abcdef\n");
+    editor.execute_keys("3rZ").unwrap();
+    assert_eq!(editor.get_buffer_text(), "ZZZdef\n");
+}
+
+/// POSIX: `r` with a count larger than the characters left on the line is an
+/// error, and the line is unchanged.
+#[test]
+fn test_replace_char_past_end_of_line_changes_nothing() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("ab\n");
+    let _ = editor.execute_keys("5rZ");
+    assert_eq!(editor.get_buffer_text(), "ab\n");
+}
+
+/// `^` moves to the first non-blank; on an all-blank line there is none, so
+/// the cursor goes to the last character rather than to column 0.
+#[test]
+fn test_first_non_blank_on_an_all_blank_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("    \n");
+    editor.execute_keys("$").unwrap();
+    editor.execute_keys("^").unwrap();
+    assert_eq!(
+        editor.get_cursor().column,
+        3,
+        "an all-blank line has no non-blank, so `^` stays on the last character"
+    );
+}

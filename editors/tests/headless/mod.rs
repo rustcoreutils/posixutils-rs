@@ -1966,3 +1966,105 @@ fn test_global_substitute_does_not_reanchor_dollar() {
     editor.execute_keys(":s/$/!/g\n").unwrap();
     assert_eq!(editor.get_buffer_text(), "abc!\n");
 }
+
+// ============================================================================
+// Phase 9b — counts that mean characters, not bytes
+// ============================================================================
+
+/// `3s` substitutes three *characters*. The end column added a character
+/// count to a byte offset and then clamped it with a character count, so on
+/// multi-byte text it consumed the wrong span.
+#[test]
+fn test_substitute_count_counts_characters() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("héllo\n");
+    editor.execute_keys("3sZ\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "Zlo\n");
+}
+
+#[test]
+fn test_substitute_count_past_end_of_line_is_clamped() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("éx\n");
+    editor.execute_keys("9sZ\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "Z\n");
+}
+
+/// `cw` extends the range past the last character of the word. Adding one
+/// *byte* landed inside that character when it was multi-byte.
+#[test]
+fn test_change_word_includes_a_multibyte_final_character() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("café x\n");
+    editor.execute_keys("cwZ\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "Z x\n");
+}
+
+/// `^W` deletes the word before the cursor, `^U` the whole insert. Both
+/// counted a byte distance and then deleted that many *characters*, so they
+/// over-deleted on multi-byte text -- `^U` ate the preceding newline.
+#[test]
+fn test_insert_delete_word_before_cursor_on_multibyte() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("");
+    editor.execute_keys("ihéllo wörld\x17").unwrap();
+    editor.execute_keys("\x1b").unwrap();
+    // trim only the newline -- the trailing blank is exactly what `^W` keeps.
+    assert_eq!(
+        editor.get_buffer_text().trim_end_matches('\n'),
+        "héllo ",
+        "^W deletes the word, not the blank before it"
+    );
+}
+
+#[test]
+fn test_insert_delete_line_does_not_eat_the_previous_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("keep\n");
+    editor.execute_keys("A\nhéllo wörld\x15").unwrap();
+    editor.execute_keys("\x1b").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "keep\n\n",
+        "^U must clear only what was inserted on this line"
+    );
+}
+
+/// POSIX (vi, "Move to Specified Column"): `|` moves to a *column*, so a tab
+/// counts for as many columns as it displays. The implementation used the
+/// count as a character index, which disagrees with the screen on any line
+/// containing a tab.
+#[test]
+fn test_pipe_moves_to_a_display_column() {
+    let mut editor = Editor::new_headless();
+    // With tabstop 8: 'a' is column 1, the tab spans columns 2-8, 'b' is
+    // column 9 and 'c' column 10. As a character index, column 9 would run
+    // past the four characters and clamp to 'c'.
+    editor.set_buffer_text("a\tbc\n");
+    editor.execute_keys("9|").unwrap();
+    assert_eq!(editor.get_cursor().column, 2, "column 9 is 'b' at byte 2");
+}
+
+#[test]
+fn test_pipe_display_column_with_consecutive_tabs() {
+    let mut editor = Editor::new_headless();
+    // Two tabs span columns 1-8 and 9-16; 'x' is column 17.
+    editor.set_buffer_text("\t\tx\n");
+    editor.execute_keys("9|").unwrap();
+    assert_eq!(
+        editor.get_cursor().column,
+        1,
+        "column 9 is the second tab, at byte 1"
+    );
+}
+
+/// Without tabs a column is a character, which on multi-byte text is still
+/// not a byte.
+#[test]
+fn test_pipe_column_is_not_a_byte_offset_on_multibyte() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("héllo\n");
+    // h=1, é=2, l=3 -- and 'l' sits at byte 3 because é is two bytes.
+    editor.execute_keys("3|").unwrap();
+    assert_eq!(editor.get_cursor().column, 3);
+}

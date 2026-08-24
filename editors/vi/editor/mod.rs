@@ -1622,7 +1622,7 @@ impl Editor {
             }
             // Go to column
             '|' => {
-                if let Ok(res) = motion::move_to_column(&self.buffer, count) {
+                if let Ok(res) = motion::move_to_column(&self.buffer, count, self.options.tabstop) {
                     self.buffer.set_cursor(res.position);
                 }
             }
@@ -1891,12 +1891,24 @@ impl Editor {
             let end_line = (cursor.line + cmd.count - 1).min(self.buffer.line_count());
             Range::lines(cursor, Position::new(end_line, 0))
         } else {
-            let line_len = self
+            // `s` takes a count of *characters*.  Walk that many character
+            // boundaries forward rather than adding the count to a byte
+            // offset and clamping it with a character count -- two different
+            // units, neither of which was the byte offset a Range needs.
+            let end_col = self
                 .buffer
                 .line(cursor.line)
-                .map(|l| l.content().chars().count())
-                .unwrap_or(0);
-            let end_col = (cursor.column + cmd.count).min(line_len);
+                .map(|l| {
+                    let mut col = cursor.column;
+                    for _ in 0..cmd.count {
+                        match l.next_char_offset(col) {
+                            Some(next) => col = next,
+                            None => break,
+                        }
+                    }
+                    col
+                })
+                .unwrap_or(cursor.column);
             Range::chars(cursor, Position::new(cursor.line, end_col))
         };
 
@@ -2083,7 +2095,7 @@ impl Editor {
             '}' => motion::move_paragraph_forward(&self.buffer, mot.count).ok(),
             '(' => motion::move_sentence_backward(&self.buffer, mot.count).ok(),
             ')' => motion::move_sentence_forward(&self.buffer, mot.count).ok(),
-            '|' => motion::move_to_column(&self.buffer, mot.count).ok(),
+            '|' => motion::move_to_column(&self.buffer, mot.count, self.options.tabstop).ok(),
             '%' => motion::find_matching_bracket(&self.buffer).ok(),
             _ => None,
         };

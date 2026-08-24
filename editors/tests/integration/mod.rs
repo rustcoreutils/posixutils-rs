@@ -274,7 +274,7 @@ fn test_motion_percent_nested_brackets() {
 fn test_motion_pipe_column() {
     let buffer = Buffer::from_text("hello world");
 
-    let result = command::motion::move_to_column(&buffer, 5).unwrap();
+    let result = command::motion::move_to_column(&buffer, 5, 8).unwrap();
     assert_eq!(result.position.column, 4); // Column 5 is index 4
 }
 
@@ -1597,7 +1597,7 @@ fn test_motion_column() {
 
     let buffer = Buffer::from_text("hello world");
 
-    let result = move_to_column(&buffer, 6).unwrap();
+    let result = move_to_column(&buffer, 6, 8).unwrap();
     assert_eq!(result.position.column, 5); // column 6 is 0-indexed as 5
 }
 

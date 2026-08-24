@@ -600,22 +600,18 @@ pub fn till_char_backward(buffer: &Buffer, c: char, count: usize) -> Result<Moti
 }
 
 /// Move to column (| command).
-pub fn move_to_column(buffer: &Buffer, col: usize) -> Result<MotionResult> {
+pub fn move_to_column(buffer: &Buffer, col: usize, tabstop: usize) -> Result<MotionResult> {
     let pos = buffer.cursor();
     let line = buffer.line(pos.line).ok_or(ViError::EmptyBuffer)?;
 
-    // Column is 1-indexed for display, convert to byte offset
-    // For now, treat column as display column
+    // POSIX (vi, "Move to Specified Column") counts *display* columns, so a
+    // tab is as wide as it renders.  Treating the count as a character index
+    // agreed with the screen only on lines with no tabs.
     let target_col = col.saturating_sub(1); // Convert to 0-indexed
 
     let content = line.content();
-    let chars: Vec<(usize, char)> = content.char_indices().collect();
-
-    let new_col = if target_col >= chars.len() {
-        chars.last().map(|(idx, _)| *idx).unwrap_or(0)
-    } else {
-        chars.get(target_col).map(|(idx, _)| *idx).unwrap_or(0)
-    };
+    let new_col = crate::ui::display_col_to_byte_offset(content, target_col, tabstop)
+        .min(line.last_char_offset());
 
     let new_pos = Position::new(pos.line, new_col);
 

@@ -178,6 +178,27 @@ more dangerous case.
 | — | Minor | `ed`'s `n` used ex's six-column padding instead of number-tab-line |
 | — | Minor | `^` on an all-blank line went to column 0, which is where `0` goes |
 
+**3. One fix unmasked a latent defect rather than causing one.** Gating the
+raw-mode restore (above) removed an *accidental* early exit: the unconditional
+`enable_raw_mode()` failed on a pipe, and in silent mode that error made ex
+quit. What it had been hiding is that the "Press ENTER or type command to
+continue" pause after `:!command` runs in ex too, where there is no screen to
+redraw and no user -- and the byte it reads comes off the **command stream**.
+Given `!true` followed by `q!` it swallowed the `q`, leaving a bare `!`: the
+interactive shell, which inherits the editor's stdin, competes for the
+controlling terminal and stops. From a terminal that reads as a hang with no
+diagnostic and no way back; under a pipe the same input merely misexecutes.
+
+The pause and the screen clear are now gated on the terminal having been in
+raw mode, which is true exactly in visual mode on a real terminal, and
+`Shell::interactive` refuses outright when stdin is not a terminal -- an
+interactive shell with nothing to be interactive with can only hang. `:w
+!command` carried all three defects and is fixed identically.
+
+Worth keeping in mind for the next pass: a test suite that only ever runs
+under pipes cannot see this class of bug, and an error that happens to abort
+the session will hide whatever comes after it.
+
 ### Standing regression nets added
 
 Three, each of which found defects the explicit tests did not:

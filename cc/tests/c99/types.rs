@@ -1600,6 +1600,12 @@ int main(void)
 }
 
 /// The header that made the rejection a build blocker.
+///
+/// Linux-only: `<link.h>` is glibc's dynamic-linker auditing interface and has
+/// no macOS equivalent -- the system compiler cannot find it there either, so
+/// this is a missing header rather than anything cc could parse.  What the
+/// header exercises is covered on every platform by
+/// `c99_vector_size_storage` above, which reproduces its shape inline.
 #[test]
 fn c99_link_h_compiles() {
     let code = r#"
@@ -1614,9 +1620,10 @@ int main(void)
     return 0;
 }
 "#;
-    // x86-64 only: the vector typedefs are inside `#ifdef __x86_64__`.
-    #[cfg(target_arch = "x86_64")]
+    // x86-64 only within Linux: the vector typedefs are inside
+    // `#ifdef __x86_64__`.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     assert_eq!(compile_and_run("link_h_compiles", code, &[]), 0);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     let _ = code;
 }

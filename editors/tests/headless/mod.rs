@@ -2196,3 +2196,15 @@ fn test_ex_copy_to_search_address() {
     editor.execute_keys(":1t/three/\n").unwrap();
     assert_eq!(editor.get_buffer_text(), "one\ntwo\nthree\none\n");
 }
+
+/// The other half of the same rule: vi begins on the first line.
+#[test]
+fn test_vi_starts_on_the_first_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.txt");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+    let mut editor = Editor::new_headless();
+    editor.open(path.to_str().unwrap()).unwrap();
+    assert_eq!(editor.get_cursor().line, 1);
+}

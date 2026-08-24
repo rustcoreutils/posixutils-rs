@@ -503,7 +503,16 @@ impl Editor {
         if old_current.is_some() {
             self.shell.set_alternate_file(old_current);
         }
-        self.buffer.set_line(1);
+        // POSIX: ex starts on the *last* line of the edit buffer, vi on the
+        // first.  Starting ex on line 1 made every command with a relative or
+        // defaulted address act on the wrong end of the file -- `:1t.` copied
+        // after line 1 rather than after the last line.
+        let start_line = if self.ex_standalone_mode {
+            self.buffer.line_count().max(1)
+        } else {
+            1
+        };
+        self.buffer.set_line(start_line);
         self.buffer.move_to_first_non_blank();
         self.undo.clear();
         Ok(())

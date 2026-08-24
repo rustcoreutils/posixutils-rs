@@ -1478,3 +1478,32 @@ fn test_ex_autoindent_keeps_a_line_typed_as_blanks() {
         "    base\n    one\n      \n      two\n",
     );
 }
+
+// ============================================================================
+// The initial current line
+// ============================================================================
+//
+// POSIX: ex begins on the *last* line of the edit buffer; vi begins on the
+// first. Starting ex on line 1 made every command with a defaulted or relative
+// address act on the wrong end of the file -- `:t.` appended after line 1
+// instead of after the last line. Cross-checked against /usr/bin/ex.
+
+#[test]
+fn test_ex_starts_on_the_last_line() {
+    ex_test_with_file("one\ntwo\nthree\n", ".=\nq!\n", "3\n");
+}
+
+#[test]
+fn test_ex_default_address_is_the_last_line() {
+    ex_test_with_file("one\ntwo\nthree\n", "p\nq!\n", "three\n");
+}
+
+#[test]
+fn test_ex_copy_to_current_appends_at_the_end() {
+    ex_test_with_file("one\ntwo\n", "1t.\n%p\nq!\n", "one\ntwo\none\n");
+}
+
+#[test]
+fn test_ex_starts_on_the_last_line_of_a_single_line_file() {
+    ex_test_with_file("only\n", ".=\nq!\n", "1\n");
+}

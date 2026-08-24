@@ -1594,3 +1594,105 @@ fn test_visual_command_in_visual_mode_edits_a_file() {
         "expected the +command to have moved to line 2"
     );
 }
+
+// ============================================================================
+// Phase 1 — crash & hang stoppers
+// ============================================================================
+
+/// `:s` with a `\n` in the replacement splits one line into several. The loop
+/// that walks the range must step *past* the lines it just inserted; stepping
+/// back onto the first part re-substitutes it forever, growing the buffer
+/// without bound until the process is killed.
+///
+/// Run on a worker thread so a regression fails the suite instead of hanging it.
+#[test]
+fn test_ex_substitute_newline_terminates() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text("a\n");
+        let r = editor.execute_keys(":1s/^/\\n/\n");
+        let _ = tx.send(r.map(|()| editor.get_buffer_text()));
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(text)) => assert_eq!(
+            text, "\na\n",
+            "the empty match at `^` should have split line 1 in two"
+        ),
+        Ok(Err(e)) => panic!("substitute failed: {}", e),
+        Err(_) => panic!("`:1s/^/\\n/` did not terminate within 10s"),
+    }
+}
+
+/// An ex command that fails must report on the status line and leave the editor
+/// running. Propagating the error out of `handle_key` unwinds to `run_editor`,
+/// which prints and exits — so visual-mode `:q` on a modified buffer used to
+/// quit vi and discard the unsaved work it was supposed to be protecting.
+#[test]
+fn test_visual_quit_on_modified_buffer_warns_without_quitting() {
+    let mut editor = Editor::new_headless();
+    editor.execute_keys("ihello\x1b").unwrap();
+
+    editor
+        .execute_keys(":q\n")
+        .expect("`:q` on a modified buffer must not propagate an error");
+
+    assert!(
+        !editor.should_quit(),
+        "vi must stay running so the unsaved buffer is not lost"
+    );
+    assert!(
+        editor.is_error_message(),
+        "expected an error on the status line, got {:?}",
+        editor.get_message()
+    );
+    assert_eq!(editor.get_buffer_text().trim(), "hello");
+}
+
+/// Every failing ex command takes the same path out of `handle_ex_key`, so one
+/// escaping error means all of them escape.
+#[test]
+fn test_failing_ex_commands_do_not_quit_the_editor() {
+    for cmd in [":e /nonexistent/nope\n", ":n\n", ":zzzz\n"] {
+        let mut editor = Editor::new_headless();
+        editor.execute_keys("ihello\x1b").unwrap();
+
+        editor
+            .execute_keys(cmd)
+            .unwrap_or_else(|e| panic!("{:?} propagated an error: {}", cmd, e));
+        assert!(!editor.should_quit(), "{:?} quit the editor", cmd);
+        assert_eq!(
+            editor.get_buffer_text().trim(),
+            "hello",
+            "{:?} lost the buffer",
+            cmd
+        );
+    }
+}
+
+/// `:d`/`:y` accept an explicit count. A count of zero used to reach
+/// `start + count - 1` unguarded.
+#[test]
+fn test_ex_delete_and_yank_reject_zero_count() {
+    for cmd in [":1d 0\n", ":1y 0\n"] {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text("one\ntwo\nthree\n");
+
+        editor
+            .execute_keys(cmd)
+            .unwrap_or_else(|e| panic!("{:?} propagated an error: {}", cmd, e));
+        assert!(
+            editor.is_error_message(),
+            "{:?} should be rejected, got message {:?}",
+            cmd,
+            editor.get_message()
+        );
+        assert_eq!(
+            editor.get_buffer_text(),
+            "one\ntwo\nthree\n",
+            "{:?} must leave the buffer alone",
+            cmd
+        );
+    }
+}

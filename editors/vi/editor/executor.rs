@@ -579,11 +579,7 @@ impl Editor {
         use crate::command::delete;
 
         let (start, end) = self.resolve_range(range)?;
-        let end = if let Some(c) = count {
-            (start + c - 1).min(self.buffer.line_count())
-        } else {
-            end
-        };
+        let end = end_from_count(start, end, count, self.buffer.line_count())?;
 
         let start_pos = Position::new(start, 0);
         let end_pos = Position::new(end, 0);
@@ -610,11 +606,7 @@ impl Editor {
         use crate::command::yank;
 
         let (start, end) = self.resolve_range(range)?;
-        let end = if let Some(c) = count {
-            (start + c - 1).min(self.buffer.line_count())
-        } else {
-            end
-        };
+        let end = end_from_count(start, end, count, self.buffer.line_count())?;
 
         let start_pos = Position::new(start, 0);
         let end_pos = Position::new(end, 0);
@@ -627,6 +619,27 @@ impl Editor {
 
         Ok(())
     }
+}
+
+/// Resolve the last line an ex command acts on when a trailing `count` was
+/// given: the range becomes `count` lines starting at `start`.
+///
+/// A count must be positive. Zero used to reach `start + count - 1` unguarded,
+/// which underflows for `start == 0` and otherwise silently addresses the line
+/// *before* `start`, so `:1d 0` walked off the front of the buffer.
+fn end_from_count(
+    start: usize,
+    end: usize,
+    count: Option<usize>,
+    last_line: usize,
+) -> Result<usize> {
+    let Some(c) = count else { return Ok(end) };
+    if c == 0 {
+        return Err(ViError::InvalidCommand(
+            "count must be positive".to_string(),
+        ));
+    }
+    Ok((start + c - 1).min(last_line))
 }
 
 /// Decrement `line` by `delta`, or fail as POSIX requires when the result

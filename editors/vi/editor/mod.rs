@@ -446,6 +446,12 @@ impl Editor {
         self.is_error
     }
 
+    /// Whether the editor has been asked to exit (for testing). A failing ex
+    /// command must leave this `false`, or the unsaved buffer goes with it.
+    pub fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
     /// Process a single key (public for testing).
     pub fn process_key(&mut self, key: Key) -> Result<()> {
         self.handle_key(key)
@@ -1066,7 +1072,14 @@ impl Editor {
             Key::Enter => {
                 let input = std::mem::take(&mut self.ex_input);
                 self.mode = Mode::Command;
-                self.execute_ex_input(&input)?;
+                // A failing ex command reports on the status line; it must not
+                // propagate. `handle_key` unwinds all the way to `run_editor`,
+                // which prints and exits -- so letting `:q` on a modified
+                // buffer return `FileModified` here quit vi and discarded the
+                // very work the warning exists to protect.
+                if let Err(e) = self.execute_ex_input(&input) {
+                    self.set_error(&e.to_string());
+                }
             }
             Key::Escape => {
                 self.ex_input.clear();
@@ -3340,9 +3353,13 @@ impl Editor {
                                 .insert_line_after(line_num - 1 + i, Line::from(part.as_str()));
                         }
                         // Later lines in the range have shifted down by the
-                        // number of extra lines introduced here.
+                        // number of extra lines introduced here. Step over
+                        // every part we just wrote: landing back on the first
+                        // one re-substitutes it forever, growing the buffer
+                        // until the process is killed.
                         end += parts.len() - 1;
                         total_count += count;
+                        line_num += parts.len();
                         continue;
                     }
                     self.undo.record_replace(

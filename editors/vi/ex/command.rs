@@ -9,7 +9,7 @@
 
 //! Ex command definitions.
 
-use super::address::AddressRange;
+use super::address::{Address, AddressRange};
 
 /// Parsed ex command.
 #[derive(Debug)]
@@ -64,9 +64,9 @@ pub enum ExCommand {
         register: Option<char>,
     },
     /// Copy lines (:co, :copy, :t).
-    Copy { range: AddressRange, dest: usize },
+    Copy { range: AddressRange, dest: Address },
     /// Move lines (:m, :move).
-    Move { range: AddressRange, dest: usize },
+    Move { range: AddressRange, dest: Address },
     /// Substitute (:s, :substitute).
     Substitute {
         range: AddressRange,

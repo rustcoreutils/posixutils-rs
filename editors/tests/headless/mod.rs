@@ -2068,3 +2068,131 @@ fn test_pipe_column_is_not_a_byte_offset_on_multibyte() {
     editor.execute_keys("3|").unwrap();
     assert_eq!(editor.get_cursor().column, 3);
 }
+
+// ============================================================================
+// Phase 10 — `:g` must survive the renumbering its own commands cause
+// ============================================================================
+//
+// POSIX marks the lines matching the pattern first, then runs the command list
+// against each in order. Every command that inserts, removes or relocates
+// lines renumbers the marks not yet visited. The code compensated only when
+// `command.trim().starts_with('d')` -- a test that misses `.d`, `.,.+1d`, `j`,
+// `m` and everything else -- so the loop then addressed unrelated lines and
+// destroyed them. Marks are now followed through the buffer's edit journal.
+
+#[test]
+fn test_ex_global_delete_with_explicit_current_address() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("a\nX\nb\nX\nc\n");
+    editor.execute_keys(":g/X/.d\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "a\nb\nc\n");
+}
+
+#[test]
+fn test_ex_global_bare_delete_still_works() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("a\nX\nb\nX\nc\n");
+    editor.execute_keys(":g/X/d\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "a\nb\nc\n");
+}
+
+#[test]
+fn test_ex_global_delete_two_lines_per_match() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("X\ngone\nkeep\nX\ngone\nkeep\n");
+    editor.execute_keys(":g/X/.,.+1d\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "keep\nkeep\n");
+}
+
+#[test]
+fn test_ex_global_join_does_not_lose_lines() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("X\ntail\nkeep\nX\ntail\n");
+    editor.execute_keys(":g/X/j\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "X tail\nkeep\nX tail\n");
+}
+
+#[test]
+fn test_ex_global_move_to_top() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("a\nX1\nb\nX2\nc\n");
+    editor.execute_keys(":g/X/m0\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "X2\nX1\na\nb\nc\n");
+}
+
+#[test]
+fn test_ex_global_substitute_that_adds_lines() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("aXb\ncXd\n");
+    editor.execute_keys(":g/X/s/X/-/\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "a-b\nc-d\n");
+}
+
+/// A relocating command leaves the line count alone while still renumbering
+/// the marks not yet visited -- the case a count delta cannot see, and the
+/// reason marks are followed through the edit journal. Matches /usr/bin/ex.
+#[test]
+fn test_ex_global_move_to_last_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("X1\na\nX2\nb\n");
+    editor.execute_keys(":g/X/m$\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "a\nb\nX1\nX2\n");
+}
+
+#[test]
+fn test_ex_global_copy_to_last_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("X1\na\nX2\nb\n");
+    editor.execute_keys(":g/X/t$\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "X1\na\nX2\nb\nX1\nX2\n");
+}
+
+// ============================================================================
+// `:m` and `:t` take an address, not a bare line number
+// ============================================================================
+//
+// POSIX (ex, `copy`/`move`) gives the destination as an address, so `$`, `.`,
+// `.+2`, a mark and a search are all valid. It was parsed with a plain integer
+// parse, so everything but a decimal literal failed outright -- `:1m$`
+// answered "invalid line number". Cross-checked against /usr/bin/ex.
+
+#[test]
+fn test_ex_move_to_last_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("X1\na\nX2\nb\n");
+    editor.execute_keys(":1m$\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "a\nX2\nb\nX1\n");
+}
+
+#[test]
+fn test_ex_copy_to_last_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("X1\na\n");
+    editor.execute_keys(":1t$\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "X1\na\nX1\n");
+}
+
+#[test]
+fn test_ex_move_to_zero_still_works() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("a\nb\nc\n");
+    editor.execute_keys(":3m0\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "c\na\nb\n");
+}
+
+#[test]
+fn test_ex_move_to_relative_address() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("a\nb\nc\nd\n");
+    editor.execute_keys(":1\n").unwrap();
+    editor.execute_keys(":1m.+2\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "b\nc\na\nd\n");
+}
+
+#[test]
+fn test_ex_copy_to_search_address() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys(":1t/three/\n").unwrap();
+    assert_eq!(editor.get_buffer_text(), "one\ntwo\nthree\none\n");
+}

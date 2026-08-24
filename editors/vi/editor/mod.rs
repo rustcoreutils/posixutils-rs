@@ -2539,11 +2539,11 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
             ExCommand::Copy { range, dest } => {
-                self.execute_ex_copy(&range, dest)?;
+                self.execute_ex_copy(&range, &dest)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Move { range, dest } => {
-                self.execute_ex_move(&range, dest)?;
+                self.execute_ex_move(&range, &dest)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Read { range, file } => {
@@ -3178,21 +3178,47 @@ impl Editor {
             }
         }
 
-        // Execute command on each matching line
-        // Process in reverse for delete commands to preserve line numbers
-        let is_delete = command.trim().starts_with('d');
-        if is_delete {
-            matching_lines.reverse();
-        }
+        // Execute the command on each matching line.
+        //
+        // POSIX marks the matching lines first and then runs the command list
+        // against each, in order.  Every command that inserts, removes or
+        // relocates lines renumbers the marks not yet visited, so follow them
+        // through the buffer's edit journal rather than by line number.  This
+        // used to reverse the list when the command text began with 'd',
+        // which missed `.d`, `.,.+1d`, `j` and everything else that changes
+        // the line count -- the loop then addressed unrelated lines and
+        // deleted them.  Reversing is not an option in general anyway: it
+        // would reverse the output of a `p` and the resulting order of an `m`.
+        //
+        // A mark is `None` once the command that ran on an earlier match
+        // deleted its text.
+        let mut pending: Vec<Option<usize>> = matching_lines.into_iter().map(Some).collect();
 
-        for line_num in matching_lines {
-            // Move cursor to the line
+        self.buffer.begin_line_tracking();
+        for idx in 0..pending.len() {
+            let Some(line_num) = pending[idx] else {
+                continue;
+            };
+            if line_num == 0 || line_num > self.buffer.line_count() {
+                continue;
+            }
+
             self.buffer.set_line(line_num);
-            // Execute the command
+            let mark = self.buffer.edit_log_len();
             if let Err(e) = self.execute_ex_input(command) {
                 self.set_error(&e.to_string());
             }
+
+            let edits: Vec<_> = self.buffer.edits_since(mark).to_vec();
+            if !edits.is_empty() {
+                for slot in &mut pending[idx + 1..] {
+                    for edit in &edits {
+                        *slot = slot.and_then(|line| edit.remap(line));
+                    }
+                }
+            }
         }
+        self.buffer.end_line_tracking();
 
         Ok(())
     }

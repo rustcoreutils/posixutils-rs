@@ -385,6 +385,24 @@ fn parse_offset(input: &str) -> (i32, &str) {
     }
 }
 
+/// Parse one address together with any trailing `+n`/`-n` offsets.
+///
+/// `parse_address` deliberately stops at the base address, so every caller
+/// that wants `.+2` or `/re/-1` has to fold the offset in itself.  Both do it
+/// here.
+pub fn parse_address_with_offset(input: &str) -> Option<(Address, &str)> {
+    let (addr, mut rest) = parse_address(input)?;
+    let mut addr = addr;
+    while rest.starts_with('+') || rest.starts_with('-') {
+        let (offset, next) = parse_offset(rest);
+        rest = next;
+        if offset != 0 {
+            addr = Address::Offset(Box::new(addr), offset);
+        }
+    }
+    Some((addr, rest))
+}
+
 /// Parse an address range.
 pub fn parse_address_range(input: &str) -> (AddressRange, &str) {
     let input = input.trim_start();
@@ -405,19 +423,8 @@ pub fn parse_address_range(input: &str) -> (AddressRange, &str) {
 
     loop {
         // One address, plus any trailing +n/-n offset.
-        let (addr, next) = match parse_address(rest) {
-            Some((addr, next)) => {
-                if next.starts_with('+') || next.starts_with('-') {
-                    let (offset, next) = parse_offset(next);
-                    if offset != 0 {
-                        (Some(Address::Offset(Box::new(addr), offset)), next)
-                    } else {
-                        (Some(addr), next)
-                    }
-                } else {
-                    (Some(addr), next)
-                }
-            }
+        let (addr, next) = match parse_address_with_offset(rest) {
+            Some((addr, next)) => (Some(addr), next),
             None => (None, rest),
         };
         addrs.push(addr);

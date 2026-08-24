@@ -1337,7 +1337,7 @@ fn test_ex_put() {
 fn test_ex_copy() {
     let cmd = ex::parse_ex_command("co 5").unwrap();
     if let ExCommand::Copy { dest, .. } = cmd {
-        assert_eq!(dest, 5);
+        assert_eq!(dest, vi_rs::Address::Line(5));
     } else {
         panic!("Expected Copy");
     }
@@ -1347,7 +1347,7 @@ fn test_ex_copy() {
 fn test_ex_move() {
     let cmd = ex::parse_ex_command("m 10").unwrap();
     if let ExCommand::Move { dest, .. } = cmd {
-        assert_eq!(dest, 10);
+        assert_eq!(dest, vi_rs::Address::Line(10));
     } else {
         panic!("Expected Move");
     }

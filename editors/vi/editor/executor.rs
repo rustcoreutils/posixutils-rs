@@ -16,7 +16,7 @@
 use super::Editor;
 use crate::buffer::{Line, Position, Range};
 use crate::error::{Result, ViError};
-use crate::ex::address::AddrCtx;
+use crate::ex::address::{AddrCtx, Address};
 use crate::ex::command::SubstituteFlags;
 use crate::ex::AddressRange;
 
@@ -127,7 +127,10 @@ impl Editor {
     }
 
     /// Execute :copy command - copy lines to destination.
-    pub(super) fn execute_ex_copy(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
+    pub(super) fn execute_ex_copy(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
+        // Resolved here, not at parse time: `$`, `.` and a search all depend
+        // on the buffer.  `allow_zero` because the destination names the line
+        // to insert *after*, so 0 means "before the first line".
         let current = self.buffer.cursor().line;
         let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
 
@@ -140,7 +143,7 @@ impl Editor {
         }
 
         // Insert after destination line
-        let insert_after = if dest == 0 { 0 } else { dest };
+        let insert_after = dest.resolve(&self.addr_ctx_allow_zero_at(current))?;
         for (i, line_text) in lines_to_copy.iter().enumerate() {
             self.buffer
                 .insert_line_after(insert_after + i, Line::from(line_text.as_str()));
@@ -154,9 +157,10 @@ impl Editor {
     }
 
     /// Execute :move command - move lines to destination.
-    pub(super) fn execute_ex_move(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
+    pub(super) fn execute_ex_move(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
         let current = self.buffer.cursor().line;
         let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
+        let dest = dest.resolve(&self.addr_ctx_allow_zero_at(current))?;
 
         // Can't move lines into themselves
         if dest >= start && dest <= end {
@@ -531,9 +535,14 @@ impl Editor {
     /// Context for the commands that insert *after* an address, where line 0 is
     /// legal and means "before the first line" (#X15).
     pub(super) fn addr_ctx_allow_zero(&self) -> AddrCtx<'_> {
+        self.addr_ctx_allow_zero_at(self.buffer.cursor().line)
+    }
+
+    /// As [`Self::addr_ctx_allow_zero`], relative to `current`.
+    pub(super) fn addr_ctx_allow_zero_at(&self, current: usize) -> AddrCtx<'_> {
         AddrCtx {
             allow_zero: true,
-            ..self.addr_ctx()
+            ..self.addr_ctx_at(current)
         }
     }
 

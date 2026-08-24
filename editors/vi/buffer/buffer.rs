@@ -22,6 +22,65 @@ pub struct Buffer {
     cursor: Position,
     /// Whether the buffer has been modified.
     modified: bool,
+    /// Structural changes recorded while something is tracking line numbers.
+    edits: Vec<LineEdit>,
+    /// Nesting depth of line-reference tracking.  Edits are journalled only
+    /// while a tracker is active, so the log cannot grow without bound.
+    track_depth: usize,
+}
+
+/// A structural change to the buffer's line numbering.
+///
+/// Commands that hold on to line numbers across an edit -- `:g` collects the
+/// lines matching its pattern before running anything -- need to know how
+/// those numbers moved.  Compensating with the change in line *count* covers
+/// insertion and deletion but not relocation: `:g/re/m$` leaves the count
+/// alone while renumbering every match not yet visited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEdit {
+    /// `count` lines inserted immediately after line `after` (0 = before the
+    /// first line).
+    Insert { after: usize, count: usize },
+    /// Lines `start..=end` removed.
+    Delete { start: usize, end: usize },
+    /// Lines `start..=end` replaced by `count` lines starting at `start`.
+    Replace {
+        start: usize,
+        end: usize,
+        count: usize,
+    },
+    /// The whole buffer was replaced; every line reference is void.
+    Reset,
+}
+
+impl LineEdit {
+    /// Where `line` ends up after this edit, or `None` if its text is gone.
+    pub fn remap(&self, line: usize) -> Option<usize> {
+        match *self {
+            LineEdit::Insert { after, count } => {
+                Some(if line > after { line + count } else { line })
+            }
+            LineEdit::Delete { start, end } => {
+                if line >= start && line <= end {
+                    None
+                } else if line > end {
+                    Some(line - (end - start + 1))
+                } else {
+                    Some(line)
+                }
+            }
+            LineEdit::Replace { start, end, count } => {
+                if line >= start && line <= end {
+                    None
+                } else if line > end {
+                    Some(line + count - (end - start + 1))
+                } else {
+                    Some(line)
+                }
+            }
+            LineEdit::Reset => None,
+        }
+    }
 }
 
 /// Snap a character-mode span to character boundaries: the start rounds down
@@ -44,6 +103,8 @@ impl Buffer {
             lines: Vec::new(),
             cursor: Position::start(),
             modified: false,
+            edits: Vec::new(),
+            track_depth: 0,
         }
     }
 
@@ -59,6 +120,40 @@ impl Buffer {
             lines,
             cursor: Position::start(),
             modified: false,
+            edits: Vec::new(),
+            track_depth: 0,
+        }
+    }
+
+    /// Start recording structural changes so a caller can keep line numbers
+    /// valid across edits.  Nests; the log is discarded when the last tracker
+    /// finishes, so it never grows without bound.
+    pub fn begin_line_tracking(&mut self) {
+        self.track_depth += 1;
+    }
+
+    /// Stop recording structural changes.
+    pub fn end_line_tracking(&mut self) {
+        self.track_depth = self.track_depth.saturating_sub(1);
+        if self.track_depth == 0 {
+            self.edits.clear();
+        }
+    }
+
+    /// How many structural changes have been recorded so far.
+    pub fn edit_log_len(&self) -> usize {
+        self.edits.len()
+    }
+
+    /// The structural changes recorded since `mark`.
+    pub fn edits_since(&self, mark: usize) -> &[LineEdit] {
+        self.edits.get(mark..).unwrap_or(&[])
+    }
+
+    /// Record a structural change, if anything is watching.
+    fn push_edit(&mut self, edit: LineEdit) {
+        if self.track_depth > 0 {
+            self.edits.push(edit);
         }
     }
 
@@ -198,6 +293,7 @@ impl Buffer {
     pub fn insert_char(&mut self, c: char) {
         if self.is_empty() {
             self.lines.push(Line::new());
+            self.push_edit(LineEdit::Insert { after: 0, count: 1 });
             self.cursor = Position::new(1, 0);
         }
 
@@ -226,6 +322,7 @@ impl Buffer {
         if self.is_empty() {
             self.lines.push(Line::new());
             self.lines.push(Line::new());
+            self.push_edit(LineEdit::Insert { after: 0, count: 2 });
             self.cursor = Position::new(2, 0);
             self.modified = true;
             return;
@@ -239,6 +336,10 @@ impl Buffer {
 
         // Insert the new line after
         self.lines.insert(line_idx + 1, new_line);
+        self.push_edit(LineEdit::Insert {
+            after: line_idx + 1,
+            count: 1,
+        });
 
         // Move cursor to start of new line
         self.cursor.line += 1;
@@ -297,6 +398,10 @@ impl Buffer {
             // Join with previous line
             let current_idx = self.cursor.line - 1;
             let current_line = self.lines.remove(current_idx);
+            self.push_edit(LineEdit::Delete {
+                start: current_idx + 1,
+                end: current_idx + 1,
+            });
             let prev_line = &mut self.lines[current_idx - 1];
             let join_col = prev_line.len();
             prev_line.join(&current_line);
@@ -316,6 +421,10 @@ impl Buffer {
         }
 
         let line = self.lines.remove(line_num - 1);
+        self.push_edit(LineEdit::Delete {
+            start: line_num,
+            end: line_num,
+        });
         self.modified = true;
 
         // Adjust cursor
@@ -340,6 +449,7 @@ impl Buffer {
         }
 
         let deleted: Vec<Line> = self.lines.drain((start - 1)..end).collect();
+        self.push_edit(LineEdit::Delete { start, end });
         self.modified = true;
 
         // Adjust cursor
@@ -360,6 +470,10 @@ impl Buffer {
     pub fn insert_line_after(&mut self, line_num: usize, line: Line) {
         let idx = line_num.min(self.lines.len());
         self.lines.insert(idx, line);
+        self.push_edit(LineEdit::Insert {
+            after: idx,
+            count: 1,
+        });
         self.modified = true;
     }
 
@@ -369,6 +483,10 @@ impl Buffer {
             return Err(ViError::InvalidLine(line_num));
         }
         self.lines.insert(line_num, Line::new());
+        self.push_edit(LineEdit::Insert {
+            after: line_num,
+            count: 1,
+        });
         self.modified = true;
         Ok(())
     }
@@ -379,13 +497,19 @@ impl Buffer {
             return Err(ViError::InvalidLine(line_num));
         }
         self.lines.insert(line_num - 1, Line::new());
+        self.push_edit(LineEdit::Insert {
+            after: line_num - 1,
+            count: 1,
+        });
         self.modified = true;
         Ok(())
     }
 
     /// Append a line at the end.
     pub fn append_line(&mut self, line: Line) {
+        let after = self.lines.len();
         self.lines.push(line);
+        self.push_edit(LineEdit::Insert { after, count: 1 });
         self.modified = true;
     }
 
@@ -532,6 +656,11 @@ impl Buffer {
                     // Insert merged line
                     let merged = Line::from(format!("{}{}", prefix, suffix));
                     self.lines.insert(start_line_idx, merged);
+                    self.push_edit(LineEdit::Replace {
+                        start: start_line_idx + 1,
+                        end: end_line_idx + 1,
+                        count: 1,
+                    });
 
                     self.modified = true;
                 }
@@ -552,6 +681,10 @@ impl Buffer {
         }
 
         let next_line = self.lines.remove(line_num); // Remove line at line_num (0-indexed: line_num)
+        self.push_edit(LineEdit::Delete {
+            start: line_num + 1,
+            end: line_num + 1,
+        });
         let current = &mut self.lines[line_num - 1];
 
         let join_col = current.len();
@@ -593,6 +726,7 @@ impl Buffer {
     /// Clear the buffer.
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.push_edit(LineEdit::Reset);
         self.cursor = Position::start();
         self.modified = true;
     }
@@ -604,6 +738,7 @@ impl Buffer {
         } else {
             text.lines().map(Line::from).collect()
         };
+        self.push_edit(LineEdit::Reset);
         self.cursor = Position::start();
         self.modified = true;
     }

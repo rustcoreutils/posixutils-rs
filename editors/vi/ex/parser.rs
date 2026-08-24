@@ -9,7 +9,7 @@
 
 //! Ex command parser.
 
-use super::address::{parse_address_range, Address, AddressRange};
+use super::address::{parse_address_range, parse_address_with_offset, Address, AddressRange};
 use super::command::{ExCommand, MapMode, SubstituteFlags};
 use crate::error::{Result, ViError};
 
@@ -146,13 +146,13 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
 
         // Copy command
         "co" | "copy" | "t" => {
-            let dest = parse_line_number(args)?;
+            let dest = parse_destination(args)?;
             Ok(ExCommand::Copy { range, dest })
         }
 
         // Move command
         "m" | "move" => {
-            let dest = parse_line_number(args)?;
+            let dest = parse_destination(args)?;
             Ok(ExCommand::Move { range, dest })
         }
 
@@ -698,11 +698,26 @@ fn parse_optional_count(args: &str) -> Option<usize> {
     args.trim().parse().ok()
 }
 
-/// Parse a line number.
-fn parse_line_number(args: &str) -> Result<usize> {
-    args.trim()
-        .parse()
-        .map_err(|_| ViError::InvalidAddress("invalid line number".to_string()))
+/// Parse the destination of `:copy`/`:move`.
+///
+/// POSIX (ex, `copy`/`move`) gives it as an *address*, so `$`, `.`, `.+2`, a
+/// mark and a search are all valid.  Parsing it as a bare integer rejected
+/// everything but a decimal literal -- `:1m$` answered "invalid line number".
+/// It stays unresolved until execution, since `$` depends on the buffer.
+fn parse_destination(args: &str) -> Result<Address> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err(ViError::InvalidAddress(
+            "missing destination address".to_string(),
+        ));
+    }
+    match parse_address_with_offset(trimmed) {
+        Some((addr, rest)) if rest.trim().is_empty() => Ok(addr),
+        _ => Err(ViError::InvalidAddress(format!(
+            "invalid destination: {}",
+            trimmed
+        ))),
+    }
 }
 
 /// Split a leading `+command` argument from `args`.

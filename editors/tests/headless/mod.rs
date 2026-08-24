@@ -2683,3 +2683,135 @@ fn test_generated_single_commands_are_undoable() {
             .join("\n  ")
     );
 }
+
+// ============================================================================
+// Motion classification: inclusive, exclusive, linewise
+// ============================================================================
+//
+// An operator's region depends on how the motion is classified. The motions
+// computed `linewise` correctly and `execute_motion_get_pos` threw it away by
+// returning only the position, and every operator+motion path then hardcoded
+// a character-mode range -- so `dj` deleted from the cursor column on one line
+// to the cursor column on the next instead of both whole lines. Nothing
+// tracked inclusivity at all outside a special case for `cw`, so every
+// inclusive motion came up one character short.
+
+#[test]
+fn test_delete_to_end_of_word_is_inclusive() {
+    // POSIX (vi, "Move to End-of-Word"): the region includes the last
+    // character of the word.
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two\n");
+    editor.execute_keys("de").unwrap();
+    assert_eq!(editor.get_buffer_text(), " two\n");
+}
+
+#[test]
+fn test_delete_to_end_of_line_is_inclusive() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world\n");
+    editor.execute_keys("d$").unwrap();
+    assert_eq!(editor.get_buffer_text(), "\n");
+}
+
+#[test]
+fn test_yank_to_end_of_line_is_inclusive() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello\n");
+    editor.execute_keys("y$").unwrap();
+    assert_eq!(
+        editor.get_unnamed_register().map(|r| r.text.as_str()),
+        Some("hello")
+    );
+}
+
+#[test]
+fn test_find_char_forward_is_inclusive() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world\n");
+    editor.execute_keys("dfo").unwrap();
+    assert_eq!(editor.get_buffer_text(), " world\n");
+}
+
+#[test]
+fn test_till_char_forward_is_inclusive_of_the_char_before() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world\n");
+    editor.execute_keys("dto").unwrap();
+    assert_eq!(editor.get_buffer_text(), "o world\n");
+}
+
+/// `F` and `T` search backwards, so the character under the cursor survives.
+#[test]
+fn test_find_char_backward_is_exclusive() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world\n");
+    editor.execute_keys("$dFo").unwrap();
+    assert_eq!(editor.get_buffer_text(), "hello wd\n");
+}
+
+#[test]
+fn test_match_bracket_is_inclusive() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("(abc)x\n");
+    editor.execute_keys("d%").unwrap();
+    assert_eq!(editor.get_buffer_text(), "x\n");
+}
+
+#[test]
+fn test_delete_down_is_linewise() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys("ldj").unwrap();
+    assert_eq!(editor.get_buffer_text(), "three\n");
+}
+
+#[test]
+fn test_delete_up_is_linewise() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys("jjldk").unwrap();
+    assert_eq!(editor.get_buffer_text(), "one\n");
+}
+
+#[test]
+fn test_delete_to_line_is_linewise() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys("jldG").unwrap();
+    assert_eq!(editor.get_buffer_text(), "one\n");
+}
+
+#[test]
+fn test_yank_down_is_linewise() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys("lyj").unwrap();
+    assert_eq!(
+        editor.get_unnamed_register().map(|r| r.linewise),
+        Some(true),
+        "a linewise yank must be stored linewise, so `p` puts whole lines"
+    );
+}
+
+/// POSIX (vi, "Change"): `cw` on a non-blank behaves as `ce`, leaving the
+/// blanks after the word -- but only on a non-blank. On a blank it is an
+/// ordinary `w`.
+#[test]
+fn test_change_word_on_a_blank_is_not_change_to_end_of_word() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("a   bcd efg\n");
+    // On a blank, `cw` is an ordinary `w`: the region runs to the start of the
+    // next word, so all three blanks go. The `ce` substitution would instead
+    // have consumed "bcd".
+    editor.execute_keys("lcwZ\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "aZbcd efg\n");
+}
+
+#[test]
+fn test_change_word_on_a_non_blank_keeps_the_following_blanks() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one   two\n");
+    editor.execute_keys("cwZ\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "Z   two\n");
+}

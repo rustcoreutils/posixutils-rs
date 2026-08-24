@@ -1959,8 +1959,8 @@ impl Editor {
             } else {
                 // d + motion
                 let start = self.buffer.cursor();
-                if let Some(end) = self.execute_motion_get_pos(mot) {
-                    let range = Range::new(start, end, BufferMode::Character);
+                if let Some(res) = self.execute_motion(mot) {
+                    let range = self.operator_region(start, &res);
                     let result =
                         delete(&mut self.buffer, range, &mut self.registers, cmd.register)?;
                     self.record_removal(range, &result);
@@ -1988,8 +1988,8 @@ impl Editor {
             } else {
                 // y + motion
                 let start = self.buffer.cursor();
-                if let Some(end) = self.execute_motion_get_pos(mot) {
-                    let range = Range::new(start, end, BufferMode::Character);
+                if let Some(res) = self.execute_motion(mot) {
+                    let range = self.operator_region(start, &res);
                     let _ = yank(&self.buffer, range, &mut self.registers, cmd.register);
                 }
             }
@@ -2077,33 +2077,24 @@ impl Editor {
             } else {
                 // c + motion
                 let start = self.buffer.cursor();
-                // Special case: cw and cW should behave like ce and cE
-                // (change to end of word, not beginning of next word)
-                // This is standard POSIX vi behavior.
-                let (end, needs_inclusive) = if mot.motion == 'w' {
-                    (
-                        motion::move_word_end(&self.buffer, mot.count)
-                            .ok()
-                            .map(|r| r.position),
-                        true,
-                    )
-                } else if mot.motion == 'W' {
-                    (
-                        motion::move_bigword_end(&self.buffer, mot.count)
-                            .ok()
-                            .map(|r| r.position),
-                        true,
-                    )
+                // POSIX (vi, "Change"): "if the motion command is `w` or `W`
+                // and the cursor is on a non-<blank>", `cw` behaves as `ce`,
+                // so the blanks after the word survive.  The non-blank
+                // precondition was missing, so `cw` on a blank wrongly
+                // consumed to the end of the *next* word.
+                let on_non_blank = self
+                    .buffer
+                    .char_at_cursor()
+                    .is_some_and(|c| !c.is_whitespace());
+                let res = if on_non_blank && mot.motion == 'w' {
+                    motion::move_word_end(&self.buffer, mot.count).ok()
+                } else if on_non_blank && mot.motion == 'W' {
+                    motion::move_bigword_end(&self.buffer, mot.count).ok()
                 } else {
-                    (self.execute_motion_get_pos(mot), false)
+                    self.execute_motion(mot)
                 };
-                if let Some(mut end) = end {
-                    // For inclusive motions like 'e', we need to add 1 to include
-                    // the character at the end position (since Range is exclusive on end)
-                    if needs_inclusive {
-                        end.column += 1;
-                    }
-                    let range = Range::new(start, end, BufferMode::Character);
+                if let Some(res) = res {
+                    let range = self.operator_region(start, &res);
                     self.undo.begin_group();
                     let result =
                         change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
@@ -2200,9 +2191,21 @@ impl Editor {
 
     /// Execute a motion and return the resulting position.
     fn execute_motion_get_pos(&self, mot: &crate::command::MotionCommand) -> Option<Position> {
+        self.execute_motion(mot).map(|r| r.position)
+    }
+
+    /// Run a motion, keeping its classification.
+    ///
+    /// The dispatcher used to discard everything but the position, so no
+    /// operator could tell a linewise motion from a characterwise one or an
+    /// inclusive one from an exclusive one.
+    fn execute_motion(
+        &self,
+        mot: &crate::command::MotionCommand,
+    ) -> Option<crate::command::motion::MotionResult> {
         use crate::command::motion;
 
-        let result = match mot.motion {
+        match mot.motion {
             'h' => motion::move_left(&self.buffer, mot.count).ok(),
             'l' => motion::move_right(&self.buffer, mot.count).ok(),
             'j' => motion::move_down(&self.buffer, mot.count).ok(),
@@ -2236,8 +2239,42 @@ impl Editor {
             '|' => motion::move_to_column(&self.buffer, mot.count, self.options.tabstop).ok(),
             '%' => motion::find_matching_bracket(&self.buffer).ok(),
             _ => None,
-        };
-        result.map(|r| r.position)
+        }
+    }
+
+    /// The region an operator acts on, given where it started and how the
+    /// motion is classified.
+    ///
+    /// This is the single place that turns a motion into a range.  Every
+    /// operator used to build `BufferMode::Character` unconditionally, which
+    /// is why `dj` deleted part of two lines instead of both of them.
+    fn operator_region(
+        &self,
+        start: Position,
+        res: &crate::command::motion::MotionResult,
+    ) -> Range {
+        use crate::command::motion::MotionClass;
+
+        match res.class {
+            MotionClass::Linewise => Range::lines(start, res.position),
+            MotionClass::Inclusive => {
+                // Extend past the character the motion landed on. Only
+                // forwards: a backward motion's landing character is already
+                // inside the region once the endpoints are ordered.
+                let end = if res.position >= start {
+                    let col = self
+                        .buffer
+                        .line(res.position.line)
+                        .and_then(|l| l.next_char_offset(res.position.column))
+                        .unwrap_or(res.position.column);
+                    Position::new(res.position.line, col)
+                } else {
+                    res.position
+                };
+                Range::new(start, end, BufferMode::Character)
+            }
+            MotionClass::Exclusive => Range::new(start, res.position, BufferMode::Character),
+        }
     }
 
     /// Execute filter operator (! with motion).

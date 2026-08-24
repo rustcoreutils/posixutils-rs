@@ -16,15 +16,31 @@ use super::text_object::{
 use crate::buffer::{char_index_at_byte, Buffer, BufferMode, Position, Range};
 use crate::error::{Result, ViError};
 
+/// How an operator's region relates to the motion's endpoints.
+///
+/// This is the piece of information every operator needs and none of them
+/// had: the motions computed `linewise` correctly, the dispatcher returned
+/// only the position, and each operator then hardcoded a character-mode
+/// range.  Inclusivity was not represented at all outside a special case for
+/// `cw`, so `de`, `d$`, `df` and `d%` all stopped one character short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MotionClass {
+    /// The region stops just before the character the motion landed on.
+    #[default]
+    Exclusive,
+    /// The region includes the character the motion landed on.
+    Inclusive,
+    /// The region is whole lines.
+    Linewise,
+}
+
 /// Result of a motion command.
 #[derive(Debug, Clone)]
 pub struct MotionResult {
     /// New cursor position.
     pub position: Position,
-    /// Text range affected (for operators).
-    pub range: Option<Range>,
-    /// Whether motion is line-wise.
-    pub linewise: bool,
+    /// How an operator should treat the endpoints.
+    pub class: MotionClass,
     /// Whether to move to first non-blank.
     pub first_non_blank: bool,
 }
@@ -34,25 +50,33 @@ impl MotionResult {
     pub fn pos(position: Position) -> Self {
         Self {
             position,
-            range: None,
-            linewise: false,
+            class: MotionClass::Exclusive,
             first_non_blank: false,
         }
     }
 
-    /// Create a motion result with a range.
+    /// Create a motion result from a computed range; its mode gives the class.
     pub fn with_range(position: Position, range: Range) -> Self {
         Self {
             position,
-            range: Some(range),
-            linewise: range.mode == BufferMode::Line,
+            class: if range.mode == BufferMode::Line {
+                MotionClass::Linewise
+            } else {
+                MotionClass::Exclusive
+            },
             first_non_blank: false,
         }
     }
 
-    /// Set linewise flag.
+    /// Mark the motion line-wise.
     pub fn linewise(mut self) -> Self {
-        self.linewise = true;
+        self.class = MotionClass::Linewise;
+        self
+    }
+
+    /// Mark the motion inclusive of the character it landed on.
+    pub fn inclusive(mut self) -> Self {
+        self.class = MotionClass::Inclusive;
         self
     }
 
@@ -198,15 +222,12 @@ pub fn move_to_line_end(buffer: &Buffer, count: usize) -> Result<MotionResult> {
         let new_col = line.last_char_offset();
         let new_pos = Position::new(target_line, new_col);
 
-        // Multi-line motion is line-wise if starting before first non-blank
-        let start_line = buffer.line(pos.line).ok_or(ViError::EmptyBuffer)?;
-        if pos.column <= start_line.first_non_blank() {
-            let range = Range::lines(pos, new_pos);
-            return Ok(MotionResult::with_range(new_pos, range).linewise());
-        }
-
+        // POSIX (vi, "Move to End-of-Line"): inclusive, whatever the count.
+        // The old "line-wise when starting at or before the first non-blank"
+        // branch was the exclusive-motion adjustment misapplied here; an
+        // inclusive motion is never subject to it.
         let range = Range::chars(pos, new_pos);
-        return Ok(MotionResult::with_range(new_pos, range));
+        return Ok(MotionResult::with_range(new_pos, range).inclusive());
     }
 
     let line = buffer.line(pos.line).ok_or(ViError::EmptyBuffer)?;
@@ -218,7 +239,7 @@ pub fn move_to_line_end(buffer: &Buffer, count: usize) -> Result<MotionResult> {
     let new_pos = Position::new(pos.line, new_col);
     let range = Range::chars(pos, new_pos);
 
-    Ok(MotionResult::with_range(new_pos, range))
+    Ok(MotionResult::with_range(new_pos, range).inclusive())
 }
 
 /// Move to line number (G command).
@@ -288,7 +309,9 @@ pub fn move_word_backward(buffer: &Buffer, count: usize) -> Result<MotionResult>
 
 /// Move to word end (e command).
 pub fn move_word_end(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    move_forward_by(buffer, count, next_word_end)
+    // POSIX (vi, "Move to End-of-Word"): inclusive of the word's last
+    // character, so `de` removes the whole word.
+    Ok(move_forward_by(buffer, count, next_word_end)?.inclusive())
 }
 
 /// Move to next bigword start (W command).
@@ -303,7 +326,7 @@ pub fn move_bigword_backward(buffer: &Buffer, count: usize) -> Result<MotionResu
 
 /// Move to bigword end (E command).
 pub fn move_bigword_end(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    move_forward_by(buffer, count, next_bigword_end)
+    Ok(move_forward_by(buffer, count, next_bigword_end)?.inclusive())
 }
 
 /// Move to next paragraph ({ command).
@@ -515,7 +538,8 @@ pub fn find_char_forward(buffer: &Buffer, c: char, count: usize) -> Result<Motio
 
     let new_pos = Position::new(pos.line, result_col);
     let range = Range::chars(pos, new_pos);
-    Ok(MotionResult::with_range(new_pos, range))
+    // POSIX (vi, "Find Character in Line"): inclusive of the character found.
+    Ok(MotionResult::with_range(new_pos, range).inclusive())
 }
 
 /// Find character backward in line (F command).
@@ -571,7 +595,9 @@ pub fn till_char_forward(buffer: &Buffer, c: char, count: usize) -> Result<Motio
     let new_pos = Position::new(result.position.line, new_col);
     let range = Range::chars(buffer.cursor(), new_pos);
 
-    Ok(MotionResult::with_range(new_pos, range))
+    // Inclusive of the character before the target, so `dtx` removes
+    // everything up to but not including `x`.
+    Ok(MotionResult::with_range(new_pos, range).inclusive())
 }
 
 /// Find till character backward (T command).
@@ -633,6 +659,9 @@ pub fn move_to_column(buffer: &Buffer, col: usize, tabstop: usize) -> Result<Mot
 }
 
 /// Find matching bracket (% command).
+/// Move to the matching bracket (`%`).
+///
+/// Inclusive: `d%` removes both brackets and everything between them.
 pub fn find_matching_bracket(buffer: &Buffer) -> Result<MotionResult> {
     let pos = buffer.cursor();
     let line = buffer.line(pos.line).ok_or(ViError::EmptyBuffer)?;
@@ -684,7 +713,7 @@ pub fn find_matching_bracket(buffer: &Buffer) -> Result<MotionResult> {
                     if count == 0 {
                         let new_pos = Position::new(line_num, start + byte_idx);
                         let range = Range::chars(Position::new(pos.line, start_col), new_pos);
-                        return Ok(MotionResult::with_range(new_pos, range));
+                        return Ok(MotionResult::with_range(new_pos, range).inclusive());
                     }
                 } else if c == open {
                     count += 1;
@@ -716,7 +745,7 @@ pub fn find_matching_bracket(buffer: &Buffer) -> Result<MotionResult> {
                     if count == 0 {
                         let new_pos = Position::new(line_num, *byte_idx);
                         let range = Range::chars(new_pos, Position::new(pos.line, start_col));
-                        return Ok(MotionResult::with_range(new_pos, range));
+                        return Ok(MotionResult::with_range(new_pos, range).inclusive());
                     }
                 } else if *c == open {
                     count += 1;

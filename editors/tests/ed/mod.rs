@@ -1923,3 +1923,72 @@ fn test_ed_quit_after_write_exits_without_warning() {
         "foo\n"
     );
 }
+
+// ============================================================================
+// Phase 5 — one command is one undo
+// ============================================================================
+//
+// POSIX (ed, `u`): "The u command shall nullify the effect of the most recent
+// command that modified anything in the buffer, namely the most recent a, c,
+// d, g, i, j, m, r, s, t, u, v, G, or V command." One `s` over a range is one
+// command, however many lines it rewrote.
+
+/// `execute_substitute` calls `buf.change()` once per matched line, and each
+/// call re-snapshotted the single undo slot, so `u` reverted only the last
+/// line. The earlier lines were unrecoverable.
+#[test]
+fn test_ed_undo_multiline_substitute_restores_every_line() {
+    ed_test("a\nax\nay\naz\n.\n1,$s/a/B/\nu\n1,$p\nQ\n", "ax\nay\naz\n");
+}
+
+/// The line-splitting path takes a different branch through the same loop.
+#[test]
+fn test_ed_undo_substitute_that_splits_lines() {
+    ed_test("a\na-b\na-c\n.\n1,$s/-/\\\n/\nu\n1,$p\nQ\n", "a-b\na-c\n");
+}
+
+/// `g` already grouped correctly via begin_global; splitting the undo-group
+/// counter out of the "am I inside g/v" flag must not change that.
+#[test]
+fn test_ed_undo_global_substitute_still_one_command() {
+    ed_test("a\nax\nay\naz\n.\ng/a/s/a/B/\nu\n1,$p\nQ\n", "ax\nay\naz\n");
+}
+
+/// ...nor may it change what `is_in_global` means: POSIX forbids splitting a
+/// line inside g/v, and that check keys off exactly this flag.
+#[test]
+fn test_ed_substitute_split_inside_global_is_still_an_error() {
+    ed_test_code("a\na-b\n.\ng/-/s/-/x\\\ny/\nQ\n", "?\n", 1);
+}
+
+/// ...and a plain `s` that splits a line must still be allowed.
+#[test]
+fn test_ed_substitute_split_outside_global_is_allowed() {
+    ed_test("a\na-b\n.\n1s/-/x\\\ny/\n1,$p\nQ\n", "ax\nyb\n");
+}
+
+/// POSIX (ed, `s`) defines the suffix as a count followed by any of g, l, n,
+/// p. The scanner collected every digit anywhere in the suffix, so
+/// `s/x/y/2p3` silently became count 23 instead of a syntax error.
+#[test]
+fn test_ed_substitute_trailing_junk_after_flag_is_error() {
+    ed_test_code("a\nxxx\n.\ns/x/y/2p3\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_substitute_unknown_flag_is_error() {
+    ed_test_code("a\nxxx\n.\ns/x/y/q\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_substitute_count_overflow_is_error() {
+    ed_test_code("a\nxxx\n.\ns/x/y/99999999999999999999\nQ\n", "?\n", 1);
+}
+
+/// The flags that do work must keep working.
+#[test]
+fn test_ed_substitute_valid_flag_combinations() {
+    ed_test("a\nx x x\n.\ns/x/y/2\n1p\nQ\n", "x y x\n");
+    ed_test("a\nx x x\n.\ns/x/y/gp\nQ\n", "y y y\n");
+    ed_test("a\nx x x\n.\ns/x/y/g\n1p\nQ\n", "y y y\n");
+}

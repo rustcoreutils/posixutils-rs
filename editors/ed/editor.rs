@@ -1042,61 +1042,24 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         let re = Regex::new(&pat, RegexFlags::bre()).map_err(|e| EdError::Syntax(e.to_string()))?;
 
-        let global = flags.contains('g');
-        let print = flags.contains('p');
-        let numbered = flags.contains('n');
-        let list = flags.contains('l');
+        let SubstituteSuffix {
+            count,
+            global,
+            print,
+            numbered,
+            list,
+        } = Self::parse_substitute_suffix(flags)?;
 
-        // Parse count from flags
-        let count: Option<usize> = flags
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .ok();
-
-        let mut any_match = false;
-        let mut last_matched_line = start;
-        // Track offset when lines are split (inserted lines shift subsequent line numbers)
-        let mut offset: usize = 0;
-
-        for i in start..=end {
-            // Compute actual buffer position accounting for previously inserted lines
-            let actual_line = i + offset;
-
-            let Some(line) = self.buf.get_line(actual_line) else {
-                continue;
-            };
-            let line_content = line.clone();
-            let body = line_content.strip_suffix('\n').unwrap_or(&line_content);
-
-            // A match — even one whose replacement yields identical text —
-            // counts as a substitution: the line is rewritten (and the buffer
-            // marked modified). Only a complete absence of matches is an error.
-            let Some(new_body) = Self::substitute_line(&re, body, &repl, global, count) else {
-                continue;
-            };
-            any_match = true;
-
-            if new_body.contains('\n') {
-                // POSIX: line splitting via \<newline> is not allowed in g/v.
-                if self.buf.is_in_global() {
-                    return Err(EdError::Generic(
-                        "cannot split lines in global command".to_string(),
-                    ));
-                }
-
-                let lines: Vec<String> = new_body.split('\n').map(|s| format!("{}\n", s)).collect();
-                let num_new_lines = lines.len();
-                self.buf.change(actual_line, actual_line, &lines)?;
-                last_matched_line = actual_line + num_new_lines - 1;
-                offset += num_new_lines - 1;
-            } else {
-                self.buf
-                    .change(actual_line, actual_line, &[format!("{}\n", new_body)])?;
-                last_matched_line = actual_line;
-            }
-        }
+        // POSIX (ed, `u`): one `s` is one command however many lines it
+        // rewrote.  Every `buf.change()` below snapshots for undo, so without
+        // a group `u` after `1,$s/../../` reverted only the last line and the
+        // rest were unrecoverable.  This is `begin_undo_group` rather than
+        // `begin_global` because `is_in_global()` carries the separate
+        // meaning checked inside the loop.
+        self.buf.begin_undo_group();
+        let outcome = self.substitute_lines(&re, start, end, &repl, global, count);
+        self.buf.end_undo_group();
+        let (any_match, last_matched_line) = outcome?;
 
         if !any_match {
             return Err(EdError::NoMatch);
@@ -1138,6 +1101,119 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         }
 
         Ok(())
+    }
+
+    /// Rewrite every matching line in `start..=end`, returning whether
+    /// anything matched and the last line the substitution touched.
+    ///
+    /// Split out of `execute_substitute` so the caller can bracket it with an
+    /// undo group that survives an early `?`.
+    fn substitute_lines(
+        &mut self,
+        re: &Regex,
+        start: usize,
+        end: usize,
+        repl: &str,
+        global: bool,
+        count: Option<usize>,
+    ) -> EdResult<(bool, usize)> {
+        let mut any_match = false;
+        let mut last_matched_line = start;
+        // Track offset when lines are split (inserted lines shift subsequent line numbers)
+        let mut offset: usize = 0;
+
+        for i in start..=end {
+            // Compute actual buffer position accounting for previously inserted lines
+            let actual_line = i + offset;
+
+            let Some(line) = self.buf.get_line(actual_line) else {
+                continue;
+            };
+            let line_content = line.clone();
+            let body = line_content.strip_suffix('\n').unwrap_or(&line_content);
+
+            // A match — even one whose replacement yields identical text —
+            // counts as a substitution: the line is rewritten (and the buffer
+            // marked modified). Only a complete absence of matches is an error.
+            let Some(new_body) = Self::substitute_line(re, body, repl, global, count) else {
+                continue;
+            };
+            any_match = true;
+
+            if new_body.contains('\n') {
+                // POSIX: line splitting via \<newline> is not allowed in g/v.
+                if self.buf.is_in_global() {
+                    return Err(EdError::Generic(
+                        "cannot split lines in global command".to_string(),
+                    ));
+                }
+
+                let lines: Vec<String> = new_body.split('\n').map(|s| format!("{}\n", s)).collect();
+                let num_new_lines = lines.len();
+                self.buf.change(actual_line, actual_line, &lines)?;
+                last_matched_line = actual_line + num_new_lines - 1;
+                offset += num_new_lines - 1;
+            } else {
+                self.buf
+                    .change(actual_line, actual_line, &[format!("{}\n", new_body)])?;
+                last_matched_line = actual_line;
+            }
+        }
+
+        Ok((any_match, last_matched_line))
+    }
+
+    /// The parsed suffix of an `s` command.
+    fn parse_substitute_suffix(flags: &str) -> EdResult<SubstituteSuffix> {
+        let mut out = SubstituteSuffix::default();
+        let mut digits = String::new();
+        let mut digits_done = false;
+
+        for ch in flags.chars() {
+            match ch {
+                // POSIX (ed, `s`) writes the count before the flag letters,
+                // but historical eds accept either order.  What is never
+                // valid is a second run of digits: `s/x/y/2p3` used to
+                // collect every digit anywhere in the suffix and silently
+                // become count 23.
+                '0'..='9' => {
+                    if digits_done {
+                        return Err(EdError::Syntax(format!(
+                            "invalid command suffix: {}",
+                            flags
+                        )));
+                    }
+                    digits.push(ch);
+                }
+                'g' | 'l' | 'n' | 'p' => {
+                    if !digits.is_empty() {
+                        digits_done = true;
+                    }
+                    match ch {
+                        'g' => out.global = true,
+                        'l' => out.list = true,
+                        'n' => out.numbered = true,
+                        _ => out.print = true,
+                    }
+                }
+                c if c.is_whitespace() => {}
+                _ => {
+                    return Err(EdError::Syntax(format!(
+                        "invalid command suffix: {}",
+                        flags
+                    )))
+                }
+            }
+        }
+
+        if !digits.is_empty() {
+            out.count = Some(
+                digits
+                    .parse()
+                    .map_err(|_| EdError::Syntax("substitute count out of range".to_string()))?,
+            );
+        }
+        Ok(out)
     }
 
     /// Check if a command string contains forbidden commands for global.
@@ -1268,8 +1344,21 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             return Ok(());
         }
 
-        // POSIX: Save one undo record for the entire global operation
+        // POSIX: Save one undo record for the entire global operation.
+        // Paired here rather than inside the body: the body writes to
+        // `self.writer` with `?` in several places, and an I/O error there
+        // used to skip `end_global()` and leave the buffer permanently
+        // "inside a global", which silently disabled undo for the rest of
+        // the session.
         self.buf.begin_global();
+        let outcome = self.run_global_commands(commands, &matching_lines);
+        self.buf.end_global();
+        outcome
+    }
+
+    /// Run a `g`/`v` command list against each already-matched line.
+    fn run_global_commands(&mut self, commands: &str, matching_lines: &[usize]) -> EdResult<()> {
+        let mut matching_lines = matching_lines.to_vec();
 
         // Track the current line set by the last successfully executed command
         let original_cur_line = self.buf.cur_line;
@@ -1325,10 +1414,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     && !gc.input_lines.is_empty()
                 {
                     // Execute a/i/c with embedded input directly
-                    if let Err(e) = self.execute_input_command_with_lines(cmd, &gc.input_lines) {
-                        self.buf.end_global();
-                        return Err(e);
-                    }
+                    self.execute_input_command_with_lines(cmd, &gc.input_lines)?;
                     last_successful_line = self.buf.cur_line;
                     continue;
                 }
@@ -1383,16 +1469,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                         // Try to parse and execute other commands
                         match parse(cmd) {
                             Ok(parsed_cmd) => {
-                                if let Err(e) = self.execute_command(parsed_cmd) {
-                                    // Abort global on error and propagate
-                                    self.buf.end_global();
-                                    return Err(e);
-                                }
+                                // Abort the global on error and propagate.
+                                self.execute_command(parsed_cmd)?;
                                 last_successful_line = self.buf.cur_line;
                             }
                             Err(e) => {
                                 // Abort global on parse error
-                                self.buf.end_global();
                                 return Err(e);
                             }
                         }
@@ -1406,9 +1488,6 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 line_offset += line_count_after as isize - line_count_before as isize;
             }
         }
-
-        // End global command (re-enable individual undo saves)
-        self.buf.end_global();
 
         // POSIX: When g command completes, current line is value assigned by last command
         let _ = self.buf.set_cur_line(last_successful_line);
@@ -1456,14 +1535,22 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             return Ok(());
         }
 
-        // Save one undo record for the entire operation
+        // Save one undo record for the entire operation; see the note in
+        // `execute_global` for why the pairing lives out here.
         self.buf.begin_global();
+        let outcome = self.run_global_interactive(&matching_lines);
+        self.buf.end_global();
+        outcome
+    }
+
+    /// Prompt for and run a command per already-matched line (`G`/`V`).
+    fn run_global_interactive(&mut self, matching_lines: &[usize]) -> EdResult<()> {
+        let mut matching_lines = matching_lines.to_vec();
 
         let mut idx = 0;
         while idx < matching_lines.len() {
             // Check for SIGINT
             if crate::SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
-                self.buf.end_global();
                 writeln!(self.writer, "?")?;
                 self.last_error = Some("Interrupt".to_string());
                 return Ok(());
@@ -1560,7 +1647,6 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             idx += 1;
         }
 
-        self.buf.end_global();
         Ok(())
     }
 
@@ -1688,6 +1774,16 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         let bytes = self.buf.read_file(path)?;
         Ok(bytes)
     }
+}
+
+/// Flags and count parsed from an `s` command's suffix.
+#[derive(Default)]
+struct SubstituteSuffix {
+    count: Option<usize>,
+    global: bool,
+    print: bool,
+    numbered: bool,
+    list: bool,
 }
 
 #[cfg(test)]

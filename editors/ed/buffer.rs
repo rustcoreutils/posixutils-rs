@@ -40,8 +40,14 @@ pub struct Buffer {
     marks: HashMap<char, usize>,
     /// Single-level undo (POSIX requirement)
     undo_record: Option<UndoRecord>,
-    /// Flag to suppress individual undo saves during global commands.
-    /// When true, buffer operations don't save undo records.
+    /// Nesting depth of the current undo group.  While non-zero, individual
+    /// mutations do not snapshot: the group took one snapshot up front, so
+    /// the whole command undoes as a unit.
+    undo_depth: usize,
+    /// Whether execution is inside a `g`/`v` command.  Distinct from
+    /// `undo_depth` because it carries a POSIX *semantic* -- notably that a
+    /// substitution may not split a line inside a global -- and so must not
+    /// become true merely because some other command grouped its undo.
     in_global: bool,
 }
 
@@ -55,6 +61,7 @@ impl Buffer {
             modified: false,
             marks: HashMap::new(),
             undo_record: None,
+            undo_depth: 0,
             in_global: false,
         }
     }
@@ -87,13 +94,8 @@ impl Buffer {
         }
     }
 
-    /// Save the current state for undo.
-    /// When in_global is true, individual operations don't save undo
-    /// (the global command saves once for the entire operation).
-    fn save_undo(&mut self) {
-        if self.in_global {
-            return; // Skip - global command already saved undo
-        }
+    /// Take the undo snapshot unconditionally.
+    fn snapshot(&mut self) {
         self.undo_record = Some(UndoRecord {
             lines: self.lines.clone(),
             cur_line: self.cur_line,
@@ -101,19 +103,39 @@ impl Buffer {
         });
     }
 
-    /// Begin a global command. Saves undo once and suppresses individual saves.
+    /// Save the current state for undo, unless a group is already open --
+    /// in which case the group's own snapshot is the one `u` must restore.
+    fn save_undo(&mut self) {
+        if self.undo_depth == 0 {
+            self.snapshot();
+        }
+    }
+
+    /// Open an undo group: everything until the matching `end_undo_group`
+    /// undoes as one command.  Nests, so a group inside a global does not
+    /// re-snapshot over the global's state.
+    pub fn begin_undo_group(&mut self) {
+        if self.undo_depth == 0 {
+            self.snapshot();
+        }
+        self.undo_depth += 1;
+    }
+
+    /// Close an undo group.
+    pub fn end_undo_group(&mut self) {
+        self.undo_depth = self.undo_depth.saturating_sub(1);
+    }
+
+    /// Begin a global command: one undo group, plus the `g`/`v` semantics.
     pub fn begin_global(&mut self) {
-        self.undo_record = Some(UndoRecord {
-            lines: self.lines.clone(),
-            cur_line: self.cur_line,
-            modified: self.modified,
-        });
+        self.begin_undo_group();
         self.in_global = true;
     }
 
-    /// End a global command. Re-enables individual undo saves.
+    /// End a global command.
     pub fn end_global(&mut self) {
         self.in_global = false;
+        self.end_undo_group();
     }
 
     /// Check if currently in a global command context.

@@ -804,10 +804,16 @@ fn test_diff_recursive_symlink_cycle_terminates() {
     // recursive walk into an infinite loop.
     let base = std::env::temp_dir().join(format!("posixutils-diff-loop-{}", std::process::id()));
     let dir = base.join("d");
+    // A crashed earlier run can leave this behind, and PIDs are recycled; the
+    // symlink below would then fail with EEXIST.
+    let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&dir).expect("mkdir d");
     std::fs::write(dir.join("f"), "x\n").expect("write d/f");
-    let linked = std::os::unix::fs::symlink("..", dir.join("up")).is_ok();
-    assert!(linked || true, "symlink support is optional here");
+    // The cycle is the whole point of the test: without it `diff -r` has
+    // nothing to loop on and the run below would pass without proving
+    // anything. Both supported platforms symlink here, so this is a hard
+    // precondition rather than a best-effort one.
+    std::os::unix::fs::symlink("..", dir.join("up")).expect("symlink d/up -> ..");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
         .args(["-r", dir.to_str().unwrap(), dir.to_str().unwrap()])

@@ -15,11 +15,13 @@ use std::{fs::File, path::PathBuf, process::Command, str};
 /// Polls `/proc/<pid>/fd` on Linux; elsewhere it just yields briefly, since the
 /// tests that need this are Linux-gated anyway.
 fn wait_for_open_fd(pid: u32, path: &str) {
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        #[cfg(target_os = "linux")]
-        {
+    use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::time::Instant;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             let fd_dir = format!("/proc/{}/fd", pid);
             if let Ok(entries) = std::fs::read_dir(&fd_dir) {
                 for e in entries.flatten() {
@@ -30,14 +32,17 @@ fn wait_for_open_fd(pid: u32, path: &str) {
                     }
                 }
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (pid, path);
-            std::thread::sleep(Duration::from_millis(200));
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // No /proc to poll, and the tests that depend on this are Linux-gated, so
+    // just yield long enough for the child to get its file open. Kept outside
+    // a loop: with nothing to re-check, iterating would only sleep again.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, path);
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 

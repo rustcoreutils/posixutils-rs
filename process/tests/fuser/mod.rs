@@ -11,6 +11,9 @@ use plib::testing::{run_test_with_checker, TestPlan};
 use std::process::Output;
 
 mod basic;
+// Every test in `modes` is Linux-gated, as are the only callers of the helper
+// below; compiling either elsewhere just yields dead-code warnings.
+#[cfg(target_os = "linux")]
 mod modes;
 #[cfg(target_os = "linux")]
 mod tcp;
@@ -38,6 +41,7 @@ mod with_user;
 /// 5-digit PID, off by one space for a 4-digit one. That made the test fail on
 /// a freshly-booted machine and pass on one with some uptime. psmisc is also
 /// simply the wrong reference here — it is the non-conforming side.
+#[cfg(target_os = "linux")]
 pub fn parse_posix_pid_list(stdout: &[u8]) -> Vec<u32> {
     let text = std::str::from_utf8(stdout).expect("fuser stdout must be valid UTF-8");
     assert!(

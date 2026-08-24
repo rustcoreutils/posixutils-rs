@@ -286,11 +286,17 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 }
                 result as isize
             }
-            AddressInfo::Offset(off) => base_line as isize + off,
+            AddressInfo::Offset(off) => (base_line as isize).saturating_add(*off),
         };
 
-        // Apply chained offsets; intermediate values may be out of range.
-        let acc = addr.offsets.iter().fold(base, |a, off| a + off);
+        // Apply chained offsets; intermediate values may legally be out of
+        // range, so saturate rather than bound-check -- but saturate rather
+        // than wrap, or a chain that overflows lands on an unrelated line in
+        // release and aborts the editor in debug.
+        let acc = addr
+            .offsets
+            .iter()
+            .fold(base, |a, off| a.saturating_add(*off));
 
         // Validate only the final resolved address.
         if acc < 0 {
@@ -776,7 +782,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             Command::Scroll(addr, count) => {
                 let start = self.resolve_address(&addr)?;
                 let count = count.unwrap_or(22); // Default page size
-                let end = std::cmp::min(start + count - 1, self.buf.last_line());
+                if count == 0 {
+                    return Err(EdError::InvalidCommand("z: count must be positive".into()));
+                }
+                let end = std::cmp::min(
+                    start.saturating_add(count.saturating_sub(1)),
+                    self.buf.last_line(),
+                );
                 if start > 0 && start <= self.buf.last_line() {
                     for i in start..=end {
                         if let Some(line) = self.buf.get_line(i) {

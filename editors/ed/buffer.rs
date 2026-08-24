@@ -383,7 +383,10 @@ impl Buffer {
         if start == 0 || start > end || end > self.lines.len() {
             return Err(EdError::AddressOutOfRange);
         }
-        if dest >= start && dest < end {
+        // POSIX (ed, `m`): it is an error if the destination falls within the
+        // range of moved lines -- and the range is inclusive, so `dest == end`
+        // is inside it.  Letting it through indexed past the drained vector.
+        if dest >= start && dest <= end {
             return Err(EdError::InvalidAddress);
         }
 

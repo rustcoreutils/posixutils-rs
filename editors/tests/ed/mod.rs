@@ -1525,3 +1525,205 @@ fn test_ed_intermediate_address_out_of_range_ok() {
     // resolved address is validated. 1-5+6 == line 2.
     ed_test("a\nl1\nl2\nl3\nl4\nl5\n.\n1-5+6p\nQ\n", "l2\n");
 }
+
+// ============================================================================
+// Phase 2 — address arithmetic must never panic
+// ============================================================================
+//
+// ed writes its diagnostics ('?') to stdout and never writes to stderr except
+// on the two fatal paths in ed_main.rs. A Rust panic exits 101 and writes a
+// backtrace to stderr. So for any command script:
+//
+//     exit code in {0,1} AND empty stderr  <=>  no panic
+//
+// `ed_survives` below is that detector, and MALFORMED is the standing corpus
+// every later phase extends.
+
+/// Drive `ed -s` with `script`, asserting only that it did not crash.
+fn ed_survives(script: &str) {
+    use plib::testing::run_test_with_checker;
+    run_test_with_checker(
+        TestPlan {
+            cmd: "ed".to_string(),
+            args: vec!["-s".to_string()],
+            stdin_data: script.to_string(),
+            // run_test_with_checker ignores these three.
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |plan, out| {
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.is_empty(),
+                "ed wrote to stderr for {:?}:\n{}",
+                plan.stdin_data,
+                err
+            );
+            assert!(
+                matches!(out.status.code(), Some(0) | Some(1)),
+                "ed exited {:?} (101 == panic) for {:?}",
+                out.status.code(),
+                plan.stdin_data
+            );
+        },
+    );
+}
+
+/// Command lines that must each yield `?` rather than a panic.
+///
+/// Deliberately contains no `w`, `W`, `e`, `E`, `r`, `f` or `!`: the test
+/// harness does not set the child's working directory, so a write command
+/// would litter the source tree and `!` would fork a shell.
+const MALFORMED: &[&str] = &[
+    // Phase 2: address arithmetic.
+    "99999999999999999999999p",
+    "9223372036854775808p",
+    "-99999999999999999999p",
+    "1+99999999999999999999p",
+    "$+9223372036854775807+9223372036854775807p",
+    "1-9223372036854775807-9223372036854775807p",
+    "z0",
+    "1z0",
+    "1z18446744073709551615",
+    "z99999999999999999999",
+    // Addressing and command syntax generally.
+    ",,p",
+    ";;p",
+    "1,p",
+    ",",
+    "0p",
+    "0i",
+    "0d",
+    "1,1j",
+    "u",
+    "k",
+    "kA",
+    "'",
+    "'A",
+    "'zp",
+    "//p",
+    "?nosuch?p",
+    "s",
+    "s/",
+    "s//",
+    "s/(/x/",
+    "s/x/y/2p3",
+    "s/a/b/99999999999999999999",
+    "/[/",
+    "g",
+    "v",
+    "G",
+    "V",
+    "g/x/g/y/p",
+    "#",
+    "=",
+    "Z",
+];
+
+/// Every corpus entry, one process each, so a failure names the input.
+#[test]
+fn test_ed_malformed_corpus_individually() {
+    for cmd in MALFORMED {
+        ed_survives(&format!("a\nl1\nl2\nl3\n.\n{}\n.\nQ\n", cmd));
+    }
+}
+
+/// The whole corpus in one process, to catch a command that survives alone but
+/// corrupts state for whatever follows it.
+#[test]
+fn test_ed_malformed_corpus_batch() {
+    let mut script = String::from("a\nl1\nl2\nl3\n.\n");
+    for cmd in MALFORMED {
+        // The trailing `.` closes input mode if the entry opened one.
+        script.push_str(cmd);
+        script.push_str("\n.\n");
+    }
+    script.push_str("Q\n");
+    ed_survives(&script);
+}
+
+/// A deterministic sweep over command metacharacters. Fixed-seed LCG rather
+/// than a dependency on `rand`, so a failure is always reproducible.
+#[test]
+fn test_ed_generated_commands_never_panic() {
+    const ALPHABET: &[u8] = b"0123456789.$,;+-/?'aicdjklmnpstuqgGvVzP#&=\\%^*[](){}|";
+
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+
+    let mut script = String::from("a\nl1\nl2\nl3\n.\n");
+    for _ in 0..512 {
+        let len = 1 + next() % 8;
+        for _ in 0..len {
+            script.push(ALPHABET[next() % ALPHABET.len()] as char);
+        }
+        // Close input mode if this case opened one.
+        script.push_str("\n.\n");
+    }
+    script.push_str("Q\n");
+    ed_survives(&script);
+}
+
+#[test]
+fn test_ed_huge_address_is_error() {
+    ed_test_code("a\nfoo\n.\n99999999999999999999999p\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_address_above_isize_max_is_error() {
+    ed_test_code("a\nfoo\n.\n9223372036854775808p\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_huge_offset_is_error() {
+    ed_test_code("a\nfoo\n.\n1+99999999999999999999p\nQ\n", "?\n", 1);
+}
+
+/// POSIX permits an out-of-range *intermediate* while chaining offsets, so the
+/// fix has to saturate rather than reject -- see
+/// `test_ed_intermediate_address_out_of_range_ok`, which must keep passing.
+#[test]
+fn test_ed_offset_chain_overflow_is_error() {
+    ed_test_code(
+        "a\nfoo\n.\n$+9223372036854775807+9223372036854775807p\nQ\n",
+        "?\n",
+        1,
+    );
+}
+
+#[test]
+fn test_ed_scroll_zero_count_is_error() {
+    ed_test_code("a\nfoo\n.\n1z0\nQ\n", "?\n", 1);
+}
+
+/// POSIX (ed, `m`): "It shall be an error if the address /address/ falls within
+/// the range of moved lines." The range is inclusive, so `dest == end` is an
+/// error -- it used to index past the drained vector and abort ed, losing the
+/// buffer. (GNU permits `dest == end` as a no-op; BSD and POSIX say error.)
+#[test]
+fn test_ed_move_dest_equal_to_end_is_error() {
+    ed_test_code("a\n1\n2\n3\n.\n2,3m3\n1,$p\nQ\n", "?\n1\n2\n3\n", 1);
+}
+
+#[test]
+fn test_ed_move_dest_equal_to_start_is_error() {
+    ed_test_code("a\n1\n2\n3\n.\n1,2m1\n1,$p\nQ\n", "?\n1\n2\n3\n", 1);
+}
+
+#[test]
+fn test_ed_move_onto_self_is_error() {
+    ed_test_code("a\n1\n2\n3\n.\n2m2\n1,$p\nQ\n", "?\n1\n2\n3\n", 1);
+}
+
+/// The legal boundary: a destination immediately *before* the range is outside
+/// it, and moving lines to where they already are is a no-op, not an error.
+#[test]
+fn test_ed_move_dest_just_before_range_is_noop() {
+    ed_test("a\n1\n2\n3\n.\n2,3m1\n1,$p\nQ\n", "1\n2\n3\n");
+}

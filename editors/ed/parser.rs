@@ -38,14 +38,16 @@ pub fn tokenize(input: &str) -> EdResult<Vec<Token>> {
             '.' => tokens.push(Token::CurrentLine),
             '$' => tokens.push(Token::LastLine),
             '0'..='9' => {
-                let n: usize = iter::once(ch)
+                // Addresses are resolved in signed arithmetic, so parse as
+                // `isize`: a line number that does not fit is out of range,
+                // not a reason to abort the editor.
+                let digits: String = iter::once(ch)
                     .chain(iter::from_fn(|| {
                         iter.by_ref().next_if(|s| s.is_ascii_digit())
                     }))
-                    .collect::<String>()
-                    .parse()
-                    .unwrap();
-                tokens.push(Token::Number(n));
+                    .collect();
+                let n: isize = digits.parse().map_err(|_| EdError::AddressOutOfRange)?;
+                tokens.push(Token::Number(n as usize));
             }
             '\'' => match iter.next() {
                 None => return Err(EdError::Syntax("missing mark character".to_string())),
@@ -129,7 +131,8 @@ pub fn tokenize(input: &str) -> EdResult<Vec<Token>> {
                         -1
                     }
                 } else {
-                    let unsigned: isize = offset_str.parse().unwrap();
+                    let unsigned: isize =
+                        offset_str.parse().map_err(|_| EdError::AddressOutOfRange)?;
                     if sign == '-' {
                         -unsigned
                     } else {

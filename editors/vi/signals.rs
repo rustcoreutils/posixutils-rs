@@ -42,37 +42,37 @@ extern "C" fn handle_hangup(_: libc::c_int) {
     HANGUP_RECEIVED.store(true, Ordering::SeqCst);
 }
 
+/// Install `handler` for `signum` *without* `SA_RESTART`.
+///
+/// This is the whole point of not using `libc::signal`: on the platforms this
+/// targets it has BSD semantics, which include `SA_RESTART`, so the kernel
+/// restarts an interrupted `read` instead of returning `EINTR`.  The editor's
+/// input loop services signals only when a read comes back interrupted, so
+/// with `SA_RESTART` the flags set below were never observed until the user
+/// happened to press a key -- and SIGHUP/SIGTERM, which have no key coming,
+/// took the unsaved buffer with them.
+fn install(signum: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0; // deliberately not SA_RESTART
+        libc::sigaction(signum, &action, std::ptr::null_mut());
+    }
+}
+
 /// Install handlers for SIGHUP and SIGTERM (buffer preservation). Idempotent;
 /// installed for both visual and ex modes.
 pub fn install_hangup_handlers() {
-    unsafe {
-        libc::signal(
-            libc::SIGHUP,
-            handle_hangup as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            handle_hangup as *const () as libc::sighandler_t,
-        );
-    }
+    install(libc::SIGHUP, handle_hangup);
+    install(libc::SIGTERM, handle_hangup);
 }
 
 /// Install the visual-mode signal handlers. Idempotent.
 pub fn install_visual_handlers() {
-    unsafe {
-        libc::signal(
-            libc::SIGWINCH,
-            handle_sigwinch as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGCONT,
-            handle_sigcont as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGINT,
-            handle_sigint as *const () as libc::sighandler_t,
-        );
-    }
+    install(libc::SIGWINCH, handle_sigwinch);
+    install(libc::SIGCONT, handle_sigcont);
+    install(libc::SIGINT, handle_sigint);
 }
 
 /// Atomically read and clear a signal flag.

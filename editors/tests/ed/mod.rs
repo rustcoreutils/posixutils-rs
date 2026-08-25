@@ -77,7 +77,7 @@ fn test_ed_insert_and_print() {
 fn test_ed_number_command() {
     ed_test(
         "a\nline one\nline two\n.\n1,$n\nQ\n",
-        "     1\tline one\n     2\tline two\n",
+        "1\tline one\n2\tline two\n",
     );
 }
 
@@ -550,7 +550,7 @@ fn test_ed_number_range() {
     // Number command on range
     ed_test(
         "a\nfirst\nsecond\nthird\n.\n1,3n\nQ\n",
-        "     1\tfirst\n     2\tsecond\n     3\tthird\n",
+        "1\tfirst\n2\tsecond\n3\tthird\n",
     );
 }
 
@@ -672,7 +672,7 @@ fn test_ed_substitute_with_number() {
     // s command with n flag prints with line number
     ed_test(
         "a\nhello world\n.\n1s/world/everyone/n\nQ\n",
-        "     1\thello everyone\n",
+        "1\thello everyone\n",
     );
 }
 
@@ -867,10 +867,7 @@ fn test_ed_global_delete_all_matches() {
 #[test]
 fn test_ed_global_number_matches() {
     // g/pattern/n should print matching lines with numbers
-    ed_test(
-        "a\nfoo\nbar\nfoo\n.\ng/foo/n\nQ\n",
-        "     1\tfoo\n     3\tfoo\n",
-    );
+    ed_test("a\nfoo\nbar\nfoo\n.\ng/foo/n\nQ\n", "1\tfoo\n3\tfoo\n");
 }
 
 #[test]
@@ -1524,4 +1521,701 @@ fn test_ed_intermediate_address_out_of_range_ok() {
     // #E7: an intermediate offset value may be out of range; only the final
     // resolved address is validated. 1-5+6 == line 2.
     ed_test("a\nl1\nl2\nl3\nl4\nl5\n.\n1-5+6p\nQ\n", "l2\n");
+}
+
+// ============================================================================
+// Phase 2 — address arithmetic must never panic
+// ============================================================================
+//
+// ed writes its diagnostics ('?') to stdout and never writes to stderr except
+// on the two fatal paths in ed_main.rs. A Rust panic exits 101 and writes a
+// backtrace to stderr. So for any command script:
+//
+//     exit code in {0,1} AND empty stderr  <=>  no panic
+//
+// `ed_survives` below is that detector, and MALFORMED is the standing corpus
+// every later phase extends.
+
+/// Drive `ed -s` with `script`, asserting only that it did not crash.
+fn ed_survives(script: &str) {
+    use plib::testing::run_test_with_checker;
+    run_test_with_checker(
+        TestPlan {
+            cmd: "ed".to_string(),
+            args: vec!["-s".to_string()],
+            stdin_data: script.to_string(),
+            // run_test_with_checker ignores these three.
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |plan, out| {
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.is_empty(),
+                "ed wrote to stderr for {:?}:\n{}",
+                plan.stdin_data,
+                err
+            );
+            assert!(
+                matches!(out.status.code(), Some(0) | Some(1)),
+                "ed exited {:?} (101 == panic) for {:?}",
+                out.status.code(),
+                plan.stdin_data
+            );
+        },
+    );
+}
+
+/// Command lines that must each yield `?` rather than a panic.
+///
+/// Deliberately contains no `w`, `W`, `e`, `E`, `r`, `f` or `!`: the test
+/// harness does not set the child's working directory, so a write command
+/// would litter the source tree and `!` would fork a shell.
+const MALFORMED: &[&str] = &[
+    // Phase 2: address arithmetic.
+    "99999999999999999999999p",
+    "9223372036854775808p",
+    "-99999999999999999999p",
+    "1+99999999999999999999p",
+    "$+9223372036854775807+9223372036854775807p",
+    "1-9223372036854775807-9223372036854775807p",
+    "z0",
+    "1z0",
+    "1z18446744073709551615",
+    "z99999999999999999999",
+    // Addressing and command syntax generally.
+    ",,p",
+    ";;p",
+    "1,p",
+    ",",
+    "0p",
+    "0i",
+    "0d",
+    "1,1j",
+    "u",
+    "k",
+    "kA",
+    "'",
+    "'A",
+    "'zp",
+    "//p",
+    "?nosuch?p",
+    "s",
+    "s/",
+    "s//",
+    "s/(/x/",
+    "s/x/y/2p3",
+    "s/a/b/99999999999999999999",
+    "/[/",
+    "g",
+    "v",
+    "G",
+    "V",
+    "g/x/g/y/p",
+    "#",
+    "=",
+    "Z",
+];
+
+/// Every corpus entry, one process each, so a failure names the input.
+#[test]
+fn test_ed_malformed_corpus_individually() {
+    for cmd in MALFORMED {
+        ed_survives(&format!("a\nl1\nl2\nl3\n.\n{}\n.\nQ\n", cmd));
+    }
+}
+
+/// The whole corpus in one process, to catch a command that survives alone but
+/// corrupts state for whatever follows it.
+#[test]
+fn test_ed_malformed_corpus_batch() {
+    let mut script = String::from("a\nl1\nl2\nl3\n.\n");
+    for cmd in MALFORMED {
+        // The trailing `.` closes input mode if the entry opened one.
+        script.push_str(cmd);
+        script.push_str("\n.\n");
+    }
+    script.push_str("Q\n");
+    ed_survives(&script);
+}
+
+/// A deterministic sweep over command metacharacters. Fixed-seed LCG rather
+/// than a dependency on `rand`, so a failure is always reproducible.
+#[test]
+fn test_ed_generated_commands_never_panic() {
+    const ALPHABET: &[u8] = b"0123456789.$,;+-/?'aicdjklmnpstuqgGvVzP#&=\\%^*[](){}|";
+
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+
+    let mut script = String::from("a\nl1\nl2\nl3\n.\n");
+    for _ in 0..512 {
+        let len = 1 + next() % 8;
+        for _ in 0..len {
+            script.push(ALPHABET[next() % ALPHABET.len()] as char);
+        }
+        // Close input mode if this case opened one.
+        script.push_str("\n.\n");
+    }
+    script.push_str("Q\n");
+    ed_survives(&script);
+}
+
+#[test]
+fn test_ed_huge_address_is_error() {
+    ed_test_code("a\nfoo\n.\n99999999999999999999999p\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_address_above_isize_max_is_error() {
+    ed_test_code("a\nfoo\n.\n9223372036854775808p\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_huge_offset_is_error() {
+    ed_test_code("a\nfoo\n.\n1+99999999999999999999p\nQ\n", "?\n", 1);
+}
+
+/// POSIX permits an out-of-range *intermediate* while chaining offsets, so the
+/// fix has to saturate rather than reject -- see
+/// `test_ed_intermediate_address_out_of_range_ok`, which must keep passing.
+#[test]
+fn test_ed_offset_chain_overflow_is_error() {
+    ed_test_code(
+        "a\nfoo\n.\n$+9223372036854775807+9223372036854775807p\nQ\n",
+        "?\n",
+        1,
+    );
+}
+
+#[test]
+fn test_ed_scroll_zero_count_is_error() {
+    ed_test_code("a\nfoo\n.\n1z0\nQ\n", "?\n", 1);
+}
+
+/// POSIX (ed, `m`): "It shall be an error if the address /address/ falls within
+/// the range of moved lines." The range is inclusive, so `dest == end` is an
+/// error -- it used to index past the drained vector and abort ed, losing the
+/// buffer. (GNU permits `dest == end` as a no-op; BSD and POSIX say error.)
+#[test]
+fn test_ed_move_dest_equal_to_end_is_error() {
+    ed_test_code("a\n1\n2\n3\n.\n2,3m3\n1,$p\nQ\n", "?\n1\n2\n3\n", 1);
+}
+
+#[test]
+fn test_ed_move_dest_equal_to_start_is_error() {
+    ed_test_code("a\n1\n2\n3\n.\n1,2m1\n1,$p\nQ\n", "?\n1\n2\n3\n", 1);
+}
+
+#[test]
+fn test_ed_move_onto_self_is_error() {
+    ed_test_code("a\n1\n2\n3\n.\n2m2\n1,$p\nQ\n", "?\n1\n2\n3\n", 1);
+}
+
+/// The legal boundary: a destination immediately *before* the range is outside
+/// it, and moving lines to where they already are is a no-op, not an error.
+#[test]
+fn test_ed_move_dest_just_before_range_is_noop() {
+    ed_test("a\n1\n2\n3\n.\n2,3m1\n1,$p\nQ\n", "1\n2\n3\n");
+}
+
+// ============================================================================
+// Phase 3 — `w` / `wq` / `Wq`
+// ============================================================================
+
+/// Run `ed` with a real working directory, so a test can assert on the files it
+/// did (and did not) create. `run_test` leaves the child in the harness's cwd.
+fn ed_in_dir(dir: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String, String) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(plib::testing::get_binary_path("ed"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ed");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait for ed");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `wq` must write the whole buffer to the remembered pathname and exit.
+///
+/// The tokenizer takes everything after the command letter as one blob, so
+/// `wq` used to parse as `w` with the filename `"q"`: it wrote the buffer to a
+/// junk file, left the real file untouched, and did not quit -- silent data
+/// loss with exit 0.
+#[test]
+fn test_ed_wq_writes_remembered_file_and_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    fs::write(&target, "hello\n").unwrap();
+
+    let (code, _out, err) = ed_in_dir(dir.path(), &["-s", "f.txt"], "1a\nworld\n.\nwq\n");
+
+    assert_eq!(code, 0, "wq should succeed; stderr: {}", err);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "hello\nworld\n");
+    assert!(
+        !dir.path().join("q").exists(),
+        "wq must not create a file named 'q'"
+    );
+}
+
+#[test]
+fn test_ed_wq_with_filename_writes_there_and_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, _out, err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nwq out.txt\n");
+
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "hello\n"
+    );
+    assert!(!dir.path().join("q out.txt").exists());
+}
+
+/// `W` is the append-writing form, so `Wq` appends and quits.
+#[test]
+fn test_ed_uppercase_wq_appends_and_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    fs::write(&target, "first\n").unwrap();
+
+    let (code, _out, err) = ed_in_dir(dir.path(), &["-s"], "a\nsecond\n.\nWq f.txt\n");
+
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "first\nsecond\n");
+}
+
+/// The distinction is literal adjacency: `wq` is write-quit, `w q` writes a
+/// file that happens to be named `q` and stays in command mode.
+#[test]
+fn test_ed_w_space_q_writes_a_file_named_q_without_quitting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out, err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nw q\n1p\nQ\n");
+
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert_eq!(fs::read_to_string(dir.path().join("q")).unwrap(), "hello\n");
+    assert_eq!(
+        out, "hello\n",
+        "`w q` must not quit -- the following 1p should still run"
+    );
+}
+
+/// POSIX (ed, `w`): with no pathname given and none remembered, it is an error.
+#[test]
+fn test_ed_wq_without_remembered_pathname_is_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out, _err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nwq\nQ\n");
+
+    assert_eq!(code, 1);
+    assert!(out.starts_with('?'), "expected '?', got {:?}", out);
+    assert!(
+        !dir.path().join("q").exists(),
+        "a failed wq must not create a file"
+    );
+}
+
+/// `x` used to be a second, degraded spelling of write-quit. GNU and BSD both
+/// define `x` as something else entirely (put the cut buffer), and POSIX
+/// defines neither -- so with a real `wq`, shipping a third meaning is worse
+/// than answering '?'.
+#[test]
+fn test_ed_x_command_is_not_recognized() {
+    // Give ed a remembered pathname, so `x` would succeed if it still meant
+    // write-quit -- otherwise this passes for the unrelated NoFilename reason.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    fs::write(&target, "hello\n").unwrap();
+
+    let (code, out, _err) = ed_in_dir(dir.path(), &["-s", "f.txt"], "1a\nworld\n.\nx\nQ\n");
+
+    assert_eq!(code, 1);
+    assert!(out.starts_with('?'), "expected '?', got {:?}", out);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "hello\n",
+        "a rejected `x` must not write"
+    );
+}
+
+// ============================================================================
+// Phase 4 — the quit warning must re-arm
+// ============================================================================
+//
+// POSIX (ed, DESCRIPTION): ed warns when `e` or `q` would destroy a modified
+// buffer, "and shall continue in command mode with the current line number
+// unchanged. If the `e` or `q` command is repeated with no intervening
+// command, ed shall exit." The flag was set once and never cleared, so any
+// later `q` exited silently no matter how much had been edited since.
+
+#[test]
+fn test_ed_quit_warning_rearms_after_intervening_command() {
+    // First `q` warns. `1p` intervenes. The second `q` must warn again rather
+    // than discarding "bar".
+    ed_test_code("a\nfoo\n.\nq\n1p\nq\nQ\n", "?\nfoo\n?\n", 1);
+}
+
+/// The other half of the same sentence: repeated with *no* intervening
+/// command, the second `q` exits.
+#[test]
+fn test_ed_quit_repeated_without_intervening_command_exits() {
+    ed_test_code("a\nfoo\n.\nq\nq\n", "?\n", 1);
+}
+
+/// A command that errors is still an intervening command.
+#[test]
+fn test_ed_quit_warning_rearms_after_failed_command() {
+    ed_test_code("a\nfoo\n.\nq\nZ\nq\nQ\n", "?\n?\n?\n", 1);
+}
+
+/// Editing after the warning re-arms it, so the edit cannot be lost silently.
+#[test]
+fn test_ed_quit_warning_rearms_after_further_editing() {
+    ed_test_code("a\nfoo\n.\nq\na\nbar\n.\nq\nQ\n", "?\n?\n", 1);
+}
+
+/// The generic re-arm subsumes the old per-command clears after `e` and `w`,
+/// but only because every editing command is itself an intervening command.
+/// Pin that: force-edit, edit again, then `q` must still warn.
+#[test]
+fn test_ed_quit_warning_rearms_after_force_edit_then_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    fs::write(&target, "orig\n").unwrap();
+
+    let (code, out, _err) = ed_in_dir(dir.path(), &["-s"], "a\nfoo\n.\nE f.txt\na\nbar\n.\nq\nQ\n");
+    assert_eq!(code, 1);
+    assert_eq!(out, "?\n", "the q after re-editing must warn, not exit");
+}
+
+/// Likewise after a successful write: writing clears `modified`, so `q` exits
+/// on its own merits rather than on a stale flag.
+#[test]
+fn test_ed_quit_after_write_exits_without_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out, _err) = ed_in_dir(dir.path(), &["-s"], "a\nfoo\n.\nw out.txt\nq\n");
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "foo\n"
+    );
+}
+
+// ============================================================================
+// Phase 5 — one command is one undo
+// ============================================================================
+//
+// POSIX (ed, `u`): "The u command shall nullify the effect of the most recent
+// command that modified anything in the buffer, namely the most recent a, c,
+// d, g, i, j, m, r, s, t, u, v, G, or V command." One `s` over a range is one
+// command, however many lines it rewrote.
+
+/// `execute_substitute` calls `buf.change()` once per matched line, and each
+/// call re-snapshotted the single undo slot, so `u` reverted only the last
+/// line. The earlier lines were unrecoverable.
+#[test]
+fn test_ed_undo_multiline_substitute_restores_every_line() {
+    ed_test("a\nax\nay\naz\n.\n1,$s/a/B/\nu\n1,$p\nQ\n", "ax\nay\naz\n");
+}
+
+/// The line-splitting path takes a different branch through the same loop.
+#[test]
+fn test_ed_undo_substitute_that_splits_lines() {
+    ed_test("a\na-b\na-c\n.\n1,$s/-/\\\n/\nu\n1,$p\nQ\n", "a-b\na-c\n");
+}
+
+/// `g` already grouped correctly via begin_global; splitting the undo-group
+/// counter out of the "am I inside g/v" flag must not change that.
+#[test]
+fn test_ed_undo_global_substitute_still_one_command() {
+    ed_test("a\nax\nay\naz\n.\ng/a/s/a/B/\nu\n1,$p\nQ\n", "ax\nay\naz\n");
+}
+
+/// ...nor may it change what `is_in_global` means: POSIX forbids splitting a
+/// line inside g/v, and that check keys off exactly this flag.
+#[test]
+fn test_ed_substitute_split_inside_global_is_still_an_error() {
+    ed_test_code("a\na-b\n.\ng/-/s/-/x\\\ny/\nQ\n", "?\n", 1);
+}
+
+/// ...and a plain `s` that splits a line must still be allowed.
+#[test]
+fn test_ed_substitute_split_outside_global_is_allowed() {
+    ed_test("a\na-b\n.\n1s/-/x\\\ny/\n1,$p\nQ\n", "ax\nyb\n");
+}
+
+/// POSIX (ed, `s`) defines the suffix as a count followed by any of g, l, n,
+/// p. The scanner collected every digit anywhere in the suffix, so
+/// `s/x/y/2p3` silently became count 23 instead of a syntax error.
+#[test]
+fn test_ed_substitute_trailing_junk_after_flag_is_error() {
+    ed_test_code("a\nxxx\n.\ns/x/y/2p3\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_substitute_unknown_flag_is_error() {
+    ed_test_code("a\nxxx\n.\ns/x/y/q\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_substitute_count_overflow_is_error() {
+    ed_test_code("a\nxxx\n.\ns/x/y/99999999999999999999\nQ\n", "?\n", 1);
+}
+
+/// The flags that do work must keep working.
+#[test]
+fn test_ed_substitute_valid_flag_combinations() {
+    ed_test("a\nx x x\n.\ns/x/y/2\n1p\nQ\n", "x y x\n");
+    ed_test("a\nx x x\n.\ns/x/y/gp\nQ\n", "y y y\n");
+    ed_test("a\nx x x\n.\ns/x/y/g\n1p\nQ\n", "y y y\n");
+}
+
+// ============================================================================
+// Phase 6 — a/i/c in a `g` command list
+// ============================================================================
+//
+// POSIX (ed, `g`): "The a, i, and c commands and associated input are
+// permitted; the '.' terminating input mode can be omitted if it would be the
+// last line of the command list." So the text comes from the *command list*,
+// and a bare `a` at the end of the list has no text: it appends nothing.
+//
+// Every expectation below was cross-checked against /bin/ed on this machine.
+
+/// A bare `a` used to fall through to `execute_command`, which does not edit
+/// -- it sets `in_input_mode` and waits for stdin that the global loop never
+/// supplies. The pending command was overwritten on each match, and the mode
+/// leaked out of the global so the *following* script lines were swallowed as
+/// input text.
+#[test]
+fn test_ed_global_bare_append_appends_nothing() {
+    ed_test("a\nfoo\nfoo\n.\ng/foo/a\n1,$p\nQ\n", "foo\nfoo\n");
+}
+
+#[test]
+fn test_ed_global_bare_insert_inserts_nothing() {
+    ed_test("a\nfoo\nbar\n.\ng/foo/i\n1,$p\nQ\n", "foo\nbar\n");
+}
+
+/// `c` with zero replacement lines deletes the addressed line.
+#[test]
+fn test_ed_global_bare_change_deletes_matching_lines() {
+    ed_test("a\nfoo\nbar\n.\ng/foo/c\n1,$p\nQ\n", "bar\n");
+}
+
+/// The mode must not leak: commands after the global still run as commands.
+#[test]
+fn test_ed_global_bare_append_does_not_swallow_later_commands() {
+    ed_test("a\nfoo\nfoo\n.\ng/foo/a\n1,$p\n2p\nQ\n", "foo\nfoo\nfoo\n");
+}
+
+/// The command list is classified by parsing it, not by scanning for the
+/// first letter -- which mistook the `a` of an address for an append command.
+#[test]
+fn test_ed_global_command_list_with_regex_address_is_not_an_append() {
+    ed_test("a\nx\nabc\ny\n.\ng/x/.,/abc/d\n1,$p\nQ\n", "y\n");
+}
+
+/// Multi-line command lists arrive by backslash continuation, and those
+/// already worked -- pin them so the classifier change cannot regress them.
+#[test]
+fn test_ed_global_append_with_continued_input_still_works() {
+    ed_test(
+        "a\nfoo\nbar\n.\ng/foo/a\\\nXXX\n.\n1,$p\nQ\n",
+        "XXX\nfoo\nXXX\nbar\n",
+    );
+}
+
+#[test]
+fn test_ed_global_change_with_continued_input_still_works() {
+    ed_test(
+        "a\nfoo\nbar\n.\ng/foo/c\\\nZZZ\n.\n1,$p\nQ\n",
+        "ZZZ\nZZZ\nbar\n",
+    );
+}
+
+// ============================================================================
+// Phase 7 — marks follow their line
+// ============================================================================
+//
+// POSIX (ed, `k`) says only that `k` marks the addressed line; it does not say
+// what happens to a mark when that line is later moved, or when lines are
+// added or removed above it. Historical ed stores the buffer as a linked list
+// and marks as node pointers, so the mark follows its text for free. This
+// implementation stores line *numbers* and renumbered them in `delete` only,
+// so after `1m$` a mark silently denoted a different line of text -- the worst
+// of the options, since it is neither correct nor visibly broken.
+//
+// Every expectation below was cross-checked against /bin/ed on this machine.
+
+/// The marked line moves; the mark goes with it.
+#[test]
+fn test_ed_mark_follows_moved_line() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1m$\n'ap\nQ\n", "C\n");
+}
+
+/// A copy above the mark shifts it down; the copy itself is unmarked.
+#[test]
+fn test_ed_mark_survives_copy_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1t0\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_insert_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1i\nNEW\n.\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_append_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1a\nNEW\n.\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_delete_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1d\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_join_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1,2j\n'ap\nQ\n", "C\n");
+}
+
+#[test]
+fn test_ed_mark_survives_change_above() {
+    ed_test("a\nA\nB\nC\n.\n3ka\n1c\nX\nY\n.\n'ap\nQ\n", "C\n");
+}
+
+/// A mark whose line no longer exists is an error, not a silent wrong answer.
+#[test]
+fn test_ed_mark_on_deleted_line_is_error() {
+    ed_test_code("a\nA\nB\nC\n.\n3ka\n3d\n'ap\nQ\n", "?\n", 1);
+}
+
+#[test]
+fn test_ed_mark_on_changed_line_is_error() {
+    ed_test_code("a\nA\nB\nC\n.\n3ka\n3c\nX\n.\n'ap\nQ\n", "?\n", 1);
+}
+
+/// `^` anchors to the start of the line, so a global substitute must not
+/// re-anchor it at each restart. `s/^/> /g` produced "> a> b> c> " because
+/// `Regex::captures_at` searched the remaining substring without telling the
+/// regex engine that it was no longer at a beginning of line.
+#[test]
+fn test_ed_global_substitute_does_not_reanchor_caret() {
+    ed_test("a\nabc\n.\ns/^/> /g\n1,$p\nQ\n", "> abc\n");
+}
+
+#[test]
+fn test_ed_global_substitute_still_anchors_dollar() {
+    ed_test("a\nabc\n.\ns/$/!/g\n1,$p\nQ\n", "abc!\n");
+}
+
+/// POSIX (ed, ASYNCHRONOUS EVENTS): on SIGHUP, if the buffer is modified, ed
+/// writes it to `ed.hup` in the current directory before exiting.
+///
+/// The handler was installed with `libc::signal`, whose BSD semantics include
+/// SA_RESTART, so the flag it set was never observed while ed sat blocked
+/// reading a command -- and on a hangup no further command is coming, so the
+/// buffer was simply lost.
+#[test]
+fn test_ed_writes_ed_hup_on_sighup() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(plib::testing::get_binary_path("ed"))
+        .arg("-s")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ed");
+
+    // Modify the buffer, then leave ed blocked waiting for the next command.
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"a\nHUP_ME\n.\n").unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+    // Let the signal land before the EOF: if stdin closes first, ed processes
+    // the EOF as an ordinary quit and never sees the hangup.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // A real hangup takes the terminal with it, so close stdin too -- that is
+    // what ends the pending read (`BufRead::read_line` retries EINTR itself).
+    drop(stdin);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let hup = dir.path().join("ed.hup");
+    let body = fs::read_to_string(&hup).unwrap_or_default();
+    assert!(
+        body.contains("HUP_ME"),
+        "SIGHUP must write the modified buffer to ed.hup; got {:?}",
+        body
+    );
+}
+
+/// POSIX (ed, `n`): "shall write the line number, followed by a <tab>,
+/// followed by the line". The line number was padded into a six-character
+/// field, which is the `ex` convention, not ed's -- cross-checked against
+/// /bin/ed, which writes "1<tab>text".
+#[test]
+fn test_ed_number_format_is_number_tab_line() {
+    ed_test("a\nfirst\nsecond\n.\n1,2n\nQ\n", "1\tfirst\n2\tsecond\n");
+}
+
+/// The `n` flag on `s` and inside `g` uses the same format.
+#[test]
+fn test_ed_number_flag_format_matches() {
+    ed_test("a\nxa\n.\ns/x/y/n\nQ\n", "1\tya\n");
+    ed_test("a\nxa\nxb\n.\ng/x/n\nQ\n", "1\txa\n2\txb\n");
+}
+
+/// A command that changes nothing must leave the undo record alone.
+///
+/// Grouping the substitute's per-line writes made the group snapshot when it
+/// *opened*, so a substitute that matched nothing overwrote the state `u` was
+/// holding and the previous edit became unrecoverable.
+#[test]
+fn test_ed_failed_substitute_does_not_destroy_the_undo_record() {
+    ed_test_code(
+        "a\nhello\n.\n1s/hello/world/\n1s/zzz/x/\nu\n1p\nQ\n",
+        "?\nhello\n",
+        1,
+    );
+}
+
+/// The same for a global that matches nothing. POSIX (ed, `u`) nullifies "the
+/// most recent command that modified anything in the buffer" -- a global with
+/// no matches modified nothing, so `u` must still reach the substitute before
+/// it. (/bin/ed prints "world" here, i.e. its `u` is consumed by the global;
+/// that reading does not match the spec's wording.)
+#[test]
+fn test_ed_failed_global_does_not_destroy_the_undo_record() {
+    ed_test(
+        "a\nhello\n.\n1s/hello/world/\ng/zzz/d\nu\n1p\nQ\n",
+        "hello\n",
+    );
 }

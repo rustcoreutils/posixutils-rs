@@ -33,10 +33,14 @@ pub fn display_col_to_byte_offset(s: &str, display_col: usize, tabstop: usize) -
     let mut byte_offset = 0;
 
     for c in s.chars() {
-        if current_display >= display_col {
-            break;
-        }
         let width = char_width(c, current_display, tabstop);
+        // The character that *occupies* the requested column, not the one
+        // after it: a tab spans several columns, and stopping only once the
+        // running total had passed `display_col` skipped over it, making every
+        // column of a tab but its first unreachable.
+        if current_display + width > display_col {
+            return byte_offset;
+        }
         current_display += width;
         byte_offset += c.len_utf8();
     }

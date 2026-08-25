@@ -16,13 +16,34 @@
 use super::Editor;
 use crate::buffer::{Line, Position, Range};
 use crate::error::{Result, ViError};
-use crate::ex::address::AddrCtx;
+use crate::ex::address::{AddrCtx, Address};
 use crate::ex::command::SubstituteFlags;
 use crate::ex::AddressRange;
 
 impl Editor {
     /// Execute :join command - join lines together.
     pub(super) fn execute_ex_join(
+        &mut self,
+        range: &AddressRange,
+        count: Option<usize>,
+        force: bool,
+    ) -> Result<()> {
+        // `:j` reaches at least one line past its start (that is the whole
+        // point), and a count extends it further -- so the snapshot span has
+        // to cover the joined-away lines, not just the addressed range.
+        let (first, last) = if range.explicit {
+            self.resolve_range(range)?
+        } else {
+            let cur = self.buffer.cursor().line;
+            (cur, cur)
+        };
+        let span_end = last.max(first + 1).max(first + count.unwrap_or(0));
+        self.splice_around(first, span_end.min(self.buffer.line_count()), |ed| {
+            ed.execute_ex_join_inner(range, count, force)
+        })
+    }
+
+    fn execute_ex_join_inner(
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
@@ -95,9 +116,7 @@ impl Editor {
         }
 
         // Replace the first line with the joined result
-        if let Some(line) = self.buffer.line_mut(start) {
-            *line = Line::from(result.as_str());
-        }
+        let _ = self.buffer.replace_line(start, &result);
 
         self.buffer.set_line(start);
 
@@ -112,6 +131,11 @@ impl Editor {
         line: Option<usize>,
         register: Option<char>,
     ) -> Result<()> {
+        let at = line.unwrap_or(self.buffer.cursor().line).max(1);
+        self.splice_around(at, at, |ed| ed.execute_ex_put_inner(line, register))
+    }
+
+    fn execute_ex_put_inner(&mut self, line: Option<usize>, register: Option<char>) -> Result<()> {
         let target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
         let reg = register.unwrap_or('"');
 
@@ -129,7 +153,23 @@ impl Editor {
     }
 
     /// Execute :copy command - copy lines to destination.
-    pub(super) fn execute_ex_copy(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
+    pub(super) fn execute_ex_copy(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
+        let (first, last) = self.affected_span(range, dest)?;
+        self.splice_around(first, last, |ed| ed.execute_ex_copy_inner(range, dest))
+    }
+
+    /// The contiguous run of lines a `:copy`/`:move` can disturb: the source
+    /// range and the destination together.
+    fn affected_span(&self, range: &AddressRange, dest: &Address) -> Result<(usize, usize)> {
+        let (start, end) = self.resolve_range(range)?;
+        let d = dest.resolve(&self.addr_ctx_allow_zero())?;
+        Ok((start.min(d.saturating_add(1)).max(1), end.max(d)))
+    }
+
+    fn execute_ex_copy_inner(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
+        // Resolved here, not at parse time: `$`, `.` and a search all depend
+        // on the buffer.  `allow_zero` because the destination names the line
+        // to insert *after*, so 0 means "before the first line".
         let current = self.buffer.cursor().line;
         let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
 
@@ -142,7 +182,7 @@ impl Editor {
         }
 
         // Insert after destination line
-        let insert_after = if dest == 0 { 0 } else { dest };
+        let insert_after = dest.resolve(&self.addr_ctx_allow_zero_at(current))?;
         for (i, line_text) in lines_to_copy.iter().enumerate() {
             self.buffer
                 .insert_line_after(insert_after + i, Line::from(line_text.as_str()));
@@ -156,9 +196,15 @@ impl Editor {
     }
 
     /// Execute :move command - move lines to destination.
-    pub(super) fn execute_ex_move(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
+    pub(super) fn execute_ex_move(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
+        let (first, last) = self.affected_span(range, dest)?;
+        self.splice_around(first, last, |ed| ed.execute_ex_move_inner(range, dest))
+    }
+
+    fn execute_ex_move_inner(&mut self, range: &AddressRange, dest: &Address) -> Result<()> {
         let current = self.buffer.cursor().line;
         let (start, end) = range.resolve(&self.addr_ctx_at(current))?;
+        let dest = dest.resolve(&self.addr_ctx_allow_zero_at(current))?;
 
         // Can't move lines into themselves
         if dest >= start && dest <= end {
@@ -385,6 +431,17 @@ impl Editor {
         range: &AddressRange,
         count: Option<usize>,
     ) -> Result<()> {
+        let (first, last) = self.resolve_range(range)?;
+        self.splice_around(first, last, |ed| {
+            ed.execute_ex_shift_left_inner(range, count)
+        })
+    }
+
+    fn execute_ex_shift_left_inner(
+        &mut self,
+        range: &AddressRange,
+        count: Option<usize>,
+    ) -> Result<()> {
         let (start, end) = self.resolve_range(range)?;
         let shift_amount = count.unwrap_or(1) * self.options.shiftwidth;
 
@@ -414,6 +471,17 @@ impl Editor {
 
     /// Execute :> command - shift lines right.
     pub(super) fn execute_ex_shift_right(
+        &mut self,
+        range: &AddressRange,
+        count: Option<usize>,
+    ) -> Result<()> {
+        let (first, last) = self.resolve_range(range)?;
+        self.splice_around(first, last, |ed| {
+            ed.execute_ex_shift_right_inner(range, count)
+        })
+    }
+
+    fn execute_ex_shift_right_inner(
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
@@ -533,9 +601,14 @@ impl Editor {
     /// Context for the commands that insert *after* an address, where line 0 is
     /// legal and means "before the first line" (#X15).
     pub(super) fn addr_ctx_allow_zero(&self) -> AddrCtx<'_> {
+        self.addr_ctx_allow_zero_at(self.buffer.cursor().line)
+    }
+
+    /// As [`Self::addr_ctx_allow_zero`], relative to `current`.
+    pub(super) fn addr_ctx_allow_zero_at(&self, current: usize) -> AddrCtx<'_> {
         AddrCtx {
             allow_zero: true,
-            ..self.addr_ctx()
+            ..self.addr_ctx_at(current)
         }
     }
 
@@ -576,14 +649,23 @@ impl Editor {
         register: Option<char>,
         count: Option<usize>,
     ) -> Result<()> {
+        let (start, end) = self.resolve_range(range)?;
+        let last = end_from_count(start, end, count, self.buffer.line_count())?;
+        self.splice_around(start, last, |ed| {
+            ed.execute_ex_delete_inner(range, register, count)
+        })
+    }
+
+    fn execute_ex_delete_inner(
+        &mut self,
+        range: &AddressRange,
+        register: Option<char>,
+        count: Option<usize>,
+    ) -> Result<()> {
         use crate::command::delete;
 
         let (start, end) = self.resolve_range(range)?;
-        let end = if let Some(c) = count {
-            (start + c - 1).min(self.buffer.line_count())
-        } else {
-            end
-        };
+        let end = end_from_count(start, end, count, self.buffer.line_count())?;
 
         let start_pos = Position::new(start, 0);
         let end_pos = Position::new(end, 0);
@@ -610,11 +692,7 @@ impl Editor {
         use crate::command::yank;
 
         let (start, end) = self.resolve_range(range)?;
-        let end = if let Some(c) = count {
-            (start + c - 1).min(self.buffer.line_count())
-        } else {
-            end
-        };
+        let end = end_from_count(start, end, count, self.buffer.line_count())?;
 
         let start_pos = Position::new(start, 0);
         let end_pos = Position::new(end, 0);
@@ -627,6 +705,27 @@ impl Editor {
 
         Ok(())
     }
+}
+
+/// Resolve the last line an ex command acts on when a trailing `count` was
+/// given: the range becomes `count` lines starting at `start`.
+///
+/// A count must be positive. Zero used to reach `start + count - 1` unguarded,
+/// which underflows for `start == 0` and otherwise silently addresses the line
+/// *before* `start`, so `:1d 0` walked off the front of the buffer.
+fn end_from_count(
+    start: usize,
+    end: usize,
+    count: Option<usize>,
+    last_line: usize,
+) -> Result<usize> {
+    let Some(c) = count else { return Ok(end) };
+    if c == 0 {
+        return Err(ViError::InvalidCommand(
+            "count must be positive".to_string(),
+        ));
+    }
+    Ok((start + c - 1).min(last_line))
 }
 
 /// Decrement `line` by `delta`, or fail as POSIX requires when the result

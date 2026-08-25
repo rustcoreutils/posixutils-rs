@@ -345,13 +345,19 @@ impl Regex {
 
         let mut pmatch: [regmatch_t; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
 
+        // Past the start of `text`, the substring's first byte is not the
+        // beginning of a line, so `^` must not match there.  Without
+        // REG_NOTBOL a global substitute re-anchors `^` at every restart:
+        // `s/^/> /g` on "abc" produced "> a> b> c> ".
+        let flags = if offset == 0 { 0 } else { REG_NOTBOL };
+
         let result = unsafe {
             regexec(
                 &self.raw,
                 c_text.as_ptr(),
                 MAX_CAPTURES,
                 pmatch.as_mut_ptr(),
-                0,
+                flags,
             )
         };
 
@@ -657,5 +663,31 @@ mod tests {
         let caps = caps.unwrap();
         assert_eq!(caps[0].start, 5);
         assert_eq!(caps[0].end, 5);
+    }
+
+    /// Past offset 0 the substring's first byte is not a beginning of line.
+    /// Without REG_NOTBOL a global substitute loop re-anchors `^` at each
+    /// restart, so `s/^/> /g` on "abc" yielded "> a> b> c> ".
+    #[test]
+    fn test_captures_at_does_not_reanchor_bol() {
+        let re = Regex::new("^", RegexFlags::bre()).unwrap();
+        assert!(
+            re.captures_at("abc", 0).is_some(),
+            "^ must match at the start of the text"
+        );
+        for offset in 1..=3 {
+            assert!(
+                re.captures_at("abc", offset).is_none(),
+                "^ must not match at offset {}",
+                offset
+            );
+        }
+    }
+
+    /// `$` is unaffected: the substring really does end where the text ends.
+    #[test]
+    fn test_captures_at_still_matches_eol() {
+        let re = Regex::new("$", RegexFlags::bre()).unwrap();
+        assert!(re.captures_at("abc", 3).is_some());
     }
 }

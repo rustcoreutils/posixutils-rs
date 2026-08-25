@@ -114,6 +114,16 @@ impl Terminal {
         Ok(())
     }
 
+    /// Whether the terminal is currently in raw mode.
+    ///
+    /// `disable_raw_mode` returns `Ok` whether or not it had anything to do,
+    /// so callers that tried to remember the previous state with `.is_ok()`
+    /// always concluded "it was raw" -- and then put a *cooked* ex terminal
+    /// into raw mode, where it stopped delivering whole lines.
+    pub fn is_raw_mode(&self) -> bool {
+        self.raw_mode
+    }
+
     /// Disable raw mode and restore original settings.
     pub fn disable_raw_mode(&mut self) -> Result<()> {
         if !self.raw_mode {

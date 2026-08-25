@@ -111,6 +111,131 @@ removed, the discriminating test has to be the unit test on the primary
 
 ---
 
+---
+
+## Closeout (2026-08-24) — defect-remediation pass
+
+A design review of `editors/` produced 21 Critical/Major findings plus ~15
+smaller ones; all are fixed. Working through them surfaced roughly the same
+number again that no finding list contained, and two things are worth
+recording.
+
+**1. The findings were symptoms of two design seams, not 36 separate bugs.**
+
+*`Position::column` is a byte offset* — which the renderer also assumes — but
+nothing enforced that a given offset began a character. `clamp_column`
+normalised with a bare `min()`, which lowers an out-of-range column and
+otherwise leaves it alone, so a mid-character offset stayed representable for
+the next slice to panic on. The fix is two invariants, each at one place: the
+cursor snaps in `clamp_column`, and character-mode range endpoints snap where
+they are sliced. That converts a class of crashes into off-by-N errors, which
+is why each arithmetic site still needed its own test.
+
+*Undo was a per-call-site obligation* that ~19 commands did not meet. It fails
+worse than "no undo": `apply_inverse` rebuilds by position and length without
+checking what is there, so an unrecorded mutation makes the *next* `u` pop an
+unrelated change and destroy whatever now occupies its position. `ed` has the
+opposite property by construction — one private `save_undo`, called by every
+mutator — and vi now approximates it with `splice_around`, which snapshots the
+affected line run rather than asking each caller to describe its own edit.
+
+**2. Three items previously ticked CONFORM were not conforming.**
+
+#X7 ("`global`/`v` two-pass ... reversing for deletes. Conforms.") was the
+defect. Reversing was keyed on the command text starting with `d`, which misses
+`.d`, `.,.+1d`, `j`, `m` and everything else that changes the line count; the
+loop then addressed unrelated lines and deleted them. `:g/X/.d` on `a X b X c`
+produced `a b X`. Marks are now followed through a `Buffer` edit journal, so
+relocating commands work too.
+
+#V19's own fix note ("no operator recorded undo") understated the scope: the ex
+commands recorded nothing at all — `editor/executor.rs` held no reference to
+undo — and `cc`, `o`, `O`, `x` and `X` recorded something *wrong*, which is the
+more dangerous case.
+
+#V18 fixed `:r !cmd` dropping raw mode but introduced the inverse defect:
+`disable_raw_mode` reports success whether or not it had anything to do, so
+`.is_ok()` always said "it was raw" and ex — which never is — was switched
+*into* raw mode and stopped receiving whole lines.
+
+### Newly found while fixing (none were in a finding list)
+
+| New | Sev | Summary |
+|---|---|---|
+| — | **Critical** | SIGHUP/SIGTERM never preserved the buffer: handlers installed with `libc::signal`, whose BSD semantics include `SA_RESTART`, so the flag was never observed. Both editors affected |
+| — | **Critical** | `:range!cmd` deadlocked above the pipe buffer — all input written before any output was read |
+| — | **Critical** | `plib::regex::captures_at` passed no `REG_NOTBOL`, so `^` re-anchored at every restart of a global substitute: `s/^/> /g` gave `> a> b> c> `. Affected `ed`, `vi` and `pax` |
+| — | Major | `:m`/`:t` parsed their destination as a bare integer: `:1m$` answered "invalid line number" |
+| — | Major | ex began on line 1; POSIX begins on the last line, so every defaulted address acted on the wrong end of the file |
+| — | Major | a parameterized cursor key (`ESC [ 1 ; 5 C`) leaked `5C` into command mode, changing to end of line |
+| — | Major | `dw` on a line's last word did nothing, and otherwise joined lines |
+| — | Major | `X` at column 0 joined lines; POSIX makes it an error |
+| — | Major | `:set ai number` was rejected as one option name, breaking ordinary `.exrc` lines |
+| — | Major | `#` expanded to the current file, not the alternate |
+| — | Major | Ctrl-^ discarded a modified buffer with no warning |
+| — | Minor | `3rZ` rewrote one character three times |
+| — | Minor | `L` with a count underflowed; `Y` on an empty buffer underflowed |
+| — | Minor | `ed`'s `n` used ex's six-column padding instead of number-tab-line |
+| — | Minor | `^` on an all-blank line went to column 0, which is where `0` goes |
+
+**3. One fix unmasked a latent defect rather than causing one.** Gating the
+raw-mode restore (above) removed an *accidental* early exit: the unconditional
+`enable_raw_mode()` failed on a pipe, and in silent mode that error made ex
+quit. What it had been hiding is that the "Press ENTER or type command to
+continue" pause after `:!command` runs in ex too, where there is no screen to
+redraw and no user -- and the byte it reads comes off the **command stream**.
+Given `!true` followed by `q!` it swallowed the `q`, leaving a bare `!`: the
+interactive shell, which inherits the editor's stdin, competes for the
+controlling terminal and stops. From a terminal that reads as a hang with no
+diagnostic and no way back; under a pipe the same input merely misexecutes.
+
+The pause and the screen clear are now gated on the terminal having been in
+raw mode, which is true exactly in visual mode on a real terminal, and
+`Shell::interactive` refuses outright when stdin is not a terminal -- an
+interactive shell with nothing to be interactive with can only hang. `:w
+!command` carried all three defects and is fixed identically.
+
+Worth keeping in mind for the next pass: a test suite that only ever runs
+under pipes cannot see this class of bug, and an error that happens to abort
+the session will hide whatever comes after it.
+
+### Standing regression nets added
+
+Three, each of which found defects the explicit tests did not:
+
+- **`ed_survives`** — ed writes diagnostics to stdout and never to stderr, so
+  "exit in {0,1} and empty stderr" is a complete panic detector. Applied to a
+  curated malformed-command corpus and a generated sweep; found the `m`
+  off-by-one.
+- **vi key fuzz** — generated key sequences over multi-byte, tab-indented,
+  blank and empty buffers, asserting no panic and an on-boundary cursor. Run in
+  a debug build it also exercises the char-boundary `debug_assert`s, making it a
+  check on the invariant rather than only on crashes. Found the `L`, `Y` and
+  text-object defects. Clean at 200_000 cases.
+- **undo sweep** — for every command: if the buffer changed, one `u` must put
+  it back exactly. Found the `x`/`X`, `:j` and `2~` cases. Clean at 80_000.
+
+Behaviour was cross-checked against `/bin/ed` and `/usr/bin/ex` throughout:
+70 mark cases, 40 ex command forms and 15 ed forms agree. The remaining
+disagreements are deliberate: `m` with a destination equal to the end of the
+moved range is an error here (POSIX and BSD) rather than GNU's silent no-op,
+and ed rejects `x` rather than shipping a third meaning for it.
+
+### Open
+
+- `ex`'s `number` output uses a `<tab>` where the reference uses blanks. The
+  exact field width POSIX intends is unclear, so it is left alone rather than
+  guessed at; ed's, which the spec states explicitly, is fixed.
+- `}`/`{` skip past the blank line to the following paragraph. Whether the
+  motion should stop *on* the separating blank line is genuinely ambiguous
+  between POSIX's wording and historical practice, and the exclusive-motion
+  adjustment rules that decide `d}` depend on it.
+- Insert counts (`3iab<ESC>` -> `ababab`) are still silent no-ops:
+  `execute_command` has no `i`/`a`/`o`/`O`/`R` arms, so `InsertState::count` is
+  always 1 and the replay code in `mode/insert.rs` is unreachable.
+- `d/pat` no longer mis-parses into stray commands, but is not implemented
+  either; it needs a parser state and an ex round-trip into a pending operator.
+
 ## Cross-cutting themes
 
 Four patterns recur across all three editors. Fixing them at the shared layer

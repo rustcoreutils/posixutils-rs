@@ -33,6 +33,17 @@ pub struct Change {
     pub linewise: bool,
     /// Number of lines affected.
     pub line_count: usize,
+    /// For [`ChangeKind::ReplaceLines`]: the run of whole lines as it stood
+    /// before the change.
+    ///
+    /// Kept as a vector rather than folded into `deleted_text`, because
+    /// joining on newlines cannot express an *empty* run: `[].join("\n")` is
+    /// `""`, which splits back into one empty line.  Every pure insertion --
+    /// `:t`, `:pu`, `p` -- has an empty old run, and every pure deletion an
+    /// empty new one, so the joined form was off by a line for all of them.
+    pub old_lines: Vec<String>,
+    /// For [`ChangeKind::ReplaceLines`]: the run that replaced it.
+    pub new_lines: Vec<String>,
 }
 
 /// Types of changes.
@@ -71,6 +82,8 @@ impl Change {
             inserted_text: Some(text),
             linewise,
             line_count,
+            old_lines: Vec::new(),
+            new_lines: Vec::new(),
         }
     }
 
@@ -84,6 +97,8 @@ impl Change {
             inserted_text: None,
             linewise,
             line_count,
+            old_lines: Vec::new(),
+            new_lines: Vec::new(),
         }
     }
 
@@ -97,6 +112,8 @@ impl Change {
             inserted_text: Some(new_text),
             linewise,
             line_count,
+            old_lines: Vec::new(),
+            new_lines: Vec::new(),
         }
     }
 
@@ -108,10 +125,12 @@ impl Change {
         Self {
             kind: ChangeKind::ReplaceLines,
             position: pos,
-            deleted_text: Some(old_lines.join("\n")),
-            inserted_text: Some(new_lines.join("\n")),
+            deleted_text: None,
+            inserted_text: None,
             linewise: true,
-            line_count: old_lines.len().max(1),
+            line_count: old_lines.len(),
+            old_lines: old_lines.to_vec(),
+            new_lines: new_lines.to_vec(),
         }
     }
 }
@@ -456,17 +475,13 @@ impl UndoManager {
                 }
             }
             ChangeKind::ReplaceLines => {
-                let old_count = change
-                    .deleted_text
-                    .as_ref()
-                    .map(|t| t.split('\n').count())
-                    .unwrap_or(0);
-                let new_lines: Vec<&str> = change
-                    .inserted_text
-                    .as_deref()
-                    .map(|t| t.split('\n').collect())
-                    .unwrap_or_default();
-                Self::splice_lines(buffer, change.position.line, old_count, &new_lines);
+                let new_lines: Vec<&str> = change.new_lines.iter().map(String::as_str).collect();
+                Self::splice_lines(
+                    buffer,
+                    change.position.line,
+                    change.old_lines.len(),
+                    &new_lines,
+                );
             }
             _ => {}
         }
@@ -543,17 +558,13 @@ impl UndoManager {
             }
             ChangeKind::ReplaceLines => {
                 // Undo = put the original run back in place of the new one.
-                let new_count = change
-                    .inserted_text
-                    .as_ref()
-                    .map(|t| t.split('\n').count())
-                    .unwrap_or(0);
-                let old_lines: Vec<&str> = change
-                    .deleted_text
-                    .as_deref()
-                    .map(|t| t.split('\n').collect())
-                    .unwrap_or_default();
-                Self::splice_lines(buffer, change.position.line, new_count, &old_lines);
+                let old_lines: Vec<&str> = change.old_lines.iter().map(String::as_str).collect();
+                Self::splice_lines(
+                    buffer,
+                    change.position.line,
+                    change.new_lines.len(),
+                    &old_lines,
+                );
             }
             _ => {}
         }

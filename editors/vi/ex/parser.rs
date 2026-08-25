@@ -9,7 +9,7 @@
 
 //! Ex command parser.
 
-use super::address::{parse_address_range, Address, AddressRange};
+use super::address::{parse_address_range, parse_address_with_offset, Address, AddressRange};
 use super::command::{ExCommand, MapMode, SubstituteFlags};
 use crate::error::{Result, ViError};
 
@@ -146,13 +146,13 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
 
         // Copy command
         "co" | "copy" | "t" => {
-            let dest = parse_line_number(args)?;
+            let dest = parse_destination(args)?;
             Ok(ExCommand::Copy { range, dest })
         }
 
         // Move command
         "m" | "move" => {
-            let dest = parse_line_number(args)?;
+            let dest = parse_destination(args)?;
             Ok(ExCommand::Move { range, dest })
         }
 
@@ -644,14 +644,16 @@ fn parse_global(range: AddressRange, args: &str, invert: bool) -> Result<ExComma
         ));
     }
 
+    // The delimiter is any character, so step over it by its encoded width --
+    // `[1..]` slices through a multi-byte delimiter and panics.
     let delim = args.chars().next().unwrap();
-    let rest = &args[1..];
+    let rest = &args[delim.len_utf8()..];
 
     // Find end of pattern
     let pattern_end = rest.find(delim).unwrap_or(rest.len());
     let pattern = rest[..pattern_end].to_string();
     let command = if pattern_end < rest.len() {
-        rest[pattern_end + 1..].to_string()
+        rest[pattern_end + delim.len_utf8()..].to_string()
     } else {
         "p".to_string() // Default command is print
     };
@@ -696,11 +698,26 @@ fn parse_optional_count(args: &str) -> Option<usize> {
     args.trim().parse().ok()
 }
 
-/// Parse a line number.
-fn parse_line_number(args: &str) -> Result<usize> {
-    args.trim()
-        .parse()
-        .map_err(|_| ViError::InvalidAddress("invalid line number".to_string()))
+/// Parse the destination of `:copy`/`:move`.
+///
+/// POSIX (ex, `copy`/`move`) gives it as an *address*, so `$`, `.`, `.+2`, a
+/// mark and a search are all valid.  Parsing it as a bare integer rejected
+/// everything but a decimal literal -- `:1m$` answered "invalid line number".
+/// It stays unresolved until execution, since `$` depends on the buffer.
+fn parse_destination(args: &str) -> Result<Address> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err(ViError::InvalidAddress(
+            "missing destination address".to_string(),
+        ));
+    }
+    match parse_address_with_offset(trimmed) {
+        Some((addr, rest)) if rest.trim().is_empty() => Ok(addr),
+        _ => Err(ViError::InvalidAddress(format!(
+            "invalid destination: {}",
+            trimmed
+        ))),
+    }
 }
 
 /// Split a leading `+command` argument from `args`.
@@ -933,6 +950,23 @@ mod tests {
             assert_eq!(args, "number");
         } else {
             panic!("Expected Set command");
+        }
+    }
+
+    /// `g` may be delimited by any character, including a multi-byte one.
+    /// `parse_substitute` already steps by `len_utf8()`; `parse_global` used a
+    /// bare `[1..]`, which slices through a multi-byte delimiter and panics.
+    #[test]
+    fn test_parse_global_multibyte_delimiter() {
+        let cmd = parse_ex_command("g\u{b5}foo\u{b5}d").unwrap();
+        if let ExCommand::Global {
+            pattern, command, ..
+        } = cmd
+        {
+            assert_eq!(pattern, "foo");
+            assert_eq!(command, "d");
+        } else {
+            panic!("Expected Global command");
         }
     }
 }

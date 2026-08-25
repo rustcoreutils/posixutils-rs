@@ -446,6 +446,12 @@ impl Editor {
         self.is_error
     }
 
+    /// Whether the editor has been asked to exit (for testing). A failing ex
+    /// command must leave this `false`, or the unsaved buffer goes with it.
+    pub fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
     /// Process a single key (public for testing).
     pub fn process_key(&mut self, key: Key) -> Result<()> {
         self.handle_key(key)
@@ -488,16 +494,32 @@ impl Editor {
     /// Open a file for editing.
     pub fn open(&mut self, path: &str) -> Result<()> {
         let path_buf = PathBuf::from(path);
-        self.buffer = read_file(&path_buf)?;
-        self.files.set_current_file(Some(path_buf.clone()));
-        // Update shell executor with current/alternate files
+        // Read before anything is replaced, so a failure leaves the editor as
+        // it was rather than half-switched to a file it could not open.
+        let new_buffer = read_file(&path_buf)?;
+
+        // Capture the outgoing file *before* `set_current_file` replaces it:
+        // reading it afterwards gave the file being opened, so `#` in a shell
+        // command expanded to the same thing as `%`.
         let old_current = self.shell_current_file();
+
+        self.buffer = new_buffer;
+        self.files.set_current_file(Some(path_buf.clone()));
         self.shell
             .set_current_file(Some(path_buf.to_string_lossy().into_owned()));
         if old_current.is_some() {
             self.shell.set_alternate_file(old_current);
         }
-        self.buffer.set_line(1);
+        // POSIX: ex starts on the *last* line of the edit buffer, vi on the
+        // first.  Starting ex on line 1 made every command with a relative or
+        // defaulted address act on the wrong end of the file -- `:1t.` copied
+        // after line 1 rather than after the last line.
+        let start_line = if self.ex_standalone_mode {
+            self.buffer.line_count().max(1)
+        } else {
+            1
+        };
+        self.buffer.set_line(start_line);
         self.buffer.move_to_first_non_blank();
         self.undo.clear();
         Ok(())
@@ -899,10 +921,16 @@ impl Editor {
                 return Ok(());
             }
             Key::Ctrl('^') => {
-                // Edit alternate file
-                if let Some(alt) = self.files.alternate_file() {
+                // Edit the alternate file. This discards the buffer, so it
+                // needs the same warning `:e` gives -- it used to open
+                // unconditionally and the unsaved work went with it.
+                if self.buffer.is_modified() {
+                    self.set_error("No write since last change");
+                } else if let Some(alt) = self.files.alternate_file() {
                     let path = alt.to_string_lossy().to_string();
-                    let _ = self.open(&path);
+                    if let Err(e) = self.open(&path) {
+                        self.set_error(&e.to_string());
+                    }
                 } else {
                     self.set_error("No alternate file");
                 }
@@ -993,12 +1021,27 @@ impl Editor {
 
     /// Enter insert mode.
     fn enter_insert(&mut self, kind: InsertKind) {
-        if let Ok(mut state) = enter_insert_mode(&mut self.buffer, kind, &self.options) {
-            // An insert session is one command. When an operator opened a group
-            // already (c/s/S/C), this call is a no-op and the operator's removal
-            // and the typed text end up in the same group, so one `u` reverses
-            // the whole change.
-            self.undo.begin_group();
+        // An insert session is one command. When an operator opened a group
+        // already (c/s/S/C), this call is a no-op and the operator's removal
+        // and the typed text end up in the same group, so one `u` reverses
+        // the whole change.
+        self.undo.begin_group();
+
+        // `o` and `O` create their line inside `enter_insert_mode`, which used
+        // to run before the group existed -- so `oZ` then `u` removed the `Z`
+        // and left the blank line behind.  Record that line as part of the
+        // session.
+        let opens_a_line = matches!(kind, InsertKind::OpenBelow | InsertKind::OpenAbove);
+        let line = self.buffer.cursor().line;
+        let entered = if opens_a_line {
+            self.splice_around(line, line, |ed| {
+                enter_insert_mode(&mut ed.buffer, kind, &ed.options)
+            })
+        } else {
+            enter_insert_mode(&mut self.buffer, kind, &self.options)
+        };
+
+        if let Ok(mut state) = entered {
             // Carry the terminal's erase/kill characters and the previous
             // insertion into the session (#V12, #V15).
             state.erase_char = self.terminal.erase_char();
@@ -1006,6 +1049,10 @@ impl Editor {
             state.previous_insert = self.previous_insert.clone();
             self.mode = Mode::Insert(kind);
             self.insert_state = Some(state);
+        } else {
+            // Nothing will close the group otherwise, and a leaked group
+            // swallows every later change into the same `u`.
+            self.undo.end_group();
         }
     }
 
@@ -1066,7 +1113,14 @@ impl Editor {
             Key::Enter => {
                 let input = std::mem::take(&mut self.ex_input);
                 self.mode = Mode::Command;
-                self.execute_ex_input(&input)?;
+                // A failing ex command reports on the status line; it must not
+                // propagate. `handle_key` unwinds all the way to `run_editor`,
+                // which prints and exits -- so letting `:q` on a modified
+                // buffer return `FileModified` here quit vi and discarded the
+                // very work the warning exists to protect.
+                if let Err(e) = self.execute_ex_input(&input) {
+                    self.set_error(&e.to_string());
+                }
             }
             Key::Escape => {
                 self.ex_input.clear();
@@ -1325,11 +1379,17 @@ impl Editor {
                 self.buffer.move_to_first_non_blank();
             }
             'L' => {
-                // Move to bottom of screen
+                // Move to bottom of screen, `count` lines up from it.
                 let size = self.terminal.size();
                 let top = self.screen.top_line();
-                let bottom = top + size.rows as usize - 2 - count + 1; // -2 for status line
-                let target = bottom.min(self.buffer.line_count());
+                // -2 for the status line.  Saturating: a count larger than the
+                // window used to underflow, which aborts in debug and wraps to
+                // a huge line number in release.
+                let bottom = top + (size.rows as usize).saturating_sub(2);
+                let target = bottom
+                    .saturating_sub(count.saturating_sub(1))
+                    .max(top)
+                    .min(self.buffer.line_count());
                 self.buffer.set_line(target);
                 self.buffer.move_to_first_non_blank();
             }
@@ -1384,36 +1444,56 @@ impl Editor {
             }
             // Delete commands
             'x' => {
-                let pos = self.buffer.cursor();
-                let mut deleted = String::new();
-                for _ in 0..count {
-                    if let Some(c) = self.buffer.delete_char() {
-                        deleted.push(c);
+                // Snapshot the line rather than record a flat delete: with a
+                // count that runs off the end of the line the cursor is
+                // clamped part-way through the loop, so the recorded position
+                // no longer described the text and `u` put it back displaced.
+                let line = self.buffer.cursor().line;
+                let register = cmd.register;
+                self.splice_around(line, line, |ed| {
+                    let mut deleted = String::new();
+                    for _ in 0..count {
+                        if let Some(c) = ed.buffer.delete_char() {
+                            deleted.push(c);
+                        }
                     }
-                }
-                if !deleted.is_empty() {
-                    self.undo.record_delete(pos, &deleted, false);
-                    self.registers
-                        .set_small_delete(RegisterContent::new(deleted, false));
-                }
+                    if !deleted.is_empty() {
+                        // Through the register policy, not straight to the
+                        // small-delete slot: writing there directly is what
+                        // made `"qx` ignore the register the user named.
+                        ed.registers
+                            .delete(register, RegisterContent::new(deleted, false), true);
+                    }
+                    Ok(())
+                })?;
             }
             'X' => {
-                let mut deleted = String::new();
-                let mut start_pos = self.buffer.cursor();
-                for _ in 0..count {
-                    if let Some(c) = self.buffer.delete_char_before() {
-                        deleted.push(c);
+                // POSIX (vi, "Delete Character Before Cursor"): "If there are
+                // no characters before the cursor in the line, it shall be an
+                // error."  It used `delete_char_before`, which joins with the
+                // previous line -- right for an insert-mode backspace, wrong
+                // here -- so `X` at column 0 silently merged two lines and no
+                // within-line undo record could express it.
+                let line = self.buffer.cursor().line;
+                let register = cmd.register;
+                self.splice_around(line, line, |ed| {
+                    let mut deleted = String::new();
+                    for _ in 0..count {
+                        if ed.buffer.cursor().column == 0 {
+                            break;
+                        }
+                        if let Some(c) = ed.buffer.delete_char_before() {
+                            deleted.push(c);
+                        }
                     }
-                }
-                if !deleted.is_empty() {
-                    // Reverse the deleted string since we accumulated in reverse order
-                    let del_text: String = deleted.chars().rev().collect();
-                    // Calculate the starting position for undo
-                    start_pos.column = start_pos.column.saturating_sub(del_text.len());
-                    self.undo.record_delete(start_pos, &del_text, false);
-                    self.registers
-                        .set_small_delete(RegisterContent::new(del_text, false));
-                }
+                    if !deleted.is_empty() {
+                        // Accumulated in reverse order.
+                        let del_text: String = deleted.chars().rev().collect();
+                        ed.registers
+                            .delete(register, RegisterContent::new(del_text, false), true);
+                    }
+                    Ok(())
+                })?;
             }
             'd' => {
                 self.execute_delete(cmd)?;
@@ -1434,10 +1514,10 @@ impl Editor {
             }
             // Put commands
             'p' => {
-                self.execute_put(false, count)?;
+                self.execute_put(false, count, cmd.register)?;
             }
             'P' => {
-                self.execute_put(true, count)?;
+                self.execute_put(true, count, cmd.register)?;
             }
             // Undo
             // POSIX: `u` reverses the last command that modified the buffer,
@@ -1533,24 +1613,61 @@ impl Editor {
             // Replace char
             'r' => {
                 if let Some(c) = cmd.char_arg {
-                    for _ in 0..count {
-                        self.replace_char(c);
+                    // `count` *successive* characters, each replaced by `c`.
+                    // Calling the single-character replace repeatedly without
+                    // advancing rewrote the same character every time, so
+                    // `3rZ` changed one character rather than three.
+                    let line = self.buffer.cursor().line;
+                    let start = self.buffer.cursor().column;
+                    let remaining = self
+                        .buffer
+                        .line(line)
+                        .map(|l| l.content()[start..].chars().count())
+                        .unwrap_or(0);
+                    // POSIX: a count larger than the characters left on the
+                    // line is an error, and the line is unchanged.
+                    if count > remaining {
+                        self.set_error("Not enough characters on the line");
+                    } else {
+                        self.undo.begin_group();
+                        for i in 0..count {
+                            self.replace_char(c);
+                            if i + 1 < count {
+                                let col = self.buffer.cursor().column;
+                                let next =
+                                    self.buffer.line(line).and_then(|l| l.next_char_offset(col));
+                                match next {
+                                    Some(n) => self.buffer.set_column(n),
+                                    None => break,
+                                }
+                            }
+                        }
+                        self.undo.end_group();
                     }
                 }
             }
             // Toggle case
             '~' => {
+                // One command, one undo: without the group each toggled
+                // character was its own change, so `2~` needed two `u`s.
+                self.undo.begin_group();
                 for _ in 0..count {
                     self.toggle_case();
                 }
+                self.undo.end_group();
             }
             // Delete to end of line
             'D' => {
-                let deleted = self.buffer.delete_to_end_of_line();
-                if !deleted.is_empty() {
-                    self.registers
-                        .set_small_delete(RegisterContent::new(deleted, false));
-                }
+                let line = self.buffer.cursor().line;
+                let register = cmd.register;
+                self.splice_around(line, line, |ed| {
+                    let deleted = ed.buffer.delete_to_end_of_line();
+                    if !deleted.is_empty() {
+                        ed.registers
+                            .delete(register, RegisterContent::new(deleted, false), true);
+                    }
+                    Ok(())
+                })?;
             }
             // Shift left/right operators
             '>' | '<' => {
@@ -1603,13 +1720,22 @@ impl Editor {
             }
             // Go to column
             '|' => {
-                if let Ok(res) = motion::move_to_column(&self.buffer, count) {
+                if let Ok(res) = motion::move_to_column(&self.buffer, count, self.options.tabstop) {
                     self.buffer.set_cursor(res.position);
                 }
             }
             // Yank line (alias for yy)
             'Y' => {
-                self.execute_yank_lines(count)?;
+                // `Y` is `yy`.  It had its own implementation that wrote
+                // straight to the unnamed register, so `"aY` and `"ayy`
+                // disagreed; build the equivalent command instead.
+                let mut yank_cmd = crate::command::ParsedCommand::new('y')
+                    .with_count(count, cmd.has_count)
+                    .with_motion(crate::command::MotionCommand::new('y').with_count(count));
+                if let Some(r) = cmd.register {
+                    yank_cmd = yank_cmd.with_register(r);
+                }
+                self.execute_yank(&yank_cmd)?;
             }
             // Repeat substitution
             '&' => {
@@ -1675,6 +1801,10 @@ impl Editor {
                                 false,
                             );
                         }
+                        // `enter_insert` opened a group and this path never
+                        // closed it, so every later change joined that stale
+                        // group and one `u` reversed the rest of the session.
+                        self.undo.end_group();
                     }
                     // Clamp cursor to valid position
                     let pos = self.buffer.cursor();
@@ -1691,7 +1821,10 @@ impl Editor {
                     if count > 1 {
                         cmd.count = count;
                         if let Some(ref mut mot) = cmd.motion {
-                            mot.count = 1; // Reset motion count when using new count
+                            // The motion now carries the full count, so the
+                            // repeat has to overwrite it rather than reset it
+                            // to 1 and rely on cmd.count.
+                            mot.count = count;
                         }
                     }
                     // Execute the saved command (but don't save it again)
@@ -1788,6 +1921,51 @@ impl Editor {
         Ok(())
     }
 
+    /// Run `f`, recording whatever it did to the run of lines starting at
+    /// `first` as a single undoable change.
+    ///
+    /// `apply_inverse` rebuilds by position and length without checking what
+    /// is there, so a mutation that records nothing does not merely fail to
+    /// undo: the next `u` pops an unrelated older change and destroys whatever
+    /// now occupies its position (audit #V19).  Snapshotting the affected run
+    /// before and after means the caller does not have to describe its edit at
+    /// all, which is what makes this usable for the commands whose hand-built
+    /// records were wrong or missing -- `:m`, `:t`, `:j`, `:pu`, the shifts,
+    /// `p`/`P`, `r` and `~`.
+    ///
+    /// `last` is the last line the edit is expected to touch; pass a
+    /// contiguous superset when the affected region is not contiguous, as
+    /// `:m` needs.
+    pub(super) fn splice_around<T>(
+        &mut self,
+        first: usize,
+        last: usize,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let first = first.max(1);
+        let snapshot = |ed: &Self, upto: usize| -> Vec<String> {
+            (first..=upto)
+                .filter_map(|n| ed.buffer.line(n).map(|l| l.content().to_string()))
+                .collect()
+        };
+
+        let before_total = self.buffer.line_count();
+        let old = snapshot(self, last.min(before_total));
+
+        let result = f(self)?;
+
+        // The run may have grown or shrunk; follow the change in line count.
+        let delta = self.buffer.line_count() as isize - before_total as isize;
+        let new_last = (last as isize + delta).max(first as isize - 1) as usize;
+        let new = snapshot(self, new_last.min(self.buffer.line_count()));
+
+        if old != new {
+            self.undo
+                .record_replace_lines(Position::new(first, 0), &old, &new);
+        }
+        Ok(result)
+    }
+
     /// Record what an operator removed, so `u` can put it back.
     ///
     /// Every operator that removes text must call this: `apply_inverse` rebuilds
@@ -1822,8 +2000,8 @@ impl Editor {
             } else {
                 // d + motion
                 let start = self.buffer.cursor();
-                if let Some(end) = self.execute_motion_get_pos(mot) {
-                    let range = Range::new(start, end, BufferMode::Character);
+                let res = self.execute_motion(mot);
+                if let Some(range) = self.operator_region(start, mot, res.as_ref()) {
                     let result =
                         delete(&mut self.buffer, range, &mut self.registers, cmd.register)?;
                     self.record_removal(range, &result);
@@ -1851,8 +2029,8 @@ impl Editor {
             } else {
                 // y + motion
                 let start = self.buffer.cursor();
-                if let Some(end) = self.execute_motion_get_pos(mot) {
-                    let range = Range::new(start, end, BufferMode::Character);
+                let res = self.execute_motion(mot);
+                if let Some(range) = self.operator_region(start, mot, res.as_ref()) {
                     let _ = yank(&self.buffer, range, &mut self.registers, cmd.register);
                 }
             }
@@ -1872,18 +2050,34 @@ impl Editor {
             let end_line = (cursor.line + cmd.count - 1).min(self.buffer.line_count());
             Range::lines(cursor, Position::new(end_line, 0))
         } else {
-            let line_len = self
+            // `s` takes a count of *characters*.  Walk that many character
+            // boundaries forward rather than adding the count to a byte
+            // offset and clamping it with a character count -- two different
+            // units, neither of which was the byte offset a Range needs.
+            let end_col = self
                 .buffer
                 .line(cursor.line)
-                .map(|l| l.content().chars().count())
-                .unwrap_or(0);
-            let end_col = (cursor.column + cmd.count).min(line_len);
+                .map(|l| {
+                    let mut col = cursor.column;
+                    for _ in 0..cmd.count {
+                        match l.next_char_offset(col) {
+                            Some(next) => col = next,
+                            None => break,
+                        }
+                    }
+                    col
+                })
+                .unwrap_or(cursor.column);
             Range::chars(cursor, Position::new(cursor.line, end_col))
         };
 
         self.undo.begin_group();
-        let result = change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
-        self.record_removal(range, &result);
+        // Snapshot rather than `record_removal`, for the reason given in the
+        // `cc` branch: `S` empties its lines instead of removing them.
+        let register = cmd.register;
+        let result = self.splice_around(range.start.line, range.end.line, |ed| {
+            change(&mut ed.buffer, range, &mut ed.registers, register)
+        })?;
         self.buffer.set_cursor(result.cursor);
         if result.enter_insert {
             self.enter_insert(if cmd.command == 'S' {
@@ -1909,8 +2103,14 @@ impl Editor {
                 // The operator and the insert session it opens are one command,
                 // so a single `u` reverses both.
                 self.undo.begin_group();
-                let result = change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
-                self.record_removal(range, &result);
+                // A snapshot, not `record_removal`: `change_lines` *empties*
+                // the first line rather than removing it, so recording a
+                // linewise delete made `u` re-insert the original lines and
+                // leave the emptied one behind as a stray blank.
+                let register = cmd.register;
+                let result = self.splice_around(start_line, end_line, |ed| {
+                    change(&mut ed.buffer, range, &mut ed.registers, register)
+                })?;
                 self.buffer.set_cursor(result.cursor);
                 if result.enter_insert {
                     self.enter_insert(InsertKind::Change);
@@ -1918,37 +2118,34 @@ impl Editor {
             } else {
                 // c + motion
                 let start = self.buffer.cursor();
-                // Special case: cw and cW should behave like ce and cE
-                // (change to end of word, not beginning of next word)
-                // This is standard POSIX vi behavior.
-                let (end, needs_inclusive) = if mot.motion == 'w' {
-                    (
-                        motion::move_word_end(&self.buffer, mot.count)
-                            .ok()
-                            .map(|r| r.position),
-                        true,
-                    )
-                } else if mot.motion == 'W' {
-                    (
-                        motion::move_bigword_end(&self.buffer, mot.count)
-                            .ok()
-                            .map(|r| r.position),
-                        true,
-                    )
+                // POSIX (vi, "Change"): "if the motion command is `w` or `W`
+                // and the cursor is on a non-<blank>", `cw` behaves as `ce`,
+                // so the blanks after the word survive.  The non-blank
+                // precondition was missing, so `cw` on a blank wrongly
+                // consumed to the end of the *next* word.
+                let on_non_blank = self
+                    .buffer
+                    .char_at_cursor()
+                    .is_some_and(|c| !c.is_whitespace());
+                let res = if on_non_blank && mot.motion == 'w' {
+                    motion::move_word_end(&self.buffer, mot.count).ok()
+                } else if on_non_blank && mot.motion == 'W' {
+                    motion::move_bigword_end(&self.buffer, mot.count).ok()
                 } else {
-                    (self.execute_motion_get_pos(mot), false)
+                    self.execute_motion(mot)
                 };
-                if let Some(mut end) = end {
-                    // For inclusive motions like 'e', we need to add 1 to include
-                    // the character at the end position (since Range is exclusive on end)
-                    if needs_inclusive {
-                        end.column += 1;
-                    }
-                    let range = Range::new(start, end, BufferMode::Character);
+                if let Some(range) = self.operator_region(start, mot, res.as_ref()) {
                     self.undo.begin_group();
+                    // Snapshot, not `record_removal`: the region can now be
+                    // line-wise (`cj`, `c'a`, `cH`), and `change_lines` empties
+                    // the first line instead of removing it -- so a linewise
+                    // delete record makes `u` restore the lines *and* leave the
+                    // emptied one behind.  Same reasoning as the `cc` arm.
+                    let register = cmd.register;
                     let result =
-                        change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
-                    self.record_removal(range, &result);
+                        self.splice_around(range.start_line(), range.end_line(), |ed| {
+                            change(&mut ed.buffer, range, &mut ed.registers, register)
+                        })?;
                     // Use set_column_for_insert to allow cursor at end of line
                     // The change operation's cursor may be clamped, so use range.start
                     // which is where we want to insert (the start of the deleted text)
@@ -1965,6 +2162,35 @@ impl Editor {
 
     /// Execute shift command (> or <).
     fn execute_shift(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
+        // `shift_right`/`shift_left` report no affected text, so there is
+        // nothing for a hand-built undo record to describe -- snapshot the
+        // rewritten run instead.
+        //
+        // The span has to come from the *motion*, not from `count` lines below
+        // the cursor: `>j`, `>G` and `>k` all shift lines the cursor-relative
+        // span does not cover, and an undo record over the wrong lines leaves
+        // the buffer in a state that is neither before nor after the command.
+        let cursor = self.buffer.cursor().line;
+        let (first, last) = match &cmd.motion {
+            // `>>`/`<<`: `count` lines from the cursor.
+            Some(mot) if mot.motion == cmd.command => (
+                cursor,
+                (cursor + cmd.count.max(1) - 1).min(self.buffer.line_count()),
+            ),
+            Some(mot) => {
+                let end = self
+                    .execute_motion(mot)
+                    .map(|r| r.position.line)
+                    .unwrap_or(cursor);
+                (cursor.min(end), cursor.max(end))
+            }
+            None => (cursor, cursor),
+        };
+        let cmd = cmd.clone();
+        self.splice_around(first, last.max(first), |ed| ed.execute_shift_inner(&cmd))
+    }
+
+    fn execute_shift_inner(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
         use crate::command::{shift_left, shift_right};
 
         if let Some(mot) = &cmd.motion {
@@ -2031,9 +2257,40 @@ impl Editor {
 
     /// Execute a motion and return the resulting position.
     fn execute_motion_get_pos(&self, mot: &crate::command::MotionCommand) -> Option<Position> {
+        self.execute_motion(mot).map(|r| r.position)
+    }
+
+    /// Line number for a screen-relative motion (`H`, `M`, `L`).
+    ///
+    /// Extracted so the operator form dispatches the same way as the bare
+    /// form; `dH` and `dL` used to fall through to "no motion" and silently
+    /// do nothing.
+    fn screen_relative_line(&self, which: char, count: usize) -> usize {
+        let top = self.screen.top_line();
+        let rows = self.terminal.size().rows as usize;
+        let target = match which {
+            'H' => top + count.saturating_sub(1),
+            'M' => top + rows / 2,
+            // -2 for the status line, `count` lines up from the bottom.
+            _ => (top + rows.saturating_sub(2))
+                .saturating_sub(count.saturating_sub(1))
+                .max(top),
+        };
+        target.min(self.buffer.line_count()).max(1)
+    }
+
+    /// Run a motion, keeping its classification.
+    ///
+    /// The dispatcher used to discard everything but the position, so no
+    /// operator could tell a linewise motion from a characterwise one or an
+    /// inclusive one from an exclusive one.
+    fn execute_motion(
+        &self,
+        mot: &crate::command::MotionCommand,
+    ) -> Option<crate::command::motion::MotionResult> {
         use crate::command::motion;
 
-        let result = match mot.motion {
+        match mot.motion {
             'h' => motion::move_left(&self.buffer, mot.count).ok(),
             'l' => motion::move_right(&self.buffer, mot.count).ok(),
             'j' => motion::move_down(&self.buffer, mot.count).ok(),
@@ -2064,11 +2321,153 @@ impl Editor {
             '}' => motion::move_paragraph_forward(&self.buffer, mot.count).ok(),
             '(' => motion::move_sentence_backward(&self.buffer, mot.count).ok(),
             ')' => motion::move_sentence_forward(&self.buffer, mot.count).ok(),
-            '|' => motion::move_to_column(&self.buffer, mot.count).ok(),
+            '|' => motion::move_to_column(&self.buffer, mot.count, self.options.tabstop).ok(),
             '%' => motion::find_matching_bracket(&self.buffer).ok(),
+            // Screen-relative: line-wise, and the cursor settles on the first
+            // non-blank (POSIX, vi, "Move to Top/Middle/Bottom of Screen").
+            'H' | 'M' | 'L' => {
+                let line = self.screen_relative_line(mot.motion, mot.count);
+                Some(
+                    motion::MotionResult::pos(Position::new(line, 0))
+                        .linewise()
+                        .with_first_non_blank(),
+                )
+            }
+            // Line-wise, to the first non-blank (POSIX, vi, "Move to
+            // First Non-Blank on Next/Previous Line", and `_` for the
+            // current line).
+            '+' | '\r' | '\n' => {
+                let line = (self.buffer.cursor().line + mot.count).min(self.buffer.line_count());
+                Some(
+                    motion::MotionResult::pos(Position::new(line, 0))
+                        .linewise()
+                        .with_first_non_blank(),
+                )
+            }
+            '-' => {
+                let line = self.buffer.cursor().line.saturating_sub(mot.count).max(1);
+                Some(
+                    motion::MotionResult::pos(Position::new(line, 0))
+                        .linewise()
+                        .with_first_non_blank(),
+                )
+            }
+            '_' => {
+                let line = (self.buffer.cursor().line + mot.count.saturating_sub(1))
+                    .min(self.buffer.line_count());
+                Some(
+                    motion::MotionResult::pos(Position::new(line, 0))
+                        .linewise()
+                        .with_first_non_blank(),
+                )
+            }
+            // A mark: `'` addresses the line and is line-wise, `` ` ``
+            // addresses the character and is exclusive.
+            '\'' | '`' => {
+                let pos = mot.char_arg.and_then(|name| self.mark_position(name))?;
+                Some(if mot.motion == '\'' {
+                    motion::MotionResult::pos(Position::new(pos.line, 0))
+                        .linewise()
+                        .with_first_non_blank()
+                } else {
+                    motion::MotionResult::pos(pos)
+                })
+            }
             _ => None,
+        }
+    }
+
+    /// The line a `w`/`W` motion would have reached one step short of its
+    /// count -- i.e. the line holding the last word it moves over.
+    ///
+    /// The end-of-line rule keys off that line, not off the start line: with a
+    /// count the motion may cross several.
+    fn word_motion_line_before_last_step(
+        &self,
+        mot: &crate::command::MotionCommand,
+        start: Position,
+    ) -> usize {
+        use crate::command::motion;
+        if mot.count <= 1 {
+            return start.line;
+        }
+        let one_short = mot.count - 1;
+        let res = if mot.motion == 'W' {
+            motion::move_bigword_forward(&self.buffer, one_short)
+        } else {
+            motion::move_word_forward(&self.buffer, one_short)
         };
-        result.map(|r| r.position)
+        res.map(|r| r.position.line).unwrap_or(start.line)
+    }
+
+    /// The region an operator acts on, given where it started and how the
+    /// motion is classified.
+    ///
+    /// This is the single place that turns a motion into a range.  Every
+    /// operator used to build `BufferMode::Character` unconditionally, which
+    /// is why `dj` deleted part of two lines instead of both of them.
+    fn operator_region(
+        &self,
+        start: Position,
+        mot: &crate::command::MotionCommand,
+        res: Option<&crate::command::motion::MotionResult>,
+    ) -> Option<Range> {
+        use crate::command::motion::MotionClass;
+
+        // POSIX (vi, "Delete"): "If the motion command is `w` or `W`, and the
+        // last word on the line is being deleted, the region shall end at the
+        // last character of the line."  So `dw` never joins lines -- and on
+        // the last word of the last line it still deletes that word, even
+        // though `w` itself reports failure there because it cannot advance.
+        //
+        // The rule is about the *last word moved over*, not about the motion
+        // crossing a line at some point: with a count it may legitimately span
+        // lines, so `d3w` on "one two\nthree four" leaves "four".  Compare the
+        // landing line against where `count - 1` words would have ended: only
+        // if the final step crossed a line did the last word end one.
+        let word_runs_off_the_line = match res {
+            None => true,
+            Some(r) if r.class != MotionClass::Exclusive => false,
+            Some(r) => {
+                let prev = self.word_motion_line_before_last_step(mot, start);
+                r.position.line != prev || r.position.column <= start.column
+            }
+        };
+        if matches!(mot.motion, 'w' | 'W') && word_runs_off_the_line {
+            let clamp_line = self.word_motion_line_before_last_step(mot, start);
+            let end_col = self.buffer.line(clamp_line).map(|l| l.len()).unwrap_or(0);
+            let end = Position::new(clamp_line, end_col);
+            if end <= start {
+                return None;
+            }
+            return Some(Range::new(start, end, BufferMode::Character));
+        }
+
+        let res = res?;
+        Some(match res.class {
+            MotionClass::Linewise => Range::lines(start, res.position),
+            MotionClass::Inclusive => {
+                // Character ranges are end-exclusive, so "inclusive" means
+                // extending past whichever endpoint is the later one.  Going
+                // forwards that is the landing character; going backwards it
+                // is the character under the cursor, which a backward `d%`
+                // would otherwise leave behind.
+                let extend_past = |p: Position| {
+                    let col = self
+                        .buffer
+                        .line(p.line)
+                        .and_then(|l| l.next_char_offset(p.column))
+                        .unwrap_or(p.column);
+                    Position::new(p.line, col)
+                };
+                if res.position >= start {
+                    Range::new(start, extend_past(res.position), BufferMode::Character)
+                } else {
+                    Range::new(res.position, extend_past(start), BufferMode::Character)
+                }
+            }
+            MotionClass::Exclusive => Range::new(start, res.position, BufferMode::Character),
+        })
     }
 
     /// Execute filter operator (! with motion).
@@ -2105,13 +2504,29 @@ impl Editor {
     }
 
     /// Execute put command.
-    fn execute_put(&mut self, before: bool, count: usize) -> Result<()> {
+    fn execute_put(&mut self, before: bool, count: usize, register: Option<char>) -> Result<()> {
+        // Like the shifts, `put_after`/`put_before` report no affected text.
+        let line = self.buffer.cursor().line;
+        self.splice_around(line, line, |ed| {
+            ed.execute_put_inner(before, count, register)
+        })
+    }
+
+    fn execute_put_inner(
+        &mut self,
+        before: bool,
+        count: usize,
+        register: Option<char>,
+    ) -> Result<()> {
         use crate::command::{put_after, put_before};
 
+        // `put_after`/`put_before` already default to the unnamed register, so
+        // hardcoding `None` here was the only thing stopping `"ap` from
+        // reaching the register the user named.
         let result = if before {
-            put_before(&mut self.buffer, &self.registers, None, count)?
+            put_before(&mut self.buffer, &self.registers, register, count)?
         } else {
-            put_after(&mut self.buffer, &self.registers, None, count)?
+            put_after(&mut self.buffer, &self.registers, register, count)?
         };
 
         self.buffer.set_cursor(result.cursor);
@@ -2508,11 +2923,11 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
             ExCommand::Copy { range, dest } => {
-                self.execute_ex_copy(&range, dest)?;
+                self.execute_ex_copy(&range, &dest)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Move { range, dest } => {
-                self.execute_ex_move(&range, dest)?;
+                self.execute_ex_move(&range, &dest)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Read { range, file } => {
@@ -2840,7 +3255,10 @@ impl Editor {
     fn execute_shell_command(&mut self, command: &str) -> Result<()> {
         let warn = self.options.warn && self.buffer.is_modified();
 
-        // Temporarily restore terminal to cooked mode
+        // Temporarily restore terminal to cooked mode.  Remember whether it
+        // was raw to begin with: ex never is, and re-enabling unconditionally
+        // left it raw afterwards, where it stopped delivering whole lines.
+        let was_raw = self.terminal.is_raw_mode();
         self.terminal.disable_raw_mode()?;
 
         if warn {
@@ -2858,8 +3276,14 @@ impl Editor {
             self.shell.execute(command)
         };
 
-        // Wait for user to press Enter before returning
-        if result.is_ok() {
+        // Wait for the user to read the output before the screen is redrawn.
+        //
+        // Only in visual mode on a real terminal -- `was_raw` is true exactly
+        // then.  In ex there is no redraw to wait for and no user to prompt,
+        // and the read *consumes a byte of the command stream*: it swallowed
+        // the `q` of a following `q!`, leaving a bare `!`, which starts an
+        // interactive shell and hangs the session.
+        if was_raw && result.is_ok() {
             use std::io::{self, Read, Write};
             print!("\nPress ENTER or type command to continue");
             io::stdout().flush()?;
@@ -2867,11 +3291,13 @@ impl Editor {
             let _ = io::stdin().read(&mut buf);
         }
 
-        // Re-enable raw mode
-        self.terminal.enable_raw_mode()?;
-
-        // Force full screen redraw
-        self.terminal.clear_screen()?;
+        // Restore raw mode only if it was raw before.
+        if was_raw {
+            self.terminal.enable_raw_mode()?;
+            // Force full screen redraw. Only meaningful in visual mode; in ex
+            // it would write escape sequences into the command output.
+            self.terminal.clear_screen()?;
+        }
 
         match result {
             Ok(output) => {
@@ -2894,7 +3320,12 @@ impl Editor {
         // #V18: the child inherits our stdin now (#X23), so it must not find
         // the terminal in raw mode. `execute_shell_command` already brackets
         // its child this way; this path did not.
-        let was_raw = self.terminal.disable_raw_mode().is_ok();
+        // `disable_raw_mode` reports success whether or not it had anything
+        // to do, so `.is_ok()` was always true -- in ex, which is never raw,
+        // that switched the terminal *into* raw mode and it stopped
+        // delivering whole lines.
+        let was_raw = self.terminal.is_raw_mode();
+        self.terminal.disable_raw_mode()?;
         let output = self.shell.execute_capture(command);
         if was_raw {
             let _ = self.terminal.enable_raw_mode();
@@ -3005,14 +3436,19 @@ impl Editor {
             }
         }
 
-        // Temporarily restore terminal
+        // Temporarily restore terminal to cooked mode, remembering whether it
+        // was raw: ex never is, and re-enabling unconditionally left it raw.
+        let was_raw = self.terminal.is_raw_mode();
         self.terminal.disable_raw_mode()?;
         println!(); // Blank line before output
 
         let result = self.shell.write_to(command, &text);
 
-        // Wait for user to press Enter
-        if result.is_ok() {
+        // Wait for the user to read the output before the screen is redrawn --
+        // visual mode only.  In ex there is no redraw and no user, and the
+        // read consumes a byte of the *command stream*: see
+        // `execute_shell_command`.
+        if was_raw && result.is_ok() {
             use std::io::{self, Read, Write};
             print!("\nPress ENTER or type command to continue");
             io::stdout().flush()?;
@@ -3020,9 +3456,10 @@ impl Editor {
             let _ = io::stdin().read(&mut buf);
         }
 
-        // Re-enable raw mode
-        self.terminal.enable_raw_mode()?;
-        self.terminal.clear_screen()?;
+        if was_raw {
+            self.terminal.enable_raw_mode()?;
+            self.terminal.clear_screen()?;
+        }
 
         match result {
             Ok(output) => {
@@ -3147,21 +3584,51 @@ impl Editor {
             }
         }
 
-        // Execute command on each matching line
-        // Process in reverse for delete commands to preserve line numbers
-        let is_delete = command.trim().starts_with('d');
-        if is_delete {
-            matching_lines.reverse();
-        }
+        // Execute the command on each matching line.
+        //
+        // POSIX marks the matching lines first and then runs the command list
+        // against each, in order.  Every command that inserts, removes or
+        // relocates lines renumbers the marks not yet visited, so follow them
+        // through the buffer's edit journal rather than by line number.  This
+        // used to reverse the list when the command text began with 'd',
+        // which missed `.d`, `.,.+1d`, `j` and everything else that changes
+        // the line count -- the loop then addressed unrelated lines and
+        // deleted them.  Reversing is not an option in general anyway: it
+        // would reverse the output of a `p` and the resulting order of an `m`.
+        //
+        // A mark is `None` once the command that ran on an earlier match
+        // deleted its text.
+        let mut pending: Vec<Option<usize>> = matching_lines.into_iter().map(Some).collect();
 
-        for line_num in matching_lines {
-            // Move cursor to the line
+        // POSIX (ex, `undo`, 95443) makes a global a single command, so one
+        // `u` must reverse all of it -- not just the last line it touched.
+        self.undo.begin_group();
+        self.buffer.begin_line_tracking();
+        for idx in 0..pending.len() {
+            let Some(line_num) = pending[idx] else {
+                continue;
+            };
+            if line_num == 0 || line_num > self.buffer.line_count() {
+                continue;
+            }
+
             self.buffer.set_line(line_num);
-            // Execute the command
+            let mark = self.buffer.edit_log_len();
             if let Err(e) = self.execute_ex_input(command) {
                 self.set_error(&e.to_string());
             }
+
+            let edits: Vec<_> = self.buffer.edits_since(mark).to_vec();
+            if !edits.is_empty() {
+                for slot in &mut pending[idx + 1..] {
+                    for edit in &edits {
+                        *slot = slot.and_then(|line| edit.remap(line));
+                    }
+                }
+            }
         }
+        self.buffer.end_line_tracking();
+        self.undo.end_group();
 
         Ok(())
     }
@@ -3236,14 +3703,17 @@ impl Editor {
         Ok(())
     }
 
+    /// Where a mark points, if it is set.
+    fn mark_position(&self, name: char) -> Option<Position> {
+        if !name.is_ascii_lowercase() {
+            return None;
+        }
+        self.marks[(name as u8 - b'a') as usize]
+    }
+
     /// Go to a mark.
     fn goto_mark(&mut self, name: char, first_non_blank: bool) -> Result<()> {
-        let pos = if name.is_ascii_lowercase() {
-            let idx = (name as u8 - b'a') as usize;
-            self.marks[idx].ok_or(ViError::MarkNotSet(name))?
-        } else {
-            return Err(ViError::MarkNotSet(name));
-        };
+        let pos = self.mark_position(name).ok_or(ViError::MarkNotSet(name))?;
 
         self.buffer.set_cursor(pos);
         if first_non_blank {
@@ -3340,9 +3810,13 @@ impl Editor {
                                 .insert_line_after(line_num - 1 + i, Line::from(part.as_str()));
                         }
                         // Later lines in the range have shifted down by the
-                        // number of extra lines introduced here.
+                        // number of extra lines introduced here. Step over
+                        // every part we just wrote: landing back on the first
+                        // one re-substitutes it forever, growing the buffer
+                        // until the process is killed.
                         end += parts.len() - 1;
                         total_count += count;
+                        line_num += parts.len();
                         continue;
                     }
                     self.undo.record_replace(
@@ -3950,19 +4424,44 @@ impl Editor {
 
     /// Replace character at cursor (r command).
     fn replace_char(&mut self, c: char) {
+        let line = self.buffer.cursor().line;
+        let _ = self.splice_around(line, line, |ed| {
+            ed.replace_char_inner(c);
+            Ok(())
+        });
+    }
+
+    fn replace_char_inner(&mut self, c: char) {
         let cursor = self.buffer.cursor();
-        if let Some(line) = self.buffer.line_mut(cursor.line) {
-            let col = cursor.column;
-            if col < line.len() {
-                // Delete char at cursor and insert new one
-                line.delete_char(col);
-                line.insert_char(col, c);
-            }
+        let Some(line) = self.buffer.line(cursor.line) else {
+            return;
+        };
+        let col = cursor.column;
+        if col >= line.len() {
+            return;
         }
+        // Rebuild through `replace_line` rather than reaching in with
+        // `line_mut`, which edits behind the buffer's back: `r` set neither
+        // the modified flag nor any undo record, so `rX` then `:q` exited
+        // with no warning and the edit was simply lost.
+        let end = line.next_char_offset(col).unwrap_or(line.len());
+        let mut updated = String::with_capacity(line.len());
+        updated.push_str(&line.content()[..col]);
+        updated.push(c);
+        updated.push_str(&line.content()[end..]);
+        let _ = self.buffer.replace_line(cursor.line, &updated);
     }
 
     /// Toggle case of character at cursor (~ command).
     fn toggle_case(&mut self) {
+        let line = self.buffer.cursor().line;
+        let _ = self.splice_around(line, line, |ed| {
+            ed.toggle_case_inner();
+            Ok(())
+        });
+    }
+
+    fn toggle_case_inner(&mut self) {
         let cursor = self.buffer.cursor();
         let char_at = self
             .buffer
@@ -3977,13 +4476,28 @@ impl Editor {
             } else {
                 c
             };
-            if let Some(line) = self.buffer.line_mut(cursor.line) {
-                let col = cursor.column;
-                line.delete_char(col);
-                line.insert_char(col, toggled);
-                // Move right if possible
-                if col + 1 < line.len() {
-                    self.buffer.set_cursor(Position::new(cursor.line, col + 1));
+            let Some(line) = self.buffer.line(cursor.line) else {
+                return;
+            };
+            let col = cursor.column;
+            let end = line.next_char_offset(col).unwrap_or(line.len());
+            let mut updated = String::with_capacity(line.len());
+            updated.push_str(&line.content()[..col]);
+            updated.push(toggled);
+            updated.push_str(&line.content()[end..]);
+            let _ = self.buffer.replace_line(cursor.line, &updated);
+
+            // Advance by the width of the character just written, not by one
+            // byte: `col + 1` landed inside the next character on any line
+            // with multi-byte text.  The replacement may differ in width from
+            // what it replaced, so measure it in `updated`.
+            let next = self
+                .buffer
+                .line(cursor.line)
+                .and_then(|l| l.next_char_offset(col));
+            if let Some(next) = next {
+                if next < updated.len() {
+                    self.buffer.set_cursor(Position::new(cursor.line, next));
                 }
             }
         }
@@ -4002,24 +4516,6 @@ impl Editor {
         if let Ok(res) = result {
             self.buffer.set_cursor(res.position);
         }
-        Ok(())
-    }
-
-    /// Yank lines (for Y command).
-    fn execute_yank_lines(&mut self, count: usize) -> Result<()> {
-        let start_line = self.buffer.cursor().line;
-        let end_line = (start_line + count - 1).min(self.buffer.line_count());
-
-        let mut text = String::new();
-        for line_num in start_line..=end_line {
-            if let Some(line) = self.buffer.line(line_num) {
-                text.push_str(line.content());
-                text.push('\n');
-            }
-        }
-
-        self.registers.set_unnamed(RegisterContent::new(text, true));
-        self.set_message(&format!("{} lines yanked", end_line - start_line + 1));
         Ok(())
     }
 
@@ -4090,7 +4586,9 @@ impl Editor {
             return None;
         }
 
-        let col = cursor.column.min(content.len().saturating_sub(1));
+        // Boundary-correct: `len() - 1` lands inside a trailing multi-byte
+        // character.
+        let col = cursor.column.min(line.last_char_offset());
         let chars: Vec<char> = content.chars().collect();
 
         // Check if cursor is on a word character

@@ -274,7 +274,7 @@ fn test_motion_percent_nested_brackets() {
 fn test_motion_pipe_column() {
     let buffer = Buffer::from_text("hello world");
 
-    let result = command::motion::move_to_column(&buffer, 5).unwrap();
+    let result = command::motion::move_to_column(&buffer, 5, 8).unwrap();
     assert_eq!(result.position.column, 4); // Column 5 is index 4
 }
 
@@ -1337,7 +1337,7 @@ fn test_ex_put() {
 fn test_ex_copy() {
     let cmd = ex::parse_ex_command("co 5").unwrap();
     if let ExCommand::Copy { dest, .. } = cmd {
-        assert_eq!(dest, 5);
+        assert_eq!(dest, vi_rs::Address::Line(5));
     } else {
         panic!("Expected Copy");
     }
@@ -1347,7 +1347,7 @@ fn test_ex_copy() {
 fn test_ex_move() {
     let cmd = ex::parse_ex_command("m 10").unwrap();
     if let ExCommand::Move { dest, .. } = cmd {
-        assert_eq!(dest, 10);
+        assert_eq!(dest, vi_rs::Address::Line(10));
     } else {
         panic!("Expected Move");
     }
@@ -1430,9 +1430,10 @@ fn test_line_first_non_blank() {
     let line = Line::from("   hello");
     assert_eq!(line.first_non_blank(), 3);
 
-    // For blank line, returns 0 (unwrap_or(0))
+    // An all-blank line has no non-blank, so the cursor stays on the last
+    // character; column 0 is where `0` goes, not `^`.
     let blank = Line::from("     ");
-    assert_eq!(blank.first_non_blank(), 0);
+    assert_eq!(blank.first_non_blank(), 4);
 }
 
 // ============================================================================
@@ -1597,7 +1598,7 @@ fn test_motion_column() {
 
     let buffer = Buffer::from_text("hello world");
 
-    let result = move_to_column(&buffer, 6).unwrap();
+    let result = move_to_column(&buffer, 6, 8).unwrap();
     assert_eq!(result.position.column, 5); // column 6 is 0-indexed as 5
 }
 

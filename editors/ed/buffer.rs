@@ -40,9 +40,50 @@ pub struct Buffer {
     marks: HashMap<char, usize>,
     /// Single-level undo (POSIX requirement)
     undo_record: Option<UndoRecord>,
-    /// Flag to suppress individual undo saves during global commands.
-    /// When true, buffer operations don't save undo records.
+    /// Nesting depth of the current undo group.  While non-zero, individual
+    /// mutations do not snapshot: the group takes one snapshot, at its first
+    /// mutation, so the whole command undoes as a unit.
+    undo_depth: usize,
+    /// Whether the open group has taken its snapshot yet.
+    ///
+    /// Deferring it to the first actual mutation is what keeps a command that
+    /// changes nothing from destroying the undo record: snapshotting when the
+    /// group opens overwrites the previous state even if the command then
+    /// fails, so a substitute that matched nothing made the edit before it
+    /// unrecoverable.
+    group_snapshotted: bool,
+    /// Whether execution is inside a `g`/`v` command.  Distinct from
+    /// `undo_depth` because it carries a POSIX *semantic* -- notably that a
+    /// substitution may not split a line inside a global -- and so must not
+    /// become true merely because some other command grouped its undo.
     in_global: bool,
+}
+
+/// A structural change to the buffer's line numbering.
+///
+/// Every mutator reports one of these so that line *references* -- marks
+/// today -- keep denoting the same text.  Historical ed gets this for free by
+/// storing marks as pointers into a linked list; with a `Vec<String>` the
+/// bookkeeping has to be explicit, and doing it in `delete` alone left a mark
+/// silently naming a different line after any other edit.
+#[derive(Debug, Clone, Copy)]
+enum LineEdit {
+    /// `count` lines inserted immediately after line `after`.
+    Insert { after: usize, count: usize },
+    /// Lines `start..=end` removed.
+    Delete { start: usize, end: usize },
+    /// Lines `start..=end` replaced by `count` new lines.
+    Replace {
+        start: usize,
+        end: usize,
+        count: usize,
+    },
+    /// Lines `start..=end` moved to immediately after line `dest`.
+    Move {
+        start: usize,
+        end: usize,
+        dest: usize,
+    },
 }
 
 impl Buffer {
@@ -55,6 +96,8 @@ impl Buffer {
             modified: false,
             marks: HashMap::new(),
             undo_record: None,
+            undo_depth: 0,
+            group_snapshotted: false,
             in_global: false,
         }
     }
@@ -87,13 +130,8 @@ impl Buffer {
         }
     }
 
-    /// Save the current state for undo.
-    /// When in_global is true, individual operations don't save undo
-    /// (the global command saves once for the entire operation).
-    fn save_undo(&mut self) {
-        if self.in_global {
-            return; // Skip - global command already saved undo
-        }
+    /// Take the undo snapshot unconditionally.
+    fn snapshot(&mut self) {
         self.undo_record = Some(UndoRecord {
             lines: self.lines.clone(),
             cur_line: self.cur_line,
@@ -101,19 +139,46 @@ impl Buffer {
         });
     }
 
-    /// Begin a global command. Saves undo once and suppresses individual saves.
+    /// Save the current state for undo.
+    ///
+    /// Inside a group only the first mutation snapshots: that state is what
+    /// `u` must restore, and it is taken here rather than when the group opens
+    /// so a command that ends up changing nothing leaves the undo record
+    /// alone.
+    fn save_undo(&mut self) {
+        if self.undo_depth == 0 {
+            self.snapshot();
+        } else if !self.group_snapshotted {
+            self.snapshot();
+            self.group_snapshotted = true;
+        }
+    }
+
+    /// Open an undo group: everything until the matching `end_undo_group`
+    /// undoes as one command.  Nests, so a group inside a global does not
+    /// re-snapshot over the global's state.
+    pub fn begin_undo_group(&mut self) {
+        if self.undo_depth == 0 {
+            self.group_snapshotted = false;
+        }
+        self.undo_depth += 1;
+    }
+
+    /// Close an undo group.
+    pub fn end_undo_group(&mut self) {
+        self.undo_depth = self.undo_depth.saturating_sub(1);
+    }
+
+    /// Begin a global command: one undo group, plus the `g`/`v` semantics.
     pub fn begin_global(&mut self) {
-        self.undo_record = Some(UndoRecord {
-            lines: self.lines.clone(),
-            cur_line: self.cur_line,
-            modified: self.modified,
-        });
+        self.begin_undo_group();
         self.in_global = true;
     }
 
-    /// End a global command. Re-enables individual undo saves.
+    /// End a global command.
     pub fn end_global(&mut self) {
         self.in_global = false;
+        self.end_undo_group();
     }
 
     /// Check if currently in a global command context.
@@ -137,6 +202,64 @@ impl Buffer {
         }
     }
 
+    /// Renumber line references to survive a structural change.
+    fn apply_line_edit(&mut self, edit: LineEdit) {
+        match edit {
+            LineEdit::Insert { after, count } => {
+                for line in self.marks.values_mut() {
+                    if *line > after {
+                        *line += count;
+                    }
+                }
+            }
+            LineEdit::Delete { start, end } => {
+                // A mark on removed text goes with it: `'a` then reports an
+                // invalid address rather than naming whatever moved up.
+                self.marks.retain(|_, line| *line < start || *line > end);
+                let removed = end - start + 1;
+                for line in self.marks.values_mut() {
+                    if *line > end {
+                        *line -= removed;
+                    }
+                }
+            }
+            LineEdit::Replace { start, end, count } => {
+                self.marks.retain(|_, line| *line < start || *line > end);
+                let removed = end - start + 1;
+                for line in self.marks.values_mut() {
+                    if *line > end {
+                        *line = *line - removed + count;
+                    }
+                }
+            }
+            LineEdit::Move { start, end, dest } => {
+                let moved = end - start + 1;
+                // Where the block lands once it has been lifted out.
+                let landing = if dest > end { dest - moved } else { dest };
+                for line in self.marks.values_mut() {
+                    *line = if *line >= start && *line <= end {
+                        // Inside the block: keep its offset, follow the text.
+                        landing + (*line - start) + 1
+                    } else if *line < start {
+                        if *line > landing {
+                            *line + moved
+                        } else {
+                            *line
+                        }
+                    } else {
+                        // Below the block, so it first shifts up by `moved`.
+                        let lifted = *line - moved;
+                        if lifted > landing {
+                            *line
+                        } else {
+                            lifted
+                        }
+                    };
+                }
+            }
+        }
+    }
+
     /// Append lines after the current line (or at start if empty).
     pub fn append(&mut self, at_line: usize, lines: &[String]) {
         self.save_undo();
@@ -150,6 +273,10 @@ impl Buffer {
         if !lines.is_empty() {
             self.cur_line = insert_idx + lines.len();
             self.modified = true;
+            self.apply_line_edit(LineEdit::Insert {
+                after: insert_idx,
+                count: lines.len(),
+            });
         }
     }
 
@@ -166,6 +293,10 @@ impl Buffer {
         if !lines.is_empty() {
             self.cur_line = insert_idx + lines.len();
             self.modified = true;
+            self.apply_line_edit(LineEdit::Insert {
+                after: insert_idx,
+                count: lines.len(),
+            });
         }
     }
 
@@ -194,14 +325,7 @@ impl Buffer {
         }
 
         self.modified = true;
-
-        // Update marks
-        self.marks.retain(|_, line| *line < start || *line > end);
-        for line in self.marks.values_mut() {
-            if *line > end {
-                *line -= end - start + 1;
-            }
-        }
+        self.apply_line_edit(LineEdit::Delete { start, end });
 
         Ok(())
     }
@@ -374,6 +498,14 @@ impl Buffer {
 
         self.cur_line = start;
         self.modified = true;
+        // The joined text is a new line, so marks on any of the joined lines
+        // go with the originals -- matching historical ed, which allocates a
+        // fresh node for the join.
+        self.apply_line_edit(LineEdit::Replace {
+            start,
+            end,
+            count: 1,
+        });
 
         Ok(())
     }
@@ -383,7 +515,10 @@ impl Buffer {
         if start == 0 || start > end || end > self.lines.len() {
             return Err(EdError::AddressOutOfRange);
         }
-        if dest >= start && dest < end {
+        // POSIX (ed, `m`): it is an error if the destination falls within the
+        // range of moved lines -- and the range is inclusive, so `dest == end`
+        // is inside it.  Letting it through indexed past the drained vector.
+        if dest >= start && dest <= end {
             return Err(EdError::InvalidAddress);
         }
 
@@ -403,6 +538,7 @@ impl Buffer {
 
         self.cur_line = adjusted_dest + num_lines;
         self.modified = true;
+        self.apply_line_edit(LineEdit::Move { start, end, dest });
 
         Ok(())
     }
@@ -419,15 +555,19 @@ impl Buffer {
         let copied: Vec<String> = self.lines[start - 1..end].to_vec();
         let num_lines = copied.len();
 
-        let adjusted_dest = dest;
-
-        // Insert at destination
+        // Insert at destination. Nothing is removed, so unlike `move_lines`
+        // the destination needs no adjustment.
         for (i, line) in copied.into_iter().enumerate() {
-            self.lines.insert(adjusted_dest + i, line);
+            self.lines.insert(dest + i, line);
         }
 
-        self.cur_line = adjusted_dest + num_lines;
+        self.cur_line = dest + num_lines;
         self.modified = true;
+        // The original keeps its mark; the copy is unmarked.
+        self.apply_line_edit(LineEdit::Insert {
+            after: dest,
+            count: num_lines,
+        });
 
         Ok(())
     }
@@ -467,6 +607,11 @@ impl Buffer {
         }
 
         self.modified = true;
+        self.apply_line_edit(LineEdit::Replace {
+            start,
+            end,
+            count: new_lines.len(),
+        });
 
         Ok(())
     }

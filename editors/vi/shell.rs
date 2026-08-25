@@ -205,17 +205,39 @@ impl ShellExecutor {
             .spawn()
             .map_err(|e| ViError::ShellError(format!("failed to spawn command: {}", e)))?;
 
-        // Write input to stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(input.as_bytes())
-                .map_err(|e| ViError::ShellError(format!("failed to write to command: {}", e)))?;
-        }
+        // Feed stdin from a separate thread.  `wait_with_output` cannot start
+        // draining the child's stdout until the write finishes, so writing
+        // inline deadlocks as soon as the child's output fills the pipe
+        // buffer: each side waits for the other, and `:1,$!cat` on anything
+        // past ~64 KB hung the editor outright.
+        let feeder = child.stdin.take().map(|mut stdin| {
+            let data = input.as_bytes().to_vec();
+            std::thread::spawn(move || stdin.write_all(&data))
+        });
 
         // Wait for completion and get output
         let output = child
             .wait_with_output()
             .map_err(|e| ViError::ShellError(format!("failed to read command output: {}", e)))?;
+
+        if let Some(feeder) = feeder {
+            match feeder.join() {
+                // A command that exits without reading all its input (`head`)
+                // gives us EPIPE; that is the command's choice, not an error.
+                Ok(Err(e)) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+                    return Err(ViError::ShellError(format!(
+                        "failed to write to command: {}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    return Err(ViError::ShellError(
+                        "failed to write to command".to_string(),
+                    ));
+                }
+                Ok(_) => {}
+            }
+        }
 
         Ok(ShellOutput {
             success: output.status.success(),
@@ -268,6 +290,18 @@ impl ShellExecutor {
     ///
     /// This is used for `:shell` - spawn interactive shell.
     pub fn interactive(&mut self) -> Result<ShellOutput> {
+        // An interactive shell needs a terminal to be interactive *with*.
+        // Started without one it inherits the editor's piped stdin, competes
+        // for the controlling terminal and stops -- which reads as the editor
+        // hanging, with no diagnostic and no way back.  Refusing is the only
+        // useful answer.
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Err(ViError::ShellError(
+                "cannot start an interactive shell without a terminal".to_string(),
+            ));
+        }
+
         // POSIX: `:shell` invokes the shell as an interactive shell (-i).
         let status = Command::new(&self.shell)
             .arg("-i")

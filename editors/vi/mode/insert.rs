@@ -417,11 +417,16 @@ fn delete_word_before(buffer: &mut Buffer, state: &mut InsertState) {
         idx -= 1;
     }
 
-    let delete_from = chars[idx].0;
-    let delete_count = pos.column - delete_from;
+    // `delete_char_before` removes one *character*, so the loop bound has to
+    // be a character count.  The byte distance back to `chars[idx].0`, which
+    // this used before, over-deletes on multi-byte text and can run off the
+    // line.
+    let delete_count = chars.len() - idx;
 
-    // Delete the characters
-    buffer.set_column(pos.column);
+    // Delete the characters.  `set_column_for_insert`, not `set_column`: the
+    // latter clamps to the last character, dragging an end-of-line cursor
+    // back one before the deletion even starts.
+    buffer.set_column_for_insert(pos.column);
     for _ in 0..delete_count {
         buffer.delete_char_before();
     }
@@ -449,8 +454,19 @@ fn delete_to_line_start(buffer: &mut Buffer, state: &mut InsertState) {
         0
     };
 
-    let delete_count = pos.column - delete_to;
+    // Again a character count, not a byte distance: as a byte distance this
+    // deleted past the start of the line and consumed the preceding newline,
+    // joining -- and so destroying -- the line above.
+    let delete_count = buffer
+        .line(pos.line)
+        .map(|l| {
+            l.content()[delete_to..pos.column.min(l.len())]
+                .chars()
+                .count()
+        })
+        .unwrap_or(0);
 
+    buffer.set_column_for_insert(pos.column);
     for _ in 0..delete_count {
         buffer.delete_char_before();
     }

@@ -38,14 +38,16 @@ pub fn tokenize(input: &str) -> EdResult<Vec<Token>> {
             '.' => tokens.push(Token::CurrentLine),
             '$' => tokens.push(Token::LastLine),
             '0'..='9' => {
-                let n: usize = iter::once(ch)
+                // Addresses are resolved in signed arithmetic, so parse as
+                // `isize`: a line number that does not fit is out of range,
+                // not a reason to abort the editor.
+                let digits: String = iter::once(ch)
                     .chain(iter::from_fn(|| {
                         iter.by_ref().next_if(|s| s.is_ascii_digit())
                     }))
-                    .collect::<String>()
-                    .parse()
-                    .unwrap();
-                tokens.push(Token::Number(n));
+                    .collect();
+                let n: isize = digits.parse().map_err(|_| EdError::AddressOutOfRange)?;
+                tokens.push(Token::Number(n as usize));
             }
             '\'' => match iter.next() {
                 None => return Err(EdError::Syntax("missing mark character".to_string())),
@@ -129,7 +131,8 @@ pub fn tokenize(input: &str) -> EdResult<Vec<Token>> {
                         -1
                     }
                 } else {
-                    let unsigned: isize = offset_str.parse().unwrap();
+                    let unsigned: isize =
+                        offset_str.parse().map_err(|_| EdError::AddressOutOfRange)?;
                     if sign == '-' {
                         -unsigned
                     } else {
@@ -262,10 +265,15 @@ pub enum Command {
     GlobalNot(Address, Address, String, String, bool),
     /// (1,$)V/re/ - interactive global not matching
     GlobalNotInteractive(Address, Address, String),
-    /// (1,$)w [file] - write
-    Write(Address, Address, Option<String>, bool), // (addr1, addr2, filename, append)
-    /// (1,$)wq [file] - write and quit
-    WriteQuit(Address, Address, Option<String>),
+    /// (1,$)w [file] - write; `W` appends, and a `q` glued to either
+    /// (`wq`, `Wq`) also quits.
+    Write {
+        addr1: Address,
+        addr2: Address,
+        filename: Option<String>,
+        append: bool,
+        quit: bool,
+    },
     /// ($)= - print line number
     LineNumber(Address),
     /// !command - shell escape
@@ -448,9 +456,12 @@ pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Command> {
             }
             ParseState::Command => match token {
                 Token::Command(cmd) => {
+                    // Untrimmed: `w` distinguishes `wq` (write-quit) from
+                    // `w q` (write to a file named `q`) by literal adjacency,
+                    // so the leading space has to survive to `parse_command`.
                     let rest = if !tokens.is_empty() {
                         if let Token::Rest(s) = tokens.remove(0) {
-                            s.trim().to_string()
+                            s
                         } else {
                             String::new()
                         }
@@ -487,10 +498,13 @@ pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Command> {
 /// Parse a specific command with its arguments.
 fn parse_command(
     cmd: char,
-    rest: String,
+    rest_raw: String,
     mut addrvec: Vec<Address>,
     separator: Option<char>,
 ) -> EdResult<Command> {
+    // Every command but `w`/`W` wants the argument with surrounding blanks
+    // removed; those two need `rest_raw` to see whether a `q` is glued on.
+    let rest = rest_raw.trim().to_string();
     match cmd {
         'a' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('a'));
@@ -620,23 +634,24 @@ fn parse_command(
         'u' => Ok(Command::Undo),
         'w' | 'W' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('w'));
-            let filename = if rest.is_empty() { None } else { Some(rest) };
-            Ok(Command::Write(
-                addrvec[0].clone(),
-                addrvec[1].clone(),
+            // A `q` immediately after the command letter is the write-quit
+            // form; anything after a blank is a pathname, even a bare "q".
+            let (quit, args) = match rest_raw.strip_prefix('q') {
+                Some(after) => (true, after.trim()),
+                None => (false, rest_raw.trim()),
+            };
+            let filename = if args.is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            };
+            Ok(Command::Write {
+                addr1: addrvec[0].clone(),
+                addr2: addrvec[1].clone(),
                 filename,
-                cmd == 'W',
-            ))
-        }
-        'x' => {
-            // wq alias
-            normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('w'));
-            let filename = if rest.is_empty() { None } else { Some(rest) };
-            Ok(Command::WriteQuit(
-                addrvec[0].clone(),
-                addrvec[1].clone(),
-                filename,
-            ))
+                append: cmd == 'W',
+                quit,
+            })
         }
         'z' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('z'));

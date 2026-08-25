@@ -765,13 +765,42 @@ fn write_helper_functions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Re
 int input(void)
 {{
     /* Check main buffer - unput() now always inserts directly here */
-    if (YYCURSOR < YYLIMIT) {{
-        return *YYCURSOR++;
+    if (YYCURSOR >= YYLIMIT) {{
+        /* Refill through YY_INPUT, the documented interception point, so a
+           user-supplied YY_INPUT sees these reads too. Append rather than
+           compact: yyless() and unput() address the buffer relative to
+           YYTOKEN, which must stay valid across input(). */
+        int yy_result;
+        size_t yy_used = (size_t)(YYLIMIT - yy_buffer);
+        if (yy_used >= yy_buffer_size) {{
+            size_t new_size = yy_buffer_size * 2;
+            size_t cursor_off = (size_t)(YYCURSOR - yy_buffer);
+            size_t limit_off = (size_t)(YYLIMIT - yy_buffer);
+            size_t token_off = (size_t)(YYTOKEN - yy_buffer);
+            size_t marker_off = (size_t)(YYMARKER - yy_buffer);
+            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);
+            if (new_buf == NULL) {{ YY_FATAL_ERROR("lex: out of memory in input()"); }}
+            yy_buffer = new_buf;
+            yy_buffer_size = new_size;
+            YYCURSOR = yy_buffer + cursor_off;
+            YYLIMIT = yy_buffer + limit_off;
+            YYTOKEN = yy_buffer + token_off;
+            YYMARKER = yy_buffer + marker_off;
+        }}
+        size_t yy_room = yy_buffer_size - yy_used;
+        if (yy_room > (size_t)INT_MAX) yy_room = (size_t)INT_MAX;
+        YY_INPUT(yy_buffer + yy_used, yy_result, (int)yy_room);
+        if (yy_result <= 0) {{
+            return 0;  /* POSIX: input() returns 0 on end of file */
+        }}
+        YYLIMIT = yy_buffer + yy_used + (size_t)yy_result;
     }}
-    /* Need to refill buffer */
-    if (yyin == NULL) yyin = stdin;
-    int yy_c = getc(yyin);
-    return yy_c == EOF ? 0 : yy_c;  /* POSIX: input() returns 0 on end of file */
+    {{
+        int yy_c = *YYCURSOR++;
+        /* A newline consumed here still starts a new line for the next token. */
+        yy_at_bol = (yy_c == '\n');
+        return yy_c;
+    }}
 }}
 "#
         )?;
@@ -821,8 +850,12 @@ int unput(int c)
             memmove(yy_buffer + 1, yy_buffer, yy_remain);
         }}
         yy_buffer[0] = (unsigned char)c;
+        /* Everything already buffered moved up one byte, so every pointer
+           into it moves with its data. YYCURSOR is the exception: it stays at
+           yy_buffer, which is now the character just pushed back. */
         YYLIMIT++;
-        /* YYCURSOR stays at yy_buffer, now pointing to inserted char */
+        YYTOKEN++;
+        YYMARKER++;
     }}
     return c;
 }}
@@ -1682,6 +1715,13 @@ fn write_yylex_direct_coded<W: Write>(
         writeln!(output, "            yytext = new_buf;")?;
         writeln!(output, "            yy_yytext_size = new_size;")?;
         writeln!(output, "        }}")?;
+    } else {
+        // %array mode: yytext is a fixed char[YYLMAX] that cannot grow, while
+        // the input buffer can, so the copy below needs an explicit bound.
+        writeln!(
+            output,
+            "        if (yy_total_len >= (size_t)YYLMAX) {{ YY_FATAL_ERROR(\"lex: token too large, exceeds YYLMAX\"); }}"
+        )?;
     }
     writeln!(
         output,
@@ -1721,6 +1761,12 @@ fn write_yylex_direct_coded<W: Write>(
         writeln!(output, "            yytext = new_buf;")?;
         writeln!(output, "            yy_yytext_size = new_size;")?;
         writeln!(output, "        }}")?;
+    } else {
+        // %array mode: see above -- yytext cannot grow to meet the token.
+        writeln!(
+            output,
+            "        if ((size_t)yyleng >= (size_t)YYLMAX) {{ YY_FATAL_ERROR(\"lex: token too large, exceeds YYLMAX\"); }}"
+        )?;
     }
     writeln!(output, "        memcpy(yytext, YYTOKEN, yyleng);")?;
     writeln!(output, "        yytext[yyleng] = '\\0';")?;

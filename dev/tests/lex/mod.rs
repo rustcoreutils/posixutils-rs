@@ -793,14 +793,10 @@ int main(void) {
 
     let (c_code, success) = run_lex(lex_input);
     assert!(success, "lex failed to generate C code");
-    assert!(
-        c_code.contains("yy_c == EOF ? 0 : yy_c"),
-        "input() must normalize EOF to 0: {}",
-        c_code
-    );
 
     // Input is just "a" with no trailing newline, so input() after matching
-    // 'a' hits EOF and must return 0.
+    // 'a' hits EOF and must return 0. Asserted on behavior rather than on the
+    // shape of the emitted C, which changed when input() moved to YY_INPUT.
     let result = compile_and_run(&c_code, "a");
     assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
     let output = result.unwrap();
@@ -3459,4 +3455,135 @@ fn test_stats_are_silent_without_verbose() {
         "-v did not produce statistics: {:?}",
         combined_v
     );
+}
+
+// ---------------------------------------------------------------------------
+// Scanner buffer safety
+// ---------------------------------------------------------------------------
+
+/// Compile `c_code`, run it on `input`, and return (stdout, stderr, exit code).
+fn compile_and_run_status(c_code: &str, input: &str) -> (String, String, Option<i32>) {
+    use std::process::Stdio;
+
+    let temp_dir = TempDir::new().unwrap();
+    let c_file = temp_dir.path().join("lexer.c");
+    let exe_file = temp_dir.path().join("lexer");
+    let input_file = temp_dir.path().join("input.txt");
+
+    fs::write(&c_file, c_code).unwrap();
+    fs::write(&input_file, input).unwrap();
+
+    let compile = Command::new("cc")
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe_file.to_str().unwrap(),
+            c_file.to_str().unwrap(),
+            "-lm",
+        ])
+        .output()
+        .expect("Failed to compile");
+    assert!(
+        compile.status.success(),
+        "Compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe_file)
+        .stdin(Stdio::from(fs::File::open(&input_file).unwrap()))
+        .output()
+        .expect("Failed to run lexer");
+
+    (
+        String::from_utf8_lossy(&run.stdout).to_string(),
+        String::from_utf8_lossy(&run.stderr).to_string(),
+        run.status.code(),
+    )
+}
+
+#[test]
+fn test_array_mode_rejects_token_larger_than_yylmax() {
+    // %array gives yytext a fixed char[YYLMAX] that cannot grow, but the input
+    // buffer grows without limit and the token was copied in unchecked, so a
+    // long token smashed past the end of yytext.
+    let lex_input = r#"%option noinput nounput
+%array
+%%
+[a-z]+  { printf("%d\n", yyleng); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let big = "a".repeat(20000);
+    let (_stdout, stderr, code) = compile_and_run_status(&c_code, &big);
+    assert_eq!(
+        code,
+        Some(2),
+        "expected a clean fatal error, got exit {:?} (stderr: {})",
+        code,
+        stderr
+    );
+    assert!(
+        stderr.contains("token too large"),
+        "expected a 'token too large' diagnostic, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_array_mode_normal_token_unaffected() {
+    let lex_input = r#"%option noinput nounput
+%array
+%%
+[a-z]+  { printf("%d\n", yyleng); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "hello\n").unwrap();
+    assert_eq!(result.trim(), "5");
+}
+
+#[test]
+fn test_input_reads_through_yy_input() {
+    // input() used to call getc(yyin) directly once the buffer was drained,
+    // ignoring a user-supplied YY_INPUT -- the documented way to feed a scanner
+    // from something other than a FILE *.
+    let lex_input = r#"%option nounput
+%{
+static const char *yy_src = "AZq";
+static int yy_src_pos = 0;
+/* One byte per call, so draining with input() must come back to YY_INPUT. */
+#define YY_INPUT(buf, result, max_size) \
+    do { \
+        if ((max_size) > 0 && yy_src[yy_src_pos] != 0) { \
+            (buf)[0] = yy_src[yy_src_pos++]; \
+            (result) = 1; \
+        } else { \
+            (result) = 0; \
+        } \
+    } while (0)
+%}
+%%
+A       { int c; printf("A["); while ((c = input()) != 0) putchar(c); printf("]"); }
+.|\n    { printf("(%s)", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // stdin is empty, so every character must come from YY_INPUT. Reading via
+    // getc(yyin) instead stopped at the one buffered lookahead character and
+    // produced "A[Z](q)".
+    let result = compile_and_run(&c_code, "").unwrap();
+    assert_eq!(result, "A[Zq]");
 }

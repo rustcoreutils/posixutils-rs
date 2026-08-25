@@ -2136,9 +2136,16 @@ impl Editor {
                 };
                 if let Some(range) = self.operator_region(start, mot, res.as_ref()) {
                     self.undo.begin_group();
+                    // Snapshot, not `record_removal`: the region can now be
+                    // line-wise (`cj`, `c'a`, `cH`), and `change_lines` empties
+                    // the first line instead of removing it -- so a linewise
+                    // delete record makes `u` restore the lines *and* leave the
+                    // emptied one behind.  Same reasoning as the `cc` arm.
+                    let register = cmd.register;
                     let result =
-                        change(&mut self.buffer, range, &mut self.registers, cmd.register)?;
-                    self.record_removal(range, &result);
+                        self.splice_around(range.start_line(), range.end_line(), |ed| {
+                            change(&mut ed.buffer, range, &mut ed.registers, register)
+                        })?;
                     // Use set_column_for_insert to allow cursor at end of line
                     // The change operation's cursor may be clamped, so use range.start
                     // which is where we want to insert (the start of the deleted text)
@@ -2158,8 +2165,27 @@ impl Editor {
         // `shift_right`/`shift_left` report no affected text, so there is
         // nothing for a hand-built undo record to describe -- snapshot the
         // rewritten run instead.
-        let first = self.buffer.cursor().line;
-        let last = (first + cmd.count.max(1) - 1).min(self.buffer.line_count());
+        //
+        // The span has to come from the *motion*, not from `count` lines below
+        // the cursor: `>j`, `>G` and `>k` all shift lines the cursor-relative
+        // span does not cover, and an undo record over the wrong lines leaves
+        // the buffer in a state that is neither before nor after the command.
+        let cursor = self.buffer.cursor().line;
+        let (first, last) = match &cmd.motion {
+            // `>>`/`<<`: `count` lines from the cursor.
+            Some(mot) if mot.motion == cmd.command => (
+                cursor,
+                (cursor + cmd.count.max(1) - 1).min(self.buffer.line_count()),
+            ),
+            Some(mot) => {
+                let end = self
+                    .execute_motion(mot)
+                    .map(|r| r.position.line)
+                    .unwrap_or(cursor);
+                (cursor.min(end), cursor.max(end))
+            }
+            None => (cursor, cursor),
+        };
         let cmd = cmd.clone();
         self.splice_around(first, last.max(first), |ed| ed.execute_shift_inner(&cmd))
     }
@@ -2351,6 +2377,29 @@ impl Editor {
         }
     }
 
+    /// The line a `w`/`W` motion would have reached one step short of its
+    /// count -- i.e. the line holding the last word it moves over.
+    ///
+    /// The end-of-line rule keys off that line, not off the start line: with a
+    /// count the motion may cross several.
+    fn word_motion_line_before_last_step(
+        &self,
+        mot: &crate::command::MotionCommand,
+        start: Position,
+    ) -> usize {
+        use crate::command::motion;
+        if mot.count <= 1 {
+            return start.line;
+        }
+        let one_short = mot.count - 1;
+        let res = if mot.motion == 'W' {
+            motion::move_bigword_forward(&self.buffer, one_short)
+        } else {
+            motion::move_word_forward(&self.buffer, one_short)
+        };
+        res.map(|r| r.position.line).unwrap_or(start.line)
+    }
+
     /// The region an operator acts on, given where it started and how the
     /// motion is classified.
     ///
@@ -2370,43 +2419,52 @@ impl Editor {
         // last character of the line."  So `dw` never joins lines -- and on
         // the last word of the last line it still deletes that word, even
         // though `w` itself reports failure there because it cannot advance.
+        //
+        // The rule is about the *last word moved over*, not about the motion
+        // crossing a line at some point: with a count it may legitimately span
+        // lines, so `d3w` on "one two\nthree four" leaves "four".  Compare the
+        // landing line against where `count - 1` words would have ended: only
+        // if the final step crossed a line did the last word end one.
         let word_runs_off_the_line = match res {
             None => true,
+            Some(r) if r.class != MotionClass::Exclusive => false,
             Some(r) => {
-                r.class == MotionClass::Exclusive
-                    && (r.position.line != start.line || r.position.column <= start.column)
+                let prev = self.word_motion_line_before_last_step(mot, start);
+                r.position.line != prev || r.position.column <= start.column
             }
         };
         if matches!(mot.motion, 'w' | 'W') && word_runs_off_the_line {
-            let end_col = self.buffer.line(start.line).map(|l| l.len()).unwrap_or(0);
-            if end_col <= start.column {
+            let clamp_line = self.word_motion_line_before_last_step(mot, start);
+            let end_col = self.buffer.line(clamp_line).map(|l| l.len()).unwrap_or(0);
+            let end = Position::new(clamp_line, end_col);
+            if end <= start {
                 return None;
             }
-            return Some(Range::new(
-                start,
-                Position::new(start.line, end_col),
-                BufferMode::Character,
-            ));
+            return Some(Range::new(start, end, BufferMode::Character));
         }
 
         let res = res?;
         Some(match res.class {
             MotionClass::Linewise => Range::lines(start, res.position),
             MotionClass::Inclusive => {
-                // Extend past the character the motion landed on. Only
-                // forwards: a backward motion's landing character is already
-                // inside the region once the endpoints are ordered.
-                let end = if res.position >= start {
+                // Character ranges are end-exclusive, so "inclusive" means
+                // extending past whichever endpoint is the later one.  Going
+                // forwards that is the landing character; going backwards it
+                // is the character under the cursor, which a backward `d%`
+                // would otherwise leave behind.
+                let extend_past = |p: Position| {
                     let col = self
                         .buffer
-                        .line(res.position.line)
-                        .and_then(|l| l.next_char_offset(res.position.column))
-                        .unwrap_or(res.position.column);
-                    Position::new(res.position.line, col)
-                } else {
-                    res.position
+                        .line(p.line)
+                        .and_then(|l| l.next_char_offset(p.column))
+                        .unwrap_or(p.column);
+                    Position::new(p.line, col)
                 };
-                Range::new(start, end, BufferMode::Character)
+                if res.position >= start {
+                    Range::new(start, extend_past(res.position), BufferMode::Character)
+                } else {
+                    Range::new(res.position, extend_past(start), BufferMode::Character)
+                }
             }
             MotionClass::Exclusive => Range::new(start, res.position, BufferMode::Character),
         })

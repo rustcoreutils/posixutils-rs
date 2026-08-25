@@ -3135,3 +3135,138 @@ fn test_yank_word_on_the_last_word_of_a_line() {
         Some("two")
     );
 }
+
+// ============================================================================
+// Code-review findings
+// ============================================================================
+
+/// POSIX (vi, "Delete"): the `w`/`W` end-of-line rule applies when *the last
+/// word moved over* ends a line -- not whenever the motion happens to cross
+/// one. With a count the motion may legitimately span lines.
+#[test]
+fn test_delete_word_with_a_count_may_cross_lines() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two\nthree four\n");
+    editor.execute_keys("d3w").unwrap();
+    assert_eq!(editor.get_buffer_text(), "four\n");
+}
+
+#[test]
+fn test_yank_word_with_a_count_may_cross_lines() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two\nthree four\n");
+    editor.execute_keys("y3w").unwrap();
+    assert_eq!(
+        editor.get_unnamed_register().map(|r| r.text.as_str()),
+        Some("one two\nthree ")
+    );
+}
+
+/// ...but a count whose final step still ends a line keeps the rule.
+#[test]
+fn test_delete_word_with_a_count_still_stops_at_end_of_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one two\nthree four\n");
+    editor.execute_keys("d2w").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "\nthree four\n",
+        "the second word ends line 1, so the region stops there"
+    );
+}
+
+/// `c` with a line-wise motion has the same hazard as `cc`: `change_lines`
+/// empties the first line rather than removing it, so a linewise delete
+/// record makes `u` restore the lines *and* leave the emptied one behind.
+#[test]
+fn test_undo_after_change_with_a_linewise_motion() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("aaa\nbbb\nccc\n");
+    editor.execute_keys("cjX\x1b").unwrap();
+    editor.execute_keys("u").unwrap();
+    assert_eq!(editor.get_buffer_text(), "aaa\nbbb\nccc\n");
+}
+
+/// The shift operator's undo snapshot must cover the lines the *motion*
+/// selects, not `count` lines from the cursor -- otherwise `u` reverts only
+/// part of the change and leaves a state that is neither before nor after.
+#[test]
+fn test_undo_after_shift_with_a_motion() {
+    for keys in [">j", ">G", "j>k"] {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text("aaa\nbbb\nccc\n");
+        editor.execute_keys(keys).unwrap();
+        assert_ne!(editor.get_buffer_text(), "aaa\nbbb\nccc\n");
+        editor.execute_keys("u").unwrap();
+        assert_eq!(
+            editor.get_buffer_text(),
+            "aaa\nbbb\nccc\n",
+            "{:?} did not fully undo",
+            keys
+        );
+    }
+}
+
+/// An inclusive motion that runs *backwards* has to include the character
+/// under the cursor: character ranges are end-exclusive, so extending the end
+/// only helps when the motion went forward.
+#[test]
+fn test_match_bracket_is_inclusive_backwards_too() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("(abc)\n");
+    editor.execute_keys("$d%").unwrap();
+    assert_eq!(editor.get_buffer_text(), "\n");
+}
+
+#[test]
+fn test_find_char_backward_inclusive_forms_keep_the_cursor_char() {
+    // `F`/`T` are exclusive, so the cursor's character survives -- pinned so
+    // the backward-inclusive fix does not change them.
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("hello world\n");
+    editor.execute_keys("$dFo").unwrap();
+    assert_eq!(editor.get_buffer_text(), "hello wd\n");
+}
+
+/// `^` anchors to the start of the line, so a search that resumes mid-line
+/// must not let it match there.
+#[test]
+fn test_search_does_not_reanchor_caret_mid_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abc\nzzz\n");
+    let r = editor.execute_keys("/^b\n");
+    assert!(
+        r.is_err() || editor.is_error_message(),
+        "`^b` must not match mid-line; cursor went to line {} col {}",
+        editor.get_cursor().line,
+        editor.get_cursor().column
+    );
+}
+
+#[test]
+fn test_backward_search_does_not_reanchor_caret_mid_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abc\nzzz\n");
+    editor.execute_keys("G$").unwrap();
+    let r = editor.execute_keys("?^b\n");
+    assert!(
+        r.is_err() || editor.is_error_message(),
+        "`^b` must not match mid-line; cursor went to line {} col {}",
+        editor.get_cursor().line,
+        editor.get_cursor().column
+    );
+}
+
+/// A display column that falls *inside* a tab belongs to the tab.
+#[test]
+fn test_pipe_column_inside_a_tab_lands_on_the_tab() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("a\tbc\n");
+    // With tabstop 8 the tab spans display columns 2-8, so 5 is inside it.
+    editor.execute_keys("5|").unwrap();
+    assert_eq!(
+        editor.get_cursor().column,
+        1,
+        "column 5 is the tab, at byte 1"
+    );
+}

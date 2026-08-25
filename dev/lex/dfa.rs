@@ -91,7 +91,10 @@ impl CharClasses {
         // Start with all characters in class 0
         let mut char_to_class = [0u8; 256];
         let mut class_signatures: HashMap<Vec<Option<usize>>, u8> = HashMap::new();
-        let mut next_class = 0u8;
+        // Counted in usize: there can be 256 distinct classes, one more than a
+        // u8 can count, and a saturating u8 under-reported the total by one
+        // whenever every character had its own class.
+        let mut next_class: usize = 0;
 
         // For each character, compute its "signature" (vector of target states from each DFA state)
         for ch in 0u8..=255 {
@@ -105,15 +108,18 @@ impl CharClasses {
             if let Some(&existing_class) = class_signatures.get(&signature) {
                 char_to_class[ch as usize] = existing_class;
             } else {
-                char_to_class[ch as usize] = next_class;
-                class_signatures.insert(signature, next_class);
-                next_class = next_class.saturating_add(1);
+                // At most 256 characters yield at most 256 classes, so the
+                // class number always fits in the u8 table entry.
+                let class = next_class as u8;
+                char_to_class[ch as usize] = class;
+                class_signatures.insert(signature, class);
+                next_class += 1;
             }
         }
 
         CharClasses {
             char_to_class,
-            num_classes: next_class as usize,
+            num_classes: next_class,
         }
     }
 }

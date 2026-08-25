@@ -166,12 +166,10 @@ pub fn generate<W: Write>(
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
 ) -> io::Result<()> {
-    // Log generation info
-    eprintln!(
-        "lex: {} states, {} equivalence classes -> direct-coded generation",
-        dfa.states.len(),
-        dfa.char_classes.num_classes
-    );
+    // No progress chatter here: POSIX makes the statistics summary conditional
+    // on -v (or declared table sizes) and suppressible with -n, and run() owns
+    // that decision. The state and equivalence-class counts this used to print
+    // unconditionally are reported by write_stats().
 
     // Pre-compute all feature flags in a single pass
     let flags = FeatureFlags::compute(lexinfo, config);
@@ -633,7 +631,10 @@ fn write_rule_metadata_tables<W: Write>(
                 let meta = &config.rule_metadata[i];
                 if meta.has_trailing_context {
                     match meta.main_pattern_len {
-                        Some(len) => len as i32,
+                        // A length that will not survive the narrowing is
+                        // reported as variable rather than silently wrapping
+                        // into a bogus (possibly negative) offset.
+                        Some(len) => i32::try_from(len).unwrap_or(-2),
                         None => -2, // Variable length main pattern
                     }
                 } else {

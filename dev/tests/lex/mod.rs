@@ -3309,3 +3309,154 @@ fn test_posix_class_inside_brackets_with_interval() {
     let result = compile_and_run(&c_code, "ab").unwrap();
     assert_eq!(result, "A");
 }
+
+// ---------------------------------------------------------------------------
+// Fixed-length analysis, equivalence-class counting, NFA size, stats gating
+// ---------------------------------------------------------------------------
+
+/// Compile `c_code` and run it against `input`, giving up after `secs`.
+///
+/// `compile_and_run` waits forever and discards the exit status, so it cannot
+/// witness a scanner that hangs or dies. Returns `Err` describing the failure.
+fn compile_and_run_bounded(c_code: &str, input: &str, secs: u64) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let temp_dir = TempDir::new().unwrap();
+    let c_file = temp_dir.path().join("lexer.c");
+    let exe_file = temp_dir.path().join("lexer");
+    let input_file = temp_dir.path().join("input.txt");
+    let out_file = temp_dir.path().join("out.txt");
+
+    fs::write(&c_file, c_code).unwrap();
+    fs::write(&input_file, input).unwrap();
+
+    let compile = Command::new("cc")
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe_file.to_str().unwrap(),
+            c_file.to_str().unwrap(),
+            "-lm",
+        ])
+        .output()
+        .expect("Failed to compile");
+    if !compile.status.success() {
+        return Err(format!(
+            "Compilation failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
+
+    let mut child = Command::new(&exe_file)
+        .stdin(Stdio::from(fs::File::open(&input_file).unwrap()))
+        .stdout(Stdio::from(fs::File::create(&out_file).unwrap()))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to run lexer");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait().expect("try_wait failed") {
+            Some(status) => {
+                if !status.success() {
+                    return Err(format!("scanner exited with {}", status));
+                }
+                break;
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("scanner did not terminate within {}s", secs));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
+    let mut out = String::new();
+    fs::File::open(&out_file)
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    Ok(out)
+}
+
+#[test]
+fn test_star_main_pattern_with_trailing_context_terminates() {
+    // compute_fixed_length() compared rep.min against rep.max.unwrap_or(0), so
+    // an unbounded `x*` (min 0, max None) was reported as a *fixed* length of
+    // zero. The scanner then rewound to the token start and made no progress.
+    let lex_input = r#"%option noinput nounput
+%%
+x*/xy   { printf("[%s]", yytext); }
+.|\n    { printf("(%s)", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result =
+        compile_and_run_bounded(&c_code, "xxxy", 10).expect("scanner must terminate on x*/xy");
+    assert!(
+        !result.is_empty(),
+        "scanner produced no output for x*/xy on xxxy"
+    );
+}
+
+#[test]
+fn test_all_distinct_equivalence_classes_are_counted() {
+    // The class counter was a u8 with saturating_add, so 256 distinct classes
+    // were reported as 255.
+    let mut spec = String::from("%option noinput nounput\n%%\n");
+    for b in 1..=255u32 {
+        spec.push_str(&format!("\\x{:02x}   {{ }}\n", b));
+    }
+    spec.push_str("%%\n");
+
+    let (c_code, success) = run_lex(&spec);
+    assert!(success, "lex failed: {}", c_code);
+
+    // 255 single-byte rules plus the class holding the unmatched NUL.
+    assert!(
+        c_code.contains("#define YY_NUM_CLASSES 256"),
+        "expected 256 equivalence classes, generated file says otherwise"
+    );
+}
+
+#[test]
+fn test_stats_are_silent_without_verbose() {
+    // POSIX gates the statistics summary on -v and requires -n to suppress it;
+    // code generation used to log a state/class count to stderr unconditionally.
+    let lex_input = "%%\n[a-z]+  { }\n%%\n";
+
+    let (_out, success) = run_lex_capture(&[], lex_input);
+    assert!(success);
+    let (combined, success) = run_lex_capture(&[], lex_input);
+    assert!(success);
+    assert!(
+        combined.is_empty(),
+        "lex chattered without -v: {:?}",
+        combined
+    );
+
+    let (combined_n, success) = run_lex_capture(&["-n"], lex_input);
+    assert!(success);
+    assert!(
+        combined_n.is_empty(),
+        "-n did not suppress statistics: {:?}",
+        combined_n
+    );
+
+    let (combined_v, success) = run_lex_capture(&["-v"], lex_input);
+    assert!(success);
+    assert!(
+        combined_v.contains("lex statistics:"),
+        "-v did not produce statistics: {:?}",
+        combined_v
+    );
+}

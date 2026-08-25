@@ -162,7 +162,21 @@ fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
     Ok(rules)
 }
 
-/// Try to compute the fixed length of a regex pattern
+/// Does every member of this class encode to a single byte?
+///
+/// The result of `compute_fixed_length` is consumed as a *byte* offset into the
+/// scanner's input buffer, so a class that can match a multi-byte character has
+/// no fixed length even though it always matches exactly one character.
+fn class_is_single_byte(class: &regex_syntax::hir::Class) -> bool {
+    use regex_syntax::hir::Class;
+
+    match class {
+        Class::Unicode(unicode) => unicode.iter().all(|r| (r.end() as u32) < 0x80),
+        Class::Bytes(_) => true,
+    }
+}
+
+/// Try to compute the fixed length, in bytes, of a regex pattern
 /// Returns Some(length) if the pattern has a fixed length, None otherwise
 fn compute_fixed_length(hir: &Hir) -> Option<usize> {
     use regex_syntax::hir::HirKind;
@@ -173,8 +187,15 @@ fn compute_fixed_length(hir: &Hir) -> Option<usize> {
             // Count UTF-8 bytes in the literal
             Some(lit.0.len())
         }
-        HirKind::Class(_) => Some(1), // Character class matches exactly 1 character
-        HirKind::Look(_) => Some(0),  // Look-around assertions don't consume input
+        HirKind::Class(class) => {
+            // Exactly one character, which is one byte only for ASCII members.
+            if class_is_single_byte(class) {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        HirKind::Look(_) => Some(0), // Look-around assertions don't consume input
         HirKind::Concat(parts) => {
             let mut total = 0;
             for part in parts.iter() {
@@ -193,8 +214,12 @@ fn compute_fixed_length(hir: &Hir) -> Option<usize> {
             Some(first_len)
         }
         HirKind::Repetition(rep) => {
-            // Only fixed repetitions have fixed length
-            if rep.min == rep.max.unwrap_or(0) {
+            // Only a bounded repetition of exactly rep.min copies has a fixed
+            // length. An unbounded repetition has max == None; comparing
+            // against a defaulted 0 used to classify `x*` (min 0, max None) as
+            // a fixed length of zero, which made the generated scanner rewind
+            // to the token start and loop forever.
+            if rep.max == Some(rep.min) {
                 let sub_len = compute_fixed_length(&rep.sub)?;
                 Some(sub_len * rep.min as usize)
             } else {
@@ -232,11 +257,8 @@ fn write_stats<W: Write + ?Sized>(
     writeln!(output, "  {} rules", lexinfo.rules.len())?;
     writeln!(output, "  {} substitution definitions", lexinfo.subs.len())?;
     writeln!(output, "  {} NFA states", nfa.states.len())?;
-    writeln!(
-        output,
-        "  {} DFA states (before minimization)",
-        dfa.num_states()
-    )?;
+    // run() minimizes before reporting, so this is the final state count.
+    writeln!(output, "  {} DFA states", dfa.num_states())?;
     writeln!(output, "  {} DFA transitions", dfa.num_transitions())?;
     writeln!(
         output,

@@ -252,14 +252,20 @@ impl Nfa {
 
     /// Build NFA for repetition (*, +, ?, {n,m})
     fn build_repetition(&mut self, rep: &Repetition) -> Result<(usize, usize), String> {
-        let (sub_start, sub_end) = self.build_hir(&rep.sub)?;
-
-        let start = self.add_state();
-        let end = self.add_state();
-
         // Get min and max from the repetition
         let min = rep.min;
         let max = rep.max; // None means unbounded
+
+        // *, + and ? wrap a single copy of the sub-expression; the bounded
+        // forms build their own copies below. Building one up front regardless
+        // left an unreachable fragment behind in every {n,m} pattern.
+        let sub = match (min, max) {
+            (0, None) | (1, None) | (0, Some(1)) => Some(self.build_hir(&rep.sub)?),
+            _ => None,
+        };
+
+        let start = self.add_state();
+        let end = self.add_state();
 
         match (min, max) {
             // * (zero or more)
@@ -268,6 +274,7 @@ impl Nfa {
                 // start -> end (can skip)
                 // sub_end -> sub_start (can repeat)
                 // sub_end -> end (can exit)
+                let (sub_start, sub_end) = sub.expect("* builds its sub-expression");
                 self.add_transition(start, Transition::Epsilon, sub_start);
                 self.add_transition(start, Transition::Epsilon, end);
                 self.add_transition(sub_end, Transition::Epsilon, sub_start);
@@ -280,6 +287,7 @@ impl Nfa {
                 // start -> sub_start
                 // sub_end -> sub_start (can repeat)
                 // sub_end -> end (can exit)
+                let (sub_start, sub_end) = sub.expect("+ builds its sub-expression");
                 self.add_transition(start, Transition::Epsilon, sub_start);
                 self.add_transition(sub_end, Transition::Epsilon, sub_start);
                 self.add_transition(sub_end, Transition::Epsilon, end);
@@ -290,6 +298,7 @@ impl Nfa {
                 // start -> sub_start (can enter)
                 // start -> end (can skip)
                 // sub_end -> end
+                let (sub_start, sub_end) = sub.expect("? builds its sub-expression");
                 self.add_transition(start, Transition::Epsilon, sub_start);
                 self.add_transition(start, Transition::Epsilon, end);
                 self.add_transition(sub_end, Transition::Epsilon, end);
@@ -412,6 +421,40 @@ mod tests {
 
     fn parse_regex(pattern: &str) -> Hir {
         regex_syntax::parse(pattern).expect("Failed to parse regex")
+    }
+
+    /// Collect every state reachable from the NFA start state.
+    fn reachable(nfa: &Nfa) -> BTreeSet<usize> {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![nfa.start];
+        while let Some(s) = stack.pop() {
+            if !seen.insert(s) {
+                continue;
+            }
+            for (_, target) in &nfa.states[s].transitions {
+                stack.push(*target);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn test_interval_repetition_leaves_no_orphan_states() {
+        // build_repetition() built one copy of the sub-expression up front and
+        // then, for the bounded forms, built all the copies it actually used --
+        // stranding the first one as unreachable NFA states.
+        for pattern in ["a{2}", "a{2,3}", "a{2,}", "(ab){0}"] {
+            let hir = parse_regex(pattern);
+            let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+            let live = reachable(&nfa);
+            assert_eq!(
+                live.len(),
+                nfa.states.len(),
+                "{} left {} unreachable state(s)",
+                pattern,
+                nfa.states.len() - live.len()
+            );
+        }
     }
 
     #[test]

@@ -43,8 +43,18 @@ pub const EOF_SYMBOL: SymbolId = 0;
 /// The special error token
 pub const ERROR_SYMBOL: SymbolId = 1;
 
+/// The placeholder terminal that every token number without a declared
+/// terminal translates to.
+///
+/// It appears in no rule, so no state ever has an action for it and any token
+/// mapping to it reaches the parser's error path. Without it, unknown token
+/// numbers translated to `error`, which some states *can* shift -- the parser
+/// would then enter recovery with no `yyerror()` call and no `yynerrs`
+/// increment.
+pub const UNDEF_SYMBOL: SymbolId = 2;
+
 /// The augmented start symbol (S')
-pub const AUGMENTED_START: SymbolId = 2;
+pub const AUGMENTED_START: SymbolId = 3;
 
 /// A symbol in the grammar
 #[derive(Debug, Clone)]
@@ -161,7 +171,10 @@ impl Grammar {
         // Add special symbols (these cannot fail - they are the first symbols added)
         grammar.add_symbol("$end", true, None, Some(0), 0, None)?; // EOF_SYMBOL = 0
         grammar.add_symbol("error", true, None, Some(256), 0, None)?; // ERROR_SYMBOL = 1
-        grammar.add_symbol("$accept", false, None, None, 0, None)?; // AUGMENTED_START = 2
+                                                                      // $undefined gets no token number: nothing maps to it except
+                                                                      // yytranslate's default fill.
+        grammar.add_symbol("$undefined", true, None, None, 0, None)?; // UNDEF_SYMBOL = 2
+        grammar.add_symbol("$accept", false, None, None, 0, None)?; // AUGMENTED_START = 3
 
         // Add declared tokens - two pass approach per POSIX:
         // 1. First pass: register all tokens with explicit numbers

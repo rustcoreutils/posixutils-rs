@@ -4721,3 +4721,123 @@ e : e '+' e | e '-' e | e '*' e | e '/' e
         stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// Token numbers with no declared terminal
+// ---------------------------------------------------------------------------
+
+/// Grammar shared by the $undefined tests: a line-oriented parser with an
+/// `error` recovery rule, fed a token number that was never declared.
+/// `$INPUT` is substituted with the C string literal the lexer walks.
+const UNDECLARED_TOKEN_DRIVER: &str = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+extern int yynerrs;
+static int recovered;
+static int reported;
+%}
+
+%token NUM
+
+%%
+input : lines ;
+lines : lines line | line ;
+line  : NUM '\n'
+      | error '\n'  { recovered++; yyerrok; }
+      ;
+%%
+
+int yylval;
+static const char *in = $INPUT;
+static int pos;
+
+int yylex(void) {
+    char c = in[pos];
+    if (c == '\0') return 0;
+    pos++;
+    if (c >= '0' && c <= '9') { yylval = c - '0'; return NUM; }
+    if (c == '!') return 30000;   /* far above YYTRANSLATE_SIZE */
+    return c;
+}
+
+void yyerror(const char *s) { reported++; (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    /* Recovery must have happened *through* the error path: yyerror called
+       once and yynerrs bumped, not a silent shift of the error token. */
+    if (recovered != 1) return 2;
+    if (reported != 1) return 3;
+    if (yynerrs != 1) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn test_undeclared_token_number_is_a_syntax_error() {
+    // yytranslate filled every unassigned token number with the *error*
+    // token's dense index. In a state that can shift `error` -- which is any
+    // grammar with a recovery rule -- an undeclared token was therefore
+    // shifted as the error token: no yyerror() call, no yynerrs increment,
+    // yyerrflag never set. '@' below is never declared.
+    let grammar = UNDECLARED_TOKEN_DRIVER.replace("$INPUT", "\"@\\n1\\n\"");
+    run_end_to_end_both_modes(&grammar, "undeclared_token");
+}
+
+#[test]
+fn test_token_number_past_the_translate_table_is_a_syntax_error() {
+    // Same path for a token number too large to index yytranslate at all,
+    // which took the out-of-range fallback rather than the default fill.
+    let grammar = UNDECLARED_TOKEN_DRIVER.replace("$INPUT", "\"!\\n1\\n\"");
+    run_end_to_end_both_modes(&grammar, "out_of_range_token");
+}
+
+#[test]
+fn test_undefined_placeholder_is_not_emitted_as_a_token_define() {
+    // $undefined and the other internal symbols must stay out of y.tab.h --
+    // their names are not C identifiers and the lexer must never name them.
+    let grammar = r#"
+%token NUM
+%%
+line : NUM '\n' | error '\n' ;
+"#;
+
+    let header = gen_and_read(&["-d"], grammar, "y.tab.h");
+
+    assert!(
+        !header.contains("undefined"),
+        "y.tab.h must not define the internal placeholder, got: {}",
+        header
+    );
+    assert!(
+        header.contains("#define NUM"),
+        "the user's token must still be defined, got: {}",
+        header
+    );
+}
+
+#[test]
+fn test_description_file_lists_undefined_without_a_token_number() {
+    // $undefined has no token number; the description file used to print a
+    // placeholder 0, which reads as $end's number.
+    let grammar = r#"
+%token NUM
+%%
+line : NUM ;
+"#;
+
+    let output = gen_and_read(&["-v"], grammar, "y.output");
+
+    assert!(
+        output.contains("$undefined\n"),
+        "expected a bare $undefined entry, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("$undefined ("),
+        "$undefined has no token number to print, got:\n{}",
+        output
+    );
+}

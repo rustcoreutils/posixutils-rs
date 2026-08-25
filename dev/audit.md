@@ -106,6 +106,16 @@ crash-safety, and Mach-O (macOS CI) cases. No open item is a known defect.
 
 ### TL;DR
 
+> **Correction, 2026-08-25.** The next paragraph's opening claim — that the
+> LALR(1) core is "solid and well-tested" — was wrong, and was never probed.
+> A design review of the algorithms, data structures, and control flow found
+> nine defects inside exactly the areas it named. Three of them stopped yacc
+> working on ordinary grammars: `%nonassoc` aborted the generator with an
+> internal-error panic, a mutually recursive non-terminal made the lookahead
+> closure spin forever, and every `$n` in a mid-rule action read past the top
+> of the value stack. See "LALR core defects" below. The rest of the TL;DR,
+> which is about the code file's boilerplate, still stands.
+
 The LALR(1) generator core (tables, conflict resolution, error recovery, action
 transformation, mid-rule actions) is solid and well-tested. POSIX conformance
 gaps are concentrated in the generated code file's *boilerplate* — the
@@ -116,6 +126,37 @@ utility itself does no locale setup, reads no `LC_*` variables, and produces
 hardcoded-English diagnostics. The `-v` description file is not produced when
 errors abort the run before codegen, and the runtime debug code is only
 emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
+
+### LALR core defects (found 2026-08-25, all fixed)
+
+Every row below was reproduced against a `--release` build before being fixed,
+and each has an end-to-end test in `dev/tests/yacc/mod.rs` that fails against
+the preceding commit. Where a reference answer exists, `bison` 3.8.2 was used:
+on `dev/tests/fixtures/python39.y` the two implementations now agree exactly
+(2 shift/reduce, 4 reduce/reduce), which they did not before #Y7 and #Y9.
+
+| # | Site | Defect | Severity |
+|---|---|---|---|
+| #Y1 | `codegen.rs` `build_packed_tables` | `consistent[]` ignored `Action::Error`, so a state holding one reduce plus a `%nonassoc` error entry reduced without reading the lookahead. `verify.rs` caught it and **panicked** — `%nonassoc '<'` killed yacc outright. `--strict` masked it. | Critical |
+| #Y2 | `lalr.rs` phase-1 worklist | The `\|\| old_size == 0` guard was not monotone; two items with empty lookahead sets re-pushed each other forever. yacc **hung** on `x : y ; y : x ;`. | Critical |
+| #Y3 | `grammar.rs` validation | No productivity check, so #Y2's root cause was reachable from an ordinary typo. | Critical |
+| #Y4 | `grammar.rs` mid-rule lowering + `codegen.rs` `transform_action` | The lowered `@N → ε` production's RHS length (0) was used to resolve `$n`, so every reference in a mid-rule action landed past the stack top. POSIX 123914-15. | Critical |
+| #Y5 | `codegen.rs` reduce switch | The default `$$ = $1` was emitted only for rules with no action, so an action that never assigns `$$` inherited the previous reduction's value. POSIX 123922. | Major |
+| #Y6 | `codegen.rs` `yytranslate` | Unassigned and out-of-range token numbers mapped to the `error` token's index, so undeclared input was *shifted as* `error`: no `yyerror()`, no `yynerrs`. Fixed by reserving a `$undefined` terminal that appears in no rule. | Major |
+| #Y7 | `grammar.rs` rule precedence | Used the last terminal *with* a precedence rather than the last terminal, silently resolving conflicts POSIX 124050 says to report. | Major |
+| #Y8 | `codegen.rs` error recovery | The error-token shift bumped `yyvsp` without storing, so `stmt : error ';' { use($1); }` read uninitialized memory. | Major |
+| #Y9 | `lalr.rs` `count_conflicts` | N-way reduce/reduce counted as 1 conflict instead of N-1, making `%expect-rr` unsatisfiable above 2. | Minor |
+
+Three further defects from the same review are **open**, deliberately left out
+of scope:
+
+- **`yytname` is indexed with a dense terminal index** but emitted in raw
+  symbol-id order, so `-t` debug output prints the wrong symbol names.
+- **`$` substitution runs inside C string literals and comments** —
+  `printf("costs $1")` in an action is rewritten to `printf("costs (yyvsp[0])")`.
+- **Character literals in `%token`/`%left`/… declarations skip the `1..=255`
+  range check** that rule-position literals get (audit #12 above closed only
+  the rule-position path), so `%left '€'` yields an 8 KB `yytranslate`.
 
 ### Priority issues
 

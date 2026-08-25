@@ -15,7 +15,7 @@
 //! - Stack-based parser with error recovery per POSIX
 
 use crate::error::YaccError;
-use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL};
+use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL, UNDEF_SYMBOL};
 use crate::lalr::{Action, LALRAutomaton};
 use crate::Options;
 use gettextrs::gettext;
@@ -233,7 +233,7 @@ fn generate_token_defines<W: Write>(w: &mut W, grammar: &Grammar) -> Result<(), 
     let mut tokens: Vec<(String, i32)> = Vec::new();
 
     for (id, sym) in grammar.symbols.iter().enumerate() {
-        if sym.is_terminal && id != EOF_SYMBOL && id != ERROR_SYMBOL {
+        if sym.is_terminal && id != EOF_SYMBOL && id != ERROR_SYMBOL && id != UNDEF_SYMBOL {
             if let Some(num) = sym.token_number {
                 // Skip character literals (they don't need defines)
                 if !sym.name.starts_with('\'') {
@@ -297,6 +297,14 @@ fn generate_tables<W: Write>(
         .terminal_index(ERROR_SYMBOL)
         .expect("error must have term_idx");
     writeln!(w, "#define YYERROR_TERM_IDX {}", error_term_idx)?;
+    writeln!(w)?;
+
+    // YYUNDEF_TERM_IDX - dense terminal index for $undefined, the placeholder
+    // every token number without a declared terminal translates to
+    let undef_term_idx = grammar
+        .terminal_index(UNDEF_SYMBOL)
+        .expect("$undefined must have term_idx");
+    writeln!(w, "#define YYUNDEF_TERM_IDX {}", undef_term_idx)?;
     writeln!(w)?;
 
     // YYNRULES - number of rules
@@ -365,13 +373,17 @@ fn generate_token_translate_table<W: Write>(
     let eof_term_idx = grammar
         .terminal_index(EOF_SYMBOL)
         .expect("EOF must have term_idx");
-    let error_term_idx = grammar
-        .terminal_index(ERROR_SYMBOL)
-        .expect("error must have term_idx");
+    let undef_term_idx = grammar
+        .terminal_index(UNDEF_SYMBOL)
+        .expect("$undefined must have term_idx");
 
-    // Create translation: external token number -> dense terminal index
-    // Unknown tokens map to error_term_idx (the error token's dense index)
-    let mut translate = vec![error_term_idx as u16; (max_token + 1) as usize];
+    // Create translation: external token number -> dense terminal index.
+    // A token number with no declared terminal maps to $undefined, which
+    // appears in no rule, so it always reaches the parser's error path. Mapping
+    // it to `error` instead let an undeclared token be *shifted* as the error
+    // token in any state that can shift one -- silent recovery with no
+    // yyerror() call and no yynerrs increment.
+    let mut translate = vec![undef_term_idx as u16; (max_token + 1) as usize];
     translate[0] = eof_term_idx as u16; // EOF token number 0 -> EOF dense index
 
     for (sym_id, sym) in grammar.symbols.iter().enumerate() {
@@ -1185,13 +1197,12 @@ fn generate_parser<W: Write>(
     writeln!(w, "        if ({}debug) {{", prefix)?;
     writeln!(
         w,
-        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        "            int {}tok = {}char < {} ? {}translate[{}char] : YYUNDEF_TERM_IDX;",
         prefix,
         prefix,
         get_translate_table_size(grammar),
         prefix,
-        prefix,
-        ERROR_SYMBOL
+        prefix
     )?;
     writeln!(
         w,
@@ -1216,7 +1227,7 @@ fn generate_parser<W: Write>(
     writeln!(w, "    {{")?;
     writeln!(
         w,
-        "        int {}tok = {}char < {} ? {}translate[{}char] : YYERROR_TERM_IDX;",
+        "        int {}tok = {}char < {} ? {}translate[{}char] : YYUNDEF_TERM_IDX;",
         prefix,
         prefix,
         get_translate_table_size(grammar),
@@ -1244,13 +1255,12 @@ fn generate_parser<W: Write>(
     writeln!(w, "        if ({}debug) {{", prefix)?;
     writeln!(
         w,
-        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        "            int {}tok = {}char < {} ? {}translate[{}char] : YYUNDEF_TERM_IDX;",
         prefix,
         prefix,
         get_translate_table_size(grammar),
         prefix,
-        prefix,
-        ERROR_SYMBOL
+        prefix
     )?;
     writeln!(
         w,
@@ -1413,13 +1423,12 @@ fn generate_parser<W: Write>(
     writeln!(w, "        if ({}debug) {{", prefix)?;
     writeln!(
         w,
-        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        "            int {}tok = {}char < {} ? {}translate[{}char] : YYUNDEF_TERM_IDX;",
         prefix,
         prefix,
         get_translate_table_size(grammar),
         prefix,
-        prefix,
-        ERROR_SYMBOL
+        prefix
     )?;
     writeln!(
         w,
@@ -1797,7 +1806,12 @@ fn generate_description_file(
     writeln!(w)?;
     for (id, sym) in grammar.symbols.iter().enumerate() {
         if sym.is_terminal {
-            write!(w, "  {} ({})", sym.name, sym.token_number.unwrap_or(0))?;
+            // $undefined has no token number; printing a placeholder 0 would
+            // read as $end's number.
+            match sym.token_number {
+                Some(num) => write!(w, "  {} ({})", sym.name, num)?,
+                None => write!(w, "  {}", sym.name)?,
+            }
             let prods: Vec<usize> = grammar
                 .productions
                 .iter()

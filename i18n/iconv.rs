@@ -19,6 +19,7 @@ use plib::io::input_stream;
 use std::{
     cell::Cell,
     collections::HashMap,
+    fmt,
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -26,8 +27,6 @@ use std::{
     rc::Rc,
     str::FromStr,
 };
-use strum::IntoEnumIterator;
-use strum_macros::{Display, EnumIter, EnumString};
 
 mod iconv_lib;
 
@@ -149,8 +148,7 @@ impl<R: Read> IntoIterator for CircularBuffer<R> {
 }
 
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
-#[derive(EnumString, EnumIter, Debug, PartialEq, Display)]
-#[strum(serialize_all = "SCREAMING-KEBAB-CASE")]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Encodings {
     ASCII,
     UTF_8,
@@ -160,6 +158,53 @@ enum Encodings {
     UTF_32,
     UTF_32LE,
     UTF_32BE,
+}
+
+/// Every encoding paired with its canonical codeset name.
+///
+/// This is the single source for `FromStr`, `Display` and `iter`, so a variant
+/// cannot be listed for one and missed by another. The names are the
+/// hyphenated forms `-f`/`-t` accept and `-l` prints.
+const ENCODINGS: [(Encodings, &str); 8] = [
+    (Encodings::ASCII, "ASCII"),
+    (Encodings::UTF_8, "UTF-8"),
+    (Encodings::UTF_16, "UTF-16"),
+    (Encodings::UTF_16LE, "UTF-16LE"),
+    (Encodings::UTF_16BE, "UTF-16BE"),
+    (Encodings::UTF_32, "UTF-32"),
+    (Encodings::UTF_32LE, "UTF-32LE"),
+    (Encodings::UTF_32BE, "UTF-32BE"),
+];
+
+impl Encodings {
+    /// The encodings, in the order `-l` lists them.
+    fn iter() -> impl Iterator<Item = Encodings> {
+        ENCODINGS.iter().map(|&(encoding, _)| encoding)
+    }
+}
+
+impl FromStr for Encodings {
+    type Err = ();
+
+    /// Matches the canonical name exactly; see [`Encodings::canonical_name`]
+    /// for the alias folding that runs first.
+    fn from_str(s: &str) -> Result<Encodings, ()> {
+        ENCODINGS
+            .iter()
+            .find(|&&(_, name)| name == s)
+            .map(|&(encoding, _)| encoding)
+            .ok_or(())
+    }
+}
+
+impl fmt::Display for Encodings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (_, name) = ENCODINGS
+            .iter()
+            .find(|&&(encoding, _)| encoding == *self)
+            .expect("ENCODINGS covers every variant");
+        f.write_str(name)
+    }
 }
 
 impl Encodings {

@@ -205,7 +205,7 @@ pub struct MessageCatalog {
 
 /// Magic Header structure for the catalog file
 #[cfg(target_os = "macos")]
-#[derive(bytemuck::NoUninit, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct CatFileMagicHeader {
     /// Magic cookie "*nazgul*"
@@ -225,6 +225,29 @@ struct CatFileMagicHeader {
 
     /// Offset of first set on disk
     first_set: i64,
+}
+
+#[cfg(target_os = "macos")]
+impl CatFileMagicHeader {
+    /// Wire size: 8 magic bytes, four `i32`s, then an 8-aligned `i64`.
+    const LEN: usize = 32;
+
+    /// Serialize in declaration order.
+    ///
+    /// Every integer field is stored already byte-swapped by the caller (each
+    /// is built with `.to_be()`), so the bytes go out in native order here and
+    /// the file ends up big-endian. Writing the fields out one at a time keeps
+    /// that independent of how the compiler happens to lay the struct out.
+    fn to_bytes(self) -> [u8; Self::LEN] {
+        let mut bytes = [0u8; Self::LEN];
+        bytes[0..8].copy_from_slice(&self.magic);
+        bytes[8..12].copy_from_slice(&self.major_ver.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.minor_ver.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&self.flags.to_ne_bytes());
+        bytes[20..24].copy_from_slice(&self.num_sets.to_ne_bytes());
+        bytes[24..32].copy_from_slice(&self.first_set.to_ne_bytes());
+        bytes
+    }
 }
 
 #[derive(Debug)]
@@ -931,7 +954,7 @@ impl MessageCatalog {
             first_set: osx::FIRST_SET_OFFSET.to_be(),
         };
 
-        file.write_all(bytemuck::bytes_of(&header))?;
+        file.write_all(&header.to_bytes())?;
 
         // the position of the first_set value within the file that we need to change later on
         let first_set_pos = file.stream_position()? - 8;

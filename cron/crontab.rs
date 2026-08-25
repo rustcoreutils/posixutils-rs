@@ -164,12 +164,10 @@ fn do_edit(target: &str) -> ! {
         }
     };
     if let Err(e) = tmp.write_all(current.as_bytes()).and_then(|()| tmp.flush()) {
-        diag_error(&format!(
-            "{}: {}",
-            gettext("cannot write temporary file"),
-            e
-        ));
-        exit(1);
+        discard_edit(
+            tmp,
+            format!("{}: {}", gettext("cannot write temporary file"), e),
+        );
     }
     let tmp_path = tmp.path().to_path_buf();
 
@@ -183,23 +181,54 @@ fn do_edit(target: &str) -> ! {
 
     match cmd.status() {
         Ok(status) if status.success() => {}
-        Ok(_) => {
-            diag_error(&gettext("editor exited with an error; crontab unchanged"));
-            exit(1);
-        }
-        Err(e) => {
-            diag_error(&format!("{}: {}", gettext("cannot launch editor"), e));
-            exit(1);
-        }
+        // The editor ran, so the buffer may hold the user's work even though
+        // it exited badly. Losing an editing session is worse than leaving a
+        // file behind, so keep it and say where it is (as Vixie crontab does).
+        Ok(_) => keep_edit(
+            tmp,
+            gettext("editor exited with an error; crontab unchanged"),
+        ),
+        // The editor never started, so the buffer is just a copy of the
+        // current crontab and there is nothing to preserve.
+        Err(e) => discard_edit(tmp, format!("{}: {}", gettext("cannot launch editor"), e)),
     }
 
     match fs::read_to_string(&tmp_path) {
-        Ok(edited) => install_crontab(target, &edited),
-        Err(e) => {
-            diag_error(&format!("{}: {}", gettext("cannot read edited crontab"), e));
-            exit(1);
+        Ok(edited) => {
+            // Remove the edit buffer before handing off: install_crontab
+            // never returns, so nothing would drop it afterwards.
+            drop(tmp);
+            install_crontab(target, &edited)
         }
+        // The edits exist but could not be read back; keep them.
+        Err(e) => keep_edit(
+            tmp,
+            format!("{}: {}", gettext("cannot read edited crontab"), e),
+        ),
     }
+}
+
+/// Report `msg` and exit 1, removing the edit buffer on the way out.
+///
+/// `exit` does not run destructors, so every failure path in `do_edit` has to
+/// dispose of the temporary explicitly; otherwise each `crontab -e` would
+/// leave a copy of the user's crontab behind in the temporary directory. Use
+/// this only where the buffer cannot contain anything the user typed.
+fn discard_edit(tmp: plib::tmp::NamedTempFile, msg: String) -> ! {
+    drop(tmp);
+    diag_error(&msg);
+    exit(1);
+}
+
+/// Report `msg` and exit 1, leaving the edit buffer in place and naming it.
+///
+/// For the failure paths that come after the editor has run: the file may hold
+/// work the user would otherwise have to redo from memory.
+fn keep_edit(tmp: plib::tmp::NamedTempFile, msg: String) -> ! {
+    let path = tmp.keep();
+    diag_error(&msg);
+    diag_error(&format!("{} {}", gettext("edits left in"), path.display()));
+    exit(1);
 }
 
 /// Emit a diagnostic to standard error with the `crontab:` prefix (audit #C3).

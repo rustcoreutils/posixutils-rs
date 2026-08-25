@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! POSIX system logging via libc `openlog`/`syslog`/`closelog`.
+//! POSIX system logging via libc `openlog` and `syslog`.
 //!
 //! Messages are handed to the platform's own syslog implementation rather than
 //! written to `/dev/log` directly, so whatever transport, framing and fallback
@@ -26,6 +26,11 @@ use std::sync::OnceLock;
 pub struct Facility(c_int);
 
 impl Facility {
+    /// `LOG_KERN` is 0, and libc's `openlog` only records a non-zero facility,
+    /// so a message sent under this one is filed as `LOG_USER` instead. That
+    /// is a property of `syslog(3)`, not of this wrapper: the kernel facility
+    /// is not reachable from user space through it. Accepted so that
+    /// `logger -p kern.<level>` is not rejected outright.
     pub const KERN: Facility = Facility(libc::LOG_KERN);
     pub const USER: Facility = Facility(libc::LOG_USER);
     pub const MAIL: Facility = Facility(libc::LOG_MAIL);
@@ -141,6 +146,12 @@ impl FromStr for Level {
 /// the allocation has to outlive every later `syslog` call. Holding it here
 /// also makes repeat calls to [`open`] a no-op, which is what callers that log
 /// from several places want.
+///
+/// Because the first identity is the one that sticks, there is deliberately no
+/// `closelog` wrapper: `closelog` clears libc's tag but could not clear this
+/// cell, so a later `open` would return early and every subsequent message
+/// would silently lose its tag and facility for the life of the process.
+/// Process exit closes the log anyway.
 static IDENT: OnceLock<CString> = OnceLock::new();
 
 /// Establish the log identity. The first call wins; later ones do nothing.
@@ -174,12 +185,6 @@ pub fn log(level: Level, msg: &str) {
     // SAFETY: both pointers are valid NUL-terminated C strings for the call,
     // and the format string consumes exactly the one argument supplied.
     unsafe { libc::syslog(level.code(), c"%s".as_ptr(), msg.as_ptr()) };
-}
-
-/// Close the log connection.
-pub fn close() {
-    // SAFETY: closelog takes no arguments and is safe to call unconditionally.
-    unsafe { libc::closelog() };
 }
 
 #[cfg(test)]

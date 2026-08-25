@@ -4031,3 +4031,35 @@ fn test_second_caret_in_class_is_an_ordinary_member() {
     let result = compile_and_run(&c_code, "ab^cd").unwrap();
     assert_eq!(result, "M(ab)^M(cd)");
 }
+
+#[test]
+fn test_refill_at_an_accepting_state_records_one_accept() {
+    // A state emits its accept record before the end-of-buffer check, so
+    // resuming there after a refill used to re-run it and push a second,
+    // identical REJECT entry. The walk-back then handed the same match back
+    // twice and the action ran twice for one position.
+    let lex_input = r#"%option noinput nounput
+%%
+abcd        { printf("[abcd]"); REJECT; }
+abc         { printf("[abc]"); REJECT; }
+ab          { printf("[ab]"); REJECT; }
+a           { printf("[a]"); REJECT; }
+.|\n        { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // Sweep the 16 KB buffer boundary so the refill lands on each state of the
+    // "abcd" match in turn; one of these offsets is the failing case.
+    for pad in 16375..16385 {
+        let input = format!("{}abcd", ".".repeat(pad));
+        let result = compile_and_run_bounded(&c_code, &input, 20).expect("scanner must terminate");
+        assert_eq!(
+            result, "[abcd][abc][ab][a]",
+            "duplicate match with {} bytes of padding",
+            pad
+        );
+    }
+}

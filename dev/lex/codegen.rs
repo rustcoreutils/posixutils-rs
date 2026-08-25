@@ -1177,6 +1177,12 @@ fn write_dfa_state<W: Write>(
     }
 
     // Check for end of input - save state for resume after refill
+    // Resumption after a refill re-enters here, past the accept record and the
+    // trailing-context candidate above. Re-running those would push a second,
+    // identical entry for this position, and the REJECT walk-back -- which
+    // discards the top entry as the one just exhausted -- would then hand the
+    // same match back a second time.
+    writeln!(output, "yy_resume_{}:", state_idx)?;
     writeln!(
         output,
         "    if (YYCURSOR >= YYLIMIT) {{ yy_resume_state = {}; goto yy_fill_or_eof; }}",
@@ -1403,11 +1409,11 @@ fn write_yylex_direct_coded<W: Write>(
     for state_idx in 0..dfa.states.len() {
         writeln!(
             output,
-            "            case {}: goto yy_state_{};",
+            "            case {}: goto yy_resume_{};",
             state_idx, state_idx
         )?;
     }
-    writeln!(output, "            default: goto yy_state_0;")?;
+    writeln!(output, "            default: goto yy_resume_0;")?;
     writeln!(output, "        }}")?;
     writeln!(output, "    }}")?;
     writeln!(output)?;

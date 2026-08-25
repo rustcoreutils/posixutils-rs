@@ -14,18 +14,19 @@
 use crate::nfa::{Nfa, Transition};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Represents an input symbol for DFA transitions
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum DfaInput {
-    /// A specific character
-    Char(char),
-}
+/// Index of a character equivalence class.
+///
+/// DFA transitions are keyed by class rather than by character: every byte in a
+/// class drives the automaton identically, so determinization walks a handful of
+/// symbols instead of all 256.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClassId(pub usize);
 
 /// A state in the DFA
 #[derive(Debug, Clone)]
 pub struct DfaState {
     /// Transitions from this state: input -> target_state
-    pub transitions: BTreeMap<DfaInput, usize>,
+    pub transitions: BTreeMap<ClassId, usize>,
     /// If this is an accepting state, contains the rule index (highest priority)
     pub accepting: Option<usize>,
     /// All accepting rules for this state, sorted by priority (lowest index first)
@@ -68,13 +69,57 @@ pub struct Dfa {
     pub char_classes: CharClasses,
 }
 
-/// Character equivalence classes for efficient table representation
+/// A set of bytes, as a 256-bit mask.
+type ByteSet = [u64; 4];
+
+fn byte_set_insert(set: &mut ByteSet, b: u8) {
+    set[(b >> 6) as usize] |= 1u64 << (b & 63);
+}
+
+fn byte_set_contains(set: &ByteSet, b: u8) -> bool {
+    (set[(b >> 6) as usize] >> (b & 63)) & 1 == 1
+}
+
+/// The bytes a single NFA transition accepts.
+///
+/// Characters above U+00FF cannot appear in the byte-oriented scanner, so they
+/// contribute nothing; epsilon transitions consume no input at all.
+fn transition_byte_set(trans: &Transition) -> Option<ByteSet> {
+    let mut set: ByteSet = [0; 4];
+    match trans {
+        Transition::Epsilon => return None,
+        Transition::Char(c) => {
+            let c = *c as u32;
+            if c > 255 {
+                return None;
+            }
+            byte_set_insert(&mut set, c as u8);
+        }
+        Transition::CharClass(ranges) => {
+            for (lo, hi) in ranges {
+                let lo = *lo as u32;
+                let hi = std::cmp::min(*hi as u32, 255);
+                if lo > hi {
+                    continue;
+                }
+                for b in lo..=hi {
+                    byte_set_insert(&mut set, b as u8);
+                }
+            }
+        }
+    }
+    Some(set)
+}
+
+/// Character equivalence classes: bytes no rule can tell apart.
 #[derive(Debug, Clone)]
 pub struct CharClasses {
-    /// Maps each character to its equivalence class
+    /// Maps each byte to its equivalence class
     pub char_to_class: [u8; 256],
     /// Number of distinct equivalence classes
     pub num_classes: usize,
+    /// One representative byte per class, for driving the NFA
+    reps: Vec<u8>,
 }
 
 impl Default for CharClasses {
@@ -88,55 +133,100 @@ impl CharClasses {
         CharClasses {
             char_to_class: [0; 256],
             num_classes: 1,
+            reps: vec![0],
         }
     }
 
-    /// Build character equivalence classes from the DFA
-    fn build(dfa: &Dfa) -> Self {
-        // Start with all characters in class 0
-        let mut char_to_class = [0u8; 256];
-        let mut class_signatures: HashMap<Vec<Option<usize>>, u8> = HashMap::new();
-        // Counted in usize: there can be 256 distinct classes, one more than a
-        // u8 can count, and a saturating u8 under-reported the total by one
-        // whenever every character had its own class.
-        let mut next_class: usize = 0;
-
-        // For each character, compute its "signature" (vector of target states from each DFA state)
-        for ch in 0u8..=255 {
-            let c = ch as char;
-            let signature: Vec<Option<usize>> = dfa
-                .states
-                .iter()
-                .map(|state| state.transitions.get(&DfaInput::Char(c)).copied())
-                .collect();
-
-            if let Some(&existing_class) = class_signatures.get(&signature) {
-                char_to_class[ch as usize] = existing_class;
-            } else {
-                // At most 256 characters yield at most 256 classes, so the
-                // class number always fits in the u8 table entry.
-                let class = next_class as u8;
-                char_to_class[ch as usize] = class;
-                class_signatures.insert(signature, class);
-                next_class += 1;
+    /// Derive equivalence classes from the NFA, before determinization.
+    ///
+    /// Start with every byte in one class and split by each transition's
+    /// character set; two bytes end up together exactly when no transition in
+    /// the automaton distinguishes them. Doing this first is what lets subset
+    /// construction iterate over a handful of classes rather than 256
+    /// characters -- the same ordering flex uses.
+    pub fn from_nfa(nfa: &Nfa) -> Self {
+        // Distinct character sets only: a rule set repeats the same class many
+        // times, and each distinct set can split the partition at most once.
+        let mut sets: BTreeSet<ByteSet> = BTreeSet::new();
+        for state in &nfa.states {
+            for (trans, _) in &state.transitions {
+                if let Some(set) = transition_byte_set(trans) {
+                    sets.insert(set);
+                }
             }
+        }
+
+        let mut classes: Vec<Vec<u8>> = vec![(0..=255u8).collect()];
+        for set in &sets {
+            let mut refined: Vec<Vec<u8>> = Vec::with_capacity(classes.len() + 1);
+            for class in classes.into_iter() {
+                let (inside, outside): (Vec<u8>, Vec<u8>) =
+                    class.into_iter().partition(|&b| byte_set_contains(set, b));
+                match (inside.is_empty(), outside.is_empty()) {
+                    // The set does not cut this class; keep it whole.
+                    (true, _) => refined.push(outside),
+                    (_, true) => refined.push(inside),
+                    _ => {
+                        refined.push(inside);
+                        refined.push(outside);
+                    }
+                }
+            }
+            classes = refined;
+        }
+
+        // At most 256 bytes yield at most 256 classes, so a class number always
+        // fits in the u8 table entry the generated scanner indexes with.
+        let mut char_to_class = [0u8; 256];
+        let mut reps = Vec::with_capacity(classes.len());
+        for (idx, members) in classes.iter().enumerate() {
+            for &b in members {
+                char_to_class[b as usize] = idx as u8;
+            }
+            reps.push(members[0]);
         }
 
         CharClasses {
             char_to_class,
-            num_classes: next_class,
+            num_classes: classes.len(),
+            reps,
         }
+    }
+
+    /// The class a byte belongs to.
+    pub fn class_of_byte(&self, b: u8) -> ClassId {
+        ClassId(self.char_to_class[b as usize] as usize)
+    }
+
+    /// A byte standing for the whole class.
+    pub fn representative(&self, class: ClassId) -> u8 {
+        self.reps[class.0]
+    }
+
+    /// Every class, in order.
+    pub fn classes(&self) -> impl Iterator<Item = ClassId> + '_ {
+        (0..self.num_classes).map(ClassId)
     }
 }
 
 impl Dfa {
     /// Convert an NFA to a DFA using subset construction
     pub fn from_nfa(nfa: &Nfa) -> Self {
+        let classes = CharClasses::from_nfa(nfa);
+        Self::from_nfa_with_classes(nfa, classes)
+    }
+
+    /// Convert an NFA to a DFA over a given set of equivalence classes.
+    ///
+    /// Taking the classes as an argument lets a subsidiary automaton -- a
+    /// trailing context, say -- share the main scanner's classes, so both can
+    /// be driven from one `yy_ec` table.
+    pub fn from_nfa_with_classes(nfa: &Nfa, char_classes: CharClasses) -> Self {
         let mut dfa = Dfa {
             states: Vec::new(),
             start: 0,
             bol_start: 0,
-            char_classes: CharClasses::new(),
+            char_classes,
         };
 
         // Map from NFA state sets to DFA state indices
@@ -170,17 +260,22 @@ impl Dfa {
         dfa.start = seed(&mut dfa, &mut state_map, &mut worklist, nfa.start);
         dfa.bol_start = seed(&mut dfa, &mut state_map, &mut worklist, nfa.bol_start);
 
-        // Build alphabet from all unique characters in NFA transitions
-        let alphabet = build_alphabet(nfa);
+        // Every byte in a class behaves identically, so one representative
+        // drives the NFA for the whole class.
+        let alphabet: Vec<(ClassId, char)> = dfa
+            .char_classes
+            .classes()
+            .map(|c| (c, dfa.char_classes.representative(c) as char))
+            .collect();
 
         // Process worklist
         while let Some(nfa_states) = worklist.pop() {
             let dfa_state_idx = *state_map.get(&nfa_states).unwrap();
 
-            // For each character in alphabet
-            for ch in &alphabet {
-                // Compute move on this character
-                let moved = nfa.move_on_char(&nfa_states, *ch);
+            // For each equivalence class
+            for &(class, rep) in &alphabet {
+                // Compute move on a representative of this class
+                let moved = nfa.move_on_char(&nfa_states, rep);
                 if moved.is_empty() {
                     continue;
                 }
@@ -209,12 +304,9 @@ impl Dfa {
                 // Add transition
                 dfa.states[dfa_state_idx]
                     .transitions
-                    .insert(DfaInput::Char(*ch), target_dfa_idx);
+                    .insert(class, target_dfa_idx);
             }
         }
-
-        // Build character equivalence classes
-        dfa.char_classes = CharClasses::build(&dfa);
 
         dfa
     }
@@ -256,13 +348,9 @@ impl Dfa {
             partitions.push(states);
         }
 
-        // Build alphabet for transitions
-        let alphabet: BTreeSet<char> = self
-            .states
-            .iter()
-            .flat_map(|s| s.transitions.keys())
-            .map(|DfaInput::Char(c)| *c)
-            .collect();
+        // Refinement runs over equivalence classes, not characters: the
+        // alphabet is a few dozen symbols rather than 256.
+        let alphabet: Vec<ClassId> = self.char_classes.classes().collect();
 
         // Refine partitions until fixed point
         let mut changed = true;
@@ -275,14 +363,14 @@ impl Dfa {
                 }
 
                 // Try to split this partition
-                for ch in &alphabet {
+                for class in &alphabet {
                     let partition = &partitions[partition_idx];
                     let mut splits: BTreeMap<Option<usize>, BTreeSet<usize>> = BTreeMap::new();
 
                     for &state in partition {
                         let target = self.states[state]
                             .transitions
-                            .get(&DfaInput::Char(*ch))
+                            .get(class)
                             .map(|&t| state_to_partition[t]);
                         splits.entry(target).or_default().insert(state);
                     }
@@ -343,9 +431,9 @@ impl Dfa {
             let old_state = &self.states[representative];
 
             let mut transitions = BTreeMap::new();
-            for (input, &target) in &old_state.transitions {
+            for (&class, &target) in &old_state.transitions {
                 let new_target = partition_to_new_state[state_to_partition[target]];
-                transitions.insert(input.clone(), new_target);
+                transitions.insert(class, new_target);
             }
 
             new_states.push(DfaState {
@@ -356,19 +444,15 @@ impl Dfa {
             });
         }
 
-        let minimized = Dfa {
+        // The classes come from the NFA and merging states cannot change
+        // which bytes an automaton can tell apart, so they carry over as-is.
+        Dfa {
             states: new_states,
             start: 0,
             // The beginning-of-line root is an entry point too, so it has to
             // follow the same partition remap as every transition target.
             bol_start: partition_to_new_state[state_to_partition[self.bol_start]],
             char_classes: self.char_classes.clone(),
-        };
-
-        // Rebuild character classes for minimized DFA
-        Dfa {
-            char_classes: CharClasses::build(&minimized),
-            ..minimized
         }
     }
 
@@ -395,41 +479,6 @@ fn get_main_pattern_end_rules(nfa: &Nfa, nfa_states: &BTreeSet<usize>) -> Vec<us
     rules.sort();
     rules.dedup();
     rules
-}
-
-/// Build the alphabet (set of all characters used in transitions) from an NFA
-/// Only includes ASCII characters (0-255) for C compatibility
-fn build_alphabet(nfa: &Nfa) -> Vec<char> {
-    let mut chars: BTreeSet<char> = BTreeSet::new();
-
-    for state in &nfa.states {
-        for (trans, _) in &state.transitions {
-            match trans {
-                Transition::Char(c) => {
-                    // Only include ASCII characters
-                    if (*c as u32) < 256 {
-                        chars.insert(*c);
-                    }
-                }
-                Transition::CharClass(ranges) => {
-                    // Add representative characters from each range (ASCII only)
-                    for (lo, hi) in ranges {
-                        // Clamp to ASCII range
-                        let lo_clamped = std::cmp::max(*lo as u32, 0);
-                        let hi_clamped = std::cmp::min(*hi as u32, 255);
-                        if lo_clamped <= hi_clamped {
-                            for c in lo_clamped..=hi_clamped {
-                                chars.insert(char::from_u32(c).unwrap_or('\0'));
-                            }
-                        }
-                    }
-                }
-                Transition::Epsilon => {}
-            }
-        }
-    }
-
-    chars.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -469,10 +518,16 @@ mod tests {
         let dfa = Dfa::from_nfa(&nfa);
 
         // Both 'a' and 'b' should lead to accepting states
-        if let Some(&target) = dfa.states[dfa.start].transitions.get(&DfaInput::Char('a')) {
+        if let Some(&target) = dfa.states[dfa.start]
+            .transitions
+            .get(&dfa.char_classes.class_of_byte(b'a'))
+        {
             assert!(dfa.states[target].accepting.is_some());
         }
-        if let Some(&target) = dfa.states[dfa.start].transitions.get(&DfaInput::Char('b')) {
+        if let Some(&target) = dfa.states[dfa.start]
+            .transitions
+            .get(&dfa.char_classes.class_of_byte(b'b'))
+        {
             assert!(dfa.states[target].accepting.is_some());
         }
     }
@@ -508,13 +563,13 @@ mod tests {
         // Navigate through "if"
         let state_after_i = dfa.states[dfa.start]
             .transitions
-            .get(&DfaInput::Char('i'))
+            .get(&dfa.char_classes.class_of_byte(b'i'))
             .copied();
         assert!(state_after_i.is_some());
 
         let state_after_if = dfa.states[state_after_i.unwrap()]
             .transitions
-            .get(&DfaInput::Char('f'))
+            .get(&dfa.char_classes.class_of_byte(b'f'))
             .copied();
         assert!(state_after_if.is_some());
 

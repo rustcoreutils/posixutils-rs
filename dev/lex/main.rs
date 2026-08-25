@@ -270,7 +270,13 @@ fn write_stats<W: Write + ?Sized>(
     writeln!(output, "  {} NFA states", nfa.states.len())?;
     // run() minimizes before reporting, so this is the final state count.
     writeln!(output, "  {} DFA states", dfa.num_states())?;
-    writeln!(output, "  {} DFA transitions", dfa.num_transitions())?;
+    // Counted per equivalence class, which is how they are stored: every byte
+    // in a class shares one transition.
+    writeln!(
+        output,
+        "  {} DFA transitions (by equivalence class)",
+        dfa.num_transitions()
+    )?;
     writeln!(
         output,
         "  {} character equivalence classes",
@@ -407,7 +413,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             index: 0,
             bol_anchor: false,
         }])?;
-        tc_dfas.push((r.index, Dfa::from_nfa(&tc_nfa).minimize()));
+        // Share the scanner's equivalence classes so the emitted matcher can
+        // be driven from the same yy_ec table. They come from the combined
+        // automaton, which contains these very transitions, so they are at
+        // least as fine as this trailing context needs.
+        tc_dfas.push((
+            r.index,
+            Dfa::from_nfa_with_classes(&tc_nfa, dfa.char_classes.clone()).minimize(),
+        ));
     }
 
     // Build rule metadata for code generation

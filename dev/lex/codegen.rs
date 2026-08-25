@@ -14,7 +14,7 @@
 //! consecutive equivalence classes with the same target state are merged
 //! into range comparisons, producing compact code.
 
-use crate::dfa::{Dfa, DfaInput, DfaState};
+use crate::dfa::{ClassId, Dfa, DfaState};
 use crate::lexfile::LexInfo;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -443,12 +443,12 @@ fn write_char_class_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result<()>
     )?;
     write!(output, "static const unsigned char yy_ec[256] = {{")?;
 
-    for (i, &class) in dfa.char_classes.char_to_class.iter().enumerate() {
-        if i % 16 == 0 {
+    for b in 0u8..=255 {
+        if b % 16 == 0 {
             write!(output, "\n    ")?;
         }
-        write!(output, "{:3}", class)?;
-        if i < 255 {
+        write!(output, "{:3}", dfa.char_classes.class_of_byte(b).0)?;
+        if b < 255 {
             write!(output, ",")?;
         }
     }
@@ -879,16 +879,7 @@ fn write_trailing_context_matchers<W: Write>(
         return Ok(());
     }
 
-    // One representative character per equivalence class, to read the
-    // trailing-context DFA's char-keyed transitions off by class.
     let num_classes = dfa.char_classes.num_classes;
-    let mut class_rep: Vec<Option<char>> = vec![None; num_classes];
-    for ch in 0u8..=255 {
-        let class = dfa.char_classes.char_to_class[ch as usize] as usize;
-        if class < num_classes && class_rep[class].is_none() {
-            class_rep[class] = Some(ch as char);
-        }
-    }
 
     writeln!(
         output,
@@ -911,9 +902,10 @@ fn write_trailing_context_matchers<W: Write>(
         )?;
         for state in &tc.states {
             write!(output, "        {{ ")?;
-            for (class, rep) in class_rep.iter().enumerate() {
-                let target = rep
-                    .and_then(|c| state.transitions.get(&DfaInput::Char(c)))
+            for class in 0..num_classes {
+                let target = state
+                    .transitions
+                    .get(&ClassId(class))
                     .map(|&t| t as i32)
                     .unwrap_or(-1);
                 write!(output, "{}", target)?;
@@ -1012,27 +1004,16 @@ fn write_reject_push<W: Write>(output: &mut W, indent: &str, state_idx: usize) -
 }
 
 /// Build a map of equivalence class -> target state for transitions from a DFA state
-fn build_class_transitions(dfa: &Dfa, state: &DfaState) -> BTreeMap<usize, usize> {
-    let mut class_to_target: BTreeMap<usize, usize> = BTreeMap::new();
-
-    for (input, &target) in &state.transitions {
-        let DfaInput::Char(ch) = input;
-        let ch_code = *ch as u32;
-        if ch_code < 256 {
-            let class_idx = dfa.char_classes.char_to_class[ch_code as usize] as usize;
-            // Assert consistency: if class already mapped, target must match
-            if let Some(&existing) = class_to_target.get(&class_idx) {
-                assert_eq!(
-                    existing, target,
-                    "char-class {} has inconsistent targets: {} vs {}",
-                    class_idx, existing, target
-                );
-            }
-            class_to_target.insert(class_idx, target);
-        }
-    }
-
-    class_to_target
+fn build_class_transitions(state: &DfaState) -> BTreeMap<usize, usize> {
+    // Transitions are already keyed by equivalence class, so this is only a
+    // change of key type. It used to fold characters into classes here and
+    // assert the fold was consistent; determinization now works in classes, so
+    // there is nothing left to collapse.
+    state
+        .transitions
+        .iter()
+        .map(|(class, &target)| (class.0, target))
+        .collect()
 }
 
 /// Build spans from class transitions by merging consecutive classes with the same target.
@@ -1143,7 +1124,6 @@ fn write_transitions_as_spans<W: Write>(output: &mut W, spans: &[Span]) -> io::R
 /// Write a single DFA state as a labeled block with span-based transitions
 fn write_dfa_state<W: Write>(
     output: &mut W,
-    dfa: &Dfa,
     state_idx: usize,
     state: &DfaState,
     config: &CodeGenConfig,
@@ -1280,7 +1260,7 @@ fn write_dfa_state<W: Write>(
     )?;
 
     // Get transitions grouped by equivalence class and compress into spans
-    let transitions = build_class_transitions(dfa, state);
+    let transitions = build_class_transitions(state);
     let spans = build_spans(&transitions);
 
     // Generate span-based if-chain (more compact than switch with individual cases)
@@ -1433,7 +1413,7 @@ fn write_yylex_direct_coded<W: Write>(
 
     // Generate all DFA states
     for (state_idx, state) in dfa.states.iter().enumerate() {
-        write_dfa_state(output, dfa, state_idx, state, config, flags)?;
+        write_dfa_state(output, state_idx, state, config, flags)?;
     }
 
     // YYFILL/EOF block

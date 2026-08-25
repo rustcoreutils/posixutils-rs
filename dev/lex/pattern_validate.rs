@@ -99,10 +99,14 @@ fn unescaped_chars(pattern: &str) -> Vec<PatternChar> {
 
     let mut out = Vec::with_capacity(chars.len());
     let mut in_brackets = false;
-    // POSIX: a ']' first in a bracket expression, possibly after '^', is an
-    // ordinary member rather than the terminator -- "[]/]" is a class of ']'
-    // and '/', not an empty class followed by a trailing-context operator.
+    // POSIX: a ']' first in a bracket expression, possibly after a negating
+    // '^', is an ordinary member rather than the terminator -- "[]/]" is a
+    // class of ']' and '/', not an empty class followed by a trailing-context
+    // operator. Only the very first member holds that position, and only a '^'
+    // immediately after '[' is the negation rather than a member of its own,
+    // so "[^^]" is the class of everything but a caret.
     let mut bracket_start = false;
+    let mut allow_negate = false;
     let mut in_quotes = false;
     let mut i = 0;
 
@@ -110,7 +114,11 @@ fn unescaped_chars(pattern: &str) -> Vec<PatternChar> {
         let ch = chars[i];
 
         if ch == '\\' {
+            // The escaped character is an ordinary member, so it ends the
+            // position where a ']' would be literal.
             i += 2; // the backslash and whatever it escapes
+            bracket_start = false;
+            allow_negate = false;
             continue;
         }
 
@@ -120,6 +128,7 @@ fn unescaped_chars(pattern: &str) -> Vec<PatternChar> {
                     if let Some(end) = find_posix_bracket_end(&chars, i + 2, next) {
                         i = end + 1;
                         bracket_start = false;
+                        allow_negate = false;
                         continue;
                     }
                 }
@@ -138,12 +147,14 @@ fn unescaped_chars(pattern: &str) -> Vec<PatternChar> {
             '[' if !in_quotes && !in_brackets => {
                 in_brackets = true;
                 bracket_start = true;
+                allow_negate = true;
             }
-            // Still at the start of the class: "[^]" has not closed anything.
-            '^' if in_brackets && bracket_start => {}
+            // The negation, not a member: "[^]" has not closed anything.
+            '^' if in_brackets && allow_negate => allow_negate = false,
             ']' if !in_quotes && in_brackets => {
                 if bracket_start {
                     bracket_start = false; // literal member
+                    allow_negate = false;
                 } else {
                     in_brackets = false;
                 }
@@ -151,6 +162,7 @@ fn unescaped_chars(pattern: &str) -> Vec<PatternChar> {
             _ => {
                 if in_brackets {
                     bracket_start = false;
+                    allow_negate = false;
                 }
             }
         }

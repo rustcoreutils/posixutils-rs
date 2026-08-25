@@ -433,9 +433,12 @@ enum RegexType {
 fn find_ere_end(line: &str) -> Result<usize, String> {
     let mut stack: Vec<RegexType> = Vec::new();
     let mut inside_brackets = false;
-    // POSIX: a ']' first in a bracket expression, possibly after '^', is an
-    // ordinary member rather than the terminator.
+    // POSIX: a ']' first in a bracket expression, possibly after a negating
+    // '^', is an ordinary member rather than the terminator. Only the first
+    // member holds that position, and only a '^' immediately after '[' is the
+    // negation rather than a member, so "[^^]" excludes a caret.
     let mut bracket_start = false;
+    let mut allow_negate = false;
     let mut inside_quotes = false;
     let mut escape_next = false;
     // Scanning is per character (lookahead indexes neighbours), but the result
@@ -450,7 +453,10 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
         // Handle escape sequences
         if escape_next {
             escape_next = false;
-            bracket_start = false; // an escaped character is an ordinary member
+            // An escaped character is an ordinary member, so it ends the
+            // position where a ']' would be literal.
+            bracket_start = false;
+            allow_negate = false;
             i += 1;
             continue;
         }
@@ -477,11 +483,13 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
         // ']'; every other member ends that position. Cleared here rather than
         // in each arm below, since most arms are about nesting, not membership.
         let at_class_start = bracket_start;
+        let can_negate = allow_negate;
         bracket_start = false;
+        allow_negate = false;
 
         match ch {
-            '^' if inside_brackets && at_class_start => {
-                // "[^]" has not closed anything yet.
+            '^' if inside_brackets && can_negate => {
+                // The negation, not a member: "[^]" has not closed anything.
                 bracket_start = true;
             }
             '[' => {
@@ -489,6 +497,7 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
                     stack.push(RegexType::Square);
                     inside_brackets = true;
                     bracket_start = true;
+                    allow_negate = true;
                 } else {
                     // Inside brackets: check for POSIX constructs [:, [=, [.
                     if i + 1 < chars.len() {
@@ -601,9 +610,10 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
     let mut in_quotes = false;
     let mut in_brace = false;
     let mut in_brackets = false;
-    // POSIX: a ']' first in a bracket expression, possibly after '^', is an
-    // ordinary member rather than the terminator.
+    // POSIX: a ']' first in a bracket expression, possibly after a negating
+    // '^', is an ordinary member rather than the terminator. See find_ere_end.
     let mut bracket_start = false;
+    let mut allow_negate = false;
     let mut brace_content = String::new();
     let mut escape_next = false;
     let chars: Vec<char> = ere.chars().collect();
@@ -615,6 +625,10 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
         // Handle escape sequences outside of quotes
         if escape_next && !in_quotes {
             escape_next = false;
+            // An escaped character is an ordinary member of a bracket
+            // expression, so it ends the position where a ']' would be literal.
+            bracket_start = false;
+            allow_negate = false;
             // In lex patterns, \c means literal character c
             // For regex, most chars just need to be passed through as \c
             // but some need hex escaping to avoid regex interpretation
@@ -746,9 +760,13 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
             } else if ch == ']' && !bracket_start {
                 in_brackets = false;
             }
-            // '^' right after '[' keeps the class at its start.
-            if !(bracket_start && ch == '^') {
+            // Only a '^' immediately after '[' is the negation; anything else,
+            // a second caret included, is a member and ends the class start.
+            if ch == '^' && allow_negate {
+                allow_negate = false;
+            } else {
                 bracket_start = false;
+                allow_negate = false;
             }
             re.push(ch);
         } else if ch == '"' {
@@ -758,6 +776,7 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
         } else if ch == '[' {
             in_brackets = true;
             bracket_start = true;
+            allow_negate = true;
             re.push(ch);
         } else {
             re.push(ch);

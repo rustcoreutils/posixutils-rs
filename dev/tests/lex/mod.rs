@@ -3952,3 +3952,82 @@ fn test_negated_class_with_escape_still_terminates() {
     let result = compile_and_run(&c_code, "ab {note} cd\n").unwrap();
     assert_eq!(result, "<w:ab><c><w:cd>");
 }
+
+#[test]
+fn test_escaped_member_does_not_hold_the_class_start() {
+    // An escaped character inside a bracket expression is an ordinary member,
+    // so it ends the position where a ']' would be literal. Treating "[^\n]"'s
+    // ']' as a member left the scanner "inside brackets" for the rest of the
+    // pattern, swallowing the '$' anchor, the '/' operator and {substitutions}.
+    let lex_input = r#"%option noinput nounput
+%%
+[^\n]*z$    { printf("M(%s)", yytext); }
+.|\n        { printf("%s", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // Only the second line ends in 'z', so only it may match.
+    let result = compile_and_run(&c_code, "az b\nxz\n").unwrap();
+    assert_eq!(result, "az b\nM(xz)\n");
+}
+
+#[test]
+fn test_escaped_bracket_member_keeps_trailing_context() {
+    let lex_input = r#"%option noinput nounput
+%%
+[\]]+/b     { printf("M(%s)", yytext); }
+.|\n        { printf("%s", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "]]b").unwrap();
+    assert_eq!(result, "M(]])b");
+}
+
+#[test]
+fn test_substitution_after_negated_class_is_expanded() {
+    // The same defect left translate_ere() inside brackets, so a {name}
+    // reference after such a class was copied through instead of expanded and
+    // the rule failed to compile at all.
+    let lex_input = r#"%option noinput nounput
+ID  [0-9]+
+%%
+[^\n]*{ID}  { printf("M(%s)", yytext); }
+.|\n        { printf("%s", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex rejected a substitution after [^\\n]: {}",
+        c_code
+    );
+
+    let result = compile_and_run(&c_code, "ab12\n").unwrap();
+    assert_eq!(result, "M(ab12)\n");
+}
+
+#[test]
+fn test_second_caret_in_class_is_an_ordinary_member() {
+    // Only a '^' immediately after '[' is the negation; "[^^]" is the class of
+    // everything except a caret, and its ']' terminates as usual.
+    let lex_input = r#"%option noinput nounput
+%%
+[^^]+       { printf("M(%s)", yytext); }
+.|\n        { printf("%s", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected [^^]: {}", c_code);
+
+    let result = compile_and_run(&c_code, "ab^cd").unwrap();
+    assert_eq!(result, "M(ab)^M(cd)");
+}

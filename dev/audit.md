@@ -411,18 +411,22 @@ Tests cover the high-confidence golden paths well (150 `#[test]`s including a CP
 
 ## `lex`
 
-**Implementation:** `dev/lex/` (main.rs 454, lexfile.rs 1369, codegen.rs 2203, dfa.rs 496, nfa.rs 637, pattern_escape.rs 259, pattern_validate.rs 283, diag.rs 120 — ~5.8 kloc)
-**Tests:** `dev/tests/lex/mod.rs` (3208 lines)
+**Implementation:** `dev/lex/` (codegen.rs, lexfile.rs, nfa.rs, dfa.rs, main.rs, pattern_validate.rs, pattern_escape.rs — ~6.2 kloc; diagnostics come from `plib::diag`)
+**Tests:** `dev/tests/lex/mod.rs` (122 integration tests) plus 62 unit tests in `dev/lex/`
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3085–3096
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/lex.md`
-**Date:** 2026-06-02
+**Date:** 2026-06-02; rows re-probed by execution 2026-08-25
 
 ### TL;DR
 
-The scanner generator core (NFA → DFA → minimized DFA → direct-coded C, with
+The scanner generator core (NFA → DFA → minimized DFA → direct-coded C) supports
 start conditions, trailing context, BOL anchoring, REJECT, yymore, yyless,
-substitution definitions, %array/%pointer, table-size declarations) is solid.
-POSIX conformance gaps cluster in two areas: (a) the generated `lex.yy.c`
+substitution definitions, %array/%pointer and table-size declarations. This
+audit called that core "solid"; it was checking that each feature was *present*
+and POSIX-shaped, not that it *matched correctly*, and a 2026-08-25 correctness
+review found 16 defects in exactly those features — see "Matching-correctness
+sweep" below. Every row in this audit is now re-probed by execution rather than
+by reading. POSIX conformance gaps cluster in two areas: (a) the generated `lex.yy.c`
 emits the lex-library functions `yywrap()` and `main()` inline, which spec
 102022–102031 says "shall appear only in the lex library accessible through
 the −l l operand" — breaking the conforming-application override path; and
@@ -430,6 +434,52 @@ the −l l operand" — breaking the conforming-application override path; and
 `unput()` is declared `static void` where the spec mandates `int unput(int)`.
 Locale handling is minimal: `gettext()` decorates clap help strings only,
 `setlocale` is never called, and runtime diagnostics are hardcoded English.
+
+### Matching-correctness sweep (2026-08-25)
+
+This audit checks that each POSIX feature is present and correctly shaped. It
+does not check that the generated scanner *tokenizes correctly*, and a review on
+2026-08-25 found 16 defects in features marked working below. All are fixed and
+carry regression tests; matching semantics are now diffed against flex 2.6.4
+(anchoring, start conditions, REJECT, both kinds of trailing context, bracket
+expressions).
+
+Two crashes or hangs:
+
+- `x*` as the main pattern of a trailing-context rule was classified fixed-length
+  zero, so the scanner rewound to the token start and looped forever.
+- `%array` copied the token into a fixed `char[YYLMAX]` unchecked while the input
+  buffer grew without limit — a 20 KB token segfaulted.
+
+Six wrong-token defects in the longest-match core:
+
+- A `^`-anchored rule recorded the longest match even off a line start, so it
+  shadowed valid shorter matches (`^foobar`/`foo` on `"xfoobar"` lost `foo`).
+- Variable-length trailing context took the *furthest* main-pattern end whether
+  or not the trailing context matched from there (`x+/xy` on `"xxxy"` gave
+  `yytext == "xxx"`; only `"xx"` leaves a remainder matching `xy`).
+- `REJECT` re-executed the rule it had just left; its history stack was a fixed
+  64 entries whose overflow was fatal; and its entries held raw pointers the
+  refill path never rebased, so a token spanning a refill hung.
+- A refill landing on an accepting state re-ran that state's accept record,
+  pushing a duplicate REJECT entry and running one action twice.
+
+Five pattern-parsing defects:
+
+- Two scanners returned character indices that callers used as byte offsets, so
+  a non-ASCII byte in a pattern panicked or split the rule at the wrong place.
+- `translate_ere` tracked quotes and braces but not bracket expressions, so
+  `[{}]` was read as a substitution reference and `["]` as a quoted string.
+- A leading `]` in a bracket expression was treated as the terminator rather than
+  an ordinary member, so `[]/]` was rejected outright.
+
+Three hygiene defects: an equivalence-class counter that under-reported by one,
+unreachable NFA states left by every interval expression, and a statistics line
+written to stderr on every run regardless of `-n`/`-v`.
+
+**Lesson for this file:** a row reading `[x] <feature> — <file>` records that the
+feature exists. It is not evidence that the feature is correct; six of the rows
+below were `[x]` while the feature they name was mis-tokenizing.
 
 ### Priority issues
 
@@ -565,10 +615,10 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 ##### Definitions
 
 - [x] `name substitute` substitution definitions — `lexfile.rs`, expansion at `560-697`.
-- [x] `{name}` substitution recognition (not inside `[ ]` or `"..."`) — `lexfile.rs` tracks `in_brace`, `in_quotes` state.
+- [x] `{name}` substitution recognition (not inside `[ ]` or `"..."`) — `lexfile.rs` tracks brace, quote *and* bracket state. The bracket state was missing until 2026-08-25, so `[{}]` was read as a reference to a substitution named `{}`. Probed.
 - [x] `%s`/`%start` inclusive start conditions — `lexfile.rs`.
 - [x] `%x` exclusive start conditions — `lexfile.rs`.
-- [x] `%array` / `%pointer` selection — `lexfile.rs`.
+- [x] `%array` / `%pointer` selection — `lexfile.rs`. `%pointer` grows a heap buffer; `%array` is bounded by `YYLMAX` and a longer token is a fatal "token too large" rather than a buffer overrun. Probed.
 - [x] Table-size declarations `%p %n %a %e %k %o` accepted — `lexfile.rs`.
 - [x] **Table-size declarations have no documented effect** (#L7 Major).
 
@@ -576,9 +626,9 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 
 - [x] ERE followed by `<blank>+` then action — `lexfile.rs`.
 - [x] `<state>r` / `<state1,state2,…>r` start-condition prefix — `lexfile.rs`.
-- [x] `r/x` trailing context — `pattern_validate::parse_anchoring_and_trailing_context`, `main.rs`.
-- [x] `^r` BOL anchor — handled by `pattern_validate::parse_anchoring_and_trailing_context`, `rule.bol_anchor`.
-- [x] `r$` EOL anchor (equivalent to `r/\n`) — same path; recorded as trailing context.
+- [x] `r/x` trailing context — split by `pattern_validate::parse_anchoring_and_trailing_context`. A fixed-length main pattern uses a compile-time length; a variable-length one records every candidate end position and picks the one whose remainder a per-rule trailing-context DFA accepts. Probed against flex on eight patterns.
+- [x] `^r` BOL anchor — parsed by `pattern_validate::parse_anchoring_and_trailing_context`; *matched* structurally, by entering a separate beginning-of-line automaton, so an anchored rule is unreachable off a line start rather than filtered after the fact.
+- [x] `r$` EOL anchor (equivalent to `r/\n`) — same path; recorded as trailing context. Probed.
 - [x] `"..."` literal strings with `\`-escapes — `lexfile.rs`.
 - [x] Substitution wrap-in-parens for quantifier correctness — `lexfile.rs`.
 - [x] Action `;` (empty C statement) valid — accepted as non-empty action text.
@@ -589,7 +639,7 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 
 - [x] `|` fall-through to next rule's action — covered by codegen rule dispatching (shared accept state to next rule).
 - [x] `ECHO` macro — `codegen.rs`.
-- [x] `REJECT` macro + history stack — `codegen.rs`.
+- [x] `REJECT` macro + history stack — `codegen.rs`. The stack grows on demand and holds offsets from `YYTOKEN`, so a refill that moves the buffer needs no fixups; the walk-back discards the position it has just exhausted. Probed against flex including tokens longer than the old fixed bound and tokens spanning a refill.
 - [x] `BEGIN(newstate)` — `codegen.rs`. `BEGIN(0)` and `BEGIN(INITIAL)` both work.
 
 ##### Functions / macros visible to user code
@@ -599,10 +649,10 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 | `int yylex(void)` | CONFORMS | `codegen.rs`. |
 | `int yymore(void)` | CONFORMS | Macro at `codegen.rs`. |
 | `int yyless(int n)` | CONFORMS | Macro at `codegen.rs`. |
-| `int input(void)` | DIVERGES | (#L2) wrong EOF return. |
-| `int unput(int c)` | DIVERGES | (#L3) wrong signature. |
-| `int yywrap(void)` | DIVERGES | (#L1) should be in libl, not lex.yy.c. |
-| `int main(int, char *[])` | DIVERGES | (#L1) should be in libl, not lex.yy.c. |
+| `int input(void)` | CONFORMS | (#L2 closed) returns 0 at end of input; refills through `YY_INPUT`. |
+| `int unput(int c)` | CONFORMS | (#L3 closed) `int unput(int c)`, returns the pushed character. |
+| `int yywrap(void)` | PARTIAL | (#L1) emitted inline, but suppressible with `YY_NO_DEFAULT_YYWRAP`; spec says libl only. |
+| `int main(int, char *[])` | PARTIAL | (#L1) same, via `YY_NO_DEFAULT_MAIN`. |
 
 ##### Regular expressions in lex
 
@@ -611,7 +661,7 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 - [x] `/` trailing-context restrictions (r cannot include further `/` or `$`; x cannot include `^`, `/`, `$`) — `pattern_validate`.
 - [x] `\<digits>` octal escapes — `pattern_escape::translate_escape_sequences`.
 - [x] `\x<digits>` hex escapes — same.
-- [x] `[...]` bracket expressions including `[:class:]`, `[=c=]`, `[.c.]` — `lexfile.rs`, `pattern_escape::expand_posix_bracket_constructs`.
+- [x] `[...]` bracket expressions including `[:class:]`, `[=c=]`, `[.c.]` — `lexfile.rs`, `pattern_escape::expand_posix_bracket_constructs`. A leading `]` (or one after `[^`) is an ordinary member; a second `^` is not a second negation. Probed against flex.
 - [x] `.` does not match `<newline>` — `main.rs`.
 - [x] **`\0`/`\x00` undefined-behavior NUL not warned** (#L12 Minor).
 - [x] **Trigraphs not flagged in copied C blocks** (#L11 Minor; spec is an app constraint).
@@ -629,14 +679,27 @@ Locale handling is minimal: `gettext()` decorates clap help strings only,
 
 ### Test coverage signal
 
-Tests cover end-to-end generation and many ERE edge cases. Gaps that map to findings:
+Tests cover end-to-end generation and many ERE edge cases. Every gap this audit
+originally listed is now closed (verified by name in `dev/tests/lex/mod.rs`):
 
-- [x] No test asserts `input()` returns 0 (not -1) on EOF (#L2).
-- [x] No test asserts `unput()` is declared `int unput(int)` (#L3).
-- [x] No test verifies that user-provided `yywrap`/`main` in a *separate* translation unit do not collide with the generated defaults (#L1).
-- [x] No test exercises `setlocale` or `LC_MESSAGES`-driven diagnostics (#L4, #L5). — partially covered by `test_diagnostics_render_under_gettext`, which pins `LC_ALL=C` and asserts the `gettext`-routed text; that no catalog exists to switch *to* is a workspace-wide condition (cross-cutting theme 4), not a lex gap.
-- [x] No test exercises stats emission triggered by `%n`/`%p` declarations alone (#L6).
-- [x] No test exercises `<STATE><<EOF>>` start-conditioned EOF rules (#L10).
+- [x] `input()` returns 0 on EOF (#L2) — `test_input_returns_zero_at_eof`.
+- [x] `unput()` is `int unput(int)` (#L3) — `test_unput_returns_pushed_char`.
+- [x] User-provided `yywrap`/`main` in a separate translation unit do not collide
+  with the generated defaults (#L1) — `test_default_main_and_yywrap_are_suppressible`.
+- [x] `setlocale` / `LC_MESSAGES`-driven diagnostics (#L4, #L5) — partially covered
+  by `test_diagnostics_render_under_gettext`, which pins `LC_ALL=C` and asserts the
+  `gettext`-routed text; that no catalog exists to switch *to* is a workspace-wide
+  condition (cross-cutting theme 4), not a lex gap.
+- [x] Stats emission triggered by `%n`/`%p` declarations alone (#L6) —
+  `test_table_size_decl_triggers_stats`, `test_table_size_stats_suppressed_by_n`.
+- [x] `<STATE><<EOF>>` start-conditioned EOF rules (#L10) —
+  `test_eof_rule_with_start_condition`.
+
+The gap this audit did *not* identify was matching correctness: the suite
+exercised generation and parsing far more than tokenization. The 2026-08-25 sweep
+added regression tests for each of its 16 defects, including cases that need an
+exit status or a timeout (a hang and a segfault are invisible to a helper that
+only returns stdout) and a sweep across the 16 KB buffer boundary.
 
 ### Suggested PR groupings
 

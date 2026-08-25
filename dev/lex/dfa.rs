@@ -57,8 +57,13 @@ impl DfaState {
 pub struct Dfa {
     /// All states in the DFA
     pub states: Vec<DfaState>,
-    /// The start state (always 0)
+    /// The start state used when not at the beginning of a line (always 0)
     pub start: usize,
+    /// The start state used at the beginning of a line.
+    ///
+    /// Equal to `start` when no rule is '^'-anchored, in which case the two
+    /// roots have the same epsilon closure and collapse to one state.
+    pub bol_start: usize,
     /// Character equivalence classes for table compression
     pub char_classes: CharClasses,
 }
@@ -130,6 +135,7 @@ impl Dfa {
         let mut dfa = Dfa {
             states: Vec::new(),
             start: 0,
+            bol_start: 0,
             char_classes: CharClasses::new(),
         };
 
@@ -139,19 +145,30 @@ impl Dfa {
         // Worklist of DFA states to process
         let mut worklist: Vec<BTreeSet<usize>> = Vec::new();
 
-        // Compute initial state (epsilon closure of NFA start state)
-        let initial_nfa_states = nfa.epsilon_closure(&BTreeSet::from([nfa.start]));
-        let initial_accepting = nfa.get_accepting(&initial_nfa_states);
-        let initial_accepting_rules = nfa.get_all_accepting(&initial_nfa_states);
-        let initial_main_end_rules = get_main_pattern_end_rules(nfa, &initial_nfa_states);
+        // Seed one DFA state per NFA root. With no '^'-anchored rule the two
+        // roots have the same epsilon closure, so state_map collapses them and
+        // bol_start == start.
+        let seed = |dfa: &mut Dfa,
+                    state_map: &mut HashMap<BTreeSet<usize>, usize>,
+                    worklist: &mut Vec<BTreeSet<usize>>,
+                    root: usize| {
+            let nfa_states = nfa.epsilon_closure(&BTreeSet::from([root]));
+            if let Some(&idx) = state_map.get(&nfa_states) {
+                return idx;
+            }
+            let idx = dfa.states.len();
+            let accepting = nfa.get_accepting(&nfa_states);
+            let accepting_rules = nfa.get_all_accepting(&nfa_states);
+            let main_end_rules = get_main_pattern_end_rules(nfa, &nfa_states);
+            state_map.insert(nfa_states.clone(), idx);
+            dfa.states
+                .push(DfaState::new(accepting, accepting_rules, main_end_rules));
+            worklist.push(nfa_states);
+            idx
+        };
 
-        state_map.insert(initial_nfa_states.clone(), 0);
-        dfa.states.push(DfaState::new(
-            initial_accepting,
-            initial_accepting_rules,
-            initial_main_end_rules,
-        ));
-        worklist.push(initial_nfa_states);
+        dfa.start = seed(&mut dfa, &mut state_map, &mut worklist, nfa.start);
+        dfa.bol_start = seed(&mut dfa, &mut state_map, &mut worklist, nfa.bol_start);
 
         // Build alphabet from all unique characters in NFA transitions
         let alphabet = build_alphabet(nfa);
@@ -208,6 +225,7 @@ impl Dfa {
             return Dfa {
                 states: Vec::new(),
                 start: 0,
+                bol_start: 0,
                 char_classes: self.char_classes.clone(),
             };
         }
@@ -341,6 +359,9 @@ impl Dfa {
         let minimized = Dfa {
             states: new_states,
             start: 0,
+            // The beginning-of-line root is an entry point too, so it has to
+            // follow the same partition remap as every transition target.
+            bol_start: partition_to_new_state[state_to_partition[self.bol_start]],
             char_classes: self.char_classes.clone(),
         };
 
@@ -415,6 +436,7 @@ fn build_alphabet(nfa: &Nfa) -> Vec<char> {
 mod tests {
     use super::*;
     use crate::nfa::Nfa;
+    use crate::nfa::NfaRule;
     use regex_syntax::hir::Hir;
 
     fn parse_regex(pattern: &str) -> Hir {
@@ -424,7 +446,7 @@ mod tests {
     #[test]
     fn test_simple_dfa() {
         let hir = parse_regex("ab");
-        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Should have states for: start, after-a, after-ab (accepting)
@@ -443,7 +465,7 @@ mod tests {
     #[test]
     fn test_alternation_dfa() {
         let hir = parse_regex("a|b");
-        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Both 'a' and 'b' should lead to accepting states
@@ -458,7 +480,7 @@ mod tests {
     #[test]
     fn test_kleene_star_dfa() {
         let hir = parse_regex("a*");
-        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Start state should be accepting (matches empty string)
@@ -468,7 +490,7 @@ mod tests {
     #[test]
     fn test_minimization() {
         let hir = parse_regex("a|b");
-        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
         let minimized = dfa.minimize();
 
@@ -480,7 +502,7 @@ mod tests {
     fn test_multiple_rules_priority() {
         let hir1 = parse_regex("if");
         let hir2 = parse_regex("[a-z]+");
-        let nfa = Nfa::from_rules(&[(hir1, None, 0), (hir2, None, 1)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir1, 0), NfaRule::plain(hir2, 1)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Navigate through "if"

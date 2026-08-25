@@ -867,8 +867,20 @@ hello     printf("HELLO\n");
 
     // Check for BOL tracking variable
     assert!(c_code.contains("yy_at_bol"));
-    // Check for BOL rule table
-    assert!(c_code.contains("yy_rule_bol"));
+    // '^' is resolved by entering a separate beginning-of-line automaton
+    // rather than by consulting a yy_rule_bol[] table after the match.
+    assert!(
+        c_code.contains("if (yy_at_bol) goto yy_state_"),
+        "expected a beginning-of-line entry state: {}",
+        c_code
+    );
+    assert!(
+        !c_code.contains("yy_rule_bol"),
+        "the accept-time BOL filter should be gone"
+    );
+
+    let result = compile_and_run(&c_code, "hello\nhello\n").unwrap();
+    assert_eq!(result, "BOL_HELLO\nBOL_HELLO\n");
 }
 
 #[test]
@@ -3586,4 +3598,79 @@ A       { int c; printf("A["); while ((c = input()) != 0) putchar(c); printf("]"
     // produced "A[Z](q)".
     let result = compile_and_run(&c_code, "").unwrap();
     assert_eq!(result, "A[Zq]");
+}
+
+// ---------------------------------------------------------------------------
+// '^' anchoring resolved by the automaton, not by a post-match filter
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bol_rule_does_not_shadow_shorter_match() {
+    // The anchored rule used to record the longest match even off a line start.
+    // The later BOL check then only looked for another rule accepting at that
+    // same longer position, so a valid shorter match was skipped entirely and
+    // the scanner fell back to echoing one character.
+    let lex_input = r#"%option noinput nounput
+%%
+^foobar { printf("<foobar>"); }
+foo     { printf("<foo>"); }
+[a-z]   { printf("<%s>", yytext); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // "xfoobar": ^foobar cannot apply, so foo must win at offset 1.
+    let result = compile_and_run(&c_code, "xfoobar\n").unwrap();
+    assert_eq!(result, "<x><foo><b><a><r>");
+
+    // At a real line start the anchored rule still wins.
+    let result = compile_and_run(&c_code, "foobar\n").unwrap();
+    assert_eq!(result, "<foobar>");
+}
+
+#[test]
+fn test_bol_anchor_after_newline_and_under_start_condition() {
+    // The beginning-of-line automaton has to be re-entered after every newline,
+    // and start conditions are filtered independently of anchoring.
+    let lex_input = r#"%option noinput nounput
+%s SC
+%%
+^begin      { printf("<^begin>"); BEGIN(SC); }
+<SC>^begin  { printf("<sc^begin>"); }
+begin       { printf("<begin>"); }
+[a-z]       { }
+\n          { printf("|"); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // Line 1 starts with begin -> anchored rule, switches to SC.
+    // Line 2 has begin mid-line -> only the unanchored rule can apply.
+    // Line 3 starts with begin -> anchored again, now in SC.
+    let result = compile_and_run(&c_code, "begin\nxbegin\nbegin\n").unwrap();
+    assert_eq!(result, "<^begin>|<begin>|<^begin>|");
+}
+
+#[test]
+fn test_no_bol_anchor_keeps_single_entry_state() {
+    // With no '^' in the spec the two roots have the same closure and collapse,
+    // so the generated scanner keeps a single unconditional entry.
+    let lex_input = r#"%option noinput nounput
+%%
+[a-z]+  { printf("W"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+    assert!(
+        !c_code.contains("if (yy_at_bol) goto yy_state_"),
+        "an unanchored spec should not pay for a BOL entry state"
+    );
 }

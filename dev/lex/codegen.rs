@@ -46,8 +46,6 @@ fn contains_identifier(text: &str, word: &str) -> bool {
 /// Rule metadata for code generation
 #[derive(Clone, Default)]
 pub struct RuleMetadata {
-    /// True if rule is anchored to beginning of line (^)
-    pub bol_anchor: bool,
     /// Fixed length of main pattern if known (for trailing context rules)
     /// When present, yyleng is set to this value (excluding trailing context)
     pub main_pattern_len: Option<usize>,
@@ -104,7 +102,6 @@ struct Span {
 struct FeatureFlags {
     has_reject: bool,
     has_start_conditions: bool,
-    has_bol_anchors: bool,
     has_trailing_context: bool,
     has_var_tc: bool,
     /// All EOF rules with their start conditions
@@ -118,7 +115,6 @@ impl FeatureFlags {
         let has_start_conditions = config.start_conditions.len() > 1;
 
         // Single pass over lexinfo.rules (the authoritative source)
-        let mut has_bol_anchors = false;
         let mut has_trailing_context = false;
         let mut has_var_tc = false;
         let mut has_reject = false;
@@ -126,7 +122,6 @@ impl FeatureFlags {
 
         for (idx, rule) in lexinfo.rules.iter().enumerate() {
             // BOL and trailing context come directly from parsed rules
-            has_bol_anchors |= rule.bol_anchor;
             has_trailing_context |= rule.trailing_context.is_some();
 
             // Variable TC requires computed info only available in metadata
@@ -145,12 +140,13 @@ impl FeatureFlags {
             }
         }
 
-        let needs_accept_lists = has_reject || has_start_conditions || has_bol_anchors;
+        // '^' is resolved by the automaton's shape now, so anchoring alone
+        // no longer needs a per-state accept list.
+        let needs_accept_lists = has_reject || has_start_conditions;
 
         FeatureFlags {
             has_reject,
             has_start_conditions,
-            has_bol_anchors,
             has_trailing_context,
             has_var_tc,
             eof_rules,
@@ -585,31 +581,10 @@ fn write_rule_metadata_tables<W: Write>(
     }
 
     // Define YY_NUM_RULES if needed for BOL or trailing context checks
-    if (flags.has_bol_anchors || flags.has_trailing_context) && !flags.has_start_conditions {
+    if flags.has_trailing_context && !flags.has_start_conditions {
         writeln!(output, "#ifndef YY_NUM_RULES")?;
         writeln!(output, "#define YY_NUM_RULES {}", num_rules)?;
         writeln!(output, "#endif\n")?;
-    }
-
-    if flags.has_bol_anchors {
-        // Write BOL anchor table (1 = rule requires BOL, 0 = no requirement)
-        writeln!(
-            output,
-            "/* BOL anchor table - 1 if rule requires beginning of line */"
-        )?;
-        write!(output, "static const int yy_rule_bol[{}] = {{ ", num_rules)?;
-        for (i, rule) in lexinfo.rules.iter().enumerate() {
-            let bol = if i < config.rule_metadata.len() {
-                config.rule_metadata[i].bol_anchor
-            } else {
-                rule.bol_anchor
-            };
-            write!(output, "{}", if bol { 1 } else { 0 })?;
-            if i < num_rules - 1 {
-                write!(output, ", ")?;
-            }
-        }
-        writeln!(output, " }};\n")?;
     }
 
     if flags.has_trailing_context {
@@ -1191,7 +1166,6 @@ fn write_yylex_direct_coded<W: Write>(
 ) -> io::Result<()> {
     // Use pre-computed flags
     let has_start_conditions = flags.has_start_conditions;
-    let has_bol_anchors = flags.has_bol_anchors;
     let has_trailing_context = flags.has_trailing_context;
     let has_var_tc = flags.has_var_tc;
     let eof_rules = &flags.eof_rules;
@@ -1306,30 +1280,21 @@ fn write_yylex_direct_coded<W: Write>(
             "    memset(yy_main_end_offset, -1, sizeof(yy_main_end_offset));"
         )?;
     }
-    // Save BOL status at token start (for BOL anchor validation)
-    if has_bol_anchors {
-        writeln!(output, "    int yy_token_started_at_bol = yy_at_bol;")?;
-    }
     writeln!(output)?;
 
-    // Start condition dispatch
-    if has_start_conditions {
-        writeln!(output, "    /* Dispatch based on start condition */")?;
-        writeln!(output, "    switch (yy_start_state) {{")?;
-        for (idx, name) in config.start_conditions.iter().enumerate() {
-            // For now, all start conditions share state 0
-            // A more sophisticated implementation would have separate start states
-            writeln!(
-                output,
-                "        case {}: /* {} */ goto yy_state_0;",
-                idx, name
-            )?;
-        }
-        writeln!(output, "        default: goto yy_state_0;")?;
-        writeln!(output, "    }}")?;
-    } else {
-        writeln!(output, "    goto yy_state_0;")?;
+    // Entry state. Start conditions all share a root and are filtered by
+    // yy_rule_cond at accept time, so the only choice here is which of the two
+    // '^' roots to enter: an anchored rule is reachable solely from the
+    // beginning-of-line automaton, and so cannot match anywhere else.
+    if dfa.bol_start != dfa.start {
+        writeln!(output, "    /* '^' rules live only in the BOL automaton */")?;
+        writeln!(
+            output,
+            "    if (yy_at_bol) goto yy_state_{};",
+            dfa.bol_start
+        )?;
     }
+    writeln!(output, "    goto yy_state_{};", dfa.start)?;
     writeln!(output)?;
 
     // Generate all DFA states
@@ -1579,12 +1544,6 @@ fn write_yylex_direct_coded<W: Write>(
                 "                if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
             )?;
         }
-        if has_bol_anchors {
-            writeln!(
-                output,
-                "                if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
-            )?;
-        }
         writeln!(output, "                yyaccept = yy_rule;")?;
         writeln!(output, "                yy_found = 1;")?;
         writeln!(output, "                break;")?;
@@ -1626,12 +1585,6 @@ fn write_yylex_direct_coded<W: Write>(
             writeln!(
                 output,
                 "                    if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
-            )?;
-        }
-        if has_bol_anchors {
-            writeln!(
-                output,
-                "                    if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
             )?;
         }
         writeln!(output, "                    yyaccept = yy_rule;")?;
@@ -1777,7 +1730,7 @@ fn write_yylex_direct_coded<W: Write>(
     // to ensure they use the finalized yyaccept value (Bug C fix)
 
     // Start condition and BOL anchor validation
-    if has_start_conditions || has_bol_anchors {
+    if has_start_conditions {
         writeln!(
             output,
             "    /* Validate rule against current start condition and BOL */"
@@ -1791,18 +1744,6 @@ fn write_yylex_direct_coded<W: Write>(
             writeln!(
                 output,
                 "        /* Rule not valid in current start condition */"
-            )?;
-            writeln!(output, "        goto yy_try_alternate_rule;")?;
-            writeln!(output, "    }}")?;
-        }
-        if has_bol_anchors {
-            writeln!(
-                output,
-                "    if (yyaccept >= 0 && yy_rule_bol[yyaccept] && !yy_token_started_at_bol) {{"
-            )?;
-            writeln!(
-                output,
-                "        /* BOL rule but not at beginning of line */"
             )?;
             writeln!(output, "        goto yy_try_alternate_rule;")?;
             writeln!(output, "    }}")?;
@@ -1842,12 +1783,6 @@ fn write_yylex_direct_coded<W: Write>(
             writeln!(
                 output,
                 "            if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
-            )?;
-        }
-        if has_bol_anchors {
-            writeln!(
-                output,
-                "            if (yy_rule_bol[yy_rule] && !yy_token_started_at_bol) continue;"
             )?;
         }
         writeln!(output, "            yyaccept = yy_rule;")?;
@@ -2062,6 +1997,7 @@ mod tests {
     use crate::dfa::Dfa;
     use crate::lexfile::LexInfo;
     use crate::nfa::Nfa;
+    use crate::nfa::NfaRule;
     use std::collections::HashMap;
 
     #[test]
@@ -2110,7 +2046,7 @@ mod tests {
     #[test]
     fn test_generate_simple_lexer() {
         let hir = regex_syntax::parse("a").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2139,7 +2075,7 @@ mod tests {
     #[test]
     fn test_generate_with_bol_anchor() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2148,14 +2084,13 @@ mod tests {
             compiled_ere: "foo".to_string(),
             action: "return BOL_RULE;".to_string(),
             start_conditions: vec![],
-            bol_anchor: true,
+            bol_anchor: false,
             trailing_context: None,
             compiled_trailing_context: None,
             is_eof: false,
         });
 
         let rule_meta = vec![RuleMetadata {
-            bol_anchor: true,
             main_pattern_len: None,
             has_trailing_context: false,
             has_variable_trailing_context: false,
@@ -2176,7 +2111,7 @@ mod tests {
     #[test]
     fn test_generate_with_start_conditions() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2214,7 +2149,7 @@ mod tests {
     #[test]
     fn test_generate_with_trailing_context() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[(hir, None, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2230,7 +2165,6 @@ mod tests {
         });
 
         let rule_meta = vec![RuleMetadata {
-            bol_anchor: false,
             main_pattern_len: Some(3),
             has_trailing_context: true,
             has_variable_trailing_context: false,

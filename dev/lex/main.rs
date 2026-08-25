@@ -349,9 +349,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build rules in the format expected by NFA with trailing context support
     // This tracks main pattern end states for variable-length trailing context
-    let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+    let nfa_rules: Vec<nfa::NfaRule> = rules
         .iter()
-        .map(|r| (r.hir.clone(), r.trailing_context.clone(), r.index))
+        .map(|r| nfa::NfaRule {
+            main: r.hir.clone(),
+            trailing: r.trailing_context.clone(),
+            index: r.index,
+            bol_anchor: r.bol_anchor,
+        })
         .collect();
 
     // Build NFA from rules using Thompson's construction
@@ -375,7 +380,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rule_metadata: Vec<codegen::RuleMetadata> = rules
         .iter()
         .map(|r| codegen::RuleMetadata {
-            bol_anchor: r.bol_anchor,
             main_pattern_len: r.main_pattern_len,
             has_trailing_context: r.trailing_context.is_some(),
             has_variable_trailing_context: r.has_variable_trailing_context,
@@ -424,9 +428,9 @@ mod tests {
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
         assert_eq!(rules.len(), 1);
 
-        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+        let nfa_rules: Vec<nfa::NfaRule> = rules
             .iter()
-            .map(|r| (r.hir.clone(), None, r.index))
+            .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
         let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
         assert!(!nfa.states.is_empty());
@@ -449,9 +453,9 @@ mod tests {
         assert_eq!(lexinfo.rules.len(), 3);
 
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
-        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+        let nfa_rules: Vec<nfa::NfaRule> = rules
             .iter()
-            .map(|r| (r.hir.clone(), None, r.index))
+            .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
         let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
         let dfa = Dfa::from_nfa(&nfa);
@@ -472,9 +476,9 @@ mod tests {
 
         let lexinfo = lexfile::parse(&input).expect("Failed to parse");
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
-        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+        let nfa_rules: Vec<nfa::NfaRule> = rules
             .iter()
-            .map(|r| (r.hir.clone(), None, r.index))
+            .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
         let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
         let dfa = Dfa::from_nfa(&nfa);

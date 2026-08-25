@@ -4321,3 +4321,148 @@ e : e '<' e | NUM ;
         code.lines().find(|l| l.contains("yyaction_t"))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Semantic value of a reduction
+// ---------------------------------------------------------------------------
+//
+// NOTE: these grammars deliberately keep `$1`/`$$` out of C string literals --
+// transform_action rewrites them there too, which is a separate known defect.
+
+#[test]
+fn test_default_value_applies_to_rules_that_have_an_action() {
+    // POSIX 123922: "By default, the value of a rule shall be the value of the
+    // first element in it." That default is not conditional on the rule having
+    // no action -- an action that never assigns $$ still gets it. Emitting the
+    // assignment only in the action-less branch left `yyval` holding the
+    // *previous* reduction's value, so `b` below came out as 100 (a's value)
+    // instead of 9.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int noted;
+%}
+
+%token NUM
+
+%%
+line : a b   { if ($1 != 100) return 1;
+               if ($2 != 9) return 2;
+               return 0; }
+     ;
+a    : NUM   { $$ = 100; }
+     ;
+b    : NUM   { noted++; }
+     ;
+%%
+
+int yylval;
+static const int toks[] = { 7, 9 };
+static int pos;
+
+int yylex(void) {
+    if (pos >= 2) return 0;
+    yylval = toks[pos++];
+    return NUM;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) { (void)noted; return yyparse(); }
+"#;
+
+    run_end_to_end_both_modes(grammar, "default_value_with_action");
+}
+
+#[test]
+fn test_default_value_is_the_first_element_even_when_it_is_a_literal() {
+    // "the first element" is positional, not "the first non-terminal": for
+    // `e : '(' NUM ')'` the default is the value of '(', not of NUM.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+%}
+
+%token NUM
+
+%%
+line : e     { if ($1 != -999) return 1; return 0; }
+     ;
+e    : '(' NUM ')'
+     ;
+%%
+
+int yylval;
+static const char *in = "(7)";
+static int pos;
+
+int yylex(void) {
+    char c = in[pos];
+    if (c == '\0') return 0;
+    pos++;
+    if (c >= '0' && c <= '9') { yylval = c - '0'; return NUM; }
+    yylval = -999;
+    return c;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) { return yyparse(); }
+"#;
+
+    run_end_to_end_both_modes(grammar, "default_value_literal_first");
+}
+
+#[test]
+fn test_error_token_value_slot_is_initialized() {
+    // The error-recovery shift bumped yyvsp without storing, so `$1` of the
+    // error symbol read whatever the popped slot happened to hold. Here that
+    // is the NUM already on the stack (5); a correct shift stores yylval at
+    // the point of error (4242). Reading uninitialized memory is the real
+    // defect -- the two distinct values are just what makes it observable.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int seen;
+%}
+
+%token NUM
+
+%%
+input : stmts ;
+stmts : stmts stmt | stmt ;
+stmt  : NUM NUM ';'
+      | error ';'    { seen = $1; yyerrok; }
+      ;
+%%
+
+int yylval;
+static const char *in = "5@;";
+static int pos;
+
+int yylex(void) {
+    char c = in[pos];
+    if (c == '\0') return 0;
+    pos++;
+    if (c >= '0' && c <= '9') { yylval = c - '0'; return NUM; }
+    yylval = 4242;
+    return c;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    if (seen != 4242) return 2;
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "error_token_value_slot");
+}

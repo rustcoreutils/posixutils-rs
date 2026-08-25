@@ -1310,39 +1310,38 @@ fn generate_parser<W: Write>(
     )?;
     writeln!(w, "#endif")?;
 
+    // POSIX: "By default, the value of a rule shall be the value of the first
+    // element in it." The default applies to every rule, including one whose
+    // action never assigns $$, so it is set before the action runs rather than
+    // in place of it. An empty rule has no first element; fall back to the
+    // slot below the stack top so nothing reads past it.
+    writeln!(w, "    /* $$ = $1 (default), before any semantic action */")?;
+    writeln!(w, "    if ({}r2[{}n])", prefix, prefix)?;
+    writeln!(
+        w,
+        "        {}val = {}vsp[1 - {}r2[{}n]];",
+        prefix, prefix, prefix, prefix
+    )?;
+    writeln!(w, "    else")?;
+    writeln!(w, "        {}val = {}vsp[0];", prefix, prefix)?;
+    writeln!(w)?;
+
     // Switch on rule number for semantic actions
     writeln!(w, "    switch ({}n) {{", prefix)?;
 
     for (prod_id, prod) in grammar.productions.iter().enumerate() {
-        // Generate case for:
-        // - Productions with explicit actions
-        // - Productions with empty RHS (no default value)
-        // - Productions without actions but with non-empty RHS (POSIX: $$ = $1 default)
-        if prod.action.is_some() || !prod.rhs.is_empty() {
+        if let Some(ref action) = prod.action {
             writeln!(w, "    case {}:", prod_id)?;
             writeln!(w, "        {{")?;
 
-            if let Some(ref action) = prod.action {
-                // Transform $$ and $n references
-                let has_union = grammar.union_def.is_some();
-                let transformed =
-                    transform_action(action, prod.rhs.len(), grammar, prod, prefix, has_union);
-                if !opts.omit_line_directives {
-                    writeln!(w, "#line {} \"{}\"", prod.line, opts.grammar_file)?;
-                }
-                writeln!(w, "        {}", transformed)?;
-            } else if !prod.rhs.is_empty() {
-                // POSIX: "By default, the value of a rule shall be the value
-                // of the first element in it." - implicitly emit $$ = $1
-                let rhs_len = prod.rhs.len();
-                writeln!(
-                    w,
-                    "        {}val = {}vsp[{}];  /* $$ = $1 (default) */",
-                    prefix,
-                    prefix,
-                    1 - rhs_len as i32
-                )?;
+            // Transform $$ and $n references
+            let has_union = grammar.union_def.is_some();
+            let transformed =
+                transform_action(action, prod.rhs.len(), grammar, prod, prefix, has_union);
+            if !opts.omit_line_directives {
+                writeln!(w, "#line {} \"{}\"", prod.line, opts.grammar_file)?;
             }
+            writeln!(w, "        {}", transformed)?;
 
             writeln!(w, "        }}")?;
             writeln!(w, "        break;")?;
@@ -1458,6 +1457,10 @@ fn generate_parser<W: Write>(
     writeln!(w, "            /* Shift the error token */")?;
     writeln!(w, "            {}ssp_offset++;", prefix)?;
     writeln!(w, "            {}vsp++;", prefix)?;
+    // Give the error symbol's value slot a defined value, as an ordinary shift
+    // does. Without this a rule like `stmt : error ';' { use($1); }` reads an
+    // uninitialized slot -- heap garbage once the stack moves to malloc.
+    writeln!(w, "            *{}vsp = {}lval;", prefix, prefix)?;
     writeln!(w, "            {}state = {}n;", prefix, prefix)?;
     writeln!(w, "            goto {}newstate;", prefix)?;
     writeln!(w, "        }}")?;

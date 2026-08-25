@@ -8,7 +8,7 @@
 //
 
 use plib::tmp::TempDir;
-use rand::{distributions::Standard, rngs::StdRng, Rng, SeedableRng};
+use rand::{distr::StandardUniform, rngs::StdRng, Rng, SeedableRng};
 use std::{ffi::CString, fs, io, os::fd::AsRawFd, path::Path, path::PathBuf, sync::Mutex};
 
 static GLOBAL_MUTEX: Mutex<()> = Mutex::new(());
@@ -147,10 +147,10 @@ fn test_ftw_fd_raii() {
         current_dir.push(test_dir);
         let mut i = 0;
         for _ in 0..500 {
-            let is_dir: bool = rng.sample(Standard);
+            let is_dir: bool = rng.sample(StandardUniform);
             if is_dir {
                 fs::create_dir(current_dir.join(format!("{i}"))).unwrap();
-                let descend: bool = rng.sample(Standard);
+                let descend: bool = rng.sample(StandardUniform);
                 if descend {
                     current_dir.push(format!("{i}"));
                     i = 0;

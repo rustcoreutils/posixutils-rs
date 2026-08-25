@@ -20,7 +20,7 @@ plib = { path = "../plib" }
 
 [dev-dependencies]
 env_logger = { version = "0.11", default-features = false, features = ["regex"] }
-regex-lite = "0.1"
+regex.workspace = true
 similar-asserts = "1.5"
 test-log = { version = "0.2", default-features=false, features=["log"]}
 

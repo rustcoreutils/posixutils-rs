@@ -68,12 +68,40 @@ fn filled_path(template: Vec<u8>) -> PathBuf {
 fn make_file(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<(File, PathBuf)> {
     let mut template = template(dir, prefix, suffix)?;
     let suffix_len = suffix.len() as libc::c_int;
+    let ptr = template.as_mut_ptr().cast::<c_char>();
 
-    // SAFETY: the template is a NUL-terminated buffer ending in the required X
-    // run plus `suffix_len` trailing bytes, which is what mkstemps rewrites.
-    let fd = unsafe { libc::mkstemps(template.as_mut_ptr().cast::<c_char>(), suffix_len) };
+    // The descriptor must be close-on-exec: these utilities spawn children
+    // constantly (cc shells out to lex/yacc, crontab launches $EDITOR), and a
+    // temporary leaking into one is exactly what O_CLOEXEC prevents. Rust's
+    // own File always sets it; mkstemps does not.
+    //
+    // SAFETY (both calls): the template is a NUL-terminated buffer ending in
+    // the required X run plus `suffix_len` trailing bytes, which is what
+    // mkstemps rewrites.
+    #[cfg(target_os = "linux")]
+    let fd = unsafe { libc::mkostemps(ptr, suffix_len, libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let fd = unsafe { libc::mkstemps(ptr, suffix_len) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
+    }
+
+    // Where mkostemps is unavailable, set the flag afterwards. This leaves a
+    // window in which a concurrent fork+exec could inherit the descriptor,
+    // which is why the flag is passed at creation time above where it can be.
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: `fd` is open and owned here; on failure it is closed before
+        // returning, so it is never leaked.
+        let ok = unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) >= 0
+        };
+        if !ok {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
     }
 
     // SAFETY: mkstemps returned a fresh descriptor that nothing else owns.
@@ -245,11 +273,13 @@ impl NamedTempFile {
     /// `Drop` does the same thing but has nowhere to report to, so use this
     /// where the removal failing is worth noticing.
     pub fn close(mut self) -> io::Result<()> {
-        // Close the descriptor first, then unlink, and mark it handled so the
-        // destructor does not try a second removal.
+        // Close the descriptor first, then unlink. The "handled" flag is set
+        // only once the removal succeeded, so a caller that ignores the error
+        // still gets the destructor's attempt.
         drop(self.file.take());
+        fs::remove_file(&self.path)?;
         self.persisted = true;
-        fs::remove_file(&self.path)
+        Ok(())
     }
 
     /// Rename the file to `path`, giving up ownership of the cleanup.
@@ -397,6 +427,7 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
 
     #[test]
     fn tempdir_exists_then_is_removed_with_contents() {
@@ -507,6 +538,31 @@ mod tests {
             .unwrap_err();
         assert!(err.file.path().exists(), "the temporary must survive");
         assert_eq!(err.file.path(), tmp_path);
+    }
+
+    #[test]
+    fn temporaries_are_close_on_exec() {
+        // A temporary must not survive into a spawned child; every one of
+        // these utilities forks and execs.
+        let named = NamedTempFile::new().unwrap();
+        let anon = tempfile().unwrap();
+        for fd in [named.as_file().as_raw_fd(), anon.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed");
+            assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC, "fd {fd}");
+        }
+    }
+
+    #[test]
+    fn a_failed_close_leaves_cleanup_armed() {
+        let dir = tempdir().unwrap();
+        let tmp = NamedTempFile::new_in(dir.path()).unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Remove it behind close()'s back so the unlink cannot succeed.
+        fs::remove_file(&path).unwrap();
+        assert!(tmp.close().is_err(), "close must report the failed unlink");
+        assert!(!path.exists());
     }
 
     #[test]

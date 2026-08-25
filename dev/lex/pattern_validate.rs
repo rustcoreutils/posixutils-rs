@@ -56,97 +56,86 @@ pub fn parse_anchoring_and_trailing_context(pattern: &str) -> (bool, String, Opt
     (bol_anchor, main_pattern, trailing_context, eol_anchor)
 }
 
+/// One unescaped character of a pattern, with the context it sits in.
+struct PatternChar {
+    /// Byte offset into the pattern, so callers may slice the pattern with it.
+    byte_idx: usize,
+    ch: char,
+    in_brackets: bool,
+    in_quotes: bool,
+}
+
+/// Walk a pattern's unescaped characters, tracking bracket-expression and
+/// quoted-string context.
+///
+/// The pattern-level operators (`/` and `$`) are only operators outside
+/// `[...]` and `"..."`, and every scanner looking for one needs exactly this
+/// state. Keeping it in one place stops the copies from drifting apart.
+///
+/// Escaped characters are skipped entirely, along with the backslash that
+/// escapes them: for these callers "escaped" and "absent" mean the same thing.
+/// The reported context is the state *entering* the character, so an opening
+/// `[` reports `in_brackets == false` and its closing `]` reports `true`.
+fn unescaped_chars(pattern: &str) -> impl Iterator<Item = PatternChar> + '_ {
+    let mut in_brackets = false;
+    let mut in_quotes = false;
+    let mut escape_next = false;
+
+    pattern.char_indices().filter_map(move |(byte_idx, ch)| {
+        if escape_next {
+            escape_next = false;
+            return None;
+        }
+        if ch == '\\' {
+            escape_next = true;
+            return None;
+        }
+
+        let here = PatternChar {
+            byte_idx,
+            ch,
+            in_brackets,
+            in_quotes,
+        };
+
+        match ch {
+            '"' if !in_brackets => in_quotes = !in_quotes,
+            '[' if !in_quotes => in_brackets = true,
+            ']' if !in_quotes && in_brackets => in_brackets = false,
+            _ => {}
+        }
+
+        Some(here)
+    })
+}
+
 /// Check if pattern ends with an unescaped $ (not inside brackets or quotes)
 pub fn pattern_ends_with_unescaped_dollar(pattern: &str) -> bool {
     if !pattern.ends_with('$') {
         return false;
     }
 
-    let chars: Vec<char> = pattern.chars().collect();
-    let len = chars.len();
+    // '$' is one byte, so the final character starts here.
+    let dollar_idx = pattern.len() - 1;
 
-    // Count consecutive backslashes before the final $
-    let mut backslash_count = 0;
-    for i in (0..len.saturating_sub(1)).rev() {
-        if chars[i] == '\\' {
-            backslash_count += 1;
-        } else {
-            break;
-        }
-    }
-
-    // $ is escaped if preceded by odd number of backslashes
-    if backslash_count % 2 == 1 {
-        return false;
-    }
-
-    // Check if $ is inside brackets (simplified check)
-    let mut in_brackets = false;
-    let mut in_quotes = false;
-    for (idx, ch) in chars.iter().enumerate() {
-        if idx == len - 1 {
-            break; // Don't count the final $
-        }
-        match ch {
-            '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes => in_brackets = false,
-            _ => {}
-        }
-    }
-
-    !in_brackets && !in_quotes
+    // An escaped '$' is never yielded by the scanner, which is precisely the
+    // "not an anchor" answer.
+    unescaped_chars(pattern).any(|pc| pc.byte_idx == dollar_idx && !pc.in_brackets && !pc.in_quotes)
 }
 
-/// Find the position of trailing context operator / (not inside brackets, quotes, or escaped)
+/// Find the byte offset of the trailing context operator / (not inside
+/// brackets, quotes, or escaped)
 pub fn find_trailing_context_slash(pattern: &str) -> Option<usize> {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut in_brackets = false;
-    let mut in_quotes = false;
-    let mut escape_next = false;
-
-    for (idx, ch) in chars.iter().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        match ch {
-            '\\' => escape_next = true,
-            '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes && in_brackets => in_brackets = false,
-            '/' if !in_brackets && !in_quotes => return Some(idx),
-            _ => {}
-        }
-    }
-
-    None
+    unescaped_chars(pattern)
+        .find(|pc| pc.ch == '/' && !pc.in_brackets && !pc.in_quotes)
+        .map(|pc| pc.byte_idx)
 }
 
 /// Count the number of unescaped trailing context operators / in a pattern
 pub fn count_trailing_context_slashes(pattern: &str) -> usize {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut in_brackets = false;
-    let mut in_quotes = false;
-    let mut escape_next = false;
-    let mut count = 0;
-
-    for ch in chars.iter() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        match ch {
-            '\\' => escape_next = true,
-            '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes && in_brackets => in_brackets = false,
-            '/' if !in_brackets && !in_quotes => count += 1,
-            _ => {}
-        }
-    }
-
-    count
+    unescaped_chars(pattern)
+        .filter(|pc| pc.ch == '/' && !pc.in_brackets && !pc.in_quotes)
+        .count()
 }
 
 /// Validate pattern restrictions per POSIX specification.
@@ -158,34 +147,19 @@ pub fn count_trailing_context_slashes(pattern: &str) -> usize {
 /// - $ only valid at end of pattern (and not with trailing context)
 /// - Only one trailing context operator / allowed
 pub fn validate_pattern_restrictions(pattern: &str) -> Result<(), String> {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut in_brackets = false;
-    let mut in_quotes = false;
-    let mut escape_next = false;
     let mut dollar_positions: Vec<usize> = Vec::new();
     let mut caret_positions: Vec<usize> = Vec::new();
 
     // First pass: find trailing context operator
     let has_trailing_context = find_trailing_context_slash(pattern).is_some();
 
-    // Second pass: find all unescaped ^ and $ positions
-    for (idx, ch) in chars.iter().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        match ch {
-            '\\' => escape_next = true,
-            '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes && in_brackets => in_brackets = false,
-            '^' if !in_brackets && !in_quotes => {
-                // ^ inside [] is a negation character, which is valid anywhere
-                caret_positions.push(idx);
-            }
-            '$' if !in_brackets && !in_quotes => {
-                dollar_positions.push(idx);
-            }
+    // Second pass: find all unescaped ^ and $ positions. '^' inside [] is a
+    // negation character and '$' inside [] is an ordinary member, so both are
+    // only operators outside brackets and quotes.
+    for pc in unescaped_chars(pattern) {
+        match pc.ch {
+            '^' if !pc.in_brackets && !pc.in_quotes => caret_positions.push(pc.byte_idx),
+            '$' if !pc.in_brackets && !pc.in_quotes => dollar_positions.push(pc.byte_idx),
             _ => {}
         }
     }
@@ -203,8 +177,9 @@ pub fn validate_pattern_restrictions(pattern: &str) -> Result<(), String> {
 
     // Validate $ positions - only valid at end (and not with trailing context)
     for pos in &dollar_positions {
-        // $ must be at the very end of the pattern
-        if *pos != chars.len() - 1 {
+        // $ must be at the very end of the pattern ('$' is one byte, so the
+        // final character starts at len - 1).
+        if *pos != pattern.len() - 1 {
             return Err(format!(
                 "{} {}",
                 gettext("'$' operator only valid at end of pattern, found at position"),

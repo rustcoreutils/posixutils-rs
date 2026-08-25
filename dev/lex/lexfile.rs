@@ -441,12 +441,18 @@ fn find_posix_bracket_end(chars: &[char], start: usize, close_char: char) -> Opt
 
 /// Find end of regex in rule line by matching brackets, parens, braces, quotes.
 /// Handles POSIX bracket constructs: [:class:], [=equiv=], [.collating.].
+///
+/// The returned index is a *byte* offset into `line`, so callers may slice
+/// `line` with it directly.
 fn find_ere_end(line: &str) -> Result<usize, String> {
     let mut stack: Vec<RegexType> = Vec::new();
     let mut inside_brackets = false;
     let mut inside_quotes = false;
     let mut escape_next = false;
+    // Scanning is per character (lookahead indexes neighbours), but the result
+    // is consumed as a byte offset; keep both so the two never disagree.
     let chars: Vec<char> = line.chars().collect();
+    let offsets: Vec<usize> = line.char_indices().map(|(off, _)| off).collect();
     let mut i = 0;
 
     while i < chars.len() {
@@ -528,7 +534,7 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
             }
             _ => {
                 if ch.is_whitespace() && stack.is_empty() && !inside_brackets {
-                    return Ok(i);
+                    return Ok(offsets[i]);
                 }
             }
         }
@@ -593,6 +599,7 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
     let mut re = String::new();
     let mut in_quotes = false;
     let mut in_brace = false;
+    let mut in_brackets = false;
     let mut brace_content = String::new();
     let mut escape_next = false;
     let chars: Vec<char> = ere.chars().collect();
@@ -714,10 +721,35 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
             brace_content.clear();
         } else if in_brace {
             brace_content.push(ch);
+        } else if in_brackets {
+            // Inside a bracket expression only ']' is special: '{' and '"' are
+            // ordinary members there, so [{}] is a brace class and ["] is a
+            // quote class rather than a substitution or a quoted string.
+            if ch == '[' {
+                // [:class:], [=equiv=] and [.collating.] are copied whole so
+                // their closing ']' does not end the enclosing expression.
+                if let Some(next) = chars.get(i + 1).copied() {
+                    if next == ':' || next == '=' || next == '.' {
+                        if let Some(end_idx) = find_posix_bracket_end(&chars, i + 2, next) {
+                            for &c in &chars[i..=end_idx] {
+                                re.push(c);
+                            }
+                            i = end_idx + 1;
+                            continue;
+                        }
+                    }
+                }
+            } else if ch == ']' {
+                in_brackets = false;
+            }
+            re.push(ch);
         } else if ch == '"' {
             in_quotes = true;
         } else if ch == '{' {
             in_brace = true;
+        } else if ch == '[' {
+            in_brackets = true;
+            re.push(ch);
         } else {
             re.push(ch);
         }
@@ -1170,8 +1202,10 @@ DIGIT [0-9]
 
         // Third rule has STRING and INITIAL conditions
         assert_eq!(lexinfo.rules[2].start_conditions, vec!["STRING", "INITIAL"]);
-        // The quote in quotes becomes empty class - quotes strip the contents
-        assert_eq!(lexinfo.rules[2].ere, "[]");
+        // '"' inside a bracket expression is an ordinary member, not the start
+        // of a quoted string; it used to be stripped, leaving the unparseable
+        // empty class "[]".
+        assert_eq!(lexinfo.rules[2].ere, "[\"]");
     }
 
     #[test]

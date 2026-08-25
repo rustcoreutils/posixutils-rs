@@ -3206,3 +3206,106 @@ int main() {
     );
     assert!(result.contains("END_STRING"), "Should end string");
 }
+
+// ---------------------------------------------------------------------------
+// Pattern scanning: byte offsets and bracket-expression context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_multibyte_pattern_does_not_panic() {
+    // find_ere_end() counted characters while parse_rule() sliced bytes, so any
+    // non-ASCII byte in a pattern split the rule at a non-char-boundary.
+    let lex_input = "%option noinput nounput\n%%\n\u{e9}  { printf(\"E\"); }\n.|\\n  { }\n%%\n";
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected a multibyte pattern: {}", c_code);
+    assert!(c_code.contains("printf(\"E\")"), "action was lost");
+}
+
+#[test]
+fn test_multibyte_quoted_pattern_splits_at_action() {
+    // The same off-by-bytes split silently mangled quoted patterns, emitting the
+    // remainder of the rule line into lex.yy.c as C.
+    let lex_input =
+        "%option noinput nounput\n%%\n\"caf\u{e9}\"  { printf(\"C\"); }\n.|\\n  { }\n%%\n";
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex rejected a quoted multibyte pattern: {}",
+        c_code
+    );
+    assert!(
+        c_code.contains("printf(\"C\");"),
+        "action did not survive the pattern/action split"
+    );
+    // The stray fragment used to land in the generated C as a bare string
+    // expression, which -Werror rejects; prove the output still compiles.
+    compile_and_run(&c_code, "x\n").expect("generated scanner must compile");
+}
+
+#[test]
+fn test_multibyte_before_trailing_context_slash() {
+    // find_trailing_context_slash() had the same char-index/byte-index defect.
+    let lex_input = "%option noinput nounput\n%%\n\u{e9}/x  { printf(\"T\"); }\n.|\\n  { }\n%%\n";
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex rejected multibyte before a trailing-context slash: {}",
+        c_code
+    );
+}
+
+#[test]
+fn test_brace_inside_bracket_expression() {
+    // translate_ere() tracked quotes and braces but not bracket expressions, so
+    // "[{}]" was read as a reference to a substitution named "{}".
+    let lex_input = r#"%option noinput nounput
+%%
+[{}]    { printf("B"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected [{{}}]: {}", c_code);
+
+    let result = compile_and_run(&c_code, "{}").unwrap();
+    assert_eq!(result, "BB", "both braces should match the class");
+}
+
+#[test]
+fn test_quote_inside_bracket_expression() {
+    // Likewise "[\"]" opened a quoted string, swallowed the ']' and left "[]".
+    let lex_input = r#"%option noinput nounput
+%%
+["]     { printf("Q"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected [\"]: {}", c_code);
+
+    let result = compile_and_run(&c_code, "\"").unwrap();
+    assert_eq!(result, "Q", "the quote character should match the class");
+}
+
+#[test]
+fn test_posix_class_inside_brackets_with_interval() {
+    // A POSIX class must be copied whole so its closing ']' does not end the
+    // enclosing bracket expression and expose a following interval.
+    let lex_input = r#"%option noinput nounput
+%%
+[[:alpha:]]{2}  { printf("A"); }
+.|\n            { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected [[:alpha:]]{{2}}: {}", c_code);
+
+    let result = compile_and_run(&c_code, "ab").unwrap();
+    assert_eq!(result, "A");
+}

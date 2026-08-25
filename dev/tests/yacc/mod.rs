@@ -4109,8 +4109,8 @@ b : b ;
         "a non-productive non-terminal must be diagnosed, not accepted"
     );
     assert!(
-        stderr.contains("derives no string of tokens"),
-        "should name the non-productive non-terminal, got: {}",
+        stderr.contains("derive no string of tokens") && stderr.contains("'x'"),
+        "should name the non-productive non-terminals, got: {}",
         stderr
     );
 }
@@ -4131,8 +4131,8 @@ b : b A ;
 
     assert!(!output.status.success(), "`b : b A ;` derives no tokens");
     assert!(
-        stderr.contains("derives no string of tokens") && stderr.contains('b'),
-        "should name 'b', got: {}",
+        stderr.contains("derive no string of tokens") && stderr.contains("'b'"),
+        "should name 'b' -- the cause, not just 's' which inherits it, got: {}",
         stderr
     );
 }
@@ -4203,5 +4203,121 @@ C : /* empty */ ;
         !stderr.contains("reduce/reduce conflict"),
         "a matching %expect-rr should suppress the warning, got: {}",
         stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// %nonassoc conflict resolution
+// ---------------------------------------------------------------------------
+
+/// Grammar body shared by the %nonassoc tests: a comparison operator declared
+/// %nonassoc, so `1 < 2` parses and `1 < 2 < 3` must be a syntax error.
+/// `$PRECS` is substituted with the precedence declarations under test.
+const NONASSOC_DRIVER: &str = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static const char *in;
+static int pos;
+static int errs;
+%}
+
+%token NUM
+$PRECS
+
+%%
+line : e ;
+e : e '<' e | e '+' e | NUM ;
+%%
+
+int yylval;
+
+int yylex(void) {
+    while (in[pos] == ' ') pos++;
+    if (in[pos] == '\0') return 0;
+    if (in[pos] >= '0' && in[pos] <= '9') { yylval = in[pos++] - '0'; return NUM; }
+    return in[pos++];
+}
+
+void yyerror(const char *s) { errs++; (void)s; }
+
+static int run(const char *s) { in = s; pos = 0; errs = 0; return yyparse(); }
+
+int main(void) {
+    /* A single comparison is associative use of nothing: it must parse. */
+    if (run("1 < 2") != 0 || errs != 0) return 1;
+    /* Chained non-associative use must be rejected. */
+    if (run("1 < 2 < 3") == 0 || errs == 0) return 2;
+    /* A left-associative operator in the same grammar still chains. */
+    if (run("1 + 2 + 3") != 0 || errs != 0) return 3;
+    return 0;
+}
+"#;
+
+#[test]
+fn test_nonassoc_operator_rejects_chained_use() {
+    // A state holding one reduce plus the %nonassoc error entry used to be
+    // marked "consistent", i.e. reduce-without-reading-the-lookahead. The
+    // internal table verifier caught the divergence and yacc died with a
+    // panic (rc=101) before writing a usable y.tab.c.
+    let grammar = NONASSOC_DRIVER.replace("$PRECS", "%nonassoc '<'\n%left '+'");
+    run_end_to_end_both_modes(&grammar, "nonassoc_chained");
+}
+
+#[test]
+fn test_nonassoc_as_highest_precedence_operator() {
+    // Same defect, reached with the %nonassoc operator declared last (highest
+    // precedence) rather than first.
+    let grammar = NONASSOC_DRIVER.replace("$PRECS", "%left '+'\n%nonassoc '<'");
+    run_end_to_end_both_modes(&grammar, "nonassoc_highest");
+}
+
+#[test]
+fn test_nonassoc_alone_generates_without_internal_error() {
+    // The smallest reproducer, generate-only: no other precedence declaration
+    // at all. Asserts yacc exits cleanly rather than panicking out of
+    // verify.rs, which would leave a truncated y.tab.c behind.
+    let grammar = r#"
+%token NUM
+%nonassoc '<'
+%%
+e : e '<' e | NUM ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "%nonassoc alone must generate cleanly, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("INTERNAL ERROR") && !stderr.contains("panicked"),
+        "table verification must not fire, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_nonassoc_error_entry_widens_action_table() {
+    // The generated parser routes explicit error entries with `yyn ==
+    // INT16_MIN`. That test is unreachable if the action table narrows to
+    // int8_t, so the sentinel must keep the table at int16_t or wider.
+    let grammar = r#"
+%token NUM
+%nonassoc '<'
+%%
+e : e '<' e | NUM ;
+"#;
+
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("typedef int16_t yyaction_t;")
+            || code.contains("typedef int32_t yyaction_t;"),
+        "an INT16_MIN error entry must widen the action table, got typedef line: {:?}",
+        code.lines().find(|l| l.contains("yyaction_t"))
     );
 }

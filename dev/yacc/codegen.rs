@@ -674,13 +674,16 @@ fn build_packed_tables(
 
     // Fill action table using dense terminal indices
     for (state_id, actions) in lalr.action_table.iter().enumerate() {
-        // Find default reduction and check if state is "consistent"
-        // A state is consistent if:
-        // - It has no shift actions (only reduces and/or error)
-        // - All reduce actions reduce by the same rule
+        // Find default reduction and check if state is "consistent".
+        // A consistent state reduces without consulting the lookahead, so it
+        // must have exactly one possible action:
+        // - no shift actions
+        // - no explicit error entries (a %nonassoc conflict resolution)
+        // - all reduce actions reduce by the same rule
         let mut best_reduce: Option<usize> = None;
         let mut best_count = 0;
         let mut has_shift = false;
+        let mut has_error = false;
         let mut all_same_reduce = true;
         let mut first_reduce: Option<usize> = None;
 
@@ -705,7 +708,9 @@ fn build_packed_tables(
                         _ => {}
                     }
                 }
-                Action::Error => {}
+                Action::Error => {
+                    has_error = true;
+                }
             }
         }
 
@@ -715,10 +720,10 @@ fn build_packed_tables(
             None => 0,
         };
 
-        // State is consistent if no shifts and all reduces are by same rule
         // In strict mode, disable this optimization to preserve exact yylex timing
         if !strict_mode {
-            consistent[state_id] = !has_shift && all_same_reduce && best_reduce.is_some();
+            consistent[state_id] =
+                !has_shift && !has_error && all_same_reduce && best_reduce.is_some();
         }
 
         // Fill action entries using dense terminal index

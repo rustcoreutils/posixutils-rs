@@ -31,6 +31,36 @@ fn grammar_error_at(line: usize, msg: String) -> YaccError {
     YaccError::Grammar(msg)
 }
 
+/// The `char` a `'c'`-style symbol name stands for, if it is one.
+fn char_literal_of(name: &str) -> Option<char> {
+    let inner = name.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut chars = inner.chars();
+    let c = chars.next()?;
+    chars.next().is_none().then_some(c)
+}
+
+/// POSIX RATIONALE 124342-6: multi-byte characters should be returned as tokens
+/// by the lexical analyzer, not written as multi-byte character literals. A
+/// literal's codepoint must therefore fit in a single byte (1..=255); 0 (NUL) is
+/// reserved for end-of-input, and POSIX 123781 forbids it outright.
+///
+/// Both places a literal can appear -- a rule body and a
+/// `%token`/`%left`/`%right`/`%nonassoc` declaration -- go through here, so
+/// they cannot diverge.
+fn check_char_literal_range(c: char) -> Result<(), YaccError> {
+    let cp = c as u32;
+    if (1..=255).contains(&cp) {
+        return Ok(());
+    }
+    Err(grammar_error(format!(
+        "{} '{}' (U+{:04X}) {}",
+        gettext("character literal"),
+        c,
+        cp,
+        gettext("is out of range; only single-byte characters 1..=255 are allowed")
+    )))
+}
+
 /// Index type for symbols
 pub type SymbolId = usize;
 
@@ -43,8 +73,18 @@ pub const EOF_SYMBOL: SymbolId = 0;
 /// The special error token
 pub const ERROR_SYMBOL: SymbolId = 1;
 
+/// The placeholder terminal that every token number without a declared
+/// terminal translates to.
+///
+/// It appears in no rule, so no state ever has an action for it and any token
+/// mapping to it reaches the parser's error path. Without it, unknown token
+/// numbers translated to `error`, which some states *can* shift -- the parser
+/// would then enter recovery with no `yyerror()` call and no `yynerrs`
+/// increment.
+pub const UNDEF_SYMBOL: SymbolId = 2;
+
 /// The augmented start symbol (S')
-pub const AUGMENTED_START: SymbolId = 2;
+pub const AUGMENTED_START: SymbolId = 3;
 
 /// A symbol in the grammar
 #[derive(Debug, Clone)]
@@ -78,6 +118,14 @@ pub struct Production {
     pub precedence: usize,
     /// Line number in source file
     pub line: usize,
+    /// For a lowered mid-rule action: the enclosing rule's RHS symbols that
+    /// precede the action. `None` for an ordinary production.
+    ///
+    /// A mid-rule action becomes an empty production for a synthetic
+    /// non-terminal, so its own `rhs` says nothing about what `$1`..`$n` mean
+    /// inside it. They refer to the enclosing rule's elements to the left,
+    /// which is what this records.
+    pub mid_rule_prefix: Option<Vec<SymbolId>>,
 }
 
 /// The complete grammar
@@ -153,7 +201,10 @@ impl Grammar {
         // Add special symbols (these cannot fail - they are the first symbols added)
         grammar.add_symbol("$end", true, None, Some(0), 0, None)?; // EOF_SYMBOL = 0
         grammar.add_symbol("error", true, None, Some(256), 0, None)?; // ERROR_SYMBOL = 1
-        grammar.add_symbol("$accept", false, None, None, 0, None)?; // AUGMENTED_START = 2
+                                                                      // $undefined gets no token number: nothing maps to it except
+                                                                      // yytranslate's default fill.
+        grammar.add_symbol("$undefined", true, None, None, 0, None)?; // UNDEF_SYMBOL = 2
+        grammar.add_symbol("$accept", false, None, None, 0, None)?; // AUGMENTED_START = 3
 
         // Add declared tokens - two pass approach per POSIX:
         // 1. First pass: register all tokens with explicit numbers
@@ -190,16 +241,18 @@ impl Grammar {
                 continue;
             }
 
-            let number = token.number.or_else(|| {
-                // Check if it's a character literal (has implicit number)
-                if token.name.starts_with('\'') && token.name.ends_with('\'') {
-                    let chars: Vec<char> = token.name[1..token.name.len() - 1].chars().collect();
-                    if chars.len() == 1 {
-                        return Some(chars[0] as i32);
-                    }
-                }
-                None
-            });
+            // A literal declared with %token/%left/... reaches the symbol
+            // table by name, bypassing the rule-body path, so the range check
+            // has to happen here too. Without it `%left '\u{20AC}'` was accepted
+            // and inflated yytranslate to 8365 entries, keyed on a value a
+            // byte-oriented yylex can never return.
+            let literal = char_literal_of(&token.name);
+            if let Some(c) = literal {
+                check_char_literal_range(c)?;
+            }
+
+            // A character literal's token number is its codepoint.
+            let number = token.number.or_else(|| literal.map(|c| c as i32));
 
             grammar.add_symbol(
                 &token.name,
@@ -235,8 +288,27 @@ impl Grammar {
 
         // First pass: identify all non-terminals from LHS of rules
         for rule in &parsed.rules {
-            if !grammar.symbol_map.contains_key(&rule.lhs) {
-                grammar.add_symbol(&rule.lhs, false, None, None, 0, None)?;
+            match grammar.symbol_map.get(&rule.lhs) {
+                None => {
+                    grammar.add_symbol(&rule.lhs, false, None, None, 0, None)?;
+                }
+                // A name declared with %token (or %left/%right/%nonassoc) stays
+                // a terminal, so the rule would build a production the LR
+                // closure never expands and the parser would silently drop it.
+                // The rule tables would also fall back to the raw symbol id for
+                // its LHS, yielding a negative non-terminal index.
+                Some(&id) if grammar.symbols[id].is_terminal => {
+                    return Err(grammar_error_at(
+                        rule.line,
+                        format!(
+                            "{} '{}', {}",
+                            gettext("rule given for"),
+                            rule.lhs,
+                            gettext("which is a token")
+                        ),
+                    ));
+                }
+                Some(_) => {}
             }
         }
 
@@ -293,6 +365,7 @@ impl Grammar {
             action: None,
             precedence: 0,
             line: 0,
+            mid_rule_prefix: None,
         };
         let prod_id = grammar.productions.len();
         grammar.productions.push(augmented_prod);
@@ -362,6 +435,8 @@ impl Grammar {
                 )));
             }
         }
+
+        grammar.validate_productive()?;
 
         Ok(grammar)
     }
@@ -482,12 +557,15 @@ impl Grammar {
                     let sym_id = self.get_or_add_symbol(sym)?;
                     rhs.push(sym_id);
 
-                    // Track precedence of last terminal
+                    // POSIX 124050: a rule's precedence is that of "the last
+                    // token or literal in the body of the rule". A trailing
+                    // terminal without precedence therefore clears whatever an
+                    // earlier operator contributed -- taking the last terminal
+                    // that *has* precedence instead would silently resolve a
+                    // conflict the spec says to report. Non-terminals are
+                    // neither tokens nor literals, so they leave it alone.
                     if self.symbols[sym_id].is_terminal {
-                        let sym_info = &self.symbols[sym_id];
-                        if sym_info.precedence > 0 {
-                            last_terminal_prec = sym_info.precedence;
-                        }
+                        last_terminal_prec = self.symbols[sym_id].precedence;
                     }
                 }
                 RhsElement::MidAction(code) => {
@@ -504,6 +582,7 @@ impl Grammar {
                         action: Some(code.clone()),
                         precedence: 0,
                         line: rule.line,
+                        mid_rule_prefix: Some(rhs.clone()),
                     };
                     let prod_id = self.productions.len();
                     self.productions.push(mid_prod);
@@ -540,6 +619,7 @@ impl Grammar {
             action: rule.action.clone(),
             precedence,
             line: rule.line,
+            mid_rule_prefix: None,
         };
 
         let prod_id = self.productions.len();
@@ -560,20 +640,7 @@ impl Grammar {
                 }
             }
             ParsedSymbol::CharLiteral(c) => {
-                // POSIX RATIONALE 124342-6: multi-byte characters should be
-                // returned as tokens by the lexer, not as multi-byte character
-                // literals. A literal codepoint must fit in a single byte
-                // (1..=255); 0 (NUL) is reserved for end-of-input.
-                let cp = *c as u32;
-                if !(1..=255).contains(&cp) {
-                    return Err(grammar_error(format!(
-                        "{} '{}' (U+{:04X}) {}",
-                        gettext("character literal"),
-                        c,
-                        cp,
-                        gettext("is out of range; only single-byte characters 1..=255 are allowed")
-                    )));
-                }
+                check_char_literal_range(*c)?;
                 let name = format!("'{}'", c);
                 if let Some(&id) = self.symbol_map.get(&name) {
                     Ok(id)
@@ -589,6 +656,81 @@ impl Grammar {
     /// Get symbol name by ID
     pub fn symbol_name(&self, id: SymbolId) -> &str {
         &self.symbols[id].name
+    }
+
+    /// Reject non-terminals that derive no string of terminals.
+    ///
+    /// Such a non-terminal can never take part in a successful parse, so every
+    /// rule mentioning it is dead. Diagnosing it here also keeps the LALR
+    /// lookahead closure well-behaved: a non-productive non-terminal has an
+    /// empty FIRST set and is not nullable, which is the one way
+    /// `first_of_sequence_with_lookahead` can return nothing.
+    fn validate_productive(&self) -> Result<(), YaccError> {
+        let mut productive = vec![false; self.symbols.len()];
+        for (id, sym) in self.symbols.iter().enumerate() {
+            productive[id] = sym.is_terminal;
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for prod in &self.productions {
+                if !productive[prod.lhs] && prod.rhs.iter().all(|&s| productive[s]) {
+                    productive[prod.lhs] = true;
+                    changed = true;
+                }
+            }
+        }
+
+        // Warn about every offender: one non-productive non-terminal makes each
+        // of its users non-productive too, so naming only the first would often
+        // name a symptom rather than the cause. `$accept` is excluded -- it is
+        // non-productive exactly when the start symbol is, and it is synthetic.
+        //
+        // These are warnings, not errors: the rules involved are dead, but the
+        // rest of the grammar is still a usable parser, and that is what other
+        // yacc implementations generate. POSIX requires a diagnostic only for a
+        // non-terminal with no rules at all (123825-26), which is a separate
+        // check above.
+        for (id, sym) in self.symbols.iter().enumerate() {
+            if sym.is_terminal || productive[id] || id == AUGMENTED_START {
+                continue;
+            }
+            diag::warning_at(
+                diag::Position::line_only(self.first_rule_line(id) as u32),
+                &format!(
+                    "{} '{}' {}",
+                    gettext("non-terminal"),
+                    sym.name,
+                    gettext("derives no string of tokens; its rules are unusable")
+                ),
+            );
+        }
+
+        // A non-productive start symbol is fatal: the grammar accepts nothing,
+        // so there is no parser to generate.
+        if !productive[self.start_symbol] {
+            return Err(grammar_error_at(
+                self.first_rule_line(self.start_symbol),
+                format!(
+                    "{} '{}' {}",
+                    gettext("start symbol"),
+                    self.symbols[self.start_symbol].name,
+                    gettext("does not derive any sentence")
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Line of the first rule defining `sym`, for diagnostics. 0 if it has none.
+    fn first_rule_line(&self, sym: SymbolId) -> usize {
+        self.productions_for
+            .get(&sym)
+            .and_then(|ids| ids.first())
+            .map(|&pid| self.productions[pid].line)
+            .unwrap_or(0)
     }
 
     /// Check if a symbol is a terminal

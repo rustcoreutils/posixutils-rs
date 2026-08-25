@@ -72,8 +72,11 @@ impl LALRAutomaton {
             if shifts > 0 && reduces > 0 {
                 sr += 1;
             }
+            // N reductions colliding on one lookahead is N-1 conflicts, which
+            // is what other yacc implementations report and what %expect-rr
+            // counts against.
             if reduces > 1 {
-                rr += 1;
+                rr += reduces - 1;
             }
         }
 
@@ -178,9 +181,15 @@ fn compute_lookaheads(
                             let old_size = entry.len();
                             entry.extend(new_lookaheads);
 
-                            if (entry.len() > old_size || old_size == 0)
-                                && !worklist.contains(&new_item)
-                            {
+                            // Only re-visit an item whose lookahead set actually
+                            // grew. Re-pushing on `old_size == 0` never
+                            // terminates: an item with an empty set contributes
+                            // an empty set to every successor, so the condition
+                            // stays true forever once two such items reach each
+                            // other (grammar.rs rejects the non-productive
+                            // non-terminals that produce empty sets, but the
+                            // guard must be monotone regardless).
+                            if entry.len() > old_size && !worklist.contains(&new_item) {
                                 worklist.push(new_item);
                             }
                         }

@@ -15,7 +15,7 @@
 //! - Stack-based parser with error recovery per POSIX
 
 use crate::error::YaccError;
-use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL};
+use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL, UNDEF_SYMBOL};
 use crate::lalr::{Action, LALRAutomaton};
 use crate::Options;
 use gettextrs::gettext;
@@ -233,7 +233,7 @@ fn generate_token_defines<W: Write>(w: &mut W, grammar: &Grammar) -> Result<(), 
     let mut tokens: Vec<(String, i32)> = Vec::new();
 
     for (id, sym) in grammar.symbols.iter().enumerate() {
-        if sym.is_terminal && id != EOF_SYMBOL && id != ERROR_SYMBOL {
+        if sym.is_terminal && id != EOF_SYMBOL && id != ERROR_SYMBOL && id != UNDEF_SYMBOL {
             if let Some(num) = sym.token_number {
                 // Skip character literals (they don't need defines)
                 if !sym.name.starts_with('\'') {
@@ -297,6 +297,14 @@ fn generate_tables<W: Write>(
         .terminal_index(ERROR_SYMBOL)
         .expect("error must have term_idx");
     writeln!(w, "#define YYERROR_TERM_IDX {}", error_term_idx)?;
+    writeln!(w)?;
+
+    // YYUNDEF_TERM_IDX - dense terminal index for $undefined, the placeholder
+    // every token number without a declared terminal translates to
+    let undef_term_idx = grammar
+        .terminal_index(UNDEF_SYMBOL)
+        .expect("$undefined must have term_idx");
+    writeln!(w, "#define YYUNDEF_TERM_IDX {}", undef_term_idx)?;
     writeln!(w)?;
 
     // YYNRULES - number of rules
@@ -365,13 +373,17 @@ fn generate_token_translate_table<W: Write>(
     let eof_term_idx = grammar
         .terminal_index(EOF_SYMBOL)
         .expect("EOF must have term_idx");
-    let error_term_idx = grammar
-        .terminal_index(ERROR_SYMBOL)
-        .expect("error must have term_idx");
+    let undef_term_idx = grammar
+        .terminal_index(UNDEF_SYMBOL)
+        .expect("$undefined must have term_idx");
 
-    // Create translation: external token number -> dense terminal index
-    // Unknown tokens map to error_term_idx (the error token's dense index)
-    let mut translate = vec![error_term_idx as u16; (max_token + 1) as usize];
+    // Create translation: external token number -> dense terminal index.
+    // A token number with no declared terminal maps to $undefined, which
+    // appears in no rule, so it always reaches the parser's error path. Mapping
+    // it to `error` instead let an undeclared token be *shifted* as the error
+    // token in any state that can shift one -- silent recovery with no
+    // yyerror() call and no yynerrs increment.
+    let mut translate = vec![undef_term_idx as u16; (max_token + 1) as usize];
     translate[0] = eof_term_idx as u16; // EOF token number 0 -> EOF dense index
 
     for (sym_id, sym) in grammar.symbols.iter().enumerate() {
@@ -674,13 +686,16 @@ fn build_packed_tables(
 
     // Fill action table using dense terminal indices
     for (state_id, actions) in lalr.action_table.iter().enumerate() {
-        // Find default reduction and check if state is "consistent"
-        // A state is consistent if:
-        // - It has no shift actions (only reduces and/or error)
-        // - All reduce actions reduce by the same rule
+        // Find default reduction and check if state is "consistent".
+        // A consistent state reduces without consulting the lookahead, so it
+        // must have exactly one possible action:
+        // - no shift actions
+        // - no explicit error entries (a %nonassoc conflict resolution)
+        // - all reduce actions reduce by the same rule
         let mut best_reduce: Option<usize> = None;
         let mut best_count = 0;
         let mut has_shift = false;
+        let mut has_error = false;
         let mut all_same_reduce = true;
         let mut first_reduce: Option<usize> = None;
 
@@ -705,7 +720,9 @@ fn build_packed_tables(
                         _ => {}
                     }
                 }
-                Action::Error => {}
+                Action::Error => {
+                    has_error = true;
+                }
             }
         }
 
@@ -715,10 +732,10 @@ fn build_packed_tables(
             None => 0,
         };
 
-        // State is consistent if no shifts and all reduces are by same rule
         // In strict mode, disable this optimization to preserve exact yylex timing
         if !strict_mode {
-            consistent[state_id] = !has_shift && all_same_reduce && best_reduce.is_some();
+            consistent[state_id] =
+                !has_shift && !has_error && all_same_reduce && best_reduce.is_some();
         }
 
         // Fill action entries using dense terminal index
@@ -846,16 +863,30 @@ fn generate_debug_tables<W: Write>(
     writeln!(w, "#if YYDEBUG")?;
     writeln!(w)?;
 
-    // Token name table - maps internal symbol ID to printable name
-    writeln!(w, "/* Symbol names for debugging */")?;
+    // Token name table, indexed by *internal* symbol number: every terminal in
+    // dense terminal-index order, then every non-terminal. That is the
+    // numbering the parser actually holds -- `yytranslate` yields a dense
+    // terminal index, and `yyr1` stores `YYNTOKENS + nt_idx` -- so both
+    // `yytname[yytok]` and `yytname[yyr1[n]]` are correct.
+    //
+    // Emitting in raw symbol-id order instead put non-terminals in among the
+    // terminals, so every debug trace named the wrong symbol as soon as the
+    // grammar used a character literal.
+    writeln!(
+        w,
+        "/* Symbol names for debugging, in internal symbol order */"
+    )?;
     writeln!(w, "static const char *const {}tname[] =", prefix)?;
     writeln!(w, "{{")?;
 
-    for (id, sym) in grammar.symbols.iter().enumerate() {
-        let name = &sym.name;
+    let internal_order = grammar
+        .term_idx_to_symbol
+        .iter()
+        .chain(grammar.nt_idx_to_symbol.iter());
+    for (idx, &sym_id) in internal_order.enumerate() {
         // Escape special characters in name for C string
-        let escaped = escape_c_string(name);
-        if id > 0 {
+        let escaped = escape_c_string(grammar.symbol_name(sym_id));
+        if idx > 0 {
             writeln!(w, ",")?;
         }
         write!(w, "    \"{}\"", escaped)?;
@@ -1180,13 +1211,12 @@ fn generate_parser<W: Write>(
     writeln!(w, "        if ({}debug) {{", prefix)?;
     writeln!(
         w,
-        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        "            int {}tok = {}char < {} ? {}translate[{}char] : YYUNDEF_TERM_IDX;",
         prefix,
         prefix,
         get_translate_table_size(grammar),
         prefix,
-        prefix,
-        ERROR_SYMBOL
+        prefix
     )?;
     writeln!(
         w,
@@ -1211,7 +1241,7 @@ fn generate_parser<W: Write>(
     writeln!(w, "    {{")?;
     writeln!(
         w,
-        "        int {}tok = {}char < {} ? {}translate[{}char] : YYERROR_TERM_IDX;",
+        "        int {}tok = {}char < {} ? {}translate[{}char] : YYUNDEF_TERM_IDX;",
         prefix,
         prefix,
         get_translate_table_size(grammar),
@@ -1239,13 +1269,12 @@ fn generate_parser<W: Write>(
     writeln!(w, "        if ({}debug) {{", prefix)?;
     writeln!(
         w,
-        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        "            int {}tok = {}char < {} ? {}translate[{}char] : YYUNDEF_TERM_IDX;",
         prefix,
         prefix,
         get_translate_table_size(grammar),
         prefix,
-        prefix,
-        ERROR_SYMBOL
+        prefix
     )?;
     writeln!(
         w,
@@ -1305,39 +1334,37 @@ fn generate_parser<W: Write>(
     )?;
     writeln!(w, "#endif")?;
 
+    // POSIX: "By default, the value of a rule shall be the value of the first
+    // element in it." The default applies to every rule, including one whose
+    // action never assigns $$, so it is set before the action runs rather than
+    // in place of it. An empty rule has no first element; fall back to the
+    // slot below the stack top so nothing reads past it.
+    writeln!(w, "    /* $$ = $1 (default), before any semantic action */")?;
+    writeln!(w, "    if ({}r2[{}n])", prefix, prefix)?;
+    writeln!(
+        w,
+        "        {}val = {}vsp[1 - {}r2[{}n]];",
+        prefix, prefix, prefix, prefix
+    )?;
+    writeln!(w, "    else")?;
+    writeln!(w, "        {}val = {}vsp[0];", prefix, prefix)?;
+    writeln!(w)?;
+
     // Switch on rule number for semantic actions
     writeln!(w, "    switch ({}n) {{", prefix)?;
 
     for (prod_id, prod) in grammar.productions.iter().enumerate() {
-        // Generate case for:
-        // - Productions with explicit actions
-        // - Productions with empty RHS (no default value)
-        // - Productions without actions but with non-empty RHS (POSIX: $$ = $1 default)
-        if prod.action.is_some() || !prod.rhs.is_empty() {
+        if let Some(ref action) = prod.action {
             writeln!(w, "    case {}:", prod_id)?;
             writeln!(w, "        {{")?;
 
-            if let Some(ref action) = prod.action {
-                // Transform $$ and $n references
-                let has_union = grammar.union_def.is_some();
-                let transformed =
-                    transform_action(action, prod.rhs.len(), grammar, prod, prefix, has_union);
-                if !opts.omit_line_directives {
-                    writeln!(w, "#line {} \"{}\"", prod.line, opts.grammar_file)?;
-                }
-                writeln!(w, "        {}", transformed)?;
-            } else if !prod.rhs.is_empty() {
-                // POSIX: "By default, the value of a rule shall be the value
-                // of the first element in it." - implicitly emit $$ = $1
-                let rhs_len = prod.rhs.len();
-                writeln!(
-                    w,
-                    "        {}val = {}vsp[{}];  /* $$ = $1 (default) */",
-                    prefix,
-                    prefix,
-                    1 - rhs_len as i32
-                )?;
+            // Transform $$ and $n references
+            let has_union = grammar.union_def.is_some();
+            let transformed = transform_action(action, grammar, prod, prefix, has_union);
+            if !opts.omit_line_directives {
+                writeln!(w, "#line {} \"{}\"", prod.line, opts.grammar_file)?;
             }
+            writeln!(w, "        {}", transformed)?;
 
             writeln!(w, "        }}")?;
             writeln!(w, "        break;")?;
@@ -1410,13 +1437,12 @@ fn generate_parser<W: Write>(
     writeln!(w, "        if ({}debug) {{", prefix)?;
     writeln!(
         w,
-        "            int {}tok = {}char < {} ? {}translate[{}char] : {};",
+        "            int {}tok = {}char < {} ? {}translate[{}char] : YYUNDEF_TERM_IDX;",
         prefix,
         prefix,
         get_translate_table_size(grammar),
         prefix,
-        prefix,
-        ERROR_SYMBOL
+        prefix
     )?;
     writeln!(
         w,
@@ -1453,6 +1479,10 @@ fn generate_parser<W: Write>(
     writeln!(w, "            /* Shift the error token */")?;
     writeln!(w, "            {}ssp_offset++;", prefix)?;
     writeln!(w, "            {}vsp++;", prefix)?;
+    // Give the error symbol's value slot a defined value, as an ordinary shift
+    // does. Without this a rule like `stmt : error ';' { use($1); }` reads an
+    // uninitialized slot -- heap garbage once the stack moves to malloc.
+    writeln!(w, "            *{}vsp = {}lval;", prefix, prefix)?;
     writeln!(w, "            {}state = {}n;", prefix, prefix)?;
     writeln!(w, "            goto {}newstate;", prefix)?;
     writeln!(w, "        }}")?;
@@ -1526,12 +1556,20 @@ fn generate_parser<W: Write>(
 /// These access values on the parser's stack preceding the current rule.
 fn transform_action(
     action: &str,
-    rhs_len: usize,
     grammar: &Grammar,
     prod: &crate::grammar::Production,
     prefix: &str,
     has_union: bool,
 ) -> String {
+    // $1..$n number the elements of the rule the action was written in. A
+    // mid-rule action was lowered to an empty production for a synthetic
+    // non-terminal, so its own `rhs` is not that list -- the elements to its
+    // left in the enclosing rule are. Deriving both the offset base and the
+    // type lookup from one slice keeps them from disagreeing.
+    let positions: &[crate::grammar::SymbolId] =
+        prod.mid_rule_prefix.as_deref().unwrap_or(&prod.rhs);
+    let rhs_len = positions.len();
+
     let mut result = String::new();
     let mut chars = action.chars().peekable();
 
@@ -1626,7 +1664,7 @@ fn transform_action(
 
                     // Try to determine type from RHS symbol (only for positive indices within RHS)
                     let (sym_tag, sym_name) = if n > 0 && (n as usize) <= rhs_len {
-                        let sym_id = prod.rhs[n as usize - 1];
+                        let sym_id = positions[n as usize - 1];
                         (
                             grammar.symbols[sym_id].tag.clone(),
                             Some(grammar.symbol_name(sym_id).to_string()),
@@ -1782,7 +1820,12 @@ fn generate_description_file(
     writeln!(w)?;
     for (id, sym) in grammar.symbols.iter().enumerate() {
         if sym.is_terminal {
-            write!(w, "  {} ({})", sym.name, sym.token_number.unwrap_or(0))?;
+            // $undefined has no token number; printing a placeholder 0 would
+            // read as $end's number.
+            match sym.token_number {
+                Some(num) => write!(w, "  {} ({})", sym.name, num)?,
+                None => write!(w, "  {}", sym.name)?,
+            }
             let prods: Vec<usize> = grammar
                 .productions
                 .iter()

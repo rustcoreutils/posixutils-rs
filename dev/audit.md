@@ -106,6 +106,16 @@ crash-safety, and Mach-O (macOS CI) cases. No open item is a known defect.
 
 ### TL;DR
 
+> **Correction, 2026-08-25.** The next paragraph's opening claim — that the
+> LALR(1) core is "solid and well-tested" — was wrong, and was never probed.
+> A design review of the algorithms, data structures, and control flow found
+> nine defects inside exactly the areas it named. Three of them stopped yacc
+> working on ordinary grammars: `%nonassoc` aborted the generator with an
+> internal-error panic, a mutually recursive non-terminal made the lookahead
+> closure spin forever, and every `$n` in a mid-rule action read past the top
+> of the value stack. See "LALR core defects" below. The rest of the TL;DR,
+> which is about the code file's boilerplate, still stands.
+
 The LALR(1) generator core (tables, conflict resolution, error recovery, action
 transformation, mid-rule actions) is solid and well-tested. POSIX conformance
 gaps are concentrated in the generated code file's *boilerplate* — the
@@ -116,6 +126,50 @@ utility itself does no locale setup, reads no `LC_*` variables, and produces
 hardcoded-English diagnostics. The `-v` description file is not produced when
 errors abort the run before codegen, and the runtime debug code is only
 emitted when `-t` is set (preventing `-DYYDEBUG=1` from enabling debug).
+
+### LALR core defects (found 2026-08-25, all fixed)
+
+Every row below was reproduced against a `--release` build before being fixed,
+and each has an end-to-end test in `dev/tests/yacc/mod.rs` that fails against
+the preceding commit. Where a reference answer exists, `bison` 3.8.2 was used:
+on `dev/tests/fixtures/python39.y` the two implementations now agree exactly
+(2 shift/reduce, 4 reduce/reduce), which they did not before #Y7 and #Y9.
+
+| # | Site | Defect | Severity |
+|---|---|---|---|
+| #Y1 | `codegen.rs` `build_packed_tables` | `consistent[]` ignored `Action::Error`, so a state holding one reduce plus a `%nonassoc` error entry reduced without reading the lookahead. `verify.rs` caught it and **panicked** — `%nonassoc '<'` killed yacc outright. `--strict` masked it. | Critical |
+| #Y2 | `lalr.rs` phase-1 worklist | The `\|\| old_size == 0` guard was not monotone; two items with empty lookahead sets re-pushed each other forever. yacc **hung** on `x : y ; y : x ;`. | Critical |
+| #Y3 | `grammar.rs` validation | No productivity check, so #Y2's root cause was reachable from an ordinary typo. Now warns per non-terminal (with the line of its first rule), and errors only when the *start symbol* derives nothing — matching bison. An earlier revision of this fix made every case fatal, which rejected grammars carrying a useless-but-unreachable non-terminal that had always built. | Critical |
+| #Y4 | `grammar.rs` mid-rule lowering + `codegen.rs` `transform_action` | The lowered `@N → ε` production's RHS length (0) was used to resolve `$n`, so every reference in a mid-rule action landed past the stack top. POSIX 123914-15. | Critical |
+| #Y5 | `codegen.rs` reduce switch | The default `$$ = $1` was emitted only for rules with no action, so an action that never assigns `$$` inherited the previous reduction's value. POSIX 123922. | Major |
+| #Y6 | `codegen.rs` `yytranslate` | Unassigned and out-of-range token numbers mapped to the `error` token's index, so undeclared input was *shifted as* `error`: no `yyerror()`, no `yynerrs`. Fixed by reserving a `$undefined` terminal that appears in no rule. | Major |
+| #Y7 | `grammar.rs` rule precedence | Used the last terminal *with* a precedence rather than the last terminal, silently resolving conflicts POSIX 124050 says to report. | Major |
+| #Y8 | `codegen.rs` error recovery | The error-token shift bumped `yyvsp` without storing, so `stmt : error ';' { use($1); }` read uninitialized memory. | Major |
+| #Y9 | `lalr.rs` `count_conflicts` | N-way reduce/reduce counted as 1 conflict instead of N-1, making `%expect-rr` unsatisfiable above 2. | Minor |
+
+One known divergence from bison remains, in grammars that already earn a #Y3
+warning: bison *deletes* useless rules before building tables, while we keep
+them, so a dead rule can still contribute a conflict to the reported counts.
+The generated parser is unaffected (the rules can never reduce) and grammars
+with no useless non-terminals — including `python39.y` — agree exactly.
+
+Two more from the same review were folded in afterwards:
+
+| # | Site | Defect | Severity |
+|---|---|---|---|
+| #Y10 | `codegen.rs` `generate_debug_tables` | `yytname` was emitted in raw symbol-id order, non-terminals interleaved, but every `-t` debug site indexes it with the dense terminal index `yytranslate` yields. Reading `NUM` printed `$accept`; reading `'+'` printed `NUM`. Now emitted in internal symbol order — terminals by dense index, then non-terminals — which is also the numbering `yyr1` stores, so `yytname[yyr1[n]]` names the LHS. The existing `-t` tests only grepped the generated source, which is why this survived them; the new test runs a parser with `yydebug=1` and reads the trace. | Minor |
+| #Y11 | `grammar.rs` token declarations | The `1..=255` range check reached literals in rule bodies but not literals declared with `%token`/`%left`/`%right`/`%nonassoc`, which reach the symbol table by name. `%left '€'` was accepted with token number 8364 and an 8 KB `yytranslate` keyed on a value a byte-oriented `yylex` can never return. Both paths now share one `check_char_literal_range`. Note audit #12 above closed only the rule-position path. | Minor |
+
+One defect from that review is still **open**:
+
+- **`$` substitution runs inside C string literals and comments** —
+  `printf("costs $1")` in an action is rewritten to `printf("costs (yyvsp[0])")`.
+  `transform_action` re-scans the action text with no string/comment state,
+  although the lexer tracked exactly that in `read_action`.
+
+Known diagnostic wart, not tracked as a defect: the character-literal range
+error reports line 0, because `TokenDecl` and the rule-body symbol path carry
+no line. The message names the offending literal and codepoint.
 
 ### Priority issues
 

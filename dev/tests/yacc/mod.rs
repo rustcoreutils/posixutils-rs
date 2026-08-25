@@ -4081,3 +4081,1032 @@ fn test_description_stub_does_not_clobber_a_real_output_file() {
         "the abort stub must not overwrite an existing description file"
     );
 }
+
+// ---------------------------------------------------------------------------
+// LALR lookahead-closure termination and conflict counting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mutually_recursive_nonterminals_warn_and_do_not_hang() {
+    // `x` and `y` derive only each other, so neither derives a string of
+    // tokens. This used to wedge the phase-1 lookahead closure: two items whose
+    // lookahead sets stay empty re-pushed each other forever, and yacc never
+    // terminated. The start symbol still has a live alternative, so -- as in
+    // bison -- the dead rules are a warning and the parser is still generated.
+    let grammar = r#"
+%token A
+%%
+s : A | x b ;
+x : y ;
+y : x ;
+b : b ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "`s : A` still derives a sentence, so this must generate: {}",
+        stderr
+    );
+    for name in ["'x'", "'y'", "'b'"] {
+        assert!(
+            stderr.contains("derives no string of tokens") && stderr.contains(name),
+            "should warn about {}, got: {}",
+            name,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn test_unreachable_nonproductive_nonterminal_is_only_a_warning() {
+    // `unused` is non-productive but never reachable from the start symbol, so
+    // it never entered the lookahead closure and grammars like this generated
+    // fine before the productivity check existed. Diagnosing it must not break
+    // them. bison 3.8 warns here and exits 0.
+    let grammar = r#"
+%token A B
+%%
+s : A ;
+unused : unused B ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "a useless non-terminal must not reject an otherwise valid grammar: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("'unused'") && stderr.contains("derives no string of tokens"),
+        "should still warn, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_nonproductive_start_symbol_is_fatal() {
+    // When the offender drags the start symbol down with it the grammar accepts
+    // nothing at all, so there is no parser to generate. bison reports the same
+    // thing: "start symbol s does not derive any sentence".
+    let grammar = r#"
+%token A
+%%
+s : A b ;
+b : b A ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a grammar that accepts nothing must be an error"
+    );
+    assert!(
+        stderr.contains("start symbol") && stderr.contains("does not derive any sentence"),
+        "should name the start symbol, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("'b'"),
+        "should also warn about 'b', the cause, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_dead_rules_do_not_break_the_generated_parser() {
+    // Keeping the unusable rules in the tables (rather than deleting them as
+    // bison does) must still yield a working parser for the live alternative.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int reported;
+%}
+
+%token A NEVER
+
+%%
+s : A | x b ;
+x : y ;
+y : x ;
+b : b NEVER ;
+%%
+
+int yylval;
+static int n;
+
+int yylex(void) { if (n++ == 0) return A; return 0; }
+
+void yyerror(const char *s) { reported++; (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    if (reported != 0) return 2;
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "dead_rules_still_parse");
+}
+
+#[test]
+fn test_productive_via_indirect_recursion_accepted() {
+    // Guard the other direction: mutual recursion is fine as long as some
+    // alternative bottoms out in terminals.
+    let grammar = r#"
+%token A B
+%%
+s : x ;
+x : y B | A ;
+y : x ;
+"#;
+
+    run_yacc_both_modes(&[], grammar);
+}
+
+#[test]
+fn test_three_way_reduce_reduce_counts_two_conflicts() {
+    // Three empty rules collide on the same lookahead. yacc counts N-way
+    // reduce/reduce as N-1 conflicts; this used to report a flat 1 regardless
+    // of how many reductions collided.
+    let grammar = r#"
+%token X
+%%
+start : A X | B X | C X ;
+A : /* empty */ ;
+B : /* empty */ ;
+C : /* empty */ ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "grammar should still generate");
+    assert!(
+        stderr.contains("2 reduce/reduce conflicts"),
+        "three colliding reductions are 2 conflicts, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_expect_rr_matches_three_way_conflict_count() {
+    // The counting fix has to agree with %expect-rr, or the declaration is
+    // unsatisfiable for any collision wider than two.
+    let grammar = r#"
+%token X
+%expect-rr 2
+%%
+start : A X | B X | C X ;
+A : /* empty */ ;
+B : /* empty */ ;
+C : /* empty */ ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "%expect-rr 2 should be satisfied: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("reduce/reduce conflict"),
+        "a matching %expect-rr should suppress the warning, got: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// %nonassoc conflict resolution
+// ---------------------------------------------------------------------------
+
+/// Grammar body shared by the %nonassoc tests: a comparison operator declared
+/// %nonassoc, so `1 < 2` parses and `1 < 2 < 3` must be a syntax error.
+/// `$PRECS` is substituted with the precedence declarations under test.
+const NONASSOC_DRIVER: &str = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static const char *in;
+static int pos;
+static int errs;
+%}
+
+%token NUM
+$PRECS
+
+%%
+line : e ;
+e : e '<' e | e '+' e | NUM ;
+%%
+
+int yylval;
+
+int yylex(void) {
+    while (in[pos] == ' ') pos++;
+    if (in[pos] == '\0') return 0;
+    if (in[pos] >= '0' && in[pos] <= '9') { yylval = in[pos++] - '0'; return NUM; }
+    return in[pos++];
+}
+
+void yyerror(const char *s) { errs++; (void)s; }
+
+static int run(const char *s) { in = s; pos = 0; errs = 0; return yyparse(); }
+
+int main(void) {
+    /* A single comparison is associative use of nothing: it must parse. */
+    if (run("1 < 2") != 0 || errs != 0) return 1;
+    /* Chained non-associative use must be rejected. */
+    if (run("1 < 2 < 3") == 0 || errs == 0) return 2;
+    /* A left-associative operator in the same grammar still chains. */
+    if (run("1 + 2 + 3") != 0 || errs != 0) return 3;
+    return 0;
+}
+"#;
+
+#[test]
+fn test_nonassoc_operator_rejects_chained_use() {
+    // A state holding one reduce plus the %nonassoc error entry used to be
+    // marked "consistent", i.e. reduce-without-reading-the-lookahead. The
+    // internal table verifier caught the divergence and yacc died with a
+    // panic (rc=101) before writing a usable y.tab.c.
+    let grammar = NONASSOC_DRIVER.replace("$PRECS", "%nonassoc '<'\n%left '+'");
+    run_end_to_end_both_modes(&grammar, "nonassoc_chained");
+}
+
+#[test]
+fn test_nonassoc_as_highest_precedence_operator() {
+    // Same defect, reached with the %nonassoc operator declared last (highest
+    // precedence) rather than first.
+    let grammar = NONASSOC_DRIVER.replace("$PRECS", "%left '+'\n%nonassoc '<'");
+    run_end_to_end_both_modes(&grammar, "nonassoc_highest");
+}
+
+#[test]
+fn test_nonassoc_alone_generates_without_internal_error() {
+    // The smallest reproducer, generate-only: no other precedence declaration
+    // at all. Asserts yacc exits cleanly rather than panicking out of
+    // verify.rs, which would leave a truncated y.tab.c behind.
+    let grammar = r#"
+%token NUM
+%nonassoc '<'
+%%
+e : e '<' e | NUM ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "%nonassoc alone must generate cleanly, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("INTERNAL ERROR") && !stderr.contains("panicked"),
+        "table verification must not fire, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_nonassoc_error_entry_widens_action_table() {
+    // The generated parser routes explicit error entries with `yyn ==
+    // INT16_MIN`. That test is unreachable if the action table narrows to
+    // int8_t, so the sentinel must keep the table at int16_t or wider.
+    let grammar = r#"
+%token NUM
+%nonassoc '<'
+%%
+e : e '<' e | NUM ;
+"#;
+
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("typedef int16_t yyaction_t;")
+            || code.contains("typedef int32_t yyaction_t;"),
+        "an INT16_MIN error entry must widen the action table, got typedef line: {:?}",
+        code.lines().find(|l| l.contains("yyaction_t"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Semantic value of a reduction
+// ---------------------------------------------------------------------------
+//
+// NOTE: these grammars deliberately keep `$1`/`$$` out of C string literals --
+// transform_action rewrites them there too, which is a separate known defect.
+
+#[test]
+fn test_default_value_applies_to_rules_that_have_an_action() {
+    // POSIX 123922: "By default, the value of a rule shall be the value of the
+    // first element in it." That default is not conditional on the rule having
+    // no action -- an action that never assigns $$ still gets it. Emitting the
+    // assignment only in the action-less branch left `yyval` holding the
+    // *previous* reduction's value, so `b` below came out as 100 (a's value)
+    // instead of 9.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int noted;
+%}
+
+%token NUM
+
+%%
+line : a b   { if ($1 != 100) return 1;
+               if ($2 != 9) return 2;
+               return 0; }
+     ;
+a    : NUM   { $$ = 100; }
+     ;
+b    : NUM   { noted++; }
+     ;
+%%
+
+int yylval;
+static const int toks[] = { 7, 9 };
+static int pos;
+
+int yylex(void) {
+    if (pos >= 2) return 0;
+    yylval = toks[pos++];
+    return NUM;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) { (void)noted; return yyparse(); }
+"#;
+
+    run_end_to_end_both_modes(grammar, "default_value_with_action");
+}
+
+#[test]
+fn test_default_value_is_the_first_element_even_when_it_is_a_literal() {
+    // "the first element" is positional, not "the first non-terminal": for
+    // `e : '(' NUM ')'` the default is the value of '(', not of NUM.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+%}
+
+%token NUM
+
+%%
+line : e     { if ($1 != -999) return 1; return 0; }
+     ;
+e    : '(' NUM ')'
+     ;
+%%
+
+int yylval;
+static const char *in = "(7)";
+static int pos;
+
+int yylex(void) {
+    char c = in[pos];
+    if (c == '\0') return 0;
+    pos++;
+    if (c >= '0' && c <= '9') { yylval = c - '0'; return NUM; }
+    yylval = -999;
+    return c;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) { return yyparse(); }
+"#;
+
+    run_end_to_end_both_modes(grammar, "default_value_literal_first");
+}
+
+#[test]
+fn test_error_token_value_slot_is_initialized() {
+    // The error-recovery shift bumped yyvsp without storing, so `$1` of the
+    // error symbol read whatever the popped slot happened to hold. Here that
+    // is the NUM already on the stack (5); a correct shift stores yylval at
+    // the point of error (4242). Reading uninitialized memory is the real
+    // defect -- the two distinct values are just what makes it observable.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int seen;
+%}
+
+%token NUM
+
+%%
+input : stmts ;
+stmts : stmts stmt | stmt ;
+stmt  : NUM NUM ';'
+      | error ';'    { seen = $1; yyerrok; }
+      ;
+%%
+
+int yylval;
+static const char *in = "5@;";
+static int pos;
+
+int yylex(void) {
+    char c = in[pos];
+    if (c == '\0') return 0;
+    pos++;
+    if (c >= '0' && c <= '9') { yylval = c - '0'; return NUM; }
+    yylval = 4242;
+    return c;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    if (seen != 4242) return 2;
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "error_token_value_slot");
+}
+
+// ---------------------------------------------------------------------------
+// Mid-rule actions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mid_rule_action_reads_values_to_its_left() {
+    // A mid-rule action is lowered to an empty production for a synthetic
+    // non-terminal, and transform_action was handed *that* production's RHS
+    // length (0) to resolve $n against. Every reference therefore landed past
+    // the top of the value stack: `$1` emitted `yyvsp[1]` instead of
+    // `yyvsp[0]`, reading whatever was above the stack. POSIX 123914-15
+    // requires the action to reach values to its left.
+    //
+    // Positions in the rule below, counting mid-rule actions as elements:
+    //   $1 = A, $2 = the first mid-rule action, $3 = B,
+    //   $4 = the second mid-rule action, $5 = C.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int saw_a, saw_mid, saw_b, saw_c;
+%}
+
+%token A B C
+
+%%
+s : A       { saw_a = $1; $$ = 99; }
+    B       { saw_mid = $2; saw_b = $3; }
+    C       { saw_c = $5; }
+  ;
+%%
+
+int yylval;
+static int n;
+
+int yylex(void) {
+    switch (n++) {
+    case 0: yylval = 11; return A;
+    case 1: yylval = 22; return B;
+    case 2: yylval = 33; return C;
+    }
+    return 0;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    if (saw_a != 11) return 2;    /* $1 in the first mid-rule action  */
+    if (saw_mid != 99) return 3;  /* $2 = that action's own value     */
+    if (saw_b != 22) return 4;    /* $3 in the second mid-rule action */
+    if (saw_c != 33) return 5;    /* $5 in the final action           */
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "mid_rule_reads_left");
+}
+
+#[test]
+fn test_mid_rule_action_infers_union_tag_from_enclosing_rule() {
+    // Type inference for $n used the lowered production's RHS too, so inside a
+    // mid-rule action it always came up empty: the reference was emitted
+    // untagged and, under %union, assigning the whole union to an int did not
+    // compile at all.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int got;
+%}
+
+%union { int ival; char *sval; }
+
+%token <ival> NUM
+%token <sval> STR
+%type <ival> s
+
+%%
+s : NUM   { got = $1; }
+    STR   { $$ = $1; }
+  ;
+%%
+
+YYSTYPE yylval;
+static int n;
+
+int yylex(void) {
+    if (n == 0) { n++; yylval.ival = 55; return NUM; }
+    if (n == 1) { n++; yylval.sval = "x"; return STR; }
+    return 0;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    if (got != 55) return 2;
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "mid_rule_union_tag");
+}
+
+// ---------------------------------------------------------------------------
+// Grammar-level diagnostics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rule_for_a_declared_token_is_rejected() {
+    // The LHS pass only registered a name it had not seen, so a name declared
+    // with %token stayed a terminal. The LR closure never expands terminals,
+    // so the rule was built and then silently dropped from the parser.
+    let grammar = r#"
+%token FOO
+%%
+s : FOO ;
+FOO : 'a' ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a rule whose LHS is a token must be diagnosed, not silently dropped"
+    );
+    assert!(
+        stderr.contains("which is a token") && stderr.contains("FOO"),
+        "should name the token, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_repeated_nonterminal_on_lhs_still_accepted() {
+    // The same check must not trip on the ordinary case of one non-terminal
+    // defined by several rules.
+    let grammar = r#"
+%token A
+%%
+s : x ;
+x : A ;
+x : A A ;
+"#;
+
+    run_yacc_both_modes(&[], grammar);
+}
+
+#[test]
+fn test_rule_precedence_comes_from_the_last_terminal() {
+    // POSIX 124050: a rule's precedence is that of "the last token or literal
+    // in the body of the rule". Taking the last terminal that *has* a
+    // precedence instead let `e : e '+' FOO e` inherit '+' and silently
+    // resolve a shift/reduce conflict. bison 3.8 reports 1 conflict here.
+    let grammar = r#"
+%token NUM FOO
+%left '+'
+%%
+e : e '+' FOO e
+  | NUM
+  ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("1 shift/reduce conflict"),
+        "FOO has no precedence, so the rule has none and the conflict stands; got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_rule_precedence_still_found_through_a_trailing_nonterminal() {
+    // Non-terminals are neither tokens nor literals, so they must not clear
+    // the precedence an earlier operator contributed -- otherwise every
+    // ordinary `e : e '+' e` rule would start reporting conflicts.
+    let grammar = r#"
+%token NUM
+%left '+'
+%left '*'
+%%
+e : e '+' e
+  | e '*' e
+  | NUM
+  ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "should generate: {}", stderr);
+    assert!(
+        !stderr.contains("conflict"),
+        "operator precedence must still resolve these, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_prec_still_overrides_the_last_terminal() {
+    // %prec must win over whatever the last terminal says, including the new
+    // "no precedence" answer.
+    let grammar = r#"
+%token NUM FOO
+%left '+'
+%%
+e : e '+' FOO e %prec '+'
+  | NUM
+  ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "should generate: {}", stderr);
+    assert!(
+        !stderr.contains("conflict"),
+        "%prec '+' must restore the resolution, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_unary_minus_grammar_has_no_conflicts() {
+    // The canonical %prec UMINUS shape, as a guard that the precedence change
+    // did not disturb the usual calculator idiom.
+    let grammar = r#"
+%token NUM
+%left '+' '-'
+%left '*' '/'
+%right UMINUS
+%%
+e : e '+' e | e '-' e | e '*' e | e '/' e
+  | '-' e %prec UMINUS
+  | NUM
+  ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "should generate: {}", stderr);
+    assert!(
+        !stderr.contains("conflict"),
+        "the unary-minus idiom must stay conflict-free, got: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Token numbers with no declared terminal
+// ---------------------------------------------------------------------------
+
+/// Grammar shared by the $undefined tests: a line-oriented parser with an
+/// `error` recovery rule, fed a token number that was never declared.
+/// `$INPUT` is substituted with the C string literal the lexer walks.
+const UNDECLARED_TOKEN_DRIVER: &str = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+extern int yynerrs;
+static int recovered;
+static int reported;
+%}
+
+%token NUM
+
+%%
+input : lines ;
+lines : lines line | line ;
+line  : NUM '\n'
+      | error '\n'  { recovered++; yyerrok; }
+      ;
+%%
+
+int yylval;
+static const char *in = $INPUT;
+static int pos;
+
+int yylex(void) {
+    char c = in[pos];
+    if (c == '\0') return 0;
+    pos++;
+    if (c >= '0' && c <= '9') { yylval = c - '0'; return NUM; }
+    if (c == '!') return 30000;   /* far above YYTRANSLATE_SIZE */
+    return c;
+}
+
+void yyerror(const char *s) { reported++; (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    /* Recovery must have happened *through* the error path: yyerror called
+       once and yynerrs bumped, not a silent shift of the error token. */
+    if (recovered != 1) return 2;
+    if (reported != 1) return 3;
+    if (yynerrs != 1) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn test_undeclared_token_number_is_a_syntax_error() {
+    // yytranslate filled every unassigned token number with the *error*
+    // token's dense index. In a state that can shift `error` -- which is any
+    // grammar with a recovery rule -- an undeclared token was therefore
+    // shifted as the error token: no yyerror() call, no yynerrs increment,
+    // yyerrflag never set. '@' below is never declared.
+    let grammar = UNDECLARED_TOKEN_DRIVER.replace("$INPUT", "\"@\\n1\\n\"");
+    run_end_to_end_both_modes(&grammar, "undeclared_token");
+}
+
+#[test]
+fn test_token_number_past_the_translate_table_is_a_syntax_error() {
+    // Same path for a token number too large to index yytranslate at all,
+    // which took the out-of-range fallback rather than the default fill.
+    let grammar = UNDECLARED_TOKEN_DRIVER.replace("$INPUT", "\"!\\n1\\n\"");
+    run_end_to_end_both_modes(&grammar, "out_of_range_token");
+}
+
+#[test]
+fn test_undefined_placeholder_is_not_emitted_as_a_token_define() {
+    // $undefined and the other internal symbols must stay out of y.tab.h --
+    // their names are not C identifiers and the lexer must never name them.
+    let grammar = r#"
+%token NUM
+%%
+line : NUM '\n' | error '\n' ;
+"#;
+
+    let header = gen_and_read(&["-d"], grammar, "y.tab.h");
+
+    assert!(
+        !header.contains("undefined"),
+        "y.tab.h must not define the internal placeholder, got: {}",
+        header
+    );
+    assert!(
+        header.contains("#define NUM"),
+        "the user's token must still be defined, got: {}",
+        header
+    );
+}
+
+#[test]
+fn test_description_file_lists_undefined_without_a_token_number() {
+    // $undefined has no token number; the description file used to print a
+    // placeholder 0, which reads as $end's number.
+    let grammar = r#"
+%token NUM
+%%
+line : NUM ;
+"#;
+
+    let output = gen_and_read(&["-v"], grammar, "y.output");
+
+    assert!(
+        output.contains("$undefined\n"),
+        "expected a bare $undefined entry, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("$undefined ("),
+        "$undefined has no token number to print, got:\n{}",
+        output
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Debug symbol names and character-literal ranges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_debug_trace_names_symbols_correctly() {
+    // yytname was emitted in raw symbol-id order, with non-terminals in among
+    // the terminals, but every debug site indexes it with the dense terminal
+    // index yytranslate yields. Reading NUM printed "$accept" and reading '+'
+    // printed "NUM". This runs a parser with yydebug=1 and reads the trace --
+    // the existing -t tests only grep the generated source, which is why the
+    // mis-indexing survived them.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+extern int yydebug;
+%}
+
+%token NUM
+
+%%
+line : e ;
+e : e '+' NUM | NUM ;
+%%
+
+int yylval;
+static const char *in = "1+2";
+static int pos;
+
+int yylex(void) {
+    char c = in[pos];
+    if (c == '\0') return 0;
+    pos++;
+    if (c >= '0' && c <= '9') { yylval = c - '0'; return NUM; }
+    return c;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) { yydebug = 1; return yyparse(); }
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["-t", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc");
+    assert!(
+        output.status.success(),
+        "yacc -t should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let exe = temp_dir.path().join("trace");
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe.to_str().unwrap(),
+            temp_dir.path().join("y.tab.c").to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+    assert!(
+        compile.status.success(),
+        "cc should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("failed to run parser");
+    assert!(run.status.success(), "parser should accept \"1+2\"");
+    let trace = String::from_utf8_lossy(&run.stderr);
+
+    assert!(
+        trace.contains("Reading token NUM"),
+        "NUM must be named NUM in the trace, got:\n{}",
+        trace
+    );
+    assert!(
+        trace.contains("Reading token '+'"),
+        "'+' must be named '+' in the trace, got:\n{}",
+        trace
+    );
+    assert!(
+        !trace.contains("Reading token $accept"),
+        "$accept is a non-terminal and can never be a lookahead, got:\n{}",
+        trace
+    );
+}
+
+#[test]
+fn test_yytname_is_emitted_in_internal_symbol_order() {
+    // The table's order is the contract the debug sites rely on: all terminals
+    // in dense terminal-index order first, then the non-terminals -- which is
+    // also the numbering yyr1 stores, so yytname[yyr1[n]] names the LHS.
+    let grammar = r#"
+%token NUM
+%%
+line : e ;
+e : e '+' NUM | NUM ;
+"#;
+
+    let code = gen_and_read(&["-t"], grammar, "y.tab.c");
+    let table = code
+        .split("yytname[] =")
+        .nth(1)
+        .and_then(|rest| rest.split("};").next())
+        .expect("y.tab.c should contain a yytname table");
+
+    let names: Vec<&str> = table
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').strip_prefix('"'))
+        .filter_map(|l| l.strip_suffix('"'))
+        .collect();
+
+    assert_eq!(
+        names,
+        vec![
+            // terminals, in dense terminal-index order
+            "$end",
+            "error",
+            "$undefined",
+            "NUM",
+            "'+'",
+            // then non-terminals
+            "$accept",
+            "line",
+            "e",
+        ],
+        "yytname must be in internal symbol order"
+    );
+}
+
+#[test]
+fn test_multibyte_char_literal_rejected_in_a_declaration() {
+    // get_or_add_symbol applied the 1..=255 range check to literals in rule
+    // bodies, but a literal declared with %token/%left/... reached the symbol
+    // table by name and skipped it. `%left '\u{20AC}'` was accepted with token
+    // number 8364, inflating yytranslate to 8365 entries keyed on a value a
+    // byte-oriented yylex can never return.
+    for decl in ["%token", "%left", "%right", "%nonassoc"] {
+        let grammar = format!("%token NUM\n{} '\u{20AC}'\n%%\ne : NUM ;\n", decl);
+        let output = run_yacc(&[], &grammar);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "{} '\u{20AC}' must be rejected",
+            decl
+        );
+        assert!(
+            stderr.contains("out of range") && stderr.contains("U+20AC"),
+            "{} should report the offending codepoint, got: {}",
+            decl,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn test_ascii_char_literal_still_accepted_in_a_declaration() {
+    // The check must not disturb the ordinary case, including the token number
+    // a declared literal derives from its codepoint.
+    let grammar = r#"
+%token NUM
+%left '+'
+%%
+e : e '+' e | NUM ;
+"#;
+
+    run_yacc_both_modes(&[], grammar);
+
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+    assert!(
+        code.contains("#define YYTRANSLATE_SIZE 258"),
+        "a byte-range literal must not inflate yytranslate, got: {:?}",
+        code.lines().find(|l| l.contains("YYTRANSLATE_SIZE"))
+    );
+}

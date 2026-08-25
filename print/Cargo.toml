@@ -12,7 +12,6 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 num-traits = "0.2"
-libc.workspace = true
 
 # IPP - blocking client only, no TLS for minimal deps
 ipp = { version = "5.3", default-features = false, features = ["client"] }

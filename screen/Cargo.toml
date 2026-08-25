@@ -10,7 +10,7 @@ rust-version.workspace = true
 [dependencies]
 clap.workspace = true
 gettext-rs.workspace = true
-terminfo = "0.8"
+terminfo = "0.9"
 termios = "0.3"
 libc.workspace = true
 

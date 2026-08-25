@@ -16,7 +16,6 @@ chrono.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 diff = "0.1"
-dirs.workspace = true
 
 [dev-dependencies]
 proptest = "1"

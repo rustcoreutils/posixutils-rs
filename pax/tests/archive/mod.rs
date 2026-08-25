@@ -10,11 +10,11 @@
 //! Archive format tests - roundtrips for ustar, cpio, pax formats
 
 use crate::common::*;
+use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tempfile::TempDir;
 
 #[test]
 fn test_ustar_roundtrip() {

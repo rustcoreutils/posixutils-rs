@@ -15,10 +15,8 @@ gettext-rs.workspace = true
 object = { version = "0.35", default-features = false, features = ["read", "std"] }
 plib = { path = "../plib" }
 # cflow shells out to lex/yacc for .l/.y operands and needs a scratch directory.
-tempfile.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
 
 [features]
 # Enable full compile matrix (4 configs) instead of default single config (-O -g)

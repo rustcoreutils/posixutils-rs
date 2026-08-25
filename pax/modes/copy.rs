@@ -721,8 +721,8 @@ fn restore_symlink_attrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plib::tmp::TempDir;
     use std::fs;
-    use tempfile::TempDir;
 
     #[test]
     fn test_copy_file() {

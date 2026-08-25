@@ -14,7 +14,6 @@ libc.workspace = true
 plib = { path = "../plib" }
 
 [dev-dependencies]
-tempfile = "3"
 filetime = "0.2"
 
 [lints]

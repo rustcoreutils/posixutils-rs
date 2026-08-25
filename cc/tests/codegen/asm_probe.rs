@@ -34,7 +34,7 @@ pub fn asm_for(name: &str, triple: &str, src: &str) -> String {
 
 /// `asm_for` with explicit extra options (e.g. a different `-O` level).
 pub fn asm_for_with(name: &str, triple: &str, src: &str, extra: &[&str]) -> String {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix(&format!("c17_cross_{}_", name))
         .tempdir()
         .expect("failed to create work dir");

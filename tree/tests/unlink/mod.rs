@@ -9,8 +9,8 @@
 //
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::tmp::tempdir;
 use std::fs;
-use tempfile::tempdir;
 
 #[test]
 fn unlink_remove_existing_file() {

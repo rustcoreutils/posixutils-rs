@@ -18,7 +18,6 @@ rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 
 
 [dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

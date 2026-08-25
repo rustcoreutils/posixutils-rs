@@ -416,8 +416,8 @@ pub fn create_backup(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plib::tmp::NamedTempFile;
     use std::io::Write as IoWrite;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_read_file() {

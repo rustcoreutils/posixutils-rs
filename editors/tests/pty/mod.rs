@@ -12,13 +12,13 @@
 //! These tests spawn the actual vi binary in a pseudo-terminal and verify
 //! behavior by checking file contents after editing operations.
 
+use plib::tmp::{tempdir, TempDir};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
-use tempfile::{tempdir, TempDir};
 
 /// Write key sequence to PTY master.
 fn write_keys<W: Write>(w: &mut W, s: &str) {

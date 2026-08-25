@@ -793,8 +793,8 @@ fn test_ex_line_number() {
 
 #[test]
 fn test_file_read() {
+    use plib::tmp::NamedTempFile;
     use std::io::Write;
-    use tempfile::NamedTempFile;
 
     let mut tmp = NamedTempFile::new().unwrap();
     writeln!(tmp, "test content").unwrap();
@@ -815,8 +815,8 @@ fn test_file_read_nonexistent() {
 
 #[test]
 fn test_file_write() {
+    use plib::tmp::NamedTempFile;
     use std::fs;
-    use tempfile::NamedTempFile;
 
     let buffer = Buffer::from_text("hello\nworld");
     let output = NamedTempFile::new().unwrap();
@@ -831,8 +831,8 @@ fn test_file_write() {
 
 #[test]
 fn test_file_write_range() {
+    use plib::tmp::NamedTempFile;
     use std::fs;
-    use tempfile::NamedTempFile;
 
     let buffer = Buffer::from_text("one\ntwo\nthree\nfour");
     let output = NamedTempFile::new().unwrap();
@@ -1941,8 +1941,8 @@ fn test_macro_with_insert_mode() {
 #[test]
 fn test_source_file_creation_and_content() {
     // Test that we can create a source file and it has valid ex commands
+    use plib::tmp::NamedTempFile;
     use std::io::Write;
-    use tempfile::NamedTempFile;
 
     // Create a temporary file with ex commands
     let mut file = NamedTempFile::new().unwrap();

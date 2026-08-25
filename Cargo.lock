@@ -434,12 +434,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
-name = "fastrand"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
-
-[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -488,8 +482,8 @@ version = "0.8.0"
 dependencies = [
  "errno",
  "libc",
+ "plib",
  "rand 0.8.7",
- "tempfile",
 ]
 
 [[package]]
@@ -535,19 +529,8 @@ checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
  "libc",
- "r-efi 5.3.0",
+ "r-efi",
  "wasip2",
-]
-
-[[package]]
-name = "getrandom"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi 6.0.0",
 ]
 
 [[package]]
@@ -751,12 +734,6 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
-
-[[package]]
-name = "linux-raw-sys"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
@@ -1011,7 +988,6 @@ dependencies = [
  "errno",
  "gettext-rs",
  "libc",
- "tempfile",
 ]
 
 [[package]]
@@ -1047,7 +1023,6 @@ dependencies = [
  "pest_derive",
  "plib",
  "rand 0.8.7",
- "tempfile",
 ]
 
 [[package]]
@@ -1072,7 +1047,6 @@ dependencies = [
  "gettext-rs",
  "object",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1085,7 +1059,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1112,7 +1085,6 @@ dependencies = [
  "plib",
  "regex",
  "regex-syntax",
- "tempfile",
 ]
 
 [[package]]
@@ -1124,7 +1096,6 @@ dependencies = [
  "libc",
  "plib",
  "portable-pty",
- "tempfile",
  "termion",
  "thiserror 2.0.19",
 ]
@@ -1138,7 +1109,6 @@ dependencies = [
  "libc",
  "plib",
  "portable-pty",
- "tempfile",
  "termios",
 ]
 
@@ -1150,7 +1120,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1180,7 +1149,6 @@ dependencies = [
  "strum",
  "strum_macros",
  "syn 2.0.119",
- "tempfile",
 ]
 
 [[package]]
@@ -1209,7 +1177,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1245,7 +1212,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1257,7 +1223,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1270,7 +1235,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1283,7 +1247,6 @@ dependencies = [
  "num-traits",
  "plib",
  "portable-pty",
- "tempfile",
 ]
 
 [[package]]
@@ -1305,7 +1268,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1317,7 +1279,6 @@ dependencies = [
  "libc",
  "plib",
  "portable-pty",
- "tempfile",
  "terminfo",
  "termios",
 ]
@@ -1330,7 +1291,6 @@ dependencies = [
  "libc",
  "plib",
  "portable-pty",
- "tempfile",
 ]
 
 [[package]]
@@ -1373,7 +1333,6 @@ dependencies = [
  "libc",
  "plib",
  "regex",
- "tempfile",
 ]
 
 [[package]]
@@ -1400,7 +1359,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1413,7 +1371,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "tempfile",
 ]
 
 [[package]]
@@ -1458,8 +1415,6 @@ dependencies = [
  "rand_chacha 0.9.0",
  "rand_xorshift",
  "regex-syntax",
- "rusty-fork",
- "tempfile",
  "unarray",
 ]
 
@@ -1468,12 +1423,6 @@ name = "pure-rust-locales"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "869675ad2d7541aea90c6d88c81f46a7f4ea9af8cd0395d38f11a95126998a0d"
-
-[[package]]
-name = "quick-error"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quote"
@@ -1489,12 +1438,6 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
-
-[[package]]
-name = "r-efi"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
@@ -1639,35 +1582,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
-name = "rustix"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
-dependencies = [
- "bitflags 2.13.1",
- "errno",
- "libc",
- "linux-raw-sys",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "rusty-fork"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
-dependencies = [
- "fnv",
- "quick-error",
- "tempfile",
- "wait-timeout",
-]
 
 [[package]]
 name = "rustyline"
@@ -1841,19 +1759,6 @@ dependencies = [
  "ntapi",
  "rayon",
  "windows",
-]
-
-[[package]]
-name = "tempfile"
-version = "3.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
-dependencies = [
- "fastrand",
- "getrandom 0.4.3",
- "once_cell",
- "rustix",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2105,15 +2010,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "wasi"

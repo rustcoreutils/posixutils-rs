@@ -8,10 +8,10 @@
 //
 
 use plib::testing::get_binary_path;
+use plib::tmp::TempDir;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use tempfile::TempDir;
 
 /// Run a built binary with the given args, cwd, env, and stdin.
 fn run_env(

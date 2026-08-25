@@ -13,10 +13,10 @@
 //! testing POSIX ex commands via stdin/stdout.
 
 use plib::testing::{get_binary_path, run_test, TestPlan};
+use plib::tmp::{NamedTempFile, TempDir};
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use tempfile::{NamedTempFile, TempDir};
 
 // Helper to create a test plan for ex in silent mode
 fn ex_test(stdin: &str, expected_out: &str) {

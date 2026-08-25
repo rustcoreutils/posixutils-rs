@@ -28,7 +28,6 @@ flate2 = "1"
 plib = { path = "../plib" }
 
 [dev-dependencies]
-tempfile = "3"
 filetime = "0.2"
 
 [[bin]]

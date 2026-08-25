@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn accepts_regular_0600_owned_by_self() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join("cronfile");
         fs::write(&p, b"* * * * * echo hi\n").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_mode_for_spool() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join("cronfile");
         fs::write(&p, b"x").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn rejects_group_writable_system_crontab() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join("crontab");
         fs::write(&p, b"x").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o662)).unwrap();
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn rejects_hardlinked_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join("cronfile");
         fs::write(&p, b"x").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn open_refuses_symlink() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let target = dir.path().join("real");
         fs::write(&target, b"x").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();

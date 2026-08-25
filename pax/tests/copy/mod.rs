@@ -10,9 +10,9 @@
 //! Copy mode tests (-r -w)
 
 use crate::common::*;
+use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
-use tempfile::TempDir;
 
 #[test]
 fn test_copy_mode_basic() {

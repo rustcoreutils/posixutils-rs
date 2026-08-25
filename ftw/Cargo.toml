@@ -12,8 +12,8 @@ libc.workspace = true
 errno.workspace = true
 
 [dev-dependencies]
+plib = { path = "../plib" }
 rand = "0.8"
-tempfile = "3"
 
 [lints]
 workspace = true

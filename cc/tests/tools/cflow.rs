@@ -200,7 +200,7 @@ fn tools_cflow_prints_the_declared_char_spelling() {
 /// now. Recorded at #C131.
 #[test]
 fn tools_cflow_prints_the_whole_type() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("cflow_types_")
         .tempdir()
         .unwrap();
@@ -261,7 +261,7 @@ fn tools_cflow_prints_the_whole_type() {
 /// A lone linemarker is enough to reproduce the original failure.
 #[test]
 fn cflow_accepts_a_linemarker() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("cflow_dot_i_")
         .tempdir()
         .unwrap();
@@ -279,7 +279,7 @@ fn cflow_accepts_a_linemarker() {
 /// original fix could not do.
 #[test]
 fn cflow_on_preprocessed_output_matches_the_source() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("cflow_dot_i_roundtrip_")
         .tempdir()
         .unwrap();
@@ -323,7 +323,7 @@ fn cflow_on_preprocessed_output_matches_the_source() {
 /// A `.i` is not preprocessed again, in cflow as in c17.
 #[test]
 fn cflow_does_not_expand_macros_in_a_dot_i() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("cflow_dot_i_nomacro_")
         .tempdir()
         .unwrap();

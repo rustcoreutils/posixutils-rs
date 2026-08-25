@@ -13,7 +13,6 @@ clap = { workspace = true }
 libc = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
-tempfile = { workspace = true }
 
 [[bin]]
 name = "at"

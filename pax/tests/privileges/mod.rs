@@ -10,12 +10,12 @@
 //! Privilege/Preservation (-p) tests
 
 use crate::common::*;
+use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tempfile::TempDir;
 
 #[cfg(unix)]
 #[test]

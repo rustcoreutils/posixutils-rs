@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_read_safe_exrc_ok() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join(".exrc");
         write_mode(&p, "set number\n", 0o600);
         assert_eq!(
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_read_safe_exrc_group_writable_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join(".exrc");
         write_mode(&p, "set number\n", 0o620);
         assert_eq!(read_safe_exrc(p.to_str().unwrap()).unwrap(), None);
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_read_safe_exrc_other_writable_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join(".exrc");
         write_mode(&p, "set number\n", 0o602);
         assert_eq!(read_safe_exrc(p.to_str().unwrap()).unwrap(), None);
@@ -138,7 +138,7 @@ mod tests {
         if unsafe { libc::getuid() } == 0 {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join(".exrc");
         write_mode(&p, "set number\n", 0o000);
         let r = read_safe_exrc(p.to_str().unwrap());
@@ -154,7 +154,7 @@ mod tests {
         // A file rejected by the ownership/permission checks is a security
         // decision, not an I/O failure: historical ex is silent there, so it
         // must stay Ok(None) rather than becoming Err.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join(".exrc");
         write_mode(&p, "set number\n", 0o622);
         assert_eq!(read_safe_exrc(p.to_str().unwrap()).unwrap(), None);
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_read_safe_exrc_missing_is_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let p = dir.path().join("does-not-exist");
         assert_eq!(read_safe_exrc(p.to_str().unwrap()).unwrap(), None);
     }

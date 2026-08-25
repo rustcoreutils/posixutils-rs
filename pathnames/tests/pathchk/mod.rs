@@ -130,7 +130,7 @@ fn pathchk_non_searchable_directory() {
         return;
     }
 
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let locked = td.path().join("locked");
     std::fs::create_dir(&locked).unwrap();
 
@@ -153,7 +153,7 @@ fn pathchk_non_searchable_directory() {
 /// above could pass for the wrong reason (e.g. a length check firing).
 #[test]
 fn pathchk_searchable_directory_is_accepted() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let open = td.path().join("open");
     std::fs::create_dir(&open).unwrap();
 

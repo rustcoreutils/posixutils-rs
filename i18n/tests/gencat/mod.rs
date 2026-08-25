@@ -180,7 +180,7 @@ fn gencat_sets_and_messagess_with_quote_unset() {
 /// unchanged: nothing may re-encode them.
 #[test]
 fn gencat_preserves_non_utf8_message_bytes() {
-    let temp = tempfile::TempDir::new().unwrap();
+    let temp = plib::tmp::TempDir::new().unwrap();
     let msg_path = temp.path().join("latin1.msg");
     let cat_path = temp.path().join("latin1.cat");
 
@@ -215,7 +215,7 @@ fn gencat_preserves_non_utf8_message_bytes() {
 /// `\ddd` names a *byte*, so a high octal escape must produce one byte.
 #[test]
 fn gencat_octal_escape_above_7f_is_one_byte() {
-    let temp = tempfile::TempDir::new().unwrap();
+    let temp = plib::tmp::TempDir::new().unwrap();
     let msg_path = temp.path().join("octal.msg");
     let cat_path = temp.path().join("octal.cat");
     // \351 == 0xE9.
@@ -249,7 +249,7 @@ fn gencat_octal_escape_above_7f_is_one_byte() {
 /// Pre-existing, and reachable with the smallest catalog that has a collision.
 #[test]
 fn gencat_two_messages_in_a_set_do_not_overrun_the_array() {
-    let temp = tempfile::TempDir::new().unwrap();
+    let temp = plib::tmp::TempDir::new().unwrap();
     let msg_path = temp.path().join("two.msg");
     let cat_path = temp.path().join("two.cat");
     std::fs::write(&msg_path, b"$set 1\n1 first\n2 second\n").unwrap();
@@ -287,7 +287,7 @@ fn gencat_two_messages_in_a_set_do_not_overrun_the_array() {
 /// replaced kept them.
 #[test]
 fn gencat_keeps_blanks_after_the_first_separator() {
-    let temp = tempfile::TempDir::new().unwrap();
+    let temp = plib::tmp::TempDir::new().unwrap();
     let msg_path = temp.path().join("indent.msg");
     let cat_path = temp.path().join("indent.cat");
     std::fs::write(&msg_path, b"$set 1\n1    indented text\n2 plain text\n").unwrap();

@@ -614,7 +614,7 @@ fn declarator_line(lines: &[&str], start_line: u32, name: &str) -> u32 {
 /// C source generated from a `.l` or `.y` operand, plus the temporary directory
 /// holding it (dropped, and so cleaned up, when this goes out of scope).
 struct GeneratedSource {
-    _dir: tempfile::TempDir,
+    _dir: plib::tmp::TempDir,
     path: String,
 }
 
@@ -634,7 +634,7 @@ impl GeneratedSource {
 fn generate_from_grammar(file: &str, ext: &str) -> io::Result<GeneratedSource> {
     use std::process::Command;
 
-    let dir = tempfile::TempDir::new()?;
+    let dir = plib::tmp::TempDir::new()?;
     let absolute = std::fs::canonicalize(file)?;
 
     let (tool, output_name) = match ext {

@@ -18,7 +18,6 @@ ipp = { version = "5.3", default-features = false, features = ["client"] }
 
 [dev-dependencies]
 portable-pty = "0.9"
-tempfile = "3"
 
 [lints]
 workspace = true

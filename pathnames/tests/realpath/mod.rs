@@ -278,7 +278,7 @@ fn realpath_newline_is_error() {
 fn realpath_non_utf8_operand() {
     use std::os::unix::ffi::OsStrExt;
 
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     // The temp dir path itself is valid UTF-8; only the entry name is not.
     let mut name = td.path().as_os_str().as_bytes().to_vec();
     name.extend_from_slice(b"/\xff\xfefile");

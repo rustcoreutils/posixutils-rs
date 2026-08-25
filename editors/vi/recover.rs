@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_preserve_and_load_roundtrip() {
-        let td = tempfile::tempdir().unwrap();
+        let td = plib::tmp::tempdir().unwrap();
         let base = td.path().to_str().unwrap();
 
         let orig = PathBuf::from("/home/user/notes.txt");
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_recover_dir_rejects_symlink() {
-        let td = tempfile::tempdir().unwrap();
+        let td = plib::tmp::tempdir().unwrap();
         let base = td.path();
         let uid = unsafe { libc::getuid() };
         // Pre-create the recovery dir name as a symlink to elsewhere.

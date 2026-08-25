@@ -1574,7 +1574,7 @@ fn test_file_info_reports_modification() {
 /// arguments thrown away.
 #[test]
 fn test_visual_command_in_visual_mode_edits_a_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let path = dir.path().join("v.txt");
     std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
 
@@ -2200,7 +2200,7 @@ fn test_ex_copy_to_search_address() {
 /// The other half of the same rule: vi begins on the first line.
 #[test]
 fn test_vi_starts_on_the_first_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let path = dir.path().join("f.txt");
     std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
 
@@ -3049,7 +3049,7 @@ fn test_first_non_blank_on_an_all_blank_line() {
 /// it, so `#` expanded to the file just opened -- the same as `%`.
 #[test]
 fn test_alternate_file_expands_to_the_previous_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let first = dir.path().join("first.txt");
     let second = dir.path().join("second.txt");
     std::fs::write(&first, "one\n").unwrap();
@@ -3078,7 +3078,7 @@ fn test_alternate_file_expands_to_the_previous_file() {
 /// went with it.
 #[test]
 fn test_ctrl_caret_warns_before_discarding_a_modified_buffer() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let first = dir.path().join("first.txt");
     let second = dir.path().join("second.txt");
     std::fs::write(&first, "one\n").unwrap();

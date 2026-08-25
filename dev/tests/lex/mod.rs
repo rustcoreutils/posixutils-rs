@@ -9,9 +9,9 @@
 
 //! Integration tests for lex
 
+use plib::tmp::TempDir;
 use std::fs;
 use std::process::Command;
-use tempfile::TempDir;
 
 fn run_lex(input: &str) -> (String, bool) {
     let temp_dir = TempDir::new().unwrap();

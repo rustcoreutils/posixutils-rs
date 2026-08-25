@@ -22,7 +22,6 @@ quote = "1"
 syn = { version = "2", features = ["parsing", "full"] }
 
 [dev-dependencies]
-tempfile = "3.10"
 pretty_assertions = "1.4"
 
 [lib]

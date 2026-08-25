@@ -8,10 +8,10 @@
 //
 
 use plib::testing::{run_test_with_checker, TestPlan};
+use plib::tmp::TempDir;
 use std::fs::File;
 use std::io::Write;
 use std::process::Output;
-use tempfile::TempDir;
 
 /// Create a minimal locale source file
 fn create_minimal_locale(dir: &TempDir) -> std::path::PathBuf {
@@ -304,7 +304,7 @@ fn test_localedef_empty_input() {
 /// says so with exit 3.
 #[test]
 fn localedef_accepts_a_non_utf8_source() {
-    let temp = tempfile::TempDir::new().unwrap();
+    let temp = plib::tmp::TempDir::new().unwrap();
     let src = temp.path().join("src");
     let mut source = Vec::new();
     source.extend_from_slice(b"LC_IDENTIFICATION\n");

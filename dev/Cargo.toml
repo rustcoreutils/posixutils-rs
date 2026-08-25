@@ -19,7 +19,6 @@ regex-syntax = "0.8"
 plib = { path = "../plib" }
 
 [dev-dependencies]
-tempfile = "3"
 
 [lints]
 workspace = true

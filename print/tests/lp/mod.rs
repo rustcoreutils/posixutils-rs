@@ -8,8 +8,8 @@
 //
 
 use plib::testing::{run_test_with_checker_and_env, TestPlan};
+use plib::tmp::TempDir;
 use std::fs;
-use tempfile::TempDir;
 
 /// With no `-d` and neither variable set, lp must still choose a destination.
 ///

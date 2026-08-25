@@ -313,7 +313,7 @@ fn seekable_stdin() -> io::Result<File> {
     // Non-seekable input: spill a bounded prefix to a temp file. io::copy uses
     // a small internal buffer, so memory stays O(1); take() caps the on-disk
     // capture so a 1 TiB pipe does not write 1 TiB to the temp directory.
-    let mut tmp = tempfile::tempfile()?;
+    let mut tmp = plib::tmp::tempfile()?;
     io::copy(&mut f.take(STDIN_SPILL_LIMIT), &mut tmp)?;
     tmp.rewind()?;
     Ok(tmp)

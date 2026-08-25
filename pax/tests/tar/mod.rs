@@ -10,10 +10,10 @@
 //! Integration tests for the `tar` compatibility front-end.
 
 use crate::common::{assert_failure, assert_success, have_tool, run_tar, stderr_str, stdout_str};
+use plib::tmp::TempDir;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tempfile::TempDir;
 
 /// Build the tree every test archives: a file, a subdirectory with two files
 /// (one of which the exclusion tests target), and a symlink.

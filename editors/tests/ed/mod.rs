@@ -13,8 +13,8 @@
 //! testing commands via stdin/stdout.
 
 use plib::testing::{run_test, TestPlan};
+use plib::tmp::NamedTempFile;
 use std::fs;
-use tempfile::NamedTempFile;
 
 // Helper to create a test plan for ed in silent mode
 fn ed_test(stdin: &str, expected_out: &str) {
@@ -1765,7 +1765,7 @@ fn ed_in_dir(dir: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String,
 /// loss with exit 0.
 #[test]
 fn test_ed_wq_writes_remembered_file_and_quits() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let target = dir.path().join("f.txt");
     fs::write(&target, "hello\n").unwrap();
 
@@ -1781,7 +1781,7 @@ fn test_ed_wq_writes_remembered_file_and_quits() {
 
 #[test]
 fn test_ed_wq_with_filename_writes_there_and_quits() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let (code, _out, err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nwq out.txt\n");
 
     assert_eq!(code, 0, "stderr: {}", err);
@@ -1795,7 +1795,7 @@ fn test_ed_wq_with_filename_writes_there_and_quits() {
 /// `W` is the append-writing form, so `Wq` appends and quits.
 #[test]
 fn test_ed_uppercase_wq_appends_and_quits() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let target = dir.path().join("f.txt");
     fs::write(&target, "first\n").unwrap();
 
@@ -1809,7 +1809,7 @@ fn test_ed_uppercase_wq_appends_and_quits() {
 /// file that happens to be named `q` and stays in command mode.
 #[test]
 fn test_ed_w_space_q_writes_a_file_named_q_without_quitting() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let (code, out, err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nw q\n1p\nQ\n");
 
     assert_eq!(code, 0, "stderr: {}", err);
@@ -1823,7 +1823,7 @@ fn test_ed_w_space_q_writes_a_file_named_q_without_quitting() {
 /// POSIX (ed, `w`): with no pathname given and none remembered, it is an error.
 #[test]
 fn test_ed_wq_without_remembered_pathname_is_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let (code, out, _err) = ed_in_dir(dir.path(), &["-s"], "a\nhello\n.\nwq\nQ\n");
 
     assert_eq!(code, 1);
@@ -1842,7 +1842,7 @@ fn test_ed_wq_without_remembered_pathname_is_error() {
 fn test_ed_x_command_is_not_recognized() {
     // Give ed a remembered pathname, so `x` would succeed if it still meant
     // write-quit -- otherwise this passes for the unrelated NoFilename reason.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let target = dir.path().join("f.txt");
     fs::write(&target, "hello\n").unwrap();
 
@@ -1898,7 +1898,7 @@ fn test_ed_quit_warning_rearms_after_further_editing() {
 /// Pin that: force-edit, edit again, then `q` must still warn.
 #[test]
 fn test_ed_quit_warning_rearms_after_force_edit_then_edit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let target = dir.path().join("f.txt");
     fs::write(&target, "orig\n").unwrap();
 
@@ -1911,7 +1911,7 @@ fn test_ed_quit_warning_rearms_after_force_edit_then_edit() {
 /// on its own merits rather than on a stale flag.
 #[test]
 fn test_ed_quit_after_write_exits_without_warning() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let (code, out, _err) = ed_in_dir(dir.path(), &["-s"], "a\nfoo\n.\nw out.txt\nq\n");
     assert_eq!(code, 0);
     assert_eq!(out, "");
@@ -2141,7 +2141,7 @@ fn test_ed_writes_ed_hup_on_sighup() {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let mut child = Command::new(plib::testing::get_binary_path("ed"))
         .arg("-s")
         .current_dir(dir.path())

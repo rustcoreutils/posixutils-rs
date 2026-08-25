@@ -112,7 +112,7 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
         .unwrap_or_else(|| Path::new("."));
     // Tempfile is created in the same directory as `path` so the final
     // `rename(2)` stays within one filesystem and is atomic.
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut tmp = crate::tmp::NamedTempFile::new_in(parent)?;
     tmp.as_file_mut().write_all(bytes)?;
     tmp.as_file_mut().sync_all()?;
 
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn input_stream_dashed_opens_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tmp::tempdir().unwrap();
         let path = dir.path().join("data.txt");
         fs::write(&path, b"hello\n").unwrap();
 
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn input_stream_dashed_missing_file_errors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tmp::tempdir().unwrap();
         let path = dir.path().join("nope.txt");
         // A real (non-"-") path that does not exist must surface the open error,
         // not be silently treated as stdin.
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn write_atomic_replaces_content() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tmp::tempdir().unwrap();
         let path = dir.path().join("target.bin");
         fs::write(&path, b"original").unwrap();
 
@@ -167,7 +167,7 @@ mod tests {
     /// umask by setting it to 0 and back.
     #[test]
     fn write_atomic_creates_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tmp::tempdir().unwrap();
         let path = dir.path().join("new.bin");
         assert!(!path.exists());
 
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn write_atomic_preserves_mode() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tmp::tempdir().unwrap();
         let path = dir.path().join("executable.bin");
         fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn write_atomic_no_leftover_temp() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tmp::tempdir().unwrap();
         let path = dir.path().join("file.bin");
         write_atomic(&path, b"data").unwrap();
 

@@ -535,7 +535,7 @@ fn test_strip_executable_removes_symtab() {
     // The aggressive path still applies to executables (ET_EXEC): the symbol
     // table is removed. Build a non-PIE executable so there is no .rela.dyn to
     // confuse the check, strip it, and confirm .symtab is gone.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let src = dir.path().join("a.c");
     let exe = dir.path().join("a.out");
     fs::write(&src, "int main(void){return 0;}\n").unwrap();
@@ -576,7 +576,7 @@ fn test_strip_executable_removes_symtab() {
 fn test_strip_preserves_non_elf_archive_members() {
     // #ST1: a non-ELF archive member must survive stripping unmodified rather
     // than being silently dropped.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let cpath = dir.path().join("o.c");
     let opath = dir.path().join("o.o");
     fs::write(&cpath, "int f(void){return 1;}\n").unwrap();
@@ -644,7 +644,7 @@ fn test_strip_preserves_long_archive_member_names() {
     const LONG: &str = "a_very_long_member_name.o";
     assert!(LONG.len() > 16, "fixture name must exceed the header field");
 
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let cpath = dir.path().join("s.c");
     let opath = dir.path().join(LONG);
     fs::write(&cpath, "int a_symbol_here(void){return 1;}\n").unwrap();
@@ -690,7 +690,7 @@ fn test_strip_rejects_bsd_variant_archive() {
     // #ST11: `!<arch>\n` is shared by the System V and BSD layouts. Our writer
     // only speaks System V, so a BSD archive (the macOS default) must be
     // refused rather than silently rewritten into a malformed hybrid.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let arc = dir.path().join("bsd.a");
 
     // Minimal BSD archive: the `#1/<len>` header form stores the member name
@@ -772,7 +772,7 @@ fn test_strip_removes_all_debug_sections() {
 #[test]
 fn test_strip_rejects_unsupported_format() {
     // #ST3: a non-ELF, non-archive file is rejected with a clear non-zero exit.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let f = dir.path().join("plain.txt");
     fs::write(&f, "not an object file\n").unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
@@ -880,7 +880,7 @@ fn test_strings_minimum_length_counts_characters_not_bytes() {
     // #S9: POSIX 115860 counts printable *characters*. Three multi-byte
     // characters span nine bytes, so a byte-based comparison wrongly cleared
     // a `-n 4` threshold. GNU strings prints nothing here.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let f = dir.path().join("mb.bin");
     // Three EURO SIGNs (U+20AC): 3 characters, 9 bytes.
     fs::write(&f, "\u{20ac}\u{20ac}\u{20ac}\n").unwrap();
@@ -918,7 +918,7 @@ fn test_strings_newline_terminates_a_string() {
     // #S2: POSIX 115860 -- a printable string is terminated by <newline> or
     // NUL. The audit flagged that no fixture contained an embedded newline,
     // so nothing pinned this behavior.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let f = dir.path().join("nl.bin");
     fs::write(&f, b"abcd\nefgh\nijkl\n").unwrap();
 
@@ -1039,7 +1039,7 @@ fn test_ar_tv_date_uses_mtime_not_age() {
     // `ar -tv` shows the real year, not 1970 (the old file-age bug).
     use std::io::Write;
     use std::time::{Duration, SystemTime};
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let f = dir.path().join("member.txt");
     {
         let mut file = fs::File::create(&f).unwrap();
@@ -1086,7 +1086,7 @@ fn test_ar_tv_date_uses_mtime_not_age() {
 fn test_ar_delete_matches_basename() {
     // #A2: a file operand is matched to a member by its last pathname
     // component, so `ar -d arc some/dir/foo.o` deletes the member `foo.o`.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let f = dir.path().join("foo.o");
     fs::write(&f, b"member contents").unwrap();
     let arc = dir.path().join("a.a");
@@ -1119,7 +1119,7 @@ fn test_ar_delete_matches_basename() {
 #[test]
 fn test_ar_bundled_mode_flags() {
     // #A3: grouped mode+modifier flags like -rc/-tv/-dv must work (XBD 12.2).
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let f = dir.path().join("m.o");
     fs::write(&f, b"some object bytes").unwrap();
     let arc = dir.path().join("b.a");
@@ -1158,8 +1158,8 @@ fn test_ar_bundled_mode_flags() {
 }
 
 /// Build an archive from `(name, contents)` pairs and return (dir, archive path).
-fn ar_make_archive(members: &[(&str, &[u8])]) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::TempDir::new().unwrap();
+fn ar_make_archive(members: &[(&str, &[u8])]) -> (plib::tmp::TempDir, std::path::PathBuf) {
+    let dir = plib::tmp::TempDir::new().unwrap();
     let mut argv = vec!["-r".to_string(), "-c".to_string()];
     let arc = dir.path().join("a.a");
     argv.push(arc.to_str().unwrap().to_string());
@@ -1307,7 +1307,7 @@ fn test_ar_list_missing_operand_names_the_operand() {
 #[test]
 fn test_ar_move_verbose() {
     // #A5: ar -m -v reports each moved member as "m - <name>".
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let a = dir.path().join("a.o");
     let b = dir.path().join("b.o");
     fs::write(&a, b"aaaa").unwrap();
@@ -1342,7 +1342,7 @@ fn test_ar_extract_long_name_truncation() {
     // #A4: extracting a member whose name exceeds NAME_MAX errors by default
     // and is truncated with -T. Build the long-name archive with the ar crate
     // (a real file with a 300-byte name can't exist on disk).
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let longname = format!("{}.o", "x".repeat(300));
     let data = b"member-data";
     let arc = dir.path().join("long.a");
@@ -1393,7 +1393,7 @@ fn test_ar_long_member_name() {
     // #A6: a member name longer than 15 bytes is stored via a "//" long-name
     // table (POSIX: valid filenames must not be rejected), and round-trips
     // through list/parse/extract.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let longname = "this_is_a_long_member_name.o"; // 28 bytes > 15
     let f = dir.path().join(longname);
     fs::write(&f, b"payload-bytes-here").unwrap();
@@ -1448,7 +1448,7 @@ fn test_ar_long_member_name() {
 #[test]
 fn test_ar_print_verbose_uses_operand_prefix() {
     // #A8: with file operands, the -pv prefix is the operand, not the member.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let f = dir.path().join("m.o");
     fs::write(&f, b"PAYLOAD").unwrap();
     let arc = dir.path().join("p.a");
@@ -1478,7 +1478,7 @@ fn test_ar_print_verbose_uses_operand_prefix() {
 fn test_ar_tv_shows_setuid_bit() {
     // #A9: the -tv mode column renders setuid/setgid/sticky like ls.
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let f = dir.path().join("s.o");
     fs::write(&f, b"x").unwrap();
     fs::set_permissions(&f, fs::Permissions::from_mode(0o4755)).unwrap();
@@ -1507,7 +1507,7 @@ fn test_ar_tv_shows_setuid_bit() {
 fn test_ar_replace_no_files_errors() {
     // #A11: -r with no file operands is a clear error, not a silent no-op or a
     // misleading "missing archive operand".
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let arc = dir.path().join("r.a");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
         .args(["-r", arc.to_str().unwrap()])
@@ -1569,7 +1569,7 @@ fn nm_line_name(line: &str) -> &str {
 #[test]
 fn test_nm_default_sorted_by_name() {
     // #N5: default output is sorted by symbol name.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let out = nm_run(&[obj.to_str().unwrap()]);
     assert!(out.status.success());
@@ -1590,7 +1590,7 @@ fn test_nm_default_sorted_by_name() {
 #[test]
 fn test_nm_portable_format() {
     // #N3/#N6/#N13: -P emits "name type value size".
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let out = nm_run(&["-P", obj.to_str().unwrap()]);
     assert!(out.status.success());
@@ -1613,7 +1613,7 @@ fn test_nm_portable_format() {
 #[test]
 fn test_nm_value_sort() {
     // #N9: -v sorts by value (ascending).
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let out = nm_run(&["-v", "-P", "-t", "d", obj.to_str().unwrap()]);
     assert!(out.status.success());
@@ -1637,7 +1637,7 @@ fn test_nm_value_sort() {
 #[test]
 fn test_nm_global_filter() {
     // #N8: -g keeps only global symbols (uppercase type letters).
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let out = nm_run(&["-g", obj.to_str().unwrap()]);
     assert!(out.status.success());
@@ -1656,7 +1656,7 @@ fn test_nm_global_filter() {
 #[test]
 fn test_nm_undefined_filter() {
     // #N8: -u keeps only undefined symbols.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let out = nm_run(&["-u", obj.to_str().unwrap()]);
     assert!(out.status.success());
@@ -1678,7 +1678,7 @@ fn test_nm_undefined_filter() {
 /// information", and a section symbol is neither undefined nor global.
 #[test]
 fn test_nm_full_output_still_honors_filters() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let path = obj.to_str().unwrap();
 
@@ -1714,7 +1714,7 @@ fn test_nm_full_output_still_honors_filters() {
 #[test]
 fn test_nm_print_name_prefix() {
     // #N4: -A prefixes every line with the object pathname.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let out = nm_run(&["-A", obj.to_str().unwrap()]);
     assert!(out.status.success());
@@ -1728,7 +1728,7 @@ fn test_nm_print_name_prefix() {
 #[test]
 fn test_nm_multiple_files_headers() {
     // #N11: multiple operands produce a "file:" header per file.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let a = nm_compile_obj(dir.path(), "first", NM_SRC);
     let b = nm_compile_obj(dir.path(), "second", "int only_here = 9;\n");
     let out = nm_run(&[a.to_str().unwrap(), b.to_str().unwrap()]);
@@ -1741,7 +1741,7 @@ fn test_nm_multiple_files_headers() {
 #[test]
 fn test_nm_archive_input() {
     // #N2: nm reads .a archives and emits a "[member]:" stanza per member.
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let arc = dir.path().join("lib.a");
     assert!(std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
@@ -1768,7 +1768,7 @@ fn test_nm_archive_input() {
 #[test]
 fn test_nm_octal_radix() {
     // #N6/#N7: -t o formats numeric columns in octal (no digits 8/9).
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
     let out = nm_run(&["-P", "-t", "o", obj.to_str().unwrap()]);
     assert!(out.status.success());
@@ -1814,7 +1814,7 @@ int use_undef(void) { return undef_sym(); }
 // one: it drops the statics.)
 #[test]
 fn test_nm_external_and_static_filter() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let obj = nm_compile_obj(td.path(), "nmscope", NM_SCOPE_SRC);
 
     let out = nm_run(&["-e", obj.to_str().unwrap()]);
@@ -1854,7 +1854,7 @@ fn test_nm_external_and_static_filter() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_nm_full_output_adds_section_symbols() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let obj = nm_compile_obj(td.path(), "nmfull", NM_SCOPE_SRC);
 
     let plain = nm_run(&[obj.to_str().unwrap()]);
@@ -1901,7 +1901,7 @@ fn test_nm_reports_unreadable_and_unparseable_files() {
     );
 
     // A regular file that is not an object.
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let junk = td.path().join("not-an-object.txt");
     fs::write(&junk, b"this is plain text, not ELF\n").unwrap();
 
@@ -1926,7 +1926,7 @@ fn test_nm_reports_unreadable_and_unparseable_files() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_strip_relocatable_object_still_links_and_runs() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
 
     let lib_c = td.path().join("lib.c");
     let main_c = td.path().join("main.c");
@@ -1988,7 +1988,7 @@ fn test_strip_relocatable_object_still_links_and_runs() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_strip_archive_symbol_table_still_resolves() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
 
     // Two members, so a wrong offset in the index picks the wrong one.
     for (name, body) in [
@@ -2064,7 +2064,7 @@ fn test_strip_leaves_input_intact_when_it_cannot_write() {
         return;
     }
 
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let dir = td.path().join("locked");
     fs::create_dir(&dir).unwrap();
 

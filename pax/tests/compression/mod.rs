@@ -9,10 +9,10 @@
 
 //! Compression integration tests for pax
 
+use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::process::{Command, Output};
-use tempfile::TempDir;
 
 fn pax_binary() -> String {
     env!("CARGO_BIN_EXE_pax").to_string()

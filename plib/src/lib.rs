@@ -22,6 +22,7 @@ pub mod regex;
 pub mod sccsfile;
 pub mod syslog;
 pub mod testing;
+pub mod tmp;
 pub mod tty;
 pub mod user;
 pub mod utmpx;

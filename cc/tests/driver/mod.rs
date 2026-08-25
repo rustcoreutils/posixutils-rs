@@ -18,12 +18,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A scratch directory that removes itself.
-struct WorkDir(tempfile::TempDir);
+struct WorkDir(plib::tmp::TempDir);
 
 impl WorkDir {
     fn new(name: &str) -> Self {
         WorkDir(
-            tempfile::Builder::new()
+            plib::tmp::Builder::new()
                 .prefix(&format!("c17_driver_{}_", name))
                 .tempdir()
                 .expect("failed to create work dir"),

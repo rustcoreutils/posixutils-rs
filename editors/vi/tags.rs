@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_lookup_finds_entry() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let tags = dir.path().join("tags");
         let mut f = File::create(&tags).unwrap();
         writeln!(f, "main\tsrc/main.c\t/^int main()$/").unwrap();
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_taglength() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let tags = dir.path().join("tags");
         let mut f = File::create(&tags).unwrap();
         writeln!(f, "function_one\ta.c\t1").unwrap();

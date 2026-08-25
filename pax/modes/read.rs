@@ -1142,8 +1142,8 @@ fn apply_pending_dirs(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use plib::tmp::TempDir;
     use std::os::unix::fs::PermissionsExt;
-    use tempfile::TempDir;
 
     #[test]
     fn test_strip_leading_components() {

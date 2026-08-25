@@ -9,8 +9,8 @@
 
 use super::common::run_test_with_checker;
 use plib::testing::TestPlan;
+use plib::tmp::TempDir;
 use std::process::Output;
-use tempfile::TempDir;
 
 fn create_sccs_file(tmp: &TempDir, name: &str, content: &str) -> std::path::PathBuf {
     let sfile = tmp.path().join(format!("s.{}", name));

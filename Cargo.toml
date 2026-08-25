@@ -50,7 +50,6 @@ libc = "0.2"
 regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
-tempfile = "3"
 thiserror = "2"
 pest = { version = "2", default-features = false }
 pest_derive = "2"

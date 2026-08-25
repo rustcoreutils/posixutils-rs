@@ -8,10 +8,10 @@
 //
 
 use plib::testing::{run_test, TestPlan};
+use plib::tmp::tempdir;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::symlink;
-use tempfile::tempdir;
 
 #[test]
 fn test_readlink_valid_symlink() {

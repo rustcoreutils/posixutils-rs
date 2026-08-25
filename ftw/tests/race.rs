@@ -32,7 +32,7 @@ fn basename(entry: &ftw::Entry) -> String {
 /// descent fails and the out-of-tree contents are never visited.
 #[test]
 fn descent_refuses_dir_swapped_for_symlink() {
-    let tmp = tempfile::Builder::new()
+    let tmp = plib::tmp::Builder::new()
         .prefix("ftw_race_symlink")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
@@ -115,7 +115,7 @@ fn descent_refuses_dir_swapped_for_symlink() {
 /// post-open `(dev, ino)` re-verification must: the decoy's contents are never visited.
 #[test]
 fn descent_refuses_dir_swapped_for_other_dir() {
-    let tmp = tempfile::Builder::new()
+    let tmp = plib::tmp::Builder::new()
         .prefix("ftw_race_devino")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
@@ -181,7 +181,7 @@ fn descent_refuses_dir_swapped_for_other_dir() {
 /// themselves (this guards against the hardening accidentally hiding entries).
 #[test]
 fn nonfollowing_walk_still_lists_symlink_entries() {
-    let tmp = tempfile::Builder::new()
+    let tmp = plib::tmp::Builder::new()
         .prefix("ftw_race_listsym")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();

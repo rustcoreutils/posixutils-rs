@@ -232,7 +232,7 @@ int main(void) {
 /// freestanding environment to enter, so say so.
 #[test]
 fn c17_ffreestanding_is_diagnosed() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_freestanding_")
         .tempdir()
         .unwrap();
@@ -303,7 +303,7 @@ fn c11_no_threads_macro_agrees_with_the_host() {
 
     let src = "#include <threads.h>\nint main(void){ return 0; }\n";
     let compiles = {
-        let dir = tempfile::Builder::new()
+        let dir = plib::tmp::Builder::new()
             .prefix("c11_threads_")
             .tempdir()
             .unwrap();

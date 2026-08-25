@@ -1308,7 +1308,7 @@ fn test_compress_bits_16_accepted_and_roundtrips(/* #C4 */) {
 /// before any cleanup runs, and a scratch file left in the source tree is both
 /// repo trash and a hazard for the next `git add`. The `TempDir` the caller
 /// holds removes everything on unwind.
-fn scratch_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> PathBuf {
+fn scratch_file(dir: &plib::tmp::TempDir, name: &str, contents: &[u8]) -> PathBuf {
     let path = dir.path().join(name);
     let mut f = File::create(&path).unwrap();
     f.write_all(contents).unwrap();
@@ -1320,7 +1320,7 @@ fn scratch_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> PathBuf
 #[test]
 fn test_compress_verbose_reports_compression_percentage() {
     // Highly compressible, so the percentage is comfortably positive.
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let source = scratch_file(&td, "verbose.txt", &b"aaaaaaaaaaaaaaaa\n".repeat(200));
     let compressed = source.with_extension("txt.Z");
 
@@ -1374,7 +1374,7 @@ fn test_compress_verbose_reports_compression_percentage() {
 /// the test above cannot pass just because some other message happens to match.
 #[test]
 fn test_compress_without_verbose_is_silent() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let source = scratch_file(&td, "quiet.txt", &b"aaaaaaaaaaaaaaaa\n".repeat(200));
     let compressed = source.with_extension("txt.Z");
 
@@ -1402,7 +1402,7 @@ fn test_compress_without_verbose_is_silent() {
 fn test_compress_preserves_mode_and_mtime() {
     use std::os::unix::fs::PermissionsExt;
 
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let source = scratch_file(
         &td,
         "preserve.txt",
@@ -1443,7 +1443,7 @@ fn test_compress_preserves_mode_and_mtime() {
 /// 1970-01-01.
 #[test]
 fn test_compress_preserves_pre_epoch_mtime() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let source = scratch_file(&td, "old.txt", &b"ancient content\n".repeat(50));
     let compressed = source.with_extension("txt.Z");
 
@@ -1491,7 +1491,7 @@ fn test_compress_preserves_pre_epoch_mtime() {
 fn test_uncompress_preserves_mode_and_mtime() {
     use std::os::unix::fs::PermissionsExt;
 
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let source = scratch_file(&td, "restore.txt", &b"round trip content\n".repeat(50));
     let compressed = source.with_extension("txt.Z");
 

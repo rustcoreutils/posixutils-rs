@@ -321,7 +321,7 @@ mod tests {
     fn libc_is_never_dropped() {
         assert!(!drop_standard_library("c", &[]));
         // Not even when a -L directory is given and holds nothing.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let paths = vec![dir.path().to_string_lossy().into_owned()];
         assert!(!drop_standard_library("c", &paths));
     }
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn a_supplied_library_is_found_under_any_suffix() {
         for suffix in LIBRARY_SUFFIXES {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = plib::tmp::tempdir().unwrap();
             let paths = vec![dir.path().to_string_lossy().into_owned()];
             // `xnet` exists on no glibc system and no macOS: the drop case.
             assert!(drop_standard_library("xnet", &paths));
@@ -349,7 +349,7 @@ mod tests {
     /// driver, and it settles it for a name that would otherwise be dropped.
     #[test]
     fn a_supplied_library_is_found_in_a_lib_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = plib::tmp::tempdir().unwrap();
         let paths = vec![dir.path().to_string_lossy().into_owned()];
 
         // `xnet` exists on no glibc system, so this is the drop case...

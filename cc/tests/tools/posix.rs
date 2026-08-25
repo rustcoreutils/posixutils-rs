@@ -14,9 +14,9 @@
 // output, which is why none of them caught the defects recorded in the audit.
 //
 
+use plib::tmp::TempDir;
 use std::fs;
 use std::process::Command;
-use tempfile::TempDir;
 
 fn exe_for(bin: &str) -> &'static str {
     match bin {

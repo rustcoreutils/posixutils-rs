@@ -10,12 +10,12 @@
 //! Special file tests (FIFO, block device, character device)
 
 use crate::common::*;
+use plib::tmp::TempDir;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::process::Command;
-use tempfile::TempDir;
 
 #[test]
 fn test_fifo_roundtrip() {

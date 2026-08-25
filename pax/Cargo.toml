@@ -22,12 +22,12 @@ gettext-rs.workspace = true
 # transparent gzip detection on read (main.rs `is_gzip(peek) || args.gzip`), so
 # dropping it would stop `.tar.gz` archives being readable at all rather than
 # merely removing a flag. Reviewed and retained; do not re-flag without
-# addressing the read path.
-libflate = "2"
+# addressing the read path. flate2 rather than libflate because xform already
+# requires it, so pax's gzip support costs no additional crates.
+flate2 = "1"
 plib = { path = "../plib" }
 
 [dev-dependencies]
-tempfile = "3"
 filetime = "0.2"
 
 [[bin]]

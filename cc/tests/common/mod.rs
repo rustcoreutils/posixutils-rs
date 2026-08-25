@@ -10,9 +10,9 @@
 //
 
 use plib::testing::run_test_base;
+use plib::tmp::NamedTempFile;
 use std::io::Write;
 use std::process::Command;
-use tempfile::NamedTempFile;
 
 // ============================================================================
 // Compile Matrix Configuration
@@ -39,7 +39,7 @@ pub const COMPILE_MATRIX: &[(&str, &[&str])] = &[("debug_opt", &["-g", "-O"])];
 /// Create a temporary C file with the given content
 /// Returns NamedTempFile which auto-deletes on drop
 pub fn create_c_file(name: &str, content: &str) -> NamedTempFile {
-    let mut file = tempfile::Builder::new()
+    let mut file = plib::tmp::Builder::new()
         .prefix(&format!("c17_test_{}_", name))
         .suffix(".c")
         .tempfile()
@@ -201,7 +201,7 @@ pub fn compile_and_run_two_units(
 /// diagnostics are on stdout/stderr and are echoed on failure, since the
 /// loader's message is the interesting part.
 pub fn compile_and_dlopen(name: &str, lib_src: &str, main_src: &str, extra_opts: &[String]) -> i32 {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix(&format!("c17_dl_{}_", name))
         .tempdir()
         .expect("failed to create work dir");
@@ -331,7 +331,7 @@ pub fn run_c17(args: &[&str]) -> C17Run {
 /// linearizer diagnoses. There is no `-fsyntax-only`.
 pub fn compile_expect_error(name: &str, content: &str, expected: &str) {
     let c_file = create_c_file(name, content);
-    let asm = tempfile::Builder::new()
+    let asm = plib::tmp::Builder::new()
         .prefix(&format!("c17_reject_{}_", name))
         .suffix(".s")
         .tempfile()
@@ -368,7 +368,7 @@ pub fn compile_expect_error(name: &str, content: &str, expected: &str) {
 /// case proving it does not fire on legal code.
 pub fn compile_expect_ok(name: &str, content: &str) {
     let c_file = create_c_file(name, content);
-    let asm = tempfile::Builder::new()
+    let asm = plib::tmp::Builder::new()
         .prefix(&format!("c17_accept_{}_", name))
         .suffix(".s")
         .tempfile()
@@ -398,7 +398,7 @@ pub fn compile_expect_ok(name: &str, content: &str) {
 /// demands a non-zero exit, the second says nothing about stderr.
 pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
     let c_file = create_c_file(name, content);
-    let asm = tempfile::Builder::new()
+    let asm = plib::tmp::Builder::new()
         .prefix(&format!("c17_warn_{}_", name))
         .suffix(".s")
         .tempfile()
@@ -436,7 +436,7 @@ pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
 /// warning does not change, so a wrongly-warned program passes it.
 pub fn compile_expect_no_diagnostic(name: &str, content: &str, forbidden: &str) {
     let c_file = create_c_file(name, content);
-    let asm = tempfile::Builder::new()
+    let asm = plib::tmp::Builder::new()
         .prefix(&format!("c17_nodiag_{}_", name))
         .suffix(".s")
         .tempfile()

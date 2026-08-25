@@ -9,9 +9,9 @@
 
 use super::common::{run_test, run_test_with_checker};
 use plib::testing::TestPlan;
+use plib::tmp::TempDir;
 use std::path::PathBuf;
 use std::process::Output;
-use tempfile::TempDir;
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

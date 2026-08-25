@@ -16,7 +16,6 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::{env, fs, io, process};
 
 use clap::Parser;
-use const_format::formatcp;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 use posixutils_make::{
@@ -28,10 +27,28 @@ use posixutils_make::{
 };
 
 const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];
-const MAKEFILE_PATH: [&str; 2] = [
-    formatcp!("./{}", MAKEFILE_NAME[0]),
-    formatcp!("./{}", MAKEFILE_NAME[1]),
-];
+const MAKEFILE_PATH: [&str; 2] = ["./makefile", "./Makefile"];
+
+/// `MAKEFILE_PATH[i]` must stay `MAKEFILE_NAME[i]` prefixed with `./`; the two
+/// are spelled out separately rather than derived, so pin the invariant here.
+const _: () = {
+    const fn is_dot_slash(path: &str, name: &str) -> bool {
+        let (path, name) = (path.as_bytes(), name.as_bytes());
+        if path.len() != name.len() + 2 || path[0] != b'.' || path[1] != b'/' {
+            return false;
+        }
+        let mut i = 0;
+        while i < name.len() {
+            if path[i + 2] != name[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    assert!(is_dot_slash(MAKEFILE_PATH[0], MAKEFILE_NAME[0]));
+    assert!(is_dot_slash(MAKEFILE_PATH[1], MAKEFILE_NAME[1]));
+};
 
 /// make - maintain, update, and regenerate groups of programs
 // todo: sort arguments

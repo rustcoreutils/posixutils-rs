@@ -14,11 +14,10 @@ pest.workspace = true
 pest_derive.workspace = true
 lexical = { version = "7", features = ["format"] }
 plib = { path = "../plib" }
-rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+rand = { version = "0.9", default-features = false, features = ["small_rng"] }
 
 
 [dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

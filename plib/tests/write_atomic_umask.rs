@@ -50,7 +50,7 @@ fn with_umask<T>(
 ) -> T {
     let _guard = UMASK_SETTER.lock().unwrap_or_else(PoisonError::into_inner);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     setup(dir.path());
 
     let original = unsafe { libc::umask(mask) };

@@ -10,7 +10,6 @@ use clap::{error::ErrorKind, Parser};
 use gettextrs::gettext;
 use thiserror::Error;
 
-use binrw::{binrw, BinReaderExt, BinWrite, Endian};
 #[cfg(target_os = "linux")]
 use libc::sa_family_t;
 use libc::{
@@ -21,8 +20,8 @@ use libc::{
 use std::{
     char,
     ffi::{CStr, CString},
-    io::{self, Cursor, Error, IsTerminal, Write},
-    mem::{size_of, zeroed},
+    io::{self, Error, IsTerminal, Write},
+    mem::zeroed,
     net::{
         self, AddrParseError, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener,
         TcpStream, ToSocketAddrs, UdpSocket,
@@ -100,8 +99,6 @@ const HOSTNAME_BUFFER_SIZE: usize = 256;
 const TALK_VERSION: u8 = 1;
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
-#[binrw]
-#[brw(repr(u8))]
 /// Represents the types of messages exchanged in the communication.
 enum MessageType {
     /// Leave invitation with server.
@@ -132,8 +129,6 @@ impl TryFrom<u8> for MessageType {
 }
 
 #[derive(Debug, PartialEq)]
-#[binrw]
-#[brw(repr(u8))]
 /// Represents the possible responses from a request.
 enum Answer {
     /// Operation completed properly.
@@ -228,13 +223,37 @@ type SaFamily = u16;
 type SaFamily = sa_family_t;
 
 #[derive(PartialEq)]
-#[binrw]
 /// Socket address structure representing a network address.
 pub struct Osockaddr {
     /// Address family (e.g., IPv4, IPv6).
     pub sa_family: SaFamily,
     /// Address data, including the port and IP address.
     pub sa_data: [u8; 14],
+}
+
+/// Wire size of [`Osockaddr`]: a big-endian `sa_family` and 14 data bytes.
+const OSOCKADDR_LEN: usize = 16;
+
+/// Wire size of [`CtlMsg`].
+const CTL_MSG_LEN: usize = 84;
+
+/// Wire size of [`CtlRes`].
+const CTL_RES_LEN: usize = 24;
+
+impl Osockaddr {
+    /// Append the big-endian encoding to `out`.
+    fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.sa_family.to_be_bytes());
+        out.extend_from_slice(&self.sa_data);
+    }
+
+    /// Decode from the fixed-width big-endian encoding.
+    fn read_from(bytes: &[u8; OSOCKADDR_LEN]) -> Self {
+        Osockaddr {
+            sa_family: SaFamily::from_be_bytes([bytes[0], bytes[1]]),
+            sa_data: bytes[2..].try_into().expect("14 bytes"),
+        }
+    }
 }
 
 #[allow(clippy::derivable_impls)]
@@ -297,7 +316,6 @@ impl From<&SocketAddrV6> for Osockaddr {
     }
 }
 
-#[binrw]
 /// Control message structure used for communication in the talk protocol.
 struct CtlMsg {
     /// Version of the message.
@@ -345,9 +363,19 @@ impl Default for CtlMsg {
 impl CtlMsg {
     // Converts the CtlMsg structure into a vector of bytes for network transmission
     fn to_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut bytes = vec![0u8; size_of::<CtlMsg>()];
-        let mut cursor = Cursor::new(&mut bytes[..]);
-        self.write_options(&mut cursor, Endian::Big, ()).unwrap();
+        let mut bytes = Vec::with_capacity(CTL_MSG_LEN);
+        bytes.push(self.vers);
+        bytes.push(self.r#type);
+        bytes.push(self.answer);
+        bytes.push(self.pad);
+        bytes.extend_from_slice(&self.id_num.to_be_bytes());
+        self.addr.write_to(&mut bytes);
+        self.ctl_addr.write_to(&mut bytes);
+        bytes.extend_from_slice(&self.pid.to_be_bytes());
+        bytes.extend(self.l_name.iter().map(|&b| b as u8));
+        bytes.extend(self.r_name.iter().map(|&b| b as u8));
+        bytes.extend(self.r_tty.iter().map(|&b| b as u8));
+        debug_assert_eq!(bytes.len(), CTL_MSG_LEN);
         Ok(bytes)
     }
 
@@ -367,8 +395,6 @@ impl CtlMsg {
     }
 }
 
-#[binrw]
-#[br(big)]
 /// Control response structure used for communication with the daemon.
 pub struct CtlRes {
     /// Version of the control protocol.
@@ -404,9 +430,20 @@ impl Default for CtlRes {
 
 impl CtlRes {
     // Converts a byte slice into a CtlRes struct, ensuring correct parsing of each field.
-    fn from_bytes(bytes: &[u8]) -> Result<Self, binrw::Error> {
-        let mut cursor = Cursor::new(bytes);
-        cursor.read_be()
+    fn from_bytes(bytes: &[u8]) -> Result<Self, TalkError> {
+        let bytes: &[u8; CTL_RES_LEN] = bytes
+            .get(..CTL_RES_LEN)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| TalkError::Other("short control response".to_string()))?;
+
+        Ok(CtlRes {
+            vers: bytes[0],
+            r#type: MessageType::try_from(bytes[1])?,
+            answer: Answer::try_from(bytes[2])?,
+            pad: bytes[3],
+            id_num: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            addr: Osockaddr::read_from(bytes[8..24].try_into().expect("16 bytes")),
+        })
     }
 }
 

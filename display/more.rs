@@ -841,7 +841,7 @@ impl Spill {
     fn new(upstream: Box<dyn Read + Send>) -> std::io::Result<Self> {
         Ok(Self {
             upstream: Some(upstream),
-            file: tempfile::tempfile()?,
+            file: plib::tmp::tempfile()?,
             written: 0,
         })
     }

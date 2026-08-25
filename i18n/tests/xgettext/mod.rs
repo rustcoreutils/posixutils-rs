@@ -12,8 +12,8 @@
 use std::fs::{read_to_string, remove_file};
 use std::path::Path;
 
+use plib::tmp::tempdir;
 use pretty_assertions::assert_eq;
-use tempfile::tempdir;
 
 use plib::testing::{run_test, TestPlan};
 

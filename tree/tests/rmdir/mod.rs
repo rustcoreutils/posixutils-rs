@@ -9,10 +9,10 @@
 //
 
 use plib::testing::{run_test_with_checker, TestPlan};
+use plib::tmp::{tempdir, TempDir};
 use std::fs;
 use std::path::Path;
 use std::process::Output;
-use tempfile::{tempdir, TempDir};
 
 fn setup_test_env() -> (TempDir, String) {
     let temp_dir = tempdir().expect("Unable to create temporary directory");

@@ -19,12 +19,12 @@
 //! line editor redraws the line after every keystroke, so scraping the screen
 //! would be both noisy and brittle.
 
+use plib::tmp::{tempdir, TempDir};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::{tempdir, TempDir};
 
 /// An interactive `sh` running in a pseudo-terminal.
 struct ShPtySession {

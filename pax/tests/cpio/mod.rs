@@ -12,11 +12,11 @@
 use crate::common::{
     assert_failure, assert_success, have_tool, run_cpio, run_front_end, stderr_str, stdout_str,
 };
+use plib::tmp::TempDir;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tempfile::TempDir;
 
 /// The pathname list a real `find .` would produce for the tree below, in the
 /// order cpio expects it on standard input.

@@ -16,7 +16,6 @@ base64 = "0"
 flate2 = "1"
 
 [dev-dependencies]
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -430,8 +430,8 @@ int main() {
 // ============================================================================
 
 /// Create a temporary assembly file
-fn create_asm_file(name: &str, content: &str, extension: &str) -> tempfile::NamedTempFile {
-    let mut file = tempfile::Builder::new()
+fn create_asm_file(name: &str, content: &str, extension: &str) -> plib::tmp::NamedTempFile {
+    let mut file = plib::tmp::Builder::new()
         .prefix(&format!("c17_test_{}_", name))
         .suffix(extension)
         .tempfile()
@@ -8158,7 +8158,7 @@ __attribute__((section(".mytext"))) int placed_fn(void) { return 3; }
 int main(void) { return weak_fn() + hidden_fn() + placed_fn() + default_fn() + protected_fn() - 15; }
 "#;
 
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_symattrs_")
         .tempdir()
         .expect("tempdir");
@@ -8440,7 +8440,7 @@ int main(void) {
 /// Assemble a source to text and hand it back, for tests that need to see the
 /// directives rather than the program's answer.
 fn asm_for(prefix: &str, src: &str) -> String {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix(prefix)
         .tempdir()
         .expect("tempdir");

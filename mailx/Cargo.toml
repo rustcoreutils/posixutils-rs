@@ -9,13 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 chrono.workspace = true
-dirs.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 plib = { path = "../plib" }
 
 [dev-dependencies]
-tempfile = "3"
 filetime = "0.2"
 
 [lints]

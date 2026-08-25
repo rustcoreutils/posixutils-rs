@@ -274,7 +274,7 @@ fn preprocessor_conditional_nesting_is_validated() {
 /// in a header was discarded rather than reported.
 #[test]
 fn preprocessor_unterminated_conditional_in_a_header_is_diagnosed() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_unterm_hdr_")
         .tempdir()
         .unwrap();
@@ -321,7 +321,7 @@ fn preprocessor_extra_tokens_after_a_conditional_warn() {
 /// name happened to be defined — deleted source three ways, all of them here.
 #[test]
 fn preprocessor_include_guard_never_deletes_source() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_guard_")
         .tempdir()
         .unwrap();
@@ -416,7 +416,7 @@ fn preprocessor_include_guard_never_deletes_source() {
 /// work at all.
 #[test]
 fn preprocessor_unguarded_include_cycle_is_bounded() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_cycle_")
         .tempdir()
         .unwrap();
@@ -519,7 +519,7 @@ int main(void) {
 /// `ib/n.h`.
 #[test]
 fn preprocessor_include_next_walks_the_dash_i_path() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_include_next_")
         .tempdir()
         .unwrap();
@@ -563,7 +563,7 @@ fn preprocessor_include_next_walks_the_dash_i_path() {
 /// system header re-find the very file it was written in, and loop.
 #[test]
 fn preprocessor_include_next_from_a_system_path_still_advances() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_include_next_sys_")
         .tempdir()
         .unwrap();
@@ -615,7 +615,7 @@ fn preprocessor_include_next_from_a_system_path_still_advances() {
 /// sitting in `d`.
 #[test]
 fn preprocessor_nostdinc_keeps_the_caller_s_system_paths() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_nostdinc_")
         .tempdir()
         .unwrap();

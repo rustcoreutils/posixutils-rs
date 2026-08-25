@@ -9,7 +9,7 @@
 //
 
 use plib::testing::{run_test, TestPlan};
-use rand::{seq::SliceRandom, thread_rng};
+use rand::{rng, seq::SliceRandom};
 
 /* #region Normal tests */
 fn head_test(n: Option<&str>, c: Option<&str>, test_data: &str, expected_output: &str) {
@@ -36,7 +36,7 @@ fn head_test(n: Option<&str>, c: Option<&str>, test_data: &str, expected_output:
             }
         }
 
-        argument_forms.shuffle(&mut thread_rng());
+        argument_forms.shuffle(&mut rng());
 
         let mut flattened = Vec::<Vec<String>>::with_capacity(argument_forms.len());
 

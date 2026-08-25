@@ -96,7 +96,7 @@ fn spool_is_writable() -> bool {
         "/var/spool/cron"
     };
     std::fs::metadata(dir).is_ok()
-        && tempfile::NamedTempFile::new_in(dir)
+        && plib::tmp::NamedTempFile::new_in(dir)
             .map(|f| {
                 let _ = f.close();
             })
@@ -139,7 +139,7 @@ fn install_list_remove_round_trip() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let src = dir.path().join("ct");
     let content = "*/5 * * * * echo hello\n";
     std::fs::write(&src, content).unwrap();
@@ -241,7 +241,7 @@ fn run_gated(
 
 #[test]
 fn crontab_allow_file_permits_only_listed_users() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let allow = dir.path().join("cron.allow");
 
     // A user absent from a present cron.allow is refused.
@@ -270,7 +270,7 @@ fn crontab_allow_file_permits_only_listed_users() {
 
 #[test]
 fn crontab_deny_file_refuses_listed_users() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let deny = dir.path().join("cron.deny");
 
     // With no cron.allow, a user named in cron.deny is refused...
@@ -300,7 +300,7 @@ fn crontab_unreadable_allow_file_fails_closed() {
     // An existing-but-unreadable cron.allow must refuse rather than fall
     // through to the deny rule: the safe reading of "cannot tell who is
     // allowed" is "nobody".
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let allow = dir.path().join("cron.allow");
     std::fs::write(&allow, format!("{}\n", whoami())).unwrap();
 

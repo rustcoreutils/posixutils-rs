@@ -523,7 +523,7 @@ int main(void) {
 fn c99_complex_conditional_merges_by_address() {
     use crate::common::run_c17;
 
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_complex_ir_")
         .tempdir()
         .expect("work dir");

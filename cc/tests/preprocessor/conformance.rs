@@ -79,7 +79,7 @@ fn preprocessor_synthesized_literals_use_payload_form() {
 /// looked for `cafÃ©.h` and reported the real file missing.
 #[test]
 fn preprocessor_non_ascii_header_name_opens() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_utf8_include_")
         .tempdir()
         .expect("failed to create work dir");
@@ -156,7 +156,7 @@ fn preprocessor_u8_prefix_survives() {
 /// directive was destroyed before it could be reassembled.
 #[test]
 fn preprocessor_header_name_is_one_token() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_header_name_")
         .tempdir()
         .expect("failed to create work dir");
@@ -571,7 +571,7 @@ fn preprocessor_line_directive_accepts_valid_forms() {
 /// be searched first; builtins used to pre-empt the whole search.
 #[test]
 fn preprocessor_local_header_wins_over_builtin() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_p9_quote_")
         .tempdir()
         .unwrap();
@@ -599,7 +599,7 @@ fn preprocessor_local_header_wins_over_builtin() {
 /// A `-I` directory also wins, for the `<...>` form.
 #[test]
 fn preprocessor_dash_i_wins_over_builtin() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_p9_inc_")
         .tempdir()
         .unwrap();
@@ -932,7 +932,7 @@ fn preprocessor_missing_include_is_still_an_error() {
 /// None were emitted at all — the markers were discarded outright.
 #[test]
 fn preprocessor_emits_line_markers_for_includes() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_markers_")
         .tempdir()
         .unwrap();
@@ -1000,7 +1000,7 @@ fn preprocessor_emits_a_marker_without_includes() {
 /// operand, and the spec says a `.i` is not re-preprocessed.
 #[test]
 fn preprocessor_output_with_markers_still_compiles() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_marker_recompile_")
         .tempdir()
         .unwrap();
@@ -1042,7 +1042,7 @@ fn preprocessor_output_with_markers_still_compiles() {
 /// `orig.c:42`, and so does c17 now.
 #[test]
 fn preprocessor_linemarker_sets_the_reported_position() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_linemarker_")
         .tempdir()
         .unwrap();
@@ -1078,7 +1078,7 @@ fn preprocessor_linemarker_sets_the_reported_position() {
 /// per marker.
 #[test]
 fn preprocessor_linemarkers_track_entering_and_returning() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_linemarker_seq_")
         .tempdir()
         .unwrap();
@@ -1113,7 +1113,7 @@ fn preprocessor_linemarkers_track_entering_and_returning() {
 /// compiling one buries the user's own diagnostics under the system headers'.
 #[test]
 fn preprocessor_linemarker_flag_three_silences_the_stream() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_linemarker_sys_")
         .tempdir()
         .unwrap();
@@ -1193,7 +1193,7 @@ fn c17_nested_stringification_preserves_spelling() {
 /// 552 diagnostics. Recorded at #C54.
 #[test]
 fn preprocessor_diagnostic_in_a_header_names_the_include_chain() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_chain_")
         .tempdir()
         .unwrap();
@@ -1248,7 +1248,7 @@ fn preprocessor_diagnostic_in_a_header_names_the_include_chain() {
 /// A diagnostic in the primary source has no chain to name.
 #[test]
 fn preprocessor_diagnostic_outside_a_header_has_no_include_chain() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_nochain_")
         .tempdir()
         .unwrap();
@@ -1944,7 +1944,7 @@ int main(void) {
 /// first line was never a directive and `<BOM>int` fused into one identifier.
 #[test]
 fn preprocessor_leading_bom_is_not_part_of_the_program() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_bom_")
         .tempdir()
         .unwrap();

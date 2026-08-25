@@ -111,7 +111,7 @@ fn expect_error_checker(plan: &TestPlan, output: &Output) {
 fn stdout_regex_checker(regex_pattern: &str) -> impl Fn(&TestPlan, &Output) + '_ {
     move |plan: &TestPlan, output: &Output| {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let re = regex_lite::Regex::new(regex_pattern).unwrap();
+        let re = regex::Regex::new(regex_pattern).unwrap();
         assert!(
             re.is_match(&stdout),
             "stdout doesn't match regex: {}\nActual stdout: {}",

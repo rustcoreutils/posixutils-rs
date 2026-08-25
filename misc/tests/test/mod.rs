@@ -233,7 +233,7 @@ fn test_file_executable() {
 
 #[test]
 fn test_symlink() {
-    let test_dir = tempfile::tempdir().unwrap();
+    let test_dir = plib::tmp::tempdir().unwrap();
     let file_path = test_dir.path().join("file");
     let link_path = test_dir.path().join("link");
     let broken_link_path = test_dir.path().join("broken_link");
@@ -415,7 +415,7 @@ fn test_special_strings() {
 #[test]
 fn test_path_comparisons() {
     // -ef tests if two paths refer to the same file
-    let test_dir = tempfile::tempdir().unwrap();
+    let test_dir = plib::tmp::tempdir().unwrap();
     let file_path = test_dir.path().join("file");
     let link_path = test_dir.path().join("link");
 
@@ -457,7 +457,7 @@ fn test_char_device() {
     test_test(&["-c", "/tmp"], 1);
     test_test(&["-c", "/nonexistent-xyz"], 1);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let f = dir.path().join("regular");
     fs::write(&f, "x").unwrap();
     test_test(&["-c", f.to_str().unwrap()], 1);
@@ -476,7 +476,7 @@ fn test_block_device() {
 /// `-p`: FIFO (named pipe), created with mkfifo(3).
 #[test]
 fn test_fifo() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let fifo = dir.path().join("fifo");
     let c = CString::new(fifo.to_str().unwrap()).unwrap();
     let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
@@ -492,7 +492,7 @@ fn test_fifo() {
 /// `-S`: socket, created by binding a Unix-domain listener.
 #[test]
 fn test_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let sock = dir.path().join("sock");
     let _listener = UnixListener::bind(&sock).unwrap();
 
@@ -508,7 +508,7 @@ fn test_socket() {
 /// the bit does not actually stick.
 #[test]
 fn test_setgid_setuid() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
 
     let gfile = dir.path().join("sgid");
     fs::write(&gfile, "x").unwrap();
@@ -561,7 +561,7 @@ fn set_mtime(path: &std::path::Path, secs: i64) {
 /// when one operand cannot be resolved.
 #[test]
 fn test_newer_older() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let older = dir.path().join("older");
     let newer = dir.path().join("newer");
     fs::write(&older, "x").unwrap();

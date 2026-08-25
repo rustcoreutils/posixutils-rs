@@ -10,10 +10,10 @@
 //! Update mode tests (-u) and access time reset tests (-t)
 
 use crate::common::*;
+use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::time::Duration;
-use tempfile::TempDir;
 
 #[cfg(unix)]
 #[test]

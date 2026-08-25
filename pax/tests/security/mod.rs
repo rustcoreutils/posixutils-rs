@@ -16,8 +16,8 @@
 //! reviewed, not tested.
 
 use crate::common::*;
+use plib::tmp::TempDir;
 use std::fs;
-use tempfile::TempDir;
 
 /// Build a one-member ustar archive by hand, so the member name can be anything
 /// -- including names pax itself would refuse to write.

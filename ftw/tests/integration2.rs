@@ -7,9 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use rand::{distributions::Standard, rngs::StdRng, Rng, SeedableRng};
+use plib::tmp::TempDir;
+use rand::{distr::StandardUniform, rngs::StdRng, Rng, SeedableRng};
 use std::{ffi::CString, fs, io, os::fd::AsRawFd, path::Path, path::PathBuf, sync::Mutex};
-use tempfile::TempDir;
 
 static GLOBAL_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -23,7 +23,7 @@ struct DeepDirCleanup {
 
 impl DeepDirCleanup {
     fn new(prefix: &str, dir_name_str: &str, depth: usize) -> io::Result<Self> {
-        let test_dir = tempfile::Builder::new()
+        let test_dir = plib::tmp::Builder::new()
             .prefix(prefix)
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
         let dir_name = CString::new(dir_name_str.as_bytes()).unwrap();
@@ -44,7 +44,7 @@ impl Drop for DeepDirCleanup {
         // Try standard removal first (works for shallow hierarchies)
         if fs::remove_dir_all(self.test_dir.path()).is_ok() {
             // Prevent TempDir from trying to remove again
-            if let Ok(new_tmp) = tempfile::tempdir() {
+            if let Ok(new_tmp) = plib::tmp::tempdir() {
                 let _ = std::mem::replace(&mut self.test_dir, new_tmp);
             }
             return;
@@ -108,7 +108,7 @@ impl Drop for DeepDirCleanup {
         }
 
         // Prevent TempDir from trying to remove (we already did, or at least tried)
-        if let Ok(new_tmp) = tempfile::tempdir() {
+        if let Ok(new_tmp) = plib::tmp::tempdir() {
             let _ = std::mem::replace(&mut self.test_dir, new_tmp);
         }
     }
@@ -131,7 +131,7 @@ fn count_open_fds() -> usize {
 fn test_ftw_fd_raii() {
     let _guard = GLOBAL_MUTEX.lock();
 
-    let tmp_dir = tempfile::Builder::new()
+    let tmp_dir = plib::tmp::Builder::new()
         .prefix("test_ftw_fd_raii")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
@@ -147,10 +147,10 @@ fn test_ftw_fd_raii() {
         current_dir.push(test_dir);
         let mut i = 0;
         for _ in 0..500 {
-            let is_dir: bool = rng.sample(Standard);
+            let is_dir: bool = rng.sample(StandardUniform);
             if is_dir {
                 fs::create_dir(current_dir.join(format!("{i}"))).unwrap();
-                let descend: bool = rng.sample(Standard);
+                let descend: bool = rng.sample(StandardUniform);
                 if descend {
                     current_dir.push(format!("{i}"));
                     i = 0;

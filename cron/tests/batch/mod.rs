@@ -14,10 +14,10 @@
 //! spool and allow-file redirected via `AT_JOB_DIR` / `AT_ALLOW`, so nothing
 //! needs root or a writable `/var/spool`.
 
+use plib::tmp::{tempdir, TempDir};
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use tempfile::{tempdir, TempDir};
 
 /// The identity `batch` itself resolves: `getpwuid(getuid())`.
 fn whoami() -> String {

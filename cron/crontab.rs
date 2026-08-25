@@ -141,7 +141,7 @@ fn do_edit(target: &str) -> ! {
     // This fails fast — before launching the editor — when the result could not
     // be installed, and guarantees the live entry is never touched on failure.
     let spool_dir = Path::new(target).parent().unwrap_or(Path::new("."));
-    if let Err(e) = tempfile::NamedTempFile::new_in(spool_dir) {
+    if let Err(e) = plib::tmp::NamedTempFile::new_in(spool_dir) {
         diag_error(&format!(
             "{}: {}",
             gettext("cannot access crontab spool"),
@@ -152,7 +152,7 @@ fn do_edit(target: &str) -> ! {
 
     // Seed the edit buffer from the current crontab (empty if none exists).
     let current = fs::read_to_string(target).unwrap_or_default();
-    let mut tmp = match tempfile::NamedTempFile::new() {
+    let mut tmp = match plib::tmp::NamedTempFile::new() {
         Ok(t) => t,
         Err(e) => {
             diag_error(&format!(

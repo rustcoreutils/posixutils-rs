@@ -71,7 +71,7 @@ int main(void) {
 /// `é` is not valid UTF-8, so it cannot be spelled in a Rust `&str` at all.
 #[test]
 fn c99_extended_identifier_across_a_line_splice() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_ident_splice_")
         .tempdir()
         .expect("failed to create work dir");
@@ -135,7 +135,7 @@ int main(void) { return (müller(0) == 1 && müller(1) == 2) ? 0 : 1; }
 
     // And every mention of the label has to be spelled the same way. Checked
     // on the text because that is where the two spellings diverged.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let src = dir.path().join("lbl.c");
     std::fs::write(&src, code).unwrap();
     let asm = dir.path().join("lbl.s");

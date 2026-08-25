@@ -186,7 +186,7 @@ fn run_tput_with_terminfo(terminfo_dir: &std::path::Path, args: &[&str]) -> (i32
 
 #[test]
 fn test_tput_init_emits_file_capability_and_runs_init_prog() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let ti = dir.path().join("terminfo");
 
     // `if` names a file whose *contents* are the sequence.
@@ -246,7 +246,7 @@ fn test_tput_init_emits_file_capability_and_runs_init_prog() {
 
 #[test]
 fn test_tput_reset_emits_reset_file_capability() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let ti = dir.path().join("terminfo");
 
     let reset_file = dir.path().join("reset.seq");
@@ -287,7 +287,7 @@ fn test_tput_reset_emits_reset_file_capability() {
 fn test_tput_reset_falls_back_to_init_when_no_reset_strings() {
     // Historical parity: a terminal with no reset capabilities at all is reset
     // with its initialization sequence.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let ti = dir.path().join("terminfo");
     write_terminfo(
         &ti,
@@ -307,7 +307,7 @@ fn test_tput_reset_falls_back_to_init_when_no_reset_strings() {
 fn test_tput_unreadable_reset_file_still_falls_back() {
     // An unreadable `rf` does not count as "reset emitted", so the init
     // sequence must still be used.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let ti = dir.path().join("terminfo");
     write_terminfo(
         &ti,

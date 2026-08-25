@@ -8,11 +8,11 @@
 //
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Output;
-use tempfile::TempDir;
 
 /// Create a temporary .po file for testing
 fn create_temp_po_file(content: &str) -> (TempDir, PathBuf) {

@@ -11,9 +11,9 @@
 // Consolidates: ALL ctags tests
 //
 
+use plib::tmp::TempDir;
 use std::fs;
 use std::process::Command;
-use tempfile::TempDir;
 
 fn run_ctags(args: &[&str]) -> (String, String, bool) {
     let output = Command::new(env!("CARGO_BIN_EXE_ctags"))

@@ -171,7 +171,7 @@ fn c11_same_encoding_concatenation_still_works() {
 /// replacement applies inside string literals too, so it is opt-in.
 #[test]
 fn c17_trigraphs_are_off_by_default() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_trigraph_off_")
         .tempdir()
         .unwrap();
@@ -188,7 +188,7 @@ fn c17_trigraphs_are_off_by_default() {
 
 #[test]
 fn c17_trigraphs_work_when_enabled() {
-    let dir = tempfile::Builder::new()
+    let dir = plib::tmp::Builder::new()
         .prefix("c17_trigraph_on_")
         .tempdir()
         .unwrap();

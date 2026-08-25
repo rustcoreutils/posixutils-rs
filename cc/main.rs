@@ -2161,7 +2161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One scratch directory for the whole run. `tempfile` places it under
     // TMPDIR when that is set (XSI, 88020-88022) and removes the whole tree on
     // drop, which is why no intermediate needs its own cleanup path.
-    let scratch = tempfile::Builder::new().prefix("c17-").tempdir()?;
+    let scratch = plib::tmp::Builder::new().prefix("c17-").tempdir()?;
 
     let mut streams = StreamTable::new();
     // Opened once, before the loop, so several source operands concatenate

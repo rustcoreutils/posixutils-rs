@@ -9,10 +9,10 @@
 
 use clap::Parser;
 use gettextrs::gettext;
+use plib::syslog::{Facility, Level};
 use std::io::{self, BufRead};
 use std::process::ExitCode;
 use std::str::FromStr;
-use syslog::{Facility, Formatter3164};
 
 /// logger - log messages
 #[derive(Parser)]
@@ -34,33 +34,6 @@ struct Args {
     strings: Vec<String>,
 }
 
-/// The syslog severity levels POSIX permits in a `facility.level` priority.
-#[derive(Clone, Copy)]
-enum Level {
-    Emerg,
-    Alert,
-    Crit,
-    Err,
-    Warning,
-    Notice,
-    Info,
-    Debug,
-}
-
-fn parse_level(s: &str) -> Option<Level> {
-    Some(match s.to_ascii_lowercase().as_str() {
-        "emerg" | "panic" => Level::Emerg,
-        "alert" => Level::Alert,
-        "crit" => Level::Crit,
-        "err" | "error" => Level::Err,
-        "warning" | "warn" => Level::Warning,
-        "notice" => Level::Notice,
-        "info" => Level::Info,
-        "debug" => Level::Debug,
-        _ => return None,
-    })
-}
-
 /// Parse a `-p` argument. POSIX specifies a `facility.level` pair; a bare level
 /// (no `.`) is accepted as a convenience and defaults the facility to `user`.
 fn parse_priority(p: &str) -> Result<(Facility, Level), String> {
@@ -70,10 +43,10 @@ fn parse_priority(p: &str) -> Result<(Facility, Level), String> {
                 .map_err(|_| format!("{}: {}", gettext("unknown facility"), fac))?;
             (facility, lvl)
         }
-        None => (Facility::LOG_USER, p),
+        None => (Facility::USER, p),
     };
-    let level = parse_level(level_str)
-        .ok_or_else(|| format!("{}: {}", gettext("unknown priority level"), level_str))?;
+    let level = Level::from_str(level_str)
+        .map_err(|_| format!("{}: {}", gettext("unknown priority level"), level_str))?;
     Ok((facility, level))
 }
 
@@ -115,7 +88,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         },
-        None => (Facility::LOG_USER, Level::Notice),
+        None => (Facility::USER, Level::Notice),
     };
 
     let messages = match collect_messages(&args) {
@@ -126,43 +99,15 @@ fn main() -> ExitCode {
         }
     };
 
-    let formatter = Formatter3164 {
-        facility,
-        hostname: None,
-        // Default tag is the invoking user's login name; -t overrides it.
-        process: args.tag.clone().unwrap_or_else(plib::curuser::login_name),
-        // -i logs the logger PID with each message.
-        pid: if args.log_pid { std::process::id() } else { 0 },
-    };
-
-    let mut writer = match syslog::unix(formatter) {
-        Ok(w) => w,
-        Err(e) => {
-            plib::diag::error(&format!(
-                "{}: {:?}",
-                gettext("unable to connect to syslog"),
-                e
-            ));
-            return ExitCode::from(1);
-        }
-    };
+    // Default tag is the invoking user's login name; -t overrides it. -i adds
+    // the logger PID to each message.
+    let tag = args.tag.clone().unwrap_or_else(plib::curuser::login_name);
+    plib::syslog::open(&tag, args.log_pid, facility);
 
     for msg in &messages {
-        let res = match level {
-            Level::Emerg => writer.emerg(msg),
-            Level::Alert => writer.alert(msg),
-            Level::Crit => writer.crit(msg),
-            Level::Err => writer.err(msg),
-            Level::Warning => writer.warning(msg),
-            Level::Notice => writer.notice(msg),
-            Level::Info => writer.info(msg),
-            Level::Debug => writer.debug(msg),
-        };
-        if let Err(e) = res {
-            plib::diag::error(&format!("{}: {:?}", gettext("could not write message"), e));
-            return ExitCode::from(1);
-        }
+        plib::syslog::log(level, msg);
     }
+    plib::syslog::close();
 
     ExitCode::SUCCESS
 }

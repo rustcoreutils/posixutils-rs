@@ -2096,7 +2096,7 @@ int main(void) {
 /// mistake rather than dumping the AST.
 #[test]
 fn c99_global_initializer_rejects_non_constant_condition() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
     let src = dir.path().join("nc.c");
     std::fs::write(&src, "int obj;\nstatic int bad = obj ?: 1;\n").unwrap();
 

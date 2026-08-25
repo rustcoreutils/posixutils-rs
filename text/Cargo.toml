@@ -15,12 +15,15 @@ regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
 thiserror.workspace = true
-diff = "0.1"
-dirs.workspace = true
 
 [dev-dependencies]
-proptest = "1"
-rand = "0.8"
+rand = "0.9"
+# `fork`/`timeout` (both on by default) exist to run each case in a subprocess;
+# the head property tests use a plain TestRunner and time out via
+# mpsc::recv_timeout instead, so those features only cost crates (rusty-fork,
+# wait-timeout, quick-error, and tempfile -> rustix). `bit-set` is kept: it is
+# the default shrinker state.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
 
 [lints]
 workspace = true

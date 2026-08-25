@@ -13,8 +13,8 @@
 //! variable or expect controlled failures when sendmail is unavailable.
 
 use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+use plib::tmp::NamedTempFile;
 use std::io::Write;
-use tempfile::NamedTempFile;
 
 /// Helper to create a temporary mailrc file with given content
 fn create_temp_mailrc(content: &str) -> NamedTempFile {

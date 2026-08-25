@@ -902,7 +902,7 @@ fn test_awk_bugfix_nf_zero() {
 // Regression: > redirect must truncate existing files
 #[test]
 fn test_awk_bugfix_redirect_truncate() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let dir = plib::tmp::tempdir().expect("failed to create temp dir");
     let outfile = dir.path().join("out.txt");
     // Write a long initial content
     std::fs::write(&outfile, "this is long initial content\n").unwrap();

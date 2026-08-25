@@ -438,7 +438,7 @@ android_api = __ANDROID_API__
 "#;
 
     // Create temp file
-    let mut file = tempfile::Builder::new()
+    let mut file = plib::tmp::Builder::new()
         .prefix("c17_test_error_")
         .suffix(".c")
         .tempfile()

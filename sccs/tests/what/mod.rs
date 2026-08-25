@@ -191,7 +191,7 @@ fn what_binary_input_does_not_abort() {
     // Regression for the UTF-8 abort bug: `what` must scan arbitrary binary
     // input (its primary use case) and never error out on non-UTF-8 bytes.
     use std::io::Write;
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
     let path = dir.path().join("bin.o");
     // Non-UTF-8 bytes (0xff, 0xfe) surrounding a valid @(#) identification.
     let mut data = vec![0xffu8, 0x00, 0xfe, b'x'];
@@ -226,7 +226,7 @@ fn what_binary_input_does_not_abort() {
 }
 
 /// Write a scratch file under a caller-owned temp dir.
-fn scratch(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+fn scratch(dir: &plib::tmp::TempDir, name: &str, bytes: &[u8]) -> PathBuf {
     let p = dir.path().join(name);
     std::fs::write(&p, bytes).unwrap();
     p
@@ -244,7 +244,7 @@ fn what_run(args: &[&str]) -> Output {
 /// exactly `"`, `>`, <newline>, `\`, <NUL>, EOF (spec 122786-122788).
 #[test]
 fn two_patterns_on_one_line_are_one_identification() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let f = scratch(&td, "two.txt", b"x@(#)first@(#)second\n");
 
     let out = what_run(&[f.to_str().unwrap()]);
@@ -260,7 +260,7 @@ fn two_patterns_on_one_line_are_one_identification() {
 /// (122788-122789), so two idents on separate lines are both reported.
 #[test]
 fn search_resumes_after_a_terminator() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let f = scratch(&td, "multi.txt", b"@(#)one\n@(#)two\n");
 
     let out = what_run(&[f.to_str().unwrap()]);
@@ -276,7 +276,7 @@ fn search_resumes_after_a_terminator() {
 /// per-file (rather than per-run) scope was never shown.
 #[test]
 fn silent_stops_per_file_not_per_run() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let a = scratch(&td, "a.txt", b"@(#)alpha\n@(#)alpha2\n");
     let b = scratch(&td, "b.txt", b"@(#)beta\n@(#)beta2\n");
 
@@ -312,7 +312,7 @@ fn output_names_dash(out: &Output) -> bool {
 /// its header line.
 #[test]
 fn exit_status_is_zero_when_any_file_matches() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let hit = scratch(&td, "hit.txt", b"@(#)alpha\n");
     let miss = scratch(&td, "miss.txt", b"nothing here\n");
 
@@ -337,7 +337,7 @@ fn exit_status_is_zero_when_any_file_matches() {
 /// fixture is deterministic rather than depending on incidental bytes.
 #[test]
 fn finds_identification_in_an_elf_object() {
-    let td = tempfile::tempdir().unwrap();
+    let td = plib::tmp::tempdir().unwrap();
     let c = td.path().join("ident.c");
     std::fs::write(
         &c,

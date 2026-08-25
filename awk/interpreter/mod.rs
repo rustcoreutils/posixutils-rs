@@ -377,7 +377,7 @@ impl Interpreter {
                 }
             }
             BuiltinFunction::Rand => {
-                let rand = self.rng.gen_range(0.0..1.0);
+                let rand = self.rng.random_range(0.0..1.0);
                 stack.push_value(rand)?;
             }
             BuiltinFunction::Srand => {

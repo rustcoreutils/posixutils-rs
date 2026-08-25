@@ -9,9 +9,9 @@
 
 //! Integration tests for yacc
 
+use plib::tmp::TempDir;
 use std::fs;
 use std::process::Command;
-use tempfile::TempDir;
 
 fn run_yacc(args: &[&str], grammar_content: &str) -> std::process::Output {
     let temp_dir = TempDir::new().unwrap();

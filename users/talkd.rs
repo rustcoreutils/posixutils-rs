@@ -31,13 +31,13 @@
 //! re-checks `plib::tty::mesg_allowed` rather than relying on `may_write`'s
 //! superuser exemption.
 
-use binrw::{binrw, BinReaderExt, BinWrite, Endian};
 use clap::Parser;
 use gettextrs::gettext;
+use plib::syslog::{Facility, Level};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, Cursor, Write};
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -154,10 +154,31 @@ enum Answer {
 }
 
 #[derive(Default, Debug, PartialEq, Clone)]
-#[binrw]
 struct Osockaddr {
     sa_family: SaFamily,
     sa_data: [u8; 14],
+}
+
+/// Wire size of [`Osockaddr`]: a big-endian `sa_family` and 14 data bytes.
+const OSOCKADDR_LEN: usize = 16;
+
+/// Wire size of [`CtlMsg`], the fixed-width request a talk client sends.
+const CTL_MSG_LEN: usize = 84;
+
+impl Osockaddr {
+    /// Append the big-endian encoding to `out`.
+    fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.sa_family.to_be_bytes());
+        out.extend_from_slice(&self.sa_data);
+    }
+
+    /// Decode from the fixed-width big-endian encoding.
+    fn read_from(bytes: &[u8; OSOCKADDR_LEN]) -> Self {
+        Osockaddr {
+            sa_family: SaFamily::from_be_bytes([bytes[0], bytes[1]]),
+            sa_data: bytes[2..].try_into().expect("14 bytes"),
+        }
+    }
 }
 
 impl From<&Osockaddr> for SocketAddrV4 {
@@ -187,26 +208,47 @@ impl From<&SocketAddrV4> for Osockaddr {
 }
 
 /// Control message from talk client
-#[binrw]
 #[derive(Clone)]
 struct CtlMsg {
     vers: u8,
     r#type: u8,
-    answer: u8,
-    pad: u8,
     id_num: u32,
     addr: Osockaddr,
     ctl_addr: Osockaddr,
-    pid: i32,
     l_name: [i8; 12],
     r_name: [i8; 12],
     r_tty: [i8; 16],
 }
 
 impl CtlMsg {
-    fn from_bytes(bytes: &[u8]) -> Result<Self, binrw::Error> {
-        let mut cursor = Cursor::new(bytes);
-        cursor.read_be()
+    /// Decode the fixed-width big-endian request.
+    ///
+    /// A datagram shorter than the full structure is rejected rather than
+    /// zero-filled, so a truncated request cannot be acted on.
+    fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let bytes: &[u8; CTL_MSG_LEN] = bytes
+            .get(..CTL_MSG_LEN)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| io::Error::other("short control message"))?;
+
+        /// Read a 12-byte NUL-padded name field.
+        fn name(bytes: &[u8]) -> [i8; 12] {
+            std::array::from_fn(|i| bytes[i] as i8)
+        }
+
+        // Bytes 2, 3 and 40..44 are the request's answer, pad and pid fields.
+        // They are part of the 84-byte layout but carry nothing the daemon
+        // acts on, so they are stepped over rather than stored.
+        Ok(CtlMsg {
+            vers: bytes[0],
+            r#type: bytes[1],
+            id_num: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            addr: Osockaddr::read_from(bytes[8..24].try_into().expect("16 bytes")),
+            ctl_addr: Osockaddr::read_from(bytes[24..40].try_into().expect("16 bytes")),
+            l_name: name(&bytes[44..56]),
+            r_name: name(&bytes[56..68]),
+            r_tty: std::array::from_fn(|i| bytes[68 + i] as i8),
+        })
     }
 
     fn local_name(&self) -> String {
@@ -223,8 +265,6 @@ impl CtlMsg {
 }
 
 /// Control response to talk client
-#[binrw]
-#[br(big)]
 struct CtlRes {
     vers: u8,
     r#type: u8,
@@ -247,10 +287,14 @@ impl CtlRes {
     }
 
     fn to_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut bytes = vec![0u8; CTL_RES_LEN];
-        let mut cursor = Cursor::new(&mut bytes[..]);
-        self.write_options(&mut cursor, Endian::Big, ())
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut bytes = Vec::with_capacity(CTL_RES_LEN);
+        bytes.push(self.vers);
+        bytes.push(self.r#type);
+        bytes.push(self.answer);
+        bytes.push(self.pad);
+        bytes.extend_from_slice(&self.id_num.to_be_bytes());
+        self.addr.write_to(&mut bytes);
+        debug_assert_eq!(bytes.len(), CTL_RES_LEN);
         Ok(bytes)
     }
 }
@@ -802,7 +846,7 @@ fn daemon_loop(socket_path: &Path, invite_timeout: Duration, tick: Duration) -> 
 /// daemonized (no controlling terminal), they go to syslog (LOG_DAEMON).
 fn log_info(msg: &str) {
     if DAEMONIZED.get().copied().unwrap_or(false) {
-        syslog_line(syslog::Severity::LOG_INFO, msg);
+        syslog_line(Level::Info, msg);
     } else {
         eprintln!("talkd: {}", msg);
     }
@@ -810,25 +854,17 @@ fn log_info(msg: &str) {
 
 fn log_err(msg: &str) {
     if DAEMONIZED.get().copied().unwrap_or(false) {
-        syslog_line(syslog::Severity::LOG_ERR, msg);
+        syslog_line(Level::Err, msg);
     } else {
         eprintln!("talkd: {}", msg);
     }
 }
 
-fn syslog_line(severity: syslog::Severity, msg: &str) {
-    let formatter = syslog::Formatter3164 {
-        facility: syslog::Facility::LOG_DAEMON,
-        hostname: None,
-        process: "talkd".into(),
-        pid: process::id(),
-    };
-    if let Ok(mut writer) = syslog::unix(formatter) {
-        let _ = match severity {
-            syslog::Severity::LOG_ERR => writer.err(msg),
-            _ => writer.info(msg),
-        };
-    }
+fn syslog_line(level: Level, msg: &str) {
+    // `open` is a no-op after the first call, so the identity is established
+    // once and every later line reuses it.
+    plib::syslog::open("talkd", true, Facility::DAEMON);
+    plib::syslog::log(level, msg);
 }
 
 // ============================================================================

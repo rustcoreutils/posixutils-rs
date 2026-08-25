@@ -8,10 +8,10 @@
 //
 
 use plib::testing::get_binary_path;
+use plib::tmp::TempDir;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use tempfile::TempDir;
 
 /// Run a built SCCS binary with the given args and cwd, feeding `stdin`.
 fn run(cmd: &str, args: &[&str], cwd: &Path, stdin: &str) -> std::process::Output {

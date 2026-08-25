@@ -27,9 +27,9 @@
 //! - testdata-5msg.mbox: 5 messages
 
 use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+use plib::tmp::{NamedTempFile, TempDir};
 use std::io::Write;
 use std::path::PathBuf;
-use tempfile::{NamedTempFile, TempDir};
 
 // =============================================================================
 // Helper Functions

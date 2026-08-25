@@ -139,13 +139,19 @@ on `dev/tests/fixtures/python39.y` the two implementations now agree exactly
 |---|---|---|---|
 | #Y1 | `codegen.rs` `build_packed_tables` | `consistent[]` ignored `Action::Error`, so a state holding one reduce plus a `%nonassoc` error entry reduced without reading the lookahead. `verify.rs` caught it and **panicked** — `%nonassoc '<'` killed yacc outright. `--strict` masked it. | Critical |
 | #Y2 | `lalr.rs` phase-1 worklist | The `\|\| old_size == 0` guard was not monotone; two items with empty lookahead sets re-pushed each other forever. yacc **hung** on `x : y ; y : x ;`. | Critical |
-| #Y3 | `grammar.rs` validation | No productivity check, so #Y2's root cause was reachable from an ordinary typo. | Critical |
+| #Y3 | `grammar.rs` validation | No productivity check, so #Y2's root cause was reachable from an ordinary typo. Now warns per non-terminal (with the line of its first rule), and errors only when the *start symbol* derives nothing — matching bison. An earlier revision of this fix made every case fatal, which rejected grammars carrying a useless-but-unreachable non-terminal that had always built. | Critical |
 | #Y4 | `grammar.rs` mid-rule lowering + `codegen.rs` `transform_action` | The lowered `@N → ε` production's RHS length (0) was used to resolve `$n`, so every reference in a mid-rule action landed past the stack top. POSIX 123914-15. | Critical |
 | #Y5 | `codegen.rs` reduce switch | The default `$$ = $1` was emitted only for rules with no action, so an action that never assigns `$$` inherited the previous reduction's value. POSIX 123922. | Major |
 | #Y6 | `codegen.rs` `yytranslate` | Unassigned and out-of-range token numbers mapped to the `error` token's index, so undeclared input was *shifted as* `error`: no `yyerror()`, no `yynerrs`. Fixed by reserving a `$undefined` terminal that appears in no rule. | Major |
 | #Y7 | `grammar.rs` rule precedence | Used the last terminal *with* a precedence rather than the last terminal, silently resolving conflicts POSIX 124050 says to report. | Major |
 | #Y8 | `codegen.rs` error recovery | The error-token shift bumped `yyvsp` without storing, so `stmt : error ';' { use($1); }` read uninitialized memory. | Major |
 | #Y9 | `lalr.rs` `count_conflicts` | N-way reduce/reduce counted as 1 conflict instead of N-1, making `%expect-rr` unsatisfiable above 2. | Minor |
+
+One known divergence from bison remains, in grammars that already earn a #Y3
+warning: bison *deletes* useless rules before building tables, while we keep
+them, so a dead rule can still contribute a conflict to the reported counts.
+The generated parser is unaffected (the rules can never reduce) and grammars
+with no useless non-terminals — including `python39.y` — agree exactly.
 
 Three further defects from the same review are **open**, deliberately left out
 of scope:

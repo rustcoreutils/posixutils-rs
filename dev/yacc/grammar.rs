@@ -663,27 +663,55 @@ impl Grammar {
             }
         }
 
-        // Report every offender: one non-productive non-terminal makes each of
-        // its users non-productive too, so naming only the first would often
+        // Warn about every offender: one non-productive non-terminal makes each
+        // of its users non-productive too, so naming only the first would often
         // name a symptom rather than the cause. `$accept` is excluded -- it is
         // non-productive exactly when the start symbol is, and it is synthetic.
-        let dead: Vec<String> = self
-            .symbols
-            .iter()
-            .enumerate()
-            .filter(|&(id, sym)| !sym.is_terminal && !productive[id] && id != AUGMENTED_START)
-            .map(|(_, sym)| format!("'{}'", sym.name))
-            .collect();
+        //
+        // These are warnings, not errors: the rules involved are dead, but the
+        // rest of the grammar is still a usable parser, and that is what other
+        // yacc implementations generate. POSIX requires a diagnostic only for a
+        // non-terminal with no rules at all (123825-26), which is a separate
+        // check above.
+        for (id, sym) in self.symbols.iter().enumerate() {
+            if sym.is_terminal || productive[id] || id == AUGMENTED_START {
+                continue;
+            }
+            diag::warning_at(
+                diag::Position::line_only(self.first_rule_line(id) as u32),
+                &format!(
+                    "{} '{}' {}",
+                    gettext("non-terminal"),
+                    sym.name,
+                    gettext("derives no string of tokens; its rules are unusable")
+                ),
+            );
+        }
 
-        if !dead.is_empty() {
-            return Err(grammar_error(format!(
-                "{}: {}",
-                gettext("non-terminals that derive no string of tokens"),
-                dead.join(", ")
-            )));
+        // A non-productive start symbol is fatal: the grammar accepts nothing,
+        // so there is no parser to generate.
+        if !productive[self.start_symbol] {
+            return Err(grammar_error_at(
+                self.first_rule_line(self.start_symbol),
+                format!(
+                    "{} '{}' {}",
+                    gettext("start symbol"),
+                    self.symbols[self.start_symbol].name,
+                    gettext("does not derive any sentence")
+                ),
+            ));
         }
 
         Ok(())
+    }
+
+    /// Line of the first rule defining `sym`, for diagnostics. 0 if it has none.
+    fn first_rule_line(&self, sym: SymbolId) -> usize {
+        self.productions_for
+            .get(&sym)
+            .and_then(|ids| ids.first())
+            .map(|&pid| self.productions[pid].line)
+            .unwrap_or(0)
     }
 
     /// Check if a symbol is a terminal

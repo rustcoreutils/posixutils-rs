@@ -4087,11 +4087,12 @@ fn test_description_stub_does_not_clobber_a_real_output_file() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_mutually_recursive_nonterminals_rejected_not_hung() {
+fn test_mutually_recursive_nonterminals_warn_and_do_not_hang() {
     // `x` and `y` derive only each other, so neither derives a string of
-    // tokens. Before the productivity check this wedged the phase-1 lookahead
-    // closure: two items whose lookahead sets stay empty re-pushed each other
-    // forever, and yacc never terminated.
+    // tokens. This used to wedge the phase-1 lookahead closure: two items whose
+    // lookahead sets stay empty re-pushed each other forever, and yacc never
+    // terminated. The start symbol still has a live alternative, so -- as in
+    // bison -- the dead rules are a warning and the parser is still generated.
     let grammar = r#"
 %token A
 %%
@@ -4105,20 +4106,53 @@ b : b ;
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
-        !output.status.success(),
-        "a non-productive non-terminal must be diagnosed, not accepted"
+        output.status.success(),
+        "`s : A` still derives a sentence, so this must generate: {}",
+        stderr
+    );
+    for name in ["'x'", "'y'", "'b'"] {
+        assert!(
+            stderr.contains("derives no string of tokens") && stderr.contains(name),
+            "should warn about {}, got: {}",
+            name,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn test_unreachable_nonproductive_nonterminal_is_only_a_warning() {
+    // `unused` is non-productive but never reachable from the start symbol, so
+    // it never entered the lookahead closure and grammars like this generated
+    // fine before the productivity check existed. Diagnosing it must not break
+    // them. bison 3.8 warns here and exits 0.
+    let grammar = r#"
+%token A B
+%%
+s : A ;
+unused : unused B ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "a useless non-terminal must not reject an otherwise valid grammar: {}",
+        stderr
     );
     assert!(
-        stderr.contains("derive no string of tokens") && stderr.contains("'x'"),
-        "should name the non-productive non-terminals, got: {}",
+        stderr.contains("'unused'") && stderr.contains("derives no string of tokens"),
+        "should still warn, got: {}",
         stderr
     );
 }
 
 #[test]
-fn test_self_recursive_nonterminal_with_no_base_case_rejected() {
-    // The one-symbol shape of the same defect: `b : b ;` has a rule, so the
-    // "has no rules" check passes it, but it derives nothing.
+fn test_nonproductive_start_symbol_is_fatal() {
+    // When the offender drags the start symbol down with it the grammar accepts
+    // nothing at all, so there is no parser to generate. bison reports the same
+    // thing: "start symbol s does not derive any sentence".
     let grammar = r#"
 %token A
 %%
@@ -4129,12 +4163,58 @@ b : b A ;
     let output = run_yacc(&[], grammar);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(!output.status.success(), "`b : b A ;` derives no tokens");
     assert!(
-        stderr.contains("derive no string of tokens") && stderr.contains("'b'"),
-        "should name 'b' -- the cause, not just 's' which inherits it, got: {}",
+        !output.status.success(),
+        "a grammar that accepts nothing must be an error"
+    );
+    assert!(
+        stderr.contains("start symbol") && stderr.contains("does not derive any sentence"),
+        "should name the start symbol, got: {}",
         stderr
     );
+    assert!(
+        stderr.contains("'b'"),
+        "should also warn about 'b', the cause, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_dead_rules_do_not_break_the_generated_parser() {
+    // Keeping the unusable rules in the tables (rather than deleting them as
+    // bison does) must still yield a working parser for the live alternative.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int reported;
+%}
+
+%token A NEVER
+
+%%
+s : A | x b ;
+x : y ;
+y : x ;
+b : b NEVER ;
+%%
+
+int yylval;
+static int n;
+
+int yylex(void) { if (n++ == 0) return A; return 0; }
+
+void yyerror(const char *s) { reported++; (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    if (reported != 0) return 2;
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "dead_rules_still_parse");
 }
 
 #[test]

@@ -10,6 +10,10 @@
 //! NFA construction using Thompson's algorithm.
 //!
 //! Converts regex HIR to NFA for subsequent DFA construction.
+//!
+//! Each start condition gets a pair of roots (plain and beginning-of-line), and
+//! a rule is wired only to the roots it can match from, so start conditions and
+//! '^' are settled by the automaton's shape rather than after a match.
 
 use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind, Literal, Repetition};
 use std::collections::{BTreeMap, BTreeSet};

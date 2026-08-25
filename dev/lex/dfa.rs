@@ -9,7 +9,9 @@
 
 //! DFA construction using subset construction (powerset algorithm).
 //!
-//! Converts NFA to DFA with Hopcroft minimization and character equivalence classes.
+//! Character equivalence classes are derived from the NFA first, so
+//! determinization and minimization both work over a few dozen classes rather
+//! than 256 characters. Minimization is Moore's partition refinement.
 
 use crate::nfa::{Nfa, Transition};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -322,7 +324,11 @@ impl Dfa {
         dfa
     }
 
-    /// Minimize the DFA using Hopcroft's algorithm
+    /// Minimize the DFA by Moore's partition refinement.
+    ///
+    /// Not Hopcroft's: there is no worklist and no smaller-half rule, so this
+    /// is O(n^2 * |classes|) rather than O(n log n). Refinement runs over
+    /// equivalence classes, so |classes| is a few dozen, not 256.
     pub fn minimize(&self) -> Dfa {
         if self.states.is_empty() {
             return Dfa {

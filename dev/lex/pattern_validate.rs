@@ -11,6 +11,9 @@
 //!
 //! This module handles validation of pattern restrictions per POSIX specification
 //! and parsing of anchoring (^, $) and trailing context (/) operators.
+//!
+//! It also owns the shared scanner for bracket-expression and quoted-string
+//! context, which every pattern-level operator has to respect.
 
 use gettextrs::gettext;
 

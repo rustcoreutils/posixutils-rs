@@ -34,6 +34,7 @@
 use binrw::{binrw, BinReaderExt, BinWrite, Endian};
 use clap::Parser;
 use gettextrs::gettext;
+use plib::syslog::{Facility, Level};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
@@ -802,7 +803,7 @@ fn daemon_loop(socket_path: &Path, invite_timeout: Duration, tick: Duration) -> 
 /// daemonized (no controlling terminal), they go to syslog (LOG_DAEMON).
 fn log_info(msg: &str) {
     if DAEMONIZED.get().copied().unwrap_or(false) {
-        syslog_line(syslog::Severity::LOG_INFO, msg);
+        syslog_line(Level::Info, msg);
     } else {
         eprintln!("talkd: {}", msg);
     }
@@ -810,25 +811,17 @@ fn log_info(msg: &str) {
 
 fn log_err(msg: &str) {
     if DAEMONIZED.get().copied().unwrap_or(false) {
-        syslog_line(syslog::Severity::LOG_ERR, msg);
+        syslog_line(Level::Err, msg);
     } else {
         eprintln!("talkd: {}", msg);
     }
 }
 
-fn syslog_line(severity: syslog::Severity, msg: &str) {
-    let formatter = syslog::Formatter3164 {
-        facility: syslog::Facility::LOG_DAEMON,
-        hostname: None,
-        process: "talkd".into(),
-        pid: process::id(),
-    };
-    if let Ok(mut writer) = syslog::unix(formatter) {
-        let _ = match severity {
-            syslog::Severity::LOG_ERR => writer.err(msg),
-            _ => writer.info(msg),
-        };
-    }
+fn syslog_line(level: Level, msg: &str) {
+    // `open` is a no-op after the first call, so the identity is established
+    // once and every later line reuses it.
+    plib::syslog::open("talkd", true, Facility::DAEMON);
+    plib::syslog::log(level, msg);
 }
 
 // ============================================================================

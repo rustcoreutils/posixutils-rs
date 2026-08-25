@@ -12,7 +12,9 @@
 //! This module provides transparent gzip compression and decompression
 //! as a filter layer that wraps Read/Write streams.
 
-use libflate::gzip;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::io::{self, Read, Write};
 
 /// Gzip magic bytes (first two bytes of a gzip file)
@@ -25,14 +27,18 @@ pub fn is_gzip(data: &[u8]) -> bool {
 
 /// Gzip decompression wrapper for Read streams
 pub struct GzipReader<R: Read> {
-    decoder: gzip::Decoder<R>,
+    decoder: GzDecoder<R>,
 }
 
 impl<R: Read> GzipReader<R> {
     /// Create a new gzip decompressor wrapping the given reader
+    ///
+    /// A malformed gzip header is reported by the first [`Read::read`] rather
+    /// than here, because `GzDecoder` parses the header lazily.
     pub fn new(reader: R) -> io::Result<Self> {
-        let decoder = gzip::Decoder::new(reader)?;
-        Ok(GzipReader { decoder })
+        Ok(GzipReader {
+            decoder: GzDecoder::new(reader),
+        })
     }
 }
 
@@ -44,15 +50,14 @@ impl<R: Read> Read for GzipReader<R> {
 
 /// Gzip compression wrapper for Write streams
 pub struct GzipWriter<W: Write> {
-    encoder: Option<gzip::Encoder<W>>,
+    encoder: Option<GzEncoder<W>>,
 }
 
 impl<W: Write> GzipWriter<W> {
     /// Create a new gzip compressor wrapping the given writer
     pub fn new(writer: W) -> io::Result<Self> {
-        let encoder = gzip::Encoder::new(writer)?;
         Ok(GzipWriter {
-            encoder: Some(encoder),
+            encoder: Some(GzEncoder::new(writer, Compression::default())),
         })
     }
 }

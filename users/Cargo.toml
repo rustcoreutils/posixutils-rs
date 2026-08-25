@@ -13,7 +13,6 @@ clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 chrono.workspace = true
-syslog = "6.1"
 libcrypt-rs = "0.1"
 thiserror.workspace = true
 binrw = "0.15"

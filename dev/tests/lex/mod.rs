@@ -3900,3 +3900,55 @@ abc     { printf("<abc>"); unput('z'); unput('y'); }
     let result = compile_and_run(&c_code, "abc\n").unwrap();
     assert_eq!(result, "<abc>(y)(z)");
 }
+
+// ---------------------------------------------------------------------------
+// POSIX bracket expressions: a leading ']' is an ordinary member
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_leading_bracket_is_a_literal_member() {
+    // In "[]abc]" the first ']' is a member, not the terminator. Treating it as
+    // the terminator ends the class early and exposes the rest of the pattern
+    // to operator parsing.
+    let cases: &[(&str, &str, &str)] = &[
+        ("[]]", "]x", "<m:]>(x)"),
+        ("[]a]", "a]x", "<m:a><m:]>(x)"),
+        // '/' inside such a class must not be read as trailing context.
+        ("[]/]+", "/]x", "<m:/]>(x)"),
+        // nor '$' as an end-of-line anchor.
+        ("[]$]+", "$]x", "<m:$]>(x)"),
+        // '^' keeps the class at its start, so ']' after it is a member too.
+        ("[^]{}]+", "ab}cd", "<m:ab>(})<m:cd>"),
+    ];
+
+    for (pattern, input, expected) in cases {
+        let lex_input = format!(
+            "%option noinput nounput\n%%\n{}   {{ printf(\"<m:%s>\", yytext); }}\n.|\\n    {{ printf(\"(%s)\", yytext); }}\n%%\n",
+            pattern
+        );
+        let (c_code, success) = run_lex(&lex_input);
+        assert!(success, "lex rejected {}: {}", pattern, c_code);
+
+        let result = compile_and_run(&c_code, input).unwrap();
+        assert_eq!(result, *expected, "pattern {} on {:?}", pattern, input);
+    }
+}
+
+#[test]
+fn test_negated_class_with_escape_still_terminates() {
+    // Regression: clearing the "class start" flag only in some match arms let
+    // "[^}\n]" read its ']' as a member and swallow the rest of the line.
+    let lex_input = r#"%option noinput nounput
+%%
+"{"[^}\n]*"}"   { printf("<c>"); }
+[a-z]+          { printf("<w:%s>", yytext); }
+.|\n            { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "ab {note} cd\n").unwrap();
+    assert_eq!(result, "<w:ab><c><w:cd>");
+}

@@ -56,6 +56,20 @@ pub fn parse_anchoring_and_trailing_context(pattern: &str) -> (bool, String, Opt
     (bol_anchor, main_pattern, trailing_context, eol_anchor)
 }
 
+/// Find the end of a POSIX bracket expression construct like [:alpha:], [=a=], or [.ch.]
+/// Returns the index of the closing bracket ']' if found, None otherwise
+pub fn find_posix_bracket_end(chars: &[char], start: usize, close_char: char) -> Option<usize> {
+    // Look for close_char followed by ]  (e.g., :] or =] or .])
+    let mut i = start;
+    while i + 1 < chars.len() {
+        if chars[i] == close_char && chars[i + 1] == ']' {
+            return Some(i + 1); // Return index of the ]
+        }
+        i += 1;
+    }
+    None
+}
+
 /// One unescaped character of a pattern, with the context it sits in.
 struct PatternChar {
     /// Byte offset into the pattern, so callers may slice the pattern with it.
@@ -74,39 +88,77 @@ struct PatternChar {
 ///
 /// Escaped characters are skipped entirely, along with the backslash that
 /// escapes them: for these callers "escaped" and "absent" mean the same thing.
+/// So are POSIX `[:class:]`, `[=equiv=]` and `[.collating.]` constructs, whose
+/// closing `]` does not end the enclosing expression.
+///
 /// The reported context is the state *entering* the character, so an opening
 /// `[` reports `in_brackets == false` and its closing `]` reports `true`.
-fn unescaped_chars(pattern: &str) -> impl Iterator<Item = PatternChar> + '_ {
+fn unescaped_chars(pattern: &str) -> Vec<PatternChar> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let offsets: Vec<usize> = pattern.char_indices().map(|(off, _)| off).collect();
+
+    let mut out = Vec::with_capacity(chars.len());
     let mut in_brackets = false;
+    // POSIX: a ']' first in a bracket expression, possibly after '^', is an
+    // ordinary member rather than the terminator -- "[]/]" is a class of ']'
+    // and '/', not an empty class followed by a trailing-context operator.
+    let mut bracket_start = false;
     let mut in_quotes = false;
-    let mut escape_next = false;
+    let mut i = 0;
 
-    pattern.char_indices().filter_map(move |(byte_idx, ch)| {
-        if escape_next {
-            escape_next = false;
-            return None;
-        }
+    while i < chars.len() {
+        let ch = chars[i];
+
         if ch == '\\' {
-            escape_next = true;
-            return None;
+            i += 2; // the backslash and whatever it escapes
+            continue;
         }
 
-        let here = PatternChar {
-            byte_idx,
+        if in_brackets && ch == '[' {
+            if let Some(&next) = chars.get(i + 1) {
+                if next == ':' || next == '=' || next == '.' {
+                    if let Some(end) = find_posix_bracket_end(&chars, i + 2, next) {
+                        i = end + 1;
+                        bracket_start = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        out.push(PatternChar {
+            byte_idx: offsets[i],
             ch,
             in_brackets,
             in_quotes,
-        };
+        });
 
         match ch {
             '"' if !in_brackets => in_quotes = !in_quotes,
-            '[' if !in_quotes => in_brackets = true,
-            ']' if !in_quotes && in_brackets => in_brackets = false,
-            _ => {}
+            '[' if !in_quotes && !in_brackets => {
+                in_brackets = true;
+                bracket_start = true;
+            }
+            // Still at the start of the class: "[^]" has not closed anything.
+            '^' if in_brackets && bracket_start => {}
+            ']' if !in_quotes && in_brackets => {
+                if bracket_start {
+                    bracket_start = false; // literal member
+                } else {
+                    in_brackets = false;
+                }
+            }
+            _ => {
+                if in_brackets {
+                    bracket_start = false;
+                }
+            }
         }
 
-        Some(here)
-    })
+        i += 1;
+    }
+
+    out
 }
 
 /// Check if pattern ends with an unescaped $ (not inside brackets or quotes)
@@ -120,13 +172,16 @@ pub fn pattern_ends_with_unescaped_dollar(pattern: &str) -> bool {
 
     // An escaped '$' is never yielded by the scanner, which is precisely the
     // "not an anchor" answer.
-    unescaped_chars(pattern).any(|pc| pc.byte_idx == dollar_idx && !pc.in_brackets && !pc.in_quotes)
+    unescaped_chars(pattern)
+        .iter()
+        .any(|pc| pc.byte_idx == dollar_idx && !pc.in_brackets && !pc.in_quotes)
 }
 
 /// Find the byte offset of the trailing context operator / (not inside
 /// brackets, quotes, or escaped)
 pub fn find_trailing_context_slash(pattern: &str) -> Option<usize> {
     unescaped_chars(pattern)
+        .iter()
         .find(|pc| pc.ch == '/' && !pc.in_brackets && !pc.in_quotes)
         .map(|pc| pc.byte_idx)
 }
@@ -134,6 +189,7 @@ pub fn find_trailing_context_slash(pattern: &str) -> Option<usize> {
 /// Count the number of unescaped trailing context operators / in a pattern
 pub fn count_trailing_context_slashes(pattern: &str) -> usize {
     unescaped_chars(pattern)
+        .iter()
         .filter(|pc| pc.ch == '/' && !pc.in_brackets && !pc.in_quotes)
         .count()
 }

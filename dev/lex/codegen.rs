@@ -1978,7 +1978,19 @@ mod tests {
     #[test]
     fn test_generate_with_bol_anchor() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
+        // Anchored, so the beginning-of-line root and the other one differ and
+        // the generated scanner has to choose between them on entry.
+        let nfa = Nfa::from_rules(
+            &[NfaRule {
+                main: hir,
+                trailing: None,
+                index: 0,
+                bol_anchor: true,
+                active_conditions: vec![0],
+            }],
+            1,
+        )
+        .unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -1987,7 +1999,7 @@ mod tests {
             compiled_ere: "foo".to_string(),
             action: "return BOL_RULE;".to_string(),
             start_conditions: vec![],
-            bol_anchor: false,
+            bol_anchor: true,
             trailing_context: None,
             compiled_trailing_context: None,
             is_eof: false,
@@ -2009,6 +2021,11 @@ mod tests {
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("return BOL_RULE"));
         assert!(s.contains("int yylex(void)"));
+        // The anchor is resolved by entering a separate automaton.
+        assert!(
+            s.contains("if (yy_at_bol) goto yy_state_"),
+            "an anchored rule should produce a beginning-of-line entry state"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::pattern_escape::{
     expand_posix_bracket_constructs, has_nul_escape, translate_escape_sequences,
 };
 use crate::pattern_validate::{
-    parse_anchoring_and_trailing_context, validate_pattern_restrictions,
+    find_posix_bracket_end, parse_anchoring_and_trailing_context, validate_pattern_restrictions,
 };
 use gettextrs::gettext;
 use plib::diag;
@@ -425,20 +425,6 @@ enum RegexType {
     Curly,
 }
 
-/// Find the end of a POSIX bracket expression construct like [:alpha:], [=a=], or [.ch.]
-/// Returns the index of the closing bracket ']' if found, None otherwise
-fn find_posix_bracket_end(chars: &[char], start: usize, close_char: char) -> Option<usize> {
-    // Look for close_char followed by ]  (e.g., :] or =] or .])
-    let mut i = start;
-    while i + 1 < chars.len() {
-        if chars[i] == close_char && chars[i + 1] == ']' {
-            return Some(i + 1); // Return index of the ]
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Find end of regex in rule line by matching brackets, parens, braces, quotes.
 /// Handles POSIX bracket constructs: [:class:], [=equiv=], [.collating.].
 ///
@@ -447,6 +433,9 @@ fn find_posix_bracket_end(chars: &[char], start: usize, close_char: char) -> Opt
 fn find_ere_end(line: &str) -> Result<usize, String> {
     let mut stack: Vec<RegexType> = Vec::new();
     let mut inside_brackets = false;
+    // POSIX: a ']' first in a bracket expression, possibly after '^', is an
+    // ordinary member rather than the terminator.
+    let mut bracket_start = false;
     let mut inside_quotes = false;
     let mut escape_next = false;
     // Scanning is per character (lookahead indexes neighbours), but the result
@@ -461,6 +450,7 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
         // Handle escape sequences
         if escape_next {
             escape_next = false;
+            bracket_start = false; // an escaped character is an ordinary member
             i += 1;
             continue;
         }
@@ -483,11 +473,22 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
             continue;
         }
 
+        // Only the character right after '[' (or after "[^") can be a literal
+        // ']'; every other member ends that position. Cleared here rather than
+        // in each arm below, since most arms are about nesting, not membership.
+        let at_class_start = bracket_start;
+        bracket_start = false;
+
         match ch {
+            '^' if inside_brackets && at_class_start => {
+                // "[^]" has not closed anything yet.
+                bracket_start = true;
+            }
             '[' => {
                 if !inside_brackets {
                     stack.push(RegexType::Square);
                     inside_brackets = true;
+                    bracket_start = true;
                 } else {
                     // Inside brackets: check for POSIX constructs [:, [=, [.
                     if i + 1 < chars.len() {
@@ -514,7 +515,7 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
                 }
             }
             ']' => {
-                if inside_brackets {
+                if inside_brackets && !at_class_start {
                     inside_brackets = false;
                     if stack.pop() != Some(RegexType::Square) {
                         return Err(gettext("unmatched closing square bracket in pattern"));
@@ -600,6 +601,9 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
     let mut in_quotes = false;
     let mut in_brace = false;
     let mut in_brackets = false;
+    // POSIX: a ']' first in a bracket expression, possibly after '^', is an
+    // ordinary member rather than the terminator.
+    let mut bracket_start = false;
     let mut brace_content = String::new();
     let mut escape_next = false;
     let chars: Vec<char> = ere.chars().collect();
@@ -739,8 +743,12 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
                         }
                     }
                 }
-            } else if ch == ']' {
+            } else if ch == ']' && !bracket_start {
                 in_brackets = false;
+            }
+            // '^' right after '[' keeps the class at its start.
+            if !(bracket_start && ch == '^') {
+                bracket_start = false;
             }
             re.push(ch);
         } else if ch == '"' {
@@ -749,6 +757,7 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
             in_brace = true;
         } else if ch == '[' {
             in_brackets = true;
+            bracket_start = true;
             re.push(ch);
         } else {
             re.push(ch);

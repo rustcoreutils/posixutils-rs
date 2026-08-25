@@ -189,6 +189,7 @@ pub fn generate<W: Write>(
     write_trailing_context_matchers(output, dfa, config)?;
     write_rule_metadata_tables(output, lexinfo, config, &flags)?;
     write_main_pattern_end_table(output, dfa, config)?;
+    write_buffer_management(output)?;
     write_helper_functions(output, lexinfo)?;
     write_yylex_direct_coded(output, dfa, lexinfo, config, &flags)?;
     write_user_subroutines(output, lexinfo)?;
@@ -681,6 +682,87 @@ fn write_eof_dispatch<W: Write>(
     Ok(())
 }
 
+/// Emit the input buffer's maintenance routines.
+///
+/// Every position the scanner remembers -- YYCURSOR, YYLIMIT, YYTOKEN,
+/// YYMARKER, and the REJECT and trailing-context stacks -- names a byte of the
+/// current token. Only these three routines move that byte, and each keeps
+/// every position on the byte it named, so nothing else has to think about it.
+/// The rebasing used to be written out at each growth and compaction site,
+/// which is how a stale pointer got left behind.
+fn write_buffer_management<W: Write>(output: &mut W) -> io::Result<()> {
+    writeln!(
+        output,
+        r#"/* Input buffer maintenance. These are the only routines that move the
+   buffer; each leaves every saved position on the byte it named. */
+
+/* Double the buffer, keeping all four cursors on their bytes. */
+static void yy_buffer_grow(void)
+{{
+    size_t yy_cursor_off = (size_t)(YYCURSOR - yy_buffer);
+    size_t yy_limit_off = (size_t)(YYLIMIT - yy_buffer);
+    size_t yy_token_off = (size_t)(YYTOKEN - yy_buffer);
+    size_t yy_marker_off = (size_t)(YYMARKER - yy_buffer);
+    size_t yy_new_size = yy_buffer_size ? yy_buffer_size * 2 : YY_BUF_SIZE;
+    unsigned char *yy_new = (unsigned char *)realloc(yy_buffer, yy_new_size + 2);
+    if (yy_new == NULL) {{
+        YY_FATAL_ERROR("lex: out of memory growing input buffer");
+    }}
+    yy_buffer = yy_new;
+    yy_buffer_size = yy_new_size;
+    YYCURSOR = yy_buffer + yy_cursor_off;
+    YYLIMIT = yy_buffer + yy_limit_off;
+    YYTOKEN = yy_buffer + yy_token_off;
+    YYMARKER = yy_buffer + yy_marker_off;
+}}
+
+/* Drop the text before the current token, moving it to the front.
+   Distances from YYTOKEN are unchanged, which is why the REJECT and
+   trailing-context stacks can store offsets from it and need no fixups. */
+static void yy_buffer_compact(void)
+{{
+    size_t yy_shift = (size_t)(YYTOKEN - yy_buffer);
+    size_t yy_live;
+    if (yy_shift == 0) {{
+        return;
+    }}
+    yy_live = (size_t)(YYLIMIT - YYTOKEN);
+    if (yy_live > 0) {{
+        memmove(yy_buffer, YYTOKEN, yy_live);
+    }}
+    YYCURSOR -= yy_shift;
+    YYLIMIT -= yy_shift;
+    YYMARKER -= yy_shift;
+    YYTOKEN = yy_buffer;
+}}
+
+/* Read more input at YYLIMIT, growing first if the buffer is full.
+   Returns the number of bytes read; 0 means end of input. */
+static int yy_buffer_fill(void)
+{{
+    int yy_result;
+    size_t yy_used;
+    size_t yy_room;
+    yy_used = (size_t)(YYLIMIT - yy_buffer);
+    if (yy_used >= yy_buffer_size) {{
+        yy_buffer_grow();
+        yy_used = (size_t)(YYLIMIT - yy_buffer);
+    }}
+    yy_room = yy_buffer_size - yy_used;
+    if (yy_room > (size_t)INT_MAX) {{
+        yy_room = (size_t)INT_MAX;
+    }}
+    YY_INPUT(yy_buffer + yy_used, yy_result, (int)yy_room);
+    if (yy_result > 0) {{
+        YYLIMIT = yy_buffer + yy_used + (size_t)yy_result;
+    }}
+    return yy_result;
+}}
+"#
+    )?;
+    Ok(())
+}
+
 fn write_helper_functions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io::Result<()> {
     // input() function - conditionally generated based on %option noinput
     if !lexinfo.options.noinput {
@@ -694,34 +776,11 @@ int input(void)
 {{
     /* Check main buffer - unput() now always inserts directly here */
     if (YYCURSOR >= YYLIMIT) {{
-        /* Refill through YY_INPUT, the documented interception point, so a
-           user-supplied YY_INPUT sees these reads too. Append rather than
-           compact: yyless() and unput() address the buffer relative to
-           YYTOKEN, which must stay valid across input(). */
-        int yy_result;
-        size_t yy_used = (size_t)(YYLIMIT - yy_buffer);
-        if (yy_used >= yy_buffer_size) {{
-            size_t new_size = yy_buffer_size * 2;
-            size_t cursor_off = (size_t)(YYCURSOR - yy_buffer);
-            size_t limit_off = (size_t)(YYLIMIT - yy_buffer);
-            size_t token_off = (size_t)(YYTOKEN - yy_buffer);
-            size_t marker_off = (size_t)(YYMARKER - yy_buffer);
-            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);
-            if (new_buf == NULL) {{ YY_FATAL_ERROR("lex: out of memory in input()"); }}
-            yy_buffer = new_buf;
-            yy_buffer_size = new_size;
-            YYCURSOR = yy_buffer + cursor_off;
-            YYLIMIT = yy_buffer + limit_off;
-            YYTOKEN = yy_buffer + token_off;
-            YYMARKER = yy_buffer + marker_off;
-        }}
-        size_t yy_room = yy_buffer_size - yy_used;
-        if (yy_room > (size_t)INT_MAX) yy_room = (size_t)INT_MAX;
-        YY_INPUT(yy_buffer + yy_used, yy_result, (int)yy_room);
-        if (yy_result <= 0) {{
+        /* Refill through the same routine the scan loop uses, so a
+           user-supplied YY_INPUT sees these reads too. */
+        if (yy_buffer_fill() == 0) {{
             return 0;  /* POSIX: input() returns 0 on end of file */
         }}
-        YYLIMIT = yy_buffer + yy_used + (size_t)yy_result;
     }}
     {{
         int yy_c = *YYCURSOR++;
@@ -754,25 +813,12 @@ int unput(int c)
         /* Room before cursor - just back up and insert */
         *--YYCURSOR = (unsigned char)c;
     }} else {{
-        /* At start of buffer - need to shift content right to make room */
+        /* At start of buffer - need to shift content right to make room.
+           Compaction cannot help here: the room has to be *before* YYTOKEN. */
         size_t yy_remain = YYLIMIT - yy_buffer;
-        /* Grow buffer if full */
         if (yy_remain >= yy_buffer_size) {{
-            size_t new_size = yy_buffer_size * 2;
-            size_t cursor_off = YYCURSOR - yy_buffer;
-            size_t limit_off = YYLIMIT - yy_buffer;
-            size_t token_off = YYTOKEN - yy_buffer;
-            size_t marker_off = YYMARKER - yy_buffer;
-            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);
-            if (new_buf == NULL) {{
-                YY_FATAL_ERROR("lex: out of memory in unput()");
-            }}
-            yy_buffer = new_buf;
-            yy_buffer_size = new_size;
-            YYCURSOR = yy_buffer + cursor_off;
-            YYLIMIT = yy_buffer + limit_off;
-            YYTOKEN = yy_buffer + token_off;
-            YYMARKER = yy_buffer + marker_off;
+            yy_buffer_grow();
+            yy_remain = YYLIMIT - yy_buffer;
         }}
         if (yy_remain > 0) {{
             memmove(yy_buffer + 1, yy_buffer, yy_remain);
@@ -1225,36 +1271,19 @@ fn write_yylex_direct_coded<W: Write>(
         writeln!(output)?;
     }
 
-    // Buffer refill check
+    // The token starts here, so compaction below can drop everything before it.
+    writeln!(output, "    /* Initialize for new token */")?;
+    writeln!(output, "    YYTOKEN = YYCURSOR;")?;
     writeln!(output, "    /* Check if buffer needs refill */")?;
     writeln!(output, "    if (YYCURSOR >= YYLIMIT) {{")?;
-    writeln!(output, "        int yy_result;")?;
-    writeln!(
-        output,
-        "        /* unput() inserts directly into buffer, no separate drain needed */"
-    )?;
-    // Guard buffer size cast to prevent overflow
-    writeln!(
-        output,
-        "        size_t yy_init_size = (yy_buffer_size > INT_MAX) ? INT_MAX : yy_buffer_size;"
-    )?;
-    writeln!(
-        output,
-        "        YY_INPUT(yy_buffer, yy_result, (int)yy_init_size);"
-    )?;
-    writeln!(output, "        YYLIMIT = yy_buffer + yy_result;")?;
-    writeln!(output, "        YYCURSOR = yy_buffer;")?;
-    writeln!(output, "        if (yy_result == 0) {{")?;
+    writeln!(output, "        yy_buffer_compact();")?;
+    writeln!(output, "        if (yy_buffer_fill() == 0) {{")?;
 
     // Handle EOF with start condition awareness
     write_eof_dispatch(output, eof_rules, config, "            ")?;
     writeln!(output, "        }}")?;
     writeln!(output, "    }}")?;
     writeln!(output)?;
-
-    // Initialize for new token
-    writeln!(output, "    /* Initialize for new token */")?;
-    writeln!(output, "    YYTOKEN = YYCURSOR;")?;
     writeln!(output, "    yyaccept = -1;")?;
     writeln!(output, "    yy_reject_flag = 0;")?;
     writeln!(output, "    yy_full_match_state = 0;")?;
@@ -1338,132 +1367,22 @@ fn write_yylex_direct_coded<W: Write>(
     // YYFILL/EOF block
     writeln!(output, "yy_fill_or_eof:")?;
     writeln!(output, "    /* End of buffer reached during scan */")?;
-    writeln!(
-        output,
-        "    /* Try to refill buffer - may find longer match */"
-    )?;
     writeln!(output, "    {{")?;
-    writeln!(output, "        int yy_result;")?;
     writeln!(
         output,
-        "        /* Save current offsets relative to buffer */"
+        "        /* Compact then refill. Both keep every saved position on its"
     )?;
     writeln!(
         output,
-        "        ptrdiff_t yy_token_offset = YYTOKEN - yy_buffer;"
+        "           byte, so the partial match in progress survives untouched. */"
     )?;
-    writeln!(
-        output,
-        "        ptrdiff_t yy_cursor_offset = YYCURSOR - yy_buffer;"
-    )?;
-    writeln!(
-        output,
-        "        ptrdiff_t yy_marker_offset = YYMARKER - yy_buffer;"
-    )?;
-    // Note: yy_main_end_offset[] tracks offsets from YYTOKEN, so no adjustment needed on buffer shifts
-    writeln!(
-        output,
-        "        /* Shift remaining data to start of buffer */"
-    )?;
-    writeln!(output, "        ptrdiff_t yy_remain = YYLIMIT - YYTOKEN;")?;
-    // Dynamic buffer growth: if token approaches buffer size, grow the buffer
-    writeln!(
-        output,
-        "        /* Grow buffer if token is getting too long */"
-    )?;
-    writeln!(
-        output,
-        "        if (YYTOKEN == yy_buffer && (size_t)yy_remain >= yy_buffer_size - 256) {{"
-    )?;
-    writeln!(output, "            size_t new_size = yy_buffer_size * 2;")?;
-    writeln!(output, "            /* Save offsets before realloc */")?;
-    writeln!(
-        output,
-        "            size_t cursor_off = YYCURSOR - yy_buffer;"
-    )?;
-    writeln!(
-        output,
-        "            size_t token_off = YYTOKEN - yy_buffer;"
-    )?;
-    writeln!(
-        output,
-        "            size_t marker_off = YYMARKER - yy_buffer;"
-    )?;
-    writeln!(
-        output,
-        "            size_t limit_off = YYLIMIT - yy_buffer;"
-    )?;
-    writeln!(
-        output,
-        "            unsigned char *new_buf = (unsigned char *)realloc(yy_buffer, new_size + 2);"
-    )?;
-    writeln!(output, "            if (new_buf == NULL) {{")?;
-    writeln!(
-        output,
-        "                fprintf(stderr, \"lex: out of memory growing buffer to %zu bytes\\n\", new_size);"
-    )?;
-    writeln!(output, "                return -1;")?;
-    writeln!(output, "            }}")?;
-    writeln!(output, "            yy_buffer = new_buf;")?;
-    writeln!(output, "            yy_buffer_size = new_size;")?;
-    writeln!(output, "            YYCURSOR = yy_buffer + cursor_off;")?;
-    writeln!(output, "            YYTOKEN = yy_buffer + token_off;")?;
-    writeln!(output, "            YYMARKER = yy_buffer + marker_off;")?;
-    writeln!(output, "            YYLIMIT = yy_buffer + limit_off;")?;
-    writeln!(output, "        }}")?;
-    writeln!(
-        output,
-        "        /* Move unscanned data to buffer start; skip if yy_remain==0 (nothing to preserve) */"
-    )?;
-    writeln!(
-        output,
-        "        if (yy_remain > 0 && YYTOKEN > yy_buffer) {{"
-    )?;
-    writeln!(
-        output,
-        "            memmove(yy_buffer, YYTOKEN, (size_t)yy_remain);"
-    )?;
-    writeln!(output, "        }}")?;
-    // Guard buffer size cast to prevent overflow
-    writeln!(
-        output,
-        "        size_t yy_read_size = yy_buffer_size - (size_t)yy_remain;"
-    )?;
-    writeln!(
-        output,
-        "        if (yy_read_size > INT_MAX) yy_read_size = INT_MAX;"
-    )?;
-    writeln!(
-        output,
-        "        YY_INPUT(yy_buffer + yy_remain, yy_result, (int)yy_read_size);"
-    )?;
-    writeln!(output, "        if (yy_result == 0) {{")?;
-    writeln!(
-        output,
-        "            /* True EOF - no more input available */"
-    )?;
-    writeln!(output, "            if (yy_remain == 0) {{")?;
-    writeln!(
-        output,
-        "                /* Buffer completely empty - handle EOF */"
-    )?;
+    writeln!(output, "        yy_buffer_compact();")?;
+    writeln!(output, "        if (yy_buffer_fill() == 0) {{")?;
+    writeln!(output, "            if (YYLIMIT == yy_buffer) {{")?;
+
+    // Nothing buffered at all: this really is end of input.
     write_eof_dispatch(output, eof_rules, config, "                ")?;
     writeln!(output, "            }}")?;
-    writeln!(
-        output,
-        "            /* Have remaining data - finalize with current match */"
-    )?;
-    writeln!(output, "            YYLIMIT = yy_buffer + yy_remain;")?;
-    writeln!(output, "            YYTOKEN = yy_buffer;")?;
-    writeln!(
-        output,
-        "            YYCURSOR = yy_buffer + (yy_cursor_offset - yy_token_offset);"
-    )?;
-    writeln!(
-        output,
-        "            YYMARKER = yy_buffer + (yy_marker_offset - yy_token_offset);"
-    )?;
-    // Note: yy_main_end_offset[] tracks offsets from YYTOKEN, no adjustment needed on shift
     writeln!(output, "            if (yyaccept >= 0) {{")?;
     writeln!(output, "                goto yy_fail;")?;
     writeln!(output, "            }}")?;
@@ -1476,24 +1395,6 @@ fn write_yylex_direct_coded<W: Write>(
     writeln!(output, "            YYCURSOR = YYTOKEN;")?;
     writeln!(output, "            goto yy_scan;")?;
     writeln!(output, "        }}")?;
-    writeln!(
-        output,
-        "        /* Refill succeeded - adjust pointers and resume scanning */"
-    )?;
-    writeln!(
-        output,
-        "        YYLIMIT = yy_buffer + yy_remain + yy_result;"
-    )?;
-    writeln!(output, "        YYTOKEN = yy_buffer;")?;
-    writeln!(
-        output,
-        "        YYCURSOR = yy_buffer + (yy_cursor_offset - yy_token_offset);"
-    )?;
-    writeln!(
-        output,
-        "        YYMARKER = yy_buffer + (yy_marker_offset - yy_token_offset);"
-    )?;
-    // Note: yy_main_end_offset[] tracks offsets from YYTOKEN, no adjustment needed on refill
     writeln!(
         output,
         "        /* Resume scanning from the DFA state that hit buffer end */"

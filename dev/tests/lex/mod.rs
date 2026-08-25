@@ -3832,3 +3832,71 @@ x*/xy   { printf("[%s]", yytext); }
     assert!(success);
     compile_and_run_bounded(&c_code, "xxxy", 10).expect("scanner must terminate");
 }
+
+// ---------------------------------------------------------------------------
+// Input buffer maintenance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_buffer_maintenance_is_centralized() {
+    // Growth used to rebase YYCURSOR/YYLIMIT/YYTOKEN/YYMARKER at each site that
+    // moved the buffer, and one of those sites forgot. Exactly one routine
+    // should reallocate it now.
+    let lex_input = r#"%%
+[a-z]+  { printf("%d,", yyleng); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let reallocs = c_code.matches("realloc(yy_buffer").count();
+    assert_eq!(
+        reallocs, 1,
+        "the input buffer should be reallocated in one place only"
+    );
+    assert!(c_code.contains("static void yy_buffer_grow(void)"));
+    assert!(c_code.contains("static void yy_buffer_compact(void)"));
+    assert!(c_code.contains("static int yy_buffer_fill(void)"));
+}
+
+#[test]
+fn test_token_far_larger_than_the_buffer() {
+    // The token has to survive repeated compaction and growth with every saved
+    // position still naming its own byte.
+    let lex_input = r#"%option noinput nounput
+%%
+a+      { printf("%d\n", yyleng); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // YY_BUF_SIZE is 16384; this spans several growths.
+    let input = format!("{}\n", "a".repeat(100_000));
+    let result = compile_and_run_bounded(&c_code, &input, 20).expect("scanner must terminate");
+    assert_eq!(result.trim(), "100000");
+}
+
+#[test]
+fn test_unput_then_rescan_across_the_buffer_front() {
+    // unput() at the front of the buffer shifts everything right; every cursor
+    // has to move with its data.
+    let lex_input = r#"%option noinput
+%%
+abc     { printf("<abc>"); unput('z'); unput('y'); }
+[a-z]   { printf("(%s)", yytext); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // "yz" is pushed back in reverse, so it is rescanned as y then z.
+    let result = compile_and_run(&c_code, "abc\n").unwrap();
+    assert_eq!(result, "<abc>(y)(z)");
+}

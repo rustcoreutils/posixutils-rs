@@ -39,11 +39,50 @@ const DEFAULT_PREFIX: &str = ".tmp";
 /// The run of `X`s `mkstemp`/`mkdtemp` replace with random characters.
 const RANDOM: &str = "XXXXXX";
 
+/// The directory for temporaries created without an explicit parent.
+///
+/// `env::temp_dir` honors `$TMPDIR`, which a set-id process must not trust:
+/// letting the caller choose the directory hands them one they own, and with
+/// it the ability to swap the file out from under the privileged program.
+/// glibc suppresses `TMPDIR` under `__libc_enable_secure` for this reason;
+/// Rust's `env::temp_dir` does not, so do it here. `crontab` is the case in
+/// this workspace -- it takes its identity from the real uid and writes into
+/// the cron spool, i.e. it is meant to be installed set-id.
+fn default_temp_dir() -> PathBuf {
+    // SAFETY: these four calls take no arguments and cannot fail.
+    let set_id = unsafe { libc::geteuid() != libc::getuid() || libc::getegid() != libc::getgid() };
+    if set_id {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+/// Reject a name fragment that would move the temporary somewhere else.
+///
+/// `Path::join` lets an absolute fragment replace the whole path, so a prefix
+/// of `/tmp/x-` would silently ignore the requested directory; a relative one
+/// containing `/` would drop the file into a subdirectory. Either breaks the
+/// placement guarantee callers rely on -- `plib::io::write_atomic_mode` needs
+/// the temporary beside its target so the `rename(2)` is atomic.
+fn reject_separator(what: &str, fragment: &OsStr) -> io::Result<()> {
+    if fragment.as_encoded_bytes().contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("temporary file {what} must not contain a path separator"),
+        ));
+    }
+    Ok(())
+}
+
 /// Build a `<dir>/<prefix>XXXXXX<suffix>` template as a mutable C string.
 ///
 /// Returned as a byte vector rather than a `CString` because `mkstemp` and
 /// `mkdtemp` rewrite the template in place.
 fn template(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<Vec<u8>> {
+    reject_separator("prefix", prefix)?;
+    reject_separator("suffix", suffix)?;
+
     let mut name = OsString::with_capacity(prefix.len() + RANDOM.len() + suffix.len());
     name.push(prefix);
     name.push(RANDOM);
@@ -86,6 +125,8 @@ fn make_file(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<(File, Pa
         return Err(io::Error::last_os_error());
     }
 
+    let path = filled_path(template);
+
     // Where mkostemps is unavailable, set the flag afterwards. This leaves a
     // window in which a concurrent fork+exec could inherit the descriptor,
     // which is why the flag is passed at creation time above where it can be.
@@ -100,13 +141,16 @@ fn make_file(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<(File, Pa
         if !ok {
             let err = io::Error::last_os_error();
             unsafe { libc::close(fd) };
+            // mkstemps already created the name; failing out without removing
+            // it would strand a file in the temporary directory for good.
+            let _ = fs::remove_file(&path);
             return Err(err);
         }
     }
 
     // SAFETY: mkstemps returned a fresh descriptor that nothing else owns.
     let file = unsafe { File::from_raw_fd(fd) };
-    Ok((file, filled_path(template)))
+    Ok((file, path))
 }
 
 /// Create a uniquely named directory, returning its path.
@@ -135,7 +179,7 @@ fn make_dir(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<PathBuf> {
 /// The file has no directory entry, so the kernel reclaims it once the last
 /// descriptor closes — no destructor has to run. See the module docs.
 pub fn tempfile() -> io::Result<File> {
-    tempfile_in(std::env::temp_dir())
+    tempfile_in(default_temp_dir())
 }
 
 /// [`tempfile`], in a caller-chosen directory.
@@ -161,9 +205,14 @@ pub fn tempfile_in(dir: impl AsRef<Path>) -> io::Result<File> {
 
     let (file, path) = make_file(dir, OsStr::new(DEFAULT_PREFIX), OsStr::new(""))?;
     // Unlink immediately: from here on the file is reachable only through the
-    // descriptor, which is what makes the cleanup survive a crash.
-    fs::remove_file(&path)?;
-    Ok(file)
+    // descriptor, which is what makes the cleanup survive a crash. Someone
+    // else having removed the entry first reaches the same end state, so it is
+    // not an error.
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(file),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(file),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -285,8 +334,10 @@ impl NamedTempFile {
     /// Rename the file to `path`, giving up ownership of the cleanup.
     ///
     /// `path` must be on the same filesystem, since the rename has to be
-    /// atomic. On failure the temporary is handed back inside the error so the
-    /// caller can retry or let it be cleaned up.
+    /// atomic. **Anything already at `path` is replaced** -- that is the point
+    /// for `plib::io::write_atomic_mode`, but it means this is not a way to
+    /// create a file only if one is absent. On failure the temporary is handed
+    /// back inside the error so the caller can retry or let it be cleaned up.
     pub fn persist(mut self, path: impl AsRef<Path>) -> Result<File, PersistError> {
         match fs::rename(&self.path, path.as_ref()) {
             Ok(()) => {
@@ -390,7 +441,7 @@ impl Builder {
 
     /// Create a temporary directory in the system temporary directory.
     pub fn tempdir(&self) -> io::Result<TempDir> {
-        self.tempdir_in(std::env::temp_dir())
+        self.tempdir_in(default_temp_dir())
     }
 
     /// Create a temporary directory in `dir`.
@@ -401,7 +452,7 @@ impl Builder {
 
     /// Create a named temporary file in the system temporary directory.
     pub fn tempfile(&self) -> io::Result<NamedTempFile> {
-        self.tempfile_in(std::env::temp_dir())
+        self.tempfile_in(default_temp_dir())
     }
 
     /// Create a named temporary file in `dir`.
@@ -590,6 +641,48 @@ mod tests {
         assert_eq!(file.metadata().unwrap().nlink(), 0);
         // Nothing was left behind under the chosen parent.
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_prefix_cannot_escape_the_chosen_directory() {
+        let dir = tempdir().unwrap();
+
+        // Absolute: `Path::join` would otherwise discard `dir` entirely.
+        let err = Builder::new()
+            .prefix("/tmp/ESCAPED-")
+            .tempfile_in(dir.path())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Relative but still a separator: would land in a subdirectory.
+        let err = Builder::new()
+            .prefix("sub/NESTED-")
+            .tempfile_in(dir.path())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = Builder::new()
+            .suffix("/etc/passwd")
+            .tempfile_in(dir.path())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = Builder::new()
+            .prefix("/tmp/ESCAPED-")
+            .tempdir_in(dir.path())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Nothing was created under either candidate location.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn default_dir_follows_tmpdir_only_when_not_set_id() {
+        // The test process is not set-id, so $TMPDIR is honored as usual.
+        assert_eq!(default_temp_dir(), std::env::temp_dir());
+        // And the set-id branch must not be able to pick a caller-named path.
+        assert!(default_temp_dir().is_absolute());
     }
 
     #[test]

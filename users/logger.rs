@@ -107,7 +107,6 @@ fn main() -> ExitCode {
     for msg in &messages {
         plib::syslog::log(level, msg);
     }
-    plib::syslog::close();
 
     ExitCode::SUCCESS
 }

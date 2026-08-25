@@ -164,12 +164,10 @@ fn do_edit(target: &str) -> ! {
         }
     };
     if let Err(e) = tmp.write_all(current.as_bytes()).and_then(|()| tmp.flush()) {
-        diag_error(&format!(
-            "{}: {}",
-            gettext("cannot write temporary file"),
-            e
-        ));
-        exit(1);
+        bail_edit(
+            tmp,
+            format!("{}: {}", gettext("cannot write temporary file"), e),
+        );
     }
     let tmp_path = tmp.path().to_path_buf();
 
@@ -183,23 +181,36 @@ fn do_edit(target: &str) -> ! {
 
     match cmd.status() {
         Ok(status) if status.success() => {}
-        Ok(_) => {
-            diag_error(&gettext("editor exited with an error; crontab unchanged"));
-            exit(1);
-        }
-        Err(e) => {
-            diag_error(&format!("{}: {}", gettext("cannot launch editor"), e));
-            exit(1);
-        }
+        Ok(_) => bail_edit(
+            tmp,
+            gettext("editor exited with an error; crontab unchanged"),
+        ),
+        Err(e) => bail_edit(tmp, format!("{}: {}", gettext("cannot launch editor"), e)),
     }
 
     match fs::read_to_string(&tmp_path) {
-        Ok(edited) => install_crontab(target, &edited),
-        Err(e) => {
-            diag_error(&format!("{}: {}", gettext("cannot read edited crontab"), e));
-            exit(1);
+        Ok(edited) => {
+            // Remove the edit buffer before handing off: install_crontab
+            // never returns, so nothing would drop it afterwards.
+            drop(tmp);
+            install_crontab(target, &edited)
         }
+        Err(e) => bail_edit(
+            tmp,
+            format!("{}: {}", gettext("cannot read edited crontab"), e),
+        ),
     }
+}
+
+/// Report `msg` and exit 1, removing the edit buffer on the way out.
+///
+/// `exit` does not run destructors, so every failure path in `do_edit` has to
+/// drop the temporary explicitly; otherwise each `crontab -e` would leave a
+/// copy of the user's crontab behind in the temporary directory.
+fn bail_edit(tmp: plib::tmp::NamedTempFile, msg: String) -> ! {
+    drop(tmp);
+    diag_error(&msg);
+    exit(1);
 }
 
 /// Emit a diagnostic to standard error with the `crontab:` prefix (audit #C3).

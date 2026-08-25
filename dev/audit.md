@@ -153,16 +153,23 @@ them, so a dead rule can still contribute a conflict to the reported counts.
 The generated parser is unaffected (the rules can never reduce) and grammars
 with no useless non-terminals — including `python39.y` — agree exactly.
 
-Three further defects from the same review are **open**, deliberately left out
-of scope:
+Two more from the same review were folded in afterwards:
 
-- **`yytname` is indexed with a dense terminal index** but emitted in raw
-  symbol-id order, so `-t` debug output prints the wrong symbol names.
+| # | Site | Defect | Severity |
+|---|---|---|---|
+| #Y10 | `codegen.rs` `generate_debug_tables` | `yytname` was emitted in raw symbol-id order, non-terminals interleaved, but every `-t` debug site indexes it with the dense terminal index `yytranslate` yields. Reading `NUM` printed `$accept`; reading `'+'` printed `NUM`. Now emitted in internal symbol order — terminals by dense index, then non-terminals — which is also the numbering `yyr1` stores, so `yytname[yyr1[n]]` names the LHS. The existing `-t` tests only grepped the generated source, which is why this survived them; the new test runs a parser with `yydebug=1` and reads the trace. | Minor |
+| #Y11 | `grammar.rs` token declarations | The `1..=255` range check reached literals in rule bodies but not literals declared with `%token`/`%left`/`%right`/`%nonassoc`, which reach the symbol table by name. `%left '€'` was accepted with token number 8364 and an 8 KB `yytranslate` keyed on a value a byte-oriented `yylex` can never return. Both paths now share one `check_char_literal_range`. Note audit #12 above closed only the rule-position path. | Minor |
+
+One defect from that review is still **open**:
+
 - **`$` substitution runs inside C string literals and comments** —
   `printf("costs $1")` in an action is rewritten to `printf("costs (yyvsp[0])")`.
-- **Character literals in `%token`/`%left`/… declarations skip the `1..=255`
-  range check** that rule-position literals get (audit #12 above closed only
-  the rule-position path), so `%left '€'` yields an 8 KB `yytranslate`.
+  `transform_action` re-scans the action text with no string/comment state,
+  although the lexer tracked exactly that in `read_action`.
+
+Known diagnostic wart, not tracked as a defect: the character-literal range
+error reports line 0, because `TokenDecl` and the rule-body symbol path carry
+no line. The message names the offending literal and codepoint.
 
 ### Priority issues
 

@@ -31,6 +31,36 @@ fn grammar_error_at(line: usize, msg: String) -> YaccError {
     YaccError::Grammar(msg)
 }
 
+/// The `char` a `'c'`-style symbol name stands for, if it is one.
+fn char_literal_of(name: &str) -> Option<char> {
+    let inner = name.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut chars = inner.chars();
+    let c = chars.next()?;
+    chars.next().is_none().then_some(c)
+}
+
+/// POSIX RATIONALE 124342-6: multi-byte characters should be returned as tokens
+/// by the lexical analyzer, not written as multi-byte character literals. A
+/// literal's codepoint must therefore fit in a single byte (1..=255); 0 (NUL) is
+/// reserved for end-of-input, and POSIX 123781 forbids it outright.
+///
+/// Both places a literal can appear -- a rule body and a
+/// `%token`/`%left`/`%right`/`%nonassoc` declaration -- go through here, so
+/// they cannot diverge.
+fn check_char_literal_range(c: char) -> Result<(), YaccError> {
+    let cp = c as u32;
+    if (1..=255).contains(&cp) {
+        return Ok(());
+    }
+    Err(grammar_error(format!(
+        "{} '{}' (U+{:04X}) {}",
+        gettext("character literal"),
+        c,
+        cp,
+        gettext("is out of range; only single-byte characters 1..=255 are allowed")
+    )))
+}
+
 /// Index type for symbols
 pub type SymbolId = usize;
 
@@ -211,16 +241,18 @@ impl Grammar {
                 continue;
             }
 
-            let number = token.number.or_else(|| {
-                // Check if it's a character literal (has implicit number)
-                if token.name.starts_with('\'') && token.name.ends_with('\'') {
-                    let chars: Vec<char> = token.name[1..token.name.len() - 1].chars().collect();
-                    if chars.len() == 1 {
-                        return Some(chars[0] as i32);
-                    }
-                }
-                None
-            });
+            // A literal declared with %token/%left/... reaches the symbol
+            // table by name, bypassing the rule-body path, so the range check
+            // has to happen here too. Without it `%left '\u{20AC}'` was accepted
+            // and inflated yytranslate to 8365 entries, keyed on a value a
+            // byte-oriented yylex can never return.
+            let literal = char_literal_of(&token.name);
+            if let Some(c) = literal {
+                check_char_literal_range(c)?;
+            }
+
+            // A character literal's token number is its codepoint.
+            let number = token.number.or_else(|| literal.map(|c| c as i32));
 
             grammar.add_symbol(
                 &token.name,
@@ -608,20 +640,7 @@ impl Grammar {
                 }
             }
             ParsedSymbol::CharLiteral(c) => {
-                // POSIX RATIONALE 124342-6: multi-byte characters should be
-                // returned as tokens by the lexer, not as multi-byte character
-                // literals. A literal codepoint must fit in a single byte
-                // (1..=255); 0 (NUL) is reserved for end-of-input.
-                let cp = *c as u32;
-                if !(1..=255).contains(&cp) {
-                    return Err(grammar_error(format!(
-                        "{} '{}' (U+{:04X}) {}",
-                        gettext("character literal"),
-                        c,
-                        cp,
-                        gettext("is out of range; only single-byte characters 1..=255 are allowed")
-                    )));
-                }
+                check_char_literal_range(*c)?;
                 let name = format!("'{}'", c);
                 if let Some(&id) = self.symbol_map.get(&name) {
                     Ok(id)

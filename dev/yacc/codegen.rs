@@ -863,16 +863,30 @@ fn generate_debug_tables<W: Write>(
     writeln!(w, "#if YYDEBUG")?;
     writeln!(w)?;
 
-    // Token name table - maps internal symbol ID to printable name
-    writeln!(w, "/* Symbol names for debugging */")?;
+    // Token name table, indexed by *internal* symbol number: every terminal in
+    // dense terminal-index order, then every non-terminal. That is the
+    // numbering the parser actually holds -- `yytranslate` yields a dense
+    // terminal index, and `yyr1` stores `YYNTOKENS + nt_idx` -- so both
+    // `yytname[yytok]` and `yytname[yyr1[n]]` are correct.
+    //
+    // Emitting in raw symbol-id order instead put non-terminals in among the
+    // terminals, so every debug trace named the wrong symbol as soon as the
+    // grammar used a character literal.
+    writeln!(
+        w,
+        "/* Symbol names for debugging, in internal symbol order */"
+    )?;
     writeln!(w, "static const char *const {}tname[] =", prefix)?;
     writeln!(w, "{{")?;
 
-    for (id, sym) in grammar.symbols.iter().enumerate() {
-        let name = &sym.name;
+    let internal_order = grammar
+        .term_idx_to_symbol
+        .iter()
+        .chain(grammar.nt_idx_to_symbol.iter());
+    for (idx, &sym_id) in internal_order.enumerate() {
         // Escape special characters in name for C string
-        let escaped = escape_c_string(name);
-        if id > 0 {
+        let escaped = escape_c_string(grammar.symbol_name(sym_id));
+        if idx > 0 {
             writeln!(w, ",")?;
         }
         write!(w, "    \"{}\"", escaped)?;

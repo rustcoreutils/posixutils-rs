@@ -4921,3 +4921,192 @@ line : NUM ;
         output
     );
 }
+
+// ---------------------------------------------------------------------------
+// Debug symbol names and character-literal ranges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_debug_trace_names_symbols_correctly() {
+    // yytname was emitted in raw symbol-id order, with non-terminals in among
+    // the terminals, but every debug site indexes it with the dense terminal
+    // index yytranslate yields. Reading NUM printed "$accept" and reading '+'
+    // printed "NUM". This runs a parser with yydebug=1 and reads the trace --
+    // the existing -t tests only grep the generated source, which is why the
+    // mis-indexing survived them.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+extern int yydebug;
+%}
+
+%token NUM
+
+%%
+line : e ;
+e : e '+' NUM | NUM ;
+%%
+
+int yylval;
+static const char *in = "1+2";
+static int pos;
+
+int yylex(void) {
+    char c = in[pos];
+    if (c == '\0') return 0;
+    pos++;
+    if (c >= '0' && c <= '9') { yylval = c - '0'; return NUM; }
+    return c;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) { yydebug = 1; return yyparse(); }
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(["-t", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc");
+    assert!(
+        output.status.success(),
+        "yacc -t should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let exe = temp_dir.path().join("trace");
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe.to_str().unwrap(),
+            temp_dir.path().join("y.tab.c").to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+    assert!(
+        compile.status.success(),
+        "cc should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("failed to run parser");
+    assert!(run.status.success(), "parser should accept \"1+2\"");
+    let trace = String::from_utf8_lossy(&run.stderr);
+
+    assert!(
+        trace.contains("Reading token NUM"),
+        "NUM must be named NUM in the trace, got:\n{}",
+        trace
+    );
+    assert!(
+        trace.contains("Reading token '+'"),
+        "'+' must be named '+' in the trace, got:\n{}",
+        trace
+    );
+    assert!(
+        !trace.contains("Reading token $accept"),
+        "$accept is a non-terminal and can never be a lookahead, got:\n{}",
+        trace
+    );
+}
+
+#[test]
+fn test_yytname_is_emitted_in_internal_symbol_order() {
+    // The table's order is the contract the debug sites rely on: all terminals
+    // in dense terminal-index order first, then the non-terminals -- which is
+    // also the numbering yyr1 stores, so yytname[yyr1[n]] names the LHS.
+    let grammar = r#"
+%token NUM
+%%
+line : e ;
+e : e '+' NUM | NUM ;
+"#;
+
+    let code = gen_and_read(&["-t"], grammar, "y.tab.c");
+    let table = code
+        .split("yytname[] =")
+        .nth(1)
+        .and_then(|rest| rest.split("};").next())
+        .expect("y.tab.c should contain a yytname table");
+
+    let names: Vec<&str> = table
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').strip_prefix('"'))
+        .filter_map(|l| l.strip_suffix('"'))
+        .collect();
+
+    assert_eq!(
+        names,
+        vec![
+            // terminals, in dense terminal-index order
+            "$end",
+            "error",
+            "$undefined",
+            "NUM",
+            "'+'",
+            // then non-terminals
+            "$accept",
+            "line",
+            "e",
+        ],
+        "yytname must be in internal symbol order"
+    );
+}
+
+#[test]
+fn test_multibyte_char_literal_rejected_in_a_declaration() {
+    // get_or_add_symbol applied the 1..=255 range check to literals in rule
+    // bodies, but a literal declared with %token/%left/... reached the symbol
+    // table by name and skipped it. `%left '\u{20AC}'` was accepted with token
+    // number 8364, inflating yytranslate to 8365 entries keyed on a value a
+    // byte-oriented yylex can never return.
+    for decl in ["%token", "%left", "%right", "%nonassoc"] {
+        let grammar = format!("%token NUM\n{} '\u{20AC}'\n%%\ne : NUM ;\n", decl);
+        let output = run_yacc(&[], &grammar);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "{} '\u{20AC}' must be rejected",
+            decl
+        );
+        assert!(
+            stderr.contains("out of range") && stderr.contains("U+20AC"),
+            "{} should report the offending codepoint, got: {}",
+            decl,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn test_ascii_char_literal_still_accepted_in_a_declaration() {
+    // The check must not disturb the ordinary case, including the token number
+    // a declared literal derives from its codepoint.
+    let grammar = r#"
+%token NUM
+%left '+'
+%%
+e : e '+' e | NUM ;
+"#;
+
+    run_yacc_both_modes(&[], grammar);
+
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+    assert!(
+        code.contains("#define YYTRANSLATE_SIZE 258"),
+        "a byte-range literal must not inflate yytranslate, got: {:?}",
+        code.lines().find(|l| l.contains("YYTRANSLATE_SIZE"))
+    );
+}

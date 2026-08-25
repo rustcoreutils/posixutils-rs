@@ -39,6 +39,15 @@ const DEFAULT_PREFIX: &str = ".tmp";
 /// The run of `X`s `mkstemp`/`mkdtemp` replace with random characters.
 const RANDOM: &str = "XXXXXX";
 
+/// Where a set-id process puts temporaries, ignoring the environment.
+const SECURE_TEMP_DIR: &str = "/tmp";
+
+/// Whether the process runs with privileges its real user does not have.
+fn is_set_id() -> bool {
+    // SAFETY: these four calls take no arguments and cannot fail.
+    unsafe { libc::geteuid() != libc::getuid() || libc::getegid() != libc::getgid() }
+}
+
 /// The directory for temporaries created without an explicit parent.
 ///
 /// `env::temp_dir` honors `$TMPDIR`, which a set-id process must not trust:
@@ -48,14 +57,20 @@ const RANDOM: &str = "XXXXXX";
 /// Rust's `env::temp_dir` does not, so do it here. `crontab` is the case in
 /// this workspace -- it takes its identity from the real uid and writes into
 /// the cron spool, i.e. it is meant to be installed set-id.
-fn default_temp_dir() -> PathBuf {
-    // SAFETY: these four calls take no arguments and cannot fail.
-    let set_id = unsafe { libc::geteuid() != libc::getuid() || libc::getegid() != libc::getgid() };
+///
+/// Split from [`is_set_id`] so the privileged branch can be asserted without
+/// the test having to be set-id itself.
+fn temp_dir_for(set_id: bool) -> PathBuf {
     if set_id {
-        PathBuf::from("/tmp")
+        PathBuf::from(SECURE_TEMP_DIR)
     } else {
         std::env::temp_dir()
     }
+}
+
+/// [`temp_dir_for`], for this process.
+fn default_temp_dir() -> PathBuf {
+    temp_dir_for(is_set_id())
 }
 
 /// Reject a name fragment that would move the temporary somewhere else.
@@ -678,11 +693,25 @@ mod tests {
     }
 
     #[test]
-    fn default_dir_follows_tmpdir_only_when_not_set_id() {
-        // The test process is not set-id, so $TMPDIR is honored as usual.
+    fn a_set_id_process_ignores_tmpdir() {
+        // The security property: under set-id the directory is a fixed path,
+        // so nothing the caller puts in the environment can steer a privileged
+        // temporary into a directory they control. Asserted through the
+        // parameter rather than the process, which a test cannot make set-id.
+        assert_eq!(temp_dir_for(true), Path::new(SECURE_TEMP_DIR));
+    }
+
+    #[test]
+    fn an_ordinary_process_honors_tmpdir() {
+        assert_eq!(temp_dir_for(false), std::env::temp_dir());
+    }
+
+    #[test]
+    fn this_test_process_is_not_set_id() {
+        // Guards the assumption the rest of these tests rest on: they create
+        // temporaries under $TMPDIR via the non-set-id branch.
+        assert!(!is_set_id());
         assert_eq!(default_temp_dir(), std::env::temp_dir());
-        // And the set-id branch must not be able to pick a caller-named path.
-        assert!(default_temp_dir().is_absolute());
     }
 
     #[test]

@@ -617,17 +617,24 @@ impl Grammar {
             }
         }
 
-        // `$accept` is non-productive exactly when the start symbol is, so
-        // naming it would bury the user's non-terminal behind a synthetic one.
-        for (id, sym) in self.symbols.iter().enumerate() {
-            if !sym.is_terminal && !productive[id] && id != AUGMENTED_START {
-                return Err(grammar_error(format!(
-                    "{} '{}' {}",
-                    gettext("non-terminal"),
-                    sym.name,
-                    gettext("derives no string of tokens")
-                )));
-            }
+        // Report every offender: one non-productive non-terminal makes each of
+        // its users non-productive too, so naming only the first would often
+        // name a symptom rather than the cause. `$accept` is excluded -- it is
+        // non-productive exactly when the start symbol is, and it is synthetic.
+        let dead: Vec<String> = self
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|&(id, sym)| !sym.is_terminal && !productive[id] && id != AUGMENTED_START)
+            .map(|(_, sym)| format!("'{}'", sym.name))
+            .collect();
+
+        if !dead.is_empty() {
+            return Err(grammar_error(format!(
+                "{}: {}",
+                gettext("non-terminals that derive no string of tokens"),
+                dead.join(", ")
+            )));
         }
 
         Ok(())

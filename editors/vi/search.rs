@@ -188,7 +188,15 @@ impl SearchState {
                 // `<=`, not `<`: an empty line has search_start == len == 0,
                 // and a pattern like `^$` matches exactly there.
                 if search_start <= content.len() {
-                    if let Some(mat) = regex.find(&content[search_start..]) {
+                    // Past the start of the line the slice's first byte is not
+                    // a beginning of line, so `^` must not match there -- the
+                    // same rule `captures_at` needs, and for the same reason.
+                    let found = if search_start == 0 {
+                        regex.find(&content[search_start..])
+                    } else {
+                        regex.find_notbol(&content[search_start..])
+                    };
+                    if let Some(mat) = found {
                         return Ok(Position::new(line_num, search_start + mat.start));
                     }
                 }
@@ -266,7 +274,8 @@ impl SearchState {
                 let content = line.content();
                 let search_start = next_char_boundary(content, start_col).unwrap_or(content.len());
                 if search_start < content.len() {
-                    if let Some(pos) = find_last_match(regex, &content[search_start..]) {
+                    // As above: this slice does not begin a line.
+                    if let Some(pos) = find_last_match_notbol(regex, &content[search_start..]) {
                         return Ok(Position::new(start_line, search_start + pos));
                     }
                 }
@@ -311,6 +320,38 @@ fn find_last_match(regex: &Regex, text: &str) -> Option<usize> {
     let mut last_pos = None;
     for mat in regex.find_iter(text) {
         last_pos = Some(mat.start);
+    }
+    last_pos
+}
+
+/// As [`find_last_match`], for a slice that does not begin a line: `^` must
+/// not match at its start.
+///
+/// There is no NOTBOL form of `find_iter`, so walk the slice by hand -- every
+/// step searches a remainder, which is never a beginning of line.
+fn find_last_match_notbol(regex: &Regex, text: &str) -> Option<usize> {
+    let mut last_pos = None;
+    let mut offset = 0usize;
+    while offset <= text.len() {
+        let Some(mat) = regex.find_notbol(&text[offset..]) else {
+            break;
+        };
+        let abs = offset + mat.start;
+        last_pos = Some(abs);
+        // Advance past this match, keeping `offset` on a character boundary so
+        // the next slice is valid; an empty match advances by one character.
+        let next = if mat.end > mat.start {
+            offset + mat.end
+        } else {
+            match text[abs..].chars().next() {
+                Some(c) => abs + c.len_utf8(),
+                None => break,
+            }
+        };
+        if next <= offset {
+            break;
+        }
+        offset = next;
     }
     last_pos
 }

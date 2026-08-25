@@ -366,6 +366,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build rules in the format expected by NFA with trailing context support
     // This tracks main pattern end states for variable-length trailing context
+    // Each rule records the conditions it is active in, so the NFA can make it
+    // reachable only from those conditions' roots.
     let nfa_rules: Vec<nfa::NfaRule> = rules
         .iter()
         .map(|r| nfa::NfaRule {
@@ -373,12 +375,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             trailing: r.trailing_context.clone(),
             index: r.index,
             bol_anchor: r.bol_anchor,
+            active_conditions: start_conditions
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| {
+                    lexfile::is_rule_active_in_condition(&lexinfo.rules[r.index], name, &lexinfo)
+                })
+                .map(|(idx, _)| idx)
+                .collect(),
         })
         .collect();
 
     // Build NFA from rules using Thompson's construction
     // This version properly tracks main pattern end states for trailing context
-    let nfa = Nfa::from_rules(&nfa_rules)?;
+    let nfa = Nfa::from_rules(&nfa_rules, start_conditions.len())?;
 
     // Convert NFA to DFA using subset construction
     let dfa = Dfa::from_nfa(&nfa);
@@ -407,12 +417,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let Some(tc_hir) = r.trailing_context.clone() else {
             continue;
         };
-        let tc_nfa = Nfa::from_rules(&[nfa::NfaRule {
-            main: tc_hir,
-            trailing: None,
-            index: 0,
-            bol_anchor: false,
-        }])?;
+        let tc_nfa = Nfa::from_rules(
+            &[nfa::NfaRule {
+                main: tc_hir,
+                trailing: None,
+                index: 0,
+                bol_anchor: false,
+                active_conditions: vec![0],
+            }],
+            1,
+        )?;
         // Share the scanner's equivalence classes so the emitted matcher can
         // be driven from the same yy_ec table. They come from the combined
         // automaton, which contains these very transitions, so they are at
@@ -480,7 +494,7 @@ mod tests {
             .iter()
             .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
-        let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
+        let nfa = Nfa::from_rules(&nfa_rules, 1).expect("Failed to build NFA");
         assert!(!nfa.states.is_empty());
 
         let dfa = Dfa::from_nfa(&nfa);
@@ -505,7 +519,7 @@ mod tests {
             .iter()
             .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
-        let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
+        let nfa = Nfa::from_rules(&nfa_rules, 1).expect("Failed to build NFA");
         let dfa = Dfa::from_nfa(&nfa);
         let minimized = dfa.minimize();
 
@@ -528,7 +542,7 @@ mod tests {
             .iter()
             .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
-        let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
+        let nfa = Nfa::from_rules(&nfa_rules, 1).expect("Failed to build NFA");
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut output = Vec::new();

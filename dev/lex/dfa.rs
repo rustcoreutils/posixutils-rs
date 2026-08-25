@@ -53,18 +53,27 @@ impl DfaState {
     }
 }
 
+/// The pair of DFA entry states belonging to one start condition.
+#[derive(Debug, Clone, Copy)]
+pub struct StartStates {
+    /// Entered when not at the beginning of a line.
+    pub plain: usize,
+    /// Entered at the beginning of a line.
+    pub bol: usize,
+}
+
 /// The complete DFA
 #[derive(Debug)]
 pub struct Dfa {
     /// All states in the DFA
     pub states: Vec<DfaState>,
-    /// The start state used when not at the beginning of a line (always 0)
-    pub start: usize,
-    /// The start state used at the beginning of a line.
+    /// Entry states for each start condition, indexed by condition number.
     ///
-    /// Equal to `start` when no rule is '^'-anchored, in which case the two
-    /// roots have the same epsilon closure and collapse to one state.
-    pub bol_start: usize,
+    /// Entries collapse whenever their roots have the same epsilon closure --
+    /// with no '^'-anchored rule, `plain` and `bol` are the same state; with
+    /// one inclusive condition whose active rules match INITIAL's, the two
+    /// conditions share states outright.
+    pub starts: Vec<StartStates>,
     /// Character equivalence classes for table compression
     pub char_classes: CharClasses,
 }
@@ -224,8 +233,7 @@ impl Dfa {
     pub fn from_nfa_with_classes(nfa: &Nfa, char_classes: CharClasses) -> Self {
         let mut dfa = Dfa {
             states: Vec::new(),
-            start: 0,
-            bol_start: 0,
+            starts: Vec::with_capacity(nfa.starts.len()),
             char_classes,
         };
 
@@ -235,9 +243,9 @@ impl Dfa {
         // Worklist of DFA states to process
         let mut worklist: Vec<BTreeSet<usize>> = Vec::new();
 
-        // Seed one DFA state per NFA root. With no '^'-anchored rule the two
-        // roots have the same epsilon closure, so state_map collapses them and
-        // bol_start == start.
+        // Seed one DFA state per NFA root. Roots with the same epsilon closure
+        // collapse here, so an unanchored spec or a condition indistinguishable
+        // from INITIAL costs nothing.
         let seed = |dfa: &mut Dfa,
                     state_map: &mut HashMap<BTreeSet<usize>, usize>,
                     worklist: &mut Vec<BTreeSet<usize>>,
@@ -257,8 +265,11 @@ impl Dfa {
             idx
         };
 
-        dfa.start = seed(&mut dfa, &mut state_map, &mut worklist, nfa.start);
-        dfa.bol_start = seed(&mut dfa, &mut state_map, &mut worklist, nfa.bol_start);
+        for roots in &nfa.starts {
+            let plain = seed(&mut dfa, &mut state_map, &mut worklist, roots.plain);
+            let bol = seed(&mut dfa, &mut state_map, &mut worklist, roots.bol);
+            dfa.starts.push(StartStates { plain, bol });
+        }
 
         // Every byte in a class behaves identically, so one representative
         // drives the NFA for the whole class.
@@ -316,8 +327,7 @@ impl Dfa {
         if self.states.is_empty() {
             return Dfa {
                 states: Vec::new(),
-                start: 0,
-                bol_start: 0,
+                starts: Vec::new(),
                 char_classes: self.char_classes.clone(),
             };
         }
@@ -405,7 +415,8 @@ impl Dfa {
         let mut partition_to_new_state: Vec<usize> = vec![0; partitions.len()];
 
         // Find new start state
-        let new_start_partition = state_to_partition[self.start];
+        // INITIAL's non-BOL entry becomes state 0; the rest follow.
+        let new_start_partition = state_to_partition[self.starts[0].plain];
 
         // Reorder so start state is 0
         let mut new_idx = 0;
@@ -448,10 +459,16 @@ impl Dfa {
         // which bytes an automaton can tell apart, so they carry over as-is.
         Dfa {
             states: new_states,
-            start: 0,
-            // The beginning-of-line root is an entry point too, so it has to
-            // follow the same partition remap as every transition target.
-            bol_start: partition_to_new_state[state_to_partition[self.bol_start]],
+            // Entry states are entry points, not transition targets, so they
+            // need the same partition remap applied explicitly.
+            starts: self
+                .starts
+                .iter()
+                .map(|s| StartStates {
+                    plain: partition_to_new_state[state_to_partition[s.plain]],
+                    bol: partition_to_new_state[state_to_partition[s.bol]],
+                })
+                .collect(),
             char_classes: self.char_classes.clone(),
         }
     }
@@ -495,7 +512,7 @@ mod tests {
     #[test]
     fn test_simple_dfa() {
         let hir = parse_regex("ab");
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Should have states for: start, after-a, after-ab (accepting)
@@ -514,17 +531,17 @@ mod tests {
     #[test]
     fn test_alternation_dfa() {
         let hir = parse_regex("a|b");
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Both 'a' and 'b' should lead to accepting states
-        if let Some(&target) = dfa.states[dfa.start]
+        if let Some(&target) = dfa.states[dfa.starts[0].plain]
             .transitions
             .get(&dfa.char_classes.class_of_byte(b'a'))
         {
             assert!(dfa.states[target].accepting.is_some());
         }
-        if let Some(&target) = dfa.states[dfa.start]
+        if let Some(&target) = dfa.states[dfa.starts[0].plain]
             .transitions
             .get(&dfa.char_classes.class_of_byte(b'b'))
         {
@@ -535,17 +552,17 @@ mod tests {
     #[test]
     fn test_kleene_star_dfa() {
         let hir = parse_regex("a*");
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Start state should be accepting (matches empty string)
-        assert!(dfa.states[dfa.start].accepting.is_some());
+        assert!(dfa.states[dfa.starts[0].plain].accepting.is_some());
     }
 
     #[test]
     fn test_minimization() {
         let hir = parse_regex("a|b");
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
         let minimized = dfa.minimize();
 
@@ -557,11 +574,11 @@ mod tests {
     fn test_multiple_rules_priority() {
         let hir1 = parse_regex("if");
         let hir2 = parse_regex("[a-z]+");
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir1, 0), NfaRule::plain(hir2, 1)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir1, 0), NfaRule::plain(hir2, 1)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         // Navigate through "if"
-        let state_after_i = dfa.states[dfa.start]
+        let state_after_i = dfa.states[dfa.starts[0].plain]
             .transitions
             .get(&dfa.char_classes.class_of_byte(b'i'))
             .copied();

@@ -997,6 +997,24 @@ pub fn parse(input: &[String]) -> Result<LexInfo, String> {
     Ok(lexinfo)
 }
 
+/// Check if a rule is active in a given start condition
+pub fn is_rule_active_in_condition(rule: &LexRule, condition: &str, lexinfo: &LexInfo) -> bool {
+    // If rule has explicit start conditions, check if this condition is listed
+    if !rule.start_conditions.is_empty() {
+        return rule.start_conditions.contains(&condition.to_string());
+    }
+
+    // Rule has no explicit conditions
+    // For INITIAL or %s (inclusive) conditions, the rule is active
+    // For %x (exclusive) conditions, the rule is NOT active
+    if condition == "INITIAL" || lexinfo.cond_start.contains(&condition.to_string()) {
+        return true;
+    }
+
+    // This is an exclusive condition (%x), and rule has no explicit conditions
+    false
+}
+
 #[cfg(test)]
 mod lextest {
     use super::*;

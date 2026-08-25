@@ -468,8 +468,18 @@ fn test_start_condition_code_generation() {
     // Check for YY_START macro
     assert!(c_code.contains("#define YY_START"));
 
-    // Check for rule condition table (since we have multiple conditions)
-    assert!(c_code.contains("yy_rule_cond"));
+    // Start conditions are resolved by which automaton the scanner enters, so
+    // there is a per-condition entry dispatch and no accept-time rule/condition
+    // table to consult.
+    assert!(
+        c_code.contains("switch (yy_start_state * 2 + (yy_at_bol ? 1 : 0))"),
+        "expected a per-condition entry dispatch: {}",
+        c_code
+    );
+    assert!(
+        !c_code.contains("yy_rule_cond"),
+        "the accept-time condition filter should be gone"
+    );
 }
 
 // REJECT tests

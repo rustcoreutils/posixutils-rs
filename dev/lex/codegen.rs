@@ -146,9 +146,9 @@ impl FeatureFlags {
             }
         }
 
-        // '^' is resolved by the automaton's shape now, so anchoring alone
-        // no longer needs a per-state accept list.
-        let needs_accept_lists = has_reject || has_start_conditions;
+        // Anchoring and start conditions are both resolved by the automaton's
+        // shape now, so only REJECT still needs per-state accept lists.
+        let needs_accept_lists = has_reject;
 
         FeatureFlags {
             has_reject,
@@ -187,7 +187,6 @@ pub fn generate<W: Write>(
         write_accepting_list_table(output, dfa)?;
     }
     write_trailing_context_matchers(output, dfa, config)?;
-    write_rule_condition_table(output, lexinfo, config, &flags)?;
     write_rule_metadata_tables(output, lexinfo, config, &flags)?;
     write_main_pattern_end_table(output, dfa, config)?;
     write_helper_functions(output, lexinfo)?;
@@ -522,72 +521,6 @@ fn write_accepting_list_table<W: Write>(output: &mut W, dfa: &Dfa) -> io::Result
     Ok(())
 }
 
-/// Write a table indicating which rules are active in which start conditions
-fn write_rule_condition_table<W: Write>(
-    output: &mut W,
-    lexinfo: &LexInfo,
-    config: &CodeGenConfig,
-    flags: &FeatureFlags,
-) -> io::Result<()> {
-    // Only generate the table if we have more than just INITIAL
-    if !flags.has_start_conditions {
-        return Ok(());
-    }
-
-    let num_rules = lexinfo.rules.len();
-    let num_conditions = config.start_conditions.len();
-
-    writeln!(output, "/* Rule active-in-condition table */")?;
-    writeln!(
-        output,
-        "/* yy_rule_cond[rule][condition] = 1 if rule is active in that condition */"
-    )?;
-    writeln!(output, "#define YY_NUM_RULES {}", num_rules)?;
-    writeln!(output, "#define YY_NUM_CONDITIONS {}", num_conditions)?;
-    writeln!(
-        output,
-        "static const unsigned char yy_rule_cond[YY_NUM_RULES][YY_NUM_CONDITIONS] = {{"
-    )?;
-
-    for (rule_idx, rule) in lexinfo.rules.iter().enumerate() {
-        write!(output, "    /* rule {} */ {{ ", rule_idx)?;
-        for (cond_idx, cond_name) in config.start_conditions.iter().enumerate() {
-            let active = is_rule_active_in_condition(rule, cond_name, lexinfo);
-            if cond_idx > 0 {
-                write!(output, ", ")?;
-            }
-            write!(output, "{}", if active { 1 } else { 0 })?;
-        }
-        writeln!(output, " }},")?;
-    }
-
-    writeln!(output, "}};\n")?;
-
-    Ok(())
-}
-
-/// Check if a rule is active in a given start condition
-fn is_rule_active_in_condition(
-    rule: &crate::lexfile::LexRule,
-    condition: &str,
-    lexinfo: &LexInfo,
-) -> bool {
-    // If rule has explicit start conditions, check if this condition is listed
-    if !rule.start_conditions.is_empty() {
-        return rule.start_conditions.contains(&condition.to_string());
-    }
-
-    // Rule has no explicit conditions
-    // For INITIAL or %s (inclusive) conditions, the rule is active
-    // For %x (exclusive) conditions, the rule is NOT active
-    if condition == "INITIAL" || lexinfo.cond_start.contains(&condition.to_string()) {
-        return true;
-    }
-
-    // This is an exclusive condition (%x), and rule has no explicit conditions
-    false
-}
-
 /// Write rule metadata tables for BOL anchoring and trailing context
 fn write_rule_metadata_tables<W: Write>(
     output: &mut W,
@@ -601,7 +534,7 @@ fn write_rule_metadata_tables<W: Write>(
     }
 
     // Define YY_NUM_RULES if needed for BOL or trailing context checks
-    if flags.has_trailing_context && !flags.has_start_conditions {
+    if flags.has_trailing_context {
         writeln!(output, "#ifndef YY_NUM_RULES")?;
         writeln!(output, "#define YY_NUM_RULES {}", num_rules)?;
         writeln!(output, "#endif\n")?;
@@ -931,7 +864,7 @@ fn write_trailing_context_matchers<W: Write>(
         writeln!(output, " }};")?;
 
         writeln!(output, "    const unsigned char *p;")?;
-        writeln!(output, "    int st = {};", tc.start)?;
+        writeln!(output, "    int st = {};", tc.starts[0].plain)?;
         writeln!(output, "    for (p = from; p < to; ++p) {{")?;
         writeln!(output, "        st = yy_tc_trans[st][yy_ec[*p]];")?;
         writeln!(output, "        if (st < 0) return 0;")?;
@@ -1135,75 +1068,20 @@ fn write_dfa_state<W: Write>(
     // When start conditions are in use, only update YYMARKER if the rule is valid
     // for the current start condition. This prevents incorrect backtracking.
     if let Some(accepting_rule) = state.accepting {
-        if flags.has_start_conditions {
-            if state.accepting_rules.len() == 1 {
-                // Optimized path: single accepting rule - no loop needed
-                let rule = state.accepting_rules[0];
-                writeln!(output, "    /* Single accepting rule {} */", rule)?;
-                writeln!(output, "    if (yy_rule_cond[{}][yy_start_state]) {{", rule)?;
-                writeln!(output, "        YYMARKER = YYCURSOR;")?;
-                writeln!(output, "        yyaccept = {};", rule)?;
-                writeln!(output, "        yy_full_match_state = {};", state_idx)?;
-
-                // Push to REJECT history stack for shorter match fallback
-                if flags.has_reject {
-                    write_reject_push(output, "        ", state_idx)?;
-                }
-
-                writeln!(output, "    }}")?;
-            } else {
-                // Multiple accepting rules - use if-else chain
-                writeln!(
-                    output,
-                    "    /* Accepting state - checking start condition validity */"
-                )?;
-                writeln!(output, "    {{")?;
-                writeln!(output, "        int yy_valid_rule = -1;")?;
-
-                // Check each accepting rule by priority (accepting_rules is sorted by rule index)
-                // Use if-else chain: once a valid rule is found, skip remaining checks
-                let mut first_rule = true;
-                for &r in &state.accepting_rules {
-                    if first_rule {
-                        writeln!(
-                            output,
-                            "        if (yy_rule_cond[{}][yy_start_state]) yy_valid_rule = {};",
-                            r, r
-                        )?;
-                        first_rule = false;
-                    } else {
-                        writeln!(
-                            output,
-                            "        else if (yy_rule_cond[{}][yy_start_state]) yy_valid_rule = {};",
-                            r, r
-                        )?;
-                    }
-                }
-
-                writeln!(output, "        if (yy_valid_rule >= 0) {{")?;
-                writeln!(output, "            YYMARKER = YYCURSOR;")?;
-                writeln!(output, "            yyaccept = yy_valid_rule;")?;
-                writeln!(output, "            yy_full_match_state = {};", state_idx)?;
-
-                // Push to REJECT history stack for shorter match fallback (inside conditional)
-                if flags.has_reject {
-                    write_reject_push(output, "            ", state_idx)?;
-                }
-
-                writeln!(output, "        }}")?;
-                writeln!(output, "    }}")?;
-            }
-        } else {
-            // No start conditions - use original unconditional behavior
-            let rule = accepting_rule;
-            writeln!(output, "    /* Accepting state for rule {} */", rule)?;
-            writeln!(output, "    YYMARKER = YYCURSOR;")?;
-            writeln!(output, "    yyaccept = {};", rule)?;
-            writeln!(output, "    yy_full_match_state = {};", state_idx)?;
-            // Push to REJECT history stack for shorter match fallback
-            if flags.has_reject {
-                write_reject_push(output, "    ", state_idx)?;
-            }
+        // Every rule reachable here is active in this state's start condition
+        // and allowed at this line position, so the longest match is recorded
+        // unconditionally: there is no predicate left to check.
+        writeln!(
+            output,
+            "    /* Accepting state for rule {} */",
+            accepting_rule
+        )?;
+        writeln!(output, "    YYMARKER = YYCURSOR;")?;
+        writeln!(output, "    yyaccept = {};", accepting_rule)?;
+        writeln!(output, "    yy_full_match_state = {};", state_idx)?;
+        // Push to REJECT history stack for shorter match fallback
+        if flags.has_reject {
+            write_reject_push(output, "    ", state_idx)?;
         }
     }
 
@@ -1279,7 +1157,6 @@ fn write_yylex_direct_coded<W: Write>(
     flags: &FeatureFlags,
 ) -> io::Result<()> {
     // Use pre-computed flags
-    let has_start_conditions = flags.has_start_conditions;
     let has_trailing_context = flags.has_trailing_context;
     let has_var_tc = flags.has_var_tc;
     let eof_rules = &flags.eof_rules;
@@ -1396,19 +1273,61 @@ fn write_yylex_direct_coded<W: Write>(
     }
     writeln!(output)?;
 
-    // Entry state. Start conditions all share a root and are filtered by
-    // yy_rule_cond at accept time, so the only choice here is which of the two
-    // '^' roots to enter: an anchored rule is reachable solely from the
-    // beginning-of-line automaton, and so cannot match anywhere else.
-    if dfa.bol_start != dfa.start {
+    // Entry state. Both the start condition and '^' are settled by which
+    // automaton we enter: a rule inactive in this condition, or anchored when
+    // we are not at a line start, is simply unreachable from here. Nothing is
+    // left to test after a match.
+    let entries: Vec<usize> = dfa.starts.iter().flat_map(|s| [s.plain, s.bol]).collect();
+    let single_entry = entries.iter().all(|&e| e == entries[0]);
+    if single_entry {
+        // Every condition and both line positions share one root.
+        writeln!(output, "    goto yy_state_{};", entries[0])?;
+    } else if dfa.starts.len() == 1 {
+        // Only INITIAL, so the sole choice is the line position.
         writeln!(output, "    /* '^' rules live only in the BOL automaton */")?;
         writeln!(
             output,
             "    if (yy_at_bol) goto yy_state_{};",
-            dfa.bol_start
+            dfa.starts[0].bol
         )?;
+        writeln!(output, "    goto yy_state_{};", dfa.starts[0].plain)?;
+    } else {
+        writeln!(
+            output,
+            "    /* Entry automaton for (start condition, BOL) */"
+        )?;
+        writeln!(
+            output,
+            "    switch (yy_start_state * 2 + (yy_at_bol ? 1 : 0)) {{"
+        )?;
+        for (cond_idx, start) in dfa.starts.iter().enumerate() {
+            let name = config
+                .start_conditions
+                .get(cond_idx)
+                .map(String::as_str)
+                .unwrap_or("?");
+            writeln!(
+                output,
+                "        case {}: /* {} */ goto yy_state_{};",
+                cond_idx * 2,
+                name,
+                start.plain
+            )?;
+            writeln!(
+                output,
+                "        case {}: /* {} at BOL */ goto yy_state_{};",
+                cond_idx * 2 + 1,
+                name,
+                start.bol
+            )?;
+        }
+        writeln!(
+            output,
+            "        default: goto yy_state_{};",
+            dfa.starts[0].plain
+        )?;
+        writeln!(output, "    }}")?;
     }
-    writeln!(output, "    goto yy_state_{};", dfa.start)?;
     writeln!(output)?;
 
     // Generate all DFA states
@@ -1652,12 +1571,6 @@ fn write_yylex_direct_coded<W: Write>(
             output,
             "                if (yy_skipping) {{ if (yy_rule == yy_skip_until_after) yy_skipping = 0; continue; }}"
         )?;
-        if has_start_conditions {
-            writeln!(
-                output,
-                "                if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
-            )?;
-        }
         writeln!(output, "                yyaccept = yy_rule;")?;
         writeln!(output, "                yy_found = 1;")?;
         writeln!(output, "                break;")?;
@@ -1700,12 +1613,6 @@ fn write_yylex_direct_coded<W: Write>(
             output,
             "                    int yy_rule = yy_accept_list[yy_i];"
         )?;
-        if has_start_conditions {
-            writeln!(
-                output,
-                "                    if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
-            )?;
-        }
         writeln!(
             output,
             "                    YYMARKER = YYTOKEN + yy_e->offset;"
@@ -1850,83 +1757,6 @@ fn write_yylex_direct_coded<W: Write>(
 
     // Note: Trailing context, yy_more_len, and BOL update moved to AFTER rule selection
     // to ensure they use the finalized yyaccept value (Bug C fix)
-
-    // Start condition and BOL anchor validation
-    if has_start_conditions {
-        writeln!(
-            output,
-            "    /* Validate rule against current start condition and BOL */"
-        )?;
-        // Note: removed yy_validate_rule: label as it was unused (no gotos to it)
-        if has_start_conditions {
-            writeln!(
-                output,
-                "    if (yyaccept >= 0 && !yy_rule_cond[yyaccept][yy_start_state]) {{"
-            )?;
-            writeln!(
-                output,
-                "        /* Rule not valid in current start condition */"
-            )?;
-            writeln!(output, "        goto yy_try_alternate_rule;")?;
-            writeln!(output, "    }}")?;
-        }
-        writeln!(output, "    goto yy_execute_action;")?;
-        writeln!(output)?;
-
-        // Try alternate rule (find next rule in accepting list)
-        writeln!(output, "yy_try_alternate_rule:")?;
-        writeln!(output, "    {{")?;
-        writeln!(
-            output,
-            "        /* Find next valid rule at this position */"
-        )?;
-        writeln!(output, "        int yy_found = 0;")?;
-        writeln!(output, "        int yy_i;")?;
-        writeln!(
-            output,
-            "        int yy_start_idx = yy_accept_idx[yy_full_match_state];"
-        )?;
-        writeln!(
-            output,
-            "        int yy_end_idx = yy_accept_idx[yy_full_match_state + 1];"
-        )?;
-        writeln!(output, "        int yy_skip_until_after = yyaccept;")?;
-        writeln!(output, "        int yy_skipping = 1;")?;
-        writeln!(
-            output,
-            "        for (yy_i = yy_start_idx; yy_i < yy_end_idx; yy_i++) {{"
-        )?;
-        writeln!(output, "            int yy_rule = yy_accept_list[yy_i];")?;
-        writeln!(
-            output,
-            "            if (yy_skipping) {{ if (yy_rule == yy_skip_until_after) yy_skipping = 0; continue; }}"
-        )?;
-        if has_start_conditions {
-            writeln!(
-                output,
-                "            if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
-            )?;
-        }
-        writeln!(output, "            yyaccept = yy_rule;")?;
-        writeln!(output, "            yy_found = 1;")?;
-        writeln!(output, "            break;")?;
-        writeln!(output, "        }}")?;
-        writeln!(output, "        if (yy_found) {{")?;
-        writeln!(output, "            goto yy_execute_action;")?;
-        writeln!(output, "        }}")?;
-        writeln!(
-            output,
-            "        /* No valid rule found - do default action (ECHO one char) */"
-        )?;
-        writeln!(output, "        yy_at_bol = (*YYTOKEN == '\\n');")?;
-        writeln!(output, "        putc(*YYTOKEN++, yyout);")?;
-        writeln!(output, "        YYCURSOR = YYTOKEN;")?;
-        writeln!(output, "        goto yy_scan;")?;
-        writeln!(output, "    }}")?;
-        writeln!(output)?;
-
-        writeln!(output, "yy_execute_action:")?;
-    }
 
     // Handle trailing context AFTER rule selection is finalized (Bug C fix)
     // This ensures we use the correct yyaccept value even after alternate rule selection
@@ -2218,7 +2048,7 @@ mod tests {
     #[test]
     fn test_generate_simple_lexer() {
         let hir = regex_syntax::parse("a").unwrap();
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2247,7 +2077,7 @@ mod tests {
     #[test]
     fn test_generate_with_bol_anchor() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2283,7 +2113,7 @@ mod tests {
     #[test]
     fn test_generate_with_start_conditions() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();
@@ -2321,7 +2151,7 @@ mod tests {
     #[test]
     fn test_generate_with_trailing_context() {
         let hir = regex_syntax::parse("foo").unwrap();
-        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)]).unwrap();
+        let nfa = Nfa::from_rules(&[NfaRule::plain(hir, 0)], 1).unwrap();
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut lexinfo = create_test_lexinfo();

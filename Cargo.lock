@@ -1010,7 +1010,6 @@ name = "posixutils-dev"
 version = "0.8.0"
 dependencies = [
  "ar",
- "chrono",
  "clap",
  "gettext-rs",
  "libc",
@@ -1241,7 +1240,6 @@ version = "0.8.0"
 dependencies = [
  "chrono",
  "clap",
- "diff",
  "gettext-rs",
  "libc",
  "plib",

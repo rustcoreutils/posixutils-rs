@@ -26,6 +26,11 @@ use std::sync::OnceLock;
 pub struct Facility(c_int);
 
 impl Facility {
+    /// `LOG_KERN` is 0, and libc's `openlog` only records a non-zero facility,
+    /// so a message sent under this one is filed as `LOG_USER` instead. That
+    /// is a property of `syslog(3)`, not of this wrapper: the kernel facility
+    /// is not reachable from user space through it. Accepted so that
+    /// `logger -p kern.<level>` is not rejected outright.
     pub const KERN: Facility = Facility(libc::LOG_KERN);
     pub const USER: Facility = Facility(libc::LOG_USER);
     pub const MAIL: Facility = Facility(libc::LOG_MAIL);

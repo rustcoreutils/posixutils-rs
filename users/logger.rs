@@ -101,6 +101,12 @@ fn main() -> ExitCode {
 
     // Default tag is the invoking user's login name; -t overrides it. -i adds
     // the logger PID to each message.
+    //
+    // There is no failure path from here on: syslog(3) neither connects up
+    // front nor reports whether a message was delivered, so an unreachable
+    // logging daemon is indistinguishable from a delivered message and the
+    // exit status stays 0. The previous implementation spoke to /dev/log
+    // itself and could fail at connect time.
     let tag = args.tag.clone().unwrap_or_else(plib::curuser::login_name);
     plib::syslog::open(&tag, args.log_pid, facility);
 

@@ -1327,12 +1327,17 @@ mod macos {
         let mut pids = check_listpid_ret(buffer_size)?;
         let buffer_ptr = pids.as_mut_ptr().cast::<c_void>();
 
+        // Same pathflags as the sizing call above: passing 0 here would ask a
+        // different question than the one just measured, dropping
+        // PROC_LISTPIDSPATH_PATH_IS_VOLUME so that `-c` on a mount point (and
+        // the block-device case) degraded to an exact-pathname match instead
+        // of covering every file on the filesystem.
         let ret = unsafe {
             osx_libproc_bindings::proc_listpidspath(
                 proc_type,
                 proc_type,
                 c_path.as_ptr().cast::<c_char>(),
-                0,
+                pathflags,
                 buffer_ptr,
                 buffer_size,
             )

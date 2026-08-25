@@ -43,9 +43,28 @@ const RANDOM: &str = "XXXXXX";
 const SECURE_TEMP_DIR: &str = "/tmp";
 
 /// Whether the process runs with privileges its real user does not have.
+///
+/// Asks the kernel rather than comparing ids, because a uid/gid comparison
+/// misses the other ways a program becomes privileged: Linux file
+/// capabilities and LSM domain transitions both leave euid == uid while still
+/// setting `AT_SECURE`, and those are exactly the cases where trusting
+/// `$TMPDIR` would be a mistake. This is the flag glibc's
+/// `__libc_enable_secure` reads.
 fn is_set_id() -> bool {
-    // SAFETY: these four calls take no arguments and cannot fail.
-    unsafe { libc::geteuid() != libc::getuid() || libc::getegid() != libc::getgid() }
+    #[cfg(target_os = "linux")]
+    // SAFETY: getauxval takes one integer and reports 0 for an absent entry.
+    unsafe {
+        libc::getauxval(libc::AT_SECURE) != 0
+    }
+
+    // issetugid() answers the same question on the BSDs and macOS, where
+    // glibc's getauxval does not exist.
+    //
+    // SAFETY: issetugid takes no arguments and cannot fail.
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        libc::issetugid() != 0
+    }
 }
 
 /// The directory for temporaries created without an explicit parent.
@@ -299,8 +318,9 @@ impl Drop for TempDir {
 pub struct NamedTempFile {
     path: PathBuf,
     file: Option<File>,
-    /// Set once the file has been renamed into place, so `Drop` leaves it.
-    persisted: bool,
+    /// Set once cleanup has been handed off -- by rename, by an explicit
+    /// removal, or by `keep` -- so `Drop` leaves the path alone.
+    disarmed: bool,
 }
 
 impl NamedTempFile {
@@ -332,6 +352,17 @@ impl NamedTempFile {
         self.file.as_mut().expect("file is taken only by persist")
     }
 
+    /// Give up ownership of the file, returning its path.
+    ///
+    /// The file stays on disk and `Drop` will not touch it. For the case where
+    /// a temporary holds work worth more than the tidiness of removing it --
+    /// `crontab -e` keeps the edit buffer when the editor fails, so the user's
+    /// session is recoverable.
+    pub fn keep(mut self) -> PathBuf {
+        self.disarmed = true;
+        std::mem::take(&mut self.path)
+    }
+
     /// Remove the file now, reporting any failure.
     ///
     /// `Drop` does the same thing but has nowhere to report to, so use this
@@ -342,7 +373,7 @@ impl NamedTempFile {
         // still gets the destructor's attempt.
         drop(self.file.take());
         fs::remove_file(&self.path)?;
-        self.persisted = true;
+        self.disarmed = true;
         Ok(())
     }
 
@@ -356,7 +387,7 @@ impl NamedTempFile {
     pub fn persist(mut self, path: impl AsRef<Path>) -> Result<File, PersistError> {
         match fs::rename(&self.path, path.as_ref()) {
             Ok(()) => {
-                self.persisted = true;
+                self.disarmed = true;
                 Ok(self.file.take().expect("file is taken only by persist"))
             }
             Err(error) => Err(PersistError { error, file: self }),
@@ -384,7 +415,7 @@ impl Write for NamedTempFile {
 
 impl Drop for NamedTempFile {
     fn drop(&mut self) {
-        if !self.persisted {
+        if !self.disarmed {
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -476,7 +507,7 @@ impl Builder {
         Ok(NamedTempFile {
             path,
             file: Some(file),
-            persisted: false,
+            disarmed: false,
         })
     }
 }
@@ -617,6 +648,19 @@ mod tests {
             assert!(flags >= 0, "F_GETFD failed");
             assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC, "fd {fd}");
         }
+    }
+
+    #[test]
+    fn keep_leaves_the_file_behind() {
+        let dir = tempdir().unwrap();
+        let path = {
+            let mut tmp = NamedTempFile::new_in(dir.path()).unwrap();
+            tmp.write_all(b"work in progress").unwrap();
+            tmp.flush().unwrap();
+            tmp.keep()
+        };
+        assert!(path.exists(), "keep must not remove the file");
+        assert_eq!(fs::read(&path).unwrap(), b"work in progress");
     }
 
     #[test]

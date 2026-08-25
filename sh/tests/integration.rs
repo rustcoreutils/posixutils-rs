@@ -2474,7 +2474,15 @@ mod audit_regressions {
     fn bg_reports_a_job_that_has_already_terminated() {
         // Only an already-*running* job is a silent success; a finished job is
         // still an error.
-        expect_clean_failure("set -m\nsleep 0.05 &\nsleep 0.3\nbg %1\n");
+        //
+        // `wait %1`, not a `sleep` long enough to "probably" outlast the job:
+        // whether the job has finished is the entire precondition, so guessing
+        // it from the wall clock makes the test a race. The earlier
+        // `sleep 0.05 & / sleep 0.3` form left a 250 ms margin, which a loaded
+        // macOS runner can exhaust in process startup alone -- the job is then
+        // still Running, `bg` correctly reports success, and the test fails
+        // demanding a non-zero status.
+        expect_clean_failure("set -m\nsleep 0.05 &\nwait %1\nbg %1\n");
     }
 
     #[test]

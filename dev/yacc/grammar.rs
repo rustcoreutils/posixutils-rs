@@ -78,6 +78,14 @@ pub struct Production {
     pub precedence: usize,
     /// Line number in source file
     pub line: usize,
+    /// For a lowered mid-rule action: the enclosing rule's RHS symbols that
+    /// precede the action. `None` for an ordinary production.
+    ///
+    /// A mid-rule action becomes an empty production for a synthetic
+    /// non-terminal, so its own `rhs` says nothing about what `$1`..`$n` mean
+    /// inside it. They refer to the enclosing rule's elements to the left,
+    /// which is what this records.
+    pub mid_rule_prefix: Option<Vec<SymbolId>>,
 }
 
 /// The complete grammar
@@ -293,6 +301,7 @@ impl Grammar {
             action: None,
             precedence: 0,
             line: 0,
+            mid_rule_prefix: None,
         };
         let prod_id = grammar.productions.len();
         grammar.productions.push(augmented_prod);
@@ -506,6 +515,7 @@ impl Grammar {
                         action: Some(code.clone()),
                         precedence: 0,
                         line: rule.line,
+                        mid_rule_prefix: Some(rhs.clone()),
                     };
                     let prod_id = self.productions.len();
                     self.productions.push(mid_prod);
@@ -542,6 +552,7 @@ impl Grammar {
             action: rule.action.clone(),
             precedence,
             line: rule.line,
+            mid_rule_prefix: None,
         };
 
         let prod_id = self.productions.len();

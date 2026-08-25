@@ -4466,3 +4466,110 @@ int main(void) {
 
     run_end_to_end_both_modes(grammar, "error_token_value_slot");
 }
+
+// ---------------------------------------------------------------------------
+// Mid-rule actions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mid_rule_action_reads_values_to_its_left() {
+    // A mid-rule action is lowered to an empty production for a synthetic
+    // non-terminal, and transform_action was handed *that* production's RHS
+    // length (0) to resolve $n against. Every reference therefore landed past
+    // the top of the value stack: `$1` emitted `yyvsp[1]` instead of
+    // `yyvsp[0]`, reading whatever was above the stack. POSIX 123914-15
+    // requires the action to reach values to its left.
+    //
+    // Positions in the rule below, counting mid-rule actions as elements:
+    //   $1 = A, $2 = the first mid-rule action, $3 = B,
+    //   $4 = the second mid-rule action, $5 = C.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int saw_a, saw_mid, saw_b, saw_c;
+%}
+
+%token A B C
+
+%%
+s : A       { saw_a = $1; $$ = 99; }
+    B       { saw_mid = $2; saw_b = $3; }
+    C       { saw_c = $5; }
+  ;
+%%
+
+int yylval;
+static int n;
+
+int yylex(void) {
+    switch (n++) {
+    case 0: yylval = 11; return A;
+    case 1: yylval = 22; return B;
+    case 2: yylval = 33; return C;
+    }
+    return 0;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    if (saw_a != 11) return 2;    /* $1 in the first mid-rule action  */
+    if (saw_mid != 99) return 3;  /* $2 = that action's own value     */
+    if (saw_b != 22) return 4;    /* $3 in the second mid-rule action */
+    if (saw_c != 33) return 5;    /* $5 in the final action           */
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "mid_rule_reads_left");
+}
+
+#[test]
+fn test_mid_rule_action_infers_union_tag_from_enclosing_rule() {
+    // Type inference for $n used the lowered production's RHS too, so inside a
+    // mid-rule action it always came up empty: the reference was emitted
+    // untagged and, under %union, assigning the whole union to an int did not
+    // compile at all.
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int got;
+%}
+
+%union { int ival; char *sval; }
+
+%token <ival> NUM
+%token <sval> STR
+%type <ival> s
+
+%%
+s : NUM   { got = $1; }
+    STR   { $$ = $1; }
+  ;
+%%
+
+YYSTYPE yylval;
+static int n;
+
+int yylex(void) {
+    if (n == 0) { n++; yylval.ival = 55; return NUM; }
+    if (n == 1) { n++; yylval.sval = "x"; return STR; }
+    return 0;
+}
+
+void yyerror(const char *s) { (void)s; }
+
+int main(void) {
+    if (yyparse() != 0) return 1;
+    if (got != 55) return 2;
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "mid_rule_union_tag");
+}

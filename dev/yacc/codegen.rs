@@ -1336,8 +1336,7 @@ fn generate_parser<W: Write>(
 
             // Transform $$ and $n references
             let has_union = grammar.union_def.is_some();
-            let transformed =
-                transform_action(action, prod.rhs.len(), grammar, prod, prefix, has_union);
+            let transformed = transform_action(action, grammar, prod, prefix, has_union);
             if !opts.omit_line_directives {
                 writeln!(w, "#line {} \"{}\"", prod.line, opts.grammar_file)?;
             }
@@ -1534,12 +1533,20 @@ fn generate_parser<W: Write>(
 /// These access values on the parser's stack preceding the current rule.
 fn transform_action(
     action: &str,
-    rhs_len: usize,
     grammar: &Grammar,
     prod: &crate::grammar::Production,
     prefix: &str,
     has_union: bool,
 ) -> String {
+    // $1..$n number the elements of the rule the action was written in. A
+    // mid-rule action was lowered to an empty production for a synthetic
+    // non-terminal, so its own `rhs` is not that list -- the elements to its
+    // left in the enclosing rule are. Deriving both the offset base and the
+    // type lookup from one slice keeps them from disagreeing.
+    let positions: &[crate::grammar::SymbolId] =
+        prod.mid_rule_prefix.as_deref().unwrap_or(&prod.rhs);
+    let rhs_len = positions.len();
+
     let mut result = String::new();
     let mut chars = action.chars().peekable();
 
@@ -1634,7 +1641,7 @@ fn transform_action(
 
                     // Try to determine type from RHS symbol (only for positive indices within RHS)
                     let (sym_tag, sym_name) = if n > 0 && (n as usize) <= rhs_len {
-                        let sym_id = prod.rhs[n as usize - 1];
+                        let sym_id = positions[n as usize - 1];
                         (
                             grammar.symbols[sym_id].tag.clone(),
                             Some(grammar.symbol_name(sym_id).to_string()),

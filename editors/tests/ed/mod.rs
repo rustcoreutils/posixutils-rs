@@ -2192,3 +2192,30 @@ fn test_ed_number_flag_format_matches() {
     ed_test("a\nxa\n.\ns/x/y/n\nQ\n", "1\tya\n");
     ed_test("a\nxa\nxb\n.\ng/x/n\nQ\n", "1\txa\n2\txb\n");
 }
+
+/// A command that changes nothing must leave the undo record alone.
+///
+/// Grouping the substitute's per-line writes made the group snapshot when it
+/// *opened*, so a substitute that matched nothing overwrote the state `u` was
+/// holding and the previous edit became unrecoverable.
+#[test]
+fn test_ed_failed_substitute_does_not_destroy_the_undo_record() {
+    ed_test_code(
+        "a\nhello\n.\n1s/hello/world/\n1s/zzz/x/\nu\n1p\nQ\n",
+        "?\nhello\n",
+        1,
+    );
+}
+
+/// The same for a global that matches nothing. POSIX (ed, `u`) nullifies "the
+/// most recent command that modified anything in the buffer" -- a global with
+/// no matches modified nothing, so `u` must still reach the substitute before
+/// it. (/bin/ed prints "world" here, i.e. its `u` is consumed by the global;
+/// that reading does not match the spec's wording.)
+#[test]
+fn test_ed_failed_global_does_not_destroy_the_undo_record() {
+    ed_test(
+        "a\nhello\n.\n1s/hello/world/\ng/zzz/d\nu\n1p\nQ\n",
+        "hello\n",
+    );
+}

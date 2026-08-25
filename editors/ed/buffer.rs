@@ -41,9 +41,17 @@ pub struct Buffer {
     /// Single-level undo (POSIX requirement)
     undo_record: Option<UndoRecord>,
     /// Nesting depth of the current undo group.  While non-zero, individual
-    /// mutations do not snapshot: the group took one snapshot up front, so
-    /// the whole command undoes as a unit.
+    /// mutations do not snapshot: the group takes one snapshot, at its first
+    /// mutation, so the whole command undoes as a unit.
     undo_depth: usize,
+    /// Whether the open group has taken its snapshot yet.
+    ///
+    /// Deferring it to the first actual mutation is what keeps a command that
+    /// changes nothing from destroying the undo record: snapshotting when the
+    /// group opens overwrites the previous state even if the command then
+    /// fails, so a substitute that matched nothing made the edit before it
+    /// unrecoverable.
+    group_snapshotted: bool,
     /// Whether execution is inside a `g`/`v` command.  Distinct from
     /// `undo_depth` because it carries a POSIX *semantic* -- notably that a
     /// substitution may not split a line inside a global -- and so must not
@@ -89,6 +97,7 @@ impl Buffer {
             marks: HashMap::new(),
             undo_record: None,
             undo_depth: 0,
+            group_snapshotted: false,
             in_global: false,
         }
     }
@@ -130,11 +139,18 @@ impl Buffer {
         });
     }
 
-    /// Save the current state for undo, unless a group is already open --
-    /// in which case the group's own snapshot is the one `u` must restore.
+    /// Save the current state for undo.
+    ///
+    /// Inside a group only the first mutation snapshots: that state is what
+    /// `u` must restore, and it is taken here rather than when the group opens
+    /// so a command that ends up changing nothing leaves the undo record
+    /// alone.
     fn save_undo(&mut self) {
         if self.undo_depth == 0 {
             self.snapshot();
+        } else if !self.group_snapshotted {
+            self.snapshot();
+            self.group_snapshotted = true;
         }
     }
 
@@ -143,7 +159,7 @@ impl Buffer {
     /// re-snapshot over the global's state.
     pub fn begin_undo_group(&mut self) {
         if self.undo_depth == 0 {
-            self.snapshot();
+            self.group_snapshotted = false;
         }
         self.undo_depth += 1;
     }

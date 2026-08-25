@@ -4081,3 +4081,127 @@ fn test_description_stub_does_not_clobber_a_real_output_file() {
         "the abort stub must not overwrite an existing description file"
     );
 }
+
+// ---------------------------------------------------------------------------
+// LALR lookahead-closure termination and conflict counting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mutually_recursive_nonterminals_rejected_not_hung() {
+    // `x` and `y` derive only each other, so neither derives a string of
+    // tokens. Before the productivity check this wedged the phase-1 lookahead
+    // closure: two items whose lookahead sets stay empty re-pushed each other
+    // forever, and yacc never terminated.
+    let grammar = r#"
+%token A
+%%
+s : A | x b ;
+x : y ;
+y : x ;
+b : b ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a non-productive non-terminal must be diagnosed, not accepted"
+    );
+    assert!(
+        stderr.contains("derives no string of tokens"),
+        "should name the non-productive non-terminal, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_self_recursive_nonterminal_with_no_base_case_rejected() {
+    // The one-symbol shape of the same defect: `b : b ;` has a rule, so the
+    // "has no rules" check passes it, but it derives nothing.
+    let grammar = r#"
+%token A
+%%
+s : A b ;
+b : b A ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "`b : b A ;` derives no tokens");
+    assert!(
+        stderr.contains("derives no string of tokens") && stderr.contains('b'),
+        "should name 'b', got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_productive_via_indirect_recursion_accepted() {
+    // Guard the other direction: mutual recursion is fine as long as some
+    // alternative bottoms out in terminals.
+    let grammar = r#"
+%token A B
+%%
+s : x ;
+x : y B | A ;
+y : x ;
+"#;
+
+    run_yacc_both_modes(&[], grammar);
+}
+
+#[test]
+fn test_three_way_reduce_reduce_counts_two_conflicts() {
+    // Three empty rules collide on the same lookahead. yacc counts N-way
+    // reduce/reduce as N-1 conflicts; this used to report a flat 1 regardless
+    // of how many reductions collided.
+    let grammar = r#"
+%token X
+%%
+start : A X | B X | C X ;
+A : /* empty */ ;
+B : /* empty */ ;
+C : /* empty */ ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "grammar should still generate");
+    assert!(
+        stderr.contains("2 reduce/reduce conflicts"),
+        "three colliding reductions are 2 conflicts, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_expect_rr_matches_three_way_conflict_count() {
+    // The counting fix has to agree with %expect-rr, or the declaration is
+    // unsatisfiable for any collision wider than two.
+    let grammar = r#"
+%token X
+%expect-rr 2
+%%
+start : A X | B X | C X ;
+A : /* empty */ ;
+B : /* empty */ ;
+C : /* empty */ ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "%expect-rr 2 should be satisfied: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("reduce/reduce conflict"),
+        "a matching %expect-rr should suppress the warning, got: {}",
+        stderr
+    );
+}

@@ -363,6 +363,8 @@ impl Grammar {
             }
         }
 
+        grammar.validate_productive()?;
+
         Ok(grammar)
     }
 
@@ -589,6 +591,46 @@ impl Grammar {
     /// Get symbol name by ID
     pub fn symbol_name(&self, id: SymbolId) -> &str {
         &self.symbols[id].name
+    }
+
+    /// Reject non-terminals that derive no string of terminals.
+    ///
+    /// Such a non-terminal can never take part in a successful parse, so every
+    /// rule mentioning it is dead. Diagnosing it here also keeps the LALR
+    /// lookahead closure well-behaved: a non-productive non-terminal has an
+    /// empty FIRST set and is not nullable, which is the one way
+    /// `first_of_sequence_with_lookahead` can return nothing.
+    fn validate_productive(&self) -> Result<(), YaccError> {
+        let mut productive = vec![false; self.symbols.len()];
+        for (id, sym) in self.symbols.iter().enumerate() {
+            productive[id] = sym.is_terminal;
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for prod in &self.productions {
+                if !productive[prod.lhs] && prod.rhs.iter().all(|&s| productive[s]) {
+                    productive[prod.lhs] = true;
+                    changed = true;
+                }
+            }
+        }
+
+        // `$accept` is non-productive exactly when the start symbol is, so
+        // naming it would bury the user's non-terminal behind a synthetic one.
+        for (id, sym) in self.symbols.iter().enumerate() {
+            if !sym.is_terminal && !productive[id] && id != AUGMENTED_START {
+                return Err(grammar_error(format!(
+                    "{} '{}' {}",
+                    gettext("non-terminal"),
+                    sym.name,
+                    gettext("derives no string of tokens")
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Check if a symbol is a terminal

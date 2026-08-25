@@ -3674,3 +3674,151 @@ fn test_no_bol_anchor_keeps_single_entry_state() {
         "an unanchored spec should not pay for a BOL entry state"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REJECT match history and variable-length trailing context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_reject_does_not_repeat_the_rule_it_left() {
+    // The fallback popped the entry for the match that had just run and
+    // rescanned its accept list from the start, re-selecting the same rule.
+    let lex_input = r#"%option noinput nounput
+%%
+abc     { printf("<abc>"); REJECT; }
+ab      { printf("<ab>"); REJECT; }
+a       { printf("<a>"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "abc").unwrap();
+    assert_eq!(result, "<abc><ab><a>");
+}
+
+#[test]
+fn test_reject_token_longer_than_the_old_fixed_stack() {
+    // The history stack was a fixed 64 entries and overflow was fatal, so any
+    // REJECT scanner died on a token of more than 64 characters.
+    let lex_input = r#"%option noinput nounput
+%%
+a+      { printf("%d,", yyleng); REJECT; }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let (stdout, stderr, code) = compile_and_run_status(&c_code, &"a".repeat(80));
+    assert_eq!(code, Some(0), "scanner failed: {}", stderr);
+    // a+ matches all 80, rejects, then 79, and so on; the old fixed stack made
+    // this fatal past 64. Scanning then resumes at the next position, so the
+    // run repeats for each remaining prefix.
+    assert!(
+        stdout.starts_with("80,79,78,"),
+        "got: {}",
+        &stdout[..40.min(stdout.len())]
+    );
+    assert!(
+        stdout.contains(",65,64,63,"),
+        "the run must pass the old 64-entry limit"
+    );
+    assert!(stdout.ends_with("1,"), "unterminated run");
+}
+
+#[test]
+fn test_reject_token_spanning_a_buffer_refill() {
+    // Entries stored raw pointers that the refill path never adjusted across
+    // its memmove and realloc, so a token spanning a refill hung on dangling
+    // pointers. Offsets from YYTOKEN survive the shift.
+    let lex_input = r#"%option noinput nounput
+%%
+xa*yb   { printf("L%d", yyleng); REJECT; }
+x       { printf("X"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let input = format!("x{}yb", "a".repeat(20000));
+    let result = compile_and_run_bounded(&c_code, &input, 20)
+        .expect("scanner must terminate on a REJECT token spanning a refill");
+    assert_eq!(result, "L20003X");
+}
+
+#[test]
+fn test_variable_trailing_context_picks_the_consistent_split() {
+    // The main-pattern end was recorded last-write-wins, so the furthest
+    // position won whether or not the trailing context matched from there.
+    // For x+/xy on "xxxy" only x+ = "xx" leaves a remainder matching "xy".
+    let lex_input = r#"%option noinput nounput
+%%
+x+/xy   { printf("[%s]", yytext); }
+.|\n    { printf("(%s)", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "xxxy").unwrap();
+    assert_eq!(result, "[xx](x)(y)");
+}
+
+#[test]
+fn test_variable_trailing_context_cases_match_flex() {
+    // Each expectation here is flex 2.6.4's answer for the same specification.
+    let cases: &[(&str, &str, &str)] = &[
+        ("x+/xy", "xxxxxy", "[xxxx](x)(y)"),
+        ("a+/ab", "aaab", "[aa](a)(b)"),
+        ("[a-z]+/,", "abc,d", "[abc](,)(d)"),
+        ("a*b/bc", "aabbc", "[aab](b)(c)"),
+        ("(ab)+/abc", "ababababc", "[ababab](a)(b)(c)"),
+        ("a+/b+", "aaabbb", "[aaa](b)(b)(b)"),
+        ("x+/x", "xxxx", "[xxx](x)"),
+        // Fixed-length trailing context must be unaffected.
+        ("ab/cd", "abcd", "[ab](c)(d)"),
+    ];
+
+    for (rule, input, expected) in cases {
+        let lex_input = format!(
+            "%option noinput nounput\n%%\n{}   {{ printf(\"[%s]\", yytext); }}\n.|\\n    {{ printf(\"(%s)\", yytext); }}\n%%\n",
+            rule
+        );
+        let (c_code, success) = run_lex(&lex_input);
+        assert!(success, "lex failed for {}: {}", rule, c_code);
+
+        let result = compile_and_run(&c_code, input).unwrap();
+        assert_eq!(result, *expected, "rule {} on {:?}", rule, input);
+    }
+}
+
+#[test]
+fn test_nullable_main_pattern_with_trailing_context_terminates() {
+    // x* admits an empty split, which consumes nothing. flex livelocks here,
+    // emitting empty matches forever; the scanner must instead step over the
+    // position, and lex must say why.
+    let lex_input = r#"%%
+x*/xy   { printf("[%s]", yytext); }
+.|\n    { printf("(%s)", yytext); }
+%%
+"#;
+
+    let (combined, success) = run_lex_capture(&[], lex_input);
+    assert!(success, "lex failed: {}", combined);
+    assert!(
+        combined.contains("can match the empty string"),
+        "expected a warning about the nullable main pattern, got: {:?}",
+        combined
+    );
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+    compile_and_run_bounded(&c_code, "xxxy", 10).expect("scanner must terminate");
+}

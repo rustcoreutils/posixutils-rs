@@ -66,6 +66,11 @@ pub struct CodeGenConfig {
     pub start_conditions: Vec<String>,
     /// Metadata for each rule (indexed by rule number)
     pub rule_metadata: Vec<RuleMetadata>,
+    /// Standalone DFA for each variable-length trailing context, by rule index.
+    ///
+    /// Used to test a candidate split: does the text after this main-pattern
+    /// end match the trailing context exactly?
+    pub tc_dfas: Vec<(usize, Dfa)>,
 }
 
 impl Default for CodeGenConfig {
@@ -75,6 +80,7 @@ impl Default for CodeGenConfig {
             yytext_size: 8192,
             start_conditions: vec!["INITIAL".to_string()],
             rule_metadata: Vec::new(),
+            tc_dfas: Vec::new(),
         }
     }
 }
@@ -173,13 +179,14 @@ pub fn generate<W: Write>(
     write_header(output)?;
     write_includes(output)?;
     write_external_definitions(output, lexinfo)?;
-    write_macros_and_types(output, lexinfo, config, &flags)?;
+    write_macros_and_types(output, config, &flags)?;
     write_char_class_table(output, dfa)?;
     write_num_states(output, dfa)?;
     // Only generate accept lists if needed for REJECT or alternate rule finding
     if flags.needs_accept_lists {
         write_accepting_list_table(output, dfa)?;
     }
+    write_trailing_context_matchers(output, dfa, config)?;
     write_rule_condition_table(output, lexinfo, config, &flags)?;
     write_rule_metadata_tables(output, lexinfo, config, &flags)?;
     write_main_pattern_end_table(output, dfa, config)?;
@@ -229,7 +236,6 @@ fn write_external_definitions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io
 
 fn write_macros_and_types<W: Write>(
     output: &mut W,
-    lexinfo: &LexInfo,
     config: &CodeGenConfig,
     flags: &FeatureFlags,
 ) -> io::Result<()> {
@@ -355,13 +361,17 @@ static int yy_full_match_state = 0;  /* DFA state where match occurred */
         writeln!(
             output,
             r#"
-/* REJECT history stack for shorter match fallback */
-#define YY_REJECT_STACK_SIZE 64
-static struct {{
-    unsigned char *marker;  /* Position of this accept */
-    int state;              /* DFA state that accepted */
-    int rule_idx;           /* Current index within accept list */
-}} yy_reject_stack[YY_REJECT_STACK_SIZE];
+/* REJECT history: one entry per accepting position reached while scanning the
+   current token, in increasing order of position.
+   Positions are offsets from YYTOKEN rather than pointers, so a refill that
+   compacts or reallocates the input buffer needs no fixups here. The stack
+   grows on demand; a token longer than any fixed bound is ordinary. */
+typedef struct {{
+    ptrdiff_t offset;  /* Distance from YYTOKEN to this accept */
+    int state;         /* DFA state that accepted */
+}} yy_reject_entry;
+static yy_reject_entry *yy_reject_stack = NULL;
+static size_t yy_reject_size = 0;
 static int yy_reject_top = 0;
 "#
         )?;
@@ -401,12 +411,22 @@ static int yy_more_len = 0;
     // Use per-rule array to correctly handle multiple rules with var-TC at the same DFA state
     // Track as offsets from YYTOKEN to avoid needing adjustment on buffer shifts
     if flags.has_var_tc {
-        let num_rules = lexinfo.rules.len();
-        writeln!(output, "/* Variable-length trailing context support */")?;
-        writeln!(output, "#define YY_NUM_VAR_TC_RULES {}", num_rules)?;
         writeln!(
             output,
-            "static int yy_main_end_offset[YY_NUM_VAR_TC_RULES]; /* Per-rule: offset from YYTOKEN where main pattern ends, or -1 */"
+            r#"/* Variable-length trailing context: every position at which some rule's
+   main pattern could have ended, recorded in increasing order while scanning.
+   Only the split whose remainder matches the trailing context is correct, so
+   all candidates are kept and tested afterwards; keeping just the furthest one
+   silently mis-tokenized. Offsets are from YYTOKEN, so a buffer shift needs no
+   fixups here. */
+typedef struct {{
+    ptrdiff_t offset;  /* Distance from YYTOKEN to this main-pattern end */
+    int rule;          /* Rule whose main pattern could end here */
+}} yy_main_end_entry;
+static yy_main_end_entry *yy_main_end_stack = NULL;
+static size_t yy_main_end_size = 0;
+static int yy_main_end_top = 0;
+"#
         )?;
         writeln!(output)?;
     }
@@ -841,6 +861,156 @@ int unput(int c)
     Ok(())
 }
 
+/// Emit a standalone matcher for each variable-length trailing context.
+///
+/// `yy_tc_match_<rule>(from, to)` answers: does the text in [from, to) match
+/// this rule's trailing context exactly? That is the test which decides where
+/// a variable-length main pattern really ended.
+///
+/// Transitions are indexed by the scanner's equivalence classes. Those classes
+/// come from the combined automaton, which contains these very trailing-context
+/// transitions, so two characters sharing a class are interchangeable here too.
+fn write_trailing_context_matchers<W: Write>(
+    output: &mut W,
+    dfa: &Dfa,
+    config: &CodeGenConfig,
+) -> io::Result<()> {
+    if config.tc_dfas.is_empty() {
+        return Ok(());
+    }
+
+    // One representative character per equivalence class, to read the
+    // trailing-context DFA's char-keyed transitions off by class.
+    let num_classes = dfa.char_classes.num_classes;
+    let mut class_rep: Vec<Option<char>> = vec![None; num_classes];
+    for ch in 0u8..=255 {
+        let class = dfa.char_classes.char_to_class[ch as usize] as usize;
+        if class < num_classes && class_rep[class].is_none() {
+            class_rep[class] = Some(ch as char);
+        }
+    }
+
+    writeln!(
+        output,
+        "/* Trailing-context matchers for variable-length main patterns */"
+    )?;
+    for (rule, tc) in &config.tc_dfas {
+        writeln!(
+            output,
+            "static int yy_tc_match_{}(const unsigned char *from, const unsigned char *to)",
+            rule
+        )?;
+        writeln!(output, "{{")?;
+
+        // -1 marks "no transition": the candidate split is impossible.
+        writeln!(
+            output,
+            "    static const short yy_tc_trans[{}][{}] = {{",
+            tc.states.len(),
+            num_classes
+        )?;
+        for state in &tc.states {
+            write!(output, "        {{ ")?;
+            for (class, rep) in class_rep.iter().enumerate() {
+                let target = rep
+                    .and_then(|c| state.transitions.get(&DfaInput::Char(c)))
+                    .map(|&t| t as i32)
+                    .unwrap_or(-1);
+                write!(output, "{}", target)?;
+                if class + 1 < num_classes {
+                    write!(output, ", ")?;
+                }
+            }
+            writeln!(output, " }},")?;
+        }
+        writeln!(output, "    }};")?;
+
+        write!(
+            output,
+            "    static const char yy_tc_accept[{}] = {{ ",
+            tc.states.len()
+        )?;
+        for (i, state) in tc.states.iter().enumerate() {
+            write!(output, "{}", if state.accepting.is_some() { 1 } else { 0 })?;
+            if i + 1 < tc.states.len() {
+                write!(output, ", ")?;
+            }
+        }
+        writeln!(output, " }};")?;
+
+        writeln!(output, "    const unsigned char *p;")?;
+        writeln!(output, "    int st = {};", tc.start)?;
+        writeln!(output, "    for (p = from; p < to; ++p) {{")?;
+        writeln!(output, "        st = yy_tc_trans[st][yy_ec[*p]];")?;
+        writeln!(output, "        if (st < 0) return 0;")?;
+        writeln!(output, "    }}")?;
+        writeln!(output, "    return yy_tc_accept[st];")?;
+        writeln!(output, "}}\n")?;
+    }
+
+    // Dispatch by rule so the match path can stay rule-agnostic.
+    writeln!(
+        output,
+        "static int yy_tc_match(int rule, const unsigned char *from, const unsigned char *to)"
+    )?;
+    writeln!(output, "{{")?;
+    writeln!(output, "    switch (rule) {{")?;
+    for (rule, _) in &config.tc_dfas {
+        writeln!(
+            output,
+            "        case {}: return yy_tc_match_{}(from, to);",
+            rule, rule
+        )?;
+    }
+    writeln!(output, "        default: return 0;")?;
+    writeln!(output, "    }}")?;
+    writeln!(output, "}}\n")?;
+
+    Ok(())
+}
+
+/// Emit the REJECT history push for an accepting state, indented by `indent`.
+///
+/// Recording every accepting position on the way forward is what lets REJECT
+/// fall back to a shorter match afterwards.
+fn write_reject_push<W: Write>(output: &mut W, indent: &str, state_idx: usize) -> io::Result<()> {
+    writeln!(
+        output,
+        "{}if ((size_t)yy_reject_top >= yy_reject_size) {{",
+        indent
+    )?;
+    writeln!(
+        output,
+        "{}    size_t yy_new_size = yy_reject_size ? yy_reject_size * 2 : 64;",
+        indent
+    )?;
+    writeln!(
+        output,
+        "{}    yy_reject_entry *yy_new = (yy_reject_entry *)realloc(yy_reject_stack, yy_new_size * sizeof(*yy_reject_stack));",
+        indent
+    )?;
+    writeln!(
+        output,
+        "{}    if (yy_new == NULL) {{ YY_FATAL_ERROR(\"lex: out of memory growing REJECT stack\"); }}",
+        indent
+    )?;
+    writeln!(output, "{}    yy_reject_stack = yy_new;", indent)?;
+    writeln!(output, "{}    yy_reject_size = yy_new_size;", indent)?;
+    writeln!(output, "{}}}", indent)?;
+    writeln!(
+        output,
+        "{}yy_reject_stack[yy_reject_top].offset = YYCURSOR - YYTOKEN;",
+        indent
+    )?;
+    writeln!(
+        output,
+        "{}yy_reject_stack[yy_reject_top].state = {};",
+        indent, state_idx
+    )?;
+    writeln!(output, "{}yy_reject_top++;", indent)?;
+    Ok(())
+}
+
 /// Build a map of equivalence class -> target state for transitions from a DFA state
 fn build_class_transitions(dfa: &Dfa, state: &DfaState) -> BTreeMap<usize, usize> {
     let mut class_to_target: BTreeMap<usize, usize> = BTreeMap::new();
@@ -997,29 +1167,7 @@ fn write_dfa_state<W: Write>(
 
                 // Push to REJECT history stack for shorter match fallback
                 if flags.has_reject {
-                    writeln!(
-                        output,
-                        "        if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{"
-                    )?;
-                    writeln!(
-                        output,
-                        "            YY_FATAL_ERROR(\"lex: REJECT stack overflow\");"
-                    )?;
-                    writeln!(output, "        }}")?;
-                    writeln!(
-                        output,
-                        "        yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
-                    )?;
-                    writeln!(
-                        output,
-                        "        yy_reject_stack[yy_reject_top].state = {};",
-                        state_idx
-                    )?;
-                    writeln!(
-                        output,
-                        "        yy_reject_stack[yy_reject_top].rule_idx = 0;"
-                    )?;
-                    writeln!(output, "        yy_reject_top++;")?;
+                    write_reject_push(output, "        ", state_idx)?;
                 }
 
                 writeln!(output, "    }}")?;
@@ -1059,29 +1207,7 @@ fn write_dfa_state<W: Write>(
 
                 // Push to REJECT history stack for shorter match fallback (inside conditional)
                 if flags.has_reject {
-                    writeln!(
-                        output,
-                        "            if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{"
-                    )?;
-                    writeln!(
-                        output,
-                        "                YY_FATAL_ERROR(\"lex: REJECT stack overflow\");"
-                    )?;
-                    writeln!(output, "            }}")?;
-                    writeln!(
-                        output,
-                        "            yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
-                    )?;
-                    writeln!(
-                        output,
-                        "            yy_reject_stack[yy_reject_top].state = {};",
-                        state_idx
-                    )?;
-                    writeln!(
-                        output,
-                        "            yy_reject_stack[yy_reject_top].rule_idx = 0;"
-                    )?;
-                    writeln!(output, "            yy_reject_top++;")?;
+                    write_reject_push(output, "            ", state_idx)?;
                 }
 
                 writeln!(output, "        }}")?;
@@ -1096,23 +1222,7 @@ fn write_dfa_state<W: Write>(
             writeln!(output, "    yy_full_match_state = {};", state_idx)?;
             // Push to REJECT history stack for shorter match fallback
             if flags.has_reject {
-                writeln!(output, "    if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{")?;
-                writeln!(
-                    output,
-                    "        YY_FATAL_ERROR(\"lex: REJECT stack overflow\");"
-                )?;
-                writeln!(output, "    }}")?;
-                writeln!(
-                    output,
-                    "    yy_reject_stack[yy_reject_top].marker = YYCURSOR;"
-                )?;
-                writeln!(
-                    output,
-                    "    yy_reject_stack[yy_reject_top].state = {};",
-                    state_idx
-                )?;
-                writeln!(output, "    yy_reject_stack[yy_reject_top].rule_idx = 0;")?;
-                writeln!(output, "    yy_reject_top++;")?;
+                write_reject_push(output, "    ", state_idx)?;
             }
         }
     }
@@ -1124,16 +1234,40 @@ fn write_dfa_state<W: Write>(
             if rule < config.rule_metadata.len()
                 && config.rule_metadata[rule].has_variable_trailing_context
             {
-                writeln!(output, "    /* Main pattern ends here for rule {} */", rule)?;
                 writeln!(
                     output,
-                    "    if (YYCURSOR - YYTOKEN > INT_MAX) {{ YY_FATAL_ERROR(\"lex: main pattern offset overflow\"); }}"
-                )?;
-                writeln!(
-                    output,
-                    "    yy_main_end_offset[{}] = (int)(YYCURSOR - YYTOKEN);",
+                    "    /* Main pattern could end here for rule {} */",
                     rule
                 )?;
+                writeln!(
+                    output,
+                    "    if ((size_t)yy_main_end_top >= yy_main_end_size) {{"
+                )?;
+                writeln!(
+                    output,
+                    "        size_t yy_new_size = yy_main_end_size ? yy_main_end_size * 2 : 64;"
+                )?;
+                writeln!(
+                    output,
+                    "        yy_main_end_entry *yy_new = (yy_main_end_entry *)realloc(yy_main_end_stack, yy_new_size * sizeof(*yy_main_end_stack));"
+                )?;
+                writeln!(
+                    output,
+                    "        if (yy_new == NULL) {{ YY_FATAL_ERROR(\"lex: out of memory growing trailing-context stack\"); }}"
+                )?;
+                writeln!(output, "        yy_main_end_stack = yy_new;")?;
+                writeln!(output, "        yy_main_end_size = yy_new_size;")?;
+                writeln!(output, "    }}")?;
+                writeln!(
+                    output,
+                    "    yy_main_end_stack[yy_main_end_top].offset = YYCURSOR - YYTOKEN;"
+                )?;
+                writeln!(
+                    output,
+                    "    yy_main_end_stack[yy_main_end_top].rule = {};",
+                    rule
+                )?;
+                writeln!(output, "    yy_main_end_top++;")?;
             }
         }
     }
@@ -1277,7 +1411,7 @@ fn write_yylex_direct_coded<W: Write>(
         // Reset per-rule main pattern end tracking for new token
         writeln!(
             output,
-            "    memset(yy_main_end_offset, -1, sizeof(yy_main_end_offset));"
+            "    yy_main_end_top = 0; /* Reset trailing-context candidates */"
         )?;
     }
     writeln!(output)?;
@@ -1551,27 +1685,32 @@ fn write_yylex_direct_coded<W: Write>(
         writeln!(output, "        }}")?;
         writeln!(
             output,
-            "        /* If not found, try shorter matches from history stack */"
+            "        /* If not found, walk back to shorter matches. The top entry is"
         )?;
-        writeln!(output, "        while (!yy_found && yy_reject_top > 0) {{")?;
+        writeln!(
+            output,
+            "           the position just exhausted above, so drop it first; a token"
+        )?;
+        writeln!(
+            output,
+            "           that rejected every rule at its longest match must not be"
+        )?;
+        writeln!(output, "           offered that same match again. */")?;
+        writeln!(output, "        while (!yy_found && yy_reject_top > 1) {{")?;
         writeln!(output, "            yy_reject_top--;")?;
-        writeln!(
-            output,
-            "            YYMARKER = yy_reject_stack[yy_reject_top].marker;"
-        )?;
-        writeln!(
-            output,
-            "            yy_full_match_state = yy_reject_stack[yy_reject_top].state;"
-        )?;
         writeln!(output, "            {{")?;
+        writeln!(
+            output,
+            "                yy_reject_entry *yy_e = &yy_reject_stack[yy_reject_top - 1];"
+        )?;
         writeln!(output, "                int yy_i;")?;
         writeln!(
             output,
-            "                int yy_start_idx = yy_accept_idx[yy_full_match_state] + yy_reject_stack[yy_reject_top].rule_idx;"
+            "                int yy_start_idx = yy_accept_idx[yy_e->state];"
         )?;
         writeln!(
             output,
-            "                int yy_end_idx = yy_accept_idx[yy_full_match_state + 1];"
+            "                int yy_end_idx = yy_accept_idx[yy_e->state + 1];"
         )?;
         writeln!(
             output,
@@ -1587,21 +1726,24 @@ fn write_yylex_direct_coded<W: Write>(
                 "                    if (!yy_rule_cond[yy_rule][yy_start_state]) continue;"
             )?;
         }
+        writeln!(
+            output,
+            "                    YYMARKER = YYTOKEN + yy_e->offset;"
+        )?;
+        writeln!(
+            output,
+            "                    yy_full_match_state = yy_e->state;"
+        )?;
         writeln!(output, "                    yyaccept = yy_rule;")?;
-        // Defense in depth: bounds check before re-pushing entry
-        writeln!(
-            output,
-            "                    if (yy_reject_top >= YY_REJECT_STACK_SIZE) {{ YY_FATAL_ERROR(\"lex: REJECT stack overflow\"); }}"
-        )?;
-        writeln!(
-            output,
-            "                    yy_reject_stack[yy_reject_top].rule_idx = yy_i - yy_accept_idx[yy_full_match_state] + 1;"
-        )?;
-        writeln!(
-            output,
-            "                    yy_reject_top++; /* Keep this entry for next REJECT */"
-        )?;
         writeln!(output, "                    yy_found = 1;")?;
+        writeln!(
+            output,
+            "                    /* Entry stays on top: a further REJECT resumes past"
+        )?;
+        writeln!(
+            output,
+            "                       this rule via the scan above. */"
+        )?;
         writeln!(output, "                    break;")?;
         writeln!(output, "                }}")?;
         writeln!(output, "            }}")?;
@@ -1827,22 +1969,55 @@ fn write_yylex_direct_coded<W: Write>(
             writeln!(output, "        }} else if (yy_main_len == -2) {{")?;
             writeln!(
                 output,
-                "            /* Variable-length main pattern - use per-rule offset */"
-            )?;
-            // Defensive bounds check: ensure yyaccept is valid index for yy_main_end_offset array
-            writeln!(
-                output,
-                "            if (yyaccept >= 0 && yyaccept < YY_NUM_VAR_TC_RULES && yy_main_end_offset[yyaccept] >= 0) {{"
+                "            /* Variable-length main pattern: of the positions where it"
             )?;
             writeln!(
                 output,
-                "                YYCURSOR = YYTOKEN + yy_main_end_offset[yyaccept];"
+                "               could have ended, take the longest whose remainder matches"
+            )?;
+            writeln!(output, "               the trailing context exactly. */")?;
+            writeln!(output, "            ptrdiff_t yy_head = -1;")?;
+            writeln!(output, "            int yy_k;")?;
+            writeln!(
+                output,
+                "            for (yy_k = yy_main_end_top - 1; yy_k >= 0; yy_k--) {{"
             )?;
             writeln!(
                 output,
-                "                yyleng = yy_main_end_offset[yyaccept];"
+                "                if (yy_main_end_stack[yy_k].rule != yyaccept) continue;"
             )?;
+            writeln!(
+                output,
+                "                if (yy_tc_match(yyaccept, YYTOKEN + yy_main_end_stack[yy_k].offset, YYMARKER)) {{"
+            )?;
+            writeln!(
+                output,
+                "                    yy_head = yy_main_end_stack[yy_k].offset;"
+            )?;
+            writeln!(output, "                    break;")?;
+            writeln!(output, "                }}")?;
+            writeln!(output, "            }}")?;
+            writeln!(output, "            if (yy_head > 0) {{")?;
+            writeln!(output, "                YYCURSOR = YYTOKEN + yy_head;")?;
+            writeln!(output, "                yyleng = (int)yy_head;")?;
             writeln!(output, "                yytext[yyleng] = '\\0';")?;
+            writeln!(output, "            }} else if (yy_head == 0) {{")?;
+            writeln!(
+                output,
+                "                /* The only consistent split leaves an empty token, so this"
+            )?;
+            writeln!(
+                output,
+                "                   rule consumes nothing here. Taking it would rescan the same"
+            )?;
+            writeln!(
+                output,
+                "                   position forever, so advance one character instead. */"
+            )?;
+            writeln!(output, "                yy_at_bol = (*YYTOKEN == '\\n');")?;
+            writeln!(output, "                putc(*YYTOKEN++, yyout);")?;
+            writeln!(output, "                YYCURSOR = YYTOKEN;")?;
+            writeln!(output, "                goto yy_scan;")?;
             writeln!(output, "            }}")?;
         }
         writeln!(output, "        }}")?;
@@ -1892,7 +2067,7 @@ fn write_yylex_direct_coded<W: Write>(
     writeln!(output, "}}\n")?;
 
     // Generate yylex_destroy, yywrap and main if needed
-    write_default_yywrap_main(output, lexinfo, config)?;
+    write_default_yywrap_main(output, lexinfo, config, flags)?;
 
     Ok(())
 }
@@ -1901,6 +2076,7 @@ fn write_default_yywrap_main<W: Write>(
     output: &mut W,
     lexinfo: &LexInfo,
     config: &CodeGenConfig,
+    flags: &FeatureFlags,
 ) -> io::Result<()> {
     // Generate yylex_destroy to free allocated buffers (enables valgrind-clean runs)
     writeln!(output, "/* Cleanup function - free allocated buffers */")?;
@@ -1916,6 +2092,22 @@ fn write_default_yywrap_main<W: Write>(
         writeln!(output, "        yy_yytext_buf = NULL;")?;
         writeln!(output, "    }}")?;
         writeln!(output, "    yytext = NULL;")?;
+    }
+    if flags.has_var_tc {
+        writeln!(output, "    if (yy_main_end_stack != NULL) {{")?;
+        writeln!(output, "        free(yy_main_end_stack);")?;
+        writeln!(output, "        yy_main_end_stack = NULL;")?;
+        writeln!(output, "    }}")?;
+        writeln!(output, "    yy_main_end_size = 0;")?;
+        writeln!(output, "    yy_main_end_top = 0;")?;
+    }
+    if flags.has_reject {
+        writeln!(output, "    if (yy_reject_stack != NULL) {{")?;
+        writeln!(output, "        free(yy_reject_stack);")?;
+        writeln!(output, "        yy_reject_stack = NULL;")?;
+        writeln!(output, "    }}")?;
+        writeln!(output, "    yy_reject_size = 0;")?;
+        writeln!(output, "    yy_reject_top = 0;")?;
     }
     writeln!(output, "    YYCURSOR = NULL;")?;
     writeln!(output, "    YYLIMIT = NULL;")?;

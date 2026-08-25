@@ -128,25 +128,36 @@ fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
             .map_err(|e| format!("rule {}: pattern '{}': {}", idx + 1, rule.ere, e))?;
 
         // Parse trailing context if present (use compiled version)
-        let (trailing_context, main_pattern_len, has_variable_tc) =
-            if let Some(ref tc) = rule.compiled_trailing_context {
-                let tc_hir = parse_regex_posix(tc).map_err(|e| {
-                    format!(
-                        "rule {}: trailing context '{}': {}",
-                        idx + 1,
-                        rule.trailing_context.as_deref().unwrap_or(""),
-                        e
-                    )
-                })?;
-                // Compute fixed length of MAIN pattern (for setting yyleng correctly)
-                // If main pattern has fixed length, we can set yyleng to that value
-                let main_len = compute_fixed_length(&hir);
-                // Variable-length TC means main pattern doesn't have fixed length
-                let has_var_tc = main_len.is_none();
-                (Some(tc_hir), main_len, has_var_tc)
-            } else {
-                (None, None, false)
-            };
+        let (trailing_context, main_pattern_len, has_variable_tc) = if let Some(ref tc) =
+            rule.compiled_trailing_context
+        {
+            let tc_hir = parse_regex_posix(tc).map_err(|e| {
+                format!(
+                    "rule {}: trailing context '{}': {}",
+                    idx + 1,
+                    rule.trailing_context.as_deref().unwrap_or(""),
+                    e
+                )
+            })?;
+            // Compute fixed length of MAIN pattern (for setting yyleng correctly)
+            // If main pattern has fixed length, we can set yyleng to that value
+            let main_len = compute_fixed_length(&hir);
+            // Variable-length TC means main pattern doesn't have fixed length
+            let has_var_tc = main_len.is_none();
+            // A main pattern that can match nothing admits an empty split,
+            // which consumes no input; the scanner has to step over it, so
+            // say why rather than appearing to skip the rule at random.
+            if has_var_tc && hir.properties().minimum_len() == Some(0) {
+                diag::warning(&format!(
+                    "{}: {}",
+                    gettext("main pattern of a trailing-context rule can match the empty string"),
+                    rule.ere
+                ));
+            }
+            (Some(tc_hir), main_len, has_var_tc)
+        } else {
+            (None, None, false)
+        };
 
         rules.push(ParsedRule {
             hir,
@@ -376,6 +387,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(fs::File::create(&args.outfile)?)
     };
 
+    // Build a standalone DFA for each variable-length trailing context.
+    //
+    // A variable-length main pattern can end at many positions, and only the
+    // one whose remainder actually matches the trailing context is the right
+    // split. Deciding that at run time means matching the trailing context on
+    // its own, so it gets its own automaton.
+    let mut tc_dfas: Vec<(usize, Dfa)> = Vec::new();
+    for r in &rules {
+        if !r.has_variable_trailing_context {
+            continue;
+        }
+        let Some(tc_hir) = r.trailing_context.clone() else {
+            continue;
+        };
+        let tc_nfa = Nfa::from_rules(&[nfa::NfaRule {
+            main: tc_hir,
+            trailing: None,
+            index: 0,
+            bol_anchor: false,
+        }])?;
+        tc_dfas.push((r.index, Dfa::from_nfa(&tc_nfa).minimize()));
+    }
+
     // Build rule metadata for code generation
     let rule_metadata: Vec<codegen::RuleMetadata> = rules
         .iter()
@@ -391,6 +425,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         yytext_is_pointer: lexinfo.yyt_is_ptr,
         start_conditions: start_conditions.clone(),
         rule_metadata,
+        tc_dfas,
         ..Default::default()
     };
     codegen::generate(&mut output, &dfa, &lexinfo, &config)?;

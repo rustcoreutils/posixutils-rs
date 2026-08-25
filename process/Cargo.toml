@@ -13,9 +13,6 @@ clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 
-[build-dependencies]
-bindgen = { version = "0.70", features = ["runtime"] }
-
 [lints]
 workspace = true
 

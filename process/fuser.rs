@@ -1230,9 +1230,37 @@ mod linux {
 mod macos {
     use super::*;
 
-    #[allow(warnings, missing_docs)]
+    /// The slice of `<libproc.h>` and `<sys/proc_info.h>` this file uses.
+    ///
+    /// `libproc` is part of libSystem, so the declarations only need to match
+    /// the header; there is nothing extra to link. Written out rather than
+    /// generated because it is four stable symbols, and generating them cost a
+    /// build-time dependency on libclang.
     pub mod osx_libproc_bindings {
-        include!(concat!(env!("OUT_DIR"), "/osx_libproc_bindings.rs"));
+        use libc::{c_char, c_int, c_void};
+
+        /// `<sys/proc_info.h>`: select every process, ignoring `typeinfo`.
+        pub const PROC_ALL_PIDS: u32 = 1;
+
+        /// `<libproc.h>`: `path` names a volume; match any file on it.
+        pub const PROC_LISTPIDSPATH_PATH_IS_VOLUME: u32 = 1;
+
+        /// `<libproc.h>`: skip processes holding the file only for events.
+        pub const PROC_LISTPIDSPATH_EXCLUDE_EVTONLY: u32 = 2;
+
+        extern "C" {
+            /// `int proc_listpidspath(uint32_t type, uint32_t typeinfo,
+            /// const char *path, uint32_t pathflags, void *buffer,
+            /// int buffersize)`
+            pub fn proc_listpidspath(
+                type_: u32,
+                typeinfo: u32,
+                path: *const c_char,
+                pathflags: u32,
+                buffer: *mut c_void,
+                buffersize: c_int,
+            ) -> c_int;
+        }
     }
     use libc::{c_char, c_int, c_void};
     use std::{ffi::CString, os::unix::ffi::OsStrExt, ptr};

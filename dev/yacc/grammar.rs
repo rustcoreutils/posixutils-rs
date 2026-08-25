@@ -243,8 +243,27 @@ impl Grammar {
 
         // First pass: identify all non-terminals from LHS of rules
         for rule in &parsed.rules {
-            if !grammar.symbol_map.contains_key(&rule.lhs) {
-                grammar.add_symbol(&rule.lhs, false, None, None, 0, None)?;
+            match grammar.symbol_map.get(&rule.lhs) {
+                None => {
+                    grammar.add_symbol(&rule.lhs, false, None, None, 0, None)?;
+                }
+                // A name declared with %token (or %left/%right/%nonassoc) stays
+                // a terminal, so the rule would build a production the LR
+                // closure never expands and the parser would silently drop it.
+                // The rule tables would also fall back to the raw symbol id for
+                // its LHS, yielding a negative non-terminal index.
+                Some(&id) if grammar.symbols[id].is_terminal => {
+                    return Err(grammar_error_at(
+                        rule.line,
+                        format!(
+                            "{} '{}', {}",
+                            gettext("rule given for"),
+                            rule.lhs,
+                            gettext("which is a token")
+                        ),
+                    ));
+                }
+                Some(_) => {}
             }
         }
 
@@ -493,12 +512,15 @@ impl Grammar {
                     let sym_id = self.get_or_add_symbol(sym)?;
                     rhs.push(sym_id);
 
-                    // Track precedence of last terminal
+                    // POSIX 124050: a rule's precedence is that of "the last
+                    // token or literal in the body of the rule". A trailing
+                    // terminal without precedence therefore clears whatever an
+                    // earlier operator contributed -- taking the last terminal
+                    // that *has* precedence instead would silently resolve a
+                    // conflict the spec says to report. Non-terminals are
+                    // neither tokens nor literals, so they leave it alone.
                     if self.symbols[sym_id].is_terminal {
-                        let sym_info = &self.symbols[sym_id];
-                        if sym_info.precedence > 0 {
-                            last_terminal_prec = sym_info.precedence;
-                        }
+                        last_terminal_prec = self.symbols[sym_id].precedence;
                     }
                 }
                 RhsElement::MidAction(code) => {

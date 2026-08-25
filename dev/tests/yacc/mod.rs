@@ -4573,3 +4573,151 @@ int main(void) {
 
     run_end_to_end_both_modes(grammar, "mid_rule_union_tag");
 }
+
+// ---------------------------------------------------------------------------
+// Grammar-level diagnostics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rule_for_a_declared_token_is_rejected() {
+    // The LHS pass only registered a name it had not seen, so a name declared
+    // with %token stayed a terminal. The LR closure never expands terminals,
+    // so the rule was built and then silently dropped from the parser.
+    let grammar = r#"
+%token FOO
+%%
+s : FOO ;
+FOO : 'a' ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a rule whose LHS is a token must be diagnosed, not silently dropped"
+    );
+    assert!(
+        stderr.contains("which is a token") && stderr.contains("FOO"),
+        "should name the token, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_repeated_nonterminal_on_lhs_still_accepted() {
+    // The same check must not trip on the ordinary case of one non-terminal
+    // defined by several rules.
+    let grammar = r#"
+%token A
+%%
+s : x ;
+x : A ;
+x : A A ;
+"#;
+
+    run_yacc_both_modes(&[], grammar);
+}
+
+#[test]
+fn test_rule_precedence_comes_from_the_last_terminal() {
+    // POSIX 124050: a rule's precedence is that of "the last token or literal
+    // in the body of the rule". Taking the last terminal that *has* a
+    // precedence instead let `e : e '+' FOO e` inherit '+' and silently
+    // resolve a shift/reduce conflict. bison 3.8 reports 1 conflict here.
+    let grammar = r#"
+%token NUM FOO
+%left '+'
+%%
+e : e '+' FOO e
+  | NUM
+  ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("1 shift/reduce conflict"),
+        "FOO has no precedence, so the rule has none and the conflict stands; got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_rule_precedence_still_found_through_a_trailing_nonterminal() {
+    // Non-terminals are neither tokens nor literals, so they must not clear
+    // the precedence an earlier operator contributed -- otherwise every
+    // ordinary `e : e '+' e` rule would start reporting conflicts.
+    let grammar = r#"
+%token NUM
+%left '+'
+%left '*'
+%%
+e : e '+' e
+  | e '*' e
+  | NUM
+  ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "should generate: {}", stderr);
+    assert!(
+        !stderr.contains("conflict"),
+        "operator precedence must still resolve these, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_prec_still_overrides_the_last_terminal() {
+    // %prec must win over whatever the last terminal says, including the new
+    // "no precedence" answer.
+    let grammar = r#"
+%token NUM FOO
+%left '+'
+%%
+e : e '+' FOO e %prec '+'
+  | NUM
+  ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "should generate: {}", stderr);
+    assert!(
+        !stderr.contains("conflict"),
+        "%prec '+' must restore the resolution, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_unary_minus_grammar_has_no_conflicts() {
+    // The canonical %prec UMINUS shape, as a guard that the precedence change
+    // did not disturb the usual calculator idiom.
+    let grammar = r#"
+%token NUM
+%left '+' '-'
+%left '*' '/'
+%right UMINUS
+%%
+e : e '+' e | e '-' e | e '*' e | e '/' e
+  | '-' e %prec UMINUS
+  | NUM
+  ;
+"#;
+
+    let output = run_yacc(&[], grammar);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "should generate: {}", stderr);
+    assert!(
+        !stderr.contains("conflict"),
+        "the unary-minus idiom must stay conflict-free, got: {}",
+        stderr
+    );
+}

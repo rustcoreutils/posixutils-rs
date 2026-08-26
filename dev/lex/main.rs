@@ -128,25 +128,36 @@ fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
             .map_err(|e| format!("rule {}: pattern '{}': {}", idx + 1, rule.ere, e))?;
 
         // Parse trailing context if present (use compiled version)
-        let (trailing_context, main_pattern_len, has_variable_tc) =
-            if let Some(ref tc) = rule.compiled_trailing_context {
-                let tc_hir = parse_regex_posix(tc).map_err(|e| {
-                    format!(
-                        "rule {}: trailing context '{}': {}",
-                        idx + 1,
-                        rule.trailing_context.as_deref().unwrap_or(""),
-                        e
-                    )
-                })?;
-                // Compute fixed length of MAIN pattern (for setting yyleng correctly)
-                // If main pattern has fixed length, we can set yyleng to that value
-                let main_len = compute_fixed_length(&hir);
-                // Variable-length TC means main pattern doesn't have fixed length
-                let has_var_tc = main_len.is_none();
-                (Some(tc_hir), main_len, has_var_tc)
-            } else {
-                (None, None, false)
-            };
+        let (trailing_context, main_pattern_len, has_variable_tc) = if let Some(ref tc) =
+            rule.compiled_trailing_context
+        {
+            let tc_hir = parse_regex_posix(tc).map_err(|e| {
+                format!(
+                    "rule {}: trailing context '{}': {}",
+                    idx + 1,
+                    rule.trailing_context.as_deref().unwrap_or(""),
+                    e
+                )
+            })?;
+            // Compute fixed length of MAIN pattern (for setting yyleng correctly)
+            // If main pattern has fixed length, we can set yyleng to that value
+            let main_len = compute_fixed_length(&hir);
+            // Variable-length TC means main pattern doesn't have fixed length
+            let has_var_tc = main_len.is_none();
+            // A main pattern that can match nothing admits an empty split,
+            // which consumes no input; the scanner has to step over it, so
+            // say why rather than appearing to skip the rule at random.
+            if has_var_tc && hir.properties().minimum_len() == Some(0) {
+                diag::warning(&format!(
+                    "{}: {}",
+                    gettext("main pattern of a trailing-context rule can match the empty string"),
+                    rule.ere
+                ));
+            }
+            (Some(tc_hir), main_len, has_var_tc)
+        } else {
+            (None, None, false)
+        };
 
         rules.push(ParsedRule {
             hir,
@@ -162,7 +173,21 @@ fn parse_rules(lexinfo: &lexfile::LexInfo) -> Result<Vec<ParsedRule>, String> {
     Ok(rules)
 }
 
-/// Try to compute the fixed length of a regex pattern
+/// Does every member of this class encode to a single byte?
+///
+/// The result of `compute_fixed_length` is consumed as a *byte* offset into the
+/// scanner's input buffer, so a class that can match a multi-byte character has
+/// no fixed length even though it always matches exactly one character.
+fn class_is_single_byte(class: &regex_syntax::hir::Class) -> bool {
+    use regex_syntax::hir::Class;
+
+    match class {
+        Class::Unicode(unicode) => unicode.iter().all(|r| (r.end() as u32) < 0x80),
+        Class::Bytes(_) => true,
+    }
+}
+
+/// Try to compute the fixed length, in bytes, of a regex pattern
 /// Returns Some(length) if the pattern has a fixed length, None otherwise
 fn compute_fixed_length(hir: &Hir) -> Option<usize> {
     use regex_syntax::hir::HirKind;
@@ -173,8 +198,15 @@ fn compute_fixed_length(hir: &Hir) -> Option<usize> {
             // Count UTF-8 bytes in the literal
             Some(lit.0.len())
         }
-        HirKind::Class(_) => Some(1), // Character class matches exactly 1 character
-        HirKind::Look(_) => Some(0),  // Look-around assertions don't consume input
+        HirKind::Class(class) => {
+            // Exactly one character, which is one byte only for ASCII members.
+            if class_is_single_byte(class) {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        HirKind::Look(_) => Some(0), // Look-around assertions don't consume input
         HirKind::Concat(parts) => {
             let mut total = 0;
             for part in parts.iter() {
@@ -193,8 +225,12 @@ fn compute_fixed_length(hir: &Hir) -> Option<usize> {
             Some(first_len)
         }
         HirKind::Repetition(rep) => {
-            // Only fixed repetitions have fixed length
-            if rep.min == rep.max.unwrap_or(0) {
+            // Only a bounded repetition of exactly rep.min copies has a fixed
+            // length. An unbounded repetition has max == None; comparing
+            // against a defaulted 0 used to classify `x*` (min 0, max None) as
+            // a fixed length of zero, which made the generated scanner rewind
+            // to the token start and loop forever.
+            if rep.max == Some(rep.min) {
                 let sub_len = compute_fixed_length(&rep.sub)?;
                 Some(sub_len * rep.min as usize)
             } else {
@@ -232,12 +268,15 @@ fn write_stats<W: Write + ?Sized>(
     writeln!(output, "  {} rules", lexinfo.rules.len())?;
     writeln!(output, "  {} substitution definitions", lexinfo.subs.len())?;
     writeln!(output, "  {} NFA states", nfa.states.len())?;
+    // run() minimizes before reporting, so this is the final state count.
+    writeln!(output, "  {} DFA states", dfa.num_states())?;
+    // Counted per equivalence class, which is how they are stored: every byte
+    // in a class shares one transition.
     writeln!(
         output,
-        "  {} DFA states (before minimization)",
-        dfa.num_states()
+        "  {} DFA transitions (by equivalence class)",
+        dfa.num_transitions()
     )?;
-    writeln!(output, "  {} DFA transitions", dfa.num_transitions())?;
     writeln!(
         output,
         "  {} character equivalence classes",
@@ -327,14 +366,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build rules in the format expected by NFA with trailing context support
     // This tracks main pattern end states for variable-length trailing context
-    let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+    // Each rule records the conditions it is active in, so the NFA can make it
+    // reachable only from those conditions' roots.
+    let nfa_rules: Vec<nfa::NfaRule> = rules
         .iter()
-        .map(|r| (r.hir.clone(), r.trailing_context.clone(), r.index))
+        .map(|r| nfa::NfaRule {
+            main: r.hir.clone(),
+            trailing: r.trailing_context.clone(),
+            index: r.index,
+            bol_anchor: r.bol_anchor,
+            active_conditions: start_conditions
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| {
+                    lexfile::is_rule_active_in_condition(&lexinfo.rules[r.index], name, &lexinfo)
+                })
+                .map(|(idx, _)| idx)
+                .collect(),
+        })
         .collect();
 
     // Build NFA from rules using Thompson's construction
     // This version properly tracks main pattern end states for trailing context
-    let nfa = Nfa::from_rules(&nfa_rules)?;
+    let nfa = Nfa::from_rules(&nfa_rules, start_conditions.len())?;
 
     // Convert NFA to DFA using subset construction
     let dfa = Dfa::from_nfa(&nfa);
@@ -349,11 +403,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(fs::File::create(&args.outfile)?)
     };
 
+    // Build a standalone DFA for each variable-length trailing context.
+    //
+    // A variable-length main pattern can end at many positions, and only the
+    // one whose remainder actually matches the trailing context is the right
+    // split. Deciding that at run time means matching the trailing context on
+    // its own, so it gets its own automaton.
+    let mut tc_dfas: Vec<(usize, Dfa)> = Vec::new();
+    for r in &rules {
+        if !r.has_variable_trailing_context {
+            continue;
+        }
+        let Some(tc_hir) = r.trailing_context.clone() else {
+            continue;
+        };
+        let tc_nfa = Nfa::from_rules(
+            &[nfa::NfaRule {
+                main: tc_hir,
+                trailing: None,
+                index: 0,
+                bol_anchor: false,
+                active_conditions: vec![0],
+            }],
+            1,
+        )?;
+        // Share the scanner's equivalence classes so the emitted matcher can
+        // be driven from the same yy_ec table. They come from the combined
+        // automaton, which contains these very transitions, so they are at
+        // least as fine as this trailing context needs.
+        tc_dfas.push((
+            r.index,
+            Dfa::from_nfa_with_classes(&tc_nfa, dfa.char_classes.clone()).minimize(),
+        ));
+    }
+
     // Build rule metadata for code generation
     let rule_metadata: Vec<codegen::RuleMetadata> = rules
         .iter()
         .map(|r| codegen::RuleMetadata {
-            bol_anchor: r.bol_anchor,
             main_pattern_len: r.main_pattern_len,
             has_trailing_context: r.trailing_context.is_some(),
             has_variable_trailing_context: r.has_variable_trailing_context,
@@ -365,6 +452,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         yytext_is_pointer: lexinfo.yyt_is_ptr,
         start_conditions: start_conditions.clone(),
         rule_metadata,
+        tc_dfas,
         ..Default::default()
     };
     codegen::generate(&mut output, &dfa, &lexinfo, &config)?;
@@ -402,11 +490,11 @@ mod tests {
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
         assert_eq!(rules.len(), 1);
 
-        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+        let nfa_rules: Vec<nfa::NfaRule> = rules
             .iter()
-            .map(|r| (r.hir.clone(), None, r.index))
+            .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
-        let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
+        let nfa = Nfa::from_rules(&nfa_rules, 1).expect("Failed to build NFA");
         assert!(!nfa.states.is_empty());
 
         let dfa = Dfa::from_nfa(&nfa);
@@ -427,11 +515,11 @@ mod tests {
         assert_eq!(lexinfo.rules.len(), 3);
 
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
-        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+        let nfa_rules: Vec<nfa::NfaRule> = rules
             .iter()
-            .map(|r| (r.hir.clone(), None, r.index))
+            .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
-        let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
+        let nfa = Nfa::from_rules(&nfa_rules, 1).expect("Failed to build NFA");
         let dfa = Dfa::from_nfa(&nfa);
         let minimized = dfa.minimize();
 
@@ -450,11 +538,11 @@ mod tests {
 
         let lexinfo = lexfile::parse(&input).expect("Failed to parse");
         let rules = parse_rules(&lexinfo).expect("Failed to parse rules");
-        let nfa_rules: Vec<(Hir, Option<Hir>, usize)> = rules
+        let nfa_rules: Vec<nfa::NfaRule> = rules
             .iter()
-            .map(|r| (r.hir.clone(), None, r.index))
+            .map(|r| nfa::NfaRule::plain(r.hir.clone(), r.index))
             .collect();
-        let nfa = Nfa::from_rules(&nfa_rules).expect("Failed to build NFA");
+        let nfa = Nfa::from_rules(&nfa_rules, 1).expect("Failed to build NFA");
         let dfa = Dfa::from_nfa(&nfa);
 
         let mut output = Vec::new();

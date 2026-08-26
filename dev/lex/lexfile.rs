@@ -19,7 +19,7 @@ use crate::pattern_escape::{
     expand_posix_bracket_constructs, has_nul_escape, translate_escape_sequences,
 };
 use crate::pattern_validate::{
-    parse_anchoring_and_trailing_context, validate_pattern_restrictions,
+    find_posix_bracket_end, parse_anchoring_and_trailing_context, validate_pattern_restrictions,
 };
 use gettextrs::gettext;
 use plib::diag;
@@ -425,28 +425,26 @@ enum RegexType {
     Curly,
 }
 
-/// Find the end of a POSIX bracket expression construct like [:alpha:], [=a=], or [.ch.]
-/// Returns the index of the closing bracket ']' if found, None otherwise
-fn find_posix_bracket_end(chars: &[char], start: usize, close_char: char) -> Option<usize> {
-    // Look for close_char followed by ]  (e.g., :] or =] or .])
-    let mut i = start;
-    while i + 1 < chars.len() {
-        if chars[i] == close_char && chars[i + 1] == ']' {
-            return Some(i + 1); // Return index of the ]
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Find end of regex in rule line by matching brackets, parens, braces, quotes.
 /// Handles POSIX bracket constructs: [:class:], [=equiv=], [.collating.].
+///
+/// The returned index is a *byte* offset into `line`, so callers may slice
+/// `line` with it directly.
 fn find_ere_end(line: &str) -> Result<usize, String> {
     let mut stack: Vec<RegexType> = Vec::new();
     let mut inside_brackets = false;
+    // POSIX: a ']' first in a bracket expression, possibly after a negating
+    // '^', is an ordinary member rather than the terminator. Only the first
+    // member holds that position, and only a '^' immediately after '[' is the
+    // negation rather than a member, so "[^^]" excludes a caret.
+    let mut bracket_start = false;
+    let mut allow_negate = false;
     let mut inside_quotes = false;
     let mut escape_next = false;
+    // Scanning is per character (lookahead indexes neighbours), but the result
+    // is consumed as a byte offset; keep both so the two never disagree.
     let chars: Vec<char> = line.chars().collect();
+    let offsets: Vec<usize> = line.char_indices().map(|(off, _)| off).collect();
     let mut i = 0;
 
     while i < chars.len() {
@@ -455,6 +453,10 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
         // Handle escape sequences
         if escape_next {
             escape_next = false;
+            // An escaped character is an ordinary member, so it ends the
+            // position where a ']' would be literal.
+            bracket_start = false;
+            allow_negate = false;
             i += 1;
             continue;
         }
@@ -477,11 +479,25 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
             continue;
         }
 
+        // Only the character right after '[' (or after "[^") can be a literal
+        // ']'; every other member ends that position. Cleared here rather than
+        // in each arm below, since most arms are about nesting, not membership.
+        let at_class_start = bracket_start;
+        let can_negate = allow_negate;
+        bracket_start = false;
+        allow_negate = false;
+
         match ch {
+            '^' if inside_brackets && can_negate => {
+                // The negation, not a member: "[^]" has not closed anything.
+                bracket_start = true;
+            }
             '[' => {
                 if !inside_brackets {
                     stack.push(RegexType::Square);
                     inside_brackets = true;
+                    bracket_start = true;
+                    allow_negate = true;
                 } else {
                     // Inside brackets: check for POSIX constructs [:, [=, [.
                     if i + 1 < chars.len() {
@@ -508,7 +524,7 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
                 }
             }
             ']' => {
-                if inside_brackets {
+                if inside_brackets && !at_class_start {
                     inside_brackets = false;
                     if stack.pop() != Some(RegexType::Square) {
                         return Err(gettext("unmatched closing square bracket in pattern"));
@@ -528,7 +544,7 @@ fn find_ere_end(line: &str) -> Result<usize, String> {
             }
             _ => {
                 if ch.is_whitespace() && stack.is_empty() && !inside_brackets {
-                    return Ok(i);
+                    return Ok(offsets[i]);
                 }
             }
         }
@@ -593,6 +609,11 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
     let mut re = String::new();
     let mut in_quotes = false;
     let mut in_brace = false;
+    let mut in_brackets = false;
+    // POSIX: a ']' first in a bracket expression, possibly after a negating
+    // '^', is an ordinary member rather than the terminator. See find_ere_end.
+    let mut bracket_start = false;
+    let mut allow_negate = false;
     let mut brace_content = String::new();
     let mut escape_next = false;
     let chars: Vec<char> = ere.chars().collect();
@@ -604,6 +625,10 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
         // Handle escape sequences outside of quotes
         if escape_next && !in_quotes {
             escape_next = false;
+            // An escaped character is an ordinary member of a bracket
+            // expression, so it ends the position where a ']' would be literal.
+            bracket_start = false;
+            allow_negate = false;
             // In lex patterns, \c means literal character c
             // For regex, most chars just need to be passed through as \c
             // but some need hex escaping to avoid regex interpretation
@@ -714,10 +739,45 @@ fn translate_ere(state: &mut ParseState, ere: &str, wrap_subs: bool) -> Result<S
             brace_content.clear();
         } else if in_brace {
             brace_content.push(ch);
+        } else if in_brackets {
+            // Inside a bracket expression only ']' is special: '{' and '"' are
+            // ordinary members there, so [{}] is a brace class and ["] is a
+            // quote class rather than a substitution or a quoted string.
+            if ch == '[' {
+                // [:class:], [=equiv=] and [.collating.] are copied whole so
+                // their closing ']' does not end the enclosing expression.
+                if let Some(next) = chars.get(i + 1).copied() {
+                    if next == ':' || next == '=' || next == '.' {
+                        if let Some(end_idx) = find_posix_bracket_end(&chars, i + 2, next) {
+                            for &c in &chars[i..=end_idx] {
+                                re.push(c);
+                            }
+                            i = end_idx + 1;
+                            continue;
+                        }
+                    }
+                }
+            } else if ch == ']' && !bracket_start {
+                in_brackets = false;
+            }
+            // Only a '^' immediately after '[' is the negation; anything else,
+            // a second caret included, is a member and ends the class start.
+            if ch == '^' && allow_negate {
+                allow_negate = false;
+            } else {
+                bracket_start = false;
+                allow_negate = false;
+            }
+            re.push(ch);
         } else if ch == '"' {
             in_quotes = true;
         } else if ch == '{' {
             in_brace = true;
+        } else if ch == '[' {
+            in_brackets = true;
+            bracket_start = true;
+            allow_negate = true;
+            re.push(ch);
         } else {
             re.push(ch);
         }
@@ -965,6 +1025,24 @@ pub fn parse(input: &[String]) -> Result<LexInfo, String> {
     Ok(lexinfo)
 }
 
+/// Check if a rule is active in a given start condition
+pub fn is_rule_active_in_condition(rule: &LexRule, condition: &str, lexinfo: &LexInfo) -> bool {
+    // If rule has explicit start conditions, check if this condition is listed
+    if !rule.start_conditions.is_empty() {
+        return rule.start_conditions.contains(&condition.to_string());
+    }
+
+    // Rule has no explicit conditions
+    // For INITIAL or %s (inclusive) conditions, the rule is active
+    // For %x (exclusive) conditions, the rule is NOT active
+    if condition == "INITIAL" || lexinfo.cond_start.contains(&condition.to_string()) {
+        return true;
+    }
+
+    // This is an exclusive condition (%x), and rule has no explicit conditions
+    false
+}
+
 #[cfg(test)]
 mod lextest {
     use super::*;
@@ -1170,8 +1248,10 @@ DIGIT [0-9]
 
         // Third rule has STRING and INITIAL conditions
         assert_eq!(lexinfo.rules[2].start_conditions, vec!["STRING", "INITIAL"]);
-        // The quote in quotes becomes empty class - quotes strip the contents
-        assert_eq!(lexinfo.rules[2].ere, "[]");
+        // '"' inside a bracket expression is an ordinary member, not the start
+        // of a quoted string; it used to be stripped, leaving the unparseable
+        // empty class "[]".
+        assert_eq!(lexinfo.rules[2].ere, "[\"]");
     }
 
     #[test]

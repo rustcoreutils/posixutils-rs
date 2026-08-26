@@ -468,8 +468,18 @@ fn test_start_condition_code_generation() {
     // Check for YY_START macro
     assert!(c_code.contains("#define YY_START"));
 
-    // Check for rule condition table (since we have multiple conditions)
-    assert!(c_code.contains("yy_rule_cond"));
+    // Start conditions are resolved by which automaton the scanner enters, so
+    // there is a per-condition entry dispatch and no accept-time rule/condition
+    // table to consult.
+    assert!(
+        c_code.contains("switch (yy_start_state * 2 + (yy_at_bol ? 1 : 0))"),
+        "expected a per-condition entry dispatch: {}",
+        c_code
+    );
+    assert!(
+        !c_code.contains("yy_rule_cond"),
+        "the accept-time condition filter should be gone"
+    );
 }
 
 // REJECT tests
@@ -793,14 +803,10 @@ int main(void) {
 
     let (c_code, success) = run_lex(lex_input);
     assert!(success, "lex failed to generate C code");
-    assert!(
-        c_code.contains("yy_c == EOF ? 0 : yy_c"),
-        "input() must normalize EOF to 0: {}",
-        c_code
-    );
 
     // Input is just "a" with no trailing newline, so input() after matching
-    // 'a' hits EOF and must return 0.
+    // 'a' hits EOF and must return 0. Asserted on behavior rather than on the
+    // shape of the emitted C, which changed when input() moved to YY_INPUT.
     let result = compile_and_run(&c_code, "a");
     assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
     let output = result.unwrap();
@@ -871,8 +877,20 @@ hello     printf("HELLO\n");
 
     // Check for BOL tracking variable
     assert!(c_code.contains("yy_at_bol"));
-    // Check for BOL rule table
-    assert!(c_code.contains("yy_rule_bol"));
+    // '^' is resolved by entering a separate beginning-of-line automaton
+    // rather than by consulting a yy_rule_bol[] table after the match.
+    assert!(
+        c_code.contains("if (yy_at_bol) goto yy_state_"),
+        "expected a beginning-of-line entry state: {}",
+        c_code
+    );
+    assert!(
+        !c_code.contains("yy_rule_bol"),
+        "the accept-time BOL filter should be gone"
+    );
+
+    let result = compile_and_run(&c_code, "hello\nhello\n").unwrap();
+    assert_eq!(result, "BOL_HELLO\nBOL_HELLO\n");
 }
 
 #[test]
@@ -3205,4 +3223,843 @@ int main() {
         "hello inside string should NOT match INITIAL-only rule"
     );
     assert!(result.contains("END_STRING"), "Should end string");
+}
+
+// ---------------------------------------------------------------------------
+// Pattern scanning: byte offsets and bracket-expression context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_multibyte_pattern_does_not_panic() {
+    // find_ere_end() counted characters while parse_rule() sliced bytes, so any
+    // non-ASCII byte in a pattern split the rule at a non-char-boundary.
+    let lex_input = "%option noinput nounput\n%%\n\u{e9}  { printf(\"E\"); }\n.|\\n  { }\n%%\n";
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected a multibyte pattern: {}", c_code);
+    assert!(c_code.contains("printf(\"E\")"), "action was lost");
+}
+
+#[test]
+fn test_multibyte_quoted_pattern_splits_at_action() {
+    // The same off-by-bytes split silently mangled quoted patterns, emitting the
+    // remainder of the rule line into lex.yy.c as C.
+    let lex_input =
+        "%option noinput nounput\n%%\n\"caf\u{e9}\"  { printf(\"C\"); }\n.|\\n  { }\n%%\n";
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex rejected a quoted multibyte pattern: {}",
+        c_code
+    );
+    assert!(
+        c_code.contains("printf(\"C\");"),
+        "action did not survive the pattern/action split"
+    );
+    // The stray fragment used to land in the generated C as a bare string
+    // expression, which -Werror rejects; prove the output still compiles.
+    compile_and_run(&c_code, "x\n").expect("generated scanner must compile");
+}
+
+#[test]
+fn test_multibyte_before_trailing_context_slash() {
+    // find_trailing_context_slash() had the same char-index/byte-index defect.
+    let lex_input = "%option noinput nounput\n%%\n\u{e9}/x  { printf(\"T\"); }\n.|\\n  { }\n%%\n";
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex rejected multibyte before a trailing-context slash: {}",
+        c_code
+    );
+}
+
+#[test]
+fn test_brace_inside_bracket_expression() {
+    // translate_ere() tracked quotes and braces but not bracket expressions, so
+    // "[{}]" was read as a reference to a substitution named "{}".
+    let lex_input = r#"%option noinput nounput
+%%
+[{}]    { printf("B"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected [{{}}]: {}", c_code);
+
+    let result = compile_and_run(&c_code, "{}").unwrap();
+    assert_eq!(result, "BB", "both braces should match the class");
+}
+
+#[test]
+fn test_quote_inside_bracket_expression() {
+    // Likewise "[\"]" opened a quoted string, swallowed the ']' and left "[]".
+    let lex_input = r#"%option noinput nounput
+%%
+["]     { printf("Q"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected [\"]: {}", c_code);
+
+    let result = compile_and_run(&c_code, "\"").unwrap();
+    assert_eq!(result, "Q", "the quote character should match the class");
+}
+
+#[test]
+fn test_posix_class_inside_brackets_with_interval() {
+    // A POSIX class must be copied whole so its closing ']' does not end the
+    // enclosing bracket expression and expose a following interval.
+    let lex_input = r#"%option noinput nounput
+%%
+[[:alpha:]]{2}  { printf("A"); }
+.|\n            { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected [[:alpha:]]{{2}}: {}", c_code);
+
+    let result = compile_and_run(&c_code, "ab").unwrap();
+    assert_eq!(result, "A");
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-length analysis, equivalence-class counting, NFA size, stats gating
+// ---------------------------------------------------------------------------
+
+/// Compile `c_code` and run it against `input`, giving up after `secs`.
+///
+/// `compile_and_run` waits forever and discards the exit status, so it cannot
+/// witness a scanner that hangs or dies. Returns `Err` describing the failure.
+fn compile_and_run_bounded(c_code: &str, input: &str, secs: u64) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let temp_dir = TempDir::new().unwrap();
+    let c_file = temp_dir.path().join("lexer.c");
+    let exe_file = temp_dir.path().join("lexer");
+    let input_file = temp_dir.path().join("input.txt");
+    let out_file = temp_dir.path().join("out.txt");
+
+    fs::write(&c_file, c_code).unwrap();
+    fs::write(&input_file, input).unwrap();
+
+    let compile = Command::new("cc")
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe_file.to_str().unwrap(),
+            c_file.to_str().unwrap(),
+            "-lm",
+        ])
+        .output()
+        .expect("Failed to compile");
+    if !compile.status.success() {
+        return Err(format!(
+            "Compilation failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
+
+    let mut child = Command::new(&exe_file)
+        .stdin(Stdio::from(fs::File::open(&input_file).unwrap()))
+        .stdout(Stdio::from(fs::File::create(&out_file).unwrap()))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to run lexer");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait().expect("try_wait failed") {
+            Some(status) => {
+                if !status.success() {
+                    return Err(format!("scanner exited with {}", status));
+                }
+                break;
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("scanner did not terminate within {}s", secs));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
+    let mut out = String::new();
+    fs::File::open(&out_file)
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    Ok(out)
+}
+
+#[test]
+fn test_star_main_pattern_with_trailing_context_terminates() {
+    // compute_fixed_length() compared rep.min against rep.max.unwrap_or(0), so
+    // an unbounded `x*` (min 0, max None) was reported as a *fixed* length of
+    // zero. The scanner then rewound to the token start and made no progress.
+    let lex_input = r#"%option noinput nounput
+%%
+x*/xy   { printf("[%s]", yytext); }
+.|\n    { printf("(%s)", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result =
+        compile_and_run_bounded(&c_code, "xxxy", 10).expect("scanner must terminate on x*/xy");
+    assert!(
+        !result.is_empty(),
+        "scanner produced no output for x*/xy on xxxy"
+    );
+}
+
+#[test]
+fn test_all_distinct_equivalence_classes_are_counted() {
+    // The class counter was a u8 with saturating_add, so 256 distinct classes
+    // were reported as 255.
+    let mut spec = String::from("%option noinput nounput\n%%\n");
+    for b in 1..=255u32 {
+        spec.push_str(&format!("\\x{:02x}   {{ }}\n", b));
+    }
+    spec.push_str("%%\n");
+
+    let (c_code, success) = run_lex(&spec);
+    assert!(success, "lex failed: {}", c_code);
+
+    // 255 single-byte rules plus the class holding the unmatched NUL.
+    assert!(
+        c_code.contains("#define YY_NUM_CLASSES 256"),
+        "expected 256 equivalence classes, generated file says otherwise"
+    );
+}
+
+#[test]
+fn test_stats_are_silent_without_verbose() {
+    // POSIX gates the statistics summary on -v and requires -n to suppress it;
+    // code generation used to log a state/class count to stderr unconditionally.
+    let lex_input = "%%\n[a-z]+  { }\n%%\n";
+
+    let (_out, success) = run_lex_capture(&[], lex_input);
+    assert!(success);
+    let (combined, success) = run_lex_capture(&[], lex_input);
+    assert!(success);
+    assert!(
+        combined.is_empty(),
+        "lex chattered without -v: {:?}",
+        combined
+    );
+
+    let (combined_n, success) = run_lex_capture(&["-n"], lex_input);
+    assert!(success);
+    assert!(
+        combined_n.is_empty(),
+        "-n did not suppress statistics: {:?}",
+        combined_n
+    );
+
+    let (combined_v, success) = run_lex_capture(&["-v"], lex_input);
+    assert!(success);
+    assert!(
+        combined_v.contains("lex statistics:"),
+        "-v did not produce statistics: {:?}",
+        combined_v
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scanner buffer safety
+// ---------------------------------------------------------------------------
+
+/// Compile `c_code`, run it on `input`, and return (stdout, stderr, exit code).
+fn compile_and_run_status(c_code: &str, input: &str) -> (String, String, Option<i32>) {
+    use std::process::Stdio;
+
+    let temp_dir = TempDir::new().unwrap();
+    let c_file = temp_dir.path().join("lexer.c");
+    let exe_file = temp_dir.path().join("lexer");
+    let input_file = temp_dir.path().join("input.txt");
+
+    fs::write(&c_file, c_code).unwrap();
+    fs::write(&input_file, input).unwrap();
+
+    let compile = Command::new("cc")
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe_file.to_str().unwrap(),
+            c_file.to_str().unwrap(),
+            "-lm",
+        ])
+        .output()
+        .expect("Failed to compile");
+    assert!(
+        compile.status.success(),
+        "Compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe_file)
+        .stdin(Stdio::from(fs::File::open(&input_file).unwrap()))
+        .output()
+        .expect("Failed to run lexer");
+
+    (
+        String::from_utf8_lossy(&run.stdout).to_string(),
+        String::from_utf8_lossy(&run.stderr).to_string(),
+        run.status.code(),
+    )
+}
+
+#[test]
+fn test_array_mode_rejects_token_larger_than_yylmax() {
+    // %array gives yytext a fixed char[YYLMAX] that cannot grow, but the input
+    // buffer grows without limit and the token was copied in unchecked, so a
+    // long token smashed past the end of yytext.
+    let lex_input = r#"%option noinput nounput
+%array
+%%
+[a-z]+  { printf("%d\n", yyleng); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let big = "a".repeat(20000);
+    let (_stdout, stderr, code) = compile_and_run_status(&c_code, &big);
+    assert_eq!(
+        code,
+        Some(2),
+        "expected a clean fatal error, got exit {:?} (stderr: {})",
+        code,
+        stderr
+    );
+    assert!(
+        stderr.contains("token too large"),
+        "expected a 'token too large' diagnostic, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_array_mode_normal_token_unaffected() {
+    let lex_input = r#"%option noinput nounput
+%array
+%%
+[a-z]+  { printf("%d\n", yyleng); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "hello\n").unwrap();
+    assert_eq!(result.trim(), "5");
+}
+
+#[test]
+fn test_input_reads_through_yy_input() {
+    // input() used to call getc(yyin) directly once the buffer was drained,
+    // ignoring a user-supplied YY_INPUT -- the documented way to feed a scanner
+    // from something other than a FILE *.
+    let lex_input = r#"%option nounput
+%{
+static const char *yy_src = "AZq";
+static int yy_src_pos = 0;
+/* One byte per call, so draining with input() must come back to YY_INPUT. */
+#define YY_INPUT(buf, result, max_size) \
+    do { \
+        if ((max_size) > 0 && yy_src[yy_src_pos] != 0) { \
+            (buf)[0] = yy_src[yy_src_pos++]; \
+            (result) = 1; \
+        } else { \
+            (result) = 0; \
+        } \
+    } while (0)
+%}
+%%
+A       { int c; printf("A["); while ((c = input()) != 0) putchar(c); printf("]"); }
+.|\n    { printf("(%s)", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // stdin is empty, so every character must come from YY_INPUT. Reading via
+    // getc(yyin) instead stopped at the one buffered lookahead character and
+    // produced "A[Z](q)".
+    let result = compile_and_run(&c_code, "").unwrap();
+    assert_eq!(result, "A[Zq]");
+}
+
+// ---------------------------------------------------------------------------
+// '^' anchoring resolved by the automaton, not by a post-match filter
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bol_rule_does_not_shadow_shorter_match() {
+    // The anchored rule used to record the longest match even off a line start.
+    // The later BOL check then only looked for another rule accepting at that
+    // same longer position, so a valid shorter match was skipped entirely and
+    // the scanner fell back to echoing one character.
+    let lex_input = r#"%option noinput nounput
+%%
+^foobar { printf("<foobar>"); }
+foo     { printf("<foo>"); }
+[a-z]   { printf("<%s>", yytext); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // "xfoobar": ^foobar cannot apply, so foo must win at offset 1.
+    let result = compile_and_run(&c_code, "xfoobar\n").unwrap();
+    assert_eq!(result, "<x><foo><b><a><r>");
+
+    // At a real line start the anchored rule still wins.
+    let result = compile_and_run(&c_code, "foobar\n").unwrap();
+    assert_eq!(result, "<foobar>");
+}
+
+#[test]
+fn test_bol_anchor_after_newline_and_under_start_condition() {
+    // The beginning-of-line automaton has to be re-entered after every newline,
+    // and start conditions are filtered independently of anchoring.
+    let lex_input = r#"%option noinput nounput
+%s SC
+%%
+^begin      { printf("<^begin>"); BEGIN(SC); }
+<SC>^begin  { printf("<sc^begin>"); }
+begin       { printf("<begin>"); }
+[a-z]       { }
+\n          { printf("|"); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // Line 1 starts with begin -> anchored rule, switches to SC.
+    // Line 2 has begin mid-line -> only the unanchored rule can apply.
+    // Line 3 starts with begin -> anchored again, now in SC.
+    let result = compile_and_run(&c_code, "begin\nxbegin\nbegin\n").unwrap();
+    assert_eq!(result, "<^begin>|<begin>|<^begin>|");
+}
+
+#[test]
+fn test_no_bol_anchor_keeps_single_entry_state() {
+    // With no '^' in the spec the two roots have the same closure and collapse,
+    // so the generated scanner keeps a single unconditional entry.
+    let lex_input = r#"%option noinput nounput
+%%
+[a-z]+  { printf("W"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+    assert!(
+        !c_code.contains("if (yy_at_bol) goto yy_state_"),
+        "an unanchored spec should not pay for a BOL entry state"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REJECT match history and variable-length trailing context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_reject_does_not_repeat_the_rule_it_left() {
+    // The fallback popped the entry for the match that had just run and
+    // rescanned its accept list from the start, re-selecting the same rule.
+    let lex_input = r#"%option noinput nounput
+%%
+abc     { printf("<abc>"); REJECT; }
+ab      { printf("<ab>"); REJECT; }
+a       { printf("<a>"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "abc").unwrap();
+    assert_eq!(result, "<abc><ab><a>");
+}
+
+#[test]
+fn test_reject_token_longer_than_the_old_fixed_stack() {
+    // The history stack was a fixed 64 entries and overflow was fatal, so any
+    // REJECT scanner died on a token of more than 64 characters.
+    let lex_input = r#"%option noinput nounput
+%%
+a+      { printf("%d,", yyleng); REJECT; }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let (stdout, stderr, code) = compile_and_run_status(&c_code, &"a".repeat(80));
+    assert_eq!(code, Some(0), "scanner failed: {}", stderr);
+    // a+ matches all 80, rejects, then 79, and so on; the old fixed stack made
+    // this fatal past 64. Scanning then resumes at the next position, so the
+    // run repeats for each remaining prefix.
+    assert!(
+        stdout.starts_with("80,79,78,"),
+        "got: {}",
+        &stdout[..40.min(stdout.len())]
+    );
+    assert!(
+        stdout.contains(",65,64,63,"),
+        "the run must pass the old 64-entry limit"
+    );
+    assert!(stdout.ends_with("1,"), "unterminated run");
+}
+
+#[test]
+fn test_reject_token_spanning_a_buffer_refill() {
+    // Entries stored raw pointers that the refill path never adjusted across
+    // its memmove and realloc, so a token spanning a refill hung on dangling
+    // pointers. Offsets from YYTOKEN survive the shift.
+    let lex_input = r#"%option noinput nounput
+%%
+xa*yb   { printf("L%d", yyleng); REJECT; }
+x       { printf("X"); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let input = format!("x{}yb", "a".repeat(20000));
+    let result = compile_and_run_bounded(&c_code, &input, 20)
+        .expect("scanner must terminate on a REJECT token spanning a refill");
+    assert_eq!(result, "L20003X");
+}
+
+#[test]
+fn test_variable_trailing_context_picks_the_consistent_split() {
+    // The main-pattern end was recorded last-write-wins, so the furthest
+    // position won whether or not the trailing context matched from there.
+    // For x+/xy on "xxxy" only x+ = "xx" leaves a remainder matching "xy".
+    let lex_input = r#"%option noinput nounput
+%%
+x+/xy   { printf("[%s]", yytext); }
+.|\n    { printf("(%s)", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "xxxy").unwrap();
+    assert_eq!(result, "[xx](x)(y)");
+}
+
+#[test]
+fn test_variable_trailing_context_cases_match_flex() {
+    // Each expectation here is flex 2.6.4's answer for the same specification.
+    let cases: &[(&str, &str, &str)] = &[
+        ("x+/xy", "xxxxxy", "[xxxx](x)(y)"),
+        ("a+/ab", "aaab", "[aa](a)(b)"),
+        ("[a-z]+/,", "abc,d", "[abc](,)(d)"),
+        ("a*b/bc", "aabbc", "[aab](b)(c)"),
+        ("(ab)+/abc", "ababababc", "[ababab](a)(b)(c)"),
+        ("a+/b+", "aaabbb", "[aaa](b)(b)(b)"),
+        ("x+/x", "xxxx", "[xxx](x)"),
+        // Fixed-length trailing context must be unaffected.
+        ("ab/cd", "abcd", "[ab](c)(d)"),
+    ];
+
+    for (rule, input, expected) in cases {
+        let lex_input = format!(
+            "%option noinput nounput\n%%\n{}   {{ printf(\"[%s]\", yytext); }}\n.|\\n    {{ printf(\"(%s)\", yytext); }}\n%%\n",
+            rule
+        );
+        let (c_code, success) = run_lex(&lex_input);
+        assert!(success, "lex failed for {}: {}", rule, c_code);
+
+        let result = compile_and_run(&c_code, input).unwrap();
+        assert_eq!(result, *expected, "rule {} on {:?}", rule, input);
+    }
+}
+
+#[test]
+fn test_nullable_main_pattern_with_trailing_context_terminates() {
+    // x* admits an empty split, which consumes nothing. flex livelocks here,
+    // emitting empty matches forever; the scanner must instead step over the
+    // position, and lex must say why.
+    let lex_input = r#"%%
+x*/xy   { printf("[%s]", yytext); }
+.|\n    { printf("(%s)", yytext); }
+%%
+"#;
+
+    let (combined, success) = run_lex_capture(&[], lex_input);
+    assert!(success, "lex failed: {}", combined);
+    assert!(
+        combined.contains("can match the empty string"),
+        "expected a warning about the nullable main pattern, got: {:?}",
+        combined
+    );
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+    compile_and_run_bounded(&c_code, "xxxy", 10).expect("scanner must terminate");
+}
+
+// ---------------------------------------------------------------------------
+// Input buffer maintenance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_buffer_maintenance_is_centralized() {
+    // Growth used to rebase YYCURSOR/YYLIMIT/YYTOKEN/YYMARKER at each site that
+    // moved the buffer, and one of those sites forgot. Exactly one routine
+    // should reallocate it now.
+    let lex_input = r#"%%
+[a-z]+  { printf("%d,", yyleng); }
+.|\n    { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let reallocs = c_code.matches("realloc(yy_buffer").count();
+    assert_eq!(
+        reallocs, 1,
+        "the input buffer should be reallocated in one place only"
+    );
+    assert!(c_code.contains("static void yy_buffer_grow(void)"));
+    assert!(c_code.contains("static void yy_buffer_compact(void)"));
+    assert!(c_code.contains("static int yy_buffer_fill(void)"));
+}
+
+#[test]
+fn test_token_far_larger_than_the_buffer() {
+    // The token has to survive repeated compaction and growth with every saved
+    // position still naming its own byte.
+    let lex_input = r#"%option noinput nounput
+%%
+a+      { printf("%d\n", yyleng); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // YY_BUF_SIZE is 16384; this spans several growths.
+    let input = format!("{}\n", "a".repeat(100_000));
+    let result = compile_and_run_bounded(&c_code, &input, 20).expect("scanner must terminate");
+    assert_eq!(result.trim(), "100000");
+}
+
+#[test]
+fn test_unput_then_rescan_across_the_buffer_front() {
+    // unput() at the front of the buffer shifts everything right; every cursor
+    // has to move with its data.
+    let lex_input = r#"%option noinput
+%%
+abc     { printf("<abc>"); unput('z'); unput('y'); }
+[a-z]   { printf("(%s)", yytext); }
+\n      { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // "yz" is pushed back in reverse, so it is rescanned as y then z.
+    let result = compile_and_run(&c_code, "abc\n").unwrap();
+    assert_eq!(result, "<abc>(y)(z)");
+}
+
+// ---------------------------------------------------------------------------
+// POSIX bracket expressions: a leading ']' is an ordinary member
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_leading_bracket_is_a_literal_member() {
+    // In "[]abc]" the first ']' is a member, not the terminator. Treating it as
+    // the terminator ends the class early and exposes the rest of the pattern
+    // to operator parsing.
+    let cases: &[(&str, &str, &str)] = &[
+        ("[]]", "]x", "<m:]>(x)"),
+        ("[]a]", "a]x", "<m:a><m:]>(x)"),
+        // '/' inside such a class must not be read as trailing context.
+        ("[]/]+", "/]x", "<m:/]>(x)"),
+        // nor '$' as an end-of-line anchor.
+        ("[]$]+", "$]x", "<m:$]>(x)"),
+        // '^' keeps the class at its start, so ']' after it is a member too.
+        ("[^]{}]+", "ab}cd", "<m:ab>(})<m:cd>"),
+    ];
+
+    for (pattern, input, expected) in cases {
+        let lex_input = format!(
+            "%option noinput nounput\n%%\n{}   {{ printf(\"<m:%s>\", yytext); }}\n.|\\n    {{ printf(\"(%s)\", yytext); }}\n%%\n",
+            pattern
+        );
+        let (c_code, success) = run_lex(&lex_input);
+        assert!(success, "lex rejected {}: {}", pattern, c_code);
+
+        let result = compile_and_run(&c_code, input).unwrap();
+        assert_eq!(result, *expected, "pattern {} on {:?}", pattern, input);
+    }
+}
+
+#[test]
+fn test_negated_class_with_escape_still_terminates() {
+    // Regression: clearing the "class start" flag only in some match arms let
+    // "[^}\n]" read its ']' as a member and swallow the rest of the line.
+    let lex_input = r#"%option noinput nounput
+%%
+"{"[^}\n]*"}"   { printf("<c>"); }
+[a-z]+          { printf("<w:%s>", yytext); }
+.|\n            { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "ab {note} cd\n").unwrap();
+    assert_eq!(result, "<w:ab><c><w:cd>");
+}
+
+#[test]
+fn test_escaped_member_does_not_hold_the_class_start() {
+    // An escaped character inside a bracket expression is an ordinary member,
+    // so it ends the position where a ']' would be literal. Treating "[^\n]"'s
+    // ']' as a member left the scanner "inside brackets" for the rest of the
+    // pattern, swallowing the '$' anchor, the '/' operator and {substitutions}.
+    let lex_input = r#"%option noinput nounput
+%%
+[^\n]*z$    { printf("M(%s)", yytext); }
+.|\n        { printf("%s", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // Only the second line ends in 'z', so only it may match.
+    let result = compile_and_run(&c_code, "az b\nxz\n").unwrap();
+    assert_eq!(result, "az b\nM(xz)\n");
+}
+
+#[test]
+fn test_escaped_bracket_member_keeps_trailing_context() {
+    let lex_input = r#"%option noinput nounput
+%%
+[\]]+/b     { printf("M(%s)", yytext); }
+.|\n        { printf("%s", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "]]b").unwrap();
+    assert_eq!(result, "M(]])b");
+}
+
+#[test]
+fn test_substitution_after_negated_class_is_expanded() {
+    // The same defect left translate_ere() inside brackets, so a {name}
+    // reference after such a class was copied through instead of expanded and
+    // the rule failed to compile at all.
+    let lex_input = r#"%option noinput nounput
+ID  [0-9]+
+%%
+[^\n]*{ID}  { printf("M(%s)", yytext); }
+.|\n        { printf("%s", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(
+        success,
+        "lex rejected a substitution after [^\\n]: {}",
+        c_code
+    );
+
+    let result = compile_and_run(&c_code, "ab12\n").unwrap();
+    assert_eq!(result, "M(ab12)\n");
+}
+
+#[test]
+fn test_second_caret_in_class_is_an_ordinary_member() {
+    // Only a '^' immediately after '[' is the negation; "[^^]" is the class of
+    // everything except a caret, and its ']' terminates as usual.
+    let lex_input = r#"%option noinput nounput
+%%
+[^^]+       { printf("M(%s)", yytext); }
+.|\n        { printf("%s", yytext); }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex rejected [^^]: {}", c_code);
+
+    let result = compile_and_run(&c_code, "ab^cd").unwrap();
+    assert_eq!(result, "M(ab)^M(cd)");
+}
+
+#[test]
+fn test_refill_at_an_accepting_state_records_one_accept() {
+    // A state emits its accept record before the end-of-buffer check, so
+    // resuming there after a refill used to re-run it and push a second,
+    // identical REJECT entry. The walk-back then handed the same match back
+    // twice and the action ran twice for one position.
+    let lex_input = r#"%option noinput nounput
+%%
+abcd        { printf("[abcd]"); REJECT; }
+abc         { printf("[abc]"); REJECT; }
+ab          { printf("[ab]"); REJECT; }
+a           { printf("[a]"); REJECT; }
+.|\n        { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    // Sweep the 16 KB buffer boundary so the refill lands on each state of the
+    // "abcd" match in turn; one of these offsets is the failing case.
+    for pad in 16375..16385 {
+        let input = format!("{}abcd", ".".repeat(pad));
+        let result = compile_and_run_bounded(&c_code, &input, 20).expect("scanner must terminate");
+        assert_eq!(
+            result, "[abcd][abc][ab][a]",
+            "duplicate match with {} bytes of padding",
+            pad
+        );
+    }
 }

@@ -15,12 +15,12 @@ use std::sync::LazyLock;
 
 /// Pre-compiled regex for normal diff commands to avoid recompilation on each parse.
 static CMD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\d+)(?:,(\d+))?([acd])(\d+)(?:,(\d+))?$").expect("invalid regex")
+    Regex::new(r"^(\d+)(?:,(\d+))?([acd])(\d+)(?:,(\d+))?\r?$").expect("invalid regex")
 });
 
 /// Pre-compiled regex for detecting normal diff commands.
 static DETECT_CMD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]\d+(?:,\d+)?$").expect("invalid regex"));
+    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]\d+(?:,\d+)?\r?$").expect("invalid regex"));
 
 /// Parse a normal diff from the given lines.
 pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), PatchError> {
@@ -117,7 +117,7 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
                     prev_old = false;
                     prev_new = true;
                     pos += 1;
-                } else if content_line == "---" {
+                } else if content_line.trim_end_matches('\r') == "---" {
                     // Separator between delete and add in change
                     pos += 1;
                 } else if content_line.starts_with("\\") {

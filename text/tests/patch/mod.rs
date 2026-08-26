@@ -2178,3 +2178,105 @@ fn test_patch_git_rename_only() {
 
     cleanup_test_dir(&test_dir);
 }
+
+// A '\r' is part of a line's content, so a patch written against LF text does
+// not match a CRLF file. It must reject rather than apply and, as a side
+// effect of str::lines() dropping the '\r', rewrite every line ending in the
+// file.
+#[test]
+fn test_patch_crlf_file_lf_patch_rejects() {
+    let test_dir = setup_test_dir("crlf_lf");
+
+    let target = test_dir.join("crlf.txt");
+    fs::write(&target, "a\r\nb\r\nc\r\n").unwrap();
+
+    let patch_file = test_dir.join("crlf.patch");
+    fs::write(
+        &patch_file,
+        "--- crlf.txt\n+++ crlf.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1, "hunk must be rejected");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"a\r\nb\r\nc\r\n",
+        "every line ending must survive untouched"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A patch whose content lines carry the file's CRLF applies, and the endings
+// round-trip.
+#[test]
+fn test_patch_crlf_file_crlf_patch_applies() {
+    let test_dir = setup_test_dir("crlf_crlf");
+
+    let target = test_dir.join("crlf.txt");
+    fs::write(&target, "a\r\nb\r\nc\r\n").unwrap();
+
+    let patch_file = test_dir.join("crlf.patch");
+    // diff metadata in LF, content lines carrying the file's CRLF.
+    fs::write(
+        &patch_file,
+        "--- crlf.txt\n+++ crlf.txt\n@@ -1,3 +1,3 @@\n a\r\n-b\r\n+B\r\n c\r\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read(&target).unwrap(), b"a\r\nB\r\nc\r\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A file with mixed endings must keep each line's own ending across a hunk
+// that touches only part of it.
+#[test]
+fn test_patch_mixed_line_endings_preserved() {
+    let test_dir = setup_test_dir("mixed_eol");
+
+    let target = test_dir.join("mixed.txt");
+    fs::write(&target, "a\nb\r\nc\nd\r\n").unwrap();
+
+    let patch_file = test_dir.join("mixed.patch");
+    fs::write(
+        &patch_file,
+        "--- mixed.txt\n+++ mixed.txt\n@@ -3,2 +3,2 @@\n-c\n+C\n d\r\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read(&target).unwrap(), b"a\nb\r\nC\nd\r\n");
+
+    cleanup_test_dir(&test_dir);
+}

@@ -15,11 +15,11 @@ use std::sync::LazyLock;
 
 /// Pre-compiled regex for ed commands to avoid recompilation on each parse.
 static CMD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+)(?:,(\d+))?([acd])$").expect("invalid regex"));
+    LazyLock::new(|| Regex::new(r"^(\d+)(?:,(\d+))?([acd])\r?$").expect("invalid regex"));
 
 /// Pre-compiled regex for detecting ed commands.
 static DETECT_CMD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]$").expect("invalid regex"));
+    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]\r?$").expect("invalid regex"));
 
 /// Parse an ed script from the given lines.
 pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), PatchError> {
@@ -72,7 +72,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                     let mut text_lines: Vec<String> = Vec::new();
                     while pos < lines.len() {
                         let text_line = lines[pos];
-                        if text_line == "." {
+                        if text_line.trim_end_matches('\r') == "." {
                             pos += 1;
                             break;
                         }
@@ -97,7 +97,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                     let mut text_lines: Vec<String> = Vec::new();
                     while pos < lines.len() {
                         let text_line = lines[pos];
-                        if text_line == "." {
+                        if text_line.trim_end_matches('\r') == "." {
                             pos += 1;
                             break;
                         }
@@ -139,7 +139,7 @@ pub fn looks_like_ed(lines: &[&str]) -> bool {
             return true;
         }
         // If we hit content that's not an ed command, it's probably not ed
-        if !line.is_empty() && !line.starts_with('.') {
+        if !super::parser::is_blank(line) && !line.starts_with('.') {
             return false;
         }
     }

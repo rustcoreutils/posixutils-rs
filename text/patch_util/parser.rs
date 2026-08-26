@@ -93,6 +93,29 @@ pub fn detect_format(lines: &[&str], config: &PatchConfig) -> Option<DiffFormat>
     None
 }
 
+/// Split text into lines on '\n' only, so a '\r' stays part of the line.
+///
+/// Unlike `str::lines`, this does not strip a carriage return: a '\r' belongs
+/// to a line's content, both in a file being patched and in the patch's own
+/// content lines. Structural lines -- hunk headers, ed commands, separators --
+/// tolerate a trailing '\r' wherever they are matched.
+pub fn split_lines(content: &str) -> Vec<&str> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    if content.ends_with('\n') {
+        // The split leaves an empty piece after the final newline.
+        lines.pop();
+    }
+    lines
+}
+
+/// Whether a line carries no text, allowing for a CRLF line ending.
+pub fn is_blank(line: &str) -> bool {
+    line.is_empty() || line == "\r"
+}
+
 /// Compute the byte length of the leading <blank> (space/tab) run of a line.
 fn leading_blank_len(line: &str) -> usize {
     line.find(|c| c != ' ' && c != '\t').unwrap_or(line.len())
@@ -106,7 +129,7 @@ fn leading_blank_len(line: &str) -> usize {
 fn common_blank_prefix_len(lines: &[&str]) -> usize {
     let mut prefix: Option<&str> = None;
     for &line in lines {
-        if line.is_empty() {
+        if is_blank(line) {
             continue;
         }
         let blanks = &line[..leading_blank_len(line)];
@@ -130,7 +153,7 @@ fn common_blank_prefix_len(lines: &[&str]) -> usize {
 
 /// Parse the patch content into a Patch structure.
 pub fn parse_patch(content: &str, config: &PatchConfig) -> Result<Patch, PatchError> {
-    let raw_lines: Vec<&str> = content.lines().collect();
+    let raw_lines = split_lines(content);
 
     if raw_lines.is_empty() {
         return Ok(Patch::default());
@@ -188,7 +211,7 @@ pub fn parse_patch(content: &str, config: &PatchConfig) -> Result<Patch, PatchEr
         // Skip any blank lines or header comments between patches
         while pos < lines.len() {
             let line = lines[pos];
-            if line.is_empty() {
+            if is_blank(line) {
                 pos += 1;
             } else {
                 break;

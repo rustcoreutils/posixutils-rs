@@ -174,12 +174,15 @@ fn collapse_slashes(path: &str) -> String {
 pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
     let content = fs::read_to_string(path)?;
     let trailing_newline = content.ends_with('\n');
-    // Count lines for pre-allocation
-    let line_count = content.bytes().filter(|&b| b == b'\n').count() + 1;
-    let mut lines = Vec::with_capacity(line_count);
-    for line in content.lines() {
-        lines.push(line.to_string());
-    }
+    // Keeping any '\r' as part of the line makes the round trip through
+    // write_output lossless for a CRLF file, and makes a patch written against
+    // LF text simply fail to match one -- which is what should happen, rather
+    // than the patch quietly rewriting every line ending in the file as a side
+    // effect of changing one line.
+    let lines: Vec<String> = super::parser::split_lines(&content)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     Ok((lines, trailing_newline))
 }
 

@@ -17,6 +17,49 @@ use super::{
     unified::{looks_like_unified, parse_unified},
 };
 
+/// Report git extended-header sections that carry no textual difference.
+///
+/// git records renames, mode changes and binary blobs with header lines and no
+/// hunk. Neither POSIX nor GNU patch applies those, but a patch made only of
+/// them is well-formed input, not garbage -- name what is being skipped so the
+/// user can act on it. Returns whether any such section was found.
+fn report_git_only_sections(lines: &[&str]) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i].starts_with("diff --git ") {
+            i += 1;
+            continue;
+        }
+        let header = lines[i];
+        let mut what: Option<String> = None;
+        let mut j = i + 1;
+        while j < lines.len() && !lines[j].starts_with("diff --git ") {
+            let l = lines[j];
+            if let Some(to) = l.strip_prefix("rename to ") {
+                let from = lines[i + 1..j]
+                    .iter()
+                    .find_map(|p| p.strip_prefix("rename from "))
+                    .unwrap_or("?");
+                what = Some(format!("rename of {} to {}", from, to));
+            } else if l.starts_with("GIT binary patch") {
+                what = Some(String::from("binary difference"));
+            } else if l.starts_with("copy to ") {
+                what = Some(String::from("file copy"));
+            } else if what.is_none() && l.starts_with("old mode ") {
+                what = Some(String::from("file mode change"));
+            }
+            j += 1;
+        }
+        if let Some(what) = what {
+            eprintln!("patch: ignoring {} ({})", what, header);
+            found = true;
+        }
+        i = j;
+    }
+    found
+}
+
 /// Detect the diff format from the patch content.
 pub fn detect_format(lines: &[&str], config: &PatchConfig) -> Option<DiffFormat> {
     // Honor forced format options
@@ -111,10 +154,22 @@ pub fn parse_patch(content: &str, config: &PatchConfig) -> Result<Patch, PatchEr
         raw_lines
     };
 
-    let format = detect_format(&lines, config).ok_or_else(|| PatchError::Parse {
-        line: 1,
-        message: "could not determine diff format".to_string(),
-    })?;
+    let format = match detect_format(&lines, config) {
+        Some(format) => format,
+        None => {
+            // A git patch section that changes no text (a rename, a mode
+            // change, a binary blob) carries no hunk for any format to
+            // recognize. Say what was skipped instead of failing the whole
+            // patch as unreadable.
+            if report_git_only_sections(&lines) {
+                return Ok(Patch::default());
+            }
+            return Err(PatchError::Parse {
+                line: 1,
+                message: "could not determine diff format".to_string(),
+            });
+        }
+    };
 
     let mut patch = Patch::default();
     let mut pos = 0;

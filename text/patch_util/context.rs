@@ -9,6 +9,7 @@
 
 //! Context diff format parser.
 
+use super::header::parse_filename;
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchError};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -90,10 +91,13 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             };
             pos += 1;
 
-            // Collect old section lines
+            // Collect old section lines, at most as many as the range
+            // declares. The cap keeps text that follows the final section --
+            // a mail signature, say -- from being read as part of the hunk.
+            let old_declared = declared_len(old_start, old_end);
             let mut old_no_newline = false;
             let mut old_lines: Vec<(char, String)> = Vec::new();
-            while pos < lines.len() {
+            while pos < lines.len() && old_lines.len() < old_declared {
                 let l = lines[pos];
                 if l.starts_with("--- ") && NEW_RANGE_RE.is_match(l) {
                     break;
@@ -124,10 +128,11 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             };
             pos += 1;
 
-            // Collect new section lines
+            // Collect new section lines, capped the same way.
+            let new_declared = declared_len(new_start, new_end);
             let mut new_no_newline = false;
             let mut new_lines: Vec<(char, String)> = Vec::new();
-            while pos < lines.len() {
+            while pos < lines.len() && new_lines.len() < new_declared {
                 let l = lines[pos];
                 if l.starts_with("***************")
                     || l.starts_with("diff ")
@@ -150,8 +155,8 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
 
             // Convert to unified-style hunk
             let mut hunk = convert_context_to_hunk(
-                old_start, old_end, new_start, new_end, &old_lines, &new_lines,
-            );
+                old_start, old_end, new_start, new_end, &old_lines, &new_lines, pos,
+            )?;
             hunk.old_no_newline = old_no_newline;
             hunk.new_no_newline = new_no_newline;
             patch.hunks.push(hunk);
@@ -161,6 +166,15 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
     }
 
     Ok((patch, pos))
+}
+
+/// Number of lines a `start,end` section range declares.
+fn declared_len(start: usize, end: usize) -> usize {
+    if end >= start {
+        end - start + 1
+    } else {
+        0
+    }
 }
 
 /// Split a context-diff section line into its one-character change prefix and
@@ -185,7 +199,8 @@ fn convert_context_to_hunk(
     new_end: usize,
     old_lines: &[(char, String)],
     new_lines: &[(char, String)],
-) -> Hunk {
+    line: usize,
+) -> Result<Hunk, PatchError> {
     // A side that contributes no lines is spelled as a bare line number
     // ("*** 5 ****" for an insertion after line 5), which reads as the range
     // 5..5 and would otherwise count as one line. An empty section body is what
@@ -193,17 +208,13 @@ fn convert_context_to_hunk(
     // to insert, so add one.
     let (old_start, old_count) = if old_lines.is_empty() {
         (old_start + 1, 0)
-    } else if old_end >= old_start {
-        (old_start, old_end - old_start + 1)
     } else {
-        (old_start, 0)
+        (old_start, declared_len(old_start, old_end))
     };
     let (new_start, new_count) = if new_lines.is_empty() {
         (new_start + 1, 0)
-    } else if new_end >= new_start {
-        (new_start, new_end - new_start + 1)
     } else {
-        (new_start, 0)
+        (new_start, declared_len(new_start, new_end))
     };
 
     let mut hunk = Hunk::new(old_start, old_count, new_start, new_count);
@@ -238,7 +249,10 @@ fn convert_context_to_hunk(
                     old_idx += 1;
                 }
                 _ => {
-                    old_idx += 1;
+                    return Err(PatchError::Parse {
+                        line,
+                        message: format!("unexpected '{}' in old section", prefix),
+                    });
                 }
             }
         }
@@ -259,43 +273,31 @@ fn convert_context_to_hunk(
                     new_idx += 1;
                 }
                 _ => {
-                    new_idx += 1;
+                    return Err(PatchError::Parse {
+                        line,
+                        message: format!("unexpected '{}' in new section", prefix),
+                    });
                 }
             }
         }
     }
 
-    hunk
-}
-
-/// Parse filename from a header line (remove timestamp if present).
-fn parse_filename(s: &str) -> String {
-    let s = s.trim();
-    if let Some(tab_pos) = s.find('\t') {
-        s[..tab_pos].to_string()
-    } else if let Some(space_pos) = s.find("  ") {
-        s[..space_pos].to_string()
-    } else {
-        s.to_string()
-    }
+    Ok(hunk)
 }
 
 /// Check if a line looks like a context diff header.
 pub fn looks_like_context(lines: &[&str]) -> bool {
-    let mut has_stars = false;
-    let mut has_dashes = false;
-
-    for line in lines.iter().take(20) {
-        if line.starts_with("*** ") && !line.starts_with("***************") {
-            has_stars = true;
-        }
-        if line.starts_with("--- ") && has_stars {
-            has_dashes = true;
-        }
+    // Scan the whole input; a mailed patch may carry a long preamble.
+    for (i, line) in lines.iter().enumerate() {
         if line.starts_with("***************") {
+            return true;
+        }
+        // Require the two file headers to be adjacent, as diff writes them, so
+        // a patch whose content contains a "--- " line is not misread.
+        if line.starts_with("*** ") && lines.get(i + 1).is_some_and(|n| n.starts_with("--- ")) {
             return true;
         }
     }
 
-    has_stars && has_dashes
+    false
 }

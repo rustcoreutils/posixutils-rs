@@ -1993,3 +1993,188 @@ fn test_patch_reject_zero_new_count_header() {
 
     cleanup_test_dir(&test_dir);
 }
+
+// git format-patch puts the commit message before the diff. Detection used to
+// look at only the first 20 lines, so any message longer than that made the
+// whole patch unreadable.
+#[test]
+fn test_patch_long_preamble() {
+    let test_dir = setup_test_dir("long_preamble");
+
+    let target = test_dir.join("t.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let mut patch_text = String::from(
+        "From 1234567890abcdef Mon Sep 17 00:00:00 2001\n\
+         From: Some One <someone@example.com>\n\
+         Subject: [PATCH] a change with a long message\n\n",
+    );
+    for i in 1..=22 {
+        patch_text.push_str(&format!("commit message line {}\n", i));
+    }
+    patch_text.push_str(
+        "\n---\n t.txt | 2 +-\n 1 file changed\n\n\
+         diff --git a/t.txt b/t.txt\n\
+         index 1234567..89abcde 100644\n\
+         --- a/t.txt\n+++ b/t.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    );
+
+    let patch_file = test_dir.join("long.patch");
+    fs::write(&patch_file, patch_text).unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
+            String::from("-p1"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nB\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// Not every diff separates the file name from the timestamp with a tab.
+#[test]
+fn test_patch_single_space_timestamp() {
+    let test_dir = setup_test_dir("space_timestamp");
+
+    let target = test_dir.join("ts.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("ts.patch");
+    fs::write(
+        &patch_file,
+        "--- ts.txt 2024-01-01 10:00:00.000000000 +0000\n\
+         +++ ts.txt 2024-01-02 10:00:00.000000000 +0000\n\
+         @@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nB\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// diff writes "< " even for an empty line; a mailer that strips trailing
+// whitespace leaves a bare "<". That used to end the hunk early, leaving it
+// with no operations at all, which was then reported as applied.
+#[test]
+fn test_patch_normal_stripped_marker() {
+    let test_dir = setup_test_dir("normal_stripped");
+
+    let target = test_dir.join("bare.txt");
+    fs::write(&target, "a\n\nb\n").unwrap();
+
+    let patch_file = test_dir.join("bare.patch");
+    fs::write(&patch_file, "2d1\n<\n").unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-n"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A hunk that supplies fewer lines than its header declares was truncated
+// somewhere; applying it as though it were complete loses data silently.
+#[test]
+fn test_patch_normal_truncated_hunk() {
+    let test_dir = setup_test_dir("normal_truncated");
+
+    let target = test_dir.join("short.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("short.patch");
+    // Declares two old lines and one new; supplies one old and none.
+    fs::write(&patch_file, "1,2c1\n< a\n").unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-n"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 2, "truncated hunk must be an error, stderr: {}", err);
+    assert!(
+        err.contains("declares"),
+        "should report the count mismatch, got: {}",
+        err
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A git section that changes no text carries no hunk. That is well-formed
+// input, not garbage: name what is skipped rather than rejecting the patch.
+#[test]
+fn test_patch_git_rename_only() {
+    let test_dir = setup_test_dir("git_rename");
+
+    let target = test_dir.join("old.txt");
+    fs::write(&target, "a\n").unwrap();
+
+    let patch_file = test_dir.join("rename.patch");
+    fs::write(
+        &patch_file,
+        "diff --git a/old.txt b/new.txt\n\
+         similarity index 100%\n\
+         rename from old.txt\n\
+         rename to new.txt\n",
+    )
+    .unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-d"),
+        test_dir.to_str().unwrap().to_string(),
+        String::from("-p1"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 0, "a rename-only patch is not an error");
+    assert!(
+        err.contains("rename of old.txt to new.txt"),
+        "should name the skipped rename, got: {}",
+        err
+    );
+    // Neither POSIX nor GNU patch performs the rename.
+    assert!(target.exists());
+    assert!(!test_dir.join("new.txt").exists());
+
+    cleanup_test_dir(&test_dir);
+}

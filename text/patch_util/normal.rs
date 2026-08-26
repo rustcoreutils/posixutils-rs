@@ -105,13 +105,13 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
             while pos < lines.len() {
                 let content_line = lines[pos];
 
-                if let Some(rest) = content_line.strip_prefix("< ") {
+                if let Some(rest) = strip_marker(content_line, '<') {
                     // Delete line (from old file)
                     hunk.lines.push(LineOp::Delete(rest.to_string()));
                     prev_old = true;
                     prev_new = false;
                     pos += 1;
-                } else if let Some(rest) = content_line.strip_prefix("> ") {
+                } else if let Some(rest) = strip_marker(content_line, '>') {
                     // Add line (to new file)
                     hunk.lines.push(LineOp::Add(rest.to_string()));
                     prev_old = false;
@@ -135,6 +135,30 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
                 }
             }
 
+            // The header declares how many lines each side contributes; a
+            // hunk that came up short was truncated (by a mailer, or by a
+            // content line we did not recognize) and must not be applied as
+            // though it were complete.
+            let got_old = hunk
+                .lines
+                .iter()
+                .filter(|op| matches!(op, LineOp::Delete(_)))
+                .count();
+            let got_new = hunk
+                .lines
+                .iter()
+                .filter(|op| matches!(op, LineOp::Add(_)))
+                .count();
+            if got_old != hunk.old_count || got_new != hunk.new_count {
+                return Err(PatchError::Parse {
+                    line: pos + 1,
+                    message: format!(
+                        "hunk at \"{}\" declares {} old and {} new lines but has {} and {}",
+                        line, hunk.old_count, hunk.new_count, got_old, got_new
+                    ),
+                });
+            }
+
             patch.hunks.push(hunk);
         } else {
             pos += 1;
@@ -144,9 +168,20 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
     Ok((patch, pos))
 }
 
+/// Strip a normal-diff line marker and the space that separates it from the
+/// payload.
+///
+/// diff writes "< " even when the line is empty; a mailer that strips trailing
+/// whitespace turns that into a bare "<", which must still be read as a line
+/// with an empty payload rather than ending the hunk.
+fn strip_marker(line: &str, marker: char) -> Option<&str> {
+    let rest = line.strip_prefix(marker)?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
 /// Check if a line looks like a normal diff command.
 pub fn looks_like_normal(lines: &[&str]) -> bool {
-    for line in lines.iter().take(20) {
+    for line in lines.iter() {
         if DETECT_CMD_RE.is_match(line) {
             return true;
         }

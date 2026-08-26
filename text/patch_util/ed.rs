@@ -130,7 +130,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
 
 /// Check if a line looks like an ed script command.
 pub fn looks_like_ed(lines: &[&str]) -> bool {
-    for line in lines.iter().take(20) {
+    for line in lines.iter() {
         // Skip Index: and diff lines
         if line.starts_with("Index: ") || line.starts_with("diff ") {
             continue;

@@ -12,7 +12,7 @@ use std::{
     ffi::OsString,
     fs, io,
     os::unix::fs::{FileTypeExt, MetadataExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use crate::diff_util::{
@@ -21,11 +21,42 @@ use crate::diff_util::{
 
 use super::{common::FormatOptions, dir_data::DirData};
 
+/// A path as it appears in output.
+fn display(path: &Path) -> String {
+    path.to_str()
+        .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+        .to_string()
+}
+
+/// What a directory entry is, once symlinks have been followed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    File,
+    Directory,
+    /// A FIFO, block-special or character-special file, named as GNU names it
+    /// in the mismatch message. diff cannot read one as a regular file, and
+    /// opening a FIFO would block.
+    Special(&'static str),
+}
+
+impl EntryKind {
+    fn describe(self) -> &'static str {
+        match self {
+            EntryKind::File => "regular file",
+            EntryKind::Directory => "directory",
+            EntryKind::Special(what) => what,
+        }
+    }
+}
+
 pub struct DirDiff<'a> {
     dir1: &'a mut DirData,
     dir2: &'a mut DirData,
     format_options: &'a FormatOptions,
     recursive: bool,
+    /// The option arguments as they were given on the command line, for the
+    /// per-file header POSIX specifies.
+    options: &'a [String],
 }
 
 impl<'a> DirDiff<'a> {
@@ -34,12 +65,14 @@ impl<'a> DirDiff<'a> {
         dir2: &'a mut DirData,
         format_options: &'a FormatOptions,
         recursive: bool,
+        options: &'a [String],
     ) -> Self {
         Self {
             dir1,
             dir2,
             format_options,
             recursive,
+            options,
         }
     }
 
@@ -48,9 +81,17 @@ impl<'a> DirDiff<'a> {
         path2: PathBuf,
         format_options: &FormatOptions,
         recursive: bool,
+        options: &[String],
     ) -> io::Result<DiffExitStatus> {
         let mut visited = HashSet::new();
-        Self::dir_diff_inner(path1, path2, format_options, recursive, &mut visited)
+        Self::dir_diff_inner(
+            path1,
+            path2,
+            format_options,
+            recursive,
+            options,
+            &mut visited,
+        )
     }
 
     /// Recursive directory comparison with (dev, ino) tracking of directories
@@ -61,9 +102,11 @@ impl<'a> DirDiff<'a> {
         path2: PathBuf,
         format_options: &FormatOptions,
         recursive: bool,
+        options: &[String],
         visited: &mut HashSet<(u64, u64)>,
     ) -> io::Result<DiffExitStatus> {
-        // Mark both directories as visited before descending into them.
+        // The two operands themselves go in before anything descends, so a
+        // link back to either of them is caught as a loop.
         for path in [&path1, &path2] {
             if let Ok(md) = fs::metadata(path) {
                 visited.insert((md.dev(), md.ino()));
@@ -73,39 +116,112 @@ impl<'a> DirDiff<'a> {
         let mut dir1: DirData = DirData::load(path1)?;
         let mut dir2: DirData = DirData::load(path2)?;
 
-        let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, format_options, recursive);
+        let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, format_options, recursive, options);
         dir_diff.analyze(visited)
     }
 
-    /// True if `dir_data`'s entry `file_name` is a FIFO, block-special, or
-    /// character-special file (which `diff` cannot read as a regular file).
-    fn is_special(file_name: &OsString, dir_data: &DirData) -> io::Result<bool> {
-        let file_type = dir_data.files()[file_name].file_type()?;
-        Ok(file_type.is_fifo() || file_type.is_block_device() || file_type.is_char_device())
+    /// Report an error against the entry it happened on and keep walking.
+    /// The bare message left the reader no way to tell which file failed.
+    fn report(path: &Path, error: &io::Error) {
+        eprintln!(
+            "diff: {}: {}",
+            display(path),
+            plib::diag::io_error_text(error)
+        );
+    }
+
+    /// Recurse into a common subdirectory, refusing to re-enter a directory
+    /// already on the current path.
+    ///
+    /// POSIX requires a diagnostic when the walk detects a loop; this used to
+    /// skip in silence and exit 0. `visited` is also popped on the way back
+    /// out, so it describes the current path rather than everything ever seen
+    /// -- two sibling links to one directory are now both compared instead of
+    /// the second silently disappearing.
+    fn descend(
+        &self,
+        path1: &Path,
+        path2: &Path,
+        visited: &mut HashSet<(u64, u64)>,
+    ) -> io::Result<DiffExitStatus> {
+        let mut ids = Vec::new();
+        for path in [path1, path2] {
+            let md = fs::metadata(path)?;
+            let id = (md.dev(), md.ino());
+            if visited.contains(&id) {
+                eprintln!("diff: {}: recursive directory loop", display(path));
+                return Ok(DiffExitStatus::Trouble);
+            }
+            ids.push(id);
+        }
+        for id in &ids {
+            visited.insert(*id);
+        }
+
+        let result = Self::dir_diff_inner(
+            path1.to_path_buf(),
+            path2.to_path_buf(),
+            self.format_options,
+            self.recursive,
+            self.options,
+            visited,
+        );
+
+        for id in &ids {
+            visited.remove(id);
+        }
+        result
+    }
+
+    /// The `diff <options> <file1> <file2>` line printed before a differing
+    /// pair.
+    ///
+    /// POSIX wants the options "as specified on the command line", so echo the
+    /// ones the user actually typed rather than a canonical rendering of the
+    /// parsed result -- this used to turn `-c` into `-C 3`, add a trailing
+    /// space, and substitute a --label value for the pathname operand, which
+    /// made the printed command something that could not be run.
+    fn file_header(&self, path1: &Path, path2: &Path) -> String {
+        let mut header = String::from("diff");
+        for option in self.options {
+            header.push(' ');
+            header.push_str(option);
+        }
+        header.push(' ');
+        header.push_str(&display(path1));
+        header.push(' ');
+        header.push_str(&display(path2));
+        header
+    }
+
+    /// What an entry is, as far as diff cares.
+    ///
+    /// Classification follows symlinks. `DirEntry::file_type` does not, so a
+    /// symlink to a regular file reported neither file nor special and was
+    /// treated as a directory: without -r that printed "Common subdirectories",
+    /// and with -r the walk called read_dir on it and the whole run died with
+    /// ENOTDIR. Any source tree containing symlinks was uncomparable.
+    fn classify(path: &Path) -> io::Result<EntryKind> {
+        let file_type = fs::metadata(path)?.file_type();
+        Ok(if file_type.is_dir() {
+            EntryKind::Directory
+        } else if file_type.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Special(if file_type.is_fifo() {
+                "fifo"
+            } else if file_type.is_block_device() {
+                "block special file"
+            } else if file_type.is_char_device() {
+                "character special file"
+            } else {
+                "special file"
+            })
+        })
     }
 
     fn analyze(&mut self, visited: &mut HashSet<(u64, u64)>) -> io::Result<DiffExitStatus> {
         let mut exit_status = DiffExitStatus::NotDifferent;
-
-        fn is_file(file_name: &OsString, dir_data: &DirData) -> io::Result<bool> {
-            let is_file = dir_data
-                .files()
-                .get_key_value(file_name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Could not find file in {}",
-                        dir_data
-                            .path()
-                            .to_str()
-                            .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                    )
-                })
-                .1
-                .file_type()?
-                .is_file();
-
-            Ok(is_file)
-        }
 
         let mut dir1_files_name = self.dir1.files().keys().collect::<Vec<&OsString>>();
         let mut dir2_files_name = self.dir2.files().keys().collect::<Vec<&OsString>>();
@@ -126,152 +242,105 @@ impl<'a> DirDiff<'a> {
                     let path1 = self.dir1.path().join(file_name);
                     let path2 = self.dir2.path().join(file_name);
 
-                    // Special files (FIFO/block/char) cannot be diffed as
-                    // regular files and would block on open; skip them.
-                    if Self::is_special(file_name, self.dir1)?
-                        || Self::is_special(file_name, self.dir2)?
-                    {
-                        println!(
-                            "File {} or {} is not a regular file or directory and was skipped",
-                            path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                            path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                        );
-                        continue;
-                    }
-
-                    let in_dir1_is_file = is_file(file_name, self.dir1)?;
-                    let in_dir2_is_file = is_file(file_name, self.dir2)?;
-
-                    if in_dir1_is_file && in_dir2_is_file {
-                        let mut show_if_different = String::from("diff ");
-
-                        match self.format_options.output_format {
-                            crate::diff_util::common::OutputFormat::Default => {}
-                            crate::diff_util::common::OutputFormat::Context(ctx) => {
-                                show_if_different.push_str(format!("-C {} ", ctx).as_str())
-                            }
-                            crate::diff_util::common::OutputFormat::EditScript => {
-                                show_if_different.push_str("-e ")
-                            }
-                            crate::diff_util::common::OutputFormat::ForwardEditScript => {
-                                show_if_different.push_str("-f ")
-                            }
-                            crate::diff_util::common::OutputFormat::Unified(ufd) => {
-                                show_if_different.push_str(format!("-U {} ", ufd).as_str())
-                            }
+                    // One unreadable entry used to end the walk: the error was
+                    // propagated out of analyze, so every later entry went
+                    // uncompared. Report it against the path it happened on and
+                    // carry on, which is what GNU does.
+                    let (kind1, kind2) = match (Self::classify(&path1), Self::classify(&path2)) {
+                        (Ok(k1), Ok(k2)) => (k1, k2),
+                        (Err(e), _) => {
+                            Self::report(&path1, &e);
+                            exit_status = DiffExitStatus::Trouble;
+                            continue;
                         }
-
-                        if self.recursive {
-                            show_if_different.push_str("-r ");
+                        (_, Err(e)) => {
+                            Self::report(&path2, &e);
+                            exit_status = DiffExitStatus::Trouble;
+                            continue;
                         }
+                    };
 
-                        if self.format_options.ignore_trailing_white_spaces {
-                            show_if_different.push_str("-b ");
-                        }
-
-                        if let Some(label1) = &self.format_options.label1() {
-                            show_if_different.push_str(format!("--label {} ", label1).as_str())
-                        }
-
-                        if let Some(label2) = &self.format_options.label2() {
-                            show_if_different.push_str(format!("--label2 {} ", label2).as_str())
-                        }
-
-                        if let Some(label1) = &self.format_options.label1() {
-                            show_if_different.push_str(format!("{} ", label1).as_str())
-                        } else {
-                            show_if_different
-                                .push_str(path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME));
-                            show_if_different.push(' ');
-                        }
-
-                        if let Some(label2) = &self.format_options.label2() {
-                            show_if_different.push_str(format!("{} ", label2).as_str())
-                        } else {
-                            show_if_different
-                                .push_str(path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME));
-                            show_if_different.push(' ');
-                        }
-
-                        let inner_exit_status = FileDiff::file_diff(
-                            path1,
-                            path2,
-                            self.format_options,
-                            Some(show_if_different),
-                        )?;
-
-                        if exit_status.status_code() < inner_exit_status.status_code() {
-                            exit_status = inner_exit_status;
-                        }
-                    } else if !in_dir1_is_file && !in_dir2_is_file {
-                        if self.recursive {
-                            // Skip subdirectories already visited on this path
-                            // (symlink cycle) to avoid infinite recursion.
-                            let cycle = [&path1, &path2].iter().any(|p| {
-                                fs::metadata(p)
-                                    .ok()
-                                    .map(|md| visited.contains(&(md.dev(), md.ino())))
-                                    .unwrap_or(false)
-                            });
-                            if !cycle {
-                                let inner_exit_status = Self::dir_diff_inner(
-                                    path1.clone(),
-                                    path2.clone(),
-                                    self.format_options,
-                                    self.recursive,
-                                    visited,
-                                )?;
-                                if exit_status.status_code() < inner_exit_status.status_code() {
-                                    exit_status = inner_exit_status;
+                    match (kind1, kind2) {
+                        (EntryKind::File, EntryKind::File) => {
+                            let header = self.file_header(&path1, &path2);
+                            match FileDiff::file_diff(
+                                path1.clone(),
+                                path2.clone(),
+                                self.format_options,
+                                Some(header),
+                            ) {
+                                Ok(inner) => {
+                                    if exit_status.status_code() < inner.status_code() {
+                                        exit_status = inner;
+                                    }
+                                }
+                                Err(e) => {
+                                    Self::report(&path1, &e);
+                                    exit_status = DiffExitStatus::Trouble;
                                 }
                             }
-                        } else {
-                            println!(
-                                "Common subdirectories: {} and {}",
-                                self.dir1
-                                    .path()
-                                    .join(file_name)
-                                    .to_str()
-                                    .unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                                self.dir2
-                                    .path()
-                                    .join(file_name)
-                                    .to_str()
-                                    .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                            );
                         }
-                    } else {
-                        let (file, dir) = if in_dir1_is_file && !in_dir2_is_file {
-                            (
-                                path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                                path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                            )
-                        } else {
-                            (
-                                path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                                path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                            )
-                        };
-
-                        println!(
-                            "File \"{}\" is a directory while file \"{}\" is a regular file",
-                            dir, file
-                        );
+                        (EntryKind::Directory, EntryKind::Directory) => {
+                            if self.recursive {
+                                match self.descend(&path1, &path2, visited) {
+                                    Ok(inner) => {
+                                        if exit_status.status_code() < inner.status_code() {
+                                            exit_status = inner;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        Self::report(&path1, &e);
+                                        exit_status = DiffExitStatus::Trouble;
+                                    }
+                                }
+                            } else {
+                                // Two directories left uncompared are not a
+                                // difference; GNU exits 0 for this alone.
+                                println!(
+                                    "Common subdirectories: {} and {}",
+                                    display(&path1),
+                                    display(&path2)
+                                );
+                            }
+                        }
+                        (k1, k2) => {
+                            // Anything else is a mismatch between the two
+                            // trees, and a mismatch is a difference.
+                            println!(
+                                "File {} is a {} while file {} is a {}",
+                                display(&path1),
+                                k1.describe(),
+                                display(&path2),
+                                k2.describe()
+                            );
+                            if exit_status.status_code() < DiffExitStatus::Different.status_code() {
+                                exit_status = DiffExitStatus::Different;
+                            }
+                        }
                     }
                 }
+                // An entry present in only one tree is a difference, so it
+                // has to raise the exit status: `if diff -r a b; then` was
+                // useless while these arms only printed.
                 (true, false) => {
                     println!(
                         "Only in {}: {}",
                         self.dir1.path_str(),
                         file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                    )
+                    );
+                    if exit_status.status_code() < DiffExitStatus::Different.status_code() {
+                        exit_status = DiffExitStatus::Different;
+                    }
                 }
                 (false, true) => {
                     println!(
                         "Only in {}: {}",
                         self.dir2.path_str(),
                         file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                    )
+                    );
+                    if exit_status.status_code() < DiffExitStatus::Different.status_code() {
+                        exit_status = DiffExitStatus::Different;
+                    }
                 }
                 (false, false) => {
                     eprintln!(

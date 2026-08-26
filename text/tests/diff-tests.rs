@@ -814,34 +814,37 @@ fn test_diff_directory_with_a_fifo() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
-
+/// `diff -r` must terminate on a symlink cycle rather than recursing forever.
+///
+/// This used to compare a directory with itself, which check_difference
+/// short-circuits on `path1 == path2` before dir_diff is ever entered -- so it
+/// proved only that the short-circuit exists. Two distinct trees actually
+/// reach the guard.
 #[test]
 fn test_diff_recursive_symlink_cycle_terminates() {
-    // A directory containing a symlink back to itself must not send the
-    // recursive walk into an infinite loop.
-    let base = std::env::temp_dir().join(format!("posixutils-diff-loop-{}", std::process::id()));
-    let dir = base.join("d");
-    // A crashed earlier run can leave this behind, and PIDs are recycled; the
-    // symlink below would then fail with EEXIST.
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&dir).expect("mkdir d");
-    std::fs::write(dir.join("f"), "x\n").expect("write d/f");
-    // The cycle is the whole point of the test: without it `diff -r` has
-    // nothing to loop on and the run below would pass without proving
-    // anything. Both supported platforms symlink here, so this is a hard
-    // precondition rather than a best-effort one.
-    std::os::unix::fs::symlink("..", dir.join("up")).expect("symlink d/up -> ..");
+    let (a, b) = dir_pair("cycle");
+    for dir in [&a, &b] {
+        std::fs::write(dir.join("f"), "x\n").expect("write f");
+        // The cycle is the whole point of the test: without it `diff -r` has
+        // nothing to loop on. Both supported platforms symlink here, so this
+        // is a hard precondition rather than a best-effort one.
+        std::os::unix::fs::symlink("..", dir.join("up")).expect("symlink up -> ..");
+    }
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
-        .args(["-r", dir.to_str().unwrap(), dir.to_str().unwrap()])
+        .args(["-r", a.to_str().unwrap(), b.to_str().unwrap()])
+        .env("LC_ALL", "C")
         .output()
         .expect("run diff -r");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "a directory compared with itself has no differences"
+    // It terminated, which is the property under test; the loop itself is
+    // reported as trouble.
+    assert_eq!(out.status.code(), Some(EXIT_STATUS_TROUBLE));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("recursive directory loop"),
+        "got {:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
 
 /// Lines inserted before the first line the two files have in common are a
@@ -1542,4 +1545,173 @@ fn test_diff_dies_by_sigpipe_on_a_closed_pipe() {
         "a closed pipe is not an error to report: {:?}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Build two directory trees under a unique base and hand back their paths.
+/// The base is removed first: a crashed earlier run can leave one behind and
+/// PIDs are recycled.
+fn dir_pair(tag: &str) -> (PathBuf, PathBuf) {
+    let base = std::env::temp_dir().join(format!("posixutils-diff-{}-{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (a, b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(&a).expect("mkdir a");
+    std::fs::create_dir_all(&b).expect("mkdir b");
+    (a, b)
+}
+
+fn run_diff(args: &[&str]) -> (String, String, Option<i32>) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run diff");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+/// A file present in only one tree is a difference. These arms only printed,
+/// leaving the status at 0, so `if diff -r a b; then` never saw a difference.
+#[test]
+fn test_diff_directory_only_in_sets_exit_status() {
+    let (a, b) = dir_pair("onlyin");
+    std::fs::write(a.join("same"), "hi\n").unwrap();
+    std::fs::write(b.join("same"), "hi\n").unwrap();
+    std::fs::write(b.join("extra"), "x\n").unwrap();
+
+    let (stdout, _, code) = run_diff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+    assert!(stdout.contains("Only in"), "got {stdout:?}");
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
+}
+
+/// Entries are classified by following symlinks. `DirEntry::file_type` does
+/// not, so a symlink to a regular file was taken for a directory: without -r
+/// that printed "Common subdirectories", and with -r the walk called read_dir
+/// on it and died with ENOTDIR, exit 2.
+#[test]
+fn test_diff_symlink_to_file_is_compared_as_a_file() {
+    let (a, b) = dir_pair("symlink");
+    for dir in [&a, &b] {
+        std::fs::write(dir.join("target"), "t\n").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).expect("symlink");
+    }
+
+    for args in [
+        vec![a.to_str().unwrap(), b.to_str().unwrap()],
+        vec!["-r", a.to_str().unwrap(), b.to_str().unwrap()],
+    ] {
+        let (stdout, stderr, code) = run_diff(&args);
+        assert_eq!(code, Some(EXIT_STATUS_NO_DIFFERENCE), "stderr {stderr:?}");
+        assert_eq!(
+            stdout, "",
+            "a symlink to an identical file is no difference"
+        );
+    }
+
+    // A symlink whose target differs is a difference like any other file.
+    std::fs::write(b.join("target"), "u\n").unwrap();
+    let (_, _, code) = run_diff(&["-r", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
+}
+
+/// A directory in one tree where the other has a file is a difference, and
+/// the message names what each side actually is.
+#[test]
+fn test_diff_directory_versus_file_mismatch() {
+    let (a, b) = dir_pair("dirfile");
+    std::fs::create_dir_all(a.join("x")).unwrap();
+    std::fs::write(a.join("x").join("inner"), "i\n").unwrap();
+    std::fs::write(b.join("x"), "hi\n").unwrap();
+
+    let (stdout, _, code) = run_diff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+    assert!(
+        stdout.contains("is a directory while file") && stdout.contains("is a regular file"),
+        "got {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
+}
+
+/// One unreadable entry used to end the walk, so every later entry went
+/// uncompared, and the diagnostic did not say which file failed.
+#[test]
+fn test_diff_directory_walk_continues_past_an_unreadable_entry() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (a, b) = dir_pair("noread");
+    for (name, left, right) in [("aaa", "x\n", "y\n"), ("zzz", "m\n", "n\n")] {
+        std::fs::write(a.join(name), left).unwrap();
+        std::fs::write(b.join(name), right).unwrap();
+    }
+    std::fs::write(a.join("mmm"), "p\n").unwrap();
+    std::fs::write(b.join("mmm"), "q\n").unwrap();
+    std::fs::set_permissions(a.join("mmm"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (stdout, stderr, _) = run_diff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    std::fs::set_permissions(a.join("mmm"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        stdout.contains("< m") && stdout.contains("> n"),
+        "the entry after the unreadable one must still be compared: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("mmm"),
+        "the diagnostic must name the file it is about: {stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
+}
+
+/// POSIX: on entering a previously visited directory, diff "shall write a
+/// diagnostic message to standard error". This used to skip in silence and
+/// exit 0.
+#[test]
+fn test_diff_recursive_directory_loop_is_diagnosed() {
+    let (a, b) = dir_pair("rloop");
+    for dir in [&a, &b] {
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink("../..", dir.join("sub").join("up")).expect("symlink");
+    }
+
+    let (_, stderr, code) = run_diff(&["-r", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert!(
+        stderr.contains("recursive directory loop"),
+        "got {stderr:?}"
+    );
+    assert_eq!(code, Some(EXIT_STATUS_TROUBLE));
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
+}
+
+/// The per-file header echoes the options as given, not a canonical rendering
+/// of them: `-c` used to come back as `-C 3`, with a trailing space, and a
+/// --label value took the pathname operand's place.
+#[test]
+fn test_diff_recursive_per_file_header_echoes_the_command_line() {
+    let (a, b) = dir_pair("header");
+    std::fs::write(a.join("f"), "one\n").unwrap();
+    std::fs::write(b.join("f"), "two\n").unwrap();
+    let (as_, bs) = (a.to_str().unwrap(), b.to_str().unwrap());
+
+    for (args, expected) in [
+        (
+            vec!["-r", "-c", as_, bs],
+            format!("diff -r -c {as_}/f {bs}/f"),
+        ),
+        (vec![as_, bs], format!("diff {as_}/f {bs}/f")),
+        (
+            vec!["-C", "5", "-b", as_, bs],
+            format!("diff -C 5 -b {as_}/f {bs}/f"),
+        ),
+    ] {
+        let (stdout, _, _) = run_diff(&args);
+        assert_eq!(
+            stdout.lines().next().unwrap(),
+            expected,
+            "header for {args:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }

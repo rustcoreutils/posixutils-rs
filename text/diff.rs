@@ -116,6 +116,27 @@ impl Args {
     }
 }
 
+/// The option arguments from the command line, with the two file operands
+/// removed.
+///
+/// POSIX specifies the per-file header `-r` prints as
+/// `"diff %s %s %s\n", <diff_options>, <filename1>, <filename2>` where the
+/// options are "as specified on the command line", so they have to come from
+/// argv rather than from a canonical rendering of the parsed options. The two
+/// operands are the last two positionals, so removing each one's last
+/// occurrence -- second operand first -- takes the operands and not an option
+/// value that happens to read the same, as in `diff -L a a b`.
+fn option_arguments(file1: &str, file2: &str) -> Vec<String> {
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = argv.iter().rposition(|a| a == file2) {
+        argv.remove(i);
+        if let Some(j) = argv.iter().take(i).rposition(|a| a == file1) {
+            argv.remove(j);
+        }
+    }
+    argv
+}
+
 fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     let is_stdin1 = args.file1 == "-";
     let is_stdin2 = args.file2 == "-";
@@ -181,7 +202,8 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     if path1_is_file && path2_is_file {
         FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
-        DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
+        let options = option_arguments(&args.file1, &args.file2);
+        DirDiff::dir_diff(path1, path2, &format_options, args.recurse, &options)
     } else {
         FileDiff::file_dir_diff(path1, path2, &format_options)
     }

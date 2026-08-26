@@ -98,11 +98,11 @@ crash-safety, and Mach-O (macOS CI) cases. No open item is a known defect.
 
 ## `yacc`
 
-**Implementation:** `dev/yacc/` (main.rs 275, lexer.rs 837, parser.rs 800, grammar.rs 841, first_follow.rs 402, lr0.rs 356, lalr.rs 602, codegen.rs 2047, verify.rs 263, diag.rs 139, error.rs 47 — ~6.6 kloc)
-**Tests:** `dev/tests/yacc/mod.rs` (3501 lines, 150 `#[test]`s)
+**Implementation:** `dev/yacc/` (codegen.rs, parser.rs, lexer.rs, grammar.rs, lalr.rs, first_follow.rs, lr0.rs, main.rs, verify.rs, error.rs — ~6.9 kloc; diagnostics come from `plib::diag`)
+**Tests:** `dev/tests/yacc/mod.rs` (122 `#[test]`s)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3, pp. 3661–3678
 **Reference slice:** `~/tmp/posix.2024/sliced/xcu-shell-and-utilities/3-utilities/yacc.md`
-**Date:** 2026-06-02
+**Date:** 2026-06-02; rows re-probed by execution 2026-08-26
 
 ### TL;DR
 
@@ -150,8 +150,14 @@ on `dev/tests/fixtures/python39.y` the two implementations now agree exactly
 One known divergence from bison remains, in grammars that already earn a #Y3
 warning: bison *deletes* useless rules before building tables, while we keep
 them, so a dead rule can still contribute a conflict to the reported counts.
-The generated parser is unaffected (the rules can never reduce) and grammars
-with no useless non-terminals — including `python39.y` — agree exactly.
+The generated parser is unaffected — the rules can never reduce.
+
+Re-probed 2026-08-26: on `python39.y` the conflict counts agree exactly with
+bison 3.8.2 (2 shift/reduce, 4 reduce/reduce) in both default and `--strict`
+modes. An earlier revision of this paragraph justified that by saying
+`python39.y` has no useless non-terminals; it does — bison reports `targets` and
+`sliceop` as useless there. They are *unreachable* rather than unproductive, a
+class we do not detect at all (#Y12), and they happen not to perturb the counts.
 
 Two more from the same review were folded in afterwards:
 
@@ -160,7 +166,17 @@ Two more from the same review were folded in afterwards:
 | #Y10 | `codegen.rs` `generate_debug_tables` | `yytname` was emitted in raw symbol-id order, non-terminals interleaved, but every `-t` debug site indexes it with the dense terminal index `yytranslate` yields. Reading `NUM` printed `$accept`; reading `'+'` printed `NUM`. Now emitted in internal symbol order — terminals by dense index, then non-terminals — which is also the numbering `yyr1` stores, so `yytname[yyr1[n]]` names the LHS. The existing `-t` tests only grepped the generated source, which is why this survived them; the new test runs a parser with `yydebug=1` and reads the trace. | Minor |
 | #Y11 | `grammar.rs` token declarations | The `1..=255` range check reached literals in rule bodies but not literals declared with `%token`/`%left`/`%right`/`%nonassoc`, which reach the symbol table by name. `%left '€'` was accepted with token number 8364 and an 8 KB `yytranslate` keyed on a value a byte-oriented `yylex` can never return. Both paths now share one `check_char_literal_range`. Note audit #12 above closed only the rule-position path. | Minor |
 
-One defect from that review is still **open**:
+Two defects are still **open**:
+
+- **No reachability check on non-terminals (#Y12, found 2026-08-26).** `grammar.rs`
+  checks *productivity* — does a non-terminal derive some string of tokens — and
+  warns when one does not. It never checks *reachability* from the start symbol,
+  so a productive but unreachable non-terminal is silently accepted. On
+  `start : NUM ; orphan : NUM NUM ;` bison warns "nonterminal useless in grammar:
+  orphan" and we say nothing; `python39.y` carries two such symbols (`targets`,
+  `sliceop`). bison folds both classes into one "useless in grammar" diagnostic.
+  Harmless to the generated parser, but it is the other half of the #Y3 check and
+  the reason the useless-rule divergence above is wider than it looks.
 
 - **`$` substitution runs inside C string literals and comments** —
   `printf("costs $1")` in an action is rewritten to `printf("costs (yyvsp[0])")`.
@@ -198,7 +214,7 @@ no line. The message names the offending literal and codepoint.
 #### Major
 
 - [x] **#5 — `-v` description file not produced when grammar/lex/parse step fails.** `dev/yacc/main.rs`, `dev/yacc/codegen.rs`. POSIX CONSEQUENCES OF ERRORS (123202–123204): "summary information in the description file *shall always be produced* if the −v flag is present" (emphasis mandated by `shall`). Today, `lexer::lex`, `parser::parse`, or `grammar::Grammar::from_parsed` returning `Err` short-circuits before `codegen::generate` runs, so no `y.output` is written. Fix: write a partial description file in the error path of `run()` when `-v` was requested, before propagating the error.
-- [x] **#6 — Runtime debug code is only generated when `-t` is set; `-DYYDEBUG=1` alone has no effect.** `dev/yacc/codegen.rs`, `308-310`, `935-940`, plus every `if opts.debug_enabled` block (`1045-1054`, `1161-1182`, `1222-1246`, `1281-1290`, `1393-1413`, `1431-1440`, `1452-1461`). POSIX 123150–123154: "If `YYDEBUG` has a non-zero value, the debugging code shall be included." The spec only governs YYDEBUG's *default value* via `-t`. Implementation gates the debug code itself at codegen time, so a compile-time `-DYYDEBUG=1` against a no-`-t` build produces a parser whose `yydebug=1` does nothing. Fix: always emit the debug code wrapped in `#if YYDEBUG` and always declare `yydebug`; let `-t` only flip the default-value `#define`.
+- [x] **#6 — Runtime debug code is only generated when `-t` is set; `-DYYDEBUG=1` alone has no effect.** `dev/yacc/codegen.rs`, in every `if opts.debug_enabled` block. POSIX 123150–123154: "If `YYDEBUG` has a non-zero value, the debugging code shall be included." The spec only governs YYDEBUG's *default value* via `-t`. Implementation gates the debug code itself at codegen time, so a compile-time `-DYYDEBUG=1` against a no-`-t` build produces a parser whose `yydebug=1` does nothing. Fix: always emit the debug code wrapped in `#if YYDEBUG` and always declare `yydebug`; let `-t` only flip the default-value `#define`.
 - [x] **#7 — `setlocale(LC_ALL, "")` is never called; no `LC_*` env var is consulted.** `dev/yacc/main.rs`, `dev/yacc/diag.rs`. POSIX 123679–123696 mandates `LANG`/`LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/`NLSPATH` shall affect yacc execution. `grep -nE 'setlocale|LC_ALL|LC_CTYPE|LC_MESSAGES|env::var\("(LANG|LC_|NLSPATH)' dev/yacc/*.rs` returns no matches. Fix: call `setlocale(libc::LC_ALL, "")` in `main()` (the utility, distinct from the *yacc-library* `main()` mentioned at 123693). ✓ closed by cross-cutting plib::diag wiring (2026-06-03).
 - [x] **#8 — Diagnostic messages are hardcoded English.** `dev/yacc/diag.rs` (`writeln!(stderr, "{}: {}: {}", ...)`), every `eprintln!` site in `dev/yacc/main.rs`. POSIX 123688–123690: `LC_MESSAGES` shall determine "the format and contents of diagnostic messages written to standard error". `grep -n 'gettext' dev/yacc/*.rs` returns no matches. Fix: route diagnostic strings through `gettextrs::gettext()` after `setlocale` per project convention.
 
@@ -218,7 +234,7 @@ no line. The message names the offending literal and codepoint.
 - [x] `-dltv` short options grouping handled — `main.rs` walks each char of a `-…` cluster.
 - [x] `-b` and `-p` accept both `-b prefix` and `-bprefix` forms — `main.rs`.
 - [x] Single `grammar` operand required, multiple rejected — `main.rs`.
-- [x] **`--` end-of-options unsupported.** (#9, Minor) `main.rs` treats any `-`-prefixed token as an option.
+- [x] `--` end-of-options handled (#9 closed) — probed by passing a grammar named `-dash.y` after `--`.
 - [x] **`--strict` extension exposed in usage text.** (#11, Minor) `main.rs`. WON'T FIX — see #11; the flag is load-bearing for the dual-mode integration harness.
 - [x] Unknown short options rejected with usage diagnostic — `main.rs`.
 
@@ -229,9 +245,9 @@ no line. The message names the offending literal and codepoint.
 | `-b file_prefix` | CONFORMS | `codegen.rs` uses prefix for `y.tab.c`/`y.tab.h`/`y.output`. |
 | `-d` | CONFORMS | `codegen.rs` writes header file only when set. |
 | `-l` | CONFORMS | `codegen.rs` gates every `#line` emission. |
-| `-p sym_prefix` | PARTIAL | Renames functions/variables (#10 Minor: also mangles user token defines, codegen.rs). |
-| `-t` | DIVERGES | (#6 Major) Debug code emission is itself gated on `-t`, not just the YYDEBUG default. |
-| `-v` | PARTIAL | (#5 Major) Description file not produced when run aborts before codegen. |
+| `-p sym_prefix` | CONFORMS | (#10 closed) `-p foo` yields `fooparse`; `#define NUM` in the header is left alone. Probed. |
+| `-t` | CONFORMS | (#6 closed) debug code always emitted under `#if YYDEBUG`; `-t` only sets the default to 1. Probed both ways. |
+| `-v` | CONFORMS | (#5 closed) `y.output` written even when the run aborts before codegen. Probed. |
 
 #### OPERANDS / STDIN / INPUT FILES
 
@@ -243,12 +259,12 @@ no line. The message names the offending literal and codepoint.
 
 | Var | Status | Notes |
 |---|---|---|
-| `LANG` | MISSING | (#7 Major) Never read. |
-| `LC_ALL` | MISSING | (#7 Major) Never read. |
-| `LC_CTYPE` | MISSING | (#7 Major) Never read; lexer always uses Rust `char` semantics. |
-| `LC_MESSAGES` | MISSING | (#7/#8 Major) No locale-driven diagnostics. |
+| `LANG` | CONFORMS | (#7 closed) `plib::diag::init_locale` calls `setlocale(LC_ALL, "")`. |
+| `LC_ALL` | CONFORMS | (#7 closed) same. |
+| `LC_CTYPE` | PARTIAL | (#7 closed for `setlocale`) the lexer still uses Rust `char` semantics rather than the locale's. |
+| `LC_MESSAGES` | CONFORMS | (#7/#8 closed) 96 `gettext` call sites; diagnostics route through the catalog when one exists. |
 | `NLSPATH` (XSI) | CONFORMS | `gettext-rs` consults `NLSPATH` ahead of `bindtextdomain`/`TEXTDOMAINDIR`/system dirs, with `%N`/`%L`/`%l`/`%t`/`%c` expansion (2026-08-04). |
-| `setlocale(LC_ALL, "")` call | MISSING | (#7 Major) Never invoked by `main()`. |
+| `setlocale(LC_ALL, "")` call | CONFORMS | (#7 closed) `diag::init_locale("yacc")` in `main.rs`. |
 
 #### ASYNCHRONOUS EVENTS
 
@@ -267,14 +283,14 @@ no line. The message names the offending literal and codepoint.
 | Required by spec | Status | Notes |
 |---|---|---|
 | `extern int yychar` declaration | CONFORMS | `codegen.rs`. |
-| `#define YYEMPTY ...` | MISSING | (#1 Critical) Never emitted. |
-| `#define YYEOF 0` | MISSING | (#2 Critical) Never emitted. |
+| `#define YYEMPTY ...` | CONFORMS | (#1 closed) probed in generated output. |
+| `#define YYEOF 0` | CONFORMS | (#2 closed) probed. |
 | Copy of header `#define`s | CONFORMS | `codegen.rs` always emits token defines into code file. |
-| `void yyerror(const char *);` prototype | PARTIAL | (#4 Critical) Present (`codegen.rs`) but not `#ifndef`-guarded. |
-| `int yylex(void);` prototype | PARTIAL | (#4 Critical) Present (`codegen.rs`) but not `#ifndef`-guarded. |
-| `int yyparse(void);` prototype | MISSING | (#3 Critical) Never emitted. |
-| Prototypes after `%{...%}`, before semantic actions | CONFORMS (for the two present) | `codegen.rs` writes prologue, then `172-175` writes prototypes, then `generate_parser` body. |
-| `%union` → `YYSTYPE` typedef + `extern YYSTYPE yylval` | CONFORMS | `codegen.rs` + `166`. |
+| `void yyerror(const char *);` prototype | CONFORMS | (#4 closed) emitted inside `#ifndef yyerror`. |
+| `int yylex(void);` prototype | CONFORMS | (#4 closed) emitted inside `#ifndef yylex`. |
+| `int yyparse(void);` prototype | CONFORMS | (#3 closed) probed. |
+| Prototypes after `%{...%}`, before semantic actions | CONFORMS (for the two present) | `codegen.rs` writes the prologue, then the prototypes, then the `generate_parser` body. |
+| `%union` → `YYSTYPE` typedef + `extern YYSTYPE yylval` | CONFORMS | `codegen.rs`. |
 | No `main()` declaration unless in `%{...%}` | CONFORMS | `codegen.rs` never emits a `main()` definition. |
 
 ##### Header file (`y.tab.h`)
@@ -335,7 +351,7 @@ no line. The message names the offending literal and codepoint.
 - [x] `%token error <n>` overrides value — `parser.rs`, `grammar.rs`.
 - [x] `YYERROR` triggers error handling without calling `yyerror` — `codegen.rs` (errlab calls yyerror; YYERROR jumps to errlab1 directly).
 - [x] `yyerror("syntax error")` called only when not recovering — `codegen.rs`.
-- [x] Three-symbol normal-shift recovery counter — `codegen.rs` (`errflag = 3`), `1254` (decrement on shift).
+- [x] Three-symbol normal-shift recovery counter — `codegen.rs` (`errflag = 3`, decremented on each shift).
 - [x] `yyerrok` resets recovery — `codegen.rs`.
 - [x] `yyclearin` discards lookahead — `codegen.rs`.
 - [x] `YYRECOVERING()` returns 1 / 0 — `codegen.rs` (`errflag != 0` evaluates to int 0 or 1 in C).
@@ -550,13 +566,13 @@ below were `[x]` while the feature they name was mis-tokenizing.
 | Opt | Status | Notes (file:line) |
 |---|---|---|
 | `-n` | CONFORMS | `main.rs`. |
-| `-t` | CONFORMS | `main.rs` switches output to stdout; `355-360` routes stats to stderr per spec 101698-9. |
+| `-t` | CONFORMS | `main.rs` switches output to stdout and routes stats to stderr per spec 101698-9. |
 | `-v` | PARTIAL | (#L6 Major) Only emits stats on `-v`, not on `%`-declared table sizes. |
 | `-o file` | DIVERGES | (#L8 Minor) Non-POSIX extension. |
 
 #### OPERANDS / STDIN / INPUT FILES
 
-- [x] `file...` operands concatenated to form single lex program — `main.rs`, `286`.
+- [x] `file...` operands concatenated to form single lex program — `main.rs`.
 - [x] `-` operand reads stdin — `main.rs`.
 - [x] No file operands → reads stdin — `main.rs`.
 - [x] Input files are text — `read_line` based parsing in `concat_input_files`.
@@ -614,7 +630,7 @@ below were `[x]` while the feature they name was mis-tokenizing.
 
 ##### Definitions
 
-- [x] `name substitute` substitution definitions — `lexfile.rs`, expansion at `560-697`.
+- [x] `name substitute` substitution definitions — `lexfile.rs`.
 - [x] `{name}` substitution recognition (not inside `[ ]` or `"..."`) — `lexfile.rs` tracks brace, quote *and* bracket state. The bracket state was missing until 2026-08-25, so `[{}]` was read as a reference to a substitution named `{}`. Probed.
 - [x] `%s`/`%start` inclusive start conditions — `lexfile.rs`.
 - [x] `%x` exclusive start conditions — `lexfile.rs`.

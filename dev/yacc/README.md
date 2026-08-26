@@ -33,7 +33,12 @@ Shift/reduce: compare rule precedence vs token precedence.
 - Equal: %left→reduce, %right→shift, %nonassoc→error
 - Unresolved: shift wins (default)
 
-Reduce/reduce: earlier production wins (no precedence resolution).
+Reduce/reduce: earlier production wins (no precedence resolution). An N-way
+reduce/reduce counts as N-1 conflicts, matching bison, so `%expect-rr` is
+satisfiable above 2.
+
+A rule's precedence comes from its last terminal, not its last terminal *with* a
+precedence — taking the latter silently resolved conflicts POSIX says to report.
 
 ### Table Packing (codegen.rs)
 Dense 2D arrays with default compression:
@@ -51,12 +56,40 @@ Bounds checking: rejects grammars exceeding i16 encoding limits (32767 states or
 Every invocation decodes packed tables and compares against canonical LALR(1) tables.
 Accepts default-action compression (Error→Reduce via defact). Panics on mismatch.
 
+### Grammar Validation (grammar.rs)
+
+Each non-terminal is checked for **productivity** — does it derive some string of
+terminals? One that does not gets a warning naming the line of its first rule; it
+is an error only when the *start symbol* derives nothing, which is what bison
+does. This also guards the lookahead fixed point, which previously spun forever
+on a grammar like `x : y ; y : x ;`.
+
+**Known gap:** there is no *reachability* check. A non-terminal that is productive
+but unreachable from the start symbol is accepted silently, where bison reports
+"nonterminal useless in grammar". Harmless to the generated parser, but a dead
+rule can still contribute to the reported conflict counts, since useless rules
+are not deleted before the tables are built.
+
+Character literals are range-checked to `1..=255` on both paths that reach the
+symbol table — rule bodies, and `%token`/`%left`/`%right`/`%nonassoc` declarations
+— since a byte-oriented `yylex` can never return a larger value.
+
 ## Generated Parser
 
 Shift-reduce with:
 - Hybrid stack: starts on C stack (YYINITDEPTH), malloc+memcpy to heap on first overflow, realloc thereafter
-- POSIX consistent-state: skips yylex() in single-reduce states
-- Three-phase error recovery: detect→pop to error-shifting state→discard tokens until 3 shifts
+- POSIX consistent-state: skips yylex() in single-reduce states. A state holding
+  one reduce plus a `%nonassoc` error entry is *not* consistent — treating it as
+  such reduced without reading the lookahead
+- Three-phase error recovery: detect→pop to error-shifting state→discard tokens
+  until 3 shifts. The error-token shift stores a value, so `stmt : error ';' { $1 }`
+  reads initialized memory
+- `yytranslate` maps unassigned and out-of-range token numbers to a reserved
+  `$undefined` terminal that appears in no rule, so undeclared input is a syntax
+  error rather than being shifted as `error`
+- `yytname` is emitted in internal symbol order — terminals by dense index, then
+  non-terminals — which is the numbering `yytranslate` yields and `yyr1` stores,
+  so `yytname[yyr1[n]]` names a rule's LHS
 
 Runtime: O(n) for unambiguous grammars.
 
@@ -106,3 +139,18 @@ PackedTables:
   defgoto: Vec<i16>             # default goto per nonterminal
   consistent: Vec<bool>         # skip-lookahead states
 ```
+
+## Known Limitations
+
+- No reachability check on non-terminals (see Grammar Validation).
+- `$` substitution in actions runs over the raw text, so `$1` inside a C string
+  literal or comment is rewritten too: `printf("costs $1")` becomes
+  `printf("costs (yyvsp[0])")`. The lexer tracks string/comment state in
+  `read_action`; `transform_action` does not.
+
+## Differential testing
+
+Conflict counts and diagnostics are checked against bison 3.8.2. On
+`dev/tests/fixtures/python39.y` both report 2 shift/reduce and 4 reduce/reduce,
+in default and `--strict` modes. `--strict` zeroes the consistent-state table, so
+every grammar is exercised both with and without that optimization.

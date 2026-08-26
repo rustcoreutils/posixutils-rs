@@ -14,7 +14,7 @@ const EXIT_STATUS_NO_DIFFERENCE: i32 = 0;
 const EXIT_STATUS_DIFFERENCE: i32 = 1;
 const EXIT_STATUS_TROUBLE: i32 = 2;
 use std::io::Write as _;
-use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::LazyLock};
+use std::{path::PathBuf, process::Stdio};
 
 /// Write `content` to a uniquely named temp file and return its path. The
 /// `tag` must be unique per test to avoid collisions under parallel runs.
@@ -111,367 +111,610 @@ fn f1_txt_with_eol_spaces_path() -> String {
         .to_string()
 }
 
-struct DiffTestHelper {
-    content: String,
-    file1_path: String,
-    file2_path: String,
-}
-
-impl DiffTestHelper {
-    fn new(options: &str, file1_path: String, file2_path: String) -> Self {
-        // Use the test binary directly instead of cargo run for performance
-        let binary = env!("CARGO_BIN_EXE_diff");
-
-        let mut args: Vec<&str> = Vec::new();
-        if !options.is_empty() {
-            args.extend(options.split_whitespace());
-        }
-        args.push(&file1_path);
-        args.push(&file2_path);
-
-        let output = std::process::Command::new(binary)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .output()
-            .expect("Could not run diff binary!");
-
-        let content = String::from_utf8(output.stdout).expect("Failed to read output of Command!");
-
-        Self {
-            file1_path,
-            file2_path,
-            content,
-        }
-    }
-
-    fn content(&self) -> &str {
-        &self.content
-    }
-
-    fn file1_path(&self) -> &str {
-        &self.file1_path
-    }
-
-    fn file2_path(&self) -> &str {
-        &self.file2_path
-    }
-}
-
-fn get_diff_test_helper_hash_map() -> HashMap<String, DiffTestHelper> {
-    let diff_test_helper_init_data = [
-        ("", f1_txt_path(), f2_txt_path(), "test_diff_normal"),
-        (" -c", f1_txt_path(), f2_txt_path(), "test_diff_context3"),
-        (" -C 1", f1_txt_path(), f2_txt_path(), "test_diff_context1"),
-        (
-            " -C 10",
-            f1_txt_path(),
-            f2_txt_path(),
-            "test_diff_context10",
-        ),
-        (" -e", f1_txt_path(), f2_txt_path(), "test_diff_edit_script"),
-        (
-            " -f",
-            f1_txt_path(),
-            f2_txt_path(),
-            "test_diff_forward_edit_script",
-        ),
-        (" -u", f1_txt_path(), f2_txt_path(), "test_diff_unified3"),
-        (" -U 0", f1_txt_path(), f2_txt_path(), "test_diff_unified0"),
-        (
-            " -U 10",
-            f1_txt_path(),
-            f2_txt_path(),
-            "test_diff_unified10",
-        ),
-        ("", f1_txt_path(), f2_dir_path(), "test_diff_file_directory"),
-        ("", f1_dir_path(), f2_dir_path(), "test_diff_directories"),
-        (
-            " -r",
-            f1_dir_path(),
-            f2_dir_path(),
-            "test_diff_directories_recursive",
-        ),
-        (
-            " -r -c",
-            f1_dir_path(),
-            f2_dir_path(),
-            "test_diff_directories_recursive_context",
-        ),
-        (
-            " -r -e",
-            f1_dir_path(),
-            f2_dir_path(),
-            "test_diff_directories_recursive_edit_script",
-        ),
-        (
-            " -r -f",
-            f1_dir_path(),
-            f2_dir_path(),
-            "test_diff_directories_recursive_forward_edit_script",
-        ),
-        (
-            " -r -u",
-            f1_dir_path(),
-            f2_dir_path(),
-            "test_diff_directories_recursive_unified",
-        ),
-        (
-            "",
-            f1_txt_path(),
-            f1_txt_with_eol_spaces_path(),
-            "test_diff_counting_eol_spaces",
-        ),
-        (
-            " -b",
-            f1_txt_path(),
-            f1_txt_with_eol_spaces_path(),
-            "test_diff_ignoring_eol_spaces",
-        ),
-        (
-            " --label F1 --label2 F2 -u",
-            f1_txt_path(),
-            f1_txt_with_eol_spaces_path(),
-            "test_diff_unified_two_labels",
-        ),
-    ];
-
-    let mut diff_test_helper_hash_map =
-        HashMap::<String, DiffTestHelper>::with_capacity(diff_test_helper_init_data.len());
-
-    for (options, file1_path, file2_path, key) in diff_test_helper_init_data {
-        let insert_option = diff_test_helper_hash_map.insert(
-            key.to_owned(),
-            DiffTestHelper::new(options, file1_path, file2_path),
-        );
-
-        assert!(insert_option.is_none());
-    }
-
-    diff_test_helper_hash_map
-}
-
-fn input_by_key(key: &str) -> &'static DiffTestHelper {
-    static DIFF_TEST_INPUT: LazyLock<HashMap<String, DiffTestHelper>> =
-        LazyLock::new(get_diff_test_helper_hash_map);
-
-    // Initialized on first access
-    DIFF_TEST_INPUT.get(key).unwrap()
+/// Compare `diff`'s output against `expected`, ignoring the timestamp a
+/// `*** ` / `--- ` / `+++ ` header carries.
+///
+/// The timestamp is the file's mtime and so is not reproducible; everything
+/// else about the output is. These expectations were taken from GNU diffutils
+/// 3.10, which matches us byte for byte on this fixture set in every format.
+fn diff_test_fixture(args: &[&str], expected: &str, code: i32) {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("diff"),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: code,
+        },
+        |plan, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let got: String = stdout
+                .split_inclusive('\n')
+                .map(|line| match line.split_once('\t') {
+                    Some((head, _))
+                        if head.starts_with("*** ")
+                            || head.starts_with("--- ")
+                            || head.starts_with("+++ ") =>
+                    {
+                        format!("{head}\n")
+                    }
+                    _ => line.to_string(),
+                })
+                .collect();
+            assert_eq!(got, expected, "stdout for {:?}", plan.args);
+            assert_eq!(
+                output.status.code(),
+                Some(plan.expected_exit_code),
+                "exit code for {:?}",
+                plan.args
+            );
+        },
+    );
 }
 
 #[test]
 fn test_diff_normal() {
-    let data = input_by_key("test_diff_normal");
-
-    diff_test(
-        &[data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &[&f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "6c6\n",
+            "< line 6 will change\r\n",
+            "---\n",
+            "> line 6 is updated\r\n",
+            "8d7\n",
+            "< This line will be removed\r\n",
+            "11,12c10,11\n",
+            "< line 9 will change\r\n",
+            "< line 10 will change\r\n",
+            "---\n",
+            "> line 9 is updated\r\n",
+            "> line 10 is updated\r\n",
+            "15,16d13\n",
+            "< \r\n",
+            "< This will be removed, too\r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_context3() {
-    let data = input_by_key("test_diff_context3");
-
-    diff_test(
-        &["-c", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-c", &f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "*** tests/diff/f1.txt\n",
+            "--- tests/diff/f2.txt\n",
+            "***************\n",
+            "*** 3,16 ****\n",
+            "  \r\n",
+            "  line 4\r\n",
+            "  line 5\r\n",
+            "! line 6 will change\r\n",
+            "  line 7\r\n",
+            "- This line will be removed\r\n",
+            "  \r\n",
+            "  line 8\r\n",
+            "! line 9 will change\r\n",
+            "! line 10 will change\r\n",
+            "  \r\n",
+            "  line 11\r\n",
+            "- \r\n",
+            "- This will be removed, too\r\n",
+            "--- 3,13 ----\n",
+            "  \r\n",
+            "  line 4\r\n",
+            "  line 5\r\n",
+            "! line 6 is updated\r\n",
+            "  line 7\r\n",
+            "  \r\n",
+            "  line 8\r\n",
+            "! line 9 is updated\r\n",
+            "! line 10 is updated\r\n",
+            "  \r\n",
+            "  line 11\r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_context1() {
-    let data = input_by_key("test_diff_context1");
-
-    diff_test(
-        &["-C", "1", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-C", "1", &f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "*** tests/diff/f1.txt\n",
+            "--- tests/diff/f2.txt\n",
+            "***************\n",
+            "*** 5,16 ****\n",
+            "  line 5\r\n",
+            "! line 6 will change\r\n",
+            "  line 7\r\n",
+            "- This line will be removed\r\n",
+            "  \r\n",
+            "  line 8\r\n",
+            "! line 9 will change\r\n",
+            "! line 10 will change\r\n",
+            "  \r\n",
+            "  line 11\r\n",
+            "- \r\n",
+            "- This will be removed, too\r\n",
+            "--- 5,13 ----\n",
+            "  line 5\r\n",
+            "! line 6 is updated\r\n",
+            "  line 7\r\n",
+            "  \r\n",
+            "  line 8\r\n",
+            "! line 9 is updated\r\n",
+            "! line 10 is updated\r\n",
+            "  \r\n",
+            "  line 11\r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_context10() {
-    let data = input_by_key("test_diff_context10");
-
-    diff_test(
-        &["-C", "10", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-C", "10", &f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "*** tests/diff/f1.txt\n",
+            "--- tests/diff/f2.txt\n",
+            "***************\n",
+            "*** 1,16 ****\n",
+            "  line 1\r\n",
+            "  line 2\r\n",
+            "  \r\n",
+            "  line 4\r\n",
+            "  line 5\r\n",
+            "! line 6 will change\r\n",
+            "  line 7\r\n",
+            "- This line will be removed\r\n",
+            "  \r\n",
+            "  line 8\r\n",
+            "! line 9 will change\r\n",
+            "! line 10 will change\r\n",
+            "  \r\n",
+            "  line 11\r\n",
+            "- \r\n",
+            "- This will be removed, too\r\n",
+            "--- 1,13 ----\n",
+            "  line 1\r\n",
+            "  line 2\r\n",
+            "  \r\n",
+            "  line 4\r\n",
+            "  line 5\r\n",
+            "! line 6 is updated\r\n",
+            "  line 7\r\n",
+            "  \r\n",
+            "  line 8\r\n",
+            "! line 9 is updated\r\n",
+            "! line 10 is updated\r\n",
+            "  \r\n",
+            "  line 11\r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_edit_script() {
-    let data = input_by_key("test_diff_edit_script");
-
-    diff_test(
-        &["-e", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-e", &f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "15,16d\n",
+            "11,12c\n",
+            "line 9 is updated\r\n",
+            "line 10 is updated\r\n",
+            ".\n",
+            "8d\n",
+            "6c\n",
+            "line 6 is updated\r\n",
+            ".\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_forward_edit_script() {
-    let data = input_by_key("test_diff_forward_edit_script");
-
-    diff_test(
-        &["-f", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-f", &f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "c6\n",
+            "line 6 is updated\r\n",
+            ".\n",
+            "d8\n",
+            "c11 12\n",
+            "line 9 is updated\r\n",
+            "line 10 is updated\r\n",
+            ".\n",
+            "d15 16\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_unified3() {
-    let data = input_by_key("test_diff_unified3");
-
-    diff_test(
-        &["-u", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-u", &f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "--- tests/diff/f1.txt\n",
+            "+++ tests/diff/f2.txt\n",
+            "@@ -3,14 +3,11 @@\n",
+            " \r\n",
+            " line 4\r\n",
+            " line 5\r\n",
+            "-line 6 will change\r\n",
+            "+line 6 is updated\r\n",
+            " line 7\r\n",
+            "-This line will be removed\r\n",
+            " \r\n",
+            " line 8\r\n",
+            "-line 9 will change\r\n",
+            "-line 10 will change\r\n",
+            "+line 9 is updated\r\n",
+            "+line 10 is updated\r\n",
+            " \r\n",
+            " line 11\r\n",
+            "-\r\n",
+            "-This will be removed, too\r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_unified0() {
-    let data = input_by_key("test_diff_unified0");
-
-    diff_test(
-        &["-U", "0", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-U", "0", &f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "--- tests/diff/f1.txt\n",
+            "+++ tests/diff/f2.txt\n",
+            "@@ -6 +6 @@\n",
+            "-line 6 will change\r\n",
+            "+line 6 is updated\r\n",
+            "@@ -8 +7,0 @@\n",
+            "-This line will be removed\r\n",
+            "@@ -11,2 +10,2 @@\n",
+            "-line 9 will change\r\n",
+            "-line 10 will change\r\n",
+            "+line 9 is updated\r\n",
+            "+line 10 is updated\r\n",
+            "@@ -15,2 +13,0 @@\n",
+            "-\r\n",
+            "-This will be removed, too\r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_unified10() {
-    let data = input_by_key("test_diff_unified10");
-
-    diff_test(
-        &["-U", "10", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-U", "10", &f1_txt_path(), &f2_txt_path()],
+        concat!(
+            "--- tests/diff/f1.txt\n",
+            "+++ tests/diff/f2.txt\n",
+            "@@ -1,16 +1,13 @@\n",
+            " line 1\r\n",
+            " line 2\r\n",
+            " \r\n",
+            " line 4\r\n",
+            " line 5\r\n",
+            "-line 6 will change\r\n",
+            "+line 6 is updated\r\n",
+            " line 7\r\n",
+            "-This line will be removed\r\n",
+            " \r\n",
+            " line 8\r\n",
+            "-line 9 will change\r\n",
+            "-line 10 will change\r\n",
+            "+line 9 is updated\r\n",
+            "+line 10 is updated\r\n",
+            " \r\n",
+            " line 11\r\n",
+            "-\r\n",
+            "-This will be removed, too\r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_file_directory() {
-    let data = input_by_key("test_diff_file_directory");
-
-    diff_test(
-        &[data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &[&f1_txt_path(), &f2_dir_path()],
+        concat!(
+            "6c6\n",
+            "< line 6 will change\r\n",
+            "---\n",
+            "> line 6 is updated\r\n",
+            "8d7\n",
+            "< This line will be removed\r\n",
+            "11,12c10,11\n",
+            "< line 9 will change\r\n",
+            "< line 10 will change\r\n",
+            "---\n",
+            "> line 9 is updated\r\n",
+            "> line 10 is updated\r\n",
+            "15,16d13\n",
+            "< \r\n",
+            "< This will be removed, too\r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_directories() {
-    let data = input_by_key("test_diff_directories");
-
-    diff_test(
-        &[data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &[&f1_dir_path(), &f2_dir_path()],
+        concat!(
+        "Common subdirectories: tests/diff/f1/empty and tests/diff/f2/empty\n",
+        "diff tests/diff/f1/f1.txt tests/diff/f2/f1.txt\n",
+        "6c6\n",
+        "< line 6 will change\r\n",
+        "---\n",
+        "> line 6 is updated\r\n",
+        "8d7\n",
+        "< This line will be removed\r\n",
+        "11,12c10,11\n",
+        "< line 9 will change\r\n",
+        "< line 10 will change\r\n",
+        "---\n",
+        "> line 9 is updated\r\n",
+        "> line 10 is updated\r\n",
+        "15,16d13\n",
+        "< \r\n",
+        "< This will be removed, too\r\n",
+        "File tests/diff/f1/f3.txt is a directory while file tests/diff/f2/f3.txt is a regular file\n",
+    ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_directories_recursive() {
-    let data = input_by_key("test_diff_directories_recursive");
-
-    diff_test(
-        &["-r", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-r", &f1_dir_path(), &f2_dir_path()],
+        concat!(
+        "diff -r tests/diff/f1/f1.txt tests/diff/f2/f1.txt\n",
+        "6c6\n",
+        "< line 6 will change\r\n",
+        "---\n",
+        "> line 6 is updated\r\n",
+        "8d7\n",
+        "< This line will be removed\r\n",
+        "11,12c10,11\n",
+        "< line 9 will change\r\n",
+        "< line 10 will change\r\n",
+        "---\n",
+        "> line 9 is updated\r\n",
+        "> line 10 is updated\r\n",
+        "15,16d13\n",
+        "< \r\n",
+        "< This will be removed, too\r\n",
+        "File tests/diff/f1/f3.txt is a directory while file tests/diff/f2/f3.txt is a regular file\n",
+    ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_directories_recursive_context() {
-    let data = input_by_key("test_diff_directories_recursive_context");
-
-    diff_test(
-        &["-r", "-c", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-r", "-c", &f1_dir_path(), &f2_dir_path()],
+        concat!(
+        "diff -r -c tests/diff/f1/f1.txt tests/diff/f2/f1.txt\n",
+        "*** tests/diff/f1/f1.txt\n",
+        "--- tests/diff/f2/f1.txt\n",
+        "***************\n",
+        "*** 3,16 ****\n",
+        "  \r\n",
+        "  line 4\r\n",
+        "  line 5\r\n",
+        "! line 6 will change\r\n",
+        "  line 7\r\n",
+        "- This line will be removed\r\n",
+        "  \r\n",
+        "  line 8\r\n",
+        "! line 9 will change\r\n",
+        "! line 10 will change\r\n",
+        "  \r\n",
+        "  line 11\r\n",
+        "- \r\n",
+        "- This will be removed, too\r\n",
+        "--- 3,13 ----\n",
+        "  \r\n",
+        "  line 4\r\n",
+        "  line 5\r\n",
+        "! line 6 is updated\r\n",
+        "  line 7\r\n",
+        "  \r\n",
+        "  line 8\r\n",
+        "! line 9 is updated\r\n",
+        "! line 10 is updated\r\n",
+        "  \r\n",
+        "  line 11\r\n",
+        "File tests/diff/f1/f3.txt is a directory while file tests/diff/f2/f3.txt is a regular file\n",
+    ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_directories_recursive_edit_script() {
-    let data = input_by_key("test_diff_directories_recursive_edit_script");
-
-    diff_test(
-        &["-r", "-e", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-r", "-e", &f1_dir_path(), &f2_dir_path()],
+        concat!(
+        "diff -r -e tests/diff/f1/f1.txt tests/diff/f2/f1.txt\n",
+        "15,16d\n",
+        "11,12c\n",
+        "line 9 is updated\r\n",
+        "line 10 is updated\r\n",
+        ".\n",
+        "8d\n",
+        "6c\n",
+        "line 6 is updated\r\n",
+        ".\n",
+        "File tests/diff/f1/f3.txt is a directory while file tests/diff/f2/f3.txt is a regular file\n",
+    ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_directories_recursive_forward_edit_script() {
-    let data = input_by_key("test_diff_directories_recursive_forward_edit_script");
-
-    diff_test(
-        &["-r", "-f", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-r", "-f", &f1_dir_path(), &f2_dir_path()],
+        concat!(
+        "diff -r -f tests/diff/f1/f1.txt tests/diff/f2/f1.txt\n",
+        "c6\n",
+        "line 6 is updated\r\n",
+        ".\n",
+        "d8\n",
+        "c11 12\n",
+        "line 9 is updated\r\n",
+        "line 10 is updated\r\n",
+        ".\n",
+        "d15 16\n",
+        "File tests/diff/f1/f3.txt is a directory while file tests/diff/f2/f3.txt is a regular file\n",
+    ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_directories_recursive_unified() {
-    let data = input_by_key("test_diff_directories_recursive_unified");
-
-    diff_test(
-        &["-r", "-u", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &["-r", "-u", &f1_dir_path(), &f2_dir_path()],
+        concat!(
+        "diff -r -u tests/diff/f1/f1.txt tests/diff/f2/f1.txt\n",
+        "--- tests/diff/f1/f1.txt\n",
+        "+++ tests/diff/f2/f1.txt\n",
+        "@@ -3,14 +3,11 @@\n",
+        " \r\n",
+        " line 4\r\n",
+        " line 5\r\n",
+        "-line 6 will change\r\n",
+        "+line 6 is updated\r\n",
+        " line 7\r\n",
+        "-This line will be removed\r\n",
+        " \r\n",
+        " line 8\r\n",
+        "-line 9 will change\r\n",
+        "-line 10 will change\r\n",
+        "+line 9 is updated\r\n",
+        "+line 10 is updated\r\n",
+        " \r\n",
+        " line 11\r\n",
+        "-\r\n",
+        "-This will be removed, too\r\n",
+        "File tests/diff/f1/f3.txt is a directory while file tests/diff/f2/f3.txt is a regular file\n",
+    ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_counting_eol_spaces() {
-    let data = input_by_key("test_diff_counting_eol_spaces");
-
-    diff_test(
-        &[data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+    diff_test_fixture(
+        &[&f1_txt_path(), &f1_txt_with_eol_spaces_path()],
+        concat!(
+            "1,2c1,2\n",
+            "< line 1\r\n",
+            "< line 2\r\n",
+            "---\n",
+            "> line 1    \r\n",
+            "> line 2    \r\n",
+            "5,8c5,8\n",
+            "< line 5\r\n",
+            "< line 6 will change\r\n",
+            "< line 7\r\n",
+            "< This line will be removed\r\n",
+            "---\n",
+            "> line 5   \r\n",
+            "> line 6 will change   \r\n",
+            "> line 7   \r\n",
+            "> This line will be removed  \r\n",
+            "10,12c10,12\n",
+            "< line 8\r\n",
+            "< line 9 will change\r\n",
+            "< line 10 will change\r\n",
+            "---\n",
+            "> line 8   \r\n",
+            "> line 9 will change   \r\n",
+            "> line 10 will change    \r\n",
+            "14c14\n",
+            "< line 11\r\n",
+            "---\n",
+            "> line 11   \r\n",
+            "16c16\n",
+            "< This will be removed, too\r\n",
+            "---\n",
+            "> This will be removed, too   \r\n",
+        ),
+        1,
     );
 }
 
 #[test]
 fn test_diff_ignoring_eol_spaces() {
-    let data = input_by_key("test_diff_ignoring_eol_spaces");
-
-    diff_test(
-        &["-b", data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_NO_DIFFERENCE,
+    diff_test_fixture(
+        &["-b", &f1_txt_path(), &f1_txt_with_eol_spaces_path()],
+        "",
+        0,
     );
 }
 
 #[test]
 fn test_diff_unified_two_labels() {
-    let data = input_by_key("test_diff_unified_two_labels");
-
-    diff_test(
+    diff_test_fixture(
         &[
             "--label",
             "F1",
             "--label2",
             "F2",
             "-u",
-            data.file1_path(),
-            data.file2_path(),
+            &f1_txt_path(),
+            &f1_txt_with_eol_spaces_path(),
         ],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
+        concat!(
+            "--- F1\n",
+            "+++ F2\n",
+            "@@ -1,16 +1,16 @@\n",
+            "-line 1\r\n",
+            "-line 2\r\n",
+            "+line 1    \r\n",
+            "+line 2    \r\n",
+            " \r\n",
+            " line 4\r\n",
+            "-line 5\r\n",
+            "-line 6 will change\r\n",
+            "-line 7\r\n",
+            "-This line will be removed\r\n",
+            "+line 5   \r\n",
+            "+line 6 will change   \r\n",
+            "+line 7   \r\n",
+            "+This line will be removed  \r\n",
+            " \r\n",
+            "-line 8\r\n",
+            "-line 9 will change\r\n",
+            "-line 10 will change\r\n",
+            "+line 8   \r\n",
+            "+line 9 will change   \r\n",
+            "+line 10 will change    \r\n",
+            " \r\n",
+            "-line 11\r\n",
+            "+line 11   \r\n",
+            " \r\n",
+            "-This will be removed, too\r\n",
+            "+This will be removed, too   \r\n",
+        ),
+        1,
     );
 }
 

@@ -78,6 +78,7 @@ impl<'a> PatchApplier<'a> {
 
         let placement = Placement::from(patch.format);
         let mut rejected_hunks: Vec<(usize, Hunk, String)> = Vec::new();
+        let mut applied_any = false;
 
         for (i, hunk) in patch.hunks.iter_mut().enumerate() {
             let hunk_num = i + 1;
@@ -99,6 +100,7 @@ impl<'a> PatchApplier<'a> {
                     if fuzz > 0 {
                         eprintln!("Hunk #{} succeeded with fuzz {}", hunk_num, fuzz);
                     }
+                    applied_any = true;
                 }
                 HunkResult::AlreadyApplied => {
                     if !self.config.ignore_applied {
@@ -107,7 +109,7 @@ impl<'a> PatchApplier<'a> {
                         // still attempted.
                         rejected_hunks.push((
                             hunk_num,
-                            hunk.clone(),
+                            self.reject_at_offset(hunk),
                             String::from("reversed (or previously applied) patch"),
                         ));
                         continue;
@@ -115,18 +117,7 @@ impl<'a> PatchApplier<'a> {
                     eprintln!("Hunk #{} already applied", hunk_num);
                 }
                 HunkResult::Rejected { reason } => {
-                    // Adjust the reject's header line numbers by the cumulative
-                    // offset of previously-applied hunks so they approximate the
-                    // positions in the (partially) patched file (matching GNU).
-                    let mut rej = hunk.clone();
-                    if self.offset != 0 {
-                        let adjust = |start: usize| -> usize {
-                            ((start as i64 + self.offset).max(1)) as usize
-                        };
-                        rej.old_start = adjust(rej.old_start);
-                        rej.new_start = adjust(rej.new_start);
-                    }
-                    rejected_hunks.push((hunk_num, rej, reason));
+                    rejected_hunks.push((hunk_num, self.reject_at_offset(hunk), reason));
                 }
             }
         }
@@ -138,7 +129,21 @@ impl<'a> PatchApplier<'a> {
             // Use mem::take to avoid cloning the entire file content
             content: std::mem::take(&mut self.file_lines),
             no_trailing_newline,
+            applied_any,
         })
+    }
+
+    /// Copy a hunk for the reject file, shifting its header line numbers by the
+    /// offset accumulated so far so they approximate positions in the
+    /// partially patched file (matching GNU).
+    fn reject_at_offset(&self, hunk: &Hunk) -> Hunk {
+        let mut rej = hunk.clone();
+        if self.offset != 0 {
+            let adjust = |start: usize| ((start as i64 + self.offset).max(1)) as usize;
+            rej.old_start = adjust(rej.old_start);
+            rej.new_start = adjust(rej.new_start);
+        }
+        rej
     }
 
     /// Reject every hunk without touching the file, for a patch the user
@@ -160,6 +165,7 @@ impl<'a> PatchApplier<'a> {
             rejected_hunks,
             content: std::mem::take(&mut self.file_lines),
             no_trailing_newline: self.eof_no_newline,
+            applied_any: false,
         }
     }
 

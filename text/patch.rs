@@ -246,6 +246,26 @@ fn run(args: Args) -> Result<bool, PatchError> {
             continue;
         }
 
+        // Nothing applied means the content is byte-identical to what was
+        // read; writing it back would change the file's modification time, and
+        // under -b leave a backup, for a patch that did nothing.
+        if !result.applied_any && !result.rejected_hunks.is_empty() {
+            had_rejects = true;
+            if let Err(e) = write_rejects(
+                &result.rejected_hunks,
+                &target,
+                &config,
+                &mut written_rejects,
+            ) {
+                eprintln!("patch: {}: {}", target.display(), e);
+                exit_code = 2;
+            }
+            for (num, _, reason) in &result.rejected_hunks {
+                eprintln!("patch: Hunk #{} FAILED -- {}", num, reason);
+            }
+            continue;
+        }
+
         // A write failure is reported against the file it happened to, and the
         // remaining file patches are still attempted.
         if let Err(e) = write_output(

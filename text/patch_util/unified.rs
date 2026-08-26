@@ -170,21 +170,26 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
     Ok((patch, pos))
 }
 
-/// Check if a line looks like a unified diff header.
-pub fn looks_like_unified(lines: &[&str]) -> bool {
+/// Index of the first line that identifies this as a unified diff.
+///
+/// Returning the position, rather than a bare yes, lets the caller pick the
+/// format whose marker appears earliest. Without that, a marker buried in some
+/// other format's *content* -- an ed script's text block, say -- outvotes the
+/// real header at the top of the file.
+pub fn unified_marker(lines: &[&str]) -> Option<usize> {
     // Scan the whole input: a mailed patch or `git format-patch` output can
     // carry an arbitrarily long commit message before the first header.
     for (i, line) in lines.iter().enumerate() {
         if HUNK_HEADER_RE.is_match(line) {
-            return true;
+            return Some(i);
         }
         // Require the two file headers to be adjacent, as diff writes them.
         // Testing only that both appear somewhere would misread any patch
         // whose *content* happens to contain a "+++ " line.
         if line.starts_with("--- ") && lines.get(i + 1).is_some_and(|n| n.starts_with("+++ ")) {
-            return true;
+            return Some(i);
         }
     }
 
-    false
+    None
 }

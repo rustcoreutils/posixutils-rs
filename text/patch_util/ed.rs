@@ -128,21 +128,22 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
     Ok((patch, pos))
 }
 
-/// Check if a line looks like an ed script command.
-pub fn looks_like_ed(lines: &[&str]) -> bool {
-    for line in lines.iter() {
+/// Index of the first ed-script command line.
+/// See [`super::unified::unified_marker`] for why this reports a position.
+pub fn ed_marker(lines: &[&str]) -> Option<usize> {
+    for (i, line) in lines.iter().enumerate() {
         // Skip Index: and diff lines
         if line.starts_with("Index: ") || line.starts_with("diff ") {
             continue;
         }
         if DETECT_CMD_RE.is_match(line) {
-            return true;
+            return Some(i);
         }
         // If we hit content that's not an ed command, it's probably not ed
         if !super::parser::is_blank(line) && !line.starts_with('.') {
-            return false;
+            return None;
         }
     }
 
-    false
+    None
 }

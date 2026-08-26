@@ -10,11 +10,11 @@
 //! Patch format detection and parsing.
 
 use super::{
-    context::{looks_like_context, parse_context},
-    ed::{looks_like_ed, parse_ed},
-    normal::{looks_like_normal, parse_normal},
+    context::{context_marker, parse_context},
+    ed::{ed_marker, parse_ed},
+    normal::{normal_marker, parse_normal},
     types::{DiffFormat, Patch, PatchConfig, PatchError},
-    unified::{looks_like_unified, parse_unified},
+    unified::{parse_unified, unified_marker},
 };
 
 /// Report git extended-header sections that carry no textual difference.
@@ -61,6 +61,13 @@ fn report_git_only_sections(lines: &[&str]) -> bool {
 }
 
 /// Detect the diff format from the patch content.
+///
+/// Every format is identified by a marker line, and a marker can appear inside
+/// another format's *content* -- an ed script's text block is unprefixed file
+/// text, so it may contain something that reads as a normal-diff command. The
+/// format whose marker comes *first* is the one that describes the file;
+/// anything later is content belonging to it. Ties keep the historical
+/// precedence: unified, context, normal, ed.
 pub fn detect_format(lines: &[&str], config: &PatchConfig) -> Option<DiffFormat> {
     // Honor forced format options
     if config.force_unified {
@@ -76,21 +83,16 @@ pub fn detect_format(lines: &[&str], config: &PatchConfig) -> Option<DiffFormat>
         return Some(DiffFormat::EdScript);
     }
 
-    // Auto-detect format
-    if looks_like_unified(lines) {
-        return Some(DiffFormat::Unified);
-    }
-    if looks_like_context(lines) {
-        return Some(DiffFormat::Context);
-    }
-    if looks_like_normal(lines) {
-        return Some(DiffFormat::Normal);
-    }
-    if looks_like_ed(lines) {
-        return Some(DiffFormat::EdScript);
-    }
-
-    None
+    [
+        (unified_marker(lines), DiffFormat::Unified),
+        (context_marker(lines), DiffFormat::Context),
+        (normal_marker(lines), DiffFormat::Normal),
+        (ed_marker(lines), DiffFormat::EdScript),
+    ]
+    .into_iter()
+    .filter_map(|(at, format)| at.map(|at| (at, format)))
+    .min_by_key(|(at, _)| *at)
+    .map(|(_, format)| format)
 }
 
 /// Split text into lines on '\n' only, so a '\r' stays part of the line.
@@ -232,19 +234,9 @@ pub fn parse_patch(content: &str, config: &PatchConfig) -> Result<Patch, PatchEr
         } else if config.force_ed {
             DiffFormat::EdScript
         } else {
-            // Look at current position to detect format
-            let remaining = &lines[pos..];
-            if looks_like_unified(remaining) {
-                DiffFormat::Unified
-            } else if looks_like_context(remaining) {
-                DiffFormat::Context
-            } else if looks_like_normal(remaining) {
-                DiffFormat::Normal
-            } else if looks_like_ed(remaining) {
-                DiffFormat::EdScript
-            } else {
-                format // Use initial detected format
-            }
+            // Look at the current position; fall back to the whole-file
+            // detection when nothing here identifies itself.
+            detect_format(&lines[pos..], config).unwrap_or(format)
         };
 
         let (file_patch, new_pos) = match local_format {

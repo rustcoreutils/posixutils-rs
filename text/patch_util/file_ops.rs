@@ -346,9 +346,11 @@ pub fn write_rejects(
     let mut writer = BufWriter::new(file);
 
     // Name the file each group of rejects belongs to, so an aggregated reject
-    // file stays attributable.
+    // file stays attributable. The header is context-style to match the hunks
+    // below it: a unified-style "--- "/"+++ " pair would make the reject file
+    // read as a unified diff that then contains no hunks at all.
+    writeln!(writer, "*** {}", target.display())?;
     writeln!(writer, "--- {}", target.display())?;
-    writeln!(writer, "+++ {}", target.display())?;
 
     // Write rejects in context diff format per POSIX
     // (even if input was unified, rejects should be in context format)

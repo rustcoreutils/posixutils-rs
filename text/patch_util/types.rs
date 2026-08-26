@@ -334,6 +334,12 @@ pub struct ApplyResult {
     pub content: Vec<String>,
     /// Whether the resulting file's last line has no trailing newline.
     pub no_trailing_newline: bool,
+    /// Whether any hunk was actually applied.
+    ///
+    /// When none was, the content is byte-identical to what was read and must
+    /// not be written back: rewriting it would change the file's modification
+    /// time, and under -b leave a backup, for a patch that did nothing.
+    pub applied_any: bool,
 }
 
 /// Configuration options for patch.

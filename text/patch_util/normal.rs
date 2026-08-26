@@ -179,13 +179,8 @@ fn strip_marker(line: &str, marker: char) -> Option<&str> {
     Some(rest.strip_prefix(' ').unwrap_or(rest))
 }
 
-/// Check if a line looks like a normal diff command.
-pub fn looks_like_normal(lines: &[&str]) -> bool {
-    for line in lines.iter() {
-        if DETECT_CMD_RE.is_match(line) {
-            return true;
-        }
-    }
-
-    false
+/// Index of the first normal-diff command line.
+/// See [`super::unified::unified_marker`] for why this reports a position.
+pub fn normal_marker(lines: &[&str]) -> Option<usize> {
+    lines.iter().position(|line| DETECT_CMD_RE.is_match(line))
 }

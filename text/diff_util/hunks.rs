@@ -221,6 +221,19 @@ impl Hunk {
     }
 }
 
+/// A run of hunks close enough together to share one `-c` / `-u` section,
+/// together with the 0-indexed half-open line range that section covers in
+/// each file: the changed lines plus the surrounding context.
+pub struct Section {
+    /// Inclusive index range into [`Hunks::hunks`].
+    pub first: usize,
+    pub last: usize,
+    pub start1: usize,
+    pub end1: usize,
+    pub start2: usize,
+    pub end2: usize,
+}
+
 #[derive(Default)]
 pub struct Hunks {
     hunks: Vec<Hunk>,
@@ -241,6 +254,55 @@ impl Hunks {
 
     pub fn hunk_count(&self) -> usize {
         self.hunks.len()
+    }
+
+    /// Group the hunks into the sections `-c` and `-u` print.
+    ///
+    /// Two adjacent hunks share a section when at most `2 * context` unchanged
+    /// lines separate them, which is the rule GNU diff applies. A larger gap
+    /// leaves at least one unchanged line between the two context windows, so
+    /// sections never overlap.
+    ///
+    /// Requires the hunks to be in ascending order, which is how both context
+    /// formats sort them.
+    pub fn sections(&self, context: usize, num_lines1: usize, num_lines2: usize) -> Vec<Section> {
+        let mut sections = Vec::new();
+        let mut first = 0usize;
+
+        while first < self.hunks.len() {
+            let mut last = first;
+            while last + 1 < self.hunks.len()
+                && self.hunks[last + 1].ln1_start() - self.hunks[last].ln1_end() <= context * 2
+            {
+                last += 1;
+            }
+
+            // Leading and trailing context must come from both files in equal
+            // amounts: the lines around a section are common to both, so they
+            // only line up if each pane is extended by the same number. Taking
+            // the minimum is also what keeps the subtraction below from
+            // underflowing when a section begins within `context` lines of
+            // either file's start -- which is reachable as soon as a hunk
+            // inserts before the first common line.
+            let lead = context
+                .min(self.hunks[first].ln1_start())
+                .min(self.hunks[first].ln2_start());
+            let trail = context
+                .min(num_lines1 - self.hunks[last].ln1_end())
+                .min(num_lines2 - self.hunks[last].ln2_end());
+
+            sections.push(Section {
+                first,
+                last,
+                start1: self.hunks[first].ln1_start() - lead,
+                end1: self.hunks[last].ln1_end() + trail,
+                start2: self.hunks[first].ln2_start() - lead,
+                end2: self.hunks[last].ln2_end() + trail,
+            });
+            first = last + 1;
+        }
+
+        sections
     }
 
     pub fn create_hunks_from_lcs(

@@ -936,3 +936,176 @@ fn test_diff_output_is_deterministic() {
         );
     }
 }
+
+/// A context section whose second-file pane is a pure insertion used to be
+/// tested for the `-` prefix that pane can never carry, so its body was
+/// dropped -- and because only the printing path cleared the buffer, the
+/// dropped lines were then flushed into the *next* section. `patch` rejects
+/// the result as "context mangled in hunk".
+#[test]
+fn test_diff_context_pure_insertion_section_is_not_swallowed() {
+    let a: String = (1..=40).map(|n| format!("{n}\n")).collect();
+    let b: String = (1..=4)
+        .map(|n| format!("{n}\n"))
+        .chain(std::iter::once("INS\n".to_string()))
+        .chain((5..=29).map(|n| format!("{n}\n")))
+        .chain(std::iter::once("CHANGED\n".to_string()))
+        .chain((31..=40).map(|n| format!("{n}\n")))
+        .collect();
+    let f1 = write_tmp("sect_1", a.as_bytes());
+    let f2 = write_tmp("sect_2", b.as_bytes());
+
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-c", &f1, &f2],
+        concat!(
+            "*** L1\n--- L2\n",
+            "***************\n",
+            "*** 2,7 ****\n",
+            "--- 2,8 ----\n  2\n  3\n  4\n+ INS\n  5\n  6\n  7\n",
+            "***************\n",
+            "*** 27,33 ****\n  27\n  28\n  29\n! 30\n  31\n  32\n  33\n",
+            "--- 28,34 ----\n  27\n  28\n  29\n! CHANGED\n  31\n  32\n  33\n",
+        ),
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-u", &f1, &f2],
+        concat!(
+            "--- L1\n+++ L2\n",
+            "@@ -2,6 +2,7 @@\n 2\n 3\n 4\n+INS\n 5\n 6\n 7\n",
+            "@@ -27,7 +28,7 @@\n 27\n 28\n 29\n-30\n+CHANGED\n 31\n 32\n 33\n",
+        ),
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// A head insertion leaves the first file's cursor at line 0, which both
+/// context printers used as their "no hunk seen yet" sentinel. The second
+/// hunk then re-ran first-hunk setup, discarding the position already reached
+/// and emitting a section header for the wrong lines.
+#[test]
+fn test_diff_head_insertion_does_not_displace_later_sections() {
+    let f1 = write_tmp("headsect_1", b"x\ny\n");
+    let f2 = write_tmp("headsect_2", b"new\nx\ny\n");
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-c", &f1, &f2],
+        "*** L1\n--- L2\n***************\n*** 1,2 ****\n--- 1,3 ----\n+ new\n  x\n  y\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    // Two hunks, the first of them a head insertion: the second section's
+    // ranges must still describe the lines it actually prints.
+    let a: String = (1..=40).map(|n| format!("{n}\n")).collect();
+    let b: String = std::iter::once("HEAD\n".to_string())
+        .chain((1..=29).map(|n| format!("{n}\n")))
+        .chain(std::iter::once("CHANGED\n".to_string()))
+        .chain((31..=40).map(|n| format!("{n}\n")))
+        .collect();
+    let g1 = write_tmp("headsect_3", a.as_bytes());
+    let g2 = write_tmp("headsect_4", b.as_bytes());
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-u", &g1, &g2],
+        concat!(
+            "--- L1\n+++ L2\n",
+            "@@ -1,3 +1,4 @@\n+HEAD\n 1\n 2\n 3\n",
+            "@@ -27,7 +28,7 @@\n 27\n 28\n 29\n-30\n+CHANGED\n 31\n 32\n 33\n",
+        ),
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// An empty second file leaves nothing to take trailing context from, so the
+/// range arithmetic must clamp rather than underflow, and the empty side
+/// renders as a zero-width range.
+#[test]
+fn test_diff_empty_second_file_context_ranges() {
+    let f1 = write_tmp("empty2_1", b"a\nb\n");
+    let f2 = write_tmp("empty2_2", b"");
+    diff_test_full(&[&f1, &f2], "1,2d0\n< a\n< b\n", "", EXIT_STATUS_DIFFERENCE);
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-c", &f1, &f2],
+        "*** L1\n--- L2\n***************\n*** 1,2 ****\n- a\n- b\n--- 0 ----\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-u", &f1, &f2],
+        "--- L1\n+++ L2\n@@ -1,2 +0,0 @@\n-a\n-b\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// The real acceptance property: context and unified output must be
+/// applicable. Feeding our own patch to our own `patch` with the first file
+/// has to reproduce the second, byte for byte, at every context width.
+#[test]
+fn test_diff_context_and_unified_round_trip_through_patch() {
+    let a: String = (1..=60).map(|n| format!("line {n}\n")).collect();
+    let b: String = std::iter::once("HEAD\n".to_string())
+        .chain((1..=9).map(|n| format!("line {n}\n")))
+        .chain(std::iter::once("CHANGED\n".to_string()))
+        .chain((11..=29).map(|n| format!("line {n}\n")))
+        .chain((40..=60).map(|n| format!("line {n}\n")))
+        .chain(std::iter::once("TAIL\n".to_string()))
+        .collect();
+    let f1 = write_tmp("rt_1", a.as_bytes());
+    let f2 = write_tmp("rt_2", b.as_bytes());
+
+    // Unified at every width, context from 2 up. The two excluded context
+    // widths are not diff defects -- our output is byte-identical to GNU's at
+    // both -- but limits of the appliers: GNU patch rejects a zero-context
+    // context diff, including one GNU diff produced itself, and our own patch
+    // cannot parse -C 1, again including GNU's own output.
+    let cases: Vec<(&str, &str)> = ["0", "1", "2", "3", "5"]
+        .iter()
+        .map(|w| ("-U", *w))
+        .chain(["2", "3", "5"].iter().map(|w| ("-C", *w)))
+        .collect();
+    {
+        for (flag, width) in cases {
+            let patch_text = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+                .args([flag, width, &f1, &f2])
+                .env("LC_ALL", "C")
+                .output()
+                .expect("run diff");
+            assert_eq!(
+                patch_text.status.code(),
+                Some(EXIT_STATUS_DIFFERENCE),
+                "{flag} {width}: the two files differ"
+            );
+
+            let work = write_tmp(&format!("rt_work_{flag}_{width}"), a.as_bytes());
+            let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_patch"))
+                .args(["-f", &work])
+                .env("LC_ALL", "C")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn patch");
+            child
+                .stdin
+                .take()
+                .expect("patch stdin")
+                .write_all(&patch_text.stdout)
+                .expect("feed patch");
+            let done = child.wait_with_output().expect("wait for patch");
+            assert!(
+                done.status.success(),
+                "{flag} {width}: patch failed: {}",
+                String::from_utf8_lossy(&done.stderr)
+            );
+            assert_eq!(
+                std::fs::read(&work).expect("read patched file"),
+                b.as_bytes(),
+                "{flag} {width}: patched file does not match the second file"
+            );
+            let _ = std::fs::remove_file(&work);
+        }
+    }
+}

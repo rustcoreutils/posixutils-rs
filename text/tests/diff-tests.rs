@@ -1500,3 +1500,46 @@ fn test_diff_stdin_leaves_no_temp_file() {
         std::env::temp_dir().display()
     );
 }
+
+/// `diff big1 big2 | head -2` must die by SIGPIPE the way the historical
+/// utilities do. The Rust runtime ignores SIGPIPE before main, so the write
+/// failed with EPIPE instead, surfacing as a panic on stderr and exit 101.
+#[test]
+fn test_diff_dies_by_sigpipe_on_a_closed_pipe() {
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    // Enough output that diff is still writing when the reader goes away.
+    let a: String = (0..50_000).map(|n| format!("a{n}\n")).collect();
+    let b: String = (0..50_000).map(|n| format!("b{n}\n")).collect();
+    let f1 = write_tmp("sigpipe_1", a.as_bytes());
+    let f2 = write_tmp("sigpipe_2", b.as_bytes());
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args([&f1, &f2])
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn diff");
+
+    // Read a little, then close the read end while diff still has more to say.
+    let mut stdout = child.stdout.take().expect("diff stdout");
+    let mut buf = [0u8; 64];
+    let _ = stdout.read(&mut buf);
+    drop(stdout);
+
+    let out = child.wait_with_output().expect("wait for diff");
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGPIPE),
+        "expected death by SIGPIPE, got {:?} with stderr {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "a closed pipe is not an error to report: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

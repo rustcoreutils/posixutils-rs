@@ -188,6 +188,9 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
 }
 
 fn main() -> DiffExitStatus {
+    // diff is routinely piped into head or less; without this a closed pipe is
+    // a panic and exit 101 rather than death by SIGPIPE.
+    plib::io::restore_sigpipe();
     plib::diag::init_locale("diff");
 
     let args = Args::parse();

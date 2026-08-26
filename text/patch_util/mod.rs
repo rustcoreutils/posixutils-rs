@@ -13,6 +13,7 @@ pub mod applier;
 pub mod context;
 pub mod ed;
 pub mod file_ops;
+pub mod header;
 pub mod normal;
 pub mod parser;
 pub mod types;

@@ -9,6 +9,7 @@
 
 //! Context diff format parser.
 
+use super::header::parse_filename;
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchError};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -80,9 +81,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             let old_line = lines[pos];
             let (old_start, old_end) = if let Some(caps) = OLD_RANGE_RE.captures(old_line) {
                 let start: usize = caps[1].parse().unwrap_or(1);
-                let end: usize = caps
-                    .get(2)
-                    .map_or(start, |m| m.as_str().parse().unwrap_or(start));
+                let end: Option<usize> = caps.get(2).map(|m| m.as_str().parse().unwrap_or(start));
                 (start, end)
             } else {
                 pos += 1;
@@ -90,7 +89,10 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             };
             pos += 1;
 
-            // Collect old section lines
+            // Collect old section lines, at most as many as the range
+            // declares. The cap keeps text that follows the final section --
+            // a mail signature, say -- from being read as part of the hunk.
+            let old_declared = old_end.map_or(1, |e| declared_len(old_start, e));
             let mut old_no_newline = false;
             let mut old_lines: Vec<(char, String)> = Vec::new();
             while pos < lines.len() {
@@ -99,18 +101,18 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
                     break;
                 }
                 if l.starts_with('\\') {
-                    // "\ No newline at end of file" for the old side.
+                    // "\ No newline at end of file" for the old side. This is
+                    // checked before the cap: the marker follows the section's
+                    // last content line, so a cap applied first would leave it
+                    // unconsumed and the new-section header unreachable.
                     old_no_newline = true;
                     pos += 1;
                     continue;
                 }
-                if l.len() >= 2 {
-                    let prefix = l.chars().next().unwrap_or(' ');
-                    let content = if l.len() > 2 { &l[2..] } else { "" };
-                    old_lines.push((prefix, content.to_string()));
-                } else if l.is_empty() {
-                    old_lines.push((' ', String::new()));
+                if old_lines.len() == old_declared {
+                    break;
                 }
+                old_lines.push(split_section_line(l));
                 pos += 1;
             }
 
@@ -121,16 +123,15 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             let new_line = lines[pos];
             let (new_start, new_end) = if let Some(caps) = NEW_RANGE_RE.captures(new_line) {
                 let start: usize = caps[1].parse().unwrap_or(1);
-                let end: usize = caps
-                    .get(2)
-                    .map_or(start, |m| m.as_str().parse().unwrap_or(start));
+                let end: Option<usize> = caps.get(2).map(|m| m.as_str().parse().unwrap_or(start));
                 (start, end)
             } else {
                 continue;
             };
             pos += 1;
 
-            // Collect new section lines
+            // Collect new section lines, capped the same way.
+            let new_declared = new_end.map_or(1, |e| declared_len(new_start, e));
             let mut new_no_newline = false;
             let mut new_lines: Vec<(char, String)> = Vec::new();
             while pos < lines.len() {
@@ -145,25 +146,23 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
                     break;
                 }
                 if l.starts_with('\\') {
-                    // "\ No newline at end of file" for the new side.
+                    // "\ No newline at end of file" for the new side; checked
+                    // before the cap, as in the old section above.
                     new_no_newline = true;
                     pos += 1;
                     continue;
                 }
-                if l.len() >= 2 {
-                    let prefix = l.chars().next().unwrap_or(' ');
-                    let content = if l.len() > 2 { &l[2..] } else { "" };
-                    new_lines.push((prefix, content.to_string()));
-                } else if l.is_empty() {
-                    new_lines.push((' ', String::new()));
+                if new_lines.len() == new_declared {
+                    break;
                 }
+                new_lines.push(split_section_line(l));
                 pos += 1;
             }
 
             // Convert to unified-style hunk
             let mut hunk = convert_context_to_hunk(
-                old_start, old_end, new_start, new_end, &old_lines, &new_lines,
-            );
+                old_start, old_end, new_start, new_end, &old_lines, &new_lines, pos,
+            )?;
             hunk.old_no_newline = old_no_newline;
             hunk.new_no_newline = new_no_newline;
             patch.hunks.push(hunk);
@@ -175,116 +174,164 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
     Ok((patch, pos))
 }
 
+/// Number of lines a `start,end` section range declares.
+fn declared_len(start: usize, end: usize) -> usize {
+    if end >= start {
+        end - start + 1
+    } else {
+        0
+    }
+}
+
+/// Split a context-diff section line into its one-character change prefix and
+/// its payload.
+///
+/// The prefix is separated from the payload by a single space. Mailers that
+/// strip trailing whitespace turn a line holding an empty payload into a bare
+/// `+`, `-`, `!` or `<space>`, so the separator is optional. Splitting by
+/// `char` rather than by byte index keeps non-ASCII payloads intact.
+fn split_section_line(l: &str) -> (char, String) {
+    let mut chars = l.chars();
+    let prefix = chars.next().unwrap_or(' ');
+    let rest = chars.as_str();
+    (prefix, rest.strip_prefix(' ').unwrap_or(rest).to_string())
+}
+
 /// Convert context diff sections to a unified-style hunk.
+///
+/// `old_end` and `new_end` are `None` when the range was written as a bare line
+/// number rather than `start,end`.
 fn convert_context_to_hunk(
     old_start: usize,
-    old_end: usize,
+    old_end: Option<usize>,
     new_start: usize,
-    new_end: usize,
+    new_end: Option<usize>,
     old_lines: &[(char, String)],
     new_lines: &[(char, String)],
-) -> Hunk {
-    let old_count = if old_end >= old_start {
-        old_end - old_start + 1
-    } else {
-        0
+    line: usize,
+) -> Result<Hunk, PatchError> {
+    // A side that contributes nothing is written as a bare line number
+    // ("*** 5 ****" for an insertion after line 5). A bare number is also how a
+    // one-line range is written, so the body settles which it is. `Hunk` wants
+    // the line before which to insert, so add one for the empty case.
+    let (old_start, old_count) = match old_end {
+        Some(end) => (old_start, declared_len(old_start, end)),
+        None if old_lines.is_empty() => (old_start + 1, 0),
+        None => (old_start, old_lines.len()),
     };
-    let new_count = if new_end >= new_start {
-        new_end - new_start + 1
+    let (new_start, new_count) = match new_end {
+        Some(end) => (new_start, declared_len(new_start, end)),
+        None if new_lines.is_empty() => (new_start + 1, 0),
+        None => (new_start, new_lines.len()),
+    };
+
+    // diff omits a section body entirely when that side holds only context, so
+    // an empty body next to a non-zero count is not an empty side -- it is the
+    // other side's context lines. Recover them, or every context line in the
+    // hunk is lost and there is nothing left to match the file against.
+    let recovered: Vec<(char, String)>;
+    let old_lines = if old_lines.is_empty() && old_count > 0 {
+        recovered = context_only(new_lines);
+        &recovered
     } else {
-        0
+        old_lines
+    };
+    let recovered_new: Vec<(char, String)>;
+    let new_lines = if new_lines.is_empty() && new_count > 0 {
+        recovered_new = context_only(old_lines);
+        &recovered_new
+    } else {
+        new_lines
     };
 
     let mut hunk = Hunk::new(old_start, old_count, new_start, new_count);
 
-    // Merge old and new sections
-    // In context diff:
-    //   ' ' = context
-    //   '-' = delete in old
-    //   '+' = add in new
-    //   '!' = change (appears in both old and new)
-
+    // Merge the two sections. A context diff writes them separately:
+    //   ' ' = context, present in both sections
+    //   '-' = removed, old section only
+    //   '+' = added, new section only
+    //   '!' = changed, appearing in both sections as separate runs
+    // The context lines are the alignment: they correspond one-to-one, in
+    // order, and every other line sits in a gap between them.
     let mut old_idx = 0;
     let mut new_idx = 0;
 
     while old_idx < old_lines.len() || new_idx < new_lines.len() {
-        // Handle old section
-        if old_idx < old_lines.len() {
-            let (prefix, content) = &old_lines[old_idx];
-            match prefix {
-                ' ' => {
-                    hunk.lines.push(LineOp::Context(content.clone()));
-                    old_idx += 1;
-                    new_idx += 1; // Context lines appear in both sections
-                }
-                '-' => {
-                    hunk.lines.push(LineOp::Delete(content.clone()));
-                    old_idx += 1;
-                }
-                '!' => {
-                    // Change: delete from old
-                    hunk.lines.push(LineOp::Delete(content.clone()));
-                    old_idx += 1;
-                }
-                _ => {
-                    old_idx += 1;
-                }
-            }
+        let progress = (old_idx, new_idx);
+
+        // Context, consumed from both sections together.
+        while old_idx < old_lines.len()
+            && new_idx < new_lines.len()
+            && old_lines[old_idx].0 == ' '
+            && new_lines[new_idx].0 == ' '
+        {
+            hunk.lines
+                .push(LineOp::Context(old_lines[old_idx].1.clone()));
+            old_idx += 1;
+            new_idx += 1;
         }
-        // Handle new section for additions
-        if new_idx < new_lines.len() {
-            let (prefix, content) = &new_lines[new_idx];
-            match prefix {
-                '+' => {
-                    hunk.lines.push(LineOp::Add(content.clone()));
-                    new_idx += 1;
-                }
-                '!' => {
-                    hunk.lines.push(LineOp::Add(content.clone()));
-                    new_idx += 1;
-                }
-                ' ' => {
-                    // Already handled in old section
-                    new_idx += 1;
-                }
-                _ => {
-                    new_idx += 1;
-                }
-            }
+
+        // Removals, then the two halves of a change, then additions -- the
+        // order a unified hunk would list them in.
+        while let Some((_, content)) = take_run(old_lines, &mut old_idx, '-') {
+            hunk.lines.push(LineOp::Delete(content));
+        }
+        while let Some((_, content)) = take_run(old_lines, &mut old_idx, '!') {
+            hunk.lines.push(LineOp::Delete(content));
+        }
+        while let Some((_, content)) = take_run(new_lines, &mut new_idx, '!') {
+            hunk.lines.push(LineOp::Add(content));
+        }
+        while let Some((_, content)) = take_run(new_lines, &mut new_idx, '+') {
+            hunk.lines.push(LineOp::Add(content));
+        }
+
+        if (old_idx, new_idx) == progress {
+            // Neither section could be advanced: the two disagree about where
+            // their context lines are.
+            let stuck = old_lines
+                .get(old_idx)
+                .or_else(|| new_lines.get(new_idx))
+                .map(|(p, _)| *p)
+                .unwrap_or(' ');
+            return Err(PatchError::Parse {
+                line,
+                message: format!("cannot align context sections at '{}'", stuck),
+            });
         }
     }
 
-    hunk
+    Ok(hunk)
 }
 
-/// Parse filename from a header line (remove timestamp if present).
-fn parse_filename(s: &str) -> String {
-    let s = s.trim();
-    if let Some(tab_pos) = s.find('\t') {
-        s[..tab_pos].to_string()
-    } else if let Some(space_pos) = s.find("  ") {
-        s[..space_pos].to_string()
-    } else {
-        s.to_string()
+/// The context lines of a section body, as a body in their own right.
+fn context_only(lines: &[(char, String)]) -> Vec<(char, String)> {
+    lines.iter().filter(|(p, _)| *p == ' ').cloned().collect()
+}
+
+/// Consume the next line of `lines` if it carries `prefix`, advancing `idx`.
+fn take_run(lines: &[(char, String)], idx: &mut usize, prefix: char) -> Option<(char, String)> {
+    let (p, content) = lines.get(*idx)?;
+    if *p != prefix {
+        return None;
     }
+    *idx += 1;
+    Some((*p, content.clone()))
 }
 
-/// Check if a line looks like a context diff header.
-pub fn looks_like_context(lines: &[&str]) -> bool {
-    let mut has_stars = false;
-    let mut has_dashes = false;
-
-    for line in lines.iter().take(20) {
-        if line.starts_with("*** ") && !line.starts_with("***************") {
-            has_stars = true;
-        }
-        if line.starts_with("--- ") && has_stars {
-            has_dashes = true;
-        }
+/// Index of the first line that identifies this as a context diff.
+/// See [`super::unified::unified_marker`] for why this reports a position.
+pub fn context_marker(lines: &[&str]) -> Option<usize> {
+    for (i, line) in lines.iter().enumerate() {
         if line.starts_with("***************") {
-            return true;
+            return Some(i);
+        }
+        // Require the two file headers to be adjacent, as diff writes them, so
+        // a patch whose content contains a "--- " line is not misread.
+        if line.starts_with("*** ") && lines.get(i + 1).is_some_and(|n| n.starts_with("--- ")) {
+            return Some(i);
         }
     }
 
-    has_stars && has_dashes
+    None
 }

@@ -15,11 +15,11 @@ use std::sync::LazyLock;
 
 /// Pre-compiled regex for ed commands to avoid recompilation on each parse.
 static CMD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+)(?:,(\d+))?([acd])$").expect("invalid regex"));
+    LazyLock::new(|| Regex::new(r"^(\d+)(?:,(\d+))?([acd])\r?$").expect("invalid regex"));
 
 /// Pre-compiled regex for detecting ed commands.
 static DETECT_CMD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]$").expect("invalid regex"));
+    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]\r?$").expect("invalid regex"));
 
 /// Parse an ed script from the given lines.
 pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), PatchError> {
@@ -55,6 +55,15 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                 .map_or(start_line, |m| m.as_str().parse().unwrap_or(start_line));
             let cmd = &caps[3];
 
+            // A range whose end precedes its start is malformed; the count
+            // arithmetic below would underflow.
+            if end_line < start_line {
+                return Err(PatchError::Parse {
+                    line: pos + 1,
+                    message: format!("malformed range in command: {}", line),
+                });
+            }
+
             pos += 1;
 
             let hunk = match cmd {
@@ -63,7 +72,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                     let mut text_lines: Vec<String> = Vec::new();
                     while pos < lines.len() {
                         let text_line = lines[pos];
-                        if text_line == "." {
+                        if text_line.trim_end_matches('\r') == "." {
                             pos += 1;
                             break;
                         }
@@ -78,21 +87,17 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                 }
                 "d" => {
                     // Delete lines start_line to end_line - no text block
+                    // An ed script does not record the text it removes; the
+                    // applier takes that from old_count and the file itself.
                     let count = end_line - start_line + 1;
-                    let mut h = Hunk::new(start_line, count, start_line, 0);
-                    // Ed scripts don't include the deleted text, so we'll have to match by position
-                    // We'll add placeholder delete operations
-                    for _ in 0..count {
-                        h.lines.push(LineOp::Delete(String::new()));
-                    }
-                    h
+                    Hunk::new(start_line, count, start_line, 0)
                 }
                 "c" => {
                     // Change lines start_line to end_line - collect text until "."
                     let mut text_lines: Vec<String> = Vec::new();
                     while pos < lines.len() {
                         let text_line = lines[pos];
-                        if text_line == "." {
+                        if text_line.trim_end_matches('\r') == "." {
                             pos += 1;
                             break;
                         }
@@ -101,11 +106,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                     }
                     let old_count = end_line - start_line + 1;
                     let mut h = Hunk::new(start_line, old_count, start_line, text_lines.len());
-                    // Add delete placeholders
-                    for _ in 0..old_count {
-                        h.lines.push(LineOp::Delete(String::new()));
-                    }
-                    // Add new lines
+                    // Only the replacement text is recorded; see the 'd' arm.
                     for line in text_lines {
                         h.lines.push(LineOp::Add(line));
                     }
@@ -127,21 +128,22 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
     Ok((patch, pos))
 }
 
-/// Check if a line looks like an ed script command.
-pub fn looks_like_ed(lines: &[&str]) -> bool {
-    for line in lines.iter().take(20) {
+/// Index of the first ed-script command line.
+/// See [`super::unified::unified_marker`] for why this reports a position.
+pub fn ed_marker(lines: &[&str]) -> Option<usize> {
+    for (i, line) in lines.iter().enumerate() {
         // Skip Index: and diff lines
         if line.starts_with("Index: ") || line.starts_with("diff ") {
             continue;
         }
         if DETECT_CMD_RE.is_match(line) {
-            return true;
+            return Some(i);
         }
         // If we hit content that's not an ed command, it's probably not ed
-        if !line.is_empty() && !line.starts_with('.') {
-            return false;
+        if !super::parser::is_blank(line) && !line.starts_with('.') {
+            return None;
         }
     }
 
-    false
+    None
 }

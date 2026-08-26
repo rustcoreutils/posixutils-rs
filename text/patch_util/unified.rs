@@ -9,6 +9,7 @@
 
 //! Unified diff format parser.
 
+use super::header::parse_filename;
 use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchError};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -70,6 +71,20 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             let old_count: usize = caps.get(2).map_or(1, |m| m.as_str().parse().unwrap_or(1));
             let new_start: usize = caps[3].parse().unwrap_or(1);
             let new_count: usize = caps.get(4).map_or(1, |m| m.as_str().parse().unwrap_or(1));
+
+            // A unified header spells a zero-count side as the line *before*
+            // which the change happens ("@@ -5,0 +6,2 @@" inserts after line
+            // 5). `Hunk` wants the line before which to insert, so add one.
+            let old_start = if old_count == 0 {
+                old_start + 1
+            } else {
+                old_start
+            };
+            let new_start = if new_count == 0 {
+                new_start + 1
+            } else {
+                new_start
+            };
 
             let mut hunk = Hunk::new(old_start, old_count, new_start, new_count);
             pos += 1;
@@ -155,36 +170,26 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
     Ok((patch, pos))
 }
 
-/// Parse filename from a header line (remove timestamp if present).
-fn parse_filename(s: &str) -> String {
-    // Format: "filename\ttimestamp" or just "filename"
-    let s = s.trim();
-    if let Some(tab_pos) = s.find('\t') {
-        s[..tab_pos].to_string()
-    } else if let Some(space_pos) = s.find("  ") {
-        // Some diffs use double-space as separator
-        s[..space_pos].to_string()
-    } else {
-        s.to_string()
-    }
-}
-
-/// Check if a line looks like a unified diff header.
-pub fn looks_like_unified(lines: &[&str]) -> bool {
-    let mut has_minus = false;
-    let mut has_plus = false;
-
-    for line in lines.iter().take(20) {
-        if line.starts_with("--- ") {
-            has_minus = true;
+/// Index of the first line that identifies this as a unified diff.
+///
+/// Returning the position, rather than a bare yes, lets the caller pick the
+/// format whose marker appears earliest. Without that, a marker buried in some
+/// other format's *content* -- an ed script's text block, say -- outvotes the
+/// real header at the top of the file.
+pub fn unified_marker(lines: &[&str]) -> Option<usize> {
+    // Scan the whole input: a mailed patch or `git format-patch` output can
+    // carry an arbitrarily long commit message before the first header.
+    for (i, line) in lines.iter().enumerate() {
+        if HUNK_HEADER_RE.is_match(line) {
+            return Some(i);
         }
-        if line.starts_with("+++ ") {
-            has_plus = true;
-        }
-        if line.starts_with("@@ ") {
-            return true;
+        // Require the two file headers to be adjacent, as diff writes them.
+        // Testing only that both appear somewhere would misread any patch
+        // whose *content* happens to contain a "+++ " line.
+        if line.starts_with("--- ") && lines.get(i + 1).is_some_and(|n| n.starts_with("+++ ")) {
+            return Some(i);
         }
     }
 
-    has_minus && has_plus
+    None
 }

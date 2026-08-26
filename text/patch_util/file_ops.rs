@@ -9,12 +9,13 @@
 
 //! File operations for the patch utility.
 
-use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchConfig, PatchError};
+use super::types::{FilePatch, Hunk, LineOp, PatchConfig, PatchError};
+use gettextrs::gettext;
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufWriter, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 /// Determine the target file for a patch.
@@ -45,6 +46,10 @@ pub fn determine_target_file(
         }
 
         let stripped = strip_path(candidate, strip);
+        if !is_safe_patch_path(&stripped) {
+            warn_dangerous_name(&stripped);
+            continue;
+        }
         let path = PathBuf::from(&stripped);
 
         if path.exists() {
@@ -52,27 +57,58 @@ pub fn determine_target_file(
         }
     }
 
-    // For new files, try the new_path directly
+    // For new files, try the new_path directly. This is the one path that
+    // returns a name without first checking that it exists, so it is also the
+    // one that would happily create a file -- and, via write_output's
+    // create_dir_all, a whole directory tree -- wherever the patch says.
     if patch.is_new_file {
         if let Some(ref new_path) = patch.new_path {
             if new_path != "/dev/null" {
                 let stripped = strip_path(new_path, strip);
+                if !is_safe_patch_path(&stripped) {
+                    warn_dangerous_name(&stripped);
+                    return Err(PatchError::NoTargetFile);
+                }
                 return Ok(PathBuf::from(stripped));
             }
         }
     }
 
     // Filename Determination step 5: prompt the user on the controlling
-    // terminal for a filename. If no terminal is available or the response is
-    // empty, give up and skip the patch (as before).
-    if let Some(name) = prompt_for_filename() {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
+    // terminal for a filename. -f means "do not ask any questions", and if no
+    // terminal is available or the response is empty, give up and skip the
+    // patch.
+    if !config.force {
+        if let Some(name) = prompt_for_filename() {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed));
+            }
         }
     }
 
     Err(PatchError::NoTargetFile)
+}
+
+/// Whether a file name taken from the patch may be written.
+///
+/// A patch is untrusted input. A name that is absolute, or that walks upward
+/// through a `..` component, reaches outside the directory the user chose to
+/// patch in; applying it would let a downloaded patch write anywhere the user
+/// can. Refuse those. A name the user supplied -- the `file` operand or `-o` --
+/// is their own instruction and is not subject to this.
+fn is_safe_patch_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.is_absolute() && !path.components().any(|c| c == Component::ParentDir)
+}
+
+/// Report a refused file name, in the same terms GNU patch uses.
+fn warn_dangerous_name(name: &str) {
+    eprintln!(
+        "patch: {}: {}",
+        gettext("ignoring potentially dangerous file name"),
+        name
+    );
 }
 
 /// Prompt on the controlling terminal (/dev/tty) for a filename to patch.
@@ -174,12 +210,15 @@ fn collapse_slashes(path: &str) -> String {
 pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
     let content = fs::read_to_string(path)?;
     let trailing_newline = content.ends_with('\n');
-    // Count lines for pre-allocation
-    let line_count = content.bytes().filter(|&b| b == b'\n').count() + 1;
-    let mut lines = Vec::with_capacity(line_count);
-    for line in content.lines() {
-        lines.push(line.to_string());
-    }
+    // Keeping any '\r' as part of the line makes the round trip through
+    // write_output lossless for a CRLF file, and makes a patch written against
+    // LF text simply fail to match one -- which is what should happen, rather
+    // than the patch quietly rewriting every line ending in the file as a side
+    // effect of changing one line.
+    let lines: Vec<String> = super::parser::split_lines(&content)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     Ok((lines, trailing_newline))
 }
 
@@ -281,8 +320,8 @@ pub fn write_output(
 pub fn write_rejects(
     rejects: &[(usize, Hunk, String)],
     target: &Path,
-    format: DiffFormat,
     config: &PatchConfig,
+    written_rejects: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     if rejects.is_empty() {
         return Ok(());
@@ -294,13 +333,29 @@ pub fn write_rejects(
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}.rej", target.display())));
 
-    let file = File::create(&reject_path)?;
+    // POSIX: rejected hunks are *appended* to the reject file. With -r, or with
+    // two patch sections naming the same file, truncating per section would
+    // leave only the last one's rejects.
+    let file = if written_rejects.contains(&reject_path) {
+        OpenOptions::new().append(true).open(&reject_path)?
+    } else {
+        File::create(&reject_path)?
+    };
+    written_rejects.insert(reject_path);
+
     let mut writer = BufWriter::new(file);
+
+    // Name the file each group of rejects belongs to, so an aggregated reject
+    // file stays attributable. The header is context-style to match the hunks
+    // below it: a unified-style "--- "/"+++ " pair would make the reject file
+    // read as a unified diff that then contains no hunks at all.
+    writeln!(writer, "*** {}", target.display())?;
+    writeln!(writer, "--- {}", target.display())?;
 
     // Write rejects in context diff format per POSIX
     // (even if input was unified, rejects should be in context format)
-    for (hunk_num, hunk, _reason) in rejects {
-        write_hunk_as_context(&mut writer, hunk, *hunk_num, format)?;
+    for (_hunk_num, hunk, _reason) in rejects {
+        write_hunk_as_context(&mut writer, hunk)?;
     }
     writer.flush()?;
 
@@ -308,19 +363,16 @@ pub fn write_rejects(
 }
 
 /// Write a hunk in context diff format.
-fn write_hunk_as_context<W: Write>(
-    writer: &mut W,
-    hunk: &Hunk,
-    _hunk_num: usize,
-    _format: DiffFormat,
-) -> io::Result<()> {
+fn write_hunk_as_context<W: Write>(writer: &mut W, hunk: &Hunk) -> io::Result<()> {
     // Write separator
     writeln!(writer, "***************")?;
 
-    // Write old section header
+    // Write old section header. A zero-count side is normalized to the line
+    // before which the change goes; a context diff spells it as the line after
+    // which, so convert back.
     let old_end = hunk.old_start + hunk.old_count.saturating_sub(1);
     if hunk.old_count == 0 {
-        writeln!(writer, "*** {} ****", hunk.old_start)?;
+        writeln!(writer, "*** {} ****", hunk.old_start.saturating_sub(1))?;
     } else {
         writeln!(writer, "*** {},{} ****", hunk.old_start, old_end)?;
     }
@@ -337,7 +389,7 @@ fn write_hunk_as_context<W: Write>(
     // Write new section header
     let new_end = hunk.new_start + hunk.new_count.saturating_sub(1);
     if hunk.new_count == 0 {
-        writeln!(writer, "--- {} ----", hunk.new_start)?;
+        writeln!(writer, "--- {} ----", hunk.new_start.saturating_sub(1))?;
     } else {
         writeln!(writer, "--- {},{} ----", hunk.new_start, new_end)?;
     }

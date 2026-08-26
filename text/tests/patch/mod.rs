@@ -949,19 +949,19 @@ fn test_patch_strip_path_p0() {
     fs::write(&original, "hello\n").unwrap();
 
     let patch_file = test_dir.join("p0.patch");
-    let full_path = original.to_str().unwrap();
+    // -p0 keeps the name verbatim; it must be relative, since an absolute name
+    // taken from the patch is refused as unsafe.
     fs::write(
         &patch_file,
-        format!(
-            "--- {}\n+++ {}\n@@ -1 +1 @@\n-hello\n+goodbye\n",
-            full_path, full_path
-        ),
+        "--- a/b/file.txt\n+++ a/b/file.txt\n@@ -1 +1 @@\n-hello\n+goodbye\n",
     )
     .unwrap();
 
     run_test(TestPlan {
         cmd: String::from("patch"),
         args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
             String::from("-p0"),
             String::from("-i"),
             patch_file.to_str().unwrap().to_string(),
@@ -1023,19 +1023,19 @@ fn test_patch_new_file() {
     assert!(!new_file.exists(), "File should not exist before patch");
 
     let patch_file = test_dir.join("new.patch");
-    // Patch to create a new file (old is /dev/null)
+    // Patch to create a new file (old is /dev/null). The name is relative:
+    // an absolute name taken from the patch is refused as unsafe.
     fs::write(
         &patch_file,
-        format!(
-            "--- /dev/null\n+++ {}\n@@ -0,0 +1,2 @@\n+line one\n+line two\n",
-            new_file.to_str().unwrap()
-        ),
+        "--- /dev/null\n+++ created.txt\n@@ -0,0 +1,2 @@\n+line one\n+line two\n",
     )
     .unwrap();
 
     run_test(TestPlan {
         cmd: String::from("patch"),
         args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
             String::from("-p0"),
             String::from("-i"),
             patch_file.to_str().unwrap().to_string(),
@@ -1327,6 +1327,1596 @@ fn test_patch_strip_path_double_slash() {
 
     let content = fs::read_to_string(&target).unwrap();
     assert_eq!(content, "new content\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A context diff whose section lines carry non-ASCII payloads must parse.
+// The section-line splitter used to slice at byte index 2, which panicked
+// (exit 101) whenever a line began with a multi-byte character.
+#[test]
+fn test_patch_context_non_ascii_line() {
+    let test_dir = setup_test_dir("context_non_ascii");
+
+    let target = test_dir.join("utf8.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("utf8.patch");
+    fs::write(
+        &patch_file,
+        "*** utf8.txt\t2024-01-01 00:00:00\n\
+         --- utf8.txt\t2024-01-01 00:00:01\n\
+         ***************\n\
+         *** 1,3 ****\n\
+         \x20 a\n\
+         ! b\n\
+         \x20 c\n\
+         --- 1,3 ----\n\
+         \x20 a\n\
+         ! B\n\
+         \x20 c\n\
+         \u{2192} trailing prose line\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-c"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nB\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A context-diff section line whose payload is empty may reach us as a bare
+// "+", "-" or "!" when a mailer has stripped the trailing separator space.
+#[test]
+fn test_patch_context_stripped_separator() {
+    let test_dir = setup_test_dir("context_stripped_sep");
+
+    let target = test_dir.join("strip.txt");
+    fs::write(&target, "a\nb\n").unwrap();
+
+    let patch_file = test_dir.join("strip.patch");
+    // The added blank line is written "+" with no trailing space.
+    fs::write(
+        &patch_file,
+        "*** strip.txt\n--- strip.txt\n***************\n\
+         *** 1,2 ****\n  a\n  b\n--- 1,3 ----\n  a\n+\n  b\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-c"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\n\nb\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A normal-diff range whose end precedes its start is malformed. The count
+// arithmetic used to underflow, aborting with a capacity-overflow panic.
+#[test]
+fn test_patch_normal_reversed_range() {
+    let test_dir = setup_test_dir("normal_rev_range");
+
+    let target = test_dir.join("rev.txt");
+    fs::write(&target, "a\nb\nc\nd\ne\n").unwrap();
+
+    let patch_file = test_dir.join("rev.patch");
+    fs::write(&patch_file, "5,2c3,1\n< a\n---\n> A\n").unwrap();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("patch"),
+            args: vec![
+                String::from("-n"),
+                String::from("-i"),
+                patch_file.to_str().unwrap().to_string(),
+                target.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 2,
+        },
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "Malformed range should be a clean error, not a panic"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("malformed range"),
+                "Should name the malformed range, got: {}",
+                stderr
+            );
+        },
+    );
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\nc\nd\ne\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// Same malformed range, in an ed script.
+#[test]
+fn test_patch_ed_reversed_range() {
+    let test_dir = setup_test_dir("ed_rev_range");
+
+    let target = test_dir.join("edrev.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("edrev.patch");
+    fs::write(&patch_file, "5,2c\nX\n.\n").unwrap();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("patch"),
+            args: vec![
+                String::from("-e"),
+                String::from("-i"),
+                patch_file.to_str().unwrap().to_string(),
+                target.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 2,
+        },
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "Malformed range should be a clean error, not a panic"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("malformed range"),
+                "Should name the malformed range, got: {}",
+                stderr
+            );
+        },
+    );
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// Helper: run patch and return its exit code plus stderr, for tests that only
+// care about a property of the result rather than exact diagnostic text.
+fn run_patch_capture(args: Vec<String>) -> (i32, String) {
+    let mut code = 0;
+    let mut err = String::new();
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("patch"),
+            args,
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            code = output.status.code().unwrap_or(-1);
+            err = String::from_utf8_lossy(&output.stderr).to_string();
+        },
+    );
+    (code, err)
+}
+
+// A fuzzy match ignores the outer context lines, so it must not write the
+// patch's copy of them over the file. Only the verified window is replaced.
+#[test]
+fn test_patch_fuzz_preserves_outer_context() {
+    let test_dir = setup_test_dir("fuzz_outer_ctx");
+
+    let target = test_dir.join("fuzz1.txt");
+    fs::write(&target, "c1\nc2\nXXX\nc3\nc4\n").unwrap();
+
+    let patch_file = test_dir.join("fuzz1.patch");
+    // The first and last context lines disagree with the file (z1/z4 vs c1/c4).
+    fs::write(
+        &patch_file,
+        "--- fuzz1.txt\n+++ fuzz1.txt\n@@ -1,5 +1,5 @@\n z1\n c2\n-XXX\n+YYY\n c3\n z4\n",
+    )
+    .unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 0, "should apply with fuzz, stderr: {}", err);
+    assert!(err.contains("fuzz 1"), "should report fuzz 1, got: {}", err);
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "c1\nc2\nYYY\nc3\nc4\n",
+        "ignored context must be left as the file has it"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// Same, with two ignored context lines at each end.
+#[test]
+fn test_patch_fuzz2_preserves_outer_context() {
+    let test_dir = setup_test_dir("fuzz2_outer_ctx");
+
+    let target = test_dir.join("fuzz2.txt");
+    fs::write(&target, "q1\nq2\nc3\nXXX\nc5\nq6\nq7\n").unwrap();
+
+    let patch_file = test_dir.join("fuzz2.patch");
+    fs::write(
+        &patch_file,
+        "--- fuzz2.txt\n+++ fuzz2.txt\n@@ -1,7 +1,7 @@\n z1\n z2\n c3\n-XXX\n+YYY\n c5\n z6\n z7\n",
+    )
+    .unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 0, "should apply with fuzz 2, stderr: {}", err);
+    assert!(err.contains("fuzz 2"), "should report fuzz 2, got: {}", err);
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "q1\nq2\nc3\nYYY\nc5\nq6\nq7\n"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// POSIX allows a rescan to ignore lines of *context*. Deleted lines are not
+// context and must still match exactly, so a hunk with no context (the shape
+// "diff -U0" produces) can never be placed by fuzz.
+#[test]
+fn test_patch_fuzz_does_not_trim_deletes() {
+    let test_dir = setup_test_dir("fuzz_no_trim_del");
+
+    let target = test_dir.join("del.txt");
+    fs::write(&target, "A\nb\nc\nd\ne\n").unwrap();
+
+    let patch_file = test_dir.join("del.patch");
+    // "a" does not match the file's "A"; there is no context to give up.
+    fs::write(
+        &patch_file,
+        "--- del.txt\n+++ del.txt\n@@ -1,3 +1,1 @@\n-a\n-b\n-c\n+X\n",
+    )
+    .unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1, "hunk must be rejected, stderr: {}", err);
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "A\nb\nc\nd\ne\n",
+        "a hunk whose deletes do not match must not modify the file"
+    );
+    assert!(test_dir.join("del.txt.rej").exists());
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A normal diff records no context at all, so no fuzz window can be built.
+#[test]
+fn test_patch_normal_diff_gets_no_fuzz() {
+    let test_dir = setup_test_dir("normal_no_fuzz");
+
+    let target = test_dir.join("nfz.txt");
+    fs::write(&target, "A\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("nfz.patch");
+    fs::write(&patch_file, "1,3c1\n< a\n< b\n< c\n---\n> X\n").unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-n"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1, "hunk must be rejected");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "A\nb\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// POSIX describes exactly two rescans, so three ignored context lines per side
+// is beyond what a fuzzy match may do.
+#[test]
+fn test_patch_fuzz_capped_at_two() {
+    let test_dir = setup_test_dir("fuzz_cap");
+
+    let target = test_dir.join("cap.txt");
+    fs::write(&target, "q1\nq2\nq3\nc4\nXXX\nc6\nq7\nq8\nq9\n").unwrap();
+
+    let patch_file = test_dir.join("cap.patch");
+    fs::write(
+        &patch_file,
+        "--- cap.txt\n+++ cap.txt\n@@ -1,9 +1,9 @@\n z1\n z2\n z3\n c4\n-XXX\n+YYY\n c6\n z7\n z8\n z9\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1, "fuzz 3 would be needed; hunk must be rejected");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "q1\nq2\nq3\nc4\nXXX\nc6\nq7\nq8\nq9\n"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A hunk whose old-side lines are all blank is still content-matched: it must
+// be verified against the file, and it must contribute to the running offset
+// that later hunks are placed by. Deriving "is this an ed script?" from the
+// old-side text got both wrong.
+#[test]
+fn test_patch_blank_line_delete_then_add() {
+    let test_dir = setup_test_dir("blank_delete");
+
+    let target = test_dir.join("blank.txt");
+    fs::write(&target, "a\n\n\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("blank.patch");
+    fs::write(
+        &patch_file,
+        "--- blank.txt\n+++ blank.txt\n@@ -2,2 +1,0 @@\n-\n-\n@@ -4,0 +3 @@\n+ZZZ\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "a\nb\nZZZ\nc\n",
+        "the blank-line delete must shift the following hunk"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// The same two insertions, expressed in unified, normal and context format,
+// must land in the same place. Each format spells a zero-count side
+// differently; the parsers normalize them to one convention.
+fn twenty_lines() -> String {
+    (1..=20).map(|i| format!("l{:02}\n", i)).collect()
+}
+
+fn expected_with_insertions() -> String {
+    let mut s = String::new();
+    for i in 1..=20 {
+        s.push_str(&format!("l{:02}\n", i));
+        if i == 5 {
+            s.push_str("n1\nn2\n");
+        }
+        if i == 15 {
+            s.push_str("n3\nn4\n");
+        }
+    }
+    s
+}
+
+#[test]
+fn test_patch_unified_zero_context_additions() {
+    let test_dir = setup_test_dir("add_unified");
+
+    let target = test_dir.join("add.txt");
+    fs::write(&target, twenty_lines()).unwrap();
+
+    let patch_file = test_dir.join("add.patch");
+    fs::write(
+        &patch_file,
+        "--- add.txt\n+++ add.txt\n@@ -5,0 +6,2 @@\n+n1\n+n2\n@@ -15,0 +18,2 @@\n+n3\n+n4\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-u"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        expected_with_insertions()
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+#[test]
+fn test_patch_normal_zero_context_additions() {
+    let test_dir = setup_test_dir("add_normal");
+
+    let target = test_dir.join("add.txt");
+    fs::write(&target, twenty_lines()).unwrap();
+
+    let patch_file = test_dir.join("add.patch");
+    fs::write(&patch_file, "5a6,7\n> n1\n> n2\n15a18,19\n> n3\n> n4\n").unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-n"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        expected_with_insertions()
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+#[test]
+fn test_patch_context_zero_context_additions() {
+    let test_dir = setup_test_dir("add_context");
+
+    let target = test_dir.join("add.txt");
+    fs::write(&target, twenty_lines()).unwrap();
+
+    let patch_file = test_dir.join("add.patch");
+    // An insertion has an empty old section, spelled as a bare line number.
+    fs::write(
+        &patch_file,
+        "*** add.txt\t2024-01-01 00:00:00\n\
+         --- add.txt\t2024-01-01 00:00:01\n\
+         ***************\n*** 5 ****\n--- 6,7 ----\n+ n1\n+ n2\n\
+         ***************\n*** 15 ****\n--- 18,19 ----\n+ n3\n+ n4\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-c"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        expected_with_insertions()
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// An ed script's line numbers are absolute: they already describe the file as
+// it stands when each command runs, so no cumulative offset may leak in.
+#[test]
+fn test_patch_ed_positional_multi() {
+    let test_dir = setup_test_dir("ed_positional");
+
+    let target = test_dir.join("edp.txt");
+    fs::write(&target, "one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
+
+    let patch_file = test_dir.join("edp.patch");
+    fs::write(&patch_file, "5c\nFIVE\n.\n2d\n").unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-e"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "one\nthree\nfour\nFIVE\nsix\n"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A synthesized #endif carries its own newline, so it overrides the hunk's
+// "no newline at end of file" marker.
+#[test]
+fn test_patch_ifdef_no_newline_at_eof() {
+    let test_dir = setup_test_dir("ifdef_eof");
+
+    let target = test_dir.join("dnl.txt");
+    fs::write(&target, "a\nb").unwrap();
+
+    let patch_file = test_dir.join("dnl.patch");
+    fs::write(
+        &patch_file,
+        "--- dnl.txt\n+++ dnl.txt\n@@ -1,2 +1,2 @@\n a\n-b\n\
+         \\ No newline at end of file\n+B\n\\ No newline at end of file\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-D"),
+            String::from("FEATURE"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "a\n#ifndef FEATURE\nb\n#else\nB\n#endif\n"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// -D must guard a pure addition too. The pure-addition path used to return
+// before the -D writer ran, inserting the new lines raw.
+#[test]
+fn test_patch_ifdef_pure_addition() {
+    let test_dir = setup_test_dir("ifdef_pure_add");
+
+    let target = test_dir.join("dadd.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("dadd.patch");
+    fs::write(
+        &patch_file,
+        "--- dadd.txt\n+++ dadd.txt\n@@ -1,0 +2 @@\n+NEW\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-D"),
+            String::from("FEATURE"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "a\n#ifdef FEATURE\nNEW\n#endif\nb\nc\n"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A rejected hunk's context-format header must convert a normalized zero-count
+// side back to the line *after* which the change goes.
+#[test]
+fn test_patch_reject_zero_new_count_header() {
+    let test_dir = setup_test_dir("reject_zero_count");
+
+    let target = test_dir.join("rj.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("rj.patch");
+    // A pure deletion that does not match, so the hunk is rejected.
+    fs::write(&patch_file, "--- rj.txt\n+++ rj.txt\n@@ -2 +1,0 @@\n-ZZZ\n").unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\nc\n");
+
+    let rej = fs::read_to_string(test_dir.join("rj.txt.rej")).unwrap();
+    assert!(
+        rej.contains("--- 1 ----"),
+        "zero-count new side should print line 1, got:\n{}",
+        rej
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// git format-patch puts the commit message before the diff. Detection used to
+// look at only the first 20 lines, so any message longer than that made the
+// whole patch unreadable.
+#[test]
+fn test_patch_long_preamble() {
+    let test_dir = setup_test_dir("long_preamble");
+
+    let target = test_dir.join("t.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let mut patch_text = String::from(
+        "From 1234567890abcdef Mon Sep 17 00:00:00 2001\n\
+         From: Some One <someone@example.com>\n\
+         Subject: [PATCH] a change with a long message\n\n",
+    );
+    for i in 1..=22 {
+        patch_text.push_str(&format!("commit message line {}\n", i));
+    }
+    patch_text.push_str(
+        "\n---\n t.txt | 2 +-\n 1 file changed\n\n\
+         diff --git a/t.txt b/t.txt\n\
+         index 1234567..89abcde 100644\n\
+         --- a/t.txt\n+++ b/t.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    );
+
+    let patch_file = test_dir.join("long.patch");
+    fs::write(&patch_file, patch_text).unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
+            String::from("-p1"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nB\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// Not every diff separates the file name from the timestamp with a tab.
+#[test]
+fn test_patch_single_space_timestamp() {
+    let test_dir = setup_test_dir("space_timestamp");
+
+    let target = test_dir.join("ts.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("ts.patch");
+    fs::write(
+        &patch_file,
+        "--- ts.txt 2024-01-01 10:00:00.000000000 +0000\n\
+         +++ ts.txt 2024-01-02 10:00:00.000000000 +0000\n\
+         @@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nB\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// diff writes "< " even for an empty line; a mailer that strips trailing
+// whitespace leaves a bare "<". That used to end the hunk early, leaving it
+// with no operations at all, which was then reported as applied.
+#[test]
+fn test_patch_normal_stripped_marker() {
+    let test_dir = setup_test_dir("normal_stripped");
+
+    let target = test_dir.join("bare.txt");
+    fs::write(&target, "a\n\nb\n").unwrap();
+
+    let patch_file = test_dir.join("bare.patch");
+    fs::write(&patch_file, "2d1\n<\n").unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-n"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A hunk that supplies fewer lines than its header declares was truncated
+// somewhere; applying it as though it were complete loses data silently.
+#[test]
+fn test_patch_normal_truncated_hunk() {
+    let test_dir = setup_test_dir("normal_truncated");
+
+    let target = test_dir.join("short.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("short.patch");
+    // Declares two old lines and one new; supplies one old and none.
+    fs::write(&patch_file, "1,2c1\n< a\n").unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-n"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 2, "truncated hunk must be an error, stderr: {}", err);
+    assert!(
+        err.contains("declares"),
+        "should report the count mismatch, got: {}",
+        err
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A git section that changes no text carries no hunk. That is well-formed
+// input, not garbage: name what is skipped rather than rejecting the patch.
+#[test]
+fn test_patch_git_rename_only() {
+    let test_dir = setup_test_dir("git_rename");
+
+    let target = test_dir.join("old.txt");
+    fs::write(&target, "a\n").unwrap();
+
+    let patch_file = test_dir.join("rename.patch");
+    fs::write(
+        &patch_file,
+        "diff --git a/old.txt b/new.txt\n\
+         similarity index 100%\n\
+         rename from old.txt\n\
+         rename to new.txt\n",
+    )
+    .unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-d"),
+        test_dir.to_str().unwrap().to_string(),
+        String::from("-p1"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 0, "a rename-only patch is not an error");
+    assert!(
+        err.contains("rename of old.txt to new.txt"),
+        "should name the skipped rename, got: {}",
+        err
+    );
+    // Neither POSIX nor GNU patch performs the rename.
+    assert!(target.exists());
+    assert!(!test_dir.join("new.txt").exists());
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A '\r' is part of a line's content, so a patch written against LF text does
+// not match a CRLF file. It must reject rather than apply and, as a side
+// effect of str::lines() dropping the '\r', rewrite every line ending in the
+// file.
+#[test]
+fn test_patch_crlf_file_lf_patch_rejects() {
+    let test_dir = setup_test_dir("crlf_lf");
+
+    let target = test_dir.join("crlf.txt");
+    fs::write(&target, "a\r\nb\r\nc\r\n").unwrap();
+
+    let patch_file = test_dir.join("crlf.patch");
+    fs::write(
+        &patch_file,
+        "--- crlf.txt\n+++ crlf.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1, "hunk must be rejected");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"a\r\nb\r\nc\r\n",
+        "every line ending must survive untouched"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A patch whose content lines carry the file's CRLF applies, and the endings
+// round-trip.
+#[test]
+fn test_patch_crlf_file_crlf_patch_applies() {
+    let test_dir = setup_test_dir("crlf_crlf");
+
+    let target = test_dir.join("crlf.txt");
+    fs::write(&target, "a\r\nb\r\nc\r\n").unwrap();
+
+    let patch_file = test_dir.join("crlf.patch");
+    // diff metadata in LF, content lines carrying the file's CRLF.
+    fs::write(
+        &patch_file,
+        "--- crlf.txt\n+++ crlf.txt\n@@ -1,3 +1,3 @@\n a\r\n-b\r\n+B\r\n c\r\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read(&target).unwrap(), b"a\r\nB\r\nc\r\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A file with mixed endings must keep each line's own ending across a hunk
+// that touches only part of it.
+#[test]
+fn test_patch_mixed_line_endings_preserved() {
+    let test_dir = setup_test_dir("mixed_eol");
+
+    let target = test_dir.join("mixed.txt");
+    fs::write(&target, "a\nb\r\nc\nd\r\n").unwrap();
+
+    let patch_file = test_dir.join("mixed.patch");
+    fs::write(
+        &patch_file,
+        "--- mixed.txt\n+++ mixed.txt\n@@ -3,2 +3,2 @@\n-c\n+C\n d\r\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read(&target).unwrap(), b"a\nb\r\nC\nd\r\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A patch covering several files may already be applied to one of them. That
+// file is skipped, but the rest must still be patched, and the run reports the
+// reject rather than an error.
+#[test]
+fn test_patch_reversed_file_skips_not_aborts() {
+    let test_dir = setup_test_dir("reversed_continue");
+
+    let a = test_dir.join("A.txt");
+    let b = test_dir.join("B.txt");
+    fs::write(&a, "new\n").unwrap(); // already applied
+    fs::write(&b, "bold\n").unwrap();
+
+    let patch_file = test_dir.join("two.patch");
+    fs::write(
+        &patch_file,
+        "--- A.txt\n+++ A.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n\
+         --- B.txt\n+++ B.txt\n@@ -1,1 +1,1 @@\n-bold\n+bnew\n",
+    )
+    .unwrap();
+
+    // -f keeps this non-interactive: without it, an already-applied patch
+    // prompts on the controlling terminal, which blocks under a real tty.
+    let (code, _) = run_patch_capture(vec![
+        String::from("-d"),
+        test_dir.to_str().unwrap().to_string(),
+        String::from("-f"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1, "rejects give exit 1, not an error");
+
+    assert_eq!(fs::read_to_string(&a).unwrap(), "new\n", "A is left alone");
+    assert_eq!(
+        fs::read_to_string(&b).unwrap(),
+        "bnew\n",
+        "B must still be patched"
+    );
+    assert!(test_dir.join("A.txt.rej").exists());
+
+    cleanup_test_dir(&test_dir);
+}
+
+// POSIX: rejected hunks are appended to the reject file. With -r naming one
+// file for the whole run, each section's rejects must survive.
+#[test]
+fn test_patch_reject_file_accumulates() {
+    let test_dir = setup_test_dir("reject_accum");
+
+    fs::write(test_dir.join("r1.txt"), "zzz\n").unwrap();
+    fs::write(test_dir.join("r2.txt"), "zzz\n").unwrap();
+
+    let patch_file = test_dir.join("two.patch");
+    fs::write(
+        &patch_file,
+        "--- r1.txt\n+++ r1.txt\n@@ -1,1 +1,1 @@\n-nomatch1\n+x1\n\
+         --- r2.txt\n+++ r2.txt\n@@ -1,1 +1,1 @@\n-nomatch2\n+x2\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-d"),
+        test_dir.to_str().unwrap().to_string(),
+        String::from("-r"),
+        String::from("all.rej"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1);
+
+    let rej = fs::read_to_string(test_dir.join("all.rej")).unwrap();
+    assert!(
+        rej.contains("nomatch1"),
+        "first file's rejects were truncated away:\n{}",
+        rej
+    );
+    assert!(rej.contains("nomatch2"), "second file's rejects missing");
+    assert!(
+        rej.contains("r1.txt") && rej.contains("r2.txt"),
+        "each group of rejects should name its file:\n{}",
+        rej
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// -f means "do not ask any questions", so an unresolvable target must fail
+// rather than prompt on the controlling terminal.
+#[test]
+fn test_patch_force_does_not_prompt() {
+    let test_dir = setup_test_dir("force_no_prompt");
+
+    let patch_file = test_dir.join("missing.patch");
+    fs::write(
+        &patch_file,
+        "--- nosuch_abc.txt\n+++ nosuch_abc.txt\n@@ -1,1 +1,1 @@\n-a\n+A\n",
+    )
+    .unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-d"),
+        test_dir.to_str().unwrap().to_string(),
+        String::from("-f"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("could not determine target file"),
+        "got: {}",
+        err
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A patch is untrusted input: a name that walks up out of the directory being
+// patched must be refused, even when the file it names exists.
+#[test]
+fn test_patch_refuses_parent_dir_traversal() {
+    let test_dir = setup_test_dir("traversal_existing");
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let victim = test_dir.join("VICTIM.txt");
+    fs::write(&victim, "victim\n").unwrap();
+
+    let patch_file = test_dir.join("esc.patch");
+    fs::write(
+        &patch_file,
+        "--- ../VICTIM.txt\n+++ ../VICTIM.txt\n@@ -1,1 +1,1 @@\n-victim\n+PWNED\n",
+    )
+    .unwrap();
+
+    let (_, err) = run_patch_capture(vec![
+        String::from("-d"),
+        subdir.to_str().unwrap().to_string(),
+        String::from("-f"),
+        String::from("-p0"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert!(
+        err.contains("dangerous file name"),
+        "should refuse the name, got: {}",
+        err
+    );
+    assert_eq!(
+        fs::read_to_string(&victim).unwrap(),
+        "victim\n",
+        "must not write outside the directory being patched"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// The new-file path returns a name without checking that it exists, so it is
+// the one that would create a whole tree wherever the patch says.
+#[test]
+fn test_patch_refuses_traversal_for_new_file() {
+    let test_dir = setup_test_dir("traversal_new");
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let patch_file = test_dir.join("esc.patch");
+    fs::write(
+        &patch_file,
+        "--- /dev/null\n+++ ../ESCAPE/deep/evil.txt\n@@ -0,0 +1,1 @@\n+pwned\n",
+    )
+    .unwrap();
+
+    let (_, err) = run_patch_capture(vec![
+        String::from("-d"),
+        subdir.to_str().unwrap().to_string(),
+        String::from("-f"),
+        String::from("-p0"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert!(err.contains("dangerous file name"), "got: {}", err);
+    assert!(
+        !test_dir.join("ESCAPE").exists(),
+        "must not create a directory tree outside the patch directory"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// An absolute name from the patch reaches anywhere the user can write.
+#[test]
+fn test_patch_refuses_absolute_name() {
+    let test_dir = setup_test_dir("absolute_name");
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let evil = test_dir.join("ABS_EVIL.txt");
+    let patch_file = test_dir.join("abs.patch");
+    fs::write(
+        &patch_file,
+        format!(
+            "--- /dev/null\n+++ {}\n@@ -0,0 +1,1 @@\n+pwned\n",
+            evil.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let (_, err) = run_patch_capture(vec![
+        String::from("-d"),
+        subdir.to_str().unwrap().to_string(),
+        String::from("-f"),
+        String::from("-p0"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert!(err.contains("dangerous file name"), "got: {}", err);
+    assert!(
+        !evil.exists(),
+        "must not write an absolute path from a patch"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// The refusal applies to names the *patch* supplies. A name the user gives on
+// the command line is their own instruction and must still work.
+#[test]
+fn test_patch_explicit_operand_reaches_any_path() {
+    let test_dir = setup_test_dir("explicit_operand");
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let outside = test_dir.join("OUT.txt");
+    fs::write(&outside, "victim\n").unwrap();
+
+    let patch_file = test_dir.join("op.patch");
+    fs::write(
+        &patch_file,
+        "--- ../OUT.txt\n+++ ../OUT.txt\n@@ -1,1 +1,1 @@\n-victim\n+OK\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-d"),
+            subdir.to_str().unwrap().to_string(),
+            String::from("-p0"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            outside.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "OK\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// diff omits a section body entirely when that side holds only context, so an
+// empty body is not an empty side. Reading it as one both mis-sized the hunk
+// (poisoning the running offset for every later hunk) and dropped every
+// context line, leaving nothing to match the file against.
+#[test]
+fn test_patch_context_omitted_section_bodies() {
+    let test_dir = setup_test_dir("context_omitted");
+
+    let target = test_dir.join("f.txt");
+    let original: String = (1..=40).map(|i| format!("{}\n", i)).collect();
+    fs::write(&target, &original).unwrap();
+
+    let patch_file = test_dir.join("c.patch");
+    // Real `diff -c` output: line 5 removed, INSERTED added after line 25.
+    // Hunk 1's new section body is omitted, hunk 2's old section body is.
+    fs::write(
+        &patch_file,
+        "*** f.txt\t2024-01-01 00:00:00\n\
+         --- f.txt\t2024-01-01 00:00:01\n\
+         ***************\n\
+         *** 2,8 ****\n  2\n  3\n  4\n- 5\n  6\n  7\n  8\n\
+         --- 2,7 ----\n\
+         ***************\n\
+         *** 23,28 ****\n\
+         --- 22,28 ----\n  23\n  24\n  25\n+ INSERTED\n  26\n  27\n  28\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-c"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    let expected: String = (1..=40)
+        .filter(|i| *i != 5)
+        .flat_map(|i| {
+            if i == 25 {
+                vec![format!("{}\n", i), String::from("INSERTED\n")]
+            } else {
+                vec![format!("{}\n", i)]
+            }
+        })
+        .collect();
+    assert_eq!(fs::read_to_string(&target).unwrap(), expected);
+
+    cleanup_test_dir(&test_dir);
+}
+
+// The two section bodies are aligned by their context lines, one to one. The
+// merge used to advance the new section's index twice per context line, so a
+// hunk with more than one leading context line applied at the wrong offset.
+#[test]
+fn test_patch_context_consecutive_context_lines() {
+    let test_dir = setup_test_dir("context_consecutive");
+
+    let target = test_dir.join("f.txt");
+    fs::write(&target, "c1\nc2\nc3\nOLD\nc4\nc5\nc6\n").unwrap();
+
+    let patch_file = test_dir.join("c.patch");
+    fs::write(
+        &patch_file,
+        "*** f.txt\n--- f.txt\n***************\n\
+         *** 1,7 ****\n  c1\n  c2\n  c3\n! OLD\n  c4\n  c5\n  c6\n\
+         --- 1,7 ----\n  c1\n  c2\n  c3\n! NEW\n  c4\n  c5\n  c6\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-c"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "c1\nc2\nc3\nNEW\nc4\nc5\nc6\n"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A reject file must be readable by patch. A unified-style "--- "/"+++ " header
+// above context-format hunks made our own detector read the file as a unified
+// diff containing no hunks at all, so re-applying it silently did nothing.
+#[test]
+fn test_patch_reject_file_is_reapplicable() {
+    let test_dir = setup_test_dir("reject_reapply");
+
+    let target = test_dir.join("t.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("t.patch");
+    fs::write(
+        &patch_file,
+        "--- t.txt\n+++ t.txt\n@@ -1,3 +1,3 @@\n a\n-NOMATCH\n+B\n c\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1);
+
+    let rej = test_dir.join("t.txt.rej");
+    assert!(rej.exists());
+
+    // Feeding the reject file back in must report the failed hunk, not exit 0
+    // having quietly parsed nothing.
+    let (code, err) = run_patch_capture(vec![
+        String::from("-i"),
+        rej.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1, "reject file should be readable, stderr: {}", err);
+    assert!(err.contains("FAILED"), "got: {}", err);
+
+    cleanup_test_dir(&test_dir);
+}
+
+// An ed script's text block is unprefixed file content, so it can contain a
+// line that reads as another format's command. The format whose marker comes
+// first is the one that describes the file.
+#[test]
+fn test_patch_ed_text_block_does_not_hijack_detection() {
+    let test_dir = setup_test_dir("ed_hijack");
+
+    let target = test_dir.join("f.txt");
+    fs::write(&target, "alpha\nbeta\ngamma\n").unwrap();
+
+    let patch_file = test_dir.join("e.patch");
+    // Appends the literal text "1c1", which reads as a normal-diff command.
+    fs::write(&patch_file, "2a\n1c1\n.\n").unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "alpha\nbeta\n1c1\ngamma\n"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A patch that applies nothing must leave the file completely alone: not
+// rewritten with identical bytes, and not backed up under -b.
+#[test]
+fn test_patch_declined_patch_does_not_touch_file() {
+    let test_dir = setup_test_dir("declined_untouched");
+
+    let target = test_dir.join("w.txt");
+    fs::write(&target, "new\n").unwrap();
+    let before = fs::metadata(&target).unwrap().modified().unwrap();
+
+    let patch_file = test_dir.join("u.patch");
+    // Already applied, so it is detected as reversed and declined.
+    fs::write(
+        &patch_file,
+        "--- w.txt\n+++ w.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-b"),
+        String::from("-f"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1);
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(
+        fs::metadata(&target).unwrap().modified().unwrap(),
+        before,
+        "an unapplied patch must not rewrite the file"
+    );
+    assert!(
+        !test_dir.join("w.txt.orig").exists(),
+        "no backup for a patch that changed nothing"
+    );
+    assert!(test_dir.join("w.txt.rej").exists());
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A section body is capped at the length its range declares, but the
+// "\ No newline at end of file" marker follows that last content line. Applying
+// the cap first left the marker unconsumed, so the new-section header was never
+// reached and the whole hunk was silently dropped.
+#[test]
+fn test_patch_context_no_newline_marker_after_full_section() {
+    let test_dir = setup_test_dir("context_nonl_cap");
+
+    let target = test_dir.join("f.txt");
+    fs::write(&target, "a\nb\nc\nd").unwrap(); // no trailing newline
+
+    let patch_file = test_dir.join("c.patch");
+    // The old section declares 4 lines and is followed immediately by the
+    // no-newline marker; a second hunk proves parsing continued past it.
+    fs::write(
+        &patch_file,
+        "*** f.txt\n--- f.txt\n***************\n\
+         *** 1,4 ****\n  a\n  b\n  c\n- d\n\\ No newline at end of file\n\
+         --- 1,4 ----\n  a\n  b\n  c\n+ D\n\\ No newline at end of file\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-c"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read(&target).unwrap(), b"a\nb\nc\nD");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A hunk that removes nothing and adds nothing must leave the file exactly as
+// it is. Sitting at end of file, such a hunk used to flip the trailing-newline
+// marker, adding a newline to a file it had not otherwise touched.
+#[test]
+fn test_patch_noop_hunk_at_eof_leaves_file_alone() {
+    let test_dir = setup_test_dir("noop_eof");
+
+    // An ed "a" command with an empty text block, plain and under -D, and the
+    // degenerate unified spelling of the same thing.
+    let cases: [(&str, &str, Vec<String>); 3] = [
+        ("ed.txt", "2a\n.\n", vec![String::from("-e")]),
+        (
+            "ed_d.txt",
+            "2a\n.\n",
+            vec![
+                String::from("-e"),
+                String::from("-D"),
+                String::from("FEATURE"),
+            ],
+        ),
+        (
+            "uni.txt",
+            "--- uni.txt\n+++ uni.txt\n@@ -2,0 +3,0 @@\n",
+            vec![],
+        ),
+    ];
+
+    for (name, patch_text, extra) in cases {
+        let target = test_dir.join(name);
+        fs::write(&target, "a\nb").unwrap(); // no trailing newline
+
+        let patch_file = test_dir.join(format!("{}.patch", name));
+        fs::write(&patch_file, patch_text).unwrap();
+
+        let mut args = extra;
+        args.push(String::from("-i"));
+        args.push(patch_file.to_str().unwrap().to_string());
+        args.push(target.to_str().unwrap().to_string());
+        let (code, err) = run_patch_capture(args);
+
+        assert_eq!(code, 0, "{}: stderr: {}", name, err);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"a\nb",
+            "{}: a no-op hunk must not add a trailing newline",
+            name
+        );
+    }
+
+    cleanup_test_dir(&test_dir);
+}
+
+// -f is "do not ask any questions and assume answers". The answer to assume
+// for a patch that looks reversed is that it is *not*: applying it forward
+// rejects and leaves the file alone. Assuming -R instead would silently undo a
+// change the file already has -- data loss from a flag whose whole purpose is
+// to be safe to run unattended.
+#[test]
+fn test_patch_force_does_not_reverse_applied_patch() {
+    let test_dir = setup_test_dir("force_no_revert");
+
+    let target = test_dir.join("w.txt");
+    fs::write(&target, "new\n").unwrap();
+
+    let patch_file = test_dir.join("u.patch");
+    fs::write(
+        &patch_file,
+        "--- w.txt\n+++ w.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-f"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+
+    assert_eq!(code, 1, "the hunk should reject");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "new\n",
+        "-f must not revert an already-applied patch"
+    );
+    assert!(test_dir.join("w.txt.rej").exists());
+
+    cleanup_test_dir(&test_dir);
+}
+
+// -R is the explicit request to reverse, and must still do so.
+#[test]
+fn test_patch_explicit_reverse_still_reverts() {
+    let test_dir = setup_test_dir("explicit_reverse");
+
+    let target = test_dir.join("w.txt");
+    fs::write(&target, "new\n").unwrap();
+
+    let patch_file = test_dir.join("u.patch");
+    fs::write(
+        &patch_file,
+        "--- w.txt\n+++ w.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-R"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "old\n");
 
     cleanup_test_dir(&test_dir);
 }

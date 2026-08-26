@@ -9,10 +9,33 @@
 
 //! Hunk application logic with fuzzy matching.
 
-use super::types::{ApplyResult, FilePatch, Hunk, HunkResult, LineOp, PatchConfig, PatchError};
+use super::types::{
+    ApplyResult, FilePatch, Hunk, HunkResult, LineOp, MatchWindow, PatchConfig, PatchError,
+    Placement,
+};
+use gettextrs::gettext;
 
-/// Maximum number of lines to scan when fuzzy matching.
-const MAX_FUZZ_LINES: usize = 1000;
+/// How far to scan in each direction for a hunk's context.
+///
+/// POSIX requires scanning "at least 1 000 bytes"; a line is at least one byte,
+/// so this many lines always satisfies it.
+const MAX_SCAN_LINES: usize = 1000;
+
+/// How many lines of context a fuzzy match may ignore at each end.
+///
+/// POSIX describes exactly two rescans: one ignoring the first and last line of
+/// context, then one ignoring the first two and last two.
+const MAX_FUZZ: usize = 2;
+
+/// What to do with a patch that looks reversed or already applied.
+enum ReversalChoice {
+    /// Reverse the patch and apply it (the user asked for -R after all).
+    ApplyReversed,
+    /// Apply it as written; the hunks will reject, leaving the file alone.
+    ApplyForward,
+    /// Leave the file untouched and send every hunk to the reject file.
+    Skip,
+}
 
 /// Applies patches to file content.
 pub struct PatchApplier<'a> {
@@ -49,27 +72,37 @@ impl<'a> PatchApplier<'a> {
         // or created in the opposite direction. Prompt (or honor -f / -N).
         // Skipped when -R was given (already reversed) or -N (ignore applied).
         if !self.config.reverse && !self.config.ignore_applied && self.detect_reversed(patch) {
-            if self.decide_assume_reverse() {
-                patch.reverse();
-            } else if !self.config.force {
-                return Err(PatchError::ReversedPatch);
+            match self.decide_reversal() {
+                ReversalChoice::ApplyReversed => patch.reverse(),
+                ReversalChoice::ApplyForward => {}
+                ReversalChoice::Skip => {
+                    // Skip this file rather than abandoning the run: a patch
+                    // covering several files may have had only this one applied
+                    // already, and the rest still need patching. The hunks go to
+                    // the reject file, which POSIX makes exit status 1.
+                    eprintln!("patch: {}", gettext("Skipping patch."));
+                    return Ok(self.skip_all(patch));
+                }
             }
-            // With -f and a "no" decision, fall through and apply forward
-            // (which will reject), matching GNU's "apply anyway" path.
         }
 
+        let placement = Placement::from(patch.format);
         let mut rejected_hunks: Vec<(usize, Hunk, String)> = Vec::new();
+        let mut applied_any = false;
 
         for (i, hunk) in patch.hunks.iter_mut().enumerate() {
             let hunk_num = i + 1;
-            match self.apply_hunk(hunk, hunk_num) {
-                HunkResult::Applied { offset, fuzz } => {
+            let result = match placement {
+                Placement::Positional => self.apply_positional_hunk(hunk),
+                Placement::ContentMatched => self.apply_matched_hunk(hunk),
+            };
+            match result {
+                HunkResult::Applied { line, offset, fuzz } => {
                     if offset != 0 {
-                        let target_line = (hunk.old_start as i64 + self.offset) as usize;
                         eprintln!(
                             "Hunk #{} succeeded at {} (offset {} line{})",
                             hunk_num,
-                            target_line,
+                            line,
                             offset,
                             if offset.abs() == 1 { "" } else { "s" }
                         );
@@ -77,32 +110,24 @@ impl<'a> PatchApplier<'a> {
                     if fuzz > 0 {
                         eprintln!("Hunk #{} succeeded with fuzz {}", hunk_num, fuzz);
                     }
-                    // Update cumulative offset (but not for ed scripts, where line numbers
-                    // are already correct for the file state at execution time)
-                    let is_ed_script = hunk.get_old_lines().iter().all(|s| s.is_empty());
-                    if !is_ed_script {
-                        self.offset += (hunk.new_count as i64) - (hunk.old_count as i64);
-                    }
+                    applied_any = true;
                 }
                 HunkResult::AlreadyApplied => {
                     if !self.config.ignore_applied {
-                        return Err(PatchError::ReversedPatch);
+                        // Not an error for the run as a whole: reject this hunk
+                        // and carry on, so the remaining hunks and files are
+                        // still attempted.
+                        rejected_hunks.push((
+                            hunk_num,
+                            self.reject_at_offset(hunk),
+                            String::from("reversed (or previously applied) patch"),
+                        ));
+                        continue;
                     }
                     eprintln!("Hunk #{} already applied", hunk_num);
                 }
                 HunkResult::Rejected { reason } => {
-                    // Adjust the reject's header line numbers by the cumulative
-                    // offset of previously-applied hunks so they approximate the
-                    // positions in the (partially) patched file (matching GNU).
-                    let mut rej = hunk.clone();
-                    if self.offset != 0 {
-                        let adjust = |start: usize| -> usize {
-                            ((start as i64 + self.offset).max(1)) as usize
-                        };
-                        rej.old_start = adjust(rej.old_start);
-                        rej.new_start = adjust(rej.new_start);
-                    }
-                    rejected_hunks.push((hunk_num, rej, reason));
+                    rejected_hunks.push((hunk_num, self.reject_at_offset(hunk), reason));
                 }
             }
         }
@@ -114,29 +139,70 @@ impl<'a> PatchApplier<'a> {
             // Use mem::take to avoid cloning the entire file content
             content: std::mem::take(&mut self.file_lines),
             no_trailing_newline,
+            applied_any,
         })
+    }
+
+    /// Copy a hunk for the reject file, shifting its header line numbers by the
+    /// offset accumulated so far so they approximate positions in the
+    /// partially patched file (matching GNU).
+    fn reject_at_offset(&self, hunk: &Hunk) -> Hunk {
+        let mut rej = hunk.clone();
+        if self.offset != 0 {
+            let adjust = |start: usize| ((start as i64 + self.offset).max(1)) as usize;
+            rej.old_start = adjust(rej.old_start);
+            rej.new_start = adjust(rej.new_start);
+        }
+        rej
+    }
+
+    /// Reject every hunk without touching the file, for a patch the user
+    /// declined to apply.
+    fn skip_all(&mut self, patch: &FilePatch) -> ApplyResult {
+        let rejected_hunks = patch
+            .hunks
+            .iter()
+            .enumerate()
+            .map(|(i, hunk)| {
+                (
+                    i + 1,
+                    hunk.clone(),
+                    String::from("reversed (or previously applied) patch"),
+                )
+            })
+            .collect();
+        ApplyResult {
+            rejected_hunks,
+            content: std::mem::take(&mut self.file_lines),
+            no_trailing_newline: self.eof_no_newline,
+            applied_any: false,
+        }
     }
 
     /// Detect whether the patch appears reversed/already-applied: its first
     /// content hunk fails to apply forward at its expected position but the
     /// reversed hunk (the new-side lines) matches there.
     fn detect_reversed(&self, patch: &FilePatch) -> bool {
+        // A positional hunk records no old-side text, so there is nothing to
+        // test either way.
+        if Placement::from(patch.format) == Placement::Positional {
+            return false;
+        }
         for hunk in &patch.hunks {
-            let old_lines = hunk.get_old_lines();
-            // Skip pure additions and ed-style hunks (no real context to test).
-            if old_lines.is_empty() || old_lines.iter().all(|s| s.is_empty()) {
+            let window = hunk.full_window();
+            let old_lines = window.old_lines();
+            // A pure addition matches anywhere, so it can never disprove
+            // forward applicability.
+            if old_lines.is_empty() {
                 continue;
             }
-            let expected_pos = if hunk.old_start == 0 {
-                0
-            } else {
-                (hunk.old_start - 1).min(self.file_lines.len())
-            };
-            let forward_ok = self.lines_match_at(&old_lines, expected_pos);
-            if forward_ok {
+            // This runs before any hunk is applied, so `self.offset` is still
+            // zero and the recorded line number is the position to test.
+            let expected_pos = hunk.old_start.saturating_sub(1).min(self.file_lines.len());
+            if self.lines_match_at(&old_lines, expected_pos) {
                 return false;
             }
-            let new_lines = hunk.get_new_lines();
+            let new_lines = window.new_lines();
             if !new_lines.is_empty() && self.lines_match_at(&new_lines, expected_pos) {
                 return true;
             }
@@ -146,159 +212,188 @@ impl<'a> PatchApplier<'a> {
         false
     }
 
-    /// Decide whether to assume -R for a detected reversed patch. With -f,
-    /// assume yes. Otherwise prompt on the controlling terminal; if no
-    /// terminal is available, default to "no" (preserving the error path).
-    fn decide_assume_reverse(&self) -> bool {
+    /// Decide what to do about a patch that looks reversed or already applied.
+    fn decide_reversal(&self) -> ReversalChoice {
+        // -f is "do not ask any questions and assume answers". The answer to
+        // assume is that the patch is *not* reversed: applying it forward
+        // rejects the hunks and leaves the file alone, whereas assuming -R
+        // would silently undo a change the file already has.
         if self.config.force {
-            return true;
+            return ReversalChoice::ApplyForward;
         }
-        // No terminal available -> default to "no" (preserves the error path).
-        super::file_ops::prompt_yes_no(
+        match super::file_ops::prompt_yes_no(
             "Reversed (or previously applied) patch detected!  Assume -R? [y] ",
-        )
-        .unwrap_or(false)
+        ) {
+            Some(true) => ReversalChoice::ApplyReversed,
+            // No controlling terminal to ask means no answer, which is a "no".
+            Some(false) | None => ReversalChoice::Skip,
+        }
     }
 
-    /// Apply a single hunk.
-    fn apply_hunk(&mut self, hunk: &Hunk, _hunk_num: usize) -> HunkResult {
-        let old_lines = hunk.get_old_lines();
+    /// Apply a hunk whose position is recorded absolutely (an ed script).
+    ///
+    /// There is no old-side text to verify and no cumulative offset to carry:
+    /// an ed script's line numbers already describe the file as it stands when
+    /// the command runs. How much to remove comes from `old_count`, because
+    /// the script does not record the removed text.
+    fn apply_positional_hunk(&mut self, hunk: &Hunk) -> HunkResult {
+        let pos = hunk.old_start.saturating_sub(1).min(self.file_lines.len());
+        let remove_end = (pos + hunk.old_count).min(self.file_lines.len());
+        let adds: Vec<&str> = hunk
+            .lines
+            .iter()
+            .filter_map(|op| match op {
+                LineOp::Add(s) => Some(s.as_str()),
+                LineOp::Context(_) | LineOp::Delete(_) => None,
+            })
+            .collect();
 
-        if old_lines.is_empty() {
-            // Pure addition - insert at the right position
-            // For ed scripts, don't apply cumulative offset (line numbers are absolute)
-            let insert_pos = if hunk.old_start == 0 {
-                0
-            } else {
-                ((hunk.old_start as i64 - 1).max(0) as usize).min(self.file_lines.len())
-            };
-
-            let new_lines: Vec<String> =
-                hunk.get_new_lines().iter().map(|s| s.to_string()).collect();
-            let new_len = new_lines.len();
-            // Use splice for O(n) instead of multiple insert() which is O(n²)
-            self.file_lines.splice(insert_pos..insert_pos, new_lines);
-            if insert_pos + new_len == self.file_lines.len() {
-                self.eof_no_newline = hunk.new_no_newline;
+        let (replacement, ends_with_directive) = match self.config.ifdef_define.as_deref() {
+            // An ed script does not carry the text it removes, so read it back
+            // from the file to build the #ifndef arm.
+            Some(define) => {
+                let dels: Vec<&str> = self.file_lines[pos..remove_end]
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                let block = ifdef_block(define, &dels, &adds);
+                // A non-empty block always closes with #endif; an empty one
+                // emitted no directive to close.
+                let ends_with_directive = !block.is_empty();
+                (block, ends_with_directive)
             }
-            return HunkResult::Applied { offset: 0, fuzz: 0 };
-        }
-
-        // Check if this is an ed script hunk (all old_lines are empty)
-        // Ed scripts don't include the content being deleted, so we apply by position.
-        // Ed scripts also have line numbers that are correct for the file state at
-        // execution time, so we don't apply cumulative offset.
-        let is_ed_script = old_lines.iter().all(|s| s.is_empty());
-        if is_ed_script {
-            let pos = if hunk.old_start == 0 {
-                0
-            } else {
-                (hunk.old_start - 1).min(self.file_lines.len())
-            };
-            self.perform_changes(hunk, pos);
-            // Don't update self.offset - ed script line numbers are already correct
-            return HunkResult::Applied { offset: 0, fuzz: 0 };
-        }
-
-        // Calculate expected position
-        let expected_pos = if hunk.old_start == 0 {
-            0
-        } else {
-            (hunk.old_start as i64 - 1 + self.offset).max(0) as usize
+            None => (adds.iter().map(|s| s.to_string()).collect(), false),
         };
 
-        // Try exact match at expected position
-        if let Some(offset) = self.try_match_at(&old_lines, expected_pos, 0) {
-            self.perform_changes(hunk, expected_pos);
-            return HunkResult::Applied { offset, fuzz: 0 };
+        self.splice(
+            pos,
+            remove_end,
+            replacement,
+            hunk.new_no_newline && !ends_with_directive,
+        );
+
+        HunkResult::Applied {
+            line: pos + 1,
+            offset: 0,
+            fuzz: 0,
         }
+    }
 
-        // Try fuzzy matching - scan forwards and backwards
-        for delta in 1..=MAX_FUZZ_LINES {
-            // Try forward
-            if expected_pos + delta < self.file_lines.len() + old_lines.len() {
-                if let Some(offset) = self.try_match_at(&old_lines, expected_pos + delta, 0) {
-                    self.perform_changes(hunk, expected_pos + delta);
-                    return HunkResult::Applied {
-                        offset: offset + delta as i64,
-                        fuzz: 0,
-                    };
-                }
-            }
+    /// Apply a hunk located by matching its recorded old-side text.
+    ///
+    /// POSIX: begin searching at the hunk's own line number plus the offset
+    /// accumulated by previously applied hunks, scanning both ways. If that
+    /// fails and the hunk carries context, rescan ignoring the first and last
+    /// line of context, then the first two and last two.
+    fn apply_matched_hunk(&mut self, hunk: &Hunk) -> HunkResult {
+        let expected = (hunk.old_start as i64 - 1 + self.offset).max(0) as usize;
 
-            // Try backward
-            if delta <= expected_pos {
-                if let Some(offset) = self.try_match_at(&old_lines, expected_pos - delta, 0) {
-                    self.perform_changes(hunk, expected_pos - delta);
-                    return HunkResult::Applied {
-                        offset: offset - delta as i64,
-                        fuzz: 0,
-                    };
-                }
-            }
-        }
-
-        // Try with fuzz factor (ignore some context lines)
-        for fuzz in 1..=2 {
-            if old_lines.len() <= fuzz * 2 {
-                continue;
-            }
-
-            let fuzzed_lines: Vec<&str> = old_lines[fuzz..old_lines.len() - fuzz].to_vec();
-
-            for delta in 0..=MAX_FUZZ_LINES {
-                // Try at expected position with fuzz
-                if delta == 0 && self.lines_match_at(&fuzzed_lines, expected_pos + fuzz) {
-                    self.perform_changes(hunk, expected_pos);
-                    return HunkResult::Applied { offset: 0, fuzz };
-                }
-
-                // Try forward with fuzz
-                if expected_pos + delta + fuzz < self.file_lines.len() + fuzzed_lines.len()
-                    && self.lines_match_at(&fuzzed_lines, expected_pos + delta + fuzz)
-                {
-                    self.perform_changes(hunk, expected_pos + delta);
-                    return HunkResult::Applied {
-                        offset: delta as i64,
-                        fuzz,
-                    };
-                }
-
-                // Try backward with fuzz
-                if delta <= expected_pos
-                    && expected_pos - delta + fuzz < self.file_lines.len()
-                    && self.lines_match_at(&fuzzed_lines, expected_pos - delta + fuzz)
-                {
-                    self.perform_changes(hunk, expected_pos - delta);
-                    return HunkResult::Applied {
-                        offset: -(delta as i64),
-                        fuzz,
-                    };
-                }
+        for fuzz in 0..=MAX_FUZZ {
+            let window = if fuzz == 0 {
+                Some(hunk.full_window())
+            } else {
+                hunk.fuzz_window(fuzz)
+            };
+            let Some(window) = window else { continue };
+            if let Some(pos) = self.locate_hunk(&window, expected) {
+                self.apply_window(hunk, &window, pos);
+                self.offset += hunk.new_count as i64 - hunk.old_count as i64;
+                return HunkResult::Applied {
+                    line: pos + 1,
+                    offset: pos as i64 - expected as i64,
+                    fuzz,
+                };
             }
         }
 
-        // Check if already applied (reverse match)
-        let new_lines = hunk.get_new_lines();
-        if !new_lines.is_empty() && self.lines_match_at(&new_lines, expected_pos) {
+        let new_lines = hunk.full_window().new_lines();
+        if !new_lines.is_empty() && self.lines_match_at(&new_lines, expected) {
             return HunkResult::AlreadyApplied;
         }
 
         HunkResult::Rejected {
-            reason: format!(
-                "patch does not apply at line {}",
-                hunk.old_start as i64 + self.offset
-            ),
+            reason: format!("patch does not apply at line {}", expected + 1),
         }
     }
 
-    /// Try to match old_lines at the given position.
-    /// Returns Some(0) if match found, None otherwise.
-    fn try_match_at(&self, old_lines: &[&str], pos: usize, _fuzz: usize) -> Option<i64> {
-        if self.lines_match_at(old_lines, pos) {
-            Some(0)
-        } else {
-            None
+    /// Scan outward from `expected` for a place where the window's old-side
+    /// text matches.
+    ///
+    /// Returns the position of the hunk's first line, which sits `lead_skip`
+    /// lines before the text that was actually verified.
+    fn locate_hunk(&self, window: &MatchWindow, expected: usize) -> Option<usize> {
+        let old_lines = window.old_lines();
+        let skip = window.lead_skip;
+        // Furthest hunk start at which the window still fits inside the file.
+        let last_start = self.file_lines.len().saturating_sub(old_lines.len() + skip);
+
+        for delta in 0..=MAX_SCAN_LINES {
+            if expected + delta <= last_start
+                && self.lines_match_at(&old_lines, expected + delta + skip)
+            {
+                return Some(expected + delta);
+            }
+            if delta > 0
+                && delta <= expected
+                && self.lines_match_at(&old_lines, expected - delta + skip)
+            {
+                return Some(expected - delta);
+            }
+            // Both directions have run off the end of the file.
+            if delta > expected && expected + delta > last_start {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Splice the window's new-side text over the file lines it matched.
+    ///
+    /// Only the window is written. Context lines that a fuzzy match agreed to
+    /// ignore are left exactly as the file has them — they were never verified,
+    /// so the patch's copy of them is not evidence of anything.
+    fn apply_window(&mut self, hunk: &Hunk, window: &MatchWindow, pos: usize) {
+        let file_start = pos + window.lead_skip;
+        let old_len = window.old_lines().len();
+        let remove_end = (file_start + old_len).min(self.file_lines.len());
+
+        let (replacement, ends_with_directive) = match self.config.ifdef_define.as_deref() {
+            Some(define) => ifdef_lines(window.ops(), define),
+            None => (
+                window.new_lines().iter().map(|s| s.to_string()).collect(),
+                false,
+            ),
+        };
+
+        self.splice(
+            file_start,
+            remove_end,
+            replacement,
+            hunk.new_no_newline && !ends_with_directive,
+        );
+    }
+
+    /// Replace `file_lines[at..remove_end]` with `replacement`, recording
+    /// whether the file now ends without a trailing newline.
+    ///
+    /// Only a write that reaches the end of the file can change that; under
+    /// fuzz the file's real last line was never replaced, so the write ends
+    /// short and the marker correctly stays put.
+    ///
+    /// A hunk that removes nothing and adds nothing leaves the file exactly as
+    /// it was, so it must not disturb the marker either. Such a hunk is
+    /// degenerate rather than typical -- an ed `a` command with an empty text
+    /// block, or a "@@ -2,0 +3,0 @@" unified header -- but without this guard
+    /// one sitting at end of file would add or drop a trailing newline while
+    /// changing no line at all.
+    fn splice(&mut self, at: usize, remove_end: usize, replacement: Vec<String>, no_newline: bool) {
+        if replacement.is_empty() && remove_end == at {
+            return;
+        }
+        let write_end = at + replacement.len();
+        self.file_lines.splice(at..remove_end, replacement);
+        if write_end == self.file_lines.len() {
+            self.eof_no_newline = no_newline;
         }
     }
 
@@ -326,109 +421,121 @@ impl<'a> PatchApplier<'a> {
             actual == expected
         }
     }
+}
 
-    /// Perform the actual changes for a hunk at the given position.
-    fn perform_changes(&mut self, hunk: &Hunk, pos: usize) {
-        if let Some(ref define) = self.config.ifdef_define {
-            self.perform_ifdef_changes(hunk, pos, define);
-        } else {
-            self.perform_normal_changes(hunk, pos);
+/// Render one window's operations as `#ifdef`-guarded text (-D).
+///
+/// Returns the lines to write and whether the last of them is a synthesized
+/// preprocessor directive. A directive always carries its own newline, so it
+/// overrides the hunk's "no newline at end of file" marker.
+fn ifdef_lines(ops: &[LineOp], define: &str) -> (Vec<String>, bool) {
+    let mut result: Vec<String> = Vec::with_capacity(ops.len() * 2);
+    let mut last_is_directive = false;
+    let mut i = 0;
+
+    while i < ops.len() {
+        if let LineOp::Context(s) = &ops[i] {
+            result.push(s.clone());
+            last_is_directive = false;
+            i += 1;
+            continue;
         }
+        // A change is a run of deletions followed by a run of additions;
+        // either run may be empty, but not both.
+        let mut dels: Vec<&str> = Vec::new();
+        while let Some(LineOp::Delete(s)) = ops.get(i) {
+            dels.push(s);
+            i += 1;
+        }
+        let mut adds: Vec<&str> = Vec::new();
+        while let Some(LineOp::Add(s)) = ops.get(i) {
+            adds.push(s);
+            i += 1;
+        }
+        result.extend(ifdef_block(define, &dels, &adds));
+        last_is_directive = true;
     }
 
-    /// Perform changes normally (delete old, insert new).
-    fn perform_normal_changes(&mut self, hunk: &Hunk, pos: usize) {
-        // Count deletes and build new lines with pre-allocated capacity
-        let mut delete_count = 0;
-        let mut new_lines: Vec<String> = Vec::with_capacity(hunk.lines.len());
+    (result, last_is_directive)
+}
 
-        for op in &hunk.lines {
-            match op {
-                LineOp::Context(s) => {
-                    delete_count += 1;
-                    new_lines.push(s.clone());
-                }
-                LineOp::Delete(_) => {
-                    delete_count += 1;
-                }
-                LineOp::Add(s) => {
-                    new_lines.push(s.clone());
-                }
-            }
+/// Build one `-D` guarded block from a run of removed and added lines.
+fn ifdef_block(define: &str, dels: &[&str], adds: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(dels.len() + adds.len() + 3);
+    match (dels.is_empty(), adds.is_empty()) {
+        // A replacement: the old text under #ifndef, the new under #else.
+        (false, false) => {
+            out.push(format!("#ifndef {}", define));
+            out.extend(dels.iter().map(|s| s.to_string()));
+            out.push(String::from("#else"));
+            out.extend(adds.iter().map(|s| s.to_string()));
         }
-
-        // Use splice for O(n) instead of drain() + multiple insert() which is O(n²)
-        let remove_end = (pos + delete_count).min(self.file_lines.len());
-        let new_len = new_lines.len();
-        self.file_lines.splice(pos..remove_end, new_lines);
-        // If this hunk's new content now ends the file, its newline marker
-        // determines whether the output gets a trailing newline.
-        if pos + new_len == self.file_lines.len() {
-            self.eof_no_newline = hunk.new_no_newline;
+        // A pure addition: new text only when the macro is defined.
+        (true, false) => {
+            out.push(format!("#ifdef {}", define));
+            out.extend(adds.iter().map(|s| s.to_string()));
         }
+        // A pure deletion: old text kept only when the macro is not defined.
+        (false, true) => {
+            out.push(format!("#ifndef {}", define));
+            out.extend(dels.iter().map(|s| s.to_string()));
+        }
+        (true, true) => return out,
     }
-
-    /// Perform changes with #ifdef wrapping.
-    ///
-    /// Adjacent deletes+adds (a change) are emitted as a single
-    /// `#ifndef DEFINE` / old / `#else` / new / `#endif` block, matching the
-    /// conventional `diff -D` / `patch -D` output. Pure additions use
-    /// `#ifdef DEFINE` / new / `#endif`; pure deletions use
-    /// `#ifndef DEFINE` / old / `#endif`.
-    fn perform_ifdef_changes(&mut self, hunk: &Hunk, pos: usize, define: &str) {
-        // Pre-allocate: worst case each line becomes ~2 lines (ifdef wrapped)
-        let mut result: Vec<String> = Vec::with_capacity(hunk.lines.len() * 2);
-        let mut delete_count = 0;
-
-        let ops = &hunk.lines;
-        let mut i = 0;
-        while i < ops.len() {
-            match &ops[i] {
-                LineOp::Context(s) => {
-                    delete_count += 1;
-                    result.push(s.clone());
-                    i += 1;
-                }
-                LineOp::Delete(_) | LineOp::Add(_) => {
-                    // Gather a run of consecutive deletes followed by adds.
-                    let mut dels: Vec<String> = Vec::new();
-                    while let Some(LineOp::Delete(s)) = ops.get(i) {
-                        dels.push(s.clone());
-                        delete_count += 1;
-                        i += 1;
-                    }
-                    let mut adds: Vec<String> = Vec::new();
-                    while let Some(LineOp::Add(s)) = ops.get(i) {
-                        adds.push(s.clone());
-                        i += 1;
-                    }
-
-                    if !dels.is_empty() && !adds.is_empty() {
-                        result.push(format!("#ifndef {}", define));
-                        result.extend(dels);
-                        result.push("#else".to_string());
-                        result.extend(adds);
-                        result.push("#endif".to_string());
-                    } else if !adds.is_empty() {
-                        result.push(format!("#ifdef {}", define));
-                        result.extend(adds);
-                        result.push("#endif".to_string());
-                    } else if !dels.is_empty() {
-                        result.push(format!("#ifndef {}", define));
-                        result.extend(dels);
-                        result.push("#endif".to_string());
-                    }
-                }
-            }
-        }
-
-        // Use splice for O(n) instead of drain() + multiple insert() which is O(n²)
-        let remove_end = (pos + delete_count).min(self.file_lines.len());
-        self.file_lines.splice(pos..remove_end, result);
-    }
+    out.push(String::from("#endif"));
+    out
 }
 
 /// Normalize whitespace for loose matching.
 fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::patch_util::types::DiffFormat;
+
+    fn hunk_with(old_start: usize, ops: Vec<LineOp>) -> Hunk {
+        let mut h = Hunk::new(old_start, 1, old_start, 1);
+        h.lines = ops;
+        h
+    }
+
+    /// Declining a reversed patch must leave the file exactly as it was and
+    /// send every hunk to the reject file. This path is otherwise only
+    /// reachable through a prompt on the controlling terminal.
+    #[test]
+    fn skip_all_rejects_every_hunk_and_keeps_content() {
+        let config = PatchConfig::default();
+        let original = vec![String::from("a"), String::from("b")];
+        let mut applier = PatchApplier::new(&config, original.clone(), true);
+
+        let mut patch = FilePatch::new(DiffFormat::Unified);
+        patch.hunks.push(hunk_with(
+            1,
+            vec![
+                LineOp::Delete(String::from("a")),
+                LineOp::Add(String::from("A")),
+            ],
+        ));
+        patch.hunks.push(hunk_with(
+            2,
+            vec![
+                LineOp::Delete(String::from("b")),
+                LineOp::Add(String::from("B")),
+            ],
+        ));
+
+        let result = applier.skip_all(&patch);
+
+        assert_eq!(result.content, original, "file content must be untouched");
+        assert!(!result.applied_any, "nothing was applied");
+        assert_eq!(result.rejected_hunks.len(), 2, "every hunk is rejected");
+        let numbers: Vec<usize> = result.rejected_hunks.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(numbers, vec![1, 2], "hunks are numbered from one");
+        for (_, _, reason) in &result.rejected_hunks {
+            assert!(reason.contains("previously applied"), "reason: {}", reason);
+        }
+    }
 }

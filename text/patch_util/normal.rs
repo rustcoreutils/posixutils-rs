@@ -15,12 +15,12 @@ use std::sync::LazyLock;
 
 /// Pre-compiled regex for normal diff commands to avoid recompilation on each parse.
 static CMD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\d+)(?:,(\d+))?([acd])(\d+)(?:,(\d+))?$").expect("invalid regex")
+    Regex::new(r"^(\d+)(?:,(\d+))?([acd])(\d+)(?:,(\d+))?\r?$").expect("invalid regex")
 });
 
 /// Pre-compiled regex for detecting normal diff commands.
 static DETECT_CMD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]\d+(?:,\d+)?$").expect("invalid regex"));
+    LazyLock::new(|| Regex::new(r"^\d+(?:,\d+)?[acd]\d+(?:,\d+)?\r?$").expect("invalid regex"));
 
 /// Parse a normal diff from the given lines.
 pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), PatchError> {
@@ -61,6 +61,15 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
                 .get(5)
                 .map_or(new_start, |m| m.as_str().parse().unwrap_or(new_start));
 
+            // A range whose end precedes its start is malformed; the count
+            // arithmetic below would underflow.
+            if old_end < old_start || new_end < new_start {
+                return Err(PatchError::Parse {
+                    line: pos + 1,
+                    message: format!("malformed range in command: {}", line),
+                });
+            }
+
             pos += 1;
 
             let mut hunk = match cmd {
@@ -96,19 +105,19 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
             while pos < lines.len() {
                 let content_line = lines[pos];
 
-                if let Some(rest) = content_line.strip_prefix("< ") {
+                if let Some(rest) = strip_marker(content_line, '<') {
                     // Delete line (from old file)
                     hunk.lines.push(LineOp::Delete(rest.to_string()));
                     prev_old = true;
                     prev_new = false;
                     pos += 1;
-                } else if let Some(rest) = content_line.strip_prefix("> ") {
+                } else if let Some(rest) = strip_marker(content_line, '>') {
                     // Add line (to new file)
                     hunk.lines.push(LineOp::Add(rest.to_string()));
                     prev_old = false;
                     prev_new = true;
                     pos += 1;
-                } else if content_line == "---" {
+                } else if content_line.trim_end_matches('\r') == "---" {
                     // Separator between delete and add in change
                     pos += 1;
                 } else if content_line.starts_with("\\") {
@@ -126,6 +135,30 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
                 }
             }
 
+            // The header declares how many lines each side contributes; a
+            // hunk that came up short was truncated (by a mailer, or by a
+            // content line we did not recognize) and must not be applied as
+            // though it were complete.
+            let got_old = hunk
+                .lines
+                .iter()
+                .filter(|op| matches!(op, LineOp::Delete(_)))
+                .count();
+            let got_new = hunk
+                .lines
+                .iter()
+                .filter(|op| matches!(op, LineOp::Add(_)))
+                .count();
+            if got_old != hunk.old_count || got_new != hunk.new_count {
+                return Err(PatchError::Parse {
+                    line: pos + 1,
+                    message: format!(
+                        "hunk at \"{}\" declares {} old and {} new lines but has {} and {}",
+                        line, hunk.old_count, hunk.new_count, got_old, got_new
+                    ),
+                });
+            }
+
             patch.hunks.push(hunk);
         } else {
             pos += 1;
@@ -135,13 +168,19 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
     Ok((patch, pos))
 }
 
-/// Check if a line looks like a normal diff command.
-pub fn looks_like_normal(lines: &[&str]) -> bool {
-    for line in lines.iter().take(20) {
-        if DETECT_CMD_RE.is_match(line) {
-            return true;
-        }
-    }
+/// Strip a normal-diff line marker and the space that separates it from the
+/// payload.
+///
+/// diff writes "< " even when the line is empty; a mailer that strips trailing
+/// whitespace turns that into a bare "<", which must still be read as a line
+/// with an empty payload rather than ending the hunk.
+fn strip_marker(line: &str, marker: char) -> Option<&str> {
+    let rest = line.strip_prefix(marker)?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
 
-    false
+/// Index of the first normal-diff command line.
+/// See [`super::unified::unified_marker`] for why this reports a position.
+pub fn normal_marker(lines: &[&str]) -> Option<usize> {
+    lines.iter().position(|line| DETECT_CMD_RE.is_match(line))
 }

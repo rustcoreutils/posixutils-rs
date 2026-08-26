@@ -29,7 +29,42 @@ impl Default for LineOp {
     }
 }
 
+/// How a hunk's location in the target file is determined.
+///
+/// This is a property of the diff format, not of a hunk's contents. An ed
+/// script names absolute line numbers and does not record the text it removes,
+/// so there is nothing to verify against the file and no cumulative offset to
+/// carry between hunks. Every other format identifies its target by matching
+/// recorded old-side text, and each applied hunk shifts the search origin for
+/// the ones that follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Apply at the recorded line number, verbatim.
+    Positional,
+    /// Locate by matching the hunk's old-side text.
+    ContentMatched,
+}
+
+impl From<DiffFormat> for Placement {
+    fn from(format: DiffFormat) -> Self {
+        match format {
+            DiffFormat::EdScript => Placement::Positional,
+            DiffFormat::Unified | DiffFormat::Context | DiffFormat::Normal => {
+                Placement::ContentMatched
+            }
+        }
+    }
+}
+
 /// A hunk represents a contiguous region of changes.
+///
+/// `old_start` is the 1-based line number of the first old-side line the hunk
+/// replaces. When `old_count` is 0 the hunk inserts rather than replaces, and
+/// `old_start` is the line number *before which* the new lines go — so the
+/// insertion index is `old_start - 1` in either case, and `old_start` ranges
+/// over `1 ..= len + 1`. `new_start` is the mirror of this on the new side.
+/// The parsers normalize every format to this convention, which keeps the
+/// invariant symmetric under [`Hunk::reverse`].
 #[derive(Debug, Clone)]
 pub struct Hunk {
     /// Original file starting line (1-indexed, from header)
@@ -80,9 +115,92 @@ impl Hunk {
         }
     }
 
-    /// Get context lines for matching (Delete and Context lines).
-    pub fn get_old_lines(&self) -> Vec<&str> {
-        self.lines
+    /// Lengths of the leading and trailing runs of [`LineOp::Context`].
+    ///
+    /// These are the only lines a fuzzy match may ignore. A hunk made
+    /// entirely of context has no separate trailing run — the leading one
+    /// already covers every op — so the two never overlap.
+    fn context_runs(&self) -> (usize, usize) {
+        let lead = self
+            .lines
+            .iter()
+            .take_while(|op| matches!(op, LineOp::Context(_)))
+            .count();
+        if lead == self.lines.len() {
+            return (lead, 0);
+        }
+        let trail = self
+            .lines
+            .iter()
+            .rev()
+            .take_while(|op| matches!(op, LineOp::Context(_)))
+            .count();
+        (lead, trail)
+    }
+
+    /// The whole hunk, with nothing ignored.
+    pub fn full_window(&self) -> MatchWindow<'_> {
+        MatchWindow {
+            ops: &self.lines,
+            lead_skip: 0,
+        }
+    }
+
+    /// The hunk with up to `fuzz` context lines ignored at each end.
+    ///
+    /// Returns `None` when neither end can give up another line, or when
+    /// trimming would leave nothing on the old side to verify — a window that
+    /// matches everywhere is not a match. A format that records no context at
+    /// all (a normal diff, or `diff -U0` output) therefore never yields a fuzz
+    /// window, which is how POSIX's "if it is a context difference" gets
+    /// enforced structurally rather than by inspecting the format.
+    pub fn fuzz_window(&self, fuzz: usize) -> Option<MatchWindow<'_>> {
+        let (lead, trail) = self.context_runs();
+        let lead_skip = fuzz.min(lead);
+        let trail_skip = fuzz.min(trail);
+        if lead_skip == 0 && trail_skip == 0 {
+            return None;
+        }
+        // A side with fewer context lines than `fuzz` is already fully
+        // trimmed; if that is true of both sides, this window is the one the
+        // previous fuzz level already tried.
+        if fuzz > 1 && lead < fuzz && trail < fuzz {
+            return None;
+        }
+        let ops = &self.lines[lead_skip..self.lines.len() - trail_skip];
+        if !ops
+            .iter()
+            .any(|op| matches!(op, LineOp::Context(_) | LineOp::Delete(_)))
+        {
+            return None;
+        }
+        Some(MatchWindow { ops, lead_skip })
+    }
+}
+
+/// A hunk narrowed to the operations that will actually be verified and
+/// written.
+///
+/// The `lead_skip` leading context ops, and any trailing ones, are ignored:
+/// the file lines they would have covered are left exactly as they are. This
+/// is what keeps a fuzzy match from writing the patch's own unverified context
+/// over real file content — the ignored ops are absent from the window rather
+/// than something the writer must remember to skip.
+pub struct MatchWindow<'h> {
+    ops: &'h [LineOp],
+    /// Context lines ignored before the window starts.
+    pub lead_skip: usize,
+}
+
+impl<'h> MatchWindow<'h> {
+    /// The operations inside the window, in source order.
+    pub fn ops(&self) -> &'h [LineOp] {
+        self.ops
+    }
+
+    /// Old-side text inside the window (Context and Delete payloads).
+    pub fn old_lines(&self) -> Vec<&'h str> {
+        self.ops
             .iter()
             .filter_map(|op| match op {
                 LineOp::Context(s) | LineOp::Delete(s) => Some(s.as_str()),
@@ -91,9 +209,9 @@ impl Hunk {
             .collect()
     }
 
-    /// Get result lines after applying (Context and Add lines).
-    pub fn get_new_lines(&self) -> Vec<&str> {
-        self.lines
+    /// New-side text inside the window (Context and Add payloads).
+    pub fn new_lines(&self) -> Vec<&'h str> {
+        self.ops
             .iter()
             .filter_map(|op| match op {
                 LineOp::Context(s) | LineOp::Add(s) => Some(s.as_str()),
@@ -191,6 +309,8 @@ impl Patch {
 pub enum HunkResult {
     /// Hunk was applied successfully.
     Applied {
+        /// 1-based line in the patched file where the hunk landed
+        line: usize,
         /// Line offset from expected position
         offset: i64,
         /// Fuzz factor used (0 = exact match)
@@ -214,6 +334,12 @@ pub struct ApplyResult {
     pub content: Vec<String>,
     /// Whether the resulting file's last line has no trailing newline.
     pub no_trailing_newline: bool,
+    /// Whether any hunk was actually applied.
+    ///
+    /// When none was, the content is byte-identical to what was read and must
+    /// not be written back: rewriting it would change the file's modification
+    /// time, and under -b leave a backup, for a patch that did nothing.
+    pub applied_any: bool,
 }
 
 /// Configuration options for patch.
@@ -264,9 +390,6 @@ pub enum PatchError {
 
     #[error("could not determine target file for patch")]
     NoTargetFile,
-
-    #[error("reversed (or previously applied) patch detected")]
-    ReversedPatch,
 
     #[error("{0}")]
     Other(String),

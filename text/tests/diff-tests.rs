@@ -1351,3 +1351,152 @@ fn test_diff_patch_round_trip_preserves_bytes() {
         let _ = std::fs::remove_file(&work);
     }
 }
+
+/// A conflict between output styles was resolved by a fixed precedence, so
+/// `diff -u -e` and `diff -e -u` both quietly produced an ed script. Refusing
+/// is what GNU does, and it is the only answer that does not discard an
+/// option the user asked for.
+#[test]
+fn test_diff_conflicting_output_styles_are_rejected() {
+    let f1 = write_tmp("conflict_1", b"a\n");
+    let f2 = write_tmp("conflict_2", b"b\n");
+    for args in [
+        vec!["-u", "-e", &f1, &f2],
+        vec!["-e", "-u", &f1, &f2],
+        vec!["-c", "-u", &f1, &f2],
+        vec!["-e", "-f", &f1, &f2],
+        vec!["-C", "2", "-U", "2", &f1, &f2],
+    ] {
+        diff_test_full(
+            &args,
+            "",
+            "diff: conflicting output style options\n",
+            EXIT_STATUS_TROUBLE,
+        );
+    }
+    // One style named twice is not a conflict: -u is -U 3.
+    diff_test_full(
+        &["-u", "-U", "3", "-L", "one", "-L", "two", &f1, &f2],
+        "--- one\n+++ two\n@@ -1 +1 @@\n-a\n+b\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// `-L` is GNU's spelling and may be given twice, once per file. A third is a
+/// usage error rather than a silently ignored option.
+#[test]
+fn test_diff_label_option_forms() {
+    let f1 = write_tmp("label_1", b"a\n");
+    let f2 = write_tmp("label_2", b"b\n");
+
+    diff_test_full(
+        &["-u", "-L", "one", "-L", "two", &f1, &f2],
+        "--- one\n+++ two\n@@ -1 +1 @@\n-a\n+b\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    // --label is the long form of -L, and --label2 our spelling of the second.
+    diff_test_full(
+        &["-u", "--label", "one", "--label2", "two", &f1, &f2],
+        "--- one\n+++ two\n@@ -1 +1 @@\n-a\n+b\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test_full(
+        &["-u", "-L", "a", "-L", "b", "-L", "c", &f1, &f2],
+        "",
+        "diff: too many file label options\n",
+        EXIT_STATUS_TROUBLE,
+    );
+    // This used to panic, exiting 101 with a Rust backtrace on stderr.
+    diff_test_full(
+        &["-u", "--label2", "two", &f1, &f2],
+        "",
+        "diff: --label2 needs --label\n",
+        EXIT_STATUS_TROUBLE,
+    );
+}
+
+/// POSIX requires the `<file>` field of a unified header to be `-` when the
+/// operand is standard input. It used to name the spill file diff had written
+/// stdin to, leaking a host path into every patch generated from a pipe.
+#[test]
+fn test_diff_stdin_is_named_dash_in_headers() {
+    let f1 = write_tmp("stdin_1", b"a\nb\n");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(["-u", "--label", "L1", &f1, "-"])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn diff");
+    child
+        .stdin
+        .take()
+        .expect("diff stdin")
+        .write_all(b"a\nc\n")
+        .expect("feed stdin");
+    let out = child.wait_with_output().expect("wait for diff");
+    assert_eq!(out.status.code(), Some(EXIT_STATUS_DIFFERENCE));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let second = stdout.lines().nth(1).expect("a +++ header line");
+    // The header carries a timestamp after a tab; only the name is at issue.
+    let name = second.strip_prefix("+++ ").expect("+++ prefix");
+    let name = name.split('\t').next().unwrap();
+    assert_eq!(name, "-", "stdin must be named `-`, got {second:?}");
+    assert!(
+        stdout.ends_with("@@ -1,2 +1,2 @@\n a\n-b\n+c\n"),
+        "got {stdout:?}"
+    );
+}
+
+/// Standard input is buffered in memory, so there is no spill file to leak on
+/// an early return. The old one had a predictable name under $TMPDIR, was
+/// created without O_EXCL, and was removed only on the success path.
+#[test]
+fn test_diff_stdin_leaves_no_temp_file() {
+    let pattern = std::env::temp_dir().join("diff_stdin_");
+    let count_spills = || {
+        let dir = std::env::temp_dir();
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.path()
+                            .to_str()
+                            .is_some_and(|p| p.starts_with(pattern.to_str().unwrap()))
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    let before = count_spills();
+    let f1 = write_tmp("stdin_leak_1", b"a\n");
+    // Every one of these takes an early return that the old cleanup missed.
+    for args in [
+        vec!["-", "/nonexistent-path-for-diff-test"],
+        vec!["-", &f1, "extra-operand-is-a-usage-error"],
+    ] {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+            .args(&args)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn diff");
+        let _ = child.stdin.take().expect("diff stdin").write_all(b"x\n");
+        let _ = child.wait();
+    }
+    assert_eq!(
+        count_spills(),
+        before,
+        "diff left a stdin spill file behind in {}",
+        std::env::temp_dir().display()
+    );
+}

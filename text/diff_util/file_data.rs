@@ -7,11 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{
-    collections::hash_map::DefaultHasher, hash::Hasher, mem::take, path::PathBuf, time::SystemTime,
-};
-
-use super::constants::COULD_NOT_UNWRAP_FILENAME;
+use std::{collections::hash_map::DefaultHasher, hash::Hasher, mem::take, time::SystemTime};
 
 /// The bytes `-b` treats as white space.
 ///
@@ -59,7 +55,9 @@ fn normalized(line: &[u8]) -> Normalized<'_> {
 /// carry that file's bytes to be applicable to it.
 #[derive(Debug)]
 pub struct FileData<'a> {
-    path: PathBuf,
+    /// What to call this file in output. The operand as the user wrote it,
+    /// except for standard input, which POSIX names `-`.
+    name: String,
     lines: Vec<&'a [u8]>,
     hashes: Vec<u64>, // Pre-computed line hashes for O(1) comparison
     modified: SystemTime,
@@ -77,7 +75,7 @@ impl<'a> FileData<'a> {
     /// Takes `modified` rather than looking it up, so the timestamp in a
     /// `-c`/`-u` header comes from the same open file the bytes did.
     pub fn new(
-        path: PathBuf,
+        name: String,
         lines: Vec<&'a [u8]>,
         modified: SystemTime,
         ends_with_newline: bool,
@@ -112,7 +110,7 @@ impl<'a> FileData<'a> {
             .collect();
 
         Self {
-            path,
+            name,
             lines,
             hashes,
             modified,
@@ -153,8 +151,8 @@ impl<'a> FileData<'a> {
         self.modified
     }
 
-    pub fn path(&self) -> &str {
-        self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 

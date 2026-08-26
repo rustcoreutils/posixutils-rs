@@ -26,20 +26,55 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufWriter, Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::SystemTime,
 };
 
-/// Read a whole file, returning its bytes and its modification time from a
-/// single `open`. Each operand used to be opened three times -- once to sniff
-/// for binary content, once for the contents, once for the timestamp -- which
-/// could observe three different files.
-fn read_file(path: &Path) -> io::Result<(Vec<u8>, SystemTime)> {
-    let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    let mut data = Vec::with_capacity(metadata.len() as usize + 1);
-    file.read_to_end(&mut data)?;
-    Ok((data, metadata.modified()?))
+/// One operand, read into memory.
+///
+/// Standard input is an operand like any other here, which is why it needs no
+/// spill file: the text path always held both files whole anyway. Carrying the
+/// display name separately from the path is what lets stdin appear as `-` in a
+/// `-u`/`-c` header, as POSIX requires, instead of whatever path it was read
+/// from.
+pub struct Source {
+    name: String,
+    content: Vec<u8>,
+    modified: SystemTime,
+}
+
+impl Source {
+    /// Read a file operand, taking its bytes and its modification time from a
+    /// single `open`. Each operand used to be opened three times -- to sniff
+    /// for binary content, for the contents, and for the timestamp -- which
+    /// could observe three different files.
+    pub fn from_path(path: PathBuf) -> io::Result<Self> {
+        let mut file = File::open(&path)?;
+        let metadata = file.metadata()?;
+        let mut content = Vec::with_capacity(metadata.len() as usize + 1);
+        file.read_to_end(&mut content)?;
+        let modified = metadata.modified()?;
+        let name = path
+            .to_str()
+            .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+            .to_string();
+        Ok(Self {
+            name,
+            content,
+            modified,
+        })
+    }
+
+    /// Standard input, buffered in memory.
+    pub fn from_stdin() -> io::Result<Self> {
+        let mut content = Vec::new();
+        io::stdin().read_to_end(&mut content)?;
+        Ok(Self {
+            name: String::from("-"),
+            content,
+            modified: SystemTime::now(),
+        })
+    }
 }
 
 /// Format a context-format (`-c`/`-C`) line range starting at 1-indexed
@@ -104,11 +139,25 @@ impl<'a> FileDiff<'a> {
         format_options: &FormatOptions,
         show_if_different: Option<String>,
     ) -> io::Result<DiffExitStatus> {
-        let (content1, modified1) = read_file(&path1)?;
-        let (content2, modified2) = read_file(&path2)?;
+        Self::diff_sources(
+            Source::from_path(path1)?,
+            Source::from_path(path2)?,
+            format_options,
+            show_if_different,
+        )
+    }
+
+    pub fn diff_sources(
+        src1: Source,
+        src2: Source,
+        format_options: &FormatOptions,
+        show_if_different: Option<String>,
+    ) -> io::Result<DiffExitStatus> {
+        let (content1, content2) = (src1.content, src2.content);
+        let (modified1, modified2) = (src1.modified, src2.modified);
 
         if is_binary(&content1) || is_binary(&content2) {
-            Self::binary_file_diff(&path1, &path2, &content1, &content2)
+            Self::binary_file_diff(&src1.name, &src2.name, &content1, &content2)
         } else {
             let linereader1 = LineReader::new(&content1);
             let ends_with_newline1 = linereader1.ends_with_newline();
@@ -122,10 +171,20 @@ impl<'a> FileDiff<'a> {
             // When -b is set, hashes are computed using normalized whitespace for comparison
             // but original lines are stored for output
             let normalize_ws = format_options.ignore_trailing_white_spaces;
-            let mut file1 =
-                FileData::new(path1, lines1, modified1, ends_with_newline1, normalize_ws);
-            let mut file2 =
-                FileData::new(path2, lines2, modified2, ends_with_newline2, normalize_ws);
+            let mut file1 = FileData::new(
+                src1.name,
+                lines1,
+                modified1,
+                ends_with_newline1,
+                normalize_ws,
+            );
+            let mut file2 = FileData::new(
+                src2.name,
+                lines2,
+                modified2,
+                ends_with_newline2,
+                normalize_ws,
+            );
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
@@ -191,8 +250,8 @@ impl<'a> FileDiff<'a> {
     }
 
     fn binary_file_diff(
-        file1_path: &Path,
-        file2_path: &Path,
+        name1: &str,
+        name2: &str,
         content1: &[u8],
         content2: &[u8],
     ) -> io::Result<DiffExitStatus> {
@@ -200,11 +259,7 @@ impl<'a> FileDiff<'a> {
             return Ok(DiffExitStatus::NotDifferent);
         }
 
-        println!(
-            "Binary files {} and {} differ",
-            file1_path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-            file2_path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-        );
+        println!("Binary files {} and {} differ", name1, name2);
         Ok(DiffExitStatus::Different)
     }
 
@@ -585,7 +640,7 @@ impl<'a> FileDiff<'a> {
         } else {
             format!(
                 "{}\t{}",
-                file.path(),
+                file.name(),
                 system_time_to_context_format(file.modified())
             )
         }
@@ -597,7 +652,7 @@ impl<'a> FileDiff<'a> {
         } else {
             format!(
                 "{}\t{}",
-                file.path(),
+                file.name(),
                 system_time_to_unified_format(file.modified())
             )
         }

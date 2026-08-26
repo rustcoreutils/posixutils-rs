@@ -15,22 +15,21 @@ pub struct FormatOptions {
 }
 
 impl FormatOptions {
-    pub fn try_new(
+    /// Infallible: the labels are validated where they are parsed, so a bad
+    /// combination is a usage error with a diagnostic rather than something
+    /// every caller has to unwrap.
+    pub fn new(
         ignore_trailing_white_spaces: bool,
         output_format: OutputFormat,
         label1: Option<String>,
         label2: Option<String>,
-    ) -> Result<Self, &'static str> {
-        if label1.is_none() && label2.is_some() {
-            return Err("label1 can not be NONE when label2 is available");
-        }
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             ignore_trailing_white_spaces,
             output_format,
             label1,
             label2,
-        })
+        }
     }
 
     pub fn label1(&self) -> &Option<String> {

@@ -178,7 +178,7 @@ impl Hunk {
         if is_last && !file1.ends_with_newline() {
             eprintln!(
                 "diff: {}:{}\n",
-                file1.path(),
+                file1.name(),
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }
@@ -186,7 +186,7 @@ impl Hunk {
         if is_last && !file2.ends_with_newline() {
             eprintln!(
                 "diff: {}:{}\n",
-                file2.path(),
+                file2.name(),
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }
@@ -228,7 +228,7 @@ impl Hunk {
         if is_last && !file1.ends_with_newline() {
             eprintln!(
                 "diff: {}:{}\n",
-                file1.path(),
+                file1.name(),
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }
@@ -236,7 +236,7 @@ impl Hunk {
         if is_last && !file2.ends_with_newline() {
             eprintln!(
                 "diff: {}:{}\n",
-                file2.path(),
+                file2.name(),
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }

@@ -14,21 +14,17 @@
 
 mod diff_util;
 
-use std::{
-    fs::{self, File},
-    io::{self, Read, Write},
-    path::PathBuf,
-};
+use std::{fs, io, path::PathBuf};
 
 use clap::Parser;
 use diff_util::{
     common::{FormatOptions, OutputFormat},
     diff_exit_status::DiffExitStatus,
     dir_diff::DirDiff,
-    file_diff::FileDiff,
+    file_diff::{FileDiff, Source},
     functions::check_existance,
 };
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 
 /// diff - compare two files
 #[derive(Parser, Clone)]
@@ -61,8 +57,8 @@ struct Args {
     #[arg(help = gettext("First comparison file (or directory, if -r is specified)"))]
     file1: String,
 
-    #[arg(long, value_parser= clap::value_parser!(String), help = gettext("Label for first file"))]
-    label: Option<String>,
+    #[arg(short = 'L', long = "label", action = clap::ArgAction::Append, help = gettext("Use <LABEL> instead of the file name in the header; may be given twice"))]
+    label: Vec<String>,
 
     #[arg(long, value_parser= clap::value_parser!(String), help = gettext("Label for second file"))]
     label2: Option<String>,
@@ -71,43 +67,53 @@ struct Args {
     file2: String,
 }
 
-impl From<&Args> for OutputFormat {
-    fn from(args: &Args) -> Self {
-        let mut args = args.clone();
+impl Args {
+    /// The output style, or `None` if the options named more than one.
+    ///
+    /// Resolving a conflict by precedence silently ignores an option the user
+    /// asked for -- `diff -u -e` and `diff -e -u` both produced an ed script --
+    /// so refuse instead, as GNU diff does.
+    fn output_format(&self) -> Option<OutputFormat> {
+        let context = self.context.or(if self.context3 { Some(3) } else { None });
+        let unified = self.unified.or(if self.unified3 { Some(3) } else { None });
 
-        if args.context3 {
-            args.context = Some(3);
-        }
+        let mut chosen = None;
+        let mut set = |format| match chosen {
+            None => {
+                chosen = Some(format);
+                true
+            }
+            Some(_) => false,
+        };
 
-        if args.unified3 {
-            args.unified = Some(3);
-        }
+        let ok = (!self.ed || set(OutputFormat::EditScript))
+            && (!self.fed || set(OutputFormat::ForwardEditScript))
+            && context.is_none_or(|n| set(OutputFormat::Context(n as usize)))
+            && unified.is_none_or(|n| set(OutputFormat::Unified(n as usize)));
 
-        if args.ed {
-            OutputFormat::EditScript
-        } else if args.fed {
-            OutputFormat::ForwardEditScript
-        } else if let Some(n) = args.context {
-            OutputFormat::Context(n as usize)
-        } else if let Some(n) = args.unified {
-            OutputFormat::Unified(n as usize)
-        } else {
-            OutputFormat::Default
-        }
+        ok.then(|| chosen.unwrap_or(OutputFormat::Default))
     }
-}
 
-/// Read stdin and write to a temporary file, returning the path
-fn read_stdin_to_temp() -> io::Result<PathBuf> {
-    let mut stdin_content = Vec::new();
-    io::stdin().read_to_end(&mut stdin_content)?;
-
-    // Create a temporary file
-    let temp_path = std::env::temp_dir().join(format!("diff_stdin_{}", std::process::id()));
-    let mut temp_file = File::create(&temp_path)?;
-    temp_file.write_all(&stdin_content)?;
-
-    Ok(temp_path)
+    /// The two header labels, in file order.
+    ///
+    /// `-L` may be given twice, as in GNU diff; `--label2` is our own spelling
+    /// of the second one.
+    fn labels(&self) -> Result<(Option<String>, Option<String>), &'static str> {
+        let mut labels = self.label.clone();
+        if let Some(second) = &self.label2 {
+            // --label2 is our own spelling of the second label, so it only
+            // makes sense once the first one has been named.
+            if labels.is_empty() {
+                return Err("--label2 needs --label");
+            }
+            labels.push(second.clone());
+        }
+        if labels.len() > 2 {
+            return Err("too many file label options");
+        }
+        let mut it = labels.into_iter();
+        Ok((it.next(), it.next()))
+    }
 }
 
 fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
@@ -120,27 +126,47 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         return Ok(DiffExitStatus::Trouble);
     }
 
-    // Handle stdin by reading to temp file
-    let (path1, temp_path1) = if is_stdin1 {
-        let temp = read_stdin_to_temp()?;
-        (temp.clone(), Some(temp))
-    } else {
-        (PathBuf::from(&args.file1), None)
+    let Some(output_format) = args.output_format() else {
+        eprintln!("diff: conflicting output style options");
+        return Ok(DiffExitStatus::Trouble);
     };
 
-    let (path2, temp_path2) = if is_stdin2 {
-        let temp = read_stdin_to_temp()?;
-        (temp.clone(), Some(temp))
-    } else {
-        (PathBuf::from(&args.file2), None)
+    let (label1, label2) = match args.labels() {
+        Ok(labels) => labels,
+        Err(message) => {
+            eprintln!("diff: {}", message);
+            return Ok(DiffExitStatus::Trouble);
+        }
     };
 
-    // Check existence (skip for stdin which is now a temp file)
+    let format_options = FormatOptions::new(args.ignore_eol_space, output_format, label1, label2);
+
+    let path1 = PathBuf::from(&args.file1);
+    let path2 = PathBuf::from(&args.file2);
+
     if !is_stdin1 && !check_existance(&path1)? {
         return Ok(DiffExitStatus::Trouble);
     }
     if !is_stdin2 && !check_existance(&path2)? {
         return Ok(DiffExitStatus::Trouble);
+    }
+
+    // Standard input is read into memory rather than spilled to a file. The
+    // spill file had a predictable name in a world-writable directory and was
+    // opened without O_EXCL, and it leaked on every early return below; none
+    // of that bought anything, since both operands are read whole regardless.
+    if is_stdin1 || is_stdin2 {
+        let src1 = if is_stdin1 {
+            Source::from_stdin()?
+        } else {
+            Source::from_path(path1)?
+        };
+        let src2 = if is_stdin2 {
+            Source::from_stdin()?
+        } else {
+            Source::from_path(path2)?
+        };
+        return FileDiff::diff_sources(src1, src2, &format_options, None);
     }
 
     // The same file named twice has no differences; that is a normal result,
@@ -149,42 +175,20 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         return Ok(DiffExitStatus::NotDifferent);
     }
 
-    let output_format: OutputFormat = (&args).into();
-
-    let format_options = FormatOptions::try_new(
-        args.ignore_eol_space,
-        output_format,
-        args.label,
-        args.label2,
-    );
-    let format_options = format_options.unwrap();
-
     let path1_is_file = fs::metadata(&path1)?.is_file();
     let path2_is_file = fs::metadata(&path2)?.is_file();
 
-    let result = if path1_is_file && path2_is_file {
+    if path1_is_file && path2_is_file {
         FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
         DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
     } else {
         FileDiff::file_dir_diff(path1, path2, &format_options)
-    };
-
-    // Clean up temp files
-    if let Some(temp) = temp_path1 {
-        let _ = fs::remove_file(temp);
     }
-    if let Some(temp) = temp_path2 {
-        let _ = fs::remove_file(temp);
-    }
-
-    result
 }
 
 fn main() -> DiffExitStatus {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs").unwrap();
-    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+    plib::diag::init_locale("diff");
 
     let args = Args::parse();
 

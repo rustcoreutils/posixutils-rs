@@ -13,6 +13,7 @@ use super::types::{
     ApplyResult, FilePatch, Hunk, HunkResult, LineOp, MatchWindow, PatchConfig, PatchError,
     Placement,
 };
+use gettextrs::gettext;
 
 /// How far to scan in each direction for a hunk's context.
 ///
@@ -64,7 +65,12 @@ impl<'a> PatchApplier<'a> {
             if self.decide_assume_reverse() {
                 patch.reverse();
             } else if !self.config.force {
-                return Err(PatchError::ReversedPatch);
+                // Skip this file rather than abandoning the run: a patch
+                // covering several files may have had only this one applied
+                // already, and the rest still need patching. The hunks go to
+                // the reject file, which POSIX makes exit status 1.
+                eprintln!("patch: {}", gettext("Skipping patch."));
+                return Ok(self.skip_all(patch));
             }
             // With -f and a "no" decision, fall through and apply forward
             // (which will reject), matching GNU's "apply anyway" path.
@@ -96,7 +102,15 @@ impl<'a> PatchApplier<'a> {
                 }
                 HunkResult::AlreadyApplied => {
                     if !self.config.ignore_applied {
-                        return Err(PatchError::ReversedPatch);
+                        // Not an error for the run as a whole: reject this hunk
+                        // and carry on, so the remaining hunks and files are
+                        // still attempted.
+                        rejected_hunks.push((
+                            hunk_num,
+                            hunk.clone(),
+                            String::from("reversed (or previously applied) patch"),
+                        ));
+                        continue;
                     }
                     eprintln!("Hunk #{} already applied", hunk_num);
                 }
@@ -125,6 +139,28 @@ impl<'a> PatchApplier<'a> {
             content: std::mem::take(&mut self.file_lines),
             no_trailing_newline,
         })
+    }
+
+    /// Reject every hunk without touching the file, for a patch the user
+    /// declined to apply.
+    fn skip_all(&mut self, patch: &FilePatch) -> ApplyResult {
+        let rejected_hunks = patch
+            .hunks
+            .iter()
+            .enumerate()
+            .map(|(i, hunk)| {
+                (
+                    i + 1,
+                    hunk.clone(),
+                    String::from("reversed (or previously applied) patch"),
+                )
+            })
+            .collect();
+        ApplyResult {
+            rejected_hunks,
+            content: std::mem::take(&mut self.file_lines),
+            no_trailing_newline: self.eof_no_newline,
+        }
     }
 
     /// Detect whether the patch appears reversed/already-applied: its first

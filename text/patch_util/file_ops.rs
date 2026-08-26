@@ -9,7 +9,7 @@
 
 //! File operations for the patch utility.
 
-use super::types::{DiffFormat, FilePatch, Hunk, LineOp, PatchConfig, PatchError};
+use super::types::{FilePatch, Hunk, LineOp, PatchConfig, PatchError};
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
@@ -63,12 +63,15 @@ pub fn determine_target_file(
     }
 
     // Filename Determination step 5: prompt the user on the controlling
-    // terminal for a filename. If no terminal is available or the response is
-    // empty, give up and skip the patch (as before).
-    if let Some(name) = prompt_for_filename() {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
+    // terminal for a filename. -f means "do not ask any questions", and if no
+    // terminal is available or the response is empty, give up and skip the
+    // patch.
+    if !config.force {
+        if let Some(name) = prompt_for_filename() {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed));
+            }
         }
     }
 
@@ -284,8 +287,8 @@ pub fn write_output(
 pub fn write_rejects(
     rejects: &[(usize, Hunk, String)],
     target: &Path,
-    format: DiffFormat,
     config: &PatchConfig,
+    written_rejects: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     if rejects.is_empty() {
         return Ok(());
@@ -297,13 +300,27 @@ pub fn write_rejects(
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}.rej", target.display())));
 
-    let file = File::create(&reject_path)?;
+    // POSIX: rejected hunks are *appended* to the reject file. With -r, or with
+    // two patch sections naming the same file, truncating per section would
+    // leave only the last one's rejects.
+    let file = if written_rejects.contains(&reject_path) {
+        OpenOptions::new().append(true).open(&reject_path)?
+    } else {
+        File::create(&reject_path)?
+    };
+    written_rejects.insert(reject_path);
+
     let mut writer = BufWriter::new(file);
+
+    // Name the file each group of rejects belongs to, so an aggregated reject
+    // file stays attributable.
+    writeln!(writer, "--- {}", target.display())?;
+    writeln!(writer, "+++ {}", target.display())?;
 
     // Write rejects in context diff format per POSIX
     // (even if input was unified, rejects should be in context format)
-    for (hunk_num, hunk, _reason) in rejects {
-        write_hunk_as_context(&mut writer, hunk, *hunk_num, format)?;
+    for (_hunk_num, hunk, _reason) in rejects {
+        write_hunk_as_context(&mut writer, hunk)?;
     }
     writer.flush()?;
 
@@ -311,12 +328,7 @@ pub fn write_rejects(
 }
 
 /// Write a hunk in context diff format.
-fn write_hunk_as_context<W: Write>(
-    writer: &mut W,
-    hunk: &Hunk,
-    _hunk_num: usize,
-    _format: DiffFormat,
-) -> io::Result<()> {
+fn write_hunk_as_context<W: Write>(writer: &mut W, hunk: &Hunk) -> io::Result<()> {
     // Write separator
     writeln!(writer, "***************")?;
 

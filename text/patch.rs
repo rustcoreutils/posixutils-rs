@@ -196,6 +196,9 @@ fn run(args: Args) -> Result<bool, PatchError> {
     // same file are concatenated rather than truncated.
     let mut backed_up: HashSet<PathBuf> = HashSet::new();
     let mut written_outputs: HashSet<PathBuf> = HashSet::new();
+    // Reject files already opened this run, so a second section's rejects are
+    // appended rather than truncating the first section's.
+    let mut written_rejects: HashSet<PathBuf> = HashSet::new();
 
     // Process each file patch
     for file_patch in &mut patch.file_patches {
@@ -209,7 +212,9 @@ fn run(args: Args) -> Result<bool, PatchError> {
             }
         };
 
-        // Read target file content (or empty for new files)
+        // Read target file content (or empty for new files). A read failure
+        // ends the run, as GNU patch does: it usually means the invocation is
+        // wrong rather than that this one file is special.
         let (lines, orig_trailing_newline) = if target.exists() {
             read_file_lines(&target)?
         } else if file_patch.is_new_file {
@@ -234,24 +239,40 @@ fn run(args: Args) -> Result<bool, PatchError> {
             && config.output_file.is_none()
             && result.rejected_hunks.is_empty()
         {
-            delete_target(&target, &config, &mut backed_up)?;
+            if let Err(e) = delete_target(&target, &config, &mut backed_up) {
+                eprintln!("patch: {}: {}", target.display(), e);
+                exit_code = 2;
+            }
             continue;
         }
 
-        // Write output
-        write_output(
+        // A write failure is reported against the file it happened to, and the
+        // remaining file patches are still attempted.
+        if let Err(e) = write_output(
             &result.content,
             &target,
             &config,
             result.no_trailing_newline,
             &mut backed_up,
             &mut written_outputs,
-        )?;
+        ) {
+            eprintln!("patch: {}: {}", target.display(), e);
+            exit_code = 2;
+            continue;
+        }
 
         // Handle rejects
         if !result.rejected_hunks.is_empty() {
             had_rejects = true;
-            write_rejects(&result.rejected_hunks, &target, file_patch.format, &config)?;
+            if let Err(e) = write_rejects(
+                &result.rejected_hunks,
+                &target,
+                &config,
+                &mut written_rejects,
+            ) {
+                eprintln!("patch: {}: {}", target.display(), e);
+                exit_code = 2;
+            }
             for (num, _, reason) in &result.rejected_hunks {
                 eprintln!("patch: Hunk #{} FAILED -- {}", num, reason);
             }

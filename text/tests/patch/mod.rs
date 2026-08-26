@@ -2280,3 +2280,115 @@ fn test_patch_mixed_line_endings_preserved() {
 
     cleanup_test_dir(&test_dir);
 }
+
+// A patch covering several files may already be applied to one of them. That
+// file is skipped, but the rest must still be patched, and the run reports the
+// reject rather than an error.
+#[test]
+fn test_patch_reversed_file_skips_not_aborts() {
+    let test_dir = setup_test_dir("reversed_continue");
+
+    let a = test_dir.join("A.txt");
+    let b = test_dir.join("B.txt");
+    fs::write(&a, "new\n").unwrap(); // already applied
+    fs::write(&b, "bold\n").unwrap();
+
+    let patch_file = test_dir.join("two.patch");
+    fs::write(
+        &patch_file,
+        "--- A.txt\n+++ A.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n\
+         --- B.txt\n+++ B.txt\n@@ -1,1 +1,1 @@\n-bold\n+bnew\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-d"),
+        test_dir.to_str().unwrap().to_string(),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1, "rejects give exit 1, not an error");
+
+    assert_eq!(fs::read_to_string(&a).unwrap(), "new\n", "A is left alone");
+    assert_eq!(
+        fs::read_to_string(&b).unwrap(),
+        "bnew\n",
+        "B must still be patched"
+    );
+    assert!(test_dir.join("A.txt.rej").exists());
+
+    cleanup_test_dir(&test_dir);
+}
+
+// POSIX: rejected hunks are appended to the reject file. With -r naming one
+// file for the whole run, each section's rejects must survive.
+#[test]
+fn test_patch_reject_file_accumulates() {
+    let test_dir = setup_test_dir("reject_accum");
+
+    fs::write(test_dir.join("r1.txt"), "zzz\n").unwrap();
+    fs::write(test_dir.join("r2.txt"), "zzz\n").unwrap();
+
+    let patch_file = test_dir.join("two.patch");
+    fs::write(
+        &patch_file,
+        "--- r1.txt\n+++ r1.txt\n@@ -1,1 +1,1 @@\n-nomatch1\n+x1\n\
+         --- r2.txt\n+++ r2.txt\n@@ -1,1 +1,1 @@\n-nomatch2\n+x2\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-d"),
+        test_dir.to_str().unwrap().to_string(),
+        String::from("-r"),
+        String::from("all.rej"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 1);
+
+    let rej = fs::read_to_string(test_dir.join("all.rej")).unwrap();
+    assert!(
+        rej.contains("nomatch1"),
+        "first file's rejects were truncated away:\n{}",
+        rej
+    );
+    assert!(rej.contains("nomatch2"), "second file's rejects missing");
+    assert!(
+        rej.contains("r1.txt") && rej.contains("r2.txt"),
+        "each group of rejects should name its file:\n{}",
+        rej
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// -f means "do not ask any questions", so an unresolvable target must fail
+// rather than prompt on the controlling terminal.
+#[test]
+fn test_patch_force_does_not_prompt() {
+    let test_dir = setup_test_dir("force_no_prompt");
+
+    let patch_file = test_dir.join("missing.patch");
+    fs::write(
+        &patch_file,
+        "--- nosuch_abc.txt\n+++ nosuch_abc.txt\n@@ -1,1 +1,1 @@\n-a\n+A\n",
+    )
+    .unwrap();
+
+    let (code, err) = run_patch_capture(vec![
+        String::from("-d"),
+        test_dir.to_str().unwrap().to_string(),
+        String::from("-f"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("could not determine target file"),
+        "got: {}",
+        err
+    );
+
+    cleanup_test_dir(&test_dir);
+}

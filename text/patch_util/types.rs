@@ -385,9 +385,6 @@ pub enum PatchError {
     #[error("could not determine target file for patch")]
     NoTargetFile,
 
-    #[error("reversed (or previously applied) patch detected")]
-    ReversedPatch,
-
     #[error("{0}")]
     Other(String),
 }

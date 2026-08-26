@@ -7,9 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::io::{self, Write};
+
 use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
-use super::file_data::FileData;
+use super::{file_data::FileData, functions::write_line};
 
 #[derive(Clone, Default)]
 pub enum Change {
@@ -85,76 +87,88 @@ impl Hunk {
     /// True when this hunk's file1 span ends at file1's final line and that
     /// line has no trailing newline (so the marker belongs to this hunk).
     fn file1_lacks_final_newline(&self, file1: &FileData) -> bool {
-        self.ln1_end == file1.lines().len() && !file1.ends_with_newline()
+        self.ln1_end == file1.line_count() && !file1.ends_with_newline()
     }
 
     /// True when this hunk's file2 span ends at file2's final line and that
     /// line has no trailing newline (so the marker belongs to this hunk).
     fn file2_lacks_final_newline(&self, file2: &FileData) -> bool {
-        self.ln2_end == file2.lines().len() && !file2.ends_with_newline()
+        self.ln2_end == file2.line_count() && !file2.ends_with_newline()
     }
 
-    pub fn print_default(&mut self, file1: &FileData, file2: &FileData) {
+    pub fn print_default(
+        &mut self,
+        out: &mut impl Write,
+        file1: &FileData,
+        file2: &FileData,
+    ) -> io::Result<()> {
         match self.kind {
             Change::None => {}
             Change::Insert => {
-                println!("{}a{}", self.ln1_start, self.f2_range(","));
+                writeln!(out, "{}a{}", self.ln1_start, self.f2_range(","))?;
 
                 for i in self.ln2_start..self.ln2_end {
-                    println!("> {}", file2.line(i));
+                    write_line(out, b"> ", file2.line(i))?;
                 }
 
                 if self.file2_lacks_final_newline(file2) {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+                    writeln!(out, "{}", NO_NEW_LINE_AT_END_OF_FILE)?;
                 }
             }
             Change::Delete => {
-                println!("{}d{}", self.f1_range(","), self.ln2_end);
+                writeln!(out, "{}d{}", self.f1_range(","), self.ln2_end)?;
 
                 for i in self.ln1_start..self.ln1_end {
-                    println!("< {}", file1.line(i));
+                    write_line(out, b"< ", file1.line(i))?;
                 }
 
                 if self.file1_lacks_final_newline(file1) {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+                    writeln!(out, "{}", NO_NEW_LINE_AT_END_OF_FILE)?;
                 }
             }
             Change::Substitute => {
-                println!("{}c{}", self.f1_range(","), self.f2_range(","));
+                writeln!(out, "{}c{}", self.f1_range(","), self.f2_range(","))?;
 
                 for i in self.ln1_start..self.ln1_end {
-                    println!("< {}", file1.line(i));
+                    write_line(out, b"< ", file1.line(i))?;
                 }
 
                 if self.file1_lacks_final_newline(file1) {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+                    writeln!(out, "{}", NO_NEW_LINE_AT_END_OF_FILE)?;
                 }
 
-                println!("---");
+                writeln!(out, "---")?;
                 for i in self.ln2_start..self.ln2_end {
-                    println!("> {}", file2.line(i));
+                    write_line(out, b"> ", file2.line(i))?;
                 }
 
                 if self.file2_lacks_final_newline(file2) {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+                    writeln!(out, "{}", NO_NEW_LINE_AT_END_OF_FILE)?;
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn print_edit_script(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {
+    pub fn print_edit_script(
+        &mut self,
+        out: &mut impl Write,
+        file1: &FileData,
+        file2: &FileData,
+        is_last: bool,
+    ) -> io::Result<()> {
         match &self.kind {
             Change::None => {}
             Change::Insert => {
-                println!("{}a", self.ln1_end);
-                print_ed_block_lines(file2, self.ln2_start..self.ln2_end, self.ln1_end + 1);
+                writeln!(out, "{}a", self.ln1_end)?;
+                print_ed_block_lines(out, file2, self.ln2_start..self.ln2_end, self.ln1_end + 1)?;
             }
             Change::Delete => {
-                println!("{}d", self.f1_range(","));
+                writeln!(out, "{}d", self.f1_range(","))?;
             }
             Change::Substitute => {
-                println!("{}c", self.f1_range(","));
-                print_ed_block_lines(file2, self.ln2_start..self.ln2_end, self.ln1_start + 1);
+                writeln!(out, "{}c", self.f1_range(","))?;
+                print_ed_block_lines(out, file2, self.ln2_start..self.ln2_end, self.ln1_start + 1)?;
             }
         }
 
@@ -176,29 +190,37 @@ impl Hunk {
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }
+
+        Ok(())
     }
 
     /// Print forward edit script format (-f flag)
     /// POSIX: command letter comes BEFORE line number (e.g., "c2" not "2c")
-    pub fn print_forward_edit_script(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {
+    pub fn print_forward_edit_script(
+        &mut self,
+        out: &mut impl Write,
+        file1: &FileData,
+        file2: &FileData,
+        is_last: bool,
+    ) -> io::Result<()> {
         match &self.kind {
             Change::None => {}
             Change::Insert => {
-                println!("a{}", self.ln1_end);
+                writeln!(out, "a{}", self.ln1_end)?;
                 for i in self.ln2_start..self.ln2_end {
-                    println!("{}", file2.line(i));
+                    write_line(out, b"", file2.line(i))?;
                 }
-                println!(".")
+                writeln!(out, ".")?;
             }
             Change::Delete => {
-                println!("d{}", self.f1_range(" "));
+                writeln!(out, "d{}", self.f1_range(" "))?;
             }
             Change::Substitute => {
-                println!("c{}", self.f1_range(" "));
+                writeln!(out, "c{}", self.f1_range(" "))?;
                 for i in self.ln2_start..self.ln2_end {
-                    println!("{}", file2.line(i));
+                    write_line(out, b"", file2.line(i))?;
                 }
-                println!(".")
+                writeln!(out, ".")?;
             }
         }
 
@@ -218,6 +240,8 @@ impl Hunk {
                 &NO_NEW_LINE_AT_END_OF_FILE[1..]
             );
         }
+
+        Ok(())
     }
 }
 
@@ -246,10 +270,6 @@ impl Hunks {
 
     pub fn hunks_mut(&mut self) -> &mut Vec<Hunk> {
         &mut self.hunks
-    }
-
-    pub fn hunk_at_mut(&mut self, index: usize) -> &mut Hunk {
-        &mut self.hunks[index]
     }
 
     pub fn hunk_count(&self) -> usize {
@@ -410,20 +430,26 @@ impl Hunks {
 /// the rest of the block. It is written as `..` and repaired afterwards by a
 /// substitute command addressed at the resulting line, which is what GNU diff
 /// emits. `first_line` is the line number the first written line will occupy.
-fn print_ed_block_lines(file2: &FileData, range: std::ops::Range<usize>, first_line: usize) {
+fn print_ed_block_lines(
+    out: &mut impl Write,
+    file2: &FileData,
+    range: std::ops::Range<usize>,
+    first_line: usize,
+) -> io::Result<()> {
     let mut escaped = Vec::new();
     for (offset, i) in range.enumerate() {
         let line = file2.line(i);
-        if line == "." {
-            println!("..");
+        if line == b"." {
+            writeln!(out, "..")?;
             escaped.push(first_line + offset);
         } else {
-            println!("{}", line);
+            write_line(out, b"", line)?;
         }
     }
-    println!(".");
+    writeln!(out, ".")?;
     // Repair in descending order so earlier addresses stay valid.
     for line_no in escaped.into_iter().rev() {
-        println!("{line_no}s/^\\.\\.$/./");
+        writeln!(out, "{line_no}s/^\\.\\.$/./")?;
     }
+    Ok(())
 }

@@ -14,6 +14,7 @@ use super::{
     file_data::{FileData, LineReader},
     functions::{
         check_existance, is_binary, system_time_to_context_format, system_time_to_unified_format,
+        write_line,
     },
     hunks::{Hunk, Hunks},
 };
@@ -23,11 +24,23 @@ use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    fs::{read_to_string, File},
-    io::{self, BufReader, BufWriter, Read, Write},
-    os::unix::fs::MetadataExt,
-    path::PathBuf,
+    fs::File,
+    io::{self, BufWriter, Read, Write},
+    path::{Path, PathBuf},
+    time::SystemTime,
 };
+
+/// Read a whole file, returning its bytes and its modification time from a
+/// single `open`. Each operand used to be opened three times -- once to sniff
+/// for binary content, once for the contents, once for the timestamp -- which
+/// could observe three different files.
+fn read_file(path: &Path) -> io::Result<(Vec<u8>, SystemTime)> {
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let mut data = Vec::with_capacity(metadata.len() as usize + 1);
+    file.read_to_end(&mut data)?;
+    Ok((data, metadata.modified()?))
+}
 
 /// Format a context-format (`-c`/`-C`) line range starting at 1-indexed
 /// `start` and spanning `len` lines. A single line prints as one number, an
@@ -91,32 +104,35 @@ impl<'a> FileDiff<'a> {
         format_options: &FormatOptions,
         show_if_different: Option<String>,
     ) -> io::Result<DiffExitStatus> {
-        if is_binary(&path1)? || is_binary(&path2)? {
-            Self::binary_file_diff(&path1, &path2)
+        let (content1, modified1) = read_file(&path1)?;
+        let (content2, modified2) = read_file(&path2)?;
+
+        if is_binary(&content1) || is_binary(&content2) {
+            Self::binary_file_diff(&path1, &path2, &content1, &content2)
         } else {
-            let content1 = read_to_string(&path1)?.into_bytes();
             let linereader1 = LineReader::new(&content1);
             let ends_with_newline1 = linereader1.ends_with_newline();
-            let lines1: Vec<&str> = linereader1.collect();
+            let lines1: Vec<&[u8]> = linereader1.collect();
 
-            let content2 = read_to_string(&path2)?.into_bytes();
             let linereader2 = LineReader::new(&content2);
             let ends_with_newline2 = linereader2.ends_with_newline();
-            let lines2: Vec<&str> = linereader2.collect();
+            let lines2: Vec<&[u8]> = linereader2.collect();
 
             // Pass whitespace normalization flag to FileData
             // When -b is set, hashes are computed using normalized whitespace for comparison
             // but original lines are stored for output
             let normalize_ws = format_options.ignore_trailing_white_spaces;
-            let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1, normalize_ws)?;
-            let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2, normalize_ws)?;
+            let mut file1 =
+                FileData::new(path1, lines1, modified1, ends_with_newline1, normalize_ws);
+            let mut file2 =
+                FileData::new(path2, lines2, modified2, ends_with_newline2, normalize_ws);
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
             // histogram diff
-            let mut lcs_indices: Vec<i32> = vec![-1; diff.file1.lines().len()];
-            let num_lines1 = diff.file1.lines().len();
-            let num_lines2 = diff.file2.lines().len();
+            let num_lines1 = diff.file1.line_count();
+            let num_lines2 = diff.file2.line_count();
+            let mut lcs_indices: Vec<i32> = vec![-1; num_lines1];
             FileDiff::histogram_lcs(
                 diff.file1,
                 diff.file2,
@@ -174,75 +190,68 @@ impl<'a> FileDiff<'a> {
         }
     }
 
-    fn binary_file_diff(file1_path: &PathBuf, file2_path: &PathBuf) -> io::Result<DiffExitStatus> {
-        let differ_report = format!(
+    fn binary_file_diff(
+        file1_path: &Path,
+        file2_path: &Path,
+        content1: &[u8],
+        content2: &[u8],
+    ) -> io::Result<DiffExitStatus> {
+        if content1 == content2 {
+            return Ok(DiffExitStatus::NotDifferent);
+        }
+
+        println!(
             "Binary files {} and {} differ",
             file1_path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
             file2_path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
         );
-
-        let file1 = File::open(file1_path)?;
-        let file2 = File::open(file2_path)?;
-
-        if file1.metadata()?.size() != file2.metadata()?.size() {
-            println!("{}", differ_report);
-            return Ok(DiffExitStatus::Different);
-        }
-
-        let file1 = BufReader::new(file1);
-        let file2 = BufReader::new(file2);
-
-        for bytes_pair in file1.bytes().zip(file2.bytes()) {
-            let (b1, b2) = (bytes_pair.0?, bytes_pair.1?);
-            if b1 != b2 {
-                println!("{}", differ_report);
-                return Ok(DiffExitStatus::Different);
-            }
-        }
-
-        Ok(DiffExitStatus::NotDifferent)
+        Ok(DiffExitStatus::Different)
     }
 
     fn print(&mut self) -> io::Result<DiffExitStatus> {
         self.order_hunks_by_output_format();
 
+        // One writer for every format: line data is bytes and has to reach
+        // stdout through write_all, and buffering it turns a write per line
+        // into a write per block.
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+
         if let OutputFormat::Context(context) = self.format_options.output_format {
             // Identical files produce no output (not even the file headers).
             if self.are_different {
-                self.print_context(context)?;
+                self.print_context(&mut out, context)?;
             }
         } else if let OutputFormat::Unified(unified) = self.format_options.output_format {
             if self.are_different {
-                self.print_unified(unified)?;
+                self.print_unified(&mut out, unified)?;
             }
         } else {
             let hunks_count = self.hunks.hunks().len();
 
             for hunk_index in 0..hunks_count {
-                let hunk = self.hunks.hunk_at_mut(hunk_index);
-                match self.format_options.output_format {
-                    OutputFormat::Default => hunk.print_default(self.file1, self.file2),
-                    OutputFormat::EditScript => hunk.print_edit_script(
-                        self.file1,
-                        self.file2,
-                        hunk_index == hunks_count - 1,
-                    ),
-                    OutputFormat::Context(_) => {
-                        eprintln!("OutputFormat::Context should be handled in other place");
-                        return Ok(DiffExitStatus::Trouble);
+                let is_last = hunk_index == hunks_count - 1;
+                let format = &self.format_options.output_format;
+                let hunk = &mut self.hunks.hunks_mut()[hunk_index];
+                match format {
+                    OutputFormat::Default => {
+                        hunk.print_default(&mut out, self.file1, self.file2)?
                     }
-                    OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
-                        self.file1,
-                        self.file2,
-                        hunk_index == hunks_count - 1,
-                    ),
-                    OutputFormat::Unified(_) => {
-                        eprintln!("OutputFormat::Unified should be handled in other place");
+                    OutputFormat::EditScript => {
+                        hunk.print_edit_script(&mut out, self.file1, self.file2, is_last)?
+                    }
+                    OutputFormat::ForwardEditScript => {
+                        hunk.print_forward_edit_script(&mut out, self.file1, self.file2, is_last)?
+                    }
+                    OutputFormat::Context(_) | OutputFormat::Unified(_) => {
+                        eprintln!("context and unified output are handled above");
                         return Ok(DiffExitStatus::Trouble);
                     }
                 }
             }
         }
+
+        out.flush()?;
 
         if self.are_different {
             // An edit script cannot faithfully represent a file whose final
@@ -430,11 +439,11 @@ impl<'a> FileDiff<'a> {
         file: &FileData,
         start: usize,
         end: usize,
-        prefix: &str,
+        prefix: &[u8],
     ) -> io::Result<()> {
-        let total = file.lines().len();
+        let total = file.line_count();
         for i in start..end {
-            writeln!(out, "{prefix}{}", file.line(i))?;
+            write_line(out, prefix, file.line(i))?;
             if i + 1 == total && !file.ends_with_newline() {
                 writeln!(out, "{}", NO_NEW_LINE_AT_END_OF_FILE)?;
             }
@@ -461,23 +470,20 @@ impl<'a> FileDiff<'a> {
                 (hunk.ln2_start(), hunk.ln2_end())
             };
             let prefix = if hunk.ln1_end() > hunk.ln1_start() && hunk.ln2_end() > hunk.ln2_start() {
-                "! "
+                b"! "
             } else if is_file1 {
-                "- "
+                b"- "
             } else {
-                "+ "
+                b"+ "
             };
-            Self::write_lines(out, file, pos, h_start, "  ")?;
+            Self::write_lines(out, file, pos, h_start, b"  ")?;
             Self::write_lines(out, file, h_start, h_end, prefix)?;
             pos = h_end;
         }
-        Self::write_lines(out, file, pos, end, "  ")
+        Self::write_lines(out, file, pos, end, b"  ")
     }
 
-    fn print_context(&mut self, context: usize) -> io::Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-
+    fn print_context(&mut self, out: &mut impl Write, context: usize) -> io::Result<()> {
         writeln!(
             out,
             "*** {}",
@@ -489,8 +495,8 @@ impl<'a> FileDiff<'a> {
             Self::get_context_header(self.file2, self.format_options.label2())
         )?;
 
-        let num1 = self.file1.lines().len();
-        let num2 = self.file2.lines().len();
+        let num1 = self.file1.line_count();
+        let num2 = self.file2.line_count();
         let hunks = self.hunks.hunks();
 
         for section in self.hunks.sections(context, num1, num2) {
@@ -507,7 +513,7 @@ impl<'a> FileDiff<'a> {
             )?;
             if group.iter().any(|h| h.ln1_end() > h.ln1_start()) {
                 Self::write_context_pane(
-                    &mut out,
+                    out,
                     self.file1,
                     group,
                     section.start1,
@@ -522,7 +528,7 @@ impl<'a> FileDiff<'a> {
             )?;
             if group.iter().any(|h| h.ln2_end() > h.ln2_start()) {
                 Self::write_context_pane(
-                    &mut out,
+                    out,
                     self.file2,
                     group,
                     section.start2,
@@ -532,13 +538,10 @@ impl<'a> FileDiff<'a> {
             }
         }
 
-        out.flush()
+        Ok(())
     }
 
-    fn print_unified(&mut self, context: usize) -> io::Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-
+    fn print_unified(&mut self, out: &mut impl Write, context: usize) -> io::Result<()> {
         writeln!(
             out,
             "--- {}",
@@ -550,8 +553,8 @@ impl<'a> FileDiff<'a> {
             Self::get_unified_header(self.file2, self.format_options.label2())
         )?;
 
-        let num1 = self.file1.lines().len();
-        let num2 = self.file2.lines().len();
+        let num1 = self.file1.line_count();
+        let num2 = self.file2.line_count();
         let hunks = self.hunks.hunks();
 
         for section in self.hunks.sections(context, num1, num2) {
@@ -565,15 +568,15 @@ impl<'a> FileDiff<'a> {
             // to both, so either would do.
             let mut pos1 = section.start1;
             for hunk in &hunks[section.first..=section.last] {
-                Self::write_lines(&mut out, self.file1, pos1, hunk.ln1_start(), " ")?;
-                Self::write_lines(&mut out, self.file1, hunk.ln1_start(), hunk.ln1_end(), "-")?;
-                Self::write_lines(&mut out, self.file2, hunk.ln2_start(), hunk.ln2_end(), "+")?;
+                Self::write_lines(out, self.file1, pos1, hunk.ln1_start(), b" ")?;
+                Self::write_lines(out, self.file1, hunk.ln1_start(), hunk.ln1_end(), b"-")?;
+                Self::write_lines(out, self.file2, hunk.ln2_start(), hunk.ln2_end(), b"+")?;
                 pos1 = hunk.ln1_end();
             }
-            Self::write_lines(&mut out, self.file1, pos1, section.end1, " ")?;
+            Self::write_lines(out, self.file1, pos1, section.end1, b" ")?;
         }
 
-        out.flush()
+        Ok(())
     }
 
     pub fn get_context_header(file: &FileData, label: &Option<String>) -> String {

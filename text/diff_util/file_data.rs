@@ -8,44 +8,59 @@
 //
 
 use std::{
-    collections::hash_map::DefaultHasher,
-    fs::File,
-    hash::{Hash, Hasher},
-    io,
-    mem::take,
-    path::PathBuf,
-    str::from_utf8,
-    time::SystemTime,
+    collections::hash_map::DefaultHasher, hash::Hasher, mem::take, path::PathBuf, time::SystemTime,
 };
 
 use super::constants::COULD_NOT_UNWRAP_FILENAME;
 
-/// Normalize whitespace for -b comparison:
-/// - Collapse runs of whitespace to single space
-/// - Trim trailing whitespace
-fn normalize_whitespace(line: &str) -> String {
-    let mut result = String::with_capacity(line.len());
-    let mut prev_was_space = false;
-    for c in line.chars() {
-        if c.is_whitespace() {
-            if !prev_was_space {
-                result.push(' ');
-                prev_was_space = true;
-            }
-        } else {
-            result.push(c);
-            prev_was_space = false;
-        }
-    }
-    // Trim trailing whitespace
-    result.truncate(result.trim_end().len());
-    result
+/// The bytes `-b` treats as white space.
+///
+/// POSIX describes `-b` in terms of "white space", not `<blank>`, and GNU diff
+/// tests `isspace()`, so this is the C locale's set minus `<newline>`, which
+/// cannot occur inside a line. Keeping `\r` here is what makes `-b` the way to
+/// compare a CRLF file with an LF one now that the default comparison reports
+/// that difference.
+fn is_blank(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | 0x0b | 0x0c)
 }
 
+/// The `-b` normal form of a line, yielded byte by byte so nothing is
+/// allocated: every run of white space becomes a single space, and a run that
+/// reaches the end of the line is dropped instead.
+struct Normalized<'a> {
+    rest: &'a [u8],
+}
+
+impl Iterator for Normalized<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        let &b = self.rest.first()?;
+        if !is_blank(b) {
+            self.rest = &self.rest[1..];
+            return Some(b);
+        }
+        let run = self.rest.iter().take_while(|&&c| is_blank(c)).count();
+        self.rest = &self.rest[run..];
+        // Trailing white space is ignored outright, so the normal form ends
+        // here rather than with a space.
+        (!self.rest.is_empty()).then_some(b' ')
+    }
+}
+
+fn normalized(line: &[u8]) -> Normalized<'_> {
+    Normalized { rest: line }
+}
+
+/// A file, split into lines that borrow from the buffer it was read into.
+///
+/// Lines are bytes, not `str`: the input files "may be of any type" (POSIX
+/// INPUT FILES), and a patch generated from a Latin-1 or Shift-JIS file has to
+/// carry that file's bytes to be applicable to it.
 #[derive(Debug)]
 pub struct FileData<'a> {
     path: PathBuf,
-    lines: Vec<&'a str>,
+    lines: Vec<&'a [u8]>,
     hashes: Vec<u64>, // Pre-computed line hashes for O(1) comparison
     modified: SystemTime,
     ends_with_newline: bool,
@@ -57,57 +72,76 @@ impl<'a> FileData<'a> {
         self.ends_with_newline
     }
 
-    pub fn get_file(
+    /// Build the per-line view of a file already read into memory.
+    ///
+    /// Takes `modified` rather than looking it up, so the timestamp in a
+    /// `-c`/`-u` header comes from the same open file the bytes did.
+    pub fn new(
         path: PathBuf,
-        lines: Vec<&'a str>,
+        lines: Vec<&'a [u8]>,
+        modified: SystemTime,
         ends_with_newline: bool,
         normalize_ws: bool,
-    ) -> io::Result<Self> {
-        let file = File::open(&path)?;
-        let modified = file.metadata()?.modified()?;
-
-        // Pre-compute hashes for O(1) line comparison
-        // If normalize_ws is set (-b flag), hash normalized lines for comparison
-        // but store original lines for output
+    ) -> Self {
+        let line_count = lines.len();
+        // Pre-compute hashes for O(1) line comparison. Under -b the hash is
+        // taken over the normalized line so that lines differing only in
+        // whitespace land in the same bucket; the original bytes are kept for
+        // output either way.
         let hashes: Vec<u64> = lines
             .iter()
-            .map(|line| {
+            .enumerate()
+            .map(|(index, line)| {
                 let mut hasher = DefaultHasher::new();
                 if normalize_ws {
-                    normalize_whitespace(line).hash(&mut hasher);
+                    for b in normalized(line) {
+                        hasher.write_u8(b);
+                    }
                 } else {
-                    line.hash(&mut hasher);
+                    hasher.write(line);
+                    // Whether the line is newline-terminated is part of what it
+                    // is, so it has to be part of the hash: "b\n" and a final
+                    // "b" with no newline are different lines. -b ignores the
+                    // distinction, as GNU does, because it treats trailing
+                    // white space -- including the newline -- as insignificant.
+                    let terminated = ends_with_newline || index + 1 != line_count;
+                    hasher.write_u8(terminated as u8);
                 }
                 hasher.finish()
             })
             .collect();
 
-        Ok(Self {
+        Self {
             path,
             lines,
             hashes,
             modified,
             ends_with_newline,
             normalize_ws,
-        })
-    }
-
-    /// Compare lines with normalization if enabled
-    pub fn lines_equal(&self, my_index: usize, other: &FileData, other_index: usize) -> bool {
-        if self.normalize_ws {
-            // When -b is set, compare normalized lines
-            normalize_whitespace(self.lines[my_index])
-                == normalize_whitespace(other.lines[other_index])
-        } else {
-            self.lines[my_index] == other.lines[other_index]
         }
     }
 
-    pub fn lines(&self) -> &Vec<&str> {
-        &self.lines
+    /// Whether line `index` ends with a newline. Only a file's final line can
+    /// lack one.
+    fn line_terminated(&self, index: usize) -> bool {
+        self.ends_with_newline || index + 1 != self.lines.len()
     }
 
-    pub fn line(&self, index: usize) -> &str {
+    /// Compare lines, normalizing whitespace when `-b` is in effect.
+    pub fn lines_equal(&self, my_index: usize, other: &FileData, other_index: usize) -> bool {
+        let (mine, theirs) = (self.lines[my_index], other.lines[other_index]);
+        if self.normalize_ws {
+            normalized(mine).eq(normalized(theirs))
+        } else {
+            mine == theirs && self.line_terminated(my_index) == other.line_terminated(other_index)
+        }
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn line(&self, index: usize) -> &'a [u8] {
         self.lines[index]
     }
 
@@ -131,7 +165,10 @@ pub struct LineReader<'a> {
 
 impl<'a> LineReader<'a> {
     pub fn new(content: &'a [u8]) -> Self {
-        let ends_with_newline = content.last() == Some(&b'\n');
+        // An empty file has no incomplete final line, so it counts as
+        // newline-terminated; treating it otherwise made `diff -e` refuse to
+        // build an edit script from an empty file.
+        let ends_with_newline = content.is_empty() || content.last() == Some(&b'\n');
         Self {
             content,
             ends_with_newline,
@@ -143,27 +180,25 @@ impl<'a> LineReader<'a> {
 }
 
 impl<'a> Iterator for LineReader<'a> {
-    type Item = &'a str;
+    type Item = &'a [u8];
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut carriage = false;
-        let mut iter = self.content.iter().enumerate();
-        let mut line_len = loop {
-            match iter.next() {
-                Some((i, b'\n')) => break i + 1,
-                None => {
-                    return (!self.content.is_empty()).then(|| {
-                        from_utf8(take(&mut self.content)).expect("Failed to convert to str")
-                    });
-                }
-                Some((_, &it)) => carriage = it == b'\r',
-            }
-        };
-        let (line, rest) = self.content.split_at(line_len);
-        if carriage {
-            line_len -= 1;
+    /// Split on `\n` alone. A `\r` before the newline is part of the line's
+    /// data, not part of the terminator: a CRLF file and an LF file are
+    /// different files, and a patch generated from CRLF input has to carry the
+    /// carriage returns or applying it silently rewrites every line ending.
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.content.is_empty() {
+            return None;
         }
-        self.content = rest;
-        Some(from_utf8(&line[..line_len - 1]).expect("Failed to convert to str"))
+        match self.content.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                let (line, rest) = self.content.split_at(i + 1);
+                self.content = rest;
+                Some(&line[..i])
+            }
+            // A final line with no newline is returned as it stands, trailing
+            // `\r` included, which is what the terminated branch above does too.
+            None => Some(take(&mut self.content)),
+        }
     }
 }

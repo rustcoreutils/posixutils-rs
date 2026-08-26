@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{run_test, run_test_u8, run_test_with_checker, TestPlan, TestPlanU8};
 
 const EXIT_STATUS_NO_DIFFERENCE: i32 = 0;
 const EXIT_STATUS_DIFFERENCE: i32 = 1;
@@ -33,6 +33,23 @@ fn diff_test_full(args: &[&str], out: &str, err: &str, code: i32) {
         stdin_data: String::new(),
         expected_out: String::from(out),
         expected_err: String::from(err),
+        expected_exit_code: code,
+    });
+}
+
+/// Run `diff` with `args`, asserting stdout and stderr byte for byte.
+///
+/// `run_test` compares through `String::from_utf8_lossy`, which replaces every
+/// invalid byte with U+FFFD on both sides -- turning exactly the corruption
+/// these tests exist to catch into a match. A `TestPlan` also cannot express a
+/// non-UTF-8 expectation in the first place.
+fn diff_test_bytes(args: &[&str], out: &[u8], err: &[u8], code: i32) {
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("diff"),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        stdin_data: Vec::new(),
+        expected_out: out.to_vec(),
+        expected_err: err.to_vec(),
         expected_exit_code: code,
     });
 }
@@ -1107,5 +1124,230 @@ fn test_diff_context_and_unified_round_trip_through_patch() {
             );
             let _ = std::fs::remove_file(&work);
         }
+    }
+}
+
+/// POSIX INPUT FILES: "The input files may be of any type." A Latin-1 file
+/// has no NUL byte, so it is not binary, but reading it as UTF-8 failed and
+/// diff exited 2 with "stream did not contain valid UTF-8".
+#[test]
+fn test_diff_latin1_lines_are_compared_as_bytes() {
+    let f1 = write_tmp("latin1_1", b"caf\xe9\nbar\n");
+    let f2 = write_tmp("latin1_2", b"caf\xe9\nbaz\n");
+    diff_test_bytes(
+        &[&f1, &f2],
+        b"2c2\n< bar\n---\n> baz\n",
+        b"",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+#[test]
+fn test_diff_latin1_identical_files_exit_zero() {
+    let f1 = write_tmp("latin1_same_1", b"caf\xe9\nbar\n");
+    let f2 = write_tmp("latin1_same_2", b"caf\xe9\nbar\n");
+    diff_test_bytes(&[&f1, &f2], b"", b"", EXIT_STATUS_NO_DIFFERENCE);
+}
+
+/// The bytes of the file have to survive into the patch, or the patch does not
+/// apply to the file it came from.
+#[test]
+fn test_diff_unified_and_edit_script_preserve_non_utf8_bytes() {
+    let f1 = write_tmp("latin1_u_1", b"caf\xe9\nbar\n");
+    let f2 = write_tmp("latin1_u_2", b"caf\xe9\nbaz\n");
+    diff_test_bytes(
+        &["--label", "L1", "--label2", "L2", "-u", &f1, &f2],
+        b"--- L1\n+++ L2\n@@ -1,2 +1,2 @@\n caf\xe9\n-bar\n+baz\n",
+        b"",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test_bytes(
+        &["-e", &f1, &f2],
+        b"2c\nbaz\n.\n",
+        b"",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// A `\r` before the newline is data. Stripping it made a CRLF file compare
+/// equal to the same text with LF endings, and made `diff -u` of two CRLF
+/// files emit LF-only bodies, so applying that patch silently converted every
+/// line ending in the target.
+#[test]
+fn test_diff_crlf_and_lf_files_differ() {
+    let f1 = write_tmp("crlf_1", b"a\r\nb\r\n");
+    let f2 = write_tmp("crlf_2", b"a\nb\n");
+    diff_test_full(
+        &[&f1, &f2],
+        "1,2c1,2\n< a\r\n< b\r\n---\n> a\n> b\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+#[test]
+fn test_diff_crlf_identical_files_exit_zero() {
+    let f1 = write_tmp("crlf_same_1", b"a\r\nb\r\n");
+    let f2 = write_tmp("crlf_same_2", b"a\r\nb\r\n");
+    diff_test_full(&[&f1, &f2], "", "", EXIT_STATUS_NO_DIFFERENCE);
+}
+
+#[test]
+fn test_diff_context_formats_keep_carriage_returns() {
+    let f1 = write_tmp("crlf_ctx_1", b"a\r\nb\r\nc\r\n");
+    let f2 = write_tmp("crlf_ctx_2", b"a\r\nB\r\nc\r\n");
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-u", &f1, &f2],
+        "--- L1\n+++ L2\n@@ -1,3 +1,3 @@\n a\r\n-b\r\n+B\r\n c\r\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test_full(
+        &["--label", "L1", "--label2", "L2", "-c", &f1, &f2],
+        concat!(
+            "*** L1\n--- L2\n***************\n",
+            "*** 1,3 ****\n  a\r\n! b\r\n  c\r\n",
+            "--- 1,3 ----\n  a\r\n! B\r\n  c\r\n",
+        ),
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// The terminated and unterminated branches of the line reader have to agree
+/// about `\r`: the final line of a file with no trailing newline used to keep
+/// its carriage return while every other line lost one.
+#[test]
+fn test_diff_final_carriage_return_without_newline() {
+    let f1 = write_tmp("crlf_final_1", b"a\r");
+    let f2 = write_tmp("crlf_final_2", b"a");
+    diff_test_full(
+        &[&f1, &f2],
+        "1c1\n< a\r\n\\ No newline at end of file\n---\n> a\n\\ No newline at end of file\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// POSIX defines -b over white space "not including <newline>", so `\r` is in
+/// the set and -b remains the way to compare a CRLF file with an LF one. GNU
+/// agrees.
+#[test]
+fn test_diff_b_ignores_carriage_return() {
+    let f1 = write_tmp("crlf_b_1", b"a\r\nb\r\n");
+    let f2 = write_tmp("crlf_b_2", b"a\nb\n");
+    diff_test_full(&["-b", &f1, &f2], "", "", EXIT_STATUS_NO_DIFFERENCE);
+}
+
+/// Whether the last line ends with a newline is part of what that line is.
+/// It was only consulted when printing the marker, so two files differing in
+/// nothing else were reported identical.
+#[test]
+fn test_diff_trailing_newline_only_difference_is_reported() {
+    let f1 = write_tmp("nonl_1", b"a\nb\n");
+    let f2 = write_tmp("nonl_2", b"a\nb");
+    diff_test_full(
+        &[&f1, &f2],
+        "2c2\n< b\n---\n> b\n\\ No newline at end of file\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    // -b treats trailing white space, the newline included, as insignificant,
+    // so it does not see this difference. GNU behaves the same way.
+    diff_test_full(&["-b", &f1, &f2], "", "", EXIT_STATUS_NO_DIFFERENCE);
+}
+
+/// An empty file has no incomplete final line, so an edit script can
+/// represent it. It used to be classed as lacking a trailing newline, which
+/// made `diff -e` report trouble instead of producing the script.
+#[test]
+fn test_diff_edit_script_from_empty_file() {
+    let f1 = write_tmp("emptyed_1", b"");
+    let f2 = write_tmp("emptyed_2", b"a\n");
+    diff_test_full(&["-e", &f1, &f2], "0a\na\n.\n", "", EXIT_STATUS_DIFFERENCE);
+}
+
+/// Binary detection is a NUL byte, as in GNU diff. The old control-byte table
+/// classified an ordinary text file carrying one 0x01 as binary and refused to
+/// diff it.
+#[test]
+fn test_diff_binary_detection_is_nul_only() {
+    let t1 = write_tmp("ctl_1", b"a\x01b\nq\n");
+    let t2 = write_tmp("ctl_2", b"a\x01b\nr\n");
+    diff_test_bytes(
+        &[&t1, &t2],
+        b"2c2\n< q\n---\n> r\n",
+        b"",
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    let n1 = write_tmp("nul_1", b"a\0b\nq\n");
+    let n2 = write_tmp("nul_2", b"a\0b\nr\n");
+    let expected = format!("Binary files {n1} and {n2} differ\n");
+    diff_test_full(&[&n1, &n2], &expected, "", EXIT_STATUS_DIFFERENCE);
+
+    let n3 = write_tmp("nul_3", b"a\0b\nq\n");
+    diff_test_full(&[&n1, &n3], "", "", EXIT_STATUS_NO_DIFFERENCE);
+}
+
+/// The property the byte-oriented line store exists for: a patch generated
+/// from a file must reproduce that file's bytes exactly when applied. Uses our
+/// own `patch`, so it also pins the two utilities to one another -- after
+/// 5e8eb888 they agree that a carriage return is line content.
+#[test]
+fn test_diff_patch_round_trip_preserves_bytes() {
+    // No non-UTF-8 case here: our `patch` still rejects such a patch with
+    // "stream did not contain valid UTF-8", including one GNU diff generated,
+    // so it is a patch-side gap rather than a diff one. That diff's own output
+    // is right is pinned instead by
+    // test_diff_unified_and_edit_script_preserve_non_utf8_bytes, whose expected
+    // bytes are GNU's, and GNU patch applies that output byte-exactly.
+    let cases: [(&str, &[u8], &[u8]); 2] = [
+        ("crlf", b"a\r\nb\r\nc\r\nd\r\n", b"a\r\nB\r\nc\r\nd\r\n"),
+        ("mixed", b"one\ntwo\r\nthree\n", b"one\ntwo\r\nTHREE\n"),
+    ];
+
+    for (tag, before, after) in cases {
+        let f1 = write_tmp(&format!("rtb_{tag}_1"), before);
+        let f2 = write_tmp(&format!("rtb_{tag}_2"), after);
+
+        let patch_text = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+            .args(["-u", &f1, &f2])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("run diff -u");
+        assert_eq!(
+            patch_text.status.code(),
+            Some(EXIT_STATUS_DIFFERENCE),
+            "{tag}: the two files differ"
+        );
+
+        let work = write_tmp(&format!("rtb_{tag}_work"), before);
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_patch"))
+            .args(["-f", &work])
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn patch");
+        child
+            .stdin
+            .take()
+            .expect("patch stdin")
+            .write_all(&patch_text.stdout)
+            .expect("feed patch");
+        let done = child.wait_with_output().expect("wait for patch");
+        assert!(
+            done.status.success(),
+            "{tag}: patch failed: {}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&work).expect("read patched file"),
+            after,
+            "{tag}: patched file does not match the second file byte for byte"
+        );
+        let _ = std::fs::remove_file(&work);
     }
 }

@@ -71,6 +71,20 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             let new_start: usize = caps[3].parse().unwrap_or(1);
             let new_count: usize = caps.get(4).map_or(1, |m| m.as_str().parse().unwrap_or(1));
 
+            // A unified header spells a zero-count side as the line *before*
+            // which the change happens ("@@ -5,0 +6,2 @@" inserts after line
+            // 5). `Hunk` wants the line before which to insert, so add one.
+            let old_start = if old_count == 0 {
+                old_start + 1
+            } else {
+                old_start
+            };
+            let new_start = if new_count == 0 {
+                new_start + 1
+            } else {
+                new_start
+            };
+
             let mut hunk = Hunk::new(old_start, old_count, new_start, new_count);
             pos += 1;
 

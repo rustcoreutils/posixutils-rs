@@ -186,15 +186,24 @@ fn convert_context_to_hunk(
     old_lines: &[(char, String)],
     new_lines: &[(char, String)],
 ) -> Hunk {
-    let old_count = if old_end >= old_start {
-        old_end - old_start + 1
+    // A side that contributes no lines is spelled as a bare line number
+    // ("*** 5 ****" for an insertion after line 5), which reads as the range
+    // 5..5 and would otherwise count as one line. An empty section body is what
+    // distinguishes the two, not the range. `Hunk` wants the line before which
+    // to insert, so add one.
+    let (old_start, old_count) = if old_lines.is_empty() {
+        (old_start + 1, 0)
+    } else if old_end >= old_start {
+        (old_start, old_end - old_start + 1)
     } else {
-        0
+        (old_start, 0)
     };
-    let new_count = if new_end >= new_start {
-        new_end - new_start + 1
+    let (new_start, new_count) = if new_lines.is_empty() {
+        (new_start + 1, 0)
+    } else if new_end >= new_start {
+        (new_start, new_end - new_start + 1)
     } else {
-        0
+        (new_start, 0)
     };
 
     let mut hunk = Hunk::new(old_start, old_count, new_start, new_count);

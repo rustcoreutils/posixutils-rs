@@ -87,14 +87,10 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                 }
                 "d" => {
                     // Delete lines start_line to end_line - no text block
+                    // An ed script does not record the text it removes; the
+                    // applier takes that from old_count and the file itself.
                     let count = end_line - start_line + 1;
-                    let mut h = Hunk::new(start_line, count, start_line, 0);
-                    // Ed scripts don't include the deleted text, so we'll have to match by position
-                    // We'll add placeholder delete operations
-                    for _ in 0..count {
-                        h.lines.push(LineOp::Delete(String::new()));
-                    }
-                    h
+                    Hunk::new(start_line, count, start_line, 0)
                 }
                 "c" => {
                     // Change lines start_line to end_line - collect text until "."
@@ -110,11 +106,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                     }
                     let old_count = end_line - start_line + 1;
                     let mut h = Hunk::new(start_line, old_count, start_line, text_lines.len());
-                    // Add delete placeholders
-                    for _ in 0..old_count {
-                        h.lines.push(LineOp::Delete(String::new()));
-                    }
-                    // Add new lines
+                    // Only the replacement text is recorded; see the 'd' arm.
                     for line in text_lines {
                         h.lines.push(LineOp::Add(line));
                     }

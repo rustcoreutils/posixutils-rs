@@ -10,11 +10,12 @@
 //! File operations for the patch utility.
 
 use super::types::{FilePatch, Hunk, LineOp, PatchConfig, PatchError};
+use gettextrs::gettext;
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufWriter, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 /// Determine the target file for a patch.
@@ -45,6 +46,10 @@ pub fn determine_target_file(
         }
 
         let stripped = strip_path(candidate, strip);
+        if !is_safe_patch_path(&stripped) {
+            warn_dangerous_name(&stripped);
+            continue;
+        }
         let path = PathBuf::from(&stripped);
 
         if path.exists() {
@@ -52,11 +57,18 @@ pub fn determine_target_file(
         }
     }
 
-    // For new files, try the new_path directly
+    // For new files, try the new_path directly. This is the one path that
+    // returns a name without first checking that it exists, so it is also the
+    // one that would happily create a file -- and, via write_output's
+    // create_dir_all, a whole directory tree -- wherever the patch says.
     if patch.is_new_file {
         if let Some(ref new_path) = patch.new_path {
             if new_path != "/dev/null" {
                 let stripped = strip_path(new_path, strip);
+                if !is_safe_patch_path(&stripped) {
+                    warn_dangerous_name(&stripped);
+                    return Err(PatchError::NoTargetFile);
+                }
                 return Ok(PathBuf::from(stripped));
             }
         }
@@ -76,6 +88,27 @@ pub fn determine_target_file(
     }
 
     Err(PatchError::NoTargetFile)
+}
+
+/// Whether a file name taken from the patch may be written.
+///
+/// A patch is untrusted input. A name that is absolute, or that walks upward
+/// through a `..` component, reaches outside the directory the user chose to
+/// patch in; applying it would let a downloaded patch write anywhere the user
+/// can. Refuse those. A name the user supplied -- the `file` operand or `-o` --
+/// is their own instruction and is not subject to this.
+fn is_safe_patch_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.is_absolute() && !path.components().any(|c| c == Component::ParentDir)
+}
+
+/// Report a refused file name, in the same terms GNU patch uses.
+fn warn_dangerous_name(name: &str) {
+    eprintln!(
+        "patch: {}: {}",
+        gettext("ignoring potentially dangerous file name"),
+        name
+    );
 }
 
 /// Prompt on the controlling terminal (/dev/tty) for a filename to patch.

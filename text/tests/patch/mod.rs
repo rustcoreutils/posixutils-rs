@@ -949,19 +949,19 @@ fn test_patch_strip_path_p0() {
     fs::write(&original, "hello\n").unwrap();
 
     let patch_file = test_dir.join("p0.patch");
-    let full_path = original.to_str().unwrap();
+    // -p0 keeps the name verbatim; it must be relative, since an absolute name
+    // taken from the patch is refused as unsafe.
     fs::write(
         &patch_file,
-        format!(
-            "--- {}\n+++ {}\n@@ -1 +1 @@\n-hello\n+goodbye\n",
-            full_path, full_path
-        ),
+        "--- a/b/file.txt\n+++ a/b/file.txt\n@@ -1 +1 @@\n-hello\n+goodbye\n",
     )
     .unwrap();
 
     run_test(TestPlan {
         cmd: String::from("patch"),
         args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
             String::from("-p0"),
             String::from("-i"),
             patch_file.to_str().unwrap().to_string(),
@@ -1023,19 +1023,19 @@ fn test_patch_new_file() {
     assert!(!new_file.exists(), "File should not exist before patch");
 
     let patch_file = test_dir.join("new.patch");
-    // Patch to create a new file (old is /dev/null)
+    // Patch to create a new file (old is /dev/null). The name is relative:
+    // an absolute name taken from the patch is refused as unsafe.
     fs::write(
         &patch_file,
-        format!(
-            "--- /dev/null\n+++ {}\n@@ -0,0 +1,2 @@\n+line one\n+line two\n",
-            new_file.to_str().unwrap()
-        ),
+        "--- /dev/null\n+++ created.txt\n@@ -0,0 +1,2 @@\n+line one\n+line two\n",
     )
     .unwrap();
 
     run_test(TestPlan {
         cmd: String::from("patch"),
         args: vec![
+            String::from("-d"),
+            test_dir.to_str().unwrap().to_string(),
             String::from("-p0"),
             String::from("-i"),
             patch_file.to_str().unwrap().to_string(),
@@ -2389,6 +2389,149 @@ fn test_patch_force_does_not_prompt() {
         "got: {}",
         err
     );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A patch is untrusted input: a name that walks up out of the directory being
+// patched must be refused, even when the file it names exists.
+#[test]
+fn test_patch_refuses_parent_dir_traversal() {
+    let test_dir = setup_test_dir("traversal_existing");
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let victim = test_dir.join("VICTIM.txt");
+    fs::write(&victim, "victim\n").unwrap();
+
+    let patch_file = test_dir.join("esc.patch");
+    fs::write(
+        &patch_file,
+        "--- ../VICTIM.txt\n+++ ../VICTIM.txt\n@@ -1,1 +1,1 @@\n-victim\n+PWNED\n",
+    )
+    .unwrap();
+
+    let (_, err) = run_patch_capture(vec![
+        String::from("-d"),
+        subdir.to_str().unwrap().to_string(),
+        String::from("-p0"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert!(
+        err.contains("dangerous file name"),
+        "should refuse the name, got: {}",
+        err
+    );
+    assert_eq!(
+        fs::read_to_string(&victim).unwrap(),
+        "victim\n",
+        "must not write outside the directory being patched"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// The new-file path returns a name without checking that it exists, so it is
+// the one that would create a whole tree wherever the patch says.
+#[test]
+fn test_patch_refuses_traversal_for_new_file() {
+    let test_dir = setup_test_dir("traversal_new");
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let patch_file = test_dir.join("esc.patch");
+    fs::write(
+        &patch_file,
+        "--- /dev/null\n+++ ../ESCAPE/deep/evil.txt\n@@ -0,0 +1,1 @@\n+pwned\n",
+    )
+    .unwrap();
+
+    let (_, err) = run_patch_capture(vec![
+        String::from("-d"),
+        subdir.to_str().unwrap().to_string(),
+        String::from("-p0"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert!(err.contains("dangerous file name"), "got: {}", err);
+    assert!(
+        !test_dir.join("ESCAPE").exists(),
+        "must not create a directory tree outside the patch directory"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// An absolute name from the patch reaches anywhere the user can write.
+#[test]
+fn test_patch_refuses_absolute_name() {
+    let test_dir = setup_test_dir("absolute_name");
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let evil = test_dir.join("ABS_EVIL.txt");
+    let patch_file = test_dir.join("abs.patch");
+    fs::write(
+        &patch_file,
+        format!(
+            "--- /dev/null\n+++ {}\n@@ -0,0 +1,1 @@\n+pwned\n",
+            evil.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let (_, err) = run_patch_capture(vec![
+        String::from("-d"),
+        subdir.to_str().unwrap().to_string(),
+        String::from("-p0"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+    ]);
+    assert!(err.contains("dangerous file name"), "got: {}", err);
+    assert!(
+        !evil.exists(),
+        "must not write an absolute path from a patch"
+    );
+
+    cleanup_test_dir(&test_dir);
+}
+
+// The refusal applies to names the *patch* supplies. A name the user gives on
+// the command line is their own instruction and must still work.
+#[test]
+fn test_patch_explicit_operand_reaches_any_path() {
+    let test_dir = setup_test_dir("explicit_operand");
+    let subdir = test_dir.join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let outside = test_dir.join("OUT.txt");
+    fs::write(&outside, "victim\n").unwrap();
+
+    let patch_file = test_dir.join("op.patch");
+    fs::write(
+        &patch_file,
+        "--- ../OUT.txt\n+++ ../OUT.txt\n@@ -1,1 +1,1 @@\n-victim\n+OK\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-d"),
+            subdir.to_str().unwrap().to_string(),
+            String::from("-p0"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            outside.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "OK\n");
 
     cleanup_test_dir(&test_dir);
 }

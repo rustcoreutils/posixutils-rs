@@ -280,11 +280,14 @@ impl<'a> FileDiff<'a> {
         mut y1: usize,
         lcs_indices: &mut Vec<i32>,
     ) {
-        // Collect common elements at the beginning using hash comparison first
+        // Collect common elements at the beginning using hash comparison first.
+        // The hashes are computed over normalized lines under -b, so the
+        // confirmation has to use the same notion of equality or this scan
+        // rejects every pair -b considers equal.
         while (x0 < x1)
             && (y0 < y1)
             && file1.line_hash(x0) == file2.line_hash(y0)
-            && file1.line(x0) == file2.line(y0)
+            && file1.lines_equal(x0, file2, y0)
         {
             lcs_indices[x0] = y0 as i32;
             x0 += 1;
@@ -300,7 +303,7 @@ impl<'a> FileDiff<'a> {
         while (x0 < x1)
             && (y0 < y1)
             && file1.line_hash(x1 - 1) == file2.line_hash(y1 - 1)
-            && file1.line(x1 - 1) == file2.line(y1 - 1)
+            && file1.lines_equal(x1 - 1, file2, y1 - 1)
         {
             lcs_indices[x1 - 1] = (y1 - 1) as i32;
             x1 -= 1;
@@ -345,19 +348,27 @@ impl<'a> FileDiff<'a> {
                 });
         }
 
-        // Find lowest-occurrence item that appears in both files
+        // Find lowest-occurrence item that appears in both files.
+        //
+        // Ties are the common case rather than the exception — every line that
+        // is unique to each file scores 2 — and `HashMap` iterates in an order
+        // seeded per process, so breaking ties by iteration order made the
+        // whole diff differ from run to run. Tie-break on the first file's
+        // position instead, which is stable. (The line hashes themselves were
+        // never the problem: `DefaultHasher` is zero-seeded.)
         let pivot = hist
             .iter()
             .filter(|(_, v)| v.cnt1 > 0 && v.cnt2 > 0)
-            .min_by_key(|(_, v)| v.cnt1 + v.cnt2);
+            .min_by_key(|(_, v)| (v.cnt1 + v.cnt2, v.pos1));
 
         if let Some((hash, entry)) = pivot {
             let x1_new = entry.pos1 as usize;
             let y1_new = entry.pos2 as usize;
 
-            // Verify that lines actually match (handles hash collisions)
-            // This check is important for correctness
-            if file1.line(x1_new) == file2.line(y1_new) {
+            // Verify that lines actually match (handles hash collisions).
+            // Uses the same equality as the histogram's hashes, so under -b a
+            // pivot is not rejected merely for differing in whitespace.
+            if file1.lines_equal(x1_new, file2, y1_new) {
                 lcs_indices[x1_new] = y1_new as i32;
                 FileDiff::histogram_lcs(file1, file2, x0, x1_new, y0, y1_new, lcs_indices);
                 FileDiff::histogram_lcs(file1, file2, x1_new + 1, x1, y1_new + 1, y1, lcs_indices);

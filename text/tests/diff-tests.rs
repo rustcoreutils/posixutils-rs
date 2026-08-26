@@ -826,3 +826,113 @@ fn test_diff_recursive_symlink_cycle_terminates() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Lines inserted before the first line the two files have in common are a
+/// hunk like any other. The hunk builder used to suppress the whole `i == 0`
+/// case to dodge an index underflow in its "insertion, no deletion" branch,
+/// so `diff` reported the two files identical and exited 0.
+#[test]
+fn test_diff_insertion_before_first_common_line() {
+    let f1 = write_tmp("head_ins_1", b"x\ny\n");
+    let f2 = write_tmp("head_ins_2", b"new\nx\ny\n");
+    diff_test_full(&[&f1, &f2], "0a1\n> new\n", "", EXIT_STATUS_DIFFERENCE);
+}
+
+/// The same insertion in every output format, since the defect was in hunk
+/// construction and so was invisible to whichever printer ran afterwards.
+#[test]
+fn test_diff_insertion_before_first_common_line_all_formats() {
+    let f1 = write_tmp("head_ins_fmt_1", b"x\ny\n");
+    let f2 = write_tmp("head_ins_fmt_2", b"new\nx\ny\n");
+    diff_test_full(
+        &["-u", "--label", "L1", "--label2", "L2", &f1, &f2],
+        "--- L1\n+++ L2\n@@ -1,2 +1,3 @@\n+new\n x\n y\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test_full(
+        &["-e", &f1, &f2],
+        "0a\nnew\n.\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test_full(
+        &["-f", &f1, &f2],
+        "a0\nnew\n.\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// Several lines inserted at the head, with the tail also changed, so the
+/// head hunk is followed by another one rather than being the whole diff.
+#[test]
+fn test_diff_multi_line_head_insertion_with_later_change() {
+    let f1 = write_tmp("head_ins_multi_1", b"a\nb\nc\n");
+    let f2 = write_tmp("head_ins_multi_2", b"p\nq\na\nb\nZ\n");
+    diff_test_full(
+        &[&f1, &f2],
+        "0a1,2\n> p\n> q\n3c5\n< c\n---\n> Z\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// A first line that already matches must NOT produce an empty leading hunk:
+/// the guard being removed exists to keep `lcs_indices[0] == 0` quiet.
+#[test]
+fn test_diff_matching_first_line_emits_no_empty_hunk() {
+    let f1 = write_tmp("no_empty_hunk_1", b"a\nb\n");
+    let f2 = write_tmp("no_empty_hunk_2", b"a\nZ\n");
+    diff_test_full(
+        &[&f1, &f2],
+        "2c2\n< b\n---\n> Z\n",
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+/// Output must not depend on the process-random iteration order of the
+/// histogram map. Ties on the pivot's occurrence count are the common case,
+/// so a run-to-run difference here is the norm, not an edge case.
+#[test]
+fn test_diff_output_is_deterministic() {
+    // A small alphabet makes almost every line a tie candidate.
+    let alphabet = ["a", "b", "c", "d"];
+    let mut s1 = String::new();
+    let mut s2 = String::new();
+    let mut state: u64 = 0x2545F491_4F6CDD1D;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..300 {
+        s1.push_str(alphabet[(next() % 4) as usize]);
+        s1.push('\n');
+        s2.push_str(alphabet[(next() % 4) as usize]);
+        s2.push('\n');
+    }
+    let f1 = write_tmp("determinism_1", s1.as_bytes());
+    let f2 = write_tmp("determinism_2", s2.as_bytes());
+
+    let once = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+            .args([&f1, &f2])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("run diff")
+            .stdout
+    };
+    // Compare as text: a mismatch on 300 lines of byte vectors is unreadable.
+    let first = String::from_utf8_lossy(&once()).into_owned();
+    assert!(!first.is_empty(), "the two files must actually differ");
+    for run in 1..12 {
+        let again = String::from_utf8_lossy(&once()).into_owned();
+        assert_eq!(
+            again, first,
+            "run {run} produced different output from run 0"
+        );
+    }
+}

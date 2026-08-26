@@ -265,23 +265,28 @@ impl Hunks {
         let mut hunk_end2: usize;
         let mut prev_val = -2_i32;
         for (i, lcs_index) in lcs_indices.iter().enumerate() {
+            // The line of the second file that this position continues from.
+            // `prev_val` is seeded to -2 to mean "before the first element",
+            // where the run starts at the very beginning of the second file.
+            let expected2 = if prev_val == -2 {
+                0
+            } else {
+                (prev_val + 1) as usize
+            };
+
             if (lcs_index == &-1) && (prev_val != -1) {
                 // We reach a new deletion/substitution block
                 hunk_start1 = i;
-                hunk_start2 = if prev_val == -2 {
-                    0
-                } else {
-                    (prev_val + 1) as usize
-                };
-            } else if (i != 0)
-                && (prev_val != -1)
-                && (lcs_index != &-1)
-                && (lcs_index != &(prev_val + 1))
-            {
-                // there was an insertion (but no deletion)
-                // no -1 values but a bump in the values, eg [136, 145]
+                hunk_start2 = expected2;
+            } else if (prev_val != -1) && (lcs_index != &-1) && (*lcs_index as usize > expected2) {
+                // There was an insertion (but no deletion): the matched lines
+                // of the second file skip forward, eg [136, 145]. Comparing
+                // against `expected2` rather than `prev_val + 1` is what lets
+                // this fire at i == 0, where the skipped lines are an
+                // insertion before the first common line and `prev_val + 1`
+                // would be -1.
                 hunk_start1 = i;
-                hunk_start2 = (prev_val + 1) as usize;
+                hunk_start2 = expected2;
                 hunk_end1 = i;
                 hunk_end2 = *lcs_index as usize;
                 self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
@@ -300,7 +305,7 @@ impl Hunks {
             hunk_end1 = num_lines1;
             hunk_end2 = num_lines2;
             self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
-        } else if lcs_indices[lcs_indices.len() - 1] < ((num_lines2 - 1) as i32) {
+        } else if ((lcs_indices[lcs_indices.len() - 1] + 1) as usize) < num_lines2 {
             // there might be some insertions after the last lcs block
             // For Insert, ln1_start represents the 1-indexed line after which to insert
             // For trailing insertion, this should be num_lines1 (after the last line)

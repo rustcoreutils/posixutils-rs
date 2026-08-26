@@ -242,14 +242,21 @@ impl<'a> PatchApplier<'a> {
                     .iter()
                     .map(|s| s.as_str())
                     .collect();
-                (ifdef_block(define, &dels, &adds), true)
+                let block = ifdef_block(define, &dels, &adds);
+                // A non-empty block always closes with #endif; an empty one
+                // emitted no directive to close.
+                let ends_with_directive = !block.is_empty();
+                (block, ends_with_directive)
             }
             None => (adds.iter().map(|s| s.to_string()).collect(), false),
         };
 
-        let write_end = pos + replacement.len();
-        self.file_lines.splice(pos..remove_end, replacement);
-        self.set_eof_marker(write_end, hunk.new_no_newline && !ends_with_directive);
+        self.splice(
+            pos,
+            remove_end,
+            replacement,
+            hunk.new_no_newline && !ends_with_directive,
+        );
 
         HunkResult::Applied {
             line: pos + 1,
@@ -344,17 +351,33 @@ impl<'a> PatchApplier<'a> {
             ),
         };
 
-        let write_end = file_start + replacement.len();
-        self.file_lines.splice(file_start..remove_end, replacement);
-        self.set_eof_marker(write_end, hunk.new_no_newline && !ends_with_directive);
+        self.splice(
+            file_start,
+            remove_end,
+            replacement,
+            hunk.new_no_newline && !ends_with_directive,
+        );
     }
 
-    /// Record whether the patched file now ends without a trailing newline.
+    /// Replace `file_lines[at..remove_end]` with `replacement`, recording
+    /// whether the file now ends without a trailing newline.
     ///
-    /// Only a splice that reaches the end of the file can change this; under
-    /// fuzz the file's real last line was never replaced, so `write_end` falls
+    /// Only a write that reaches the end of the file can change that; under
+    /// fuzz the file's real last line was never replaced, so the write ends
     /// short and the marker correctly stays put.
-    fn set_eof_marker(&mut self, write_end: usize, no_newline: bool) {
+    ///
+    /// A hunk that removes nothing and adds nothing leaves the file exactly as
+    /// it was, so it must not disturb the marker either. Such a hunk is
+    /// degenerate rather than typical -- an ed `a` command with an empty text
+    /// block, or a "@@ -2,0 +3,0 @@" unified header -- but without this guard
+    /// one sitting at end of file would add or drop a trailing newline while
+    /// changing no line at all.
+    fn splice(&mut self, at: usize, remove_end: usize, replacement: Vec<String>, no_newline: bool) {
+        if replacement.is_empty() && remove_end == at {
+            return;
+        }
+        let write_end = at + replacement.len();
+        self.file_lines.splice(at..remove_end, replacement);
         if write_end == self.file_lines.len() {
             self.eof_no_newline = no_newline;
         }

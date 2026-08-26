@@ -2790,3 +2790,55 @@ fn test_patch_context_no_newline_marker_after_full_section() {
 
     cleanup_test_dir(&test_dir);
 }
+
+// A hunk that removes nothing and adds nothing must leave the file exactly as
+// it is. Sitting at end of file, such a hunk used to flip the trailing-newline
+// marker, adding a newline to a file it had not otherwise touched.
+#[test]
+fn test_patch_noop_hunk_at_eof_leaves_file_alone() {
+    let test_dir = setup_test_dir("noop_eof");
+
+    // An ed "a" command with an empty text block, plain and under -D, and the
+    // degenerate unified spelling of the same thing.
+    let cases: [(&str, &str, Vec<String>); 3] = [
+        ("ed.txt", "2a\n.\n", vec![String::from("-e")]),
+        (
+            "ed_d.txt",
+            "2a\n.\n",
+            vec![
+                String::from("-e"),
+                String::from("-D"),
+                String::from("FEATURE"),
+            ],
+        ),
+        (
+            "uni.txt",
+            "--- uni.txt\n+++ uni.txt\n@@ -2,0 +3,0 @@\n",
+            vec![],
+        ),
+    ];
+
+    for (name, patch_text, extra) in cases {
+        let target = test_dir.join(name);
+        fs::write(&target, "a\nb").unwrap(); // no trailing newline
+
+        let patch_file = test_dir.join(format!("{}.patch", name));
+        fs::write(&patch_file, patch_text).unwrap();
+
+        let mut args = extra;
+        args.push(String::from("-i"));
+        args.push(patch_file.to_str().unwrap().to_string());
+        args.push(target.to_str().unwrap().to_string());
+        let (code, err) = run_patch_capture(args);
+
+        assert_eq!(code, 0, "{}: stderr: {}", name, err);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"a\nb",
+            "{}: a no-op hunk must not add a trailing newline",
+            name
+        );
+    }
+
+    cleanup_test_dir(&test_dir);
+}

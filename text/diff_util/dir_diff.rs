@@ -17,6 +17,7 @@ use std::{
 
 use crate::diff_util::{
     constants::COULD_NOT_UNWRAP_FILENAME, diff_exit_status::DiffExitStatus, file_diff::FileDiff,
+    functions::io_error_at,
 };
 
 use super::{common::FormatOptions, dir_data::DirData};
@@ -82,7 +83,7 @@ impl<'a> DirDiff<'a> {
         format_options: &FormatOptions,
         recursive: bool,
         options: &[String],
-    ) -> io::Result<DiffExitStatus> {
+    ) -> DiffExitStatus {
         let mut visited = HashSet::new();
         Self::dir_diff_inner(
             path1,
@@ -104,7 +105,7 @@ impl<'a> DirDiff<'a> {
         recursive: bool,
         options: &[String],
         visited: &mut HashSet<(u64, u64)>,
-    ) -> io::Result<DiffExitStatus> {
+    ) -> DiffExitStatus {
         // The two operands themselves go in before anything descends, so a
         // link back to either of them is caught as a loop.
         for path in [&path1, &path2] {
@@ -113,21 +114,23 @@ impl<'a> DirDiff<'a> {
             }
         }
 
-        let mut dir1: DirData = DirData::load(path1)?;
-        let mut dir2: DirData = DirData::load(path2)?;
+        let (mut dir1, mut dir2) = match (DirData::load(path1), DirData::load(path2)) {
+            (Ok(d1), Ok(d2)) => (d1, d2),
+            (Err(e), _) | (_, Err(e)) => {
+                Self::report(&e);
+                return DiffExitStatus::Trouble;
+            }
+        };
 
         let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, format_options, recursive, options);
         dir_diff.analyze(visited)
     }
 
-    /// Report an error against the entry it happened on and keep walking.
-    /// The bare message left the reader no way to tell which file failed.
-    fn report(path: &Path, error: &io::Error) {
-        eprintln!(
-            "diff: {}: {}",
-            display(path),
-            plib::diag::io_error_text(error)
-        );
+    /// Report an error and keep walking. The error names the path it happened
+    /// on -- see `io_error_at` -- so this no longer has to guess, which it did
+    /// by always naming the first operand.
+    fn report(error: &io::Error) {
+        eprintln!("diff: {}", error);
     }
 
     /// Recurse into a common subdirectory, refusing to re-enter a directory
@@ -143,14 +146,20 @@ impl<'a> DirDiff<'a> {
         path1: &Path,
         path2: &Path,
         visited: &mut HashSet<(u64, u64)>,
-    ) -> io::Result<DiffExitStatus> {
+    ) -> DiffExitStatus {
         let mut ids = Vec::new();
         for path in [path1, path2] {
-            let md = fs::metadata(path)?;
+            let md = match fs::metadata(path) {
+                Ok(md) => md,
+                Err(e) => {
+                    Self::report(&io_error_at(path, e));
+                    return DiffExitStatus::Trouble;
+                }
+            };
             let id = (md.dev(), md.ino());
             if visited.contains(&id) {
                 eprintln!("diff: {}: recursive directory loop", display(path));
-                return Ok(DiffExitStatus::Trouble);
+                return DiffExitStatus::Trouble;
             }
             ids.push(id);
         }
@@ -220,7 +229,7 @@ impl<'a> DirDiff<'a> {
         })
     }
 
-    fn analyze(&mut self, visited: &mut HashSet<(u64, u64)>) -> io::Result<DiffExitStatus> {
+    fn analyze(&mut self, visited: &mut HashSet<(u64, u64)>) -> DiffExitStatus {
         let mut exit_status = DiffExitStatus::NotDifferent;
 
         let mut dir1_files_name = self.dir1.files().keys().collect::<Vec<&OsString>>();
@@ -248,13 +257,8 @@ impl<'a> DirDiff<'a> {
                     // carry on, which is what GNU does.
                     let (kind1, kind2) = match (Self::classify(&path1), Self::classify(&path2)) {
                         (Ok(k1), Ok(k2)) => (k1, k2),
-                        (Err(e), _) => {
-                            Self::report(&path1, &e);
-                            exit_status = DiffExitStatus::Trouble;
-                            continue;
-                        }
-                        (_, Err(e)) => {
-                            Self::report(&path2, &e);
+                        (Err(e), _) | (_, Err(e)) => {
+                            Self::report(&e);
                             exit_status = DiffExitStatus::Trouble;
                             continue;
                         }
@@ -264,8 +268,8 @@ impl<'a> DirDiff<'a> {
                         (EntryKind::File, EntryKind::File) => {
                             let header = self.file_header(&path1, &path2);
                             match FileDiff::file_diff(
-                                path1.clone(),
-                                path2.clone(),
+                                path1,
+                                path2,
                                 self.format_options,
                                 Some(header),
                             ) {
@@ -275,23 +279,16 @@ impl<'a> DirDiff<'a> {
                                     }
                                 }
                                 Err(e) => {
-                                    Self::report(&path1, &e);
+                                    Self::report(&e);
                                     exit_status = DiffExitStatus::Trouble;
                                 }
                             }
                         }
                         (EntryKind::Directory, EntryKind::Directory) => {
                             if self.recursive {
-                                match self.descend(&path1, &path2, visited) {
-                                    Ok(inner) => {
-                                        if exit_status.status_code() < inner.status_code() {
-                                            exit_status = inner;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        Self::report(&path1, &e);
-                                        exit_status = DiffExitStatus::Trouble;
-                                    }
+                                let inner = self.descend(&path1, &path2, visited);
+                                if exit_status.status_code() < inner.status_code() {
+                                    exit_status = inner;
                                 }
                             } else {
                                 // Two directories left uncompared are not a
@@ -347,11 +344,11 @@ impl<'a> DirDiff<'a> {
                         "At least one of directories should contain file \"{}\"",
                         file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
                     );
-                    return Ok(DiffExitStatus::Trouble);
+                    return DiffExitStatus::Trouble;
                 }
             }
         }
 
-        Ok(exit_status)
+        exit_status
     }
 }

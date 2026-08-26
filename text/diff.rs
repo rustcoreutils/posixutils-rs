@@ -22,7 +22,7 @@ use diff_util::{
     diff_exit_status::DiffExitStatus,
     dir_diff::DirDiff,
     file_diff::{FileDiff, Source},
-    functions::check_existance,
+    functions::{check_existance, io_error_at},
 };
 use gettextrs::gettext;
 
@@ -196,14 +196,24 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         return Ok(DiffExitStatus::NotDifferent);
     }
 
-    let path1_is_file = fs::metadata(&path1)?.is_file();
-    let path2_is_file = fs::metadata(&path2)?.is_file();
+    let path1_is_file = fs::metadata(&path1)
+        .map_err(|e| io_error_at(&path1, e))?
+        .is_file();
+    let path2_is_file = fs::metadata(&path2)
+        .map_err(|e| io_error_at(&path2, e))?
+        .is_file();
 
     if path1_is_file && path2_is_file {
         FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
         let options = option_arguments(&args.file1, &args.file2);
-        DirDiff::dir_diff(path1, path2, &format_options, args.recurse, &options)
+        Ok(DirDiff::dir_diff(
+            path1,
+            path2,
+            &format_options,
+            args.recurse,
+            &options,
+        ))
     } else {
         FileDiff::file_dir_diff(path1, path2, &format_options)
     }

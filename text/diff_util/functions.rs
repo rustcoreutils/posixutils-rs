@@ -52,6 +52,25 @@ pub fn write_line(out: &mut impl Write, prefix: &[u8], line: &[u8]) -> io::Resul
     out.write_all(b"\n")
 }
 
+/// Attach `path` to an I/O error, so the diagnostic names the file it happened
+/// on.
+///
+/// An `io::Error` from `open` or `read_dir` does not say which path produced
+/// it, so a caller holding two of them could only guess -- and guessed the
+/// first one, naming the wrong file for every failure on the second operand.
+/// Attaching it here, where the path is still in hand, means no reporting site
+/// has to guess.
+pub fn io_error_at(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{}: {}",
+            path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
+            plib::diag::io_error_text(&error)
+        ),
+    )
+}
+
 pub fn check_existance(path_buf: &Path) -> io::Result<bool> {
     if !path_buf.exists() {
         eprintln!(

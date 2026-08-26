@@ -13,8 +13,8 @@ use super::{
     diff_exit_status::DiffExitStatus,
     file_data::{FileData, LineReader},
     functions::{
-        check_existance, is_binary, system_time_to_context_format, system_time_to_unified_format,
-        write_line,
+        check_existance, io_error_at, is_binary, system_time_to_context_format,
+        system_time_to_unified_format, write_line,
     },
     hunks::{Hunk, Hunks},
 };
@@ -49,11 +49,12 @@ impl Source {
     /// for binary content, for the contents, and for the timestamp -- which
     /// could observe three different files.
     pub fn from_path(path: PathBuf) -> io::Result<Self> {
-        let mut file = File::open(&path)?;
-        let metadata = file.metadata()?;
+        let at = |e| io_error_at(&path, e);
+        let mut file = File::open(&path).map_err(at)?;
+        let metadata = file.metadata().map_err(at)?;
         let mut content = Vec::with_capacity(metadata.len() as usize + 1);
-        file.read_to_end(&mut content)?;
-        let modified = metadata.modified()?;
+        file.read_to_end(&mut content).map_err(at)?;
+        let modified = metadata.modified().map_err(at)?;
         let name = path
             .to_str()
             .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
@@ -224,7 +225,10 @@ impl<'a> FileDiff<'a> {
         path2: PathBuf,
         format_options: &FormatOptions,
     ) -> io::Result<DiffExitStatus> {
-        let path1_file_type = path1.metadata()?.file_type();
+        let path1_file_type = path1
+            .metadata()
+            .map_err(|e| io_error_at(&path1, e))?
+            .file_type();
 
         if path1_file_type.is_file() {
             let path1_file = path1.clone();

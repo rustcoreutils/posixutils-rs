@@ -1958,3 +1958,61 @@ fn test_diff_recursive_per_file_header_echoes_the_command_line() {
     }
     let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
+
+/// An I/O error names the file it actually happened on.
+///
+/// `io::Error` does not carry a path, so the reporting sites used to guess,
+/// and always guessed the first operand: a failure reading the *second* file
+/// of a pair, or the second subdirectory, was reported against the first.
+#[test]
+fn test_diff_io_error_names_the_failing_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let unreadable = std::fs::Permissions::from_mode(0o000);
+    let readable = std::fs::Permissions::from_mode(0o644);
+
+    let (a, b) = dir_pair("whichpath");
+    std::fs::write(a.join("f"), "x\n").unwrap();
+    std::fs::write(b.join("f"), "y\n").unwrap();
+    let (as_, bs) = (
+        a.to_str().unwrap().to_string(),
+        b.to_str().unwrap().to_string(),
+    );
+
+    // Either side of a file pair, whichever one is unreadable.
+    for (broken, side) in [(a.join("f"), "first"), (b.join("f"), "second")] {
+        std::fs::set_permissions(&broken, unreadable.clone()).unwrap();
+        let (_, stderr, code) = run_diff(&[&as_, &bs]);
+        std::fs::set_permissions(&broken, readable.clone()).unwrap();
+
+        assert_eq!(code, Some(EXIT_STATUS_TROUBLE), "{side} file unreadable");
+        assert!(
+            stderr.contains(broken.to_str().unwrap()),
+            "the {side} file is the one that failed, but the message was {stderr:?}"
+        );
+    }
+
+    // And as a direct operand, not only inside a walk.
+    let f = b.join("f");
+    std::fs::set_permissions(&f, unreadable.clone()).unwrap();
+    let (_, stderr, code) = run_diff(&[a.join("f").to_str().unwrap(), f.to_str().unwrap()]);
+    std::fs::set_permissions(&f, readable.clone()).unwrap();
+    assert_eq!(code, Some(EXIT_STATUS_TROUBLE));
+    assert!(stderr.contains(f.to_str().unwrap()), "got {stderr:?}");
+
+    // A subdirectory that cannot be read names itself, not its counterpart.
+    let (c, d) = dir_pair("whichdir");
+    for dir in [&c, &d] {
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("g"), "1\n").unwrap();
+    }
+    let broken = d.join("sub");
+    std::fs::set_permissions(&broken, unreadable).unwrap();
+    let (_, stderr, code) = run_diff(&["-r", c.to_str().unwrap(), d.to_str().unwrap()]);
+    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, Some(EXIT_STATUS_TROUBLE));
+    assert!(stderr.contains(broken.to_str().unwrap()), "got {stderr:?}");
+
+    let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    let _ = std::fs::remove_dir_all(c.parent().unwrap());
+}

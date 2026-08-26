@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
 };
 
-use super::constants::*;
+use super::{constants::*, functions::io_error_at};
 
 pub struct DirData {
     path: PathBuf,
@@ -26,10 +26,12 @@ impl DirData {
     pub fn load(path: PathBuf) -> io::Result<Self> {
         let mut files: HashMap<OsString, DirEntry> = Default::default();
 
-        let entries = fs::read_dir(&path)?;
+        // Errors carry the directory they came from: a caller holding two
+        // directories cannot otherwise tell which of them it could not read.
+        let entries = fs::read_dir(&path).map_err(|e| io_error_at(&path, e))?;
 
         for entry in entries {
-            let entry = entry?;
+            let entry = entry.map_err(|e| io_error_at(&path, e))?;
             files.insert(entry.file_name(), entry);
         }
 

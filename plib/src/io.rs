@@ -125,6 +125,26 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
     Ok(())
 }
 
+/// Restore the default disposition for `SIGPIPE`.
+///
+/// The Rust runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so a write to a
+/// closed pipe returns `EPIPE` instead of killing the process. For a filter
+/// that is routinely piped into `head` or `less` that is the wrong shape: the
+/// error surfaces as a panic ("failed printing to stdout: Broken pipe") and
+/// exit 101, where the historical utilities die by the signal and the shell
+/// reports 141.
+///
+/// Call this once at the top of `main`, before any output. It affects only
+/// this process; `exec`ing a child resets ignored signals anyway, and a
+/// default disposition is inherited unchanged.
+pub fn restore_sigpipe() {
+    // SAFETY: `signal` with SIG_DFL is async-signal-safe and this runs before
+    // any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

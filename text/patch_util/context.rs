@@ -104,13 +104,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
                     pos += 1;
                     continue;
                 }
-                if l.len() >= 2 {
-                    let prefix = l.chars().next().unwrap_or(' ');
-                    let content = if l.len() > 2 { &l[2..] } else { "" };
-                    old_lines.push((prefix, content.to_string()));
-                } else if l.is_empty() {
-                    old_lines.push((' ', String::new()));
-                }
+                old_lines.push(split_section_line(l));
                 pos += 1;
             }
 
@@ -150,13 +144,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
                     pos += 1;
                     continue;
                 }
-                if l.len() >= 2 {
-                    let prefix = l.chars().next().unwrap_or(' ');
-                    let content = if l.len() > 2 { &l[2..] } else { "" };
-                    new_lines.push((prefix, content.to_string()));
-                } else if l.is_empty() {
-                    new_lines.push((' ', String::new()));
-                }
+                new_lines.push(split_section_line(l));
                 pos += 1;
             }
 
@@ -173,6 +161,20 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
     }
 
     Ok((patch, pos))
+}
+
+/// Split a context-diff section line into its one-character change prefix and
+/// its payload.
+///
+/// The prefix is separated from the payload by a single space. Mailers that
+/// strip trailing whitespace turn a line holding an empty payload into a bare
+/// `+`, `-`, `!` or `<space>`, so the separator is optional. Splitting by
+/// `char` rather than by byte index keeps non-ASCII payloads intact.
+fn split_section_line(l: &str) -> (char, String) {
+    let mut chars = l.chars();
+    let prefix = chars.next().unwrap_or(' ');
+    let rest = chars.as_str();
+    (prefix, rest.strip_prefix(' ').unwrap_or(rest).to_string())
 }
 
 /// Convert context diff sections to a unified-style hunk.

@@ -55,6 +55,15 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
                 .map_or(start_line, |m| m.as_str().parse().unwrap_or(start_line));
             let cmd = &caps[3];
 
+            // A range whose end precedes its start is malformed; the count
+            // arithmetic below would underflow.
+            if end_line < start_line {
+                return Err(PatchError::Parse {
+                    line: pos + 1,
+                    message: format!("malformed range in command: {}", line),
+                });
+            }
+
             pos += 1;
 
             let hunk = match cmd {

@@ -1330,3 +1330,178 @@ fn test_patch_strip_path_double_slash() {
 
     cleanup_test_dir(&test_dir);
 }
+
+// A context diff whose section lines carry non-ASCII payloads must parse.
+// The section-line splitter used to slice at byte index 2, which panicked
+// (exit 101) whenever a line began with a multi-byte character.
+#[test]
+fn test_patch_context_non_ascii_line() {
+    let test_dir = setup_test_dir("context_non_ascii");
+
+    let target = test_dir.join("utf8.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("utf8.patch");
+    fs::write(
+        &patch_file,
+        "*** utf8.txt\t2024-01-01 00:00:00\n\
+         --- utf8.txt\t2024-01-01 00:00:01\n\
+         ***************\n\
+         *** 1,3 ****\n\
+         \x20 a\n\
+         ! b\n\
+         \x20 c\n\
+         --- 1,3 ----\n\
+         \x20 a\n\
+         ! B\n\
+         \x20 c\n\
+         \u{2192} trailing prose line\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-c"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nB\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A context-diff section line whose payload is empty may reach us as a bare
+// "+", "-" or "!" when a mailer has stripped the trailing separator space.
+#[test]
+fn test_patch_context_stripped_separator() {
+    let test_dir = setup_test_dir("context_stripped_sep");
+
+    let target = test_dir.join("strip.txt");
+    fs::write(&target, "a\nb\n").unwrap();
+
+    let patch_file = test_dir.join("strip.patch");
+    // The added blank line is written "+" with no trailing space.
+    fs::write(
+        &patch_file,
+        "*** strip.txt\n--- strip.txt\n***************\n\
+         *** 1,2 ****\n  a\n  b\n--- 1,3 ----\n  a\n+\n  b\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-c"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\n\nb\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// A normal-diff range whose end precedes its start is malformed. The count
+// arithmetic used to underflow, aborting with a capacity-overflow panic.
+#[test]
+fn test_patch_normal_reversed_range() {
+    let test_dir = setup_test_dir("normal_rev_range");
+
+    let target = test_dir.join("rev.txt");
+    fs::write(&target, "a\nb\nc\nd\ne\n").unwrap();
+
+    let patch_file = test_dir.join("rev.patch");
+    fs::write(&patch_file, "5,2c3,1\n< a\n---\n> A\n").unwrap();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("patch"),
+            args: vec![
+                String::from("-n"),
+                String::from("-i"),
+                patch_file.to_str().unwrap().to_string(),
+                target.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 2,
+        },
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "Malformed range should be a clean error, not a panic"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("malformed range"),
+                "Should name the malformed range, got: {}",
+                stderr
+            );
+        },
+    );
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\nc\nd\ne\n");
+
+    cleanup_test_dir(&test_dir);
+}
+
+// Same malformed range, in an ed script.
+#[test]
+fn test_patch_ed_reversed_range() {
+    let test_dir = setup_test_dir("ed_rev_range");
+
+    let target = test_dir.join("edrev.txt");
+    fs::write(&target, "a\nb\nc\n").unwrap();
+
+    let patch_file = test_dir.join("edrev.patch");
+    fs::write(&patch_file, "5,2c\nX\n.\n").unwrap();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("patch"),
+            args: vec![
+                String::from("-e"),
+                String::from("-i"),
+                patch_file.to_str().unwrap().to_string(),
+                target.to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 2,
+        },
+        |_, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "Malformed range should be a clean error, not a panic"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("malformed range"),
+                "Should name the malformed range, got: {}",
+                stderr
+            );
+        },
+    );
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\nb\nc\n");
+
+    cleanup_test_dir(&test_dir);
+}

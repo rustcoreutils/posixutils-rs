@@ -27,6 +27,16 @@ const MAX_SCAN_LINES: usize = 1000;
 /// context, then one ignoring the first two and last two.
 const MAX_FUZZ: usize = 2;
 
+/// What to do with a patch that looks reversed or already applied.
+enum ReversalChoice {
+    /// Reverse the patch and apply it (the user asked for -R after all).
+    ApplyReversed,
+    /// Apply it as written; the hunks will reject, leaving the file alone.
+    ApplyForward,
+    /// Leave the file untouched and send every hunk to the reject file.
+    Skip,
+}
+
 /// Applies patches to file content.
 pub struct PatchApplier<'a> {
     config: &'a PatchConfig,
@@ -62,18 +72,18 @@ impl<'a> PatchApplier<'a> {
         // or created in the opposite direction. Prompt (or honor -f / -N).
         // Skipped when -R was given (already reversed) or -N (ignore applied).
         if !self.config.reverse && !self.config.ignore_applied && self.detect_reversed(patch) {
-            if self.decide_assume_reverse() {
-                patch.reverse();
-            } else if !self.config.force {
-                // Skip this file rather than abandoning the run: a patch
-                // covering several files may have had only this one applied
-                // already, and the rest still need patching. The hunks go to
-                // the reject file, which POSIX makes exit status 1.
-                eprintln!("patch: {}", gettext("Skipping patch."));
-                return Ok(self.skip_all(patch));
+            match self.decide_reversal() {
+                ReversalChoice::ApplyReversed => patch.reverse(),
+                ReversalChoice::ApplyForward => {}
+                ReversalChoice::Skip => {
+                    // Skip this file rather than abandoning the run: a patch
+                    // covering several files may have had only this one applied
+                    // already, and the rest still need patching. The hunks go to
+                    // the reject file, which POSIX makes exit status 1.
+                    eprintln!("patch: {}", gettext("Skipping patch."));
+                    return Ok(self.skip_all(patch));
+                }
             }
-            // With -f and a "no" decision, fall through and apply forward
-            // (which will reject), matching GNU's "apply anyway" path.
         }
 
         let placement = Placement::from(patch.format);
@@ -202,18 +212,22 @@ impl<'a> PatchApplier<'a> {
         false
     }
 
-    /// Decide whether to assume -R for a detected reversed patch. With -f,
-    /// assume yes. Otherwise prompt on the controlling terminal; if no
-    /// terminal is available, default to "no" (preserving the error path).
-    fn decide_assume_reverse(&self) -> bool {
+    /// Decide what to do about a patch that looks reversed or already applied.
+    fn decide_reversal(&self) -> ReversalChoice {
+        // -f is "do not ask any questions and assume answers". The answer to
+        // assume is that the patch is *not* reversed: applying it forward
+        // rejects the hunks and leaves the file alone, whereas assuming -R
+        // would silently undo a change the file already has.
         if self.config.force {
-            return true;
+            return ReversalChoice::ApplyForward;
         }
-        // No terminal available -> default to "no" (preserves the error path).
-        super::file_ops::prompt_yes_no(
+        match super::file_ops::prompt_yes_no(
             "Reversed (or previously applied) patch detected!  Assume -R? [y] ",
-        )
-        .unwrap_or(false)
+        ) {
+            Some(true) => ReversalChoice::ApplyReversed,
+            // No controlling terminal to ask means no answer, which is a "no".
+            Some(false) | None => ReversalChoice::Skip,
+        }
     }
 
     /// Apply a hunk whose position is recorded absolutely (an ed script).
@@ -475,4 +489,53 @@ fn ifdef_block(define: &str, dels: &[&str], adds: &[&str]) -> Vec<String> {
 /// Normalize whitespace for loose matching.
 fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::patch_util::types::DiffFormat;
+
+    fn hunk_with(old_start: usize, ops: Vec<LineOp>) -> Hunk {
+        let mut h = Hunk::new(old_start, 1, old_start, 1);
+        h.lines = ops;
+        h
+    }
+
+    /// Declining a reversed patch must leave the file exactly as it was and
+    /// send every hunk to the reject file. This path is otherwise only
+    /// reachable through a prompt on the controlling terminal.
+    #[test]
+    fn skip_all_rejects_every_hunk_and_keeps_content() {
+        let config = PatchConfig::default();
+        let original = vec![String::from("a"), String::from("b")];
+        let mut applier = PatchApplier::new(&config, original.clone(), true);
+
+        let mut patch = FilePatch::new(DiffFormat::Unified);
+        patch.hunks.push(hunk_with(
+            1,
+            vec![
+                LineOp::Delete(String::from("a")),
+                LineOp::Add(String::from("A")),
+            ],
+        ));
+        patch.hunks.push(hunk_with(
+            2,
+            vec![
+                LineOp::Delete(String::from("b")),
+                LineOp::Add(String::from("B")),
+            ],
+        ));
+
+        let result = applier.skip_all(&patch);
+
+        assert_eq!(result.content, original, "file content must be untouched");
+        assert!(!result.applied_any, "nothing was applied");
+        assert_eq!(result.rejected_hunks.len(), 2, "every hunk is rejected");
+        let numbers: Vec<usize> = result.rejected_hunks.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(numbers, vec![1, 2], "hunks are numbered from one");
+        for (_, _, reason) in &result.rejected_hunks {
+            assert!(reason.contains("previously applied"), "reason: {}", reason);
+        }
+    }
 }

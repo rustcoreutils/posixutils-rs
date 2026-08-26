@@ -2301,9 +2301,12 @@ fn test_patch_reversed_file_skips_not_aborts() {
     )
     .unwrap();
 
+    // -f keeps this non-interactive: without it, an already-applied patch
+    // prompts on the controlling terminal, which blocks under a real tty.
     let (code, _) = run_patch_capture(vec![
         String::from("-d"),
         test_dir.to_str().unwrap().to_string(),
+        String::from("-f"),
         String::from("-i"),
         patch_file.to_str().unwrap().to_string(),
     ]);
@@ -2414,6 +2417,7 @@ fn test_patch_refuses_parent_dir_traversal() {
     let (_, err) = run_patch_capture(vec![
         String::from("-d"),
         subdir.to_str().unwrap().to_string(),
+        String::from("-f"),
         String::from("-p0"),
         String::from("-i"),
         patch_file.to_str().unwrap().to_string(),
@@ -2450,6 +2454,7 @@ fn test_patch_refuses_traversal_for_new_file() {
     let (_, err) = run_patch_capture(vec![
         String::from("-d"),
         subdir.to_str().unwrap().to_string(),
+        String::from("-f"),
         String::from("-p0"),
         String::from("-i"),
         patch_file.to_str().unwrap().to_string(),
@@ -2484,6 +2489,7 @@ fn test_patch_refuses_absolute_name() {
     let (_, err) = run_patch_capture(vec![
         String::from("-d"),
         subdir.to_str().unwrap().to_string(),
+        String::from("-f"),
         String::from("-p0"),
         String::from("-i"),
         patch_file.to_str().unwrap().to_string(),
@@ -2729,6 +2735,7 @@ fn test_patch_declined_patch_does_not_touch_file() {
 
     let (code, _) = run_patch_capture(vec![
         String::from("-b"),
+        String::from("-f"),
         String::from("-i"),
         patch_file.to_str().unwrap().to_string(),
         target.to_str().unwrap().to_string(),
@@ -2839,6 +2846,77 @@ fn test_patch_noop_hunk_at_eof_leaves_file_alone() {
             name
         );
     }
+
+    cleanup_test_dir(&test_dir);
+}
+
+// -f is "do not ask any questions and assume answers". The answer to assume
+// for a patch that looks reversed is that it is *not*: applying it forward
+// rejects and leaves the file alone. Assuming -R instead would silently undo a
+// change the file already has -- data loss from a flag whose whole purpose is
+// to be safe to run unattended.
+#[test]
+fn test_patch_force_does_not_reverse_applied_patch() {
+    let test_dir = setup_test_dir("force_no_revert");
+
+    let target = test_dir.join("w.txt");
+    fs::write(&target, "new\n").unwrap();
+
+    let patch_file = test_dir.join("u.patch");
+    fs::write(
+        &patch_file,
+        "--- w.txt\n+++ w.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+
+    let (code, _) = run_patch_capture(vec![
+        String::from("-f"),
+        String::from("-i"),
+        patch_file.to_str().unwrap().to_string(),
+        target.to_str().unwrap().to_string(),
+    ]);
+
+    assert_eq!(code, 1, "the hunk should reject");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "new\n",
+        "-f must not revert an already-applied patch"
+    );
+    assert!(test_dir.join("w.txt.rej").exists());
+
+    cleanup_test_dir(&test_dir);
+}
+
+// -R is the explicit request to reverse, and must still do so.
+#[test]
+fn test_patch_explicit_reverse_still_reverts() {
+    let test_dir = setup_test_dir("explicit_reverse");
+
+    let target = test_dir.join("w.txt");
+    fs::write(&target, "new\n").unwrap();
+
+    let patch_file = test_dir.join("u.patch");
+    fs::write(
+        &patch_file,
+        "--- w.txt\n+++ w.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+
+    run_test(TestPlan {
+        cmd: String::from("patch"),
+        args: vec![
+            String::from("-R"),
+            String::from("-i"),
+            patch_file.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "old\n");
 
     cleanup_test_dir(&test_dir);
 }

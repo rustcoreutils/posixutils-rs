@@ -10,7 +10,7 @@
 use crate::cli::args::{parse_args, ExecutionMode};
 use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
-use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp};
+use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp, wait_for_input};
 use crate::parse::ParserError;
 use crate::shell::Shell;
 use cli::terminal::read_nonblocking_char;
@@ -24,7 +24,6 @@ use std::fs::File;
 use std::io;
 use std::io::{IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
-use std::time::Duration;
 
 mod builtin;
 mod cli;
@@ -180,7 +179,9 @@ fn standard_repl(shell: &mut Shell) {
             set_cursor_pos(cursor_position);
             flush_stdout();
         }
-        std::thread::sleep(Duration::from_millis(16));
+        // Wait for a keystroke or a signal rather than waking 62 times a
+        // second to find neither.
+        let _ = wait_for_input(io::stdin().as_raw_fd());
         shell.signal_manager.reset_sigint_count();
         shell.handle_async_events();
         if shell.signal_manager.get_sigint_count() > 0 {
@@ -254,7 +255,9 @@ fn vi_repl(shell: &mut Shell) {
             set_cursor_pos(cursor_position);
             flush_stdout()
         }
-        std::thread::sleep(Duration::from_millis(16));
+        // Wait for a keystroke or a signal rather than waking 62 times a
+        // second to find neither.
+        let _ = wait_for_input(io::stdin().as_raw_fd());
         shell.signal_manager.reset_sigint_count();
         shell.handle_async_events();
         if shell.signal_manager.get_sigint_count() > 0 {

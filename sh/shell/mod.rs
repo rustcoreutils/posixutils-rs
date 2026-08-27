@@ -44,7 +44,6 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Duration;
 use std::{env, io};
 
 /// Default capacity for cached command locations HashMap
@@ -301,7 +300,14 @@ impl Shell {
     /// and must stay in the job table.
     pub fn wait_child_process_result(&mut self, child_pid: Pid) -> OsResult<(i32, bool)> {
         loop {
-            match waitpid(child_pid, true, true)? {
+            // Block. Signal handlers are installed without SA_RESTART and write
+            // to a self-pipe, so a signal interrupts the wait with EINTR and the
+            // trap runs below; polling with WNOHANG and sleeping instead cost a
+            // full tick per foreground command.
+            match waitpid(child_pid, false, true)? {
+                WaitStatus::Interrupted => {
+                    self.handle_async_events();
+                }
                 WaitStatus::Exited { exit_status } => return Ok((exit_status, true)),
                 WaitStatus::Signaled { signal, .. } => return Ok((signal.exit_status(), true)),
                 WaitStatus::Stopped { signal } => {
@@ -317,8 +323,9 @@ impl Shell {
                     return Ok((signal.exit_status(), false));
                 }
                 WaitStatus::StillAlive => {
+                    // Only reachable for a status this shell does not ask for
+                    // (WIFCONTINUED); the child is still running, so wait again.
                     self.handle_async_events();
-                    std::thread::sleep(Duration::from_millis(16));
                 }
             }
         }
@@ -326,14 +333,19 @@ impl Shell {
 
     pub fn handle_async_events(&mut self) {
         self.process_signals();
-        if self.set_options.monitor {
-            if let Err(err) = self.background_jobs.update_jobs() {
-                self.eprint(&format!("sh: error updating background jobs ({err})\n"));
-            }
-            if self.set_options.notify {
-                self.background_jobs
-                    .write_report(|job| self.opened_files.write_err(job.to_string_short()));
-            }
+        // Reap terminated background jobs whether or not job control is on:
+        // without this a non-interactive `cmd &` loop leaves one zombie per
+        // iteration. Only the *reporting* of state changes is a job-control
+        // feature.
+        if let Err(err) = self.background_jobs.update_jobs() {
+            self.eprint(&format!("sh: error updating background jobs ({err})\n"));
+        }
+        if self.set_options.monitor && self.set_options.notify {
+            self.background_jobs
+                .write_report(|job| self.opened_files.write_err(job.to_string_short()));
+        }
+        if !self.set_options.monitor {
+            self.background_jobs.cleanup_terminated_jobs();
         }
     }
 
@@ -449,7 +461,13 @@ impl Shell {
                 self.become_subshell();
                 self.exec(command, args, opened_files)
             }
-            ForkResult::Parent { child } => self.wait_child_process(child),
+            ForkResult::Parent { child } => {
+                let status = self.wait_child_process(child);
+                // A background job may have finished while this one ran.
+                // `update_jobs` is a no-op when nothing is tracked.
+                self.handle_async_events();
+                status
+            }
         }
     }
 
@@ -1049,7 +1067,9 @@ impl Shell {
                 }
                 ForkResult::Parent { child } => {
                     loop {
-                        match waitpid(child, true, true)? {
+                        // Blocking; a signal interrupts with EINTR and is
+                        // handled below rather than being polled for.
+                        match waitpid(child, false, true)? {
                             WaitStatus::Exited { .. } => {
                                 // the only way this happened is if there was an error before going
                                 // the child went to sleep
@@ -1083,9 +1103,8 @@ impl Shell {
                                     break;
                                 }
                             }
-                            WaitStatus::StillAlive => {
+                            WaitStatus::StillAlive | WaitStatus::Interrupted => {
                                 self.handle_async_events();
-                                std::thread::sleep(Duration::from_millis(16));
                             }
                         }
                     }
@@ -1169,6 +1188,10 @@ impl Shell {
                     self.last_background_pid = Some(child);
                     self.background_jobs
                         .add_job(child, conjunction.to_string(), JobState::Running);
+                    // Reap whatever has already finished, so a loop that starts
+                    // background jobs does not accumulate a zombie per
+                    // iteration.
+                    self.handle_async_events();
                     0
                 }
                 Err(_) => {
@@ -1226,7 +1249,9 @@ impl Shell {
                 self.last_command_substitution_status = match waitpid(child, false, false)? {
                     WaitStatus::Exited { exit_status } => exit_status,
                     WaitStatus::Signaled { signal } => signal.exit_status(),
-                    WaitStatus::Stopped { .. } | WaitStatus::StillAlive => 0,
+                    WaitStatus::Stopped { .. }
+                    | WaitStatus::StillAlive
+                    | WaitStatus::Interrupted => 0,
                 };
                 // The shell represents words as UTF-8 strings; bytes that are
                 // not valid UTF-8 cannot be carried through, so substitute

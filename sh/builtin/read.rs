@@ -18,7 +18,6 @@ use crate::wordexp::split_fields;
 use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::Duration;
 
 fn bytes_to_string(bytes: Vec<u8>) -> Result<String, BuiltinError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| gettext("read: invalid UTF-8").into())
@@ -106,7 +105,9 @@ fn read_until_from_non_blocking_fd(
         }
         // might receive signals while reading
         shell.handle_async_events();
-        std::thread::sleep(Duration::from_millis(16));
+        // Wait for the next byte instead of sleeping a tick between polls; the
+        // signal pipe is watched too, so a trap is still handled promptly.
+        crate::os::wait_for_input(fd)?;
     }
     if !buffer.is_empty() {
         result.append(bytes_to_string(buffer)?, false, true);

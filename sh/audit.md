@@ -581,3 +581,36 @@ Deliberately **not** changed: a redirection error exits 1 here and in
 The `umask` fixture was corrected on both counts: it asserted the inherited mask
 was 022 (it varies by environment, so the script now sets one first) and it
 asserted the mode-755 behavior this phase fixes.
+
+### Phase 6 — wait instead of polling
+
+- [x] **Every foreground command cost a 16 ms tick.**
+  `wait_child_process_result` called `waitpid` with `WNOHANG` and slept 16 ms on
+  `StillAlive`. A loop running 200 external commands took **6.83 s** against
+  dash's 0.10 s — 68x. The same tick appeared in the pipeline wait, both
+  interactive REPL loops and the `read` builtin, so an idle interactive shell
+  woke 62 times a second.
+  The fix needed almost no new machinery, because the self-pipe was already
+  there: `os/signals.rs` installs handlers that write the signal number to
+  `SIGNAL_WRITE`, `SIGNAL_READ` is `O_NONBLOCK` and `FD_CLOEXEC`, and the
+  handlers use `SA_SIGINFO` **without `SA_RESTART`**, so a blocking syscall
+  already returns `EINTR`. `waitpid` now blocks and reports `EINTR` as
+  `WaitStatus::Interrupted`, which runs any pending trap and waits again; the
+  input loops `poll()` on stdin together with the signal pipe.
+  200 external commands now take **0.30 s**, and an idle interactive shell uses
+  **0 CPU ticks over 2 seconds**.
+- [x] **Background jobs were never reaped without job control.** `update_jobs`
+  ran only under `set -m`, so a non-interactive `cmd &` loop accumulated one
+  zombie per iteration — 20 for 20 jobs, where dash leaves none. Reaping is now
+  unconditional (only the *reporting* of state changes is a job-control
+  feature) and also runs after each foreground command, since one may have
+  finished while it ran.
+  Reaping unconditionally then exposed a second defect: `wait` collects a job
+  directly, so `update_jobs` could hit `ECHILD` for a job that was already
+  gone and printed that as an error. It is now read as "already reaped".
+
+The remaining gap to dash is ~5x per external command and is **not** polling:
+it is fork/exec cost plus the work done per command. The largest practical
+share of it is that `test` and `[` are not built in, so every `[ ... ]`
+conditional forks a process — dash and bash build both in. That belongs with
+the missing-builtin work rather than here.

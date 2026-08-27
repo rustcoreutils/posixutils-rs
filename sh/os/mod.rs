@@ -115,6 +115,38 @@ pub fn get_umask() -> u32 {
     previous
 }
 
+/// Blocks until `fd` has input available or a signal arrives, whichever comes
+/// first. Replaces polling with a sleep: an idle shell should not wake up at
+/// all, and a signal must not have to wait out a tick to be seen.
+pub fn wait_for_input(fd: RawFd) -> OsResult<()> {
+    let signal_fd = crate::os::signals::signal_read_fd();
+    let mut fds = [
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: signal_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+    if result < 0 {
+        let errno = get_current_errno_value();
+        // A signal without SA_RESTART interrupts the poll; that is the wake-up
+        // it was waiting for, not a failure.
+        if errno != Errno::EINTR {
+            return Err(OsError {
+                command: "poll",
+                errno,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn fork() -> OsResult<ForkResult> {
     // fork in general is not safe for multithreaded programs, but all code in this module is single
     // threaded, so this is safe
@@ -158,9 +190,17 @@ pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
 }
 
 pub enum WaitStatus {
-    Exited { exit_status: libc::c_int },
-    Signaled { signal: TermSignal },
-    Stopped { signal: TermSignal },
+    /// `waitpid` returned EINTR: no status yet, but a signal is pending.
+    Interrupted,
+    Exited {
+        exit_status: libc::c_int,
+    },
+    Signaled {
+        signal: TermSignal,
+    },
+    Stopped {
+        signal: TermSignal,
+    },
     StillAlive,
 }
 
@@ -175,7 +215,17 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
     }
     let wait_result = unsafe { libc::waitpid(pid, &mut status, options) };
     if wait_result < 0 {
-        Err(OsError::from_current_errno("waitpid"))
+        let errno = get_current_errno_value();
+        if errno == Errno::EINTR {
+            // A signal arrived while blocked. The handler has recorded it on
+            // the signal pipe; report it so the caller can run any trap and
+            // wait again, rather than treating it as a failure.
+            return Ok(WaitStatus::Interrupted);
+        }
+        Err(OsError {
+            command: "waitpid",
+            errno,
+        })
     } else if wait_result == 0 && no_hang {
         Ok(WaitStatus::StillAlive)
     } else if libc::WIFEXITED(status) {

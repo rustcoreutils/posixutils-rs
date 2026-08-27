@@ -3120,4 +3120,29 @@ mod audit_regressions {
             "-rw-------\n",
         );
     }
+
+    // ---- Phase 6: wait instead of polling ----------------------------------
+
+    #[test]
+    fn background_jobs_are_reaped_without_job_control() {
+        // Terminated background jobs were only collected when `monitor` was
+        // set, so a non-interactive `cmd &` loop left one zombie per iteration.
+        // Counting them needs `ps`, so assert the count rather than a timing.
+        run_successfully_and(
+            "i=0\nwhile [ $i -lt 20 ]; do /bin/true & i=$((i+1)); done\nsleep 1\nps -o stat= --ppid $$ 2>/dev/null | grep -c Z || true\n",
+            |out| assert_eq!(out.trim(), "0", "background jobs left zombies"),
+        );
+    }
+
+    #[test]
+    fn waiting_for_a_job_already_reaped_is_not_an_error() {
+        // Reaping unconditionally meant `update_jobs` could hit ECHILD for a
+        // job `wait` had already collected, and it reported that as an error.
+        test_script(
+            "for i in 1 2 3; do true & done\nwait\necho done\n",
+            "done\n",
+        );
+        test_script("true &\nwait $!\necho $?\n", "0\n");
+        test_script("false &\nwait $!\necho $?\n", "1\n");
+    }
 }

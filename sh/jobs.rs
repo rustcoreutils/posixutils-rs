@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::os::errno::Errno;
 use crate::os::signals::{Signal, TermSignal};
 use crate::os::{waitpid, OsResult, Pid, WaitStatus};
 use std::fmt::{Display, Formatter, Write};
@@ -151,7 +152,18 @@ impl JobManager {
             if matches!(job.state, JobState::Done(_) | JobState::Signaled(_)) {
                 continue;
             }
-            match waitpid(job.pid, true, true)? {
+            let status = match waitpid(job.pid, true, true) {
+                Ok(status) => status,
+                Err(err) if err.errno == Errno::ECHILD => {
+                    // Already reaped — `wait` collects a job directly, and the
+                    // shell may also be running without job control. There is
+                    // no status left to read, and nothing to report.
+                    job.state = JobState::Done(0);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            match status {
                 WaitStatus::Exited { exit_status } => {
                     job.state = JobState::Done(exit_status);
                     job.state_should_be_reported = true;
@@ -164,7 +176,8 @@ impl JobManager {
                     }
                     job.state_should_be_reported = true;
                 }
-                WaitStatus::StillAlive => {}
+                // EINTR while polling a background job: nothing to record.
+                WaitStatus::StillAlive | WaitStatus::Interrupted => {}
                 WaitStatus::Stopped { .. } => {
                     job.state = JobState::Stopped;
                     job.state_should_be_reported = true;

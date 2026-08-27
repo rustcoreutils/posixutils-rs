@@ -263,6 +263,13 @@ pub unsafe fn setup_signal_handling() {
     SIGNAL_READ = Some(read_pipe.into_raw_fd());
 }
 
+/// The read end of the self-pipe the signal handlers write to. Pollable, so a
+/// wait for input can be woken by a signal instead of being timed out.
+pub fn signal_read_fd() -> RawFd {
+    // SIGNAL_READ is never modified after the initial setup, so this is safe
+    unsafe { SIGNAL_READ.unwrap() }
+}
+
 fn get_pending_signal() -> Option<Signal> {
     // SIGNAL_READ is never modified after the initial
     // setup, so this is safe

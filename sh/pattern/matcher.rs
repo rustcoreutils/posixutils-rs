@@ -165,6 +165,9 @@ fn endpoint_char(endpoint: &RangeEndpoint) -> Option<char> {
 fn bracket_matches(expr: &BracketExpression, step: &Step, subject: &[u8]) -> bool {
     let matched = expr.items.iter().any(|item| match item {
         BracketItem::Char(c) => step.ch == Some(*c),
+        BracketItem::Byte(b) => {
+            step.ch.is_none() && step.range.len() == 1 && subject[step.range.start] == *b
+        }
         BracketItem::CollatingSymbol(s) | BracketItem::EquivalenceClass(s) => {
             single_char(s).is_some_and(|c| step.ch == Some(c))
         }

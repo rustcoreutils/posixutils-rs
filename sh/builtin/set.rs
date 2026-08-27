@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{args_as_str, BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{args_for_option_scan, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::shstr::ShString;
@@ -23,9 +23,12 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        // Options are text; the operands become the positional parameters and
-        // so must keep their bytes.
-        let options = args_as_str("set", args)?;
+        // Options are ASCII, so they can be scanned through a lossy view; the
+        // operands become the positional parameters and are taken from `args`,
+        // keeping their bytes. Rejecting a non-text argument outright would
+        // break `set -- "$@"`, the single most common idiom in the shell.
+        let options = args_for_option_scan(args);
+        let options: Vec<&str> = options.iter().map(String::as_str).collect();
         match shell.set_options.parse_args_and_update(&options) {
             Err(err) => Err(format!("set: {}\n", err).into()),
             Ok(parsed_args) => {

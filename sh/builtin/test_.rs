@@ -33,9 +33,12 @@ impl BuiltinUtility for Test {
         _: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        let mut args: Vec<String> = args.iter().map(|a| a.display().to_string()).collect();
+        // Operands keep their bytes: a path or a compared string need not be
+        // text, and converting lossily made two distinct values compare equal
+        // and file tests probe the wrong path.
+        let mut args: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
         if self.requires_closing_bracket {
-            if args.last().map(String::as_str) != Some("]") {
+            if args.last().map(Vec::as_slice) != Some(b"]".as_slice()) {
                 // A usage error, not a false expression: POSIX distinguishes
                 // them by exiting greater than 1.
                 opened_files.write_err(format!("[: {}\n", gettext("missing closing bracket")));

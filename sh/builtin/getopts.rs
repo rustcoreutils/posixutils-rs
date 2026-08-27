@@ -63,23 +63,25 @@ impl<'s> OptsParser<'s> {
                     return ParseResult::EndOfOptions;
                 }
                 options if options.starts_with(b"-") && options.len() > 1 => {
-                    // An option letter is ASCII by definition.
-                    let options = String::from_utf8_lossy(options).into_owned();
-                    for (pos, c) in options[1..].char_indices() {
+                    // Scanned over the raw bytes: an option letter is ASCII, so
+                    // one byte each, and a byte that is not one simply is not an
+                    // option. Scanning a lossy view instead made every invalid
+                    // byte three bytes wide there but one here, so the offset of
+                    // an inline option-argument indexed past the end.
+                    for (pos, byte) in options[1..].iter().enumerate() {
+                        let c = char::from(*byte);
+                        if !byte.is_ascii() {
+                            return ParseResult::InvalidOption(c);
+                        }
                         if let Some(requires_argument) = self.get_option(c) {
                             if requires_argument {
-                                if pos + c.len_utf8() + 1 < options.len() {
+                                if pos + 2 < options.len() {
                                     if i == *option_index {
                                         *param_index += 1;
                                         *option_index = 0;
-                                        // Option letters are ASCII, so the
-                                        // offset into the lossy view is the
-                                        // same offset into the bytes.
                                         return ParseResult::OptionWithArg {
                                             option: c,
-                                            arg: ShString::from(
-                                                param[1 + pos + c.len_utf8()..].to_vec(),
-                                            ),
+                                            arg: ShString::from(options[pos + 2..].to_vec()),
                                         };
                                     }
                                     break;
@@ -99,7 +101,7 @@ impl<'s> OptsParser<'s> {
                                 advance_position(
                                     param_index,
                                     option_index,
-                                    pos + c.len_utf8() >= options.len() - 1,
+                                    pos + 1 >= options.len() - 1,
                                 );
                                 return ParseResult::SimpleOption(c);
                             }
@@ -107,7 +109,7 @@ impl<'s> OptsParser<'s> {
                             advance_position(
                                 param_index,
                                 option_index,
-                                pos + c.len_utf8() >= options.len() - 1,
+                                pos + 1 >= options.len() - 1,
                             );
                             return ParseResult::InvalidOption(c);
                         }

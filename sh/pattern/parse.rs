@@ -19,6 +19,9 @@ pub enum RangeEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BracketItem {
     Char(char),
+    /// A byte that is not part of a character, standing for itself — the
+    /// bracket counterpart of [`PatternItem::Byte`].
+    Byte(u8),
     CollatingSymbol(String),
     EquivalenceClass(String),
     CharacterClass(String),
@@ -349,7 +352,7 @@ impl<'w> Parser<'w> {
         loop {
             match self.lookahead {
                 Token::Byte(b) => {
-                    expression_items.push(BracketItem::Char(char::from(b)));
+                    expression_items.push(BracketItem::Byte(b));
                     self.advance();
                 }
                 Token::Char(']') => {

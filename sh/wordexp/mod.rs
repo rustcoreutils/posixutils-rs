@@ -46,6 +46,10 @@ struct FieldSplitter<'a> {
     current: ExpandedWord,
     /// Inside a run of IFS characters that has not yet been resolved.
     in_delimiter_run: bool,
+    /// IFS white space held back once `max_fields` is reached: it joins the
+    /// final field only if ordinary text follows it, so that the white space at
+    /// the ends of the remainder is still stripped.
+    pending_whitespace: ShString,
 }
 
 impl<'a> FieldSplitter<'a> {
@@ -56,6 +60,7 @@ impl<'a> FieldSplitter<'a> {
             result: Vec::new(),
             current: ExpandedWord::default(),
             in_delimiter_run: false,
+            pending_whitespace: ShString::new(),
         }
     }
 
@@ -104,11 +109,33 @@ impl<'a> FieldSplitter<'a> {
         for element in value.chars_lossless() {
             // Only a character can be an IFS delimiter; a byte that is not part
             // of one is ordinary text.
-            let delimiter = match element {
-                CharOrByte::Char(c) => self.is_ifs(c) && !self.reached_max_fields(),
-                CharOrByte::Byte(_) => false,
-            };
-            if delimiter {
+            let is_ifs = matches!(element, CharOrByte::Char(c) if self.is_ifs(c));
+            let is_ifs_space = matches!(element, CharOrByte::Char(c) if self.is_ifs_whitespace(c));
+
+            if self.reached_max_fields() {
+                // No further field may be created, but IFS white space at the
+                // *ends* of what is left is still not part of it. Hold it back:
+                // it belongs to the field only if ordinary text follows.
+                if is_ifs_space {
+                    if !(self.current.is_empty() && accumulator.is_empty()) {
+                        self.pending_whitespace.push_char(match element {
+                            CharOrByte::Char(c) => c,
+                            CharOrByte::Byte(_) => unreachable!("white space is a character"),
+                        });
+                    }
+                    continue;
+                }
+                if !self.pending_whitespace.is_empty() {
+                    accumulator.push_bytes(std::mem::take(&mut self.pending_whitespace));
+                }
+                match element {
+                    CharOrByte::Char(c) => accumulator.push_char(c),
+                    CharOrByte::Byte(b) => accumulator.push_bytes([b]),
+                }
+                continue;
+            }
+
+            if is_ifs {
                 let CharOrByte::Char(c) = element else {
                     unreachable!("only a character can be a delimiter")
                 };

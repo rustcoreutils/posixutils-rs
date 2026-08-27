@@ -213,6 +213,14 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
 /// that is not valid text cannot be any of those, so it is reported rather than
 /// silently mangled. Utilities that carry *values* — `export`, `read`, `cd`,
 /// `test` — take the bytes instead.
+/// A lossy text view for *option scanning only*. An option letter is ASCII, so
+/// an argument that is not text cannot be one and will simply not match any
+/// option; the operand itself is still taken from the byte `args`. Never use
+/// this where the value matters.
+fn args_for_option_scan(args: &[ShString]) -> Vec<String> {
+    args.iter().map(|a| a.display().to_string()).collect()
+}
+
 fn args_as_str<'a>(utility: &str, args: &'a [ShString]) -> Result<Vec<&'a str>, BuiltinError> {
     args.iter()
         .map(|arg| {

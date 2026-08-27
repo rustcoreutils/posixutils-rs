@@ -200,38 +200,40 @@ fn read_from_stdin(
     }
 }
 
-fn read_from_here_document(content: &str, delimiter: u8, backslash_escape: bool) -> ReadResult {
-    let mut buffer = String::new();
+fn read_from_here_document(content: &[u8], delimiter: u8, backslash_escape: bool) -> ReadResult {
+    // Scanned over bytes: the delimiter and the backslash are ASCII, so nothing
+    // here needs decoding and the contents survive unchanged.
+    let mut buffer = ShString::new();
     let mut result = ExpandedWord::default();
     let mut reached_eof = true;
     let mut escape_next = false;
     let mut consumed_bytes = content.len();
-    for (offset, c) in content.char_indices() {
+    for (offset, c) in content.iter().copied().enumerate() {
         // An escaped character is taken literally, so the delimiter test must
         // come after this one: backslash-<delimiter> is a line continuation,
         // not the end of the line (same rule as `read_until_from_file`).
         if escape_next {
             escape_next = false;
-            if c == delimiter as char {
+            if c == delimiter {
                 continue;
-            } else if c == '\\' {
-                buffer.push('\\');
+            } else if c == b'\\' {
+                buffer.push_bytes(b"\\");
             } else {
                 result.append(std::mem::take(&mut buffer), false, true);
-                result.append(c.to_string(), true, true);
+                result.append(ShString::from(vec![c]), true, true);
             }
             continue;
         }
-        if c == delimiter as char {
+        if c == delimiter {
             reached_eof = false;
-            consumed_bytes = offset + c.len_utf8();
+            consumed_bytes = offset + 1;
             break;
         }
-        if backslash_escape && c == '\\' {
+        if backslash_escape && c == b'\\' {
             escape_next = true;
             continue;
         }
-        buffer.push(c);
+        buffer.push_bytes([c]);
     }
     if !buffer.is_empty() {
         result.append(buffer, false, true);
@@ -287,10 +289,11 @@ fn read_until(
             // A here-document has no file offset, so the text just read is
             // removed from the shared buffer; the next `read` continues after
             // it, as it would with a real descriptor.
-            let result = read_from_here_document(&contents.borrow(), delimiter, backslash_escape);
+            let result =
+                read_from_here_document(contents.borrow().as_bytes(), delimiter, backslash_escape);
             let mut remaining = contents.borrow_mut();
             let consumed = result.consumed_bytes.min(remaining.len());
-            remaining.drain(..consumed);
+            *remaining = ShString::from(remaining[consumed..].to_vec());
             Ok(result)
         }
         _ => Err(gettext("read: invalid standard input").into()),

@@ -62,6 +62,21 @@ fn join_parameters(parameters: &[ShString], separator: &[u8]) -> ShString {
     result
 }
 
+/// The separator `$*` joins with: the *first character* of IFS, or the first
+/// byte when that byte is not part of one. Slicing one byte unconditionally
+/// split a multi-byte character and panicked (`IFS=é`). An unset IFS behaves as
+/// a space; an empty IFS joins with nothing.
+fn dollar_star_separator(shell: &Shell) -> ShString {
+    match shell.environment.get_value("IFS") {
+        Some(ifs) => match ifs.chars_lossless().next() {
+            Some(CharOrByte::Char(c)) => ShString::from(&ifs[..c.len_utf8()]),
+            Some(CharOrByte::Byte(b)) => ShString::from(vec![b]),
+            None => ShString::new(),
+        },
+        None => ShString::from(" "),
+    }
+}
+
 fn add_split_parameters_to_expanded_word(
     word: &mut ExpandedWord,
     parameters: &[ShString],
@@ -199,10 +214,15 @@ fn expand_simple_parameter_into(
             // always set.
             match special_parameter {
                 SpecialParameter::At | SpecialParameter::Asterisk => {
-                    // Always set, but null when they expand to nothing — so
+                    // Always set, but null when the *joined* value is empty, so
                     // `${*:-word}` substitutes with no positional parameters
-                    // while `${*-word}` does not.
-                    if shell.positional_parameters.iter().all(|p| p.is_empty()) {
+                    // while `${*-word}` does not. The separators count: two
+                    // empty parameters join to a single space and so are not
+                    // null, unless IFS is itself empty.
+                    let all_empty = shell.positional_parameters.iter().all(|p| p.is_empty());
+                    let joins_to_nothing = shell.positional_parameters.len() < 2
+                        || dollar_star_separator(shell).is_empty();
+                    if all_empty && joins_to_nothing {
                         ParameterExpansionResult::Null
                     } else {
                         ParameterExpansionResult::Set
@@ -257,9 +277,12 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
+                // The default *replaces* the parameter, so its own expansion
+                // must not be appended as well.
                 simple_word_expansion_into(expanded_word, default, TildeMode::Word, shell)?;
+            } else {
+                expanded_word.extend(expanded_parameter);
             }
-            expanded_word.extend(expanded_parameter);
         }
         ParameterExpansion::UnsetAssignDefault {
             variable: variable_name,

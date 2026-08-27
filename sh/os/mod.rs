@@ -334,6 +334,8 @@ pub fn exec(
         .unwrap_or(libc::STDERR_FILENO);
     let mut staged: Vec<(RawFd, RawFd)> = Vec::with_capacity(opened_files.opened_files.len());
     let mut to_close: Vec<RawFd> = Vec::new();
+    // Descriptors this function opened and must not leave behind.
+    let mut temporaries: Vec<RawFd> = Vec::new();
     for (id, file) in &opened_files.opened_files {
         let dest = *id as i32;
         let src = match file {
@@ -344,7 +346,12 @@ pub fn exec(
             | OpenedFile::WriteFile(file)
             | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
             OpenedFile::HereDocument(contents) => {
-                here_document_fd(contents.borrow().as_bytes())?.into_raw_fd()
+                // Owned here: the temporary must be closed once it has been
+                // duplicated into place, or it is inherited by the exec'd
+                // process as a stray descriptor.
+                let fd = here_document_fd(contents.borrow().as_bytes())?.into_raw_fd();
+                temporaries.push(fd);
+                fd
             }
             OpenedFile::Closed => {
                 // `2>&-`: the descriptor must actually be closed, not merely
@@ -362,6 +369,9 @@ pub fn exec(
     for (src, dest) in staged {
         dup2(src, dest)?;
         close(src)?;
+    }
+    for fd in temporaries {
+        let _ = close(fd);
     }
     for fd in to_close {
         let _ = close(fd);

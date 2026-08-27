@@ -1249,12 +1249,19 @@ impl Shell {
                 // POSIX 2.9.1: when a command consists only of substitutions,
                 // its exit status is that of the last one, so the status has
                 // to be recorded rather than discarded.
-                self.last_command_substitution_status = match waitpid(child, false, false)? {
-                    WaitStatus::Exited { exit_status } => exit_status,
-                    WaitStatus::Signaled { signal } => signal.exit_status(),
-                    WaitStatus::Stopped { .. }
-                    | WaitStatus::StillAlive
-                    | WaitStatus::Interrupted => 0,
+                // Blocking, so EINTR must be retried like every other wait
+                // site: handlers are installed without SA_RESTART, and folding
+                // `Interrupted` into 0 would report success for whatever the
+                // child actually did and leave it unreaped.
+                self.last_command_substitution_status = loop {
+                    match waitpid(child, false, false)? {
+                        WaitStatus::Exited { exit_status } => break exit_status,
+                        WaitStatus::Signaled { signal } => break signal.exit_status(),
+                        WaitStatus::Interrupted | WaitStatus::StillAlive => {
+                            self.handle_async_events()
+                        }
+                        WaitStatus::Stopped { .. } => break 0,
+                    }
                 };
                 // POSIX leaves NUL bytes in command output unspecified; drop
                 // them (as bash does) so they cannot reach the C-string paths.

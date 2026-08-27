@@ -22,10 +22,8 @@ impl SpecialBuiltinUtility for Eval {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         let args = skip_option_terminator(args);
-        // `eval` concatenates its operands and reparses them, so the text has
-        // to be text; the lexer works on `&str`.
-        // `eval` concatenates its operands and reparses them; the lexer now
-        // works on bytes, so nothing has to be text.
+        // `eval` concatenates its operands and reparses them; the lexer works
+        // on bytes, so nothing has to be text.
         let mut program: Vec<u8> = Vec::new();
         for (index, arg) in args.iter().enumerate() {
             if index > 0 {

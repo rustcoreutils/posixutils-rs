@@ -3367,4 +3367,122 @@ mod audit_regressions {
             b"a\xffb\n",
         );
     }
+
+    // ---- Review follow-up: byte-safety gaps in the converted builtins ------
+
+    #[test]
+    fn set_and_cd_keep_the_bytes_of_their_operands() {
+        // Both scanned their options through a *fallible* text conversion, so
+        // any non-text argument was rejected outright -- `set -- "$@"` is the
+        // most common idiom in the shell. Options are ASCII, so they can be
+        // scanned lossily while the operand keeps its bytes.
+        expect_stdout_bytes(
+            b"set -- \"$(printf 'a\\377b')\"\necho \"$1\"\n",
+            b"a\xffb\n",
+        );
+        expect_stdout_bytes(
+            b"cd \"$TEST_WRITE_DIR\"\nd=$(printf 'd\\377')\nrm -rf \"$d\"\nmkdir \"$d\"\ncd \"$d\" && echo in\ncd ..\nrm -rf \"$d\"\n",
+            b"in\n",
+        );
+    }
+
+    #[test]
+    fn test_probes_the_path_it_was_given() {
+        // The builtin converted every operand lossily, so a file test probed a
+        // path with U+FFFD in it and two distinct byte strings compared equal.
+        expect_stdout_bytes(
+            b"cd \"$TEST_WRITE_DIR\"\nf=$(printf 'tf\\377')\nrm -f \"$f\"\n: > \"$f\"\n[ -e \"$f\" ] && echo present\nrm -f \"$f\"\n",
+            b"present\n",
+        );
+        expect_stdout_bytes(
+            b"a=$(printf 'x\\377')\nb=$(printf 'x\\376')\n[ \"$a\" = \"$b\" ] && echo same || echo different\n",
+            b"different\n",
+        );
+    }
+
+    #[test]
+    fn a_redirection_target_keeps_its_bytes() {
+        // The target was converted lossily on the way to `open`, so the file
+        // created had U+FFFD in its name rather than the byte asked for.
+        expect_stdout_bytes(
+            b"cd \"$TEST_WRITE_DIR\"\nf=$(printf 'rt\\377')\nrm -f \"$f\"\necho hi > \"$f\"\ncat \"$f\"\nrm -f \"$f\"\n",
+            b"hi\n",
+        );
+    }
+
+    #[test]
+    fn getopts_does_not_panic_on_a_non_text_parameter() {
+        // Option letters were scanned through a lossy view but the offset of an
+        // inline option-argument indexed the raw bytes, so an invalid byte
+        // (1 raw byte, 3 lossy) ran the slice past the end.
+        expect_exit_code(
+            "set -- \"$(printf -- '-\\377aX')\"\ngetopts 'a:' o\ngetopts 'a:' o\n",
+            0,
+        );
+        // The ordinary forms still work.
+        test_script(
+            "set -- -aVAL\ngetopts a: o\necho \"$o=$OPTARG\"\n",
+            "a=VAL\n",
+        );
+        test_script(
+            "set -- -ab\ngetopts ab o; echo $o\ngetopts ab o; echo $o\n",
+            "a\nb\n",
+        );
+    }
+
+    #[test]
+    fn read_strips_ifs_whitespace_from_the_ends() {
+        // The field splitter stops creating fields once `max_fields` is reached,
+        // which for `read var` is immediately -- but that must not stop it
+        // recognizing the IFS white space at the *ends* of the remainder.
+        test_script("read a <<EOF\n  hello  \nEOF\necho \"[$a]\"\n", "[hello]\n");
+        test_script("read a b <<EOF\nx y z \nEOF\necho \"[$b]\"\n", "[y z]\n");
+        // A non-white-space IFS character is *not* stripped.
+        test_script(
+            "IFS=:\nread a b <<EOF\nx:y:z\nEOF\necho \"[$b]\"\n",
+            "[y:z]\n",
+        );
+    }
+
+    #[test]
+    fn a_here_document_leaves_no_stray_descriptor() {
+        // The temporary the here-document is written to was duplicated into
+        // place but never closed, so the exec'd process inherited it.
+        run_successfully_and("ls /proc/self/fd 2>/dev/null <<EOF\nx\nEOF\n", |out| {
+            let fds: Vec<&str> = out.split_whitespace().collect();
+            assert!(
+                fds.len() <= 4,
+                "a here-document leaked a descriptor: {fds:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn dollar_star_is_null_only_when_it_joins_to_nothing() {
+        // Nullness follows the *joined* value, separators included: two empty
+        // parameters join to a single space and so are not null, unless IFS is
+        // itself empty. And when the default is used the parameter's own
+        // expansion must not be appended after it.
+        test_script("set -- ''\necho \"[${*:-X}]\"\n", "[X]\n");
+        test_script("set -- '' ''\necho \"[${*:-X}]\"\n", "[ ]\n");
+        test_script("IFS=\nset -- '' ''\necho \"[${*:-X}]\"\n", "[X]\n");
+        test_script("set --\necho \"[${*:-X}]\"\n", "[X]\n");
+        test_script("set -- '' a\necho \"[${*:-X}]\"\n", "[ a]\n");
+        test_script("set -- ''\necho \"[${*-X}]\"\n", "[]\n");
+    }
+
+    #[test]
+    fn a_bracket_expression_matches_a_byte_that_is_not_a_character() {
+        // The member was recorded as the Latin-1 *character*, but the subject
+        // step for such a byte decodes to nothing, so it could never match --
+        // while the same byte outside a bracket matched correctly.
+        expect_stdout_bytes(
+            b"case $(printf '\\377') in [\xff]) echo match;; *) echo no;; esac\n",
+            b"match\n",
+        );
+        expect_stdout_bytes(
+            b"case a in [!\xff]) echo match;; *) echo no;; esac\n",
+            b"match\n",
+        );
+    }
 }

@@ -852,3 +852,64 @@ did turn up is a conformance-adjacent gap of a different kind:
   they cannot drift apart. `misc`'s 37 `test` tests pass unchanged against the
   extracted code. A usage error exits 2 and a false expression exits 1, matching
   dash.
+
+### Review follow-up — byte-safety gaps left by the conversion
+
+A review of the branch found twelve defects, ten of them introduced by the byte
+conversion itself: places that had been converted to *carry* bytes but still
+*decoded* them at the last step. All are fixed.
+
+- [x] **`set` and `cd` rejected any non-text operand.** Both scanned their
+  options through the *fallible* `args_as_str`, which bails before the operand
+  is used — so `set -- "$@"`, the most common idiom in the shell, failed on any
+  argument that was not text. Option letters are ASCII, so a new
+  `args_for_option_scan` gives a lossy view for scanning while the operand is
+  still taken from the bytes.
+- [x] **The `test`/`[` builtin decoded every operand.** `a.display().to_string()`
+  turned an invalid byte into U+FFFD, so a file test probed the wrong path and
+  two distinct byte strings compared equal. `plib::test_expr` now evaluates over
+  `&[Vec<u8>]` — paths via `OsStr::from_bytes`, `=`/`!=` by byte comparison,
+  numbers and descriptor numbers still parsed as text — and both the standalone
+  utility and the builtin pass it bytes. `misc`'s 37 tests pass unchanged.
+- [x] **A redirection target was decoded on the way to `open`.** The comment said
+  "a redirection target is a path: bytes" and the code then passed
+  `file.display().to_string()`, so `> "$f"` created a file with U+FFFD in its
+  name. `io_redirect` takes `&ShStr` and opens through `OsStr`. Here-document
+  contents were decoded the same way and now stay bytes end to end.
+- [x] **`getopts` panicked on a non-text positional parameter.** Option letters
+  were scanned through a lossy view but the offset of an inline option-argument
+  indexed the *raw* bytes — an invalid byte is 3 bytes in the view and 1 in the
+  original, so the slice ran past the end. The scan is over raw bytes now; a
+  non-ASCII byte simply is not an option.
+- [x] **`read` stopped stripping IFS white space from the ends.** The new
+  splitter disables delimiter handling once `max_fields` is reached, which for
+  `read var` is immediately, so `read a` on `␣␣hello␣␣` kept the padding. The cap
+  must stop *creating fields*, not stop recognizing IFS white space at the ends:
+  white space is now held back and joins the final field only if ordinary text
+  follows.
+- [x] **A here-document leaked its descriptor into the exec'd process.** The
+  temporary is duplicated into place, but the original was never closed after
+  the staging rewrite, so the child inherited a stray fd on `/tmp/sh-heredoc-*`.
+- [x] **EINTR in a command substitution was reported as exit status 0.**
+  `WaitStatus::Interrupted` was folded into the `=> 0` arm instead of retrying,
+  so a trapped signal arriving before the `waitpid` reported success whatever
+  the child did, and left it unreaped. It loops like every other blocking wait.
+- [x] **`${*:-word}` substituted when it should not, and leaked.** Nullness was
+  "all parameters empty", but it follows the *joined* value: two empty
+  parameters join to a single space and so are not null, unless IFS is itself
+  empty. And when the default was used the parameter's own expansion was still
+  appended after it, so `set -- "" ""` gave `X ` instead of ` `.
+- [x] **A raw byte inside a bracket expression could never match.** It was
+  recorded as the Latin-1 *character*, but the subject step for such a byte
+  decodes to nothing, so `[<0xff>]` never matched while a bare `<0xff>` did —
+  the two paths disagreed. `BracketItem::Byte` mirrors `PatternItem::Byte`.
+- [x] **`#[allow(dead_code)]`** on `HistoryPattern::match_only_at_line_start`,
+  which CLAUDE.md forbids outright. The field was written and never read (the
+  anchoring is baked into `items`); it is deleted.
+- [x] A duplicated, self-contradicting comment in `eval` — one half written
+  before the lexer took bytes and one after — is reduced to the true half.
+
+The lesson is narrow and worth keeping: converting a *type* to bytes does not
+convert the *code*, and `.display()` is exactly where the two come apart. Every
+one of these was a `.display()`, a lossy view, or a fallible text conversion
+sitting on a path that had already been given bytes to carry.

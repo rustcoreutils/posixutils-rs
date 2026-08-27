@@ -10,6 +10,7 @@
 use crate::os::write;
 use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
 use crate::shell::{CommandExecutionError, Shell};
+use crate::shstr::{ShStr, ShString};
 use crate::wordexp::expand_word_to_string;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -45,7 +46,7 @@ pub enum OpenedFile {
     /// A here-document. The remaining text is shared between clones of
     /// `OpenedFiles`, the way a real descriptor shares its file offset, so
     /// that `read` in a loop consumes successive lines.
-    HereDocument(Rc<RefCell<String>>),
+    HereDocument(Rc<RefCell<ShString>>),
 }
 
 fn io_err_to_redirection_err(err: std::io::Error) -> CommandExecutionError {
@@ -61,7 +62,7 @@ impl OpenedFiles {
     fn io_redirect(
         &mut self,
         kind: &IORedirectionKind,
-        target: &str,
+        target: &ShStr,
         file_descriptor: Option<u32>,
         shell: &Shell,
     ) -> RedirectionResult {
@@ -81,25 +82,26 @@ impl OpenedFiles {
                         .mode(FILE_CREATION_MODE)
                         .write(true)
                         .create_new(true)
-                        .open(target)
+                        .open(target.as_os_str())
                     {
                         Ok(file) => file,
                         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                             // noclobber only forbids overwriting an existing
                             // regular file; FIFOs/devices may still be written.
-                            let is_regular = std::fs::metadata(target)
+                            let is_regular = std::fs::metadata(target.as_os_str())
                                 .map(|m| m.is_file())
                                 .unwrap_or(true);
                             if is_regular {
                                 return Err(CommandExecutionError::RedirectionError(format!(
-                                    "sh: redirection would overwrite existing file {target}",
+                                    "sh: redirection would overwrite existing file {}",
+                                    target.display()
                                 )));
                             }
                             File::options()
                                 .mode(FILE_CREATION_MODE)
                                 .write(true)
                                 .create(true)
-                                .open(target)
+                                .open(target.as_os_str())
                                 .map_err(io_err_to_redirection_err)?
                         }
                         Err(err) => return Err(io_err_to_redirection_err(err)),
@@ -111,7 +113,7 @@ impl OpenedFiles {
                         .truncate(!append)
                         .append(append)
                         .create(true)
-                        .open(target)
+                        .open(target.as_os_str())
                         .map_err(io_err_to_redirection_err)?
                 };
 
@@ -125,15 +127,20 @@ impl OpenedFiles {
                 } else {
                     file_descriptor.unwrap_or(STDIN_FILENO)
                 };
-                if target == "-" {
+                if *target == "-" {
                     self.opened_files.insert(dest_fd, OpenedFile::Closed);
                 } else {
                     let duplicate_input = *kind == IORedirectionKind::DuplicateInput;
-                    let source_fd = target.parse::<u32>().map_err(|_| {
-                        CommandExecutionError::RedirectionError(format!(
-                            "sh: invalid file descriptor {target}"
-                        ))
-                    })?;
+                    // A descriptor number is text by definition.
+                    let source_fd = target
+                        .to_str()
+                        .and_then(|t| t.parse::<u32>().ok())
+                        .ok_or_else(|| {
+                            CommandExecutionError::RedirectionError(format!(
+                                "sh: invalid file descriptor {}",
+                                target.display()
+                            ))
+                        })?;
                     match self.opened_files.get(&source_fd) {
                         Some(OpenedFile::WriteFile(_))
                         | Some(OpenedFile::Stdout)
@@ -168,7 +175,7 @@ impl OpenedFiles {
                 let file = File::options()
                     .mode(FILE_CREATION_MODE)
                     .read(true)
-                    .open(target)
+                    .open(target.as_os_str())
                     .map_err(io_err_to_redirection_err)?;
                 let source_fd = file_descriptor.unwrap_or(STDIN_FILENO);
                 self.opened_files
@@ -180,7 +187,7 @@ impl OpenedFiles {
                     .read(true)
                     .write(true)
                     .create(true)
-                    .open(target)
+                    .open(target.as_os_str())
                     .map_err(io_err_to_redirection_err)?;
                 let source_fd = file_descriptor.unwrap_or(STDIN_FILENO);
                 self.opened_files
@@ -199,29 +206,20 @@ impl OpenedFiles {
             match &redir.kind {
                 RedirectionKind::IORedirection { kind, file } => {
                     let file = expand_word_to_string(&file.word, false, shell)?;
-                    // A redirection target is a path: bytes.
-                    self.io_redirect(
-                        kind,
-                        &file.display().to_string(),
-                        redir.file_descriptor,
-                        shell,
-                    )?;
+                    // A redirection target is a path, so it keeps its bytes.
+                    self.io_redirect(kind, &file, redir.file_descriptor, shell)?;
                 }
                 RedirectionKind::HereDocument { contents, .. } => {
                     let contents = expand_word_to_string(&contents.word, false, shell)?;
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
-                        OpenedFile::HereDocument(Rc::new(RefCell::new(
-                            contents.display().to_string(),
-                        ))),
+                        OpenedFile::HereDocument(Rc::new(RefCell::new(contents.clone()))),
                     );
                 }
                 RedirectionKind::QuotedHereDocument { contents, .. } => {
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
-                        OpenedFile::HereDocument(Rc::new(RefCell::new(
-                            contents.display().to_string(),
-                        ))),
+                        OpenedFile::HereDocument(Rc::new(RefCell::new(contents.clone()))),
                     );
                 }
             }

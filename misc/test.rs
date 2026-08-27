@@ -12,6 +12,8 @@
 
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::test_expr::{eval_posix_strict, EvalResult};
+use std::ffi::OsStr;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,10 +23,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let mut args: Vec<String> = std::env::args().collect();
+    // Operands are byte strings: a path or a compared string need not be text.
+    let mut args: Vec<Vec<u8>> = std::env::args_os().map(|a| a.into_vec()).collect();
 
     // Detect if invoked as "[" or "test"
-    let prog_name = Path::new(&args[0])
+    let prog_name = Path::new(OsStr::from_bytes(&args[0]))
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -32,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // If program name is "[", then final arg must be "]"
     if is_bracket {
-        if args.last().map(|s| s.as_str()) != Some("]") {
+        if args.last().map(Vec::as_slice) != Some(b"]".as_slice()) {
             eprintln!("{}", gettext("missing closing bracket"));
             std::process::exit(2);
         }

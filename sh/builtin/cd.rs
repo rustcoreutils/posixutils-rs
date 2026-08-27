@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{args_as_str, BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_for_option_scan, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::chdir;
 use crate::shell::opened_files::OpenedFiles;
@@ -137,7 +137,10 @@ impl BuiltinUtility for Cd {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        let options = args_as_str("cd", args)?;
+        // As in `set`: options through a lossy view, the directory operand from
+        // the bytes. A path need not be text.
+        let options = args_for_option_scan(args);
+        let options: Vec<&str> = options.iter().map(String::as_str).collect();
         let args = match CdArgs::parse(args, &options) {
             Ok(args) => args,
             Err(err) => {

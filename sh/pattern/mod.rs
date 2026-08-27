@@ -166,10 +166,9 @@ impl TryFrom<ShString> for FilenamePattern {
 }
 
 pub struct HistoryPattern {
+    /// The anchoring is baked in: an unanchored search is padded with `*` on
+    /// both sides, a `^`-anchored one only on the right.
     items: ParsedPattern,
-    /// Kept for `Debug`/introspection; the anchoring is baked into `items`.
-    #[allow(dead_code)]
-    match_only_at_line_start: bool,
 }
 
 impl HistoryPattern {
@@ -190,10 +189,7 @@ impl HistoryPattern {
         );
         items.push(PatternItem::Asterisk);
         matcher::validate(&items)?;
-        Ok(Self {
-            items,
-            match_only_at_line_start,
-        })
+        Ok(Self { items })
     }
 
     pub fn matches(&self, s: &str) -> bool {

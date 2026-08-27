@@ -444,19 +444,33 @@ impl Rule {
 
     /// A helper function to initialize env vars for shell commands.
     fn init_env(&self, env_macros: bool, command: &mut Command, variables: &[Macro]) {
-        let mut macros: HashMap<String, String> = variables.iter().cloned().collect();
-
-        // POSIX: the `SHELL` macro shall not modify the `SHELL` environment
-        // variable seen by recipes, so never export it. The child still
-        // inherits the real `SHELL` from this process's environment.
-        macros.remove(DEFAULT_SHELL_VAR);
-
-        if env_macros {
-            let env_vars: HashMap<String, String> = std::env::vars().collect();
-            macros.extend(env_vars);
-        }
-        command.envs(macros);
+        command.envs(exported_macros(env_macros, variables));
     }
+}
+
+/// The makefile macros a recipe's environment should carry.
+///
+/// POSIX 105869: macros defined in a makefile "shall not be added to the
+/// environment of make if they are not already in its environment", so a macro
+/// whose name make did not inherit is never exported. Whether an
+/// already-present variable is *updated* is unspecified (105871); we update it,
+/// matching GNU make -- except under `-e`, where the environment wins.
+///
+/// `SHELL` is excluded outright: it selects the recipe shell and must not be
+/// handed to the child as an environment variable.
+///
+/// The child inherits make's own environment regardless; this only decides what
+/// is added on top.
+fn exported_macros(env_macros: bool, variables: &[Macro]) -> HashMap<String, String> {
+    if env_macros {
+        return HashMap::new();
+    }
+    let inherited: HashMap<String, String> = std::env::vars().collect();
+    variables
+        .iter()
+        .filter(|(name, _)| name != DEFAULT_SHELL_VAR && inherited.contains_key(name))
+        .cloned()
+        .collect()
 }
 
 impl From<ParsedRule> for Rule {

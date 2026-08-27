@@ -90,19 +90,15 @@ wrong build.
   2026-08-27 (P1 step 1). `expand_includes` threads the real macro table through
   `process_include_lines`, which was being handed `&HashMap::new()`, so
   `include $(TOP)/inc.mk` now resolves. Test `test_include_path_may_use_a_macro`.
-- [ ] **#36 — No `VARIABLE` node is ever built, so `SHELL` and the recipe
-  environment are dead.** `parser/parse.rs`. `Makefile::variable_definitions()`
-  always returns empty and `Make::macros` is always `[]`, which makes `Macro`,
-  `Rule::init_env` and the `SHELL` lookup in `rule.rs` unreachable machinery.
-  Old #12 claimed this fixed ("the recipe shell is resolved from the `SHELL`
-  *macro*"); it is not. Probed with `SHELL = ./fakesh`: the recipe runs under
-  `/bin/sh` and prints `real-sh-ran`, where GNU runs `fakesh` and prints
-  `FAKESH-RAN args=[-c echo real-sh-ran]`. Note the macro *does* expand —
-  `$(SHELL)` yields `/bin/zzz` — because textual substitution happens in the
-  preprocessor. It is only the structured `Make::macros` lookup that is empty,
-  so a fix has to route the recipe-shell decision through the same path
-  expansion already uses. The env-var half of old #12 holds: `SHELL` in the
-  environment is correctly ignored.
+- [x] **#36 — No `VARIABLE` node is ever built, so `SHELL` and the recipe
+  environment are dead.** ✓ fixed 2026-08-27 (P1). Macros never reached the
+  tree: the preprocessor consumed them textually and blanked their lines before
+  lexing, so `variable_definitions()` was always empty and `Make::macros` always
+  `[]`. `preprocess` now returns the macro table and `Make` takes it directly —
+  no node kind was needed. Probed with `SHELL = ./fakesh`: the recipe runs under
+  `fakesh`, matching GNU. Test `shell_macro_selects_the_recipe_shell`.
+  _Landing this exposed **#49**, which had to be fixed alongside it._
+
 - [ ] **#37 — `$*` expands to the whole target name, not the stem.** `rule.rs`.
   POSIX: the target with the suffix deleted. A `.c.o:` rule on `f.o` yields
   `STAR=[f.o]`, should be `f`. This also breaks the crate's own built-in `.c.a`
@@ -143,6 +139,27 @@ wrong build.
   which of `.c:` / `.sh:` appears first in the makefile: rules in the order
   `.c` then `.sh` give `VIA-C`, and reversing just the two rules gives
   `VIA-SH`. GNU gives `VIA-SH` in both cases, following `.SUFFIXES`.
+
+- [x] **#49 — Makefile macros leak into every recipe's environment.** ✓ fixed
+  2026-08-27 (P1), in the commit that closed #36. `init_env` did
+  `command.envs(macros)` unconditionally — inert only while `Make::macros` was
+  empty, and a live leak the moment #36 wired it up. POSIX 105869: macros
+  defined in a makefile "shall not be added to the environment of make if they
+  are not already in its environment". `exported_macros` now filters to names
+  make already inherited, and `SHELL` is excluded outright. Whether an
+  already-present variable is *updated* is unspecified (105871); we update it,
+  matching GNU, except under `-e` where the environment wins. Tests
+  `makefile_macro_absent_from_env_is_not_exported`,
+  `makefile_macro_present_in_env_is_updated`, `dash_e_lets_the_environment_win`.
+  _Known residual: `main.rs` appends command-line macros to the makefile text,
+  so they are indistinguishable from makefile macros and are also not exported.
+  POSIX 105866 requires that they be. Recorded as **#50**._
+- [ ] **#50 — Command-line `macro=value` operands are not exported to recipes.**
+  POSIX 105866: command-line macro definitions (except `MAKEFLAGS` and `SHELL`)
+  "shall be added to the environment of make". `main.rs` appends them as trailing
+  makefile text, so by the time they reach `Make::macros` nothing distinguishes
+  them from a definition written in the file, and #49's filter excludes both.
+  Needs macro *source* tracking (POSIX sources 1-4), which is P3 work.
 
 ## Minor
 

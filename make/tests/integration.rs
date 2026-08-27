@@ -299,6 +299,69 @@ mod internal_macros {
         );
     }
 
+    // Audit #36: the recipe shell comes from the `SHELL` macro. It used to be
+    // inert because `Make::macros` was always empty, so every recipe ran under
+    // /bin/sh no matter what the makefile said. `/bin/echo` as the shell makes
+    // the invocation visible instead of running it.
+    #[test]
+    fn shell_macro_selects_the_recipe_shell() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-f", "tests/makefiles/macros/shell_macro.mk"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // /bin/echo consumes the leading `-e` as its own "enable escapes"
+        // flag, so what it prints back is the rest of the invocation. Seeing
+        // it at all proves /bin/echo, not /bin/sh, ran the recipe.
+        assert_eq!(stdout, "-c echo hi\n", "stdout: {stdout}");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    fn run_env_export(extra_env: Option<(&str, &str)>, args: &[&str]) -> String {
+        let bin = get_binary_path("make");
+        let mut cmd = Command::new(bin);
+        cmd.arg("-f")
+            .arg("tests/makefiles/macros/env_export.mk")
+            .args(args);
+        if let Some((k, v)) = extra_env {
+            cmd.env(k, v);
+        }
+        let output = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    // POSIX 105869: a macro defined in a makefile "shall not be added to the
+    // environment of make if they are not already in its environment". Wiring
+    // #36 made `Make::macros` non-empty for the first time, which turned
+    // `init_env`'s unconditional export into a live leak.
+    #[test]
+    fn makefile_macro_absent_from_env_is_not_exported() {
+        let stdout = run_env_export(None, &[]);
+        assert_eq!(stdout, "MYMACRO=[]\n", "stdout: {stdout}");
+    }
+
+    // 105871 leaves updating an existing variable unspecified; we update it,
+    // matching GNU make.
+    #[test]
+    fn makefile_macro_present_in_env_is_updated() {
+        let stdout = run_env_export(Some(("MYMACRO", "fromenv")), &[]);
+        assert_eq!(stdout, "MYMACRO=[frommakefile]\n", "stdout: {stdout}");
+    }
+
+    // Under -e the environment wins over the makefile.
+    #[test]
+    fn dash_e_lets_the_environment_win() {
+        let stdout = run_env_export(Some(("MYMACRO", "fromenv")), &["-e"]);
+        assert_eq!(stdout, "MYMACRO=[fromenv]\n", "stdout: {stdout}");
+    }
+
     // Audit #13: the `MAKEFLAGS` environment variable seeds options; `n`
     // behaves as `-n` (print recipe, do not execute).
     #[test]

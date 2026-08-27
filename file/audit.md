@@ -11,8 +11,9 @@ verification** of all Critical/Major findings against freshly built release bina
 (`cargo build --release`). The original pass modified no code; the follow-up
 passes recorded below landed fixes and tests.
 
-**Status: all findings closed.** The only unchecked boxes remaining are two
-`N/A` notes recording deliberate non-POSIX extensions (DD-10, SPLIT-3).
+**Status: all findings closed**, with no unchecked boxes left. Two of the
+ticked items are `N/A` dispositions rather than fixes — DD-10 and SPLIT-3
+record deliberate non-POSIX size-suffix extensions kept on purpose.
 
 This crate ships eight POSIX utilities plus one support module:
 

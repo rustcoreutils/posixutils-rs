@@ -35,6 +35,11 @@ SysV message-queue omission (#IR3 — platform limitation), and the crate-wide
 consistent with `dev/`). All six utilities are promoted to README
 **Stage 6 — Audited**.
 
+**The two unchecked boxes left in this file are test-coverage gaps, not
+findings:** `ps` header suppression asserts the exit status but not the output
+content, and `who`'s `-T` state characters and `-b` "system boot" line are
+unasserted. The behavior itself is implemented; only the assertions are missing.
+
 ## Cross-cutting observations
 
 Four patterns recur across the crate and are not repeated in every section:
@@ -347,7 +352,8 @@ var) are absent. `TZ`/`LC_TIME` are ignored for all time output.
 Not covered:
 - [x] `etime` numeric correctness (#P1) — unit test `format_etime_elapsed` + behavioral cross-check vs `/usr/bin/ps` (Phase 3).
 - [x] `COLUMNS`/`-w` truncation (#P4) — unit test + behavioral 3041-byte argv check (Phase 5).
-- [x] `-n` accepted (#P5, Phase 5); defunct marking (#P10 — unit test + real-zombie check, Phase 6). [ ] header suppression content (`ps_empty_header` only checks exit).
+- [x] `-n` accepted (#P5, Phase 5); defunct marking (#P10 — unit test + real-zombie check, Phase 6).
+  - [ ] Header-suppression *content* is still unasserted — `ps_empty_header` only checks the exit status.
 
 ---
 
@@ -473,7 +479,8 @@ extra operands beyond `file` are silently ignored rather than diagnosed.
 ### Test coverage signal
 
 Most tests check exit code only. Not covered:
-- [x] `-d` exit field (#W1) + `-l` name=`LOGIN` (#W2) — unit tests (Phase 8); extra-operand rejection (#W3 — behavioral, exit 2). [ ] `-T` state chars, `-b` "system boot" content.
+- [x] `-d` exit field (#W1) + `-l` name=`LOGIN` (#W2) — unit tests (Phase 8); extra-operand rejection (#W3 — behavioral, exit 2).
+  - [ ] `-T` state characters and the `-b` "system boot" line content are still unasserted.
 
 ---
 

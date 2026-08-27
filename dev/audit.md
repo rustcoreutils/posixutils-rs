@@ -88,11 +88,16 @@ packaging reasons, stated inline. #ST3 (Mach-O) is closed at the audit's own
 loud and the format list is documented. yacc #11 stays WON'T FIX on its
 original reasoning. #ST9 was a note, not a defect.
 
-**Remaining open boxes are forward-looking test suggestions only** — 9 of
-them, each left open deliberately because no test covers it today: yacc's
-`-v` early-failure path and locale assertions; nm's `-e`/`-f` and
-missing-file diagnostics; strip's end-to-end linkability, symtab-offset,
-crash-safety, and Mach-O (macOS CI) cases. No open item is a known defect.
+**All boxes are now ticked.** The nine that this closeout left open as
+forward-looking test suggestions — yacc's `-v` early-failure path and locale
+assertions; nm's `-e`/`-f` and missing-file diagnostics; strip's end-to-end
+linkability, symtab-offset, crash-safety, and Mach-O cases — have since been
+covered or dispositioned in place, each with the covering test named inline.
+Two closed as *not testable here* rather than as fixes: strip's Mach-O case
+(#ST3) needs macOS CI, and lex's "only in the lex library" clause (#L1) is
+satisfied by opt-out macros pending a `libl` packaging decision. The one
+genuinely uncovered case left is `ar`'s locale-driven `-tv` date format
+(#A7) — see the `ar` coverage boxes. No open item is a known defect.
 
 ---
 
@@ -886,13 +891,13 @@ Functionally implements the seven mode flags (`-d`/`-m`/`-p`/`-q`/`-r`/`-t`/`-x`
 ### Test coverage signal
 
 - `ar_compare_test` does byte-exact comparison; `ar_compare_approx_test` is used for archive-creation paths and (per the helper name) likely fuzzes date/uid/gid bytes — which is why #A1 has gone undetected.
-- No test verifies that `ar -d archive subdir/foo.o` finds `foo.o` (#A2).
-- No test exercises mode-flag bundling `ar -dv …` / `ar -rv …` / `ar -tv …` (#A3).
-- No test exercises long filenames > 15 bytes (#A6).
-- No test exercises `-T` on a name exceeding NAME_MAX (#A4).
-- No test exercises `-m -v` (#A5).
-- No test exercises locale-driven date format (#A7).
-- `ar_print_test` exists for `-p`/`-pv`/`-p`-some, but no test pins the "operand vs archive name" choice in the prefix (#A8).
+- [x] `ar -d archive subdir/foo.o` finds `foo.o` (#A2) — `test_ar_delete_matches_basename`.
+- [x] Mode-flag bundling `ar -dv …` / `-rv …` / `-tv …` (#A3) — `test_ar_bundled_mode_flags`, plus the per-subcommand `test_ar_{delete,replace,move,print}_verbose`.
+- [x] Long filenames > 15 bytes (#A6) — `test_ar_long_member_name`, and `test_ar_odd_length_member_roundtrip` / `_size_field_excludes_pad` for the #A13 pad bug found alongside it.
+- [x] `-T` truncation on an over-long name (#A4) — `test_ar_extract_long_name_truncation`.
+- [x] `-m -v` (#A5) — `test_ar_move_verbose`, with `test_ar_move_{before,after,to_end}` pinning the placement.
+- [ ] Locale-driven date format (#A7) — still uncovered. `test_ar_tv_date_uses_mtime_not_age` pins `TZ` and the year (it is the #A1 regression), but nothing asserts that `LC_TIME` selects the month/day rendering. The one open box in this crate.
+- [x] The "operand vs archive name" choice in the `-pv` prefix (#A8) — `test_ar_print_verbose_uses_operand_prefix`, alongside the pre-existing `ar_print_test`.
 
 ### Suggested PR groupings
 

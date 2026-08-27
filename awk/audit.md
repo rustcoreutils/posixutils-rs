@@ -11,7 +11,13 @@ string.rs 142, array.rs 338}`.
 **Date:** 2026-06-05
 **Method:** spec read in full; implementation read paired with spec; every
 Critical/Major finding confirmed by building `target/release/awk` and running it
-(behavioral evidence inline). No code was modified.
+(behavioral evidence inline). No code was modified *by the audit pass*.
+
+**Status: every finding below is closed.** The remediation landed after the
+audit; each box is ticked with the fix and its regression test named inline. No
+box in this file is unchecked, and no item is deferred. The TL;DR and the
+"Suggested PR groupings" section describe `awk` **as it stood on 2026-06-05**
+and are kept as the historical record, not as pending work.
 
 ## TL;DR
 

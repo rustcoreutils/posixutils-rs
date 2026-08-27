@@ -6,6 +6,12 @@
 **Spec source:** the mega-PDF `~/tmp/POSIX.2024.pdf` (no sliced tree available for this crate); per-utility sections were extracted verbatim to `~/tmp/i18n-spec/*.txt` and cross-referenced against the implementation.
 **Date:** 2026-06-13
 
+**Status: every finding below is closed.** All eight utilities were remediated
+across the numbered phases; each box is ticked with the fix and its phase
+inline. No box in this file is unchecked and no item is deferred. The TL;DR and
+the "Suggested PR groupings" section describe the crate **as it stood on
+2026-06-13** and are kept as the historical record, not as pending work.
+
 Findings marked **✓ verified** were confirmed by building the crate (`cargo build --release -p posixutils-i18n`) and running the binary; the observed behavior is quoted inline. Unmarked findings are from spec-vs-source reading only.
 
 ---

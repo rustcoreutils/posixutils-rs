@@ -57,7 +57,12 @@ Research sources:
 ## Closeout (2026-08-03)
 
 Six phases. 33 open boxes → 4, each of the four left open with the specific
-thing CI lacks recorded next to it.
+thing CI lacks recorded next to it. **Three of those four remain as of
+2026-08-08**: `crontab`'s allow/deny box closed once `CRON_ALLOW`/`CRON_DENY`
+overrides made the gating decision testable — see the revised CI note at the
+end of the `batch` section. The three still open are #A2/#X1 (a job running at
+its time), #A7 (`at -r` ownership), and #X1 (`at`/`batch` spool execution);
+each needs a running `crond` or a second user, not a code change.
 
 **Unlike the `dev/` and `editors/` passes, the recorded fixes here were real.**
 Before reconciling anything I checked the security-critical claims against the

@@ -47,19 +47,18 @@ promotions: `id`, `logname`, `logger`, `mesg`, `newgrp`, `pwd`, `tty`, `write`
 → **Stage 6 — Audited** (2026-06-18); `talk (with talkd local daemon)`
 → **Stage 6 — Audited** (2026-08-01).
 
-> **Residual on `talk` — read before trusting the promotion.** Every finding is
-> closed and the render path now has unit tests where it had none, but the
-> interactive path is **not guarded by an automated test**. A two-peer session
-> was verified by hand with a pty driver — connect, type, receive in the peer
-> window, single local echo, SIGINT exit 0 — and that is what justifies the
-> promotion. It is manual evidence, so it does not protect against regression.
-> The phase-10 audit's judgement that this code is hard to verify was sound:
-> two of the defects found here (#TK21 stdout deadlock, #TK22 unbound client
-> socket) each made the utility non-functional and survived a full audit plus
-> the whole test suite. **An end-to-end pty test is the outstanding work**, and
-> is now clearly feasible: the throwaway driver used here was about sixty
-> lines, and `users` already has `portable-pty` as a dev-dependency plus
-> raw-libc pty helpers in `tests/tty` and `tests/write`.
+> **The `talk` residual is closed (2026-08-08).** When this crate was promoted
+> on 2026-08-01 the interactive path rested on manual pty evidence alone, and
+> the outstanding work was named as an end-to-end pty test. That test now
+> exists: `tests/talk` brings up a talkd on a private `TALKD_SOCKET` and
+> connects **two `talk` peers, each on its own pseudo-terminal**, asserting the
+> exchange and character-processing rules (#TK7/#TK8) that were previously
+> unverified. It immediately found a defect — an incoming `^G` never rang the
+> recipient's terminal — which is the third defect in this utility of the kind
+> that survives a full audit and the whole test suite because nothing connects
+> two peers. See the `talk` section for the full account. The tests self-skip
+> when no PTY, binary, or rendezvous is available, so the manual-evidence
+> caveat now applies only to environments that cannot run them.
 
 ## Revision history
 
@@ -117,9 +116,13 @@ promotions: `id`, `logname`, `logger`, `mesg`, `newgrp`, `pwd`, `tty`, `write`
   controlling terminal, after which its job-control signals were delivered to
   talkd. DIVERGES. ✓ fixed in `plib::tty::open_for_write`.
 
-**Remaining open item:** one, deliberately — no test connects two `talk` peers
-end-to-end, so the interactive exchange and character-processing rules
-(#TK7/#TK8) are still unverified. See the `talk` section.
+- **2026-08-08** — two-peer pty tests for `talk` (`tests/talk`), closing the
+  last open item; they found the un-rung incoming `^G`.
+
+**Remaining open items:** none. The last one — no test connecting two `talk`
+peers end-to-end, leaving the interactive exchange and character-processing
+rules (#TK7/#TK8) unverified — was closed on 2026-08-08 by the two-peer pty
+tests in `tests/talk`. See the `talk` section.
 
 ---
 

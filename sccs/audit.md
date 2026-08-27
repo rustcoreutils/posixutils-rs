@@ -24,10 +24,10 @@ re-run), not taken on the sub-agents' word.
 > each behaviorally re-verified byte-for-byte against GNU CSSC 1.4.1 and gated
 > on `cargo build`/`clippy`/`test` (91 integration tests). All ten utilities are
 > promoted to README **Stage 6 — Audited**. The original findings are preserved
-> below (now ticked) as the historical record. The only boxes left unchecked are
-> the forward-looking "Test coverage gaps" checklists — many are now covered by
-> the regression tests added per phase; the rest remain as suggestions for
-> future hardening.
+> below (now ticked) as the historical record. The forward-looking "Test
+> coverage gaps" checklists were the last thing left unchecked; they were worked
+> through in the phases that followed and **no box in this file is unchecked
+> today**.
 
 ---
 
@@ -60,9 +60,10 @@ accept our output everywhere except encoded files).
 findings; all of them have since been fixed. Theme 1 (#X1) closed in Phase 3,
 theme 2 in Phase 4 (`paths::expand_operands`), theme 4's `get` options in
 Phase 4, z-file locking in Phase 12, theme 5's diagnostics in Phase 13, and
-`what`'s binary handling in Phase 11. **What remains open in this crate is
-test coverage, not conformance** — see the per-utility "Test coverage gaps"
-boxes below.
+`what`'s binary handling in Phase 11. What remained open at that date was test
+coverage rather than conformance; those per-utility "Test coverage gaps" boxes
+have since been closed too, so **nothing in this crate is open** — some boxes
+are ticked with a note that the box was already stale when written.
 
 ---
 

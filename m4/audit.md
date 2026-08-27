@@ -18,6 +18,12 @@ spec; each Critical/Major finding confirmed by building `target/release/m4` and
 running it (behavioral evidence inline). No code was modified. Extensions are
 flagged only where they diverge from required behavior (per `audits.md`).
 
+**Status: every finding below is closed.** The remediation landed after the
+audit; each box is ticked with the fix inline. No box in this file is unchecked
+and no item is deferred. The assessment prose and the "Suggested PR groupings"
+section describe `m4` **as it stood on 2026-06-11** and are kept as the
+historical record, not as pending work.
+
 ## TL;DR
 
 The macro engine is broad and the common path is solid: the spec's own worked

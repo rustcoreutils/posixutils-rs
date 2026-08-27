@@ -8,8 +8,16 @@ lens** on top of plain POSIX conformance, because these utilities are the canoni
 targets of TOCTOU and symlink-swap attacks and the canonical cause of accidental data
 loss. **Part II** (appended below, 2026-06-17) extends the audit to the **remaining 13
 `tree/` utilities** — `chmod`, `chown`, `chgrp`, `mkdir`, `mkfifo`, `rmdir`, `link`,
-`unlink`, `ln`, `readlink`, `du`, `touch`, `ls` — as an **audit-only** pass (findings
-recorded, not yet remediated; cp/mv/rm remain the only Stage-6 utilities).
+`unlink`, `ln`, `readlink`, `du`, `touch`, `ls`.
+
+**Status (current).** Both parts are remediated and every box in this file is ticked. The
+Part I and Part II headers below describe each pass *as it was run* — both were audit-only
+at the time, and both were followed by a remediation pass on the `tree-audit` branch, so
+"no source was modified" refers to the audit pass, not to the state of the crate. All 16
+utilities are README **Stage 6 — Audited**. Two things remain deliberately unclosed and
+are neither defects nor pending work: `du -x`'s cross-device case needs a real mount point
+to exercise, and the documented ftw residuals (#F1's `DeferredDir` path having no
+`(dev, ino)` baseline, #F3's deep-tree reopen panic) are recorded inline where they apply.
 
 **Method.** Static spec-vs-code (each `shall` read against the cited implementation
 line) with `grep` proofs for absence claims, plus `cargo build --release`, the existing
@@ -392,8 +400,10 @@ still `panic!`s on a mid-walk race rather than routing to `err_reporter`.
 
 # Part II — Remaining `tree/` utilities (audit only)
 
-**Date:** 2026-06-17. **Status: audit-only** — findings recorded; **no source changed** and
-no README "Stage" promotion (cp/mv/rm remain the only Stage-6 utilities). Covers the 13
+**Date:** 2026-06-17. **Status when run: audit-only** — findings recorded; no source changed
+and no README "Stage" promotion. *Superseded:* every finding below was fixed in Phases 1–11
+on the `tree-audit` branch and all 13 utilities are now Stage 6 — see the "Resolved
+2026-06-17" blockquote in the Part II summary and in each per-utility section. Covers the 13
 remaining `tree/` utilities: `chmod`, `chown`, `chgrp`, `mkdir`, `mkfifo`, `rmdir`, `link`,
 `unlink`, `ln`, `readlink`, `du`, `touch`, `ls`.
 
@@ -887,7 +897,8 @@ and symlink-default semantics are correct.
 - [x] no-operand → `.`; multiple operands in order; STDIN/INPUT FILES "None"; output `size<tab>path` (tab is a `<blank>`, conforms); 512-byte default, `-k` halves; directory size = subtree sum + dir; symlinks counted not followed (default); race-safe recursion; EXIT 0/`>0` — CONFORMS. [x] CONSEQUENCES now report-and-continue (#DU1); [x] cross-operand dedup (#DU3).
 
 ### Test coverage signal
-- [x] mid-walk error continuation (#DU1); `-H -L`/`-L -H` order (#DU2); same file under two operands (#DU3). [ ] `-x` device boundary (needs a mount).
+- [x] mid-walk error continuation (#DU1); `-H -L`/`-L -H` order (#DU2); same file under two operands (#DU3).
+  - [ ] `-x` device boundary — needs a real mount point, so CI cannot exercise it.
 - [x] `-a`,`-s`,`-k`(512 vs 1024), default, file-operand-listed, `-H`,`-L`, hard-link dedup, nonexistent→exit 1.
 
 ### Suggested PR groupings

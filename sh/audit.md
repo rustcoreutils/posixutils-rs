@@ -984,3 +984,9 @@ reason they claimed:
   that creates such a name and checks, rather than on the platform name. The
   probe fails loudly if the target temporary directory is unusable, so it cannot
   quietly turn the tests off where they are supposed to run.
+
+The descriptor test for pipelines had the identical latent flaw -- it took its
+baseline in a *separate* shell process, so a change in the harness's own
+descriptors between the two runs would have failed it. It now takes the baseline
+in the same shell as the pipelines it compares against, and compares which
+descriptors are extra rather than how many there are.

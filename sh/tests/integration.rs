@@ -2665,38 +2665,26 @@ mod audit_regressions {
     fn pipelines_do_not_leak_descriptors_to_their_commands() {
         // A pipeline member must see exactly what a plain command sees. That
         // is not a fixed set: a shell passes the descriptors it inherited on
-        // to its children, and the test harness may hold some open. So the
-        // single-command case is the baseline, and the question is only
-        // whether the pipeline machinery adds anything of its own.
-        if !Path::new("/proc/self/fd").exists() {
-            return;
-        }
-        let open_fds = |script: &str| {
-            let fds = std::cell::RefCell::new(Vec::new());
-            run_successfully_and(script, |out| {
-                let mut listed: Vec<u32> = out
-                    .split_whitespace()
-                    .filter_map(|fd| fd.parse().ok())
-                    .collect();
-                listed.sort_unstable();
-                *fds.borrow_mut() = listed;
-            });
-            fds.into_inner()
-        };
-        let baseline = open_fds("ls /proc/self/fd\n");
-        for script in [
-            "true | ls /proc/self/fd\n",
-            "ls /proc/self/fd | cat\n",
-            "true | true | ls /proc/self/fd\n",
-        ] {
-            let fds = open_fds(script);
-            assert_eq!(
-                fds.len(),
-                baseline.len(),
-                "`{}` leaked descriptors: {fds:?} vs baseline {baseline:?}",
-                script.trim_end()
-            );
-        }
+        // to its children, and the test harness may hold some open. So a plain
+        // command is the baseline, and the question is only whether the
+        // pipeline machinery adds anything of its own.
+        //
+        // Baseline and pipelines run in the *same* shell, so that what the
+        // harness has open cannot differ between them, and the comparison is
+        // by which descriptors are extra rather than by how many there are.
+        run_successfully_and(
+            "cd \"$TEST_WRITE_DIR\"\n\
+             if ls /proc/self/fd >/dev/null 2>&1; then\n\
+             \x20 ls /proc/self/fd > fd_base 2>/dev/null\n\
+             \x20 true | ls /proc/self/fd > fd_a 2>/dev/null\n\
+             \x20 ls /proc/self/fd | cat > fd_b 2>/dev/null\n\
+             \x20 true | true | ls /proc/self/fd > fd_c 2>/dev/null\n\
+             \x20 for f in fd_a fd_b fd_c; do comm -13 fd_base $f; done\n\
+             \x20 rm -f fd_base fd_a fd_b fd_c\n\
+             fi\n\
+             echo done\n",
+            |out| assert_eq!(out, "done\n", "a pipeline leaked a descriptor"),
+        );
     }
 
     #[test]

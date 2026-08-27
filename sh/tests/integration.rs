@@ -2798,4 +2798,79 @@ mod audit_regressions {
         test_script("set -f -- a b c\necho $#\n", "3\n");
         test_script("set -- x y\nset -f -- \"$@\"\necho $1 $2\n", "x y\n");
     }
+
+    // ---- Phase 2: reserved words are recognized only in command position ----
+
+    #[test]
+    fn a_reserved_word_used_as_an_argument_is_an_ordinary_word() {
+        // The lexer classified reserved words unconditionally, and
+        // `parse_simple_command` stopped at whichever one it had been handed as
+        // the terminator, so `echo done` inside a loop body ate the `done` and
+        // the loop never terminated.
+        test_script("while true; do echo done; break; done\n", "done\n");
+        test_script("for i in 1; do echo done; done\n", "done\n");
+        test_script(
+            "for i in do done esac in; do echo $i; done\n",
+            "do\ndone\nesac\nin\n",
+        );
+        test_script(
+            "echo then; echo if fi done esac\n",
+            "then\nif fi done esac\n",
+        );
+        test_script("until false; do echo u; break; done\n", "u\n");
+    }
+
+    #[test]
+    fn in_is_recognized_as_the_third_word_of_case_and_for() {
+        // POSIX 2.4 excludes `in` from the "first word after a reserved word"
+        // rule, so the word before it carries no signal and the parser has to
+        // accept an ordinary word spelled `in`.
+        test_script("case in in in) echo M;; esac\n", "M\n");
+        test_script("for in in in; do echo $in; done\n", "in\n");
+        test_script("case case in case) echo C;; esac\n", "C\n");
+    }
+
+    #[test]
+    fn a_case_item_may_have_an_empty_body() {
+        // POSIX 2.9.4 permits `x) ;;`, which the AST could not represent.
+        test_script("case x in x) ;; esac\necho rc=$?\n", "rc=0\n");
+        test_script("case x in x) ;; *) echo NO;; esac\n", "");
+        test_script("case y in x) ;; *) echo STAR;; esac\n", "STAR\n");
+        test_script("case word in esac\necho done\n", "done\n");
+    }
+
+    #[test]
+    fn command_substitution_containing_a_case_is_scanned_to_its_end() {
+        // The scanner counted parentheses, but a `case` pattern's `)` has no
+        // opener, so it cut the substitution short at the first pattern — and
+        // then executed the truncated text anyway.
+        test_script("x=$(case a in a) echo A;; esac)\necho \"[$x]\"\n", "[A]\n");
+        test_script(
+            "x=$(case a in a) case b in b) echo X;; esac;; esac)\necho \"[$x]\"\n",
+            "[X]\n",
+        );
+        test_script("echo \"$(case q in *) echo deep;; esac)\"\n", "deep\n");
+        // `case`/`esac` outside command position must not be counted.
+        test_script("x=$(echo case)\necho \"[$x]\"\n", "[case]\n");
+        test_script(
+            "x=$(case a in a) echo esac;; esac)\necho \"[$x]\"\n",
+            "[esac]\n",
+        );
+    }
+
+    #[test]
+    fn an_alias_may_expand_to_a_compound_command() {
+        // `alias_substitution` returned Ok(None) when the expansion did not
+        // start with a plain word, and the caller then advanced past it.
+        test_script("alias f=\"if true; then echo t; fi\"\nf\n", "t\n");
+        test_script("alias g=\"while true; do echo L; break; done\"\ng\n", "L\n");
+    }
+
+    #[test]
+    fn a_closing_brace_needs_a_preceding_separator() {
+        // `}` is a reserved word, so it is only recognized in command position;
+        // `{ word }` is a syntax error in dash and bash alike.
+        test_script("{ echo hi; }\n", "hi\n");
+        expect_exit_code("{ echo hi }\n", 2);
+    }
 }

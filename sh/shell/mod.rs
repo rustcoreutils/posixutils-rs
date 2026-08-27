@@ -772,7 +772,10 @@ impl Shell {
             if !matched {
                 continue;
             }
-            let mut result = self.interpret(&case.body, ignore_errexit);
+            let mut result = match &case.body {
+                Some(body) => self.interpret(body, ignore_errexit),
+                None => 0,
+            };
             // `;&` falls through: execute subsequent items' bodies without
             // pattern matching, stopping at a `;;` item, the end, or once a
             // break/continue/return is pending.
@@ -782,7 +785,10 @@ impl Shell {
                 && self.control_flow_state == ControlFlowState::None
             {
                 idx += 1;
-                result = self.interpret(&cases[idx].body, ignore_errexit);
+                result = match &cases[idx].body {
+                    Some(body) => self.interpret(body, ignore_errexit),
+                    None => 0,
+                };
             }
             return Ok(result);
         }

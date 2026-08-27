@@ -54,6 +54,10 @@ pub struct CommandParser<'src> {
     lookahead_lineno: u32,
     start_lineno: u32,
     parsed_one_command: bool,
+    /// Set when alias substitution replaced a command word with text starting
+    /// in a reserved word, so the alias produced a compound command and
+    /// `parse_command` has to dispatch on the grammar again.
+    alias_became_reserved_word: bool,
 }
 
 impl<'src> CommandParser<'src> {
@@ -65,12 +69,83 @@ impl<'src> CommandParser<'src> {
         self.lookahead_lineno + self.start_lineno
     }
 
+    /// POSIX 2.4: a reserved word is only recognized as such when it is the
+    /// first word of a command, or the first word following a reserved word
+    /// other than `case`, `for` or `in`. Anywhere else it is an ordinary word,
+    /// which is why `echo done` inside a loop body is an argument and not the
+    /// loop terminator.
+    ///
+    /// The token being consumed determines the position of the one after it,
+    /// so the whole rule lives here rather than at each call site. The two
+    /// remaining positions in the rule — the third word of a `case` or `for`
+    /// command, where only `in`/`do` are valid — are handled by
+    /// [`Self::match_reserved_word`], because the word before them is ordinary
+    /// and carries no such signal.
+    fn reserved_words_follow(consumed: &CommandToken) -> bool {
+        matches!(
+            consumed,
+            // A separator or opening operator: what follows begins a command.
+            CommandToken::SemiColon
+                | CommandToken::Newline
+                | CommandToken::And
+                | CommandToken::AndIf
+                | CommandToken::OrIf
+                | CommandToken::Pipe
+                | CommandToken::LParen
+                | CommandToken::RParen
+                | CommandToken::DSemi
+                | CommandToken::SemiAnd
+                // A reserved word other than `case`, `for` and `in`.
+                | CommandToken::Bang
+                | CommandToken::LBrace
+                | CommandToken::RBrace
+                | CommandToken::Do
+                | CommandToken::Done
+                | CommandToken::Elif
+                | CommandToken::Else
+                | CommandToken::Esac
+                | CommandToken::Fi
+                | CommandToken::If
+                | CommandToken::Then
+                | CommandToken::Until
+                | CommandToken::While
+        )
+    }
+
     /// advances the current shell token and returns the previous shell lookahead
     fn advance(&mut self) -> ParseResult<CommandToken<'src>> {
-        let (mut next_token, next_token_line_no) = self.lexer.next_token()?;
+        self.advance_with(Self::reserved_words_follow(&self.lookahead))
+    }
+
+    /// [`Self::advance`] with the reserved-word decision supplied by the
+    /// caller, for the positions the token-to-token rule cannot see.
+    fn advance_with(&mut self, recognize_reserved: bool) -> ParseResult<CommandToken<'src>> {
+        let (mut next_token, next_token_line_no) = self.lexer.next_token(recognize_reserved)?;
         self.lookahead_lineno = next_token_line_no;
         std::mem::swap(&mut self.lookahead, &mut next_token);
         Ok(next_token)
+    }
+
+    /// Is the lookahead `token`, either as a reserved word or as an ordinary
+    /// word spelled the same? See [`Self::match_reserved_word`].
+    fn lookahead_is_reserved(&self, token: CommandToken) -> bool {
+        self.lookahead == token
+            || matches!(
+                (&self.lookahead, token.as_word_str()),
+                (CommandToken::Word(word), Some(text)) if word.as_ref() == text
+            )
+    }
+
+    /// Accepts `token` when the lookahead is that reserved word, or an ordinary
+    /// word spelled the same. POSIX 2.4 recognizes `in` as the third word of a
+    /// `case`/`for` command and `do` as the third word of a `for`, but the word
+    /// before them is ordinary, so the lexer will have read them as words.
+    fn match_reserved_word(&mut self, token: CommandToken) -> ParseResult<bool> {
+        let matched = self.lookahead_is_reserved(token);
+        if matched {
+            self.advance()?;
+        }
+        Ok(matched)
     }
 
     fn match_alternatives(
@@ -251,10 +326,14 @@ impl<'src> CommandParser<'src> {
                     next_substitution.as_ref(),
                 );
                 performed_one_substitution = true;
-                self.advance()?;
+                // The replacement text takes the command word's place, so its
+                // first token is in command position and a reserved word there
+                // really is one (`alias x="if true; then echo t; fi"`).
+                self.advance_with(true)?;
                 if let CommandToken::Word(word) = &self.lookahead {
                     next_substitution = word.clone();
                 } else {
+                    self.alias_became_reserved_word = true;
                     return Ok(None);
                 }
             } else {
@@ -269,7 +348,6 @@ impl<'src> CommandParser<'src> {
 
     fn parse_simple_command(
         &mut self,
-        end: CommandToken,
         alias_table: &AliasTable,
     ) -> ParseResult<Option<SimpleCommand>> {
         // simple_command = (io_redirect | assignment_word)* word? (io_redirect | word)*
@@ -278,7 +356,7 @@ impl<'src> CommandParser<'src> {
         let mut continue_to_apply_alias_substitution = true;
 
         while command.words.is_empty() {
-            if self.lookahead == end {
+            if self.lookahead.is_reserved_word() {
                 return Ok(command.none_if_empty());
             }
             match self.lookahead.as_word_str() {
@@ -292,6 +370,13 @@ impl<'src> CommandParser<'src> {
                                     &mut continue_to_apply_alias_substitution,
                                     alias_table,
                                 )?;
+                                if self.alias_became_reserved_word {
+                                    // The alias expanded to a compound command;
+                                    // `parse_command` re-dispatches on it. The
+                                    // token is already the lookahead, so it must
+                                    // not be consumed here.
+                                    return Ok(command.none_if_empty());
+                                }
                                 command.words.extend(next_word);
                             } else {
                                 command.words.push(parse_word_pair(
@@ -312,7 +397,7 @@ impl<'src> CommandParser<'src> {
         }
 
         loop {
-            if self.lookahead == end {
+            if self.lookahead.is_reserved_word() {
                 return Ok(command.none_if_empty());
             }
             match self.lookahead.as_word_str() {
@@ -341,11 +426,7 @@ impl<'src> CommandParser<'src> {
         Ok(command.none_if_empty())
     }
 
-    fn parse_compound_list(
-        &mut self,
-        end: CommandToken,
-        alias_table: &AliasTable,
-    ) -> ParseResult<CompleteCommand> {
+    fn parse_compound_list(&mut self, alias_table: &AliasTable) -> ParseResult<CompleteCommand> {
         self.skip_linebreak()?;
         let list_start = self.lookahead_lineno;
 
@@ -361,7 +442,7 @@ impl<'src> CommandParser<'src> {
             CommandToken::Then,
         ];
 
-        let mut last_conjunction = self.parse_and_or(end.clone(), alias_table)?;
+        let mut last_conjunction = self.parse_and_or(alias_table)?;
         let mut commands = Vec::new();
         while let Some(mut conjunction) = last_conjunction {
             match self.lookahead {
@@ -381,7 +462,7 @@ impl<'src> CommandParser<'src> {
                 break;
             }
             commands.push(conjunction);
-            last_conjunction = self.parse_and_or(end.clone(), alias_table)?;
+            last_conjunction = self.parse_and_or(alias_table)?;
         }
         if let Ok(commands) = commands.try_into() {
             Ok(CompleteCommand { commands })
@@ -397,7 +478,7 @@ impl<'src> CommandParser<'src> {
     fn parse_brace_group(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume '{'
         self.advance()?;
-        let inner = self.parse_compound_list(CommandToken::RBrace, alias_table)?;
+        let inner = self.parse_compound_list(alias_table)?;
         self.match_token(CommandToken::RBrace)?;
         Ok(CompoundCommand::BraceGroup(inner))
     }
@@ -405,14 +486,14 @@ impl<'src> CommandParser<'src> {
     fn parse_subshell(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume '('
         self.advance()?;
-        let inner = self.parse_compound_list(CommandToken::RParen, alias_table)?;
+        let inner = self.parse_compound_list(alias_table)?;
         self.match_token(CommandToken::RParen)?;
         Ok(CompoundCommand::Subshell(inner))
     }
 
     fn parse_do_group(&mut self, alias_table: &AliasTable) -> ParseResult<CompleteCommand> {
         self.match_token(CommandToken::Do)?;
-        let inner = self.parse_compound_list(CommandToken::Done, alias_table)?;
+        let inner = self.parse_compound_list(alias_table)?;
         self.match_token(CommandToken::Done)?;
         Ok(inner)
     }
@@ -423,8 +504,7 @@ impl<'src> CommandParser<'src> {
         let iter_var = self.match_name()?;
         self.skip_linebreak()?;
         let mut words = Vec::new();
-        if self.lookahead == CommandToken::In {
-            self.advance()?;
+        if self.match_reserved_word(CommandToken::In)? {
             while self.lookahead.as_word_str().is_some() {
                 let word = self.advance()?.into_word_cow().unwrap();
                 words.push(parse_word_pair(&word, self.lookahead_lineno, false)?);
@@ -472,7 +552,17 @@ impl<'src> CommandParser<'src> {
             )
         })?;
 
-        let body = self.parse_compound_list(CommandToken::Eof, alias_table)?;
+        // POSIX 2.9.4 permits an empty body (`x) ;;`), which `parse_compound_list`
+        // cannot represent, so recognize the terminator first.
+        self.skip_linebreak()?;
+        let body = if self.lookahead == CommandToken::DSemi
+            || self.lookahead == CommandToken::SemiAnd
+            || self.lookahead_is_reserved(CommandToken::Esac)
+        {
+            None
+        } else {
+            Some(self.parse_compound_list(alias_table)?)
+        };
 
         let mut fallthrough = false;
         if self.lookahead == CommandToken::DSemi {
@@ -482,7 +572,7 @@ impl<'src> CommandParser<'src> {
             fallthrough = true;
             self.advance()?;
             self.skip_linebreak()?;
-        } else if self.lookahead != CommandToken::Esac {
+        } else if !self.lookahead_is_reserved(CommandToken::Esac) {
             return Err(ParserError::new(
                 self.lookahead_lineno,
                 format!("expected ';;' or ';&', found {}", self.lookahead),
@@ -502,18 +592,26 @@ impl<'src> CommandParser<'src> {
         self.advance()?;
         let arg = self.parse_word_pair()?;
         self.skip_linebreak()?;
-        self.match_token(CommandToken::In)?;
+        if !self.match_reserved_word(CommandToken::In)? {
+            return Err(ParserError::new(
+                self.lookahead_lineno,
+                format!("expected 'in', found {}", self.lookahead),
+                self.lookahead == CommandToken::Eof,
+            ));
+        }
         self.skip_linebreak()?;
         let mut cases = Vec::new();
-        loop {
-            match self.lookahead {
-                CommandToken::Esac => break,
-                _ => {
-                    cases.push(self.parse_case_item(alias_table)?);
-                }
+        while !self.lookahead_is_reserved(CommandToken::Esac) {
+            if self.lookahead == CommandToken::Eof {
+                return Err(ParserError::new(
+                    self.lookahead_lineno,
+                    "expected 'esac', found EOF",
+                    true,
+                ));
             }
+            cases.push(self.parse_case_item(alias_table)?);
         }
-        self.match_token(CommandToken::Esac)?;
+        self.advance()?;
         Ok(CompoundCommand::CaseClause { arg, cases })
     }
 
@@ -521,9 +619,9 @@ impl<'src> CommandParser<'src> {
         // consume 'if'
         self.advance()?;
         // there is a terminator after the condition, we don't need to terminate on CommandToken::Then
-        let condition = self.parse_compound_list(CommandToken::Eof, alias_table)?;
+        let condition = self.parse_compound_list(alias_table)?;
         self.match_token(CommandToken::Then)?;
-        let then_part = self.parse_compound_list(CommandToken::Eof, alias_table)?;
+        let then_part = self.parse_compound_list(alias_table)?;
         let mut if_chain = NonEmpty::new(If {
             condition,
             body: then_part,
@@ -531,9 +629,9 @@ impl<'src> CommandParser<'src> {
         while self.lookahead == CommandToken::Elif {
             // consume 'elif'
             self.advance()?;
-            let condition = self.parse_compound_list(CommandToken::Eof, alias_table)?;
+            let condition = self.parse_compound_list(alias_table)?;
             self.match_token(CommandToken::Then)?;
-            let then_part = self.parse_compound_list(CommandToken::Eof, alias_table)?;
+            let then_part = self.parse_compound_list(alias_table)?;
             if_chain.push(If {
                 condition,
                 body: then_part,
@@ -542,7 +640,7 @@ impl<'src> CommandParser<'src> {
         let mut else_body = None;
         if self.lookahead == CommandToken::Else {
             self.advance()?;
-            else_body = Some(self.parse_compound_list(CommandToken::Eof, alias_table)?);
+            else_body = Some(self.parse_compound_list(alias_table)?);
         }
         self.match_token(CommandToken::Fi)?;
         Ok(CompoundCommand::IfClause {
@@ -554,7 +652,7 @@ impl<'src> CommandParser<'src> {
     fn parse_while_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'while'
         self.advance()?;
-        let condition = self.parse_compound_list(CommandToken::Eof, alias_table)?;
+        let condition = self.parse_compound_list(alias_table)?;
         let body = self.parse_do_group(alias_table)?;
         Ok(CompoundCommand::WhileClause { condition, body })
     }
@@ -562,7 +660,7 @@ impl<'src> CommandParser<'src> {
     fn parse_until_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'until'
         self.advance()?;
-        let condition = self.parse_compound_list(CommandToken::Eof, alias_table)?;
+        let condition = self.parse_compound_list(alias_table)?;
         let body = self.parse_do_group(alias_table)?;
         Ok(CompoundCommand::UntilClause { condition, body })
     }
@@ -607,16 +705,15 @@ impl<'src> CommandParser<'src> {
         }
     }
 
-    fn parse_command(
-        &mut self,
-        end: CommandToken,
-        alias_table: &AliasTable,
-    ) -> ParseResult<Option<Command>> {
+    fn parse_command(&mut self, alias_table: &AliasTable) -> ParseResult<Option<Command>> {
         // command =
         // 			| compound_command redirect_list?
         // 			| simple_command
         // 			| function_definition
         let start_lineno = self.lineno();
+        if self.alias_became_reserved_word {
+            self.alias_became_reserved_word = false;
+        }
         if let Some(compound_command) = self.parse_compound_command(alias_table)? {
             let mut redirections = Vec::new();
             while let Some(redirection) = self.parse_redirection_opt()? {
@@ -640,26 +737,28 @@ impl<'src> CommandParser<'src> {
                                 .map(CommandType::FunctionDefinition)?,
                         )
                     } else {
-                        self.parse_simple_command(end, alias_table)?
+                        self.parse_simple_command(alias_table)?
                             .map(CommandType::SimpleCommand)
                     }
                 }
                 _ => self
-                    .parse_simple_command(end, alias_table)?
+                    .parse_simple_command(alias_table)?
                     .map(CommandType::SimpleCommand),
             };
+            if command_type.is_none() && self.alias_became_reserved_word {
+                // The command word was an alias for a compound command; the
+                // grammar has to look at it again.
+                self.alias_became_reserved_word = false;
+                return self.parse_command(alias_table);
+            }
             Ok(command_type.map(|type_| Command::new(type_, self.lineno())))
         }
     }
 
-    fn parse_pipeline(
-        &mut self,
-        end: CommandToken,
-        alias_table: &AliasTable,
-    ) -> ParseResult<Option<Pipeline>> {
+    fn parse_pipeline(&mut self, alias_table: &AliasTable) -> ParseResult<Option<Pipeline>> {
         // pipeline = "!" command ("|" linebreak command)*
         let negate_status = self.match_alternatives(&[CommandToken::Bang])?.is_some();
-        let mut commands = if let Some(command) = self.parse_command(end.clone(), alias_table)? {
+        let mut commands = if let Some(command) = self.parse_command(alias_table)? {
             NonEmpty::new(command)
         } else {
             return Ok(None);
@@ -668,7 +767,7 @@ impl<'src> CommandParser<'src> {
             let pipe_location = self.lookahead_lineno;
             self.advance()?;
             self.skip_linebreak()?;
-            if let Some(command) = self.parse_command(end.clone(), alias_table)? {
+            if let Some(command) = self.parse_command(alias_table)? {
                 commands.push(command);
             } else {
                 return Err(ParserError::new(
@@ -684,13 +783,9 @@ impl<'src> CommandParser<'src> {
         }))
     }
 
-    fn parse_and_or(
-        &mut self,
-        end: CommandToken,
-        alias_table: &AliasTable,
-    ) -> ParseResult<Option<Conjunction>> {
+    fn parse_and_or(&mut self, alias_table: &AliasTable) -> ParseResult<Option<Conjunction>> {
         // and_or = pipeline (("&&" | "||") linebreak pipeline)*
-        let mut last = if let Some(pipeline) = self.parse_pipeline(end.clone(), alias_table)? {
+        let mut last = if let Some(pipeline) = self.parse_pipeline(alias_table)? {
             pipeline
         } else {
             return Ok(None);
@@ -704,7 +799,7 @@ impl<'src> CommandParser<'src> {
             };
             let operator_location = self.lookahead_lineno;
             self.skip_linebreak()?;
-            let next = if let Some(next) = self.parse_pipeline(end.clone(), alias_table)? {
+            let next = if let Some(next) = self.parse_pipeline(alias_table)? {
                 next
             } else {
                 return Err(ParserError::new(
@@ -730,7 +825,7 @@ impl<'src> CommandParser<'src> {
         let mut commands = Vec::new();
         while self.lookahead != CommandToken::Newline || self.lookahead != CommandToken::Eof {
             let command_start = self.lookahead_lineno;
-            if let Some(mut and_or) = self.parse_and_or(CommandToken::Eof, alias_table)? {
+            if let Some(mut and_or) = self.parse_and_or(alias_table)? {
                 if self.lookahead == CommandToken::And {
                     and_or.is_async = true;
                 }
@@ -773,12 +868,14 @@ impl<'src> CommandParser<'src> {
 
     pub fn new(source: &'src str, start_lineno: u32) -> ParseResult<Self> {
         let mut lexer = CommandLexer::new(source);
-        let (lookahead, lookahead_lineno) = lexer.next_token()?;
+        // The very first token of the input begins a command.
+        let (lookahead, lookahead_lineno) = lexer.next_token(true)?;
         let mut parser = Self {
             lexer,
             lookahead,
             lookahead_lineno,
             parsed_one_command: false,
+            alias_became_reserved_word: false,
             start_lineno,
         };
         parser.skip_linebreak()?;
@@ -1294,8 +1391,11 @@ mod tests {
 
     #[test]
     fn parse_brace_group() {
+        // POSIX 2.9.4 / 2.4: `}` is a reserved word, so it is only recognized
+        // in command position — `{ word }` is a syntax error in dash and bash
+        // alike, and the separator is required.
         assert_eq!(
-            parse_compound_command("{ word }").0,
+            parse_compound_command("{ word; }").0,
             CompoundCommand::BraceGroup(complete_command_from_word_pair(
                 unquoted_literal_pair("word"),
                 false
@@ -1394,7 +1494,10 @@ mod tests {
                 arg: unquoted_literal_pair("word"),
                 cases: vec![CaseItem {
                     pattern: NonEmpty::new(unquoted_literal_pair("pattern")),
-                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
+                    body: Some(complete_command_from_word_pair(
+                        unquoted_literal_pair("cmd"),
+                        false
+                    )),
                     fallthrough: false,
                 }]
             }
@@ -1421,17 +1524,26 @@ mod tests {
                 cases: vec![
                     CaseItem {
                         pattern: NonEmpty::new(unquoted_literal_pair("pattern1")),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd1"), false),
+                        body: Some(complete_command_from_word_pair(
+                            unquoted_literal_pair("cmd1"),
+                            false
+                        )),
                         fallthrough: false,
                     },
                     CaseItem {
                         pattern: NonEmpty::new(unquoted_literal_pair("pattern2")),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd2"), false),
+                        body: Some(complete_command_from_word_pair(
+                            unquoted_literal_pair("cmd2"),
+                            false
+                        )),
                         fallthrough: false,
                     },
                     CaseItem {
                         pattern: NonEmpty::new(unquoted_literal_pair("pattern3")),
-                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd3"), false),
+                        body: Some(complete_command_from_word_pair(
+                            unquoted_literal_pair("cmd3"),
+                            false
+                        )),
                         fallthrough: false,
                     }
                 ]

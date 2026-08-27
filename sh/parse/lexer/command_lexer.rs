@@ -360,6 +360,31 @@ impl Display for CommandToken<'_> {
 }
 
 impl<'src> CommandToken<'src> {
+    /// A reserved word can only occur in command position (POSIX 2.4), so one
+    /// appearing while a simple command is being read means that command has
+    /// ended.
+    pub fn is_reserved_word(&self) -> bool {
+        matches!(
+            self,
+            CommandToken::Bang
+                | CommandToken::LBrace
+                | CommandToken::RBrace
+                | CommandToken::Case
+                | CommandToken::Do
+                | CommandToken::Done
+                | CommandToken::Elif
+                | CommandToken::Else
+                | CommandToken::Esac
+                | CommandToken::Fi
+                | CommandToken::For
+                | CommandToken::If
+                | CommandToken::In
+                | CommandToken::Then
+                | CommandToken::Until
+                | CommandToken::While
+        )
+    }
+
     pub fn as_word_str(&self) -> Option<&str> {
         match self {
             CommandToken::Bang => Some("!"),
@@ -406,7 +431,10 @@ impl<'src> CommandToken<'src> {
         }
     }
 
-    fn word(word: Cow<'src, str>) -> Self {
+    fn word(word: Cow<'src, str>, recognize_reserved: bool) -> Self {
+        if !recognize_reserved {
+            return CommandToken::Word(word);
+        }
         // A reserved word may be split by a line continuation (`i\`+newline+`f`),
         // which is removed before token recognition.
         let unsplit = if word.contains('\\') {
@@ -441,10 +469,14 @@ impl<'src> CommandToken<'src> {
 /// any other quoting, which would keep it an ordinary word regardless.
 fn strip_line_continuations(word: &str) -> Option<String> {
     let mut result = String::with_capacity(word.len());
-    let mut chars = word.chars();
+    let mut chars = word.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\\' if chars.next() == Some('\n') => {}
+            // Peek rather than consume: a guard that calls `chars.next()`
+            // swallows the character even when the guard fails.
+            '\\' if chars.peek() == Some(&'\n') => {
+                chars.next();
+            }
             '\\' | '\'' | '"' | '`' | '$' => return None,
             _ => result.push(c),
         }
@@ -622,7 +654,13 @@ impl<'src> CommandLexer<'src> {
         }
     }
 
-    pub fn next_token(&mut self) -> ParseResult<(CommandToken<'src>, u32)> {
+    /// `recognize_reserved` implements POSIX 2.4: a reserved word is only a
+    /// reserved word in specific grammatical positions, and an ordinary word
+    /// everywhere else. The parser decides, since only it knows the position.
+    pub fn next_token(
+        &mut self,
+        recognize_reserved: bool,
+    ) -> ParseResult<(CommandToken<'src>, u32)> {
         self.prev_read_state = self.source.read_state.clone();
         self.skip_blanks();
         self.skip_comment();
@@ -697,10 +735,10 @@ impl<'src> CommandLexer<'src> {
                     CommandToken::IoNumber(number)
                 } else {
                     self.source.read_state = prev_read_state;
-                    CommandToken::word(self.read_word_token()?)
+                    CommandToken::word(self.read_word_token()?, recognize_reserved)
                 }
             }
-            _ => CommandToken::word(self.read_word_token()?),
+            _ => CommandToken::word(self.read_word_token()?, recognize_reserved),
         };
         Ok((token, line_no))
     }
@@ -738,8 +776,8 @@ mod tests {
 
     fn lex_word(text: &str) {
         let mut lex = CommandLexer::new(text);
-        if let CommandToken::Word(word) = lex.next_token().unwrap().0 {
-            assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        if let CommandToken::Word(word) = lex.next_token(true).unwrap().0 {
+            assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
             assert_eq!(word, text);
         } else {
             panic!("not a word")
@@ -748,12 +786,12 @@ mod tests {
 
     fn lex_token(token: &str) -> CommandToken<'_> {
         let mut lex = CommandLexer::new(token);
-        let token = lex.next_token().unwrap().0;
+        let token = lex.next_token(true).unwrap().0;
         // A here-document pushes the remainder of its line back, so a trailing
         // newline may still be pending.
-        let mut next = lex.next_token().unwrap().0;
+        let mut next = lex.next_token(true).unwrap().0;
         if next == CommandToken::Newline {
-            next = lex.next_token().unwrap().0;
+            next = lex.next_token(true).unwrap().0;
         }
         assert_eq!(next, CommandToken::Eof);
         token
@@ -762,70 +800,70 @@ mod tests {
     #[test]
     fn lex_empty_string() {
         let mut lex = CommandLexer::new("");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 
     #[test]
     fn lex_skip_comment() {
         let mut lex = CommandLexer::new("# this is a comment\n");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Newline);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Newline);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
 
         let mut lex = CommandLexer::new("cmd arg #comment");
         assert_eq!(
-            lex.next_token().unwrap().0,
+            lex.next_token(true).unwrap().0,
             CommandToken::Word("cmd".into())
         );
         assert_eq!(
-            lex.next_token().unwrap().0,
+            lex.next_token(true).unwrap().0,
             CommandToken::Word("arg".into())
         );
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 
     #[test]
     fn lex_operators() {
         let mut lex = CommandLexer::new("&();\n|&&||;;< > >| >><&>&<>");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::And);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::LParen);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::RParen);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::SemiColon);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Newline);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Pipe);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::AndIf);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::OrIf);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::DSemi);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Less);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Greater);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Clobber);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::DGreat);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::LessAnd);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::GreatAnd);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::LessGreat);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::And);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::LParen);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::RParen);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::SemiColon);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Newline);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Pipe);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::AndIf);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::OrIf);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::DSemi);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Less);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Greater);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Clobber);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::DGreat);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::LessAnd);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::GreatAnd);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::LessGreat);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 
     #[test]
     fn test_lex_reserved_words() {
         let mut lex =
             CommandLexer::new("! { } case do done elif else esac fi for if in then until while");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Bang);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::LBrace);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::RBrace);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Case);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Do);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Done);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Elif);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Else);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Esac);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Fi);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::For);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::If);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::In);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Then);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Until);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::While);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Bang);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::LBrace);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::RBrace);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Case);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Do);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Done);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Elif);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Else);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Esac);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Fi);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::For);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::If);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::In);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Then);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Until);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::While);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 
     #[test]
@@ -948,10 +986,10 @@ mod tests {
     #[test]
     fn lex_io_number() {
         let mut lex = CommandLexer::new("123>");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::IoNumber(123));
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::IoNumber(123));
         let mut lex = CommandLexer::new("123");
         assert_eq!(
-            lex.next_token().unwrap().0,
+            lex.next_token(true).unwrap().0,
             CommandToken::Word("123".into())
         );
     }
@@ -959,13 +997,28 @@ mod tests {
     #[test]
     fn insert_text() {
         let mut lex = CommandLexer::new("a b c");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("a".into()));
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word("a".into())
+        );
         lex.insert_text_at_current_position("x".into(), "x");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("x".into()));
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("b".into()));
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("c".into()));
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word("x".into())
+        );
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word("b".into())
+        );
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word("c".into())
+        );
         lex.insert_text_at_current_position("y".into(), "y");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("y".into()));
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word("y".into())
+        );
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 }

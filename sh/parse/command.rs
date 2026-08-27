@@ -167,7 +167,8 @@ impl SimpleCommand {
 #[cfg_attr(test, derive(PartialEq))]
 pub struct CaseItem {
     pub pattern: NonEmpty<WordPair>,
-    pub body: CompleteCommand,
+    /// `None` for an item with an empty body (`x) ;;`), which POSIX permits.
+    pub body: Option<CompleteCommand>,
     /// `true` if this item is terminated by `;&` (fall through to the next
     /// item's body without pattern matching) rather than `;;`.
     pub fallthrough: bool,
@@ -180,7 +181,9 @@ impl Display for CaseItem {
             write!(f, " | {}", pattern.as_string)?;
         }
         write!(f, ")")?;
-        write!(f, " {}", self.body)?;
+        if let Some(body) = &self.body {
+            write!(f, " {body}")?;
+        }
         write!(f, "{}", if self.fallthrough { ";&" } else { ";;" })
     }
 }

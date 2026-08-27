@@ -129,6 +129,16 @@ trait Lexer {
     fn skip_command_substitution(&mut self) -> ParseResult<()> {
         let start_lineno = self.line_no();
         let mut open_parens = 0;
+        // A `case` item's pattern ends in a `)` that never had a matching `(`,
+        // so paren counting alone mistakes it for the end of the substitution
+        // and `$(case a in a) echo A;; esac)` is cut short. Track how many
+        // `case`s are still open; while any is, a `)` at depth zero belongs to
+        // a pattern.
+        let mut open_cases: u32 = 0;
+        let mut word = String::new();
+        // `case`/`esac` are reserved words only in command position, so
+        // `$(echo case)` must not be counted (POSIX 2.4).
+        let mut at_command_start = true;
         self.skip_comment();
         loop {
             if self.reached_eof() {
@@ -138,7 +148,26 @@ trait Lexer {
                     true,
                 ));
             }
-            match self.lookahead() {
+            // A blank or operator ends the current word; `case` and `esac` are
+            // only reserved words when they stand alone.
+            let c = self.lookahead();
+            if is_blank(c) || is_operator(c) {
+                if !word.is_empty() {
+                    if at_command_start {
+                        match word.as_str() {
+                            "case" => open_cases += 1,
+                            "esac" => open_cases = open_cases.saturating_sub(1),
+                            _ => {}
+                        }
+                    }
+                    at_command_start = false;
+                    word.clear();
+                }
+                if matches!(c, ';' | '&' | '|' | '\n' | '(' | ')') {
+                    at_command_start = true;
+                }
+            }
+            match c {
                 '"' => {
                     self.skip_double_quoted_string()?;
                 }
@@ -149,8 +178,11 @@ trait Lexer {
                 '(' => {
                     open_parens += 1;
                 }
-                ')' if open_parens == 0 => {
+                ')' if open_parens == 0 && open_cases == 0 => {
                     break;
+                }
+                ')' if open_parens == 0 => {
+                    // closes a `case` item's pattern
                 }
                 ')' => {
                     open_parens -= 1;
@@ -179,14 +211,13 @@ trait Lexer {
                     continue;
                 }
                 other if is_blank(other) || is_operator(other) => {
-                    // unquoted blanks and operators are word delimiters
                     // when '#' is not inside a word it is a comment.
                     self.advance();
                     self.skip_comment();
                     // don't advance char
                     continue;
                 }
-                _ => {}
+                other => word.push(other),
             }
             self.advance();
         }

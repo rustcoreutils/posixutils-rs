@@ -414,3 +414,50 @@ A near-miss worth recording: hoisting assignment expansion out of
 left-to-right assignment visibility (`a=1 b=$a` set `b` to empty instead of
 `1`). Expansion and assignment must interleave. There is now a regression test
 pinning it.
+
+### Phase 2 — reserved words are recognized only in command position
+
+- [x] **`while true; do echo done; break; done` hung forever.**
+  `CommandLexer::word()` mapped `if`/`do`/`done`/… to reserved tokens
+  **unconditionally**, with no notion of token position, and
+  `parse_simple_command` compensated by stopping at a threaded
+  `end: CommandToken`. So `done` used as an *argument* was taken for the loop
+  terminator, `break` landed outside the loop, and the loop never ended.
+  `for i in 1; do echo done; done` reported `sh: 'done' not found`.
+  The lexer now takes a `recognize_reserved` flag and the parser supplies it
+  from POSIX 2.4: a reserved word is one only as the first word of a command,
+  or the first word after a reserved word other than `case`, `for` or `in`.
+  The decision depends solely on the token being consumed, so it lives in
+  `advance()` rather than at ~50 call sites. `parse_simple_command` now stops
+  at any reserved word — a reserved word cannot be an argument — which made
+  the threaded `end: CommandToken` vestigial; it is deleted from all five
+  functions that carried it.
+- [x] **`in` as the third word of `case`/`for`.** POSIX 2.4 excludes `in` from
+  the "first word after a reserved word" rule, so the preceding word carries no
+  signal and the lexer reads `in` as ordinary. `match_reserved_word` accepts
+  either spelling, so `case in in in) …` and `for in in in; do …` work.
+  `esac` immediately after `in` closes an empty case list, and is accepted the
+  same way.
+- [x] **`case x in x) ;; esac` was rejected** though POSIX 2.9.4 permits an
+  empty body. `CaseItem::body` was a `CompleteCommand` holding a
+  `NonEmpty<Conjunction>`, so an empty body was unrepresentable; it is now
+  `Option<CompleteCommand>`.
+- [x] **`$(case a in a) …;; esac)` was cut short and executed anyway.** The
+  command-substitution scanner counted parentheses, but a `case` pattern's `)`
+  has no opener, so the substitution ended at the first pattern. The scanner
+  now tracks open `case`s, counting `case`/`esac` only in command position so
+  `$(echo case)` is unaffected.
+- [x] **An alias expanding to a compound command lost its first token.**
+  `alias_substitution` returned `Ok(None)` when the expansion did not start
+  with a plain word, and both callers then advanced past it, so
+  `alias f="if true; then echo t; fi"; f` reported `sh: 'then' not found`.
+  The replacement text takes the command word's place, so its first token is
+  read in command position, and `parse_command` re-dispatches on it.
+- [x] **A guard consumed the character it peeked at.**
+  `strip_line_continuations` matched `'\\' if chars.next() == Some('\n')`,
+  swallowing the following character even when the guard failed.
+
+One committed test encoded non-POSIX behavior and was corrected rather than
+preserved: `parse_brace_group` asserted that `{ word }` parses. `}` is a
+reserved word, so it is only recognized in command position — dash and bash
+both reject `{ word }` and require the separator.

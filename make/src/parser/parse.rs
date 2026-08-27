@@ -113,6 +113,8 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
         /// the list of syntax errors we've accumulated
         /// so far.
         errors: Vec<String>,
+        /// how many rules the root loop produced.
+        rules_seen: usize,
     }
 
     impl Parser {
@@ -200,6 +202,7 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
                 match self.find(|&&(k, _)| k == COLON || k == NEWLINE || k == INCLUDE) {
                     Some((COLON, ":")) => {
                         self.parse_rule();
+                        self.rules_seen += 1;
                     }
                     Some((INCLUDE, "include")) => {
                         dbg!(&self.tokens);
@@ -219,6 +222,9 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
                 if self.current().is_none() {
                     break;
                 }
+            }
+            if self.rules_seen == 0 && self.errors.is_empty() {
+                self.errors.push(" *** No targets. Stop.".to_string());
             }
             // Close the root node.
             self.builder.finish_node();
@@ -281,6 +287,7 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
         tokens,
         builder: GreenNodeBuilder::new(),
         errors: Vec::new(),
+        rules_seen: 0,
     }
     .parse();
 
@@ -529,7 +536,7 @@ impl FromStr for Makefile {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let processed = preprocess(s).map_err(|e| ParseError(vec![e.to_string()]))?;
+        let (processed, _macros) = preprocess(s).map_err(|e| ParseError(vec![e.to_string()]))?;
         parse(&processed).map(|node| node.root())
     }
 }

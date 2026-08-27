@@ -19,12 +19,17 @@ all:
 	$(VAR) $V ${VAR} ${V} $(V)
 "#;
 
+        // Two macro definitions are blanked rather than deleted, so each
+        // leaves an empty line behind and every later line keeps its original
+        // number. The original blank line is still there too, hence four.
         const EXPECTED: &str = r#"
+
+
 
 all:
 	var ok var ok ok
 "#;
-        let Ok(result) = preprocess(MACROS) else {
+        let Ok((result, _macros)) = preprocess(MACROS) else {
             panic!("Test must be preprocessed without an error")
         };
         assert_eq!(result, EXPECTED);
@@ -33,14 +38,18 @@ all:
     // Audit #6: `$(VAR:subst1=subst2)` suffix substitution.
     #[test]
     fn test_subst_suffix() {
-        let result = preprocess("SRC = a.c b.c foo.c\nall:\n\t@echo $(SRC:.c=.o)\n").unwrap();
+        let result = preprocess("SRC = a.c b.c foo.c\nall:\n\t@echo $(SRC:.c=.o)\n")
+            .unwrap()
+            .0;
         assert!(result.contains("@echo a.o b.o foo.o"), "got: {result:?}");
     }
 
     // Audit #6: `$(VAR:op%os=np%ns)` pattern substitution.
     #[test]
     fn test_subst_pattern() {
-        let result = preprocess("O = a.o b.o\nall:\n\t@echo $(O:%.o=%.x)\n").unwrap();
+        let result = preprocess("O = a.o b.o\nall:\n\t@echo $(O:%.o=%.x)\n")
+            .unwrap()
+            .0;
         assert!(result.contains("@echo a.x b.x"), "got: {result:?}");
     }
 
@@ -48,7 +57,9 @@ all:
     // macro definition.
     #[test]
     fn test_continuation_macro() {
-        let result = preprocess("FOO = a\\\nb\nall:\n\t@echo $(FOO)\n").unwrap();
+        let result = preprocess("FOO = a\\\nb\nall:\n\t@echo $(FOO)\n")
+            .unwrap()
+            .0;
         assert!(result.contains("@echo a b"), "got: {result:?}");
     }
 
@@ -56,7 +67,7 @@ all:
     // (the leading tab of the continuation is removed).
     #[test]
     fn test_continuation_recipe() {
-        let result = preprocess("all:\n\t@echo one \\\n\ttwo\n").unwrap();
+        let result = preprocess("all:\n\t@echo one \\\n\ttwo\n").unwrap().0;
         assert!(result.contains("@echo one two"), "got: {result:?}");
     }
 
@@ -64,7 +75,9 @@ all:
     // rule stage rather than being expanded or rejected here.
     #[test]
     fn test_internal_macros_passthrough() {
-        let result = preprocess("all: a b\n\t@echo $^ $+ $(@D) $(@F) ${?F}\n").unwrap();
+        let result = preprocess("all: a b\n\t@echo $^ $+ $(@D) $(@F) ${?F}\n")
+            .unwrap()
+            .0;
         assert!(
             result.contains("@echo $^ $+ $(@D) $(@F) ${?F}"),
             "got: {result:?}"
@@ -77,7 +90,7 @@ all:
     fn test_dash_include_missing_ignored() {
         let result = preprocess("-include /nonexistent_xyz.mk\nall:\n\t@echo ok\n");
         assert!(result.is_ok(), "got: {result:?}");
-        assert!(result.unwrap().contains("@echo ok"));
+        assert!(result.unwrap().0.contains("@echo ok"));
     }
 
     #[test]
@@ -90,7 +103,9 @@ all:
     // directive (it lacks the required trailing blank after `include`).
     #[test]
     fn test_includedir_not_mistaken_for_include() {
-        let result = preprocess("includedir = /usr\nall:\n\t@echo $(includedir)\n").unwrap();
+        let result = preprocess("includedir = /usr\nall:\n\t@echo $(includedir)\n")
+            .unwrap()
+            .0;
         assert!(result.contains("@echo /usr"), "got: {result:?}");
     }
 
@@ -108,6 +123,90 @@ all:
     fn test_subst_missing_close_errors() {
         let result = preprocess("V = a.c\nall:\n\t@echo $(V:.c=.o\n");
         assert!(result.is_err(), "expected an error, got: {result:?}");
+    }
+
+    fn macros_of(source: &str) -> Vec<(String, String)> {
+        preprocess(source).expect("must preprocess").1
+    }
+
+    fn value_of(source: &str, name: &str) -> String {
+        macros_of(source)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("macro {name} not returned"))
+            .1
+    }
+
+    // Audit #36: macro definitions must reach the caller. They used to be
+    // consumed here and dropped, leaving `Make::macros` permanently empty and
+    // the `SHELL` macro inert.
+    #[test]
+    fn test_macros_are_returned() {
+        assert_eq!(
+            value_of("SHELL = /bin/bash\nall:\n\techo hi\n", "SHELL"),
+            "/bin/bash"
+        );
+    }
+
+    // The returned table keeps first-definition order, so the macros handed to
+    // `Make` are deterministic.
+    #[test]
+    fn test_macro_order_is_first_definition() {
+        let names: Vec<String> = macros_of("B = 2\nA = 1\nB = 3\nall:\n\techo hi\n")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec!["B".to_string(), "A".to_string()]);
+    }
+
+    // POSIX assignment operators, checked through the returned table rather
+    // than through their effect on the text.
+    #[test]
+    fn test_append_operator() {
+        assert_eq!(value_of("A = 1\nA += 2\nall:\n\techo hi\n", "A"), "1 2");
+    }
+
+    #[test]
+    fn test_append_to_undefined_is_plain_assignment() {
+        assert_eq!(value_of("A += 2\nall:\n\techo hi\n", "A"), "2");
+    }
+
+    #[test]
+    fn test_conditional_operator_keeps_existing() {
+        assert_eq!(value_of("A = y\nA ?= x\nall:\n\techo hi\n", "A"), "y");
+    }
+
+    #[test]
+    fn test_conditional_operator_assigns_when_unset() {
+        assert_eq!(value_of("A ?= x\nall:\n\techo hi\n", "A"), "x");
+    }
+
+    // POSIX 105746-105748: `!=` strips leading white space, drops one trailing
+    // <newline>, and turns every remaining <newline> into a <space>.
+    #[test]
+    fn test_shell_assignment_whitespace_rules() {
+        assert_eq!(
+            value_of("A != printf 'one\\ntwo\\n'\nall:\n\techo hi\n", "A"),
+            "one two"
+        );
+    }
+
+    // Audit #35: an include path may reference a macro. The include pass used
+    // to be handed an empty table, so this was always UndefinedMacro.
+    #[test]
+    fn test_include_path_may_use_a_macro() {
+        let dir = std::env::temp_dir().join("make_preproc_include_macro");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inc = dir.join("inc.mk");
+        std::fs::write(&inc, "included:\n\t@echo from-include\n").unwrap();
+
+        let source = format!("TOP = {}\ninclude $(TOP)/inc.mk\n", dir.display());
+        let text = preprocess(&source)
+            .expect("include with a macro in its path")
+            .0;
+        assert!(text.contains("from-include"), "got: {text:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -349,7 +448,7 @@ rule: dependency
 	${VARIABLE}
 
 "#;
-        let Ok(processed) = preprocess(SIMPLE) else {
+        let Ok((processed, _macros)) = preprocess(SIMPLE) else {
             panic!("Must be preprocessed without an error")
         };
         let parsed = parse(&processed);
@@ -358,24 +457,25 @@ rule: dependency
         let node = parsed.clone().unwrap().syntax();
         assert_eq!(
             format!("{:#?}", node),
-            r#"ROOT@0..38
+            r#"ROOT@0..39
   NEWLINE@0..1 "\n"
-  RULE@1..38
-    IDENTIFIER@1..5 "rule"
-    COLON@5..6 ":"
-    WHITESPACE@6..7 " "
-    EXPR@7..17
-      IDENTIFIER@7..17 "dependency"
-    NEWLINE@17..18 "\n"
-    RECIPE@18..27
-      INDENT@18..19 "\t"
-      TEXT@19..26 "command"
-      NEWLINE@26..27 "\n"
-    RECIPE@27..37
-      INDENT@27..28 "\t"
-      TEXT@28..36 "command2"
-      NEWLINE@36..37 "\n"
-    NEWLINE@37..38 "\n"
+  NEWLINE@1..2 "\n"
+  RULE@2..39
+    IDENTIFIER@2..6 "rule"
+    COLON@6..7 ":"
+    WHITESPACE@7..8 " "
+    EXPR@8..18
+      IDENTIFIER@8..18 "dependency"
+    NEWLINE@18..19 "\n"
+    RECIPE@19..28
+      INDENT@19..20 "\t"
+      TEXT@20..27 "command"
+      NEWLINE@27..28 "\n"
+    RECIPE@28..38
+      INDENT@28..29 "\t"
+      TEXT@29..37 "command2"
+      NEWLINE@37..38 "\n"
+    NEWLINE@38..39 "\n"
 "#
         );
 
@@ -396,7 +496,7 @@ rule: dependency
     fn test_parse_export_assign() {
         const EXPORT: &str = r#"export VARIABLE := value
 "#;
-        let Ok(processed) = preprocess(EXPORT).map_err(|e| println!("{e:?}")) else {
+        let Ok((processed, _macros)) = preprocess(EXPORT).map_err(|e| println!("{e:?}")) else {
             panic!("Must be preprocessed without an error")
         };
         let parsed = parse(&processed);

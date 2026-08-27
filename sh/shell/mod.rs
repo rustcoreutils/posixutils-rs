@@ -262,8 +262,12 @@ fn is_assignment_shaped(word: &str) -> bool {
 }
 
 impl Shell {
+    /// POSIX 2.12: a subshell starts with every trap the parent *caught* reset
+    /// to its default action; ignored traps stay ignored. That covers the EXIT
+    /// trap too, which is held separately from the signal traps.
     fn become_subshell(&mut self) {
         self.signal_manager.reset();
+        self.exit_action = TrapAction::Default;
         self.is_subshell = true;
     }
 
@@ -441,7 +445,10 @@ impl Shell {
         opened_files: &OpenedFiles,
     ) -> OsResult<i32> {
         match fork()? {
-            ForkResult::Child => self.exec(command, args, opened_files),
+            ForkResult::Child => {
+                self.become_subshell();
+                self.exec(command, args, opened_files)
+            }
             ForkResult::Parent { child } => self.wait_child_process(child),
         }
     }
@@ -519,12 +526,16 @@ impl Shell {
     ) -> CommandExecutionResult<i32> {
         self.environment.push_scope();
 
-        self.assign_locals(&simple_command.assignments)?;
+        // The scope must be popped even when the assignment fails, or the
+        // variable stays set and, because `Environment::exported` exports every
+        // local scope, leaks into every later child.
+        if let Err(err) = self.assign_locals(&simple_command.assignments) {
+            self.environment.pop_scope();
+            return Err(err);
+        }
 
-        let mut previous_opened_files = self.opened_files.clone();
-        previous_opened_files.redirect(&simple_command.redirections, self)?;
-        std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
-
+        // The redirections are applied by `interpret_compound_command` below;
+        // applying them here as well opened every one of them twice.
         let mut args = expanded_words[1..].to_vec();
         std::mem::swap(&mut args, &mut self.positional_parameters);
 
@@ -548,7 +559,6 @@ impl Shell {
         self.loop_depth = saved_loop_depth;
         self.last_lineno = saved_lineno;
         std::mem::swap(&mut args, &mut self.positional_parameters);
-        std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
         self.environment.pop_scope();
         result
     }
@@ -562,17 +572,23 @@ impl Shell {
         let mut opened_files = self.opened_files.clone();
         opened_files.redirect(&simple_command.redirections, self)?;
 
+        // The prefix assignments live in a scope of their own, which must be
+        // popped even when the assignment fails: `Environment::exported`
+        // exports every local scope, so a leaked one would put the variable in
+        // the environment of every later child.
         self.environment.push_scope();
-        self.assign_locals(&simple_command.assignments)?;
-        let status = match builtin_utility.exec(args, self, &mut opened_files) {
-            Ok(status) => status,
-            Err(err) => {
-                opened_files.write_err(format!("{err}\n"));
-                1
-            }
-        };
+        let result =
+            self.assign_locals(&simple_command.assignments).map(|_| {
+                match builtin_utility.exec(args, self, &mut opened_files) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        opened_files.write_err(format!("{err}\n"));
+                        1
+                    }
+                }
+            });
         self.environment.pop_scope();
-        Ok(status)
+        result
     }
 
     /// `set -x`: report the command about to be executed, preceded by PS4.
@@ -697,12 +713,14 @@ impl Shell {
                 ))?;
 
             self.environment.push_scope();
-            self.assign_locals(&simple_command.assignments)?;
-            let mut opened_files = self.opened_files.clone();
-            opened_files.redirect(&simple_command.redirections, self)?;
             let result = self
-                .fork_and_exec(command, &expanded_words, &opened_files)
-                .map_err(|err| err.into());
+                .assign_locals(&simple_command.assignments)
+                .and_then(|_| {
+                    let mut opened_files = self.opened_files.clone();
+                    opened_files.redirect(&simple_command.redirections, self)?;
+                    self.fork_and_exec(command, &expanded_words, &opened_files)
+                        .map_err(|err| err.into())
+                });
             self.environment.pop_scope();
             result
         }
@@ -820,14 +838,16 @@ impl Shell {
         continue_if_zero: bool,
         ignore_errexit: bool,
     ) -> i32 {
-        let status = 0;
+        // POSIX: a loop's exit status is that of the last command executed in
+        // its body, or zero if the body never ran.
+        let mut status = 0;
         loop {
             let condition = self.interpret(condition, true);
             if (condition == 0 && !continue_if_zero) || (condition != 0 && continue_if_zero) {
                 break;
             }
             self.loop_depth += 1;
-            self.interpret(body, ignore_errexit);
+            status = self.interpret(body, ignore_errexit);
             self.loop_depth -= 1;
             match self.control_flow_state {
                 ControlFlowState::Break(_) => {
@@ -1089,10 +1109,27 @@ impl Shell {
         ignore_errexit: bool,
     ) -> i32 {
         let mut status = 0;
-        let mut i = 0;
-        while i < list.len() {
-            let (pipeline, op) = &list[i];
-            let ignore_errexit = i == list.len() - 1 && ignore_errexit;
+        for i in 0..list.len() {
+            let (pipeline, _) = &list[i];
+            // The first pipeline always runs. Each later one runs only if the
+            // operator joining it to the previous pipeline is satisfied by the
+            // status so far; otherwise it is skipped and the status carries
+            // through. Skipping one element at a time is what makes
+            // `false && a && b` run neither a nor b.
+            if i > 0 {
+                let run = match list[i - 1].1 {
+                    LogicalOp::And => status == 0,
+                    LogicalOp::Or => status != 0,
+                    LogicalOp::None => true,
+                };
+                if !run {
+                    continue;
+                }
+            }
+            // POSIX 2.11: `set -e` exempts every command of an AND-OR list
+            // except the last, since the earlier ones' failure is what the
+            // operators are testing.
+            let ignore_errexit = i != list.len() - 1 || ignore_errexit;
             status = match self.interpret_pipeline(pipeline, ignore_errexit) {
                 Ok(status) => status,
                 Err(err) => {
@@ -1103,14 +1140,6 @@ impl Shell {
             if self.control_flow_state != ControlFlowState::None {
                 return status;
             }
-            if status != 0 && *op == LogicalOp::And {
-                // false && other ... -> skip other
-                i += 1;
-            } else if status == 0 && *op == LogicalOp::Or {
-                // true || other ... -> skip other
-                i += 1;
-            }
-            i += 1;
         }
         status
     }
@@ -1227,7 +1256,14 @@ impl Shell {
         loop {
             let command = parser.parse_next_command(&self.alias_table)?;
             if !self.is_interactive && self.set_options.noexec {
-                return Ok(result);
+                // `set -n` reads and parses without executing, so the whole
+                // input must be parsed: returning here checked only the first
+                // command and reported success for a script whose later
+                // commands do not parse.
+                if command.is_none() {
+                    return Ok(result);
+                }
+                continue;
             }
             if let Some(command) = command {
                 if self.is_interactive {

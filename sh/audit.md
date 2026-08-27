@@ -461,3 +461,42 @@ One committed test encoded non-POSIX behavior and was corrected rather than
 preserved: `parse_brace_group` asserted that `{ word }` parses. `}` is a
 reserved word, so it is only recognized in command position — dash and bash
 both reject `{ word }` and require the separator.
+
+### Phase 3 — control flow, errexit, traps, `-n`
+
+- [x] **`false && echo A && echo B` ran `B`.** `interpret_and_or_list`'s
+  short-circuit added a single extra `i += 1`, skipping only the *next*
+  pipeline. Rewritten to the standard form: the first pipeline always runs, and
+  each later one runs only if the operator joining it to the previous pipeline
+  is satisfied by the status so far, so a skip naturally carries through the
+  whole run. `false && a && b` is now rc 1 with nothing run.
+- [x] **`set -e; false || echo recovered` exited 1 silently.** The errexit
+  predicate was `i == list.len() - 1 && ignore_errexit` — inverted. POSIX 2.11
+  exempts every element of an AND-OR list *except* the last, since the earlier
+  ones' failure is exactly what the operators test.
+- [x] **A loop always returned 0.** `interpret_loop_clause` bound
+  `let status = 0;` and never reassigned it, discarding the body's status.
+  `interpret_for_clause` alongside it was already correct.
+- [x] **The EXIT trap fired in every subshell.** `become_subshell` reset
+  `signal_manager` but left `exit_action`, and `fork_and_exec`'s child never
+  called it at all. POSIX 2.12 requires caught traps reset to their default in
+  a subshell, so the standard `trap 'rm -rf "$tmpdir"' EXIT` idiom deleted the
+  temporary directory at the first subshell or command substitution.
+- [x] **A failed prefix assignment leaked into the environment permanently.**
+  `exec_builtin_utility`, `exec_function` and the external-command branch each
+  called `push_scope()` and then `?`-returned past `pop_scope`, and
+  `Environment::exported` exports every local scope — so after
+  `FOO=bar cat </nonexistent`, `FOO` was set *and exported to every later
+  child*. All three now pop on every path.
+- [x] **A function's redirections were applied twice.** `exec_function`
+  redirected into its own copy of the file table and then passed the same
+  redirections to `interpret_compound_command`, which redirects again. Every
+  redirection was opened twice; the local copy is deleted.
+- [x] **`sh -n` only syntax-checked the first command.** The guard sat inside
+  the `parse_next_command` loop and returned on the first iteration, so
+  `printf 'true\n)))\n' > f; sh -n f` exited 0 where dash exits 2. It now
+  parses to end of input without executing.
+
+Re-probed from the feature backlog: **`set -o pipefail` is implemented and
+correct** (`set -o pipefail; false | true` → 1, without it → 0), so the entry
+listing it as missing is stale.

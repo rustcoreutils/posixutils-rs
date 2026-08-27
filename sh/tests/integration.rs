@@ -2873,4 +2873,98 @@ mod audit_regressions {
         test_script("{ echo hi; }\n", "hi\n");
         expect_exit_code("{ echo hi }\n", 2);
     }
+
+    // ---- Phase 3: control flow, errexit, traps, -n --------------------------
+
+    #[test]
+    fn and_or_list_skips_every_element_the_operator_excludes() {
+        // The short-circuit advanced by a single extra element, so only the
+        // *next* pipeline was skipped and `false && a && b` still ran b.
+        test_script("false && echo A && echo B\necho rc=$?\n", "rc=1\n");
+        test_script("true || echo A || echo B\necho rc=$?\n", "rc=0\n");
+        test_script("false || echo A || echo B\necho rc=$?\n", "A\nrc=0\n");
+        test_script("true && echo A && echo B\necho rc=$?\n", "A\nB\nrc=0\n");
+        test_script("false && echo A || echo C\necho rc=$?\n", "C\nrc=0\n");
+    }
+
+    #[test]
+    fn errexit_exempts_every_element_of_an_and_or_list_but_the_last() {
+        // The predicate was inverted, so `set -e; false || echo recovered`
+        // exited 1 without running the recovery.
+        test_script(
+            "set -e\nfalse || echo recovered\necho done\n",
+            "recovered\ndone\n",
+        );
+        test_script("set -e\nfalse && echo A\necho done\n", "done\n");
+        // The last element is still subject to errexit.
+        expect_exit_code("set -e\ntrue && false\necho notreached\n", 1);
+    }
+
+    #[test]
+    fn a_loop_reports_the_status_of_its_body() {
+        // `interpret_loop_clause` bound `status` to 0 and never reassigned it.
+        test_script(
+            "i=0\nwhile [ $i -lt 1 ]; do i=1; false; done\necho $?\n",
+            "1\n",
+        );
+        test_script(
+            "i=0\nuntil [ $i -ge 1 ]; do i=1; true; done\necho $?\n",
+            "0\n",
+        );
+        // A body that never runs leaves the status at zero.
+        test_script("while false; do echo x; done\necho $?\n", "0\n");
+    }
+
+    #[test]
+    fn a_subshell_starts_with_the_exit_trap_reset() {
+        // POSIX 2.12: traps the parent caught are reset to their default in a
+        // subshell. `become_subshell` reset the signal traps but left
+        // `exit_action`, so `trap 'rm -rf "$tmpdir"' EXIT` fired in every
+        // subshell, and `fork_and_exec`'s child never reset anything at all.
+        test_script("trap 'echo TRAP' EXIT\n(true)\necho done\n", "done\nTRAP\n");
+        test_script(
+            "trap 'echo TRAP' EXIT\nx=$(true)\necho done\n",
+            "done\nTRAP\n",
+        );
+        test_script("trap 'echo T' EXIT\ntrue | true\necho done\n", "done\nT\n");
+    }
+
+    #[test]
+    fn a_failed_prefix_assignment_does_not_leak_into_the_environment() {
+        // `push_scope` was followed by a `?`-return that skipped `pop_scope`,
+        // and `Environment::exported` exports every local scope, so the
+        // variable persisted *and* reached every later child.
+        run_successfully_and(
+            "FOO=bar cat </nonexistent 2>/dev/null\nenv | grep -c '^FOO=' || true\n",
+            |out| assert_eq!(out, "0\n"),
+        );
+        run_successfully_and("FOO=bar true\nenv | grep -c '^FOO=' || true\n", |out| {
+            assert_eq!(out, "0\n")
+        });
+    }
+
+    #[test]
+    fn a_functions_redirections_are_applied_once() {
+        // `exec_function` redirected into its own copy and then
+        // `interpret_compound_command` redirected again, opening every
+        // redirection twice.
+        test_script(
+            "f() { echo x; }\nf >> $TEST_WRITE_DIR/once.txt\nf >> $TEST_WRITE_DIR/once.txt\nwc -l < $TEST_WRITE_DIR/once.txt\nrm -f $TEST_WRITE_DIR/once.txt\n",
+            "2\n",
+        );
+    }
+
+    #[test]
+    fn noexec_parses_the_whole_input() {
+        // The guard returned after the first command, so `sh -n` reported
+        // success for a script whose later commands do not parse.
+        expect_cli_exit_code(vec!["-n".to_string(), "-s".to_string()], "true\n)))\n", 2);
+        expect_cli_exit_code(
+            vec!["-n".to_string(), "-s".to_string()],
+            "true\necho ok\n",
+            0,
+        );
+        // -n must not execute anything.
+        run_successfully_and("true\n", |out| assert_eq!(out, ""));
+    }
 }

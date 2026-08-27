@@ -111,7 +111,10 @@ pub fn umask(mask: u32) -> u32 {
 /// Reads the process file-mode creation mask without changing it. There is no
 /// query form of `umask(2)`, so it has to be set and put back.
 pub fn get_umask() -> u32 {
-    let previous = umask(0o022);
+    // The mask is the most restrictive one available, so that a file created
+    // between the two calls -- from a signal handler, say -- is not left more
+    // permissive than the caller asked for.
+    let previous = umask(0o777);
     umask(previous);
     previous
 }

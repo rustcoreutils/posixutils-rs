@@ -350,7 +350,7 @@ impl Shell {
                 .write_report(|job| self.opened_files.write_err(job.to_string_short()));
         }
         if !self.set_options.monitor {
-            self.background_jobs.cleanup_terminated_jobs();
+            self.background_jobs.collect_terminated_jobs();
         }
     }
 
@@ -1315,7 +1315,7 @@ impl Shell {
             self.background_jobs
                 .write_report(|job| self.opened_files.write_err(job.to_string_short()));
         }
-        self.background_jobs.cleanup_terminated_jobs();
+        self.background_jobs.collect_terminated_jobs();
         self.last_lineno = parser.lineno() - 1;
         Ok(result)
     }

@@ -913,3 +913,43 @@ The lesson is narrow and worth keeping: converting a *type* to bytes does not
 convert the *code*, and `.display()` is exactly where the two come apart. Every
 one of these was a `.display()`, a lossy view, or a fallible text conversion
 sitting on a path that had already been given bytes to carry.
+
+### CI and external-review follow-up — jobs, tildes, and test portability
+
+Three defects survived the branch's own gate, one of them because the gate is
+Linux-only.
+
+- [x] **`wait` reported 127 for a job it had already reaped.** Phase 6's zombie
+  fix made the shell reap background children eagerly, and `handle_async_events`
+  then *pruned* the finished jobs, discarding the status `wait` exists to
+  report. `wait $!` on a job that had had time to finish gave 127 — the status
+  POSIX reserves for a pid that was never a child. A terminated job now keeps
+  its status until `wait` collects it, and a collected status outlives the job
+  in a bounded ring, so a repeated `wait` on the same pid still answers, as dash
+  and bash both do. The Linux run was fast enough to win the race and pass; only
+  macOS CI failed. A terminated job still leaves the table promptly -- nothing
+  bounds how many background commands a loop starts -- it just leaves it into
+  the bounded memory of collected statuses rather than into nothing.
+- [x] **A tilde-prefix that was not text expanded to `$HOME`.** The login name
+  was decoded with `unwrap_or("")`, and an empty login name means "use HOME", so
+  `~<0xff>/x` silently became `$HOME/x`. Reported by an external review; the
+  same flaw was in both tilde paths, and the neighbouring `getpwnam` wrapper
+  would have panicked on a non-text home directory.
+- [x] **An unrecognized login name aborted the expansion**, where dash and bash
+  leave the tilde-prefix as written. POSIX leaves the case undefined, so this is
+  a compatibility fix rather than a conformance one — but it is what makes the
+  above fall out as one rule: a name the system does not recognize, for any
+  reason, is not a tilde-prefix.
+- [x] **A quoted tilde-prefix was expanded anyway.** POSIX 2.6.1: "If any of the
+  characters in the tilde-prefix are quoted, none of the characters in the
+  tilde-prefix shall be treated as a tilde-prefix." Only the leading unquoted
+  literal was examined, so `~"root"` gave `$HOME` + `root` and `~$u` likewise.
+  The prefix ends at the first *unquoted* slash, which is why `~root"/x"` is not
+  a tilde-prefix either.
+
+Two tests were wrong rather than the shell: `export -p | grep '^export V'` also
+matched the CI runner's `VCPKG_INSTALLATION_ROOT`, and two assertions compared
+`wc -l` output exactly, which BSD `wc` pads. A third asserted `ls` exits 2 on a
+missing file, which is a GNU-ism; it now asserts that writing to the closed
+descriptor fails, with the same probe run against an *open* descriptor so it
+cannot pass for an unrelated reason.

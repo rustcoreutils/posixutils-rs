@@ -253,8 +253,7 @@ fn simple_word_expansion_into(
     shell: &mut Shell,
 ) -> ExpansionResult<()> {
     let mut word = word.clone();
-    tilde_expansion(&mut word, tilde_mode, &shell.environment)
-        .map_err(CommandExecutionError::ExpansionError)?;
+    tilde_expansion(&mut word, tilde_mode, &shell.environment);
     for part in word.parts.into_iter() {
         match part {
             WordPart::UnquotedLiteral(lit) => result.append(lit, false, false),

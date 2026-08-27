@@ -534,7 +534,8 @@ mod tests {
             ),
             "123".to_string()
         );
-        shell.background_jobs.remove_job_by_pid(123);
+        shell.background_jobs.current_mut().unwrap().state = JobState::Done(0);
+        shell.background_jobs.collect_terminated_jobs();
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),

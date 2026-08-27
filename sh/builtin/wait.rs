@@ -17,14 +17,28 @@ use crate::shstr::ShString;
 /// Waits for `pid`, returning its status and whether it actually terminated
 /// (the wait also ends when the child merely stops).
 fn wait_for_pid(pid: Pid, shell: &mut Shell) -> (i32, bool) {
-    match shell.wait_child_process_result(pid) {
+    // A background job may already have been reaped by the periodic sweep, in
+    // which case `waitpid` gives ECHILD and the status lives only in the job
+    // table -- or, for a repeated `wait`, only in the memory of jobs already
+    // collected. dash and bash both keep reporting it.
+    if let Some(status) = shell.background_jobs.take_collected_status(pid) {
+        return (status, true);
+    }
+    let result = match shell.wait_child_process_result(pid) {
         Ok(result) => result,
-        // No such child (already reaped or never existed).
+        // No such child: never a child of this shell, or one whose status is
+        // long enough past that it is no longer remembered.
         Err(err) if err.errno == Errno::ECHILD => (127, true),
         // Any other error (e.g. EINTR from a trapped signal) must not abort the
         // shell; report a non-zero status rather than panicking.
         Err(_) => (127, false),
+    };
+    if result.1 {
+        // Reaped, so it is no longer a job; a merely stopped child is still
+        // alive and must stay in the table.
+        shell.background_jobs.collect(pid, result.0);
     }
+    result
 }
 
 pub struct Wait;
@@ -35,20 +49,22 @@ impl BuiltinUtility for Wait {
 
         let mut status = 0;
         if pids.is_empty() {
-            for job in shell.background_jobs.drain() {
-                wait_for_pid(job.pid, shell);
+            // Not a drain: each pid goes through the same path as an explicit
+            // `wait`, so a job that has already terminated leaves the table
+            // with its real status rather than a fabricated one.
+            let pids = shell
+                .background_jobs
+                .iter()
+                .map(|job| job.pid)
+                .collect::<Vec<_>>();
+            for pid in pids {
+                wait_for_pid(pid, shell);
             }
         } else {
             for pid in pids {
                 let pid = parse_pid(&pid.display().to_string(), shell)
                     .map_err(|err| format!("wait: {err}"))?;
-                let terminated;
-                (status, terminated) = wait_for_pid(pid, shell);
-                if terminated {
-                    // reaped, so it is no longer a known job; a merely stopped
-                    // child is still alive and must stay in the table
-                    shell.background_jobs.remove_job_by_pid(pid);
-                }
+                (status, _) = wait_for_pid(pid, shell);
             }
         }
 

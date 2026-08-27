@@ -2258,6 +2258,56 @@ mod audit_regressions {
         });
     }
 
+    #[test]
+    fn an_unrecognized_login_name_leaves_the_tilde_prefix_alone() {
+        // The login name was decoded with `unwrap_or("")`, so a tilde-prefix
+        // that is not text expanded to HOME instead; and a name the system does
+        // not know aborted the whole expansion. POSIX leaves both undefined and
+        // dash and bash both leave the tilde-prefix as written.
+        test_script(
+            "echo ~nosuchuser_xyz/x\nV=~nosuchuser_xyz/x\necho \"$V\"\n",
+            "~nosuchuser_xyz/x\n~nosuchuser_xyz/x\n",
+        );
+        expect_stdout_bytes(b"echo ~$(printf '\\377')/x\n", b"~\xff/x\n");
+    }
+
+    #[test]
+    fn a_quoted_tilde_prefix_is_not_a_tilde_prefix() {
+        // > If any of the characters in the tilde-prefix are quoted, none of
+        // > the characters in the tilde-prefix shall be treated as a
+        // > tilde-prefix.  -- POSIX XCU 2.6.1
+        // The prefix ends at the first *unquoted* slash, so `~root"/x"` is not
+        // one either. Only the leading unquoted literal was examined.
+        test_script("echo ~\"root\"\n", "~root\n");
+        test_script("u=root\necho ~$u\n", "~root\n");
+        test_script("echo ~root\"/x\"\n", "~root/x\n");
+        test_script("V=~\"root\"\necho \"$V\"\n", "~root\n");
+        // A prefix that does end at an unquoted slash still expands.
+        run_successfully_and("echo ~/\"x\" = $HOME/x\n", |out| {
+            let (got, want) = out.trim().split_once(" = ").expect("no marker");
+            assert_eq!(got, want);
+        });
+    }
+
+    #[test]
+    fn wait_keeps_reporting_the_status_of_a_job_it_collected() {
+        // The status of a collected job outlives the job itself: dash and bash
+        // both answer a repeated `wait` on the same pid, and reserve 127 for a
+        // pid that was never a child of this shell.
+        run_successfully_and(
+            "false & p=$!; wait $p; echo a=$?; wait $p; echo b=$?\n",
+            |out| assert_eq!(out, "a=1\nb=1\n"),
+        );
+        // The same, after the periodic sweep has had time to reap the child, so
+        // `waitpid` is guaranteed to fail with ECHILD.
+        run_successfully_and("false & p=$!; sleep 0.3; wait $p; echo $?\n", |out| {
+            assert_eq!(out, "1\n")
+        });
+        run_successfully_and("wait 2>/dev/null 99999; echo $?\n", |out| {
+            assert_eq!(out, "127\n")
+        });
+    }
+
     // ----- Phase 6: built-in output and option handling -----
 
     #[test]
@@ -2972,9 +3022,10 @@ mod audit_regressions {
         // `exec_function` redirected into its own copy and then
         // `interpret_compound_command` redirected again, opening every
         // redirection twice.
-        test_script(
+        // BSD `wc -l` pads its count, so compare the trimmed text.
+        run_successfully_and(
             "f() { echo x; }\nf >> $TEST_WRITE_DIR/once.txt\nf >> $TEST_WRITE_DIR/once.txt\nwc -l < $TEST_WRITE_DIR/once.txt\nrm -f $TEST_WRITE_DIR/once.txt\n",
-            "2\n",
+            |out| assert_eq!(out.trim(), "2"),
         );
     }
 
@@ -3099,11 +3150,18 @@ mod audit_regressions {
     #[test]
     fn closing_a_file_descriptor_actually_closes_it() {
         // `2>&-` only removed the entry from the table, and an absent
-        // descriptor is inherited from the shell rather than closed.
-        expect_exit_code("ls /nonexistent_xyz 2>&-\n", 2);
-        run_successfully_and("ls /nonexistent_xyz 2>&- 2>/dev/null || true\n", |out| {
-            assert_eq!(out, "")
-        });
+        // descriptor is inherited from the shell rather than closed. Assert the
+        // write fails rather than a particular status, which differs by system.
+        test_script(
+            "if ( echo x >&2 ) 2>&-; then echo open; else echo closed; fi\n",
+            "closed\n",
+        );
+        // The same probe with the descriptor left open, so the test cannot pass
+        // by the write failing for some unrelated reason.
+        test_script(
+            "if ( echo x >&2 ) 2>/dev/null; then echo open; else echo closed; fi\n",
+            "open\n",
+        );
     }
 
     #[test]
@@ -3112,10 +3170,11 @@ mod audit_regressions {
         // command may be handed fd 5 by the kernel. Closing during the
         // placement pass took that descriptor with it, in whichever order the
         // map happened to yield -- the same script gave 4 lines or 1.
+        // BSD `wc -l` pads its count, so compare the trimmed text.
         for _ in 0..8 {
-            test_script(
+            run_successfully_and(
                 "cd $TEST_READ_DIR\ncat 5<file1.txt 5<&- <file1.txt | wc -l\n",
-                "4\n",
+                |out| assert_eq!(out.trim(), "4"),
             );
         }
     }
@@ -3322,7 +3381,7 @@ mod audit_regressions {
         // `export -p` is meant to be read back by the shell, so a value that is
         // not text has to survive it rather than being flattened.
         expect_stdout_bytes(
-            b"V=$(printf 'a\\377b')\nexport V\nexport -p | grep '^export V'\n",
+            b"V=$(printf 'a\\377b')\nexport V\nexport -p | grep '^export V='\n",
             b"export V='a\xffb'\n",
         );
     }

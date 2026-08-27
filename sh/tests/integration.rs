@@ -2406,12 +2406,14 @@ mod audit_regressions {
         set_env_vars();
         // `hash name` remembers a location, `hash` lists it, and assigning to
         // PATH clears the table.
+        // `cat` rather than `true`: only an *external* utility is hashed, and
+        // `true` is a builtin.
         run_successfully_and(
-            "saved=$PATH\nhash true\nbefore=$(hash)\nPATH=/nonexistent\nafter=$(hash)\n\
+            "saved=$PATH\nhash cat\nbefore=$(hash)\nPATH=/nonexistent\nafter=$(hash)\n\
              PATH=$saved\necho \"[$before][$after]\"\n",
             |out| {
                 assert!(
-                    out.contains("true"),
+                    out.contains("cat"),
                     "expected a remembered location: {out:?}"
                 );
                 assert!(out.ends_with("[]\n"), "expected an empty table: {out:?}");
@@ -3204,5 +3206,31 @@ mod audit_regressions {
     fn parameter_length_counts_characters() {
         test_script("x=héllo\necho \"${#x}\"\n", "5\n");
         test_script("x=abc\necho \"${#x}\"\n", "3\n");
+    }
+
+    // ---- Phase 9: missing builtins and interactive output -------------------
+
+    #[test]
+    fn pwd_true_and_false_are_builtins() {
+        // POSIX XCU lists all three as utilities. `pwd` in particular *must* be
+        // built in, because `cd` is: a forked /bin/pwd reports the process
+        // working directory, which differs from the shell's logical one after
+        // `cd` through a symbolic link.
+        test_script("true\necho $?\n", "0\n");
+        test_script("false\necho $?\n", "1\n");
+        test_script("true && echo yes\n", "yes\n");
+        test_script(
+            "type pwd true false\n",
+            "pwd is a shell builtin\ntrue is a shell builtin\nfalse is a shell builtin\n",
+        );
+    }
+
+    #[test]
+    fn pwd_reports_the_logical_directory_after_following_a_link() {
+        // The whole reason `pwd` has to be a builtin.
+        test_script(
+            "cd $TEST_WRITE_DIR\nrm -rf pwdlink\nmkdir -p pwdlink_real\nln -sfn pwdlink_real pwdlink\ncd pwdlink\ntest \"$(pwd)\" != \"$(pwd -P)\" && echo differ\ncase $(pwd) in */pwdlink) echo logical;; esac\ncase $(pwd -P) in */pwdlink_real) echo physical;; esac\ncd ..\nrm -rf pwdlink pwdlink_real\n",
+            "differ\nlogical\nphysical\n",
+        );
     }
 }

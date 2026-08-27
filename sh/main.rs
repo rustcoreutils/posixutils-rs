@@ -90,28 +90,28 @@ fn report_mail(shell: &mut Shell) {
     }
 }
 
-fn flush_stdout() {
-    // this is a basic operation, if this doesn't work,
-    // there's nothing else we can do
-    io::stdout().flush().expect("could not flush stdout");
+/// The interactive editor's own output goes to standard error, so that a shell
+/// whose stdout is redirected does not have its prompt and echoed input mixed
+/// into the redirected stream.
+fn flush_terminal() {
+    let _ = io::stderr().flush();
 }
 
-fn write_stdout(bytes: &[u8]) {
-    io::stdout()
-        .write_all(bytes)
-        .expect("failed to write to stdout");
+fn write_terminal(bytes: &[u8]) {
+    let _ = io::stderr().write_all(bytes);
 }
 
+/// Writes the prompt and returns its width in *characters*: the caller uses it
+/// as a cursor column, and a byte count misplaces the cursor for any prompt
+/// containing a multi-byte character.
 fn print_prompt(shell: &mut Shell, print_ps2: bool) -> usize {
-    if print_ps2 {
-        let ps2 = shell.get_ps2();
-        print!("{}", ps2);
-        ps2.len()
+    let prompt = if print_ps2 {
+        shell.get_ps2()
     } else {
-        let ps1 = shell.get_ps1();
-        print!("{}", ps1);
-        ps1.len()
-    }
+        shell.get_ps1()
+    };
+    write_terminal(prompt.as_bytes());
+    prompt.chars().count()
 }
 
 fn standard_repl(shell: &mut Shell) {
@@ -119,7 +119,7 @@ fn standard_repl(shell: &mut Shell) {
     let mut line_buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
-    flush_stdout();
+    flush_terminal();
     report_mail(shell);
     eprint!("{}", shell.get_ps1());
     loop {
@@ -149,7 +149,7 @@ fn standard_repl(shell: &mut Shell) {
                             continue;
                         }
                     };
-                    println!();
+                    let _ = writeln!(io::stderr());
                     shell.terminal.reset();
                     match shell.execute_program(program_string) {
                         Ok(_) => {
@@ -176,9 +176,9 @@ fn standard_repl(shell: &mut Shell) {
             let mut cursor_position = line_buffer.len();
             clear_line();
             cursor_position += print_prompt(shell, print_ps2);
-            write_stdout(&line_buffer);
+            write_terminal(&line_buffer);
             set_cursor_pos(cursor_position);
-            flush_stdout();
+            flush_terminal();
         }
         // Wait for a keystroke or a signal rather than waking 62 times a
         // second to find neither.
@@ -188,7 +188,7 @@ fn standard_repl(shell: &mut Shell) {
         if shell.signal_manager.get_sigint_count() > 0 {
             program_buffer.clear();
             line_buffer.clear();
-            println!();
+            let _ = writeln!(io::stderr());
             report_mail(shell);
             eprint!("{}", shell.get_ps1());
         }
@@ -203,7 +203,7 @@ fn vi_repl(shell: &mut Shell) {
     let mut program_buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
-    flush_stdout();
+    flush_terminal();
     report_mail(shell);
     eprint!("{}", shell.get_ps1());
     loop {
@@ -222,7 +222,7 @@ fn vi_repl(shell: &mut Shell) {
                             continue;
                         }
                     };
-                    println!();
+                    let _ = writeln!(io::stderr());
                     shell.terminal.reset();
                     match shell.execute_program(program_string) {
                         Ok(_) => {
@@ -252,9 +252,9 @@ fn vi_repl(shell: &mut Shell) {
             let mut cursor_position = editor.cursor_position();
             clear_line();
             cursor_position += print_prompt(shell, print_ps2);
-            write_stdout(editor.current_line(shell));
+            write_terminal(editor.current_line(shell));
             set_cursor_pos(cursor_position);
-            flush_stdout()
+            flush_terminal()
         }
         // Wait for a keystroke or a signal rather than waking 62 times a
         // second to find neither.
@@ -264,7 +264,7 @@ fn vi_repl(shell: &mut Shell) {
         if shell.signal_manager.get_sigint_count() > 0 {
             program_buffer.clear();
             editor.reset_current_line();
-            println!();
+            let _ = writeln!(io::stderr());
             report_mail(shell);
             eprint!("{}", shell.get_ps1());
         }

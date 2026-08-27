@@ -705,3 +705,32 @@ builtins still hold `String`. It errors rather than losing bytes, which is what
 that path already did, so nothing regresses. Stages 2–4 (environment values and
 positional parameters; the argv/environ boundary and the builtin trait; the
 lexer and script text) remove it and finish the conversion.
+
+### Phase 9 — missing builtins and interactive output
+
+- [x] **`pwd`, `true` and `false` were not builtins.** POSIX XCU lists all three
+  as utilities, and every shell builds them in. `pwd` in particular *must* be
+  built in, because `cd` is: `cd` updates the shell's own
+  `current_directory`/`PWD`, but a forked `/bin/pwd` reports the *process*
+  working directory, so the two diverge after `cd` through a symbolic link.
+  `pwd` implements both `-L` (default; uses `$PWD` when it is absolute and free
+  of `.`/`..`, per the POSIX algorithm) and `-P`. Extra operands are ignored, as
+  dash and bash both do, rather than rejected — POSIX defines no operands, but
+  rejecting them would break scripts for nothing.
+- [x] **The prompt and the line editor drew on standard output.** POSIX is
+  explicit for PS1: "After expansion, the value shall be written to standard
+  error." Ours wrote the prompt, the echoed input and every cursor escape to
+  stdout, so `sh -i > log` filled the log with `\x1b[K`. All of it now goes to
+  stderr, matching `bash --posix`. (dash writes its prompt to stdout, which is
+  the non-conforming choice here.)
+- [x] **`print_prompt` returned a byte count** that the caller uses as a cursor
+  column, so any prompt with a multi-byte character misplaced the cursor. It
+  now counts characters.
+
+Not a defect after probing: `find_command` passes an empty default `PATH`, but
+an unset `PATH` makes dash, `bash --posix` and this shell alike report the
+command as not found, so there is nothing to reconcile.
+
+One committed test had to change: `hash_forgets_remembered_locations_when_path_changes`
+used `hash true` as a stand-in for an external utility, and `true` is now a
+builtin (only external utilities are hashed). It uses `cat`.

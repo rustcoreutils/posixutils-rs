@@ -23,12 +23,14 @@ use crate::builtin::getopts::GetOpts;
 use crate::builtin::hash::Hash;
 use crate::builtin::jobs::Jobs;
 use crate::builtin::kill::Kill;
+use crate::builtin::pwd::Pwd;
 use crate::builtin::read::BuiltinRead;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::shift::Shift;
 use crate::builtin::times::Times;
 use crate::builtin::trap::Trap;
+use crate::builtin::true_false::{False, True};
 use crate::builtin::type_::Type_;
 use crate::builtin::ulimit::Ulimit;
 use crate::builtin::umask::Umask;
@@ -58,12 +60,14 @@ mod getopts;
 mod hash;
 mod jobs;
 mod kill;
+mod pwd;
 mod read;
 mod readonly;
 pub mod set;
 mod shift;
 mod times;
 pub mod trap;
+mod true_false;
 mod type_;
 mod ulimit;
 mod umask;
@@ -183,6 +187,12 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "jobs" => Some(&Jobs),
         "type" => Some(&Type_),
         "unalias" => Some(&Unalias),
+        // POSIX XCU lists these as utilities; building them in is what every
+        // shell does, and `pwd` in particular *must* be built in because `cd`
+        // is (a forked /bin/pwd reports the process directory, not the shell's).
+        "pwd" => Some(&Pwd),
+        "true" => Some(&True),
+        "false" => Some(&False),
         _ => None,
     }
 }

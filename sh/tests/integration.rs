@@ -10,6 +10,7 @@
 mod pty;
 
 use plib::testing::{run_test, run_test_u8, run_test_with_checker, TestPlan, TestPlanU8};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3360,6 +3361,23 @@ mod audit_regressions {
 
     /// Byte-exact: the shapes below cannot be written as a `.sh`/`.out` fixture
     /// pair, which is `include_str!`-based UTF-8.
+    /// Whether the filesystem under test can hold a filename that is not valid
+    /// text. APFS cannot, so on macOS the byte-name probes below are measuring
+    /// the filesystem rather than the shell. Probed rather than assumed, so
+    /// they still run wherever the names are accepted.
+    fn filesystem_keeps_byte_names() -> bool {
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(&dir).expect("the target temporary directory is unusable");
+        let path = dir.join(std::ffi::OsStr::from_bytes(b"byte-name-probe\xff"));
+        let _ = std::fs::remove_file(&path);
+        let accepted = std::fs::write(&path, b"").is_ok();
+        let _ = std::fs::remove_file(&path);
+        if !accepted {
+            eprintln!("this filesystem rejects a filename that is not valid text");
+        }
+        accepted
+    }
+
     fn expect_stdout_bytes(script: &[u8], expected: &[u8]) {
         set_env_vars();
         run_test_u8(TestPlanU8 {
@@ -3453,6 +3471,9 @@ mod audit_regressions {
             b"set -- \"$(printf 'a\\377b')\"\necho \"$1\"\n",
             b"a\xffb\n",
         );
+        if !filesystem_keeps_byte_names() {
+            return;
+        }
         expect_stdout_bytes(
             b"cd \"$TEST_WRITE_DIR\"\nd=$(printf 'd\\377')\nrm -rf \"$d\"\nmkdir \"$d\"\ncd \"$d\" && echo in\ncd ..\nrm -rf \"$d\"\n",
             b"in\n",
@@ -3464,12 +3485,15 @@ mod audit_regressions {
         // The builtin converted every operand lossily, so a file test probed a
         // path with U+FFFD in it and two distinct byte strings compared equal.
         expect_stdout_bytes(
-            b"cd \"$TEST_WRITE_DIR\"\nf=$(printf 'tf\\377')\nrm -f \"$f\"\n: > \"$f\"\n[ -e \"$f\" ] && echo present\nrm -f \"$f\"\n",
-            b"present\n",
-        );
-        expect_stdout_bytes(
             b"a=$(printf 'x\\377')\nb=$(printf 'x\\376')\n[ \"$a\" = \"$b\" ] && echo same || echo different\n",
             b"different\n",
+        );
+        if !filesystem_keeps_byte_names() {
+            return;
+        }
+        expect_stdout_bytes(
+            b"cd \"$TEST_WRITE_DIR\"\nf=$(printf 'tf\\377')\nrm -f \"$f\"\n: > \"$f\"\n[ -e \"$f\" ] && echo present\nrm -f \"$f\"\n",
+            b"present\n",
         );
     }
 
@@ -3477,6 +3501,9 @@ mod audit_regressions {
     fn a_redirection_target_keeps_its_bytes() {
         // The target was converted lossily on the way to `open`, so the file
         // created had U+FFFD in its name rather than the byte asked for.
+        if !filesystem_keeps_byte_names() {
+            return;
+        }
         expect_stdout_bytes(
             b"cd \"$TEST_WRITE_DIR\"\nf=$(printf 'rt\\377')\nrm -f \"$f\"\necho hi > \"$f\"\ncat \"$f\"\nrm -f \"$f\"\n",
             b"hi\n",
@@ -3521,13 +3548,14 @@ mod audit_regressions {
     fn a_here_document_leaves_no_stray_descriptor() {
         // The temporary the here-document is written to was duplicated into
         // place but never closed, so the exec'd process inherited it.
-        run_successfully_and("ls /proc/self/fd 2>/dev/null <<EOF\nx\nEOF\n", |out| {
-            let fds: Vec<&str> = out.split_whitespace().collect();
-            assert!(
-                fds.len() <= 4,
-                "a here-document leaked a descriptor: {fds:?}"
-            );
-        });
+        // Counting the descriptors cannot work: the shell inherits whatever the
+        // test harness has open. Compare the same command with and without the
+        // here-document instead, so the inherited ones cancel out -- and do
+        // nothing at all where there is no /proc to ask.
+        run_successfully_and(
+            "cd \"$TEST_WRITE_DIR\"\nif ls /proc/self/fd >/dev/null 2>&1; then\n  ls /proc/self/fd > hd_base 2>/dev/null\n  ls /proc/self/fd <<EOF > hd_here 2>/dev/null\nx\nEOF\n  comm -13 hd_base hd_here\n  rm -f hd_base hd_here\nfi\necho done\n",
+            |out| assert_eq!(out, "done\n", "a here-document leaked a descriptor"),
+        );
     }
 
     #[test]

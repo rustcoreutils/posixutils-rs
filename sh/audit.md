@@ -966,3 +966,21 @@ while making the `export -p` test independent of `grep`:
   "sh: invalid utf-8 sequence". The same pure round-trip: the decoded string was
   handed straight to `execute_program` as `.as_bytes()`, and the lexer has taken
   bytes since the conversion.
+
+A third round of test-portability fixes, all four failures being the test rather
+than the shell -- and two of them tests that could not have failed for the
+reason they claimed:
+
+- **The here-document descriptor test counted descriptors**, so it was really
+  measuring how many the test harness had open: on a busier run the shell
+  inherited fds 142 and 145 and the count went over. It now runs the same
+  command with and without the here-document and compares, so inherited
+  descriptors cancel out; the mechanism is checked by planting a deliberate
+  `9<file` leak, which it reports. It also asked `/proc` unconditionally, which
+  is why it failed differently again on macOS.
+- **Three byte-name probes create a file whose name is not valid text**, which
+  APFS rejects outright -- so on macOS they were measuring the filesystem. The
+  filesystem-free halves now run everywhere and the rest is gated on a probe
+  that creates such a name and checks, rather than on the platform name. The
+  probe fails loudly if the target temporary directory is unusable, so it cannot
+  quietly turn the tests off where they are supposed to run.

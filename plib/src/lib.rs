@@ -21,6 +21,7 @@ pub mod priority;
 pub mod regex;
 pub mod sccsfile;
 pub mod syslog;
+pub mod test_expr;
 pub mod testing;
 pub mod tmp;
 pub mod tty;

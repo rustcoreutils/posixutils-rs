@@ -3233,4 +3233,34 @@ mod audit_regressions {
             "differ\nlogical\nphysical\n",
         );
     }
+
+    // ---- Phase 10: test and [ are builtins ---------------------------------
+
+    #[test]
+    fn test_and_bracket_are_builtins() {
+        test_script(
+            "type test [\n",
+            "test is a shell builtin\n[ is a shell builtin\n",
+        );
+        test_script("[ 1 -eq 1 ] && echo yes\n", "yes\n");
+        test_script("[ 1 -eq 2 ] || echo no\n", "no\n");
+        test_script("test -n abc && echo nonempty\n", "nonempty\n");
+        test_script("[ -z '' ] && echo empty\n", "empty\n");
+        test_script("[ -e /etc/passwd ] && echo exists\n", "exists\n");
+        test_script("[ ! -e /nonexistent_xyz ] && echo absent\n", "absent\n");
+        test_script(
+            "i=0\nwhile [ $i -lt 3 ]; do echo $i; i=$((i+1)); done\n",
+            "0\n1\n2\n",
+        );
+    }
+
+    #[test]
+    fn a_test_usage_error_exits_greater_than_one() {
+        // POSIX distinguishes a usage error from an expression that is merely
+        // false: false is 1, a usage error is greater than 1.
+        expect_exit_code("[ 1 -eq 1 ]\n", 0);
+        expect_exit_code("[ 1 -eq 2 ]\n", 1);
+        expect_exit_code("[ 1 -eq 1\n", 2);
+        expect_exit_code("[ -q x ]\n", 2);
+    }
 }

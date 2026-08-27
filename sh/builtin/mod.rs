@@ -28,6 +28,7 @@ use crate::builtin::read::BuiltinRead;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::shift::Shift;
+use crate::builtin::test_::Test;
 use crate::builtin::times::Times;
 use crate::builtin::trap::Trap;
 use crate::builtin::true_false::{False, True};
@@ -65,6 +66,7 @@ mod read;
 mod readonly;
 pub mod set;
 mod shift;
+mod test_;
 mod times;
 pub mod trap;
 mod true_false;
@@ -193,6 +195,14 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "pwd" => Some(&Pwd),
         "true" => Some(&True),
         "false" => Some(&False),
+        // A conditional is the most frequently executed command in a script;
+        // forking one per `[ ... ]` makes every loop pay for a process.
+        "test" => Some(&Test {
+            requires_closing_bracket: false,
+        }),
+        "[" => Some(&Test {
+            requires_closing_bracket: true,
+        }),
         _ => None,
     }
 }

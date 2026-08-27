@@ -734,3 +734,36 @@ command as not found, so there is nothing to reconcile.
 One committed test had to change: `hash_forgets_remembered_locations_when_path_changes`
 used `hash true` as a stand-in for an external utility, and `true` is now a
 builtin (only external utilities are hashed). It uses `cat`.
+
+### Phase 10 — POSIX.2024 feature survey
+
+The feature backlog recorded above was re-probed against the current binary
+rather than trusted. **Almost all of it is stale**, and what remains is
+optional by the standard's own words:
+
+| Candidate | Status |
+|---|---|
+| `$'...'` | **Implemented** (`WordToken::DollarSingleQuote`), including `\t`, `\xNN` |
+| `;&` fall-through | **Implemented** (`CommandToken::SemiAnd`) |
+| `set -o pipefail` | **Implemented** and correct |
+| Arithmetic `?:`, `,` | **Implemented** |
+| `read -d` | Implemented (a bash extension, not POSIX) |
+| `getopts`, `ulimit`, `times`, `command -v` | Implemented |
+| `newgrp` | Available as an external utility; POSIX does not require it built in |
+| `{varname}<` IO_LOCATION | **Optional**: the grammar marks it "Optionally supported". dash does not have it either. Left unimplemented, and it is a syntax error rather than silent acceptance. |
+| Arithmetic `++`/`--` | **Not required**: XCU 2.6.4 says "the `sizeof( )` operator and the prefix and postfix `++` and `--` operators are not required". Rejected with a diagnostic, not silently accepted. |
+| `local` | Not in POSIX at all |
+
+So there is no *required* POSIX.2024 feature missing. The one thing the survey
+did turn up is a conformance-adjacent gap of a different kind:
+
+- [x] **`test` and `[` were not builtins.** Functionally they worked, by forking
+  `/usr/bin/[`, but a conditional is the most frequently executed command in a
+  shell script: `while [ $i -lt N ]` paid for a process per iteration, and that
+  was the single largest remaining share of the gap to dash. A 2000-iteration
+  arithmetic loop went from **1.75 s to 0.12 s**.
+  The evaluator was not duplicated: it moved from `misc/test.rs` into
+  `plib::test_expr`, and the standalone utility and the builtin now share it, so
+  they cannot drift apart. `misc`'s 37 `test` tests pass unchanged against the
+  extracted code. A usage error exits 2 and a false expression exits 1, matching
+  dash.

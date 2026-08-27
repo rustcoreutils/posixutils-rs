@@ -3145,4 +3145,45 @@ mod audit_regressions {
         test_script("true &\nwait $!\necho $?\n", "0\n");
         test_script("false &\nwait $!\necho $?\n", "1\n");
     }
+
+    // ---- Phase 7: patterns match bytes directly ----------------------------
+
+    #[test]
+    fn a_pattern_ending_in_a_slash_names_directories_only() {
+        // `FilenamePattern::new` split on '/' and filtered out empty
+        // components, which discarded the trailing slash entirely: `*/` matched
+        // plain files and reported them without the slash.
+        test_script(
+            "cd $TEST_WRITE_DIR\nrm -rf slashdir\nmkdir -p slashdir/sub slashdir/sub2\n: > slashdir/afile\ncd slashdir\nprintf '[%s]' */\necho\ncd ..\nrm -rf slashdir\n",
+            "[sub/][sub2/]\n",
+        );
+        test_script("echo /etc/\n", "/etc/\n");
+    }
+
+    #[test]
+    fn shell_patterns_have_no_regex_metacharacters() {
+        // Patterns used to be translated to a BRE, so every regex
+        // metacharacter needed escaping and a missed one changed the meaning.
+        test_script("case '.' in .) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case 'a' in .) echo NO;; *) echo M;; esac\n", "M\n");
+        test_script("case '^' in [.*^]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case 'x+y' in 'x+y') echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case 'a$b' in 'a$b') echo M;; *) echo NO;; esac\n", "M\n");
+    }
+
+    #[test]
+    fn a_pattern_with_many_asterisks_terminates() {
+        // A backtracking matcher goes exponential on this shape; the state-set
+        // simulation does not. A regression would hang rather than fail.
+        test_script(
+            "x=$(printf 'a%.0s' $(seq 200))\ncase $x in a*a*a*a*a*b) echo NO;; *) echo M;; esac\n",
+            "M\n",
+        );
+    }
+
+    #[test]
+    fn question_mark_matches_a_character_not_a_byte() {
+        test_script("case 'é' in ?) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("x=héllo\necho \"${x#?}\"\n", "éllo\n");
+    }
 }

@@ -614,3 +614,54 @@ it is fork/exec cost plus the work done per command. The largest practical
 share of it is that `test` and `[` are not built in, so every `[ ... ]`
 conditional forks a process — dash and bash build both in. That belongs with
 the missing-builtin work rather than here.
+
+### Phase 7 — patterns match bytes directly; `pattern/regex.rs` is gone
+
+Shell patterns were translated to a POSIX BRE string and executed by
+`plib::regex`. The detour cost a regex compile per word, made anchoring a
+per-call-site decision (the root of Phase 1's affix bugs), forced every regex
+metacharacter to be escaped on the way through, and — decisively — could not
+carry bytes: `plib::regex` is `&str`-only, and the bridge used
+`CStr::to_str().unwrap_or("")`, silently turning a subject that is not valid
+text into the empty string.
+
+`pattern/matcher.rs` replaces it, matching `&[PatternItem]` against `&[u8]`
+directly. `pattern/regex.rs` is **deleted** (356 lines), and with it `sh`'s only
+use of `plib::regex`.
+
+- The engine simulates a Thompson-style state set: `O(subject × pattern)` time,
+  `O(pattern)` space, with no input that makes it blow up. `a*a*a*a*a*b` against
+  a long subject costs the same as any other pattern of that length, where a
+  backtracking matcher goes exponential.
+- Simulating the whole set also answers the question affix removal actually
+  asks. One pass yields *every* position a match can end at, so `${x#pat}` and
+  `${x##pat}` are the first and last of them; the previous implementation had to
+  truncate and retry. Suffixes reuse the same pass over reversed items and
+  reversed *steps* — never reversed bytes, which would shred multi-byte
+  characters.
+- The subject is split into "steps": one valid character, or one byte that is
+  not part of one. `?` matches a step, so it matches one character and removal
+  never cuts one in half — consistent with `${#x}` already counting characters.
+  A byte that is not a character belongs to no character class, but still
+  matches `*`, `?`, a literal of that byte, and a negated bracket.
+- Character classes use the locale's `iswalpha` and friends rather than Rust's
+  Unicode tables, since the shell calls `setlocale` at startup and sorts with
+  `strcoll`. An unknown class name is rejected at construction, as `regcomp`'s
+  `REG_ECTYPE` used to do.
+- [x] **`*/` matched plain files and dropped the slash.** `FilenamePattern::new`
+  split on `/` and filtered out empty components, discarding the trailing one
+  entirely, so `*/` behaved as `*` and `echo /etc/` printed `/etc`. A pattern
+  ending in `/` now matches directories only and keeps the slash.
+- Globbing matches directory entries as raw bytes, so a file name that is not
+  valid text is found rather than silently skipped. Carrying it through the
+  expansion still fails loudly ("contains invalid utf8") because a field is a
+  `String`; that is what the byte-core phase is for.
+
+The 16 `convert_*` tests in the deleted module asserted the *spelling* of the
+generated BRE, so they would have become meaningless rather than failing.
+Their intent is re-expressed as behavior tests in `pattern/matcher.rs`, plus
+coverage the old layer had none of: the exponential-blowup shape, bytes that
+are not characters, and the affix boundaries.
+
+Not a defect: `?` matches one *character*, so `case héllo in h?llo` matches
+here and in `bash --posix`, while byte-oriented dash does not.

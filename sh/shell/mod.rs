@@ -37,7 +37,7 @@ use crate::wordexp::{
 };
 use gettextrs::gettext;
 use std::collections::HashMap;
-use std::ffi::{CString, OsString};
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
@@ -789,18 +789,11 @@ impl Shell {
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let arg = expand_word_to_string(&arg.word, false, self)?;
-        // A NUL cannot appear in a C string; treat the value as ending there.
-        let arg_cstr = CString::new(arg).unwrap_or_else(|err| {
-            let pos = err.nul_position();
-            let mut bytes = err.into_vec();
-            bytes.truncate(pos);
-            CString::new(bytes).expect("truncated at the first NUL")
-        });
         for (index, case) in cases.iter().enumerate() {
             let mut matched = false;
             for pattern in &case.pattern {
                 let pattern = word_to_pattern(&pattern.word, self)?;
-                if pattern.matches(&arg_cstr) {
+                if pattern.matches(arg.as_bytes()) {
                     matched = true;
                     break;
                 }

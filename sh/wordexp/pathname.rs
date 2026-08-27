@@ -73,37 +73,42 @@ fn list_files_rec(
     let add_to_result = component_index == pattern.component_count();
     for entry in filesystem.read_dir(Path::new(current_directory)) {
         match entry {
-            DirEntry::File(file_name) if add_to_result => {
-                let file_name_cstring =
-                    CString::new(file_name.clone().into_encoded_bytes()).unwrap();
-                if pattern.matches_all(component_index, &file_name_cstring) {
+            // A pattern ending in `/` names directories only.
+            DirEntry::File(file_name) if add_to_result && !pattern.matches_directories_only() => {
+                // Matched as raw bytes: a file name need not be valid text, and
+                // routing it through CStr/str used to drop such entries
+                // silently.
+                if pattern.matches_all(component_index, file_name.as_encoded_bytes()) {
                     let mut path = prefix.clone();
                     path.push(file_name);
                     result.push(path.into_os_string())
                 }
             }
-            DirEntry::Dir(dir_name) => {
-                let dir_name_cstring = CString::new(dir_name.clone().into_encoded_bytes()).unwrap();
-                if pattern.matches_all(component_index, &dir_name_cstring) {
-                    let prev_prefix = prefix.clone();
-                    prefix.push(&dir_name);
-                    if add_to_result {
-                        result.push(prefix.clone().into_os_string())
-                    } else {
-                        let prev_current_dir = current_directory.clone();
-                        current_directory.push(&dir_name);
-                        list_files_rec(
-                            filesystem,
-                            pattern,
-                            component_index + 1,
-                            current_directory,
-                            prefix,
-                            result,
-                        );
-                        *current_directory = prev_current_dir;
+            DirEntry::Dir(dir_name)
+                if pattern.matches_all(component_index, dir_name.as_encoded_bytes()) =>
+            {
+                let prev_prefix = prefix.clone();
+                prefix.push(&dir_name);
+                if add_to_result {
+                    let mut matched = prefix.clone().into_os_string();
+                    if pattern.matches_directories_only() {
+                        matched.push("/");
                     }
-                    *prefix = prev_prefix;
+                    result.push(matched)
+                } else {
+                    let prev_current_dir = current_directory.clone();
+                    current_directory.push(&dir_name);
+                    list_files_rec(
+                        filesystem,
+                        pattern,
+                        component_index + 1,
+                        current_directory,
+                        prefix,
+                        result,
+                    );
+                    *current_directory = prev_current_dir;
                 }
+                *prefix = prev_prefix;
             }
             _ => {}
         }

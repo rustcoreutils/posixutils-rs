@@ -7,68 +7,37 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::pattern::parse::{parse_pattern, PatternItem};
-use crate::pattern::regex::{parsed_pattern_to_regex, Regex};
+use crate::pattern::parse::{parse_pattern, ParsedPattern, PatternItem};
 use crate::wordexp::expanded_word::ExpandedWord;
-use std::ffi::{CStr, CString};
 
+mod matcher;
 mod parse;
-mod regex;
 
 pub struct Pattern {
     pattern_string: String,
-    regex: Regex,
+    items: ParsedPattern,
 }
 
 impl Pattern {
     pub fn new(word: &ExpandedWord) -> Result<Self, String> {
-        let parsed_pattern = parse_pattern(word, false)?;
-        let regex = parsed_pattern_to_regex(&parsed_pattern)?;
+        let items = parse_pattern(word, false)?;
+        matcher::validate(&items)?;
         Ok(Self {
             pattern_string: word.to_string(),
-            regex,
+            items,
         })
     }
 
-    pub fn matches(&self, s: &CStr) -> bool {
-        // A shell pattern must match the ENTIRE string (e.g. in `case`), unlike
-        // the substring semantics of the underlying regex engine. Because the
-        // engine is POSIX leftmost-longest, if any match begins at offset 0 then
-        // the leftmost match begins at 0 and is the longest there, so checking
-        // that it spans the whole string is a correct full-match test.
-        match self.regex.match_locations(s).next() {
-            Some(m) => m.start == 0 && m.end == s.to_bytes().len(),
-            None => false,
-        }
-    }
-
-    /// Byte offsets at which an affix of `s` may begin or end: every character
-    /// boundary, including both ends. Removal must never split a character.
-    fn boundaries(s: &str) -> impl DoubleEndedIterator<Item = usize> + '_ {
-        s.char_indices()
-            .map(|(i, _)| i)
-            .chain(std::iter::once(s.len()))
-    }
-
-    /// Does the pattern match the whole of `candidate`, anchored at both ends?
-    ///
-    /// The affix-removal operators are defined in terms of affixes that the
-    /// pattern matches *in their entirety* (POSIX 2.6.2), so a substring test
-    /// is the wrong question to ask. The underlying engine is NUL-terminated,
-    /// so a candidate containing an interior NUL cannot be expressed and never
-    /// matches; the byte matcher that replaces this engine removes that
-    /// limitation.
-    fn matches_entire(&self, candidate: &str) -> bool {
-        CString::new(candidate).is_ok_and(|c| self.matches(&c))
+    /// A shell pattern matches the ENTIRE string (POSIX 2.14), which is what
+    /// `case` needs and what each affix candidate is tested against.
+    pub fn matches(&self, s: &[u8]) -> bool {
+        matcher::matches_whole(&self.items, s)
     }
 
     /// Longest prefix the pattern matches entirely, removed. On no match the
     /// value is returned unchanged.
     pub fn remove_largest_prefix(&self, s: String) -> String {
-        let found = Self::boundaries(&s)
-            .rev()
-            .find(|&e| self.matches_entire(&s[..e]));
-        match found {
+        match matcher::longest_prefix_end(&self.items, s.as_bytes()) {
             Some(end) => s[end..].to_string(),
             None => s,
         }
@@ -76,18 +45,15 @@ impl Pattern {
 
     /// Shortest prefix the pattern matches entirely, removed.
     pub fn remove_shortest_prefix(&self, s: String) -> String {
-        let found = Self::boundaries(&s).find(|&e| self.matches_entire(&s[..e]));
-        match found {
+        match matcher::shortest_prefix_end(&self.items, s.as_bytes()) {
             Some(end) => s[end..].to_string(),
             None => s,
         }
     }
 
-    /// Longest suffix the pattern matches entirely, removed. The longest suffix
-    /// is the one starting earliest.
+    /// Longest suffix the pattern matches entirely, removed.
     pub fn remove_largest_suffix(&self, s: String) -> String {
-        let found = Self::boundaries(&s).find(|&b| self.matches_entire(&s[b..]));
-        match found {
+        match matcher::longest_suffix_start(&self.items, s.as_bytes()) {
             Some(begin) => s[..begin].to_string(),
             None => s,
         }
@@ -95,10 +61,7 @@ impl Pattern {
 
     /// Shortest suffix the pattern matches entirely, removed.
     pub fn remove_shortest_suffix(&self, s: String) -> String {
-        let found = Self::boundaries(&s)
-            .rev()
-            .find(|&b| self.matches_entire(&s[b..]));
-        match found {
+        match matcher::shortest_suffix_start(&self.items, s.as_bytes()) {
             Some(begin) => s[..begin].to_string(),
             None => s,
         }
@@ -112,19 +75,25 @@ impl From<Pattern> for String {
 }
 
 struct FilenamePatternPart {
-    regex: Regex,
+    items: ParsedPattern,
     starts_with_dot: bool,
 }
 
 pub struct FilenamePattern {
     path_parts: Vec<FilenamePatternPart>,
     pattern_string: String,
+    /// A pattern ending in `/` matches directories only, and the `/` is part of
+    /// the result: `*/` lists subdirectories as `sub/`, not `sub`.
+    has_trailing_slash: bool,
 }
 
 impl FilenamePattern {
     pub fn new(word: &ExpandedWord) -> Result<Self, String> {
         let pattern_string = word.to_string();
         let parsed_pattern = parse_pattern(word, true)?;
+        // Splitting on `/` drops the empty component a trailing slash leaves
+        // behind, so the distinction has to be recorded before that happens.
+        let has_trailing_slash = parsed_pattern.last() == Some(&PatternItem::Char('/'));
         let mut path_parts = Vec::new();
 
         parsed_pattern
@@ -132,9 +101,9 @@ impl FilenamePattern {
             .filter(|items| !items.is_empty())
             .try_for_each(|items| {
                 let starts_with_dot = items.starts_with(&[PatternItem::Char('.')]);
-                let regex = parsed_pattern_to_regex(items)?;
+                matcher::validate(items)?;
                 path_parts.push(FilenamePatternPart {
-                    regex,
+                    items: items.to_vec(),
                     starts_with_dot,
                 });
                 Ok::<(), String>(())
@@ -143,31 +112,23 @@ impl FilenamePattern {
         Ok(Self {
             path_parts,
             pattern_string,
+            has_trailing_slash,
         })
     }
 
     /// # Panics
     /// panics if `depth` is smaller than 1 or bigger than `component_count`
-    pub fn matches_all(&self, depth: usize, s: &CStr) -> bool {
+    pub fn matches_all(&self, depth: usize, s: &[u8]) -> bool {
         assert!(
             depth > 0 && depth <= self.component_count(),
             "invalid depth"
         );
         let component_index = depth - 1;
-        if s.to_bytes().first() == Some(&b'.') && !self.path_parts[component_index].starts_with_dot
-        {
+        if s.first() == Some(&b'.') && !self.path_parts[component_index].starts_with_dot {
             // dot at the start is only matched explicitly
             return false;
         }
-        if let Some(loc) = self.path_parts[component_index]
-            .regex
-            .match_locations(s)
-            .next()
-        {
-            loc.start == 0 && loc.end == s.count_bytes()
-        } else {
-            false
-        }
+        matcher::matches_whole(&self.path_parts[component_index].items, s)
     }
 
     /// Returns number of components in the path
@@ -179,6 +140,12 @@ impl FilenamePattern {
 
     pub fn is_absolute(&self) -> bool {
         self.pattern_string.starts_with('/')
+    }
+
+    /// True when the pattern ends in `/`, so only directories match its last
+    /// component and the slash belongs to the result.
+    pub fn matches_directories_only(&self) -> bool {
+        self.has_trailing_slash
     }
 }
 
@@ -198,41 +165,38 @@ impl TryFrom<String> for FilenamePattern {
 }
 
 pub struct HistoryPattern {
-    regex: Regex,
+    items: ParsedPattern,
+    /// Kept for `Debug`/introspection; the anchoring is baked into `items`.
+    #[allow(dead_code)]
     match_only_at_line_start: bool,
 }
 
 impl HistoryPattern {
     pub fn new(pattern: String) -> Result<Self, String> {
-        let parsed_pattern = parse_pattern(&ExpandedWord::unquoted_literal(pattern), false)?;
-        if parsed_pattern
-            .first()
-            .is_some_and(|p| *p == PatternItem::Char('^'))
-        {
-            let regex = parsed_pattern_to_regex(&parsed_pattern[1..])?;
-            Ok(Self {
-                regex,
-                match_only_at_line_start: true,
-            })
-        } else {
-            let regex = parsed_pattern_to_regex(&parsed_pattern)?;
-            Ok(Self {
-                regex,
-                match_only_at_line_start: false,
-            })
+        let parsed = parse_pattern(&ExpandedWord::unquoted_literal(pattern), false)?;
+        let match_only_at_line_start = parsed.first() == Some(&PatternItem::Char('^'));
+        // History search asks whether the command *contains* the pattern, which
+        // the whole-match engine expresses by padding with `*`. A leading `^`
+        // anchors it to the start, so only the trailing pad applies.
+        let mut items = Vec::with_capacity(parsed.len() + 2);
+        if !match_only_at_line_start {
+            items.push(PatternItem::Asterisk);
         }
+        items.extend(
+            parsed
+                .into_iter()
+                .skip(usize::from(match_only_at_line_start)),
+        );
+        items.push(PatternItem::Asterisk);
+        matcher::validate(&items)?;
+        Ok(Self {
+            items,
+            match_only_at_line_start,
+        })
     }
 
     pub fn matches(&self, s: &str) -> bool {
-        if let Ok(s_cstr) = CString::new(s) {
-            if let Some(first_match) = self.regex.match_locations(&s_cstr).next() {
-                if self.match_only_at_line_start && first_match.start != 0 {
-                    return false;
-                }
-                return true;
-            }
-        }
-        false
+        matcher::matches_whole(&self.items, s.as_bytes())
     }
 }
 
@@ -247,10 +211,6 @@ pub mod tests {
     pub fn filename_pattern_from_str(pat: &str) -> FilenamePattern {
         FilenamePattern::new(&ExpandedWord::unquoted_literal(pat))
             .expect("failed to create filename pattern")
-    }
-
-    fn cstring_from_str(s: &str) -> CString {
-        CString::new(s).unwrap()
     }
 
     #[test]
@@ -320,29 +280,29 @@ pub mod tests {
     #[test]
     fn filename_pattern_matches_simple_components_in_path() {
         let pattern = filename_pattern_from_str("/path/to/file");
-        assert!(pattern.matches_all(1, &cstring_from_str("path")));
-        assert!(pattern.matches_all(2, &cstring_from_str("to")));
-        assert!(pattern.matches_all(3, &cstring_from_str("file")));
+        assert!(pattern.matches_all(1, b"path"));
+        assert!(pattern.matches_all(2, b"to"));
+        assert!(pattern.matches_all(3, b"file"));
     }
 
     #[test]
     fn period_at_the_start_is_only_matched_explicitly() {
         let pattern = filename_pattern_from_str("*test");
-        assert!(!pattern.matches_all(1, &cstring_from_str(".test")));
-        assert!(pattern.matches_all(1, &cstring_from_str("atest")));
+        assert!(!pattern.matches_all(1, b".test"));
+        assert!(pattern.matches_all(1, b"atest"));
 
         let pattern = filename_pattern_from_str("/dir/*file");
-        assert!(!pattern.matches_all(2, &cstring_from_str(".file")));
+        assert!(!pattern.matches_all(2, b".file"));
 
         let pattern = filename_pattern_from_str(".test");
-        assert!(pattern.matches_all(1, &cstring_from_str(".test")));
+        assert!(pattern.matches_all(1, b".test"));
     }
 
     #[test]
     fn period_at_the_start_is_not_matched_by_bracket_expression_with_multiple_chars() {
         // the standard leaves this case to the implementation, here we follow what bash does
         let pattern = filename_pattern_from_str("[.abc]*");
-        assert!(!pattern.matches_all(1, &cstring_from_str(".a")));
+        assert!(!pattern.matches_all(1, b".a"));
     }
 
     #[test]
@@ -498,6 +458,6 @@ pub mod tests {
     fn filename_pattern_matches_all_accepts_an_empty_component() {
         // `matches_all` indexed `s.to_bytes()[0]` with no emptiness guard.
         let pattern = filename_pattern_from_str("*");
-        assert!(pattern.matches_all(1, &cstring_from_str("")));
+        assert!(pattern.matches_all(1, b""));
     }
 }

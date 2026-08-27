@@ -9,13 +9,13 @@
 
 use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RangeEndpoint {
     Char(char),
     CollatingSymbol(String),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BracketItem {
     Char(char),
     CollatingSymbol(String),
@@ -39,13 +39,13 @@ fn is_valid_range_endpoint(item: &BracketItem) -> bool {
     matches!(item, BracketItem::Char(_) | BracketItem::CollatingSymbol(_))
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BracketExpression {
     pub items: Vec<BracketItem>,
     pub matching: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternItem {
     Char(char),
     QuestionMark,

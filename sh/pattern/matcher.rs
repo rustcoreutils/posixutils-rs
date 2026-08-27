@@ -201,6 +201,11 @@ fn endpoint_byte(endpoint: &RangeEndpoint) -> Option<u8> {
 fn item_matches(item: &PatternItem, step: &Step, subject: &[u8]) -> bool {
     match item {
         PatternItem::Char(c) => step.ch == Some(*c),
+        // Matches that exact byte, which by construction is one that does not
+        // form a character.
+        PatternItem::Byte(b) => {
+            step.ch.is_none() && step.range.len() == 1 && subject[step.range.start] == *b
+        }
         PatternItem::QuestionMark => true,
         // Handled by the state set, never asked directly.
         PatternItem::Asterisk => false,

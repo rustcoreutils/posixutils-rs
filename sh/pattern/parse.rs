@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::shstr::{CharOrByte, CharsLossless};
 use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,9 @@ pub struct BracketExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternItem {
     Char(char),
+    /// A byte in the pattern that is not part of a valid character. It matches
+    /// exactly that byte in the subject.
+    Byte(u8),
     QuestionMark,
     Asterisk,
     BracketExpression(BracketExpression),
@@ -58,6 +62,7 @@ pub type ParsedPattern = Vec<PatternItem>;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Token {
     Char(char),
+    Byte(u8),
     QuotedChar(char),
     Eof,
 }
@@ -109,7 +114,7 @@ fn create_range_expressions(items: Vec<BracketItem>) -> Vec<BracketItem> {
 
 struct Parser<'w> {
     word_parts: std::slice::Iter<'w, ExpandedWordPart>,
-    chars: std::str::Chars<'w>,
+    chars: CharsLossless<'w>,
     inside_quoted_string: bool,
     lookahead: Token,
     used_in_filename_expansion: bool,
@@ -119,7 +124,7 @@ struct Parser<'w> {
 /// parse (e.g. a `[:class:]` / `[.sym.]` / `[=eq=]` attempt) fails.
 type Checkpoint<'w> = (
     std::slice::Iter<'w, ExpandedWordPart>,
-    std::str::Chars<'w>,
+    CharsLossless<'w>,
     bool,
     Token,
 );
@@ -142,19 +147,24 @@ impl<'w> Parser<'w> {
     }
 
     fn advance(&mut self) {
-        if let Some(c) = self.chars.next() {
-            self.lookahead = Token::from_char(c, self.inside_quoted_string);
+        if let Some(next) = self.chars.next() {
+            self.lookahead = match next {
+                CharOrByte::Char(c) => Token::from_char(c, self.inside_quoted_string),
+                // A byte that is not part of a character can only ever stand
+                // for itself, quoted or not.
+                CharOrByte::Byte(b) => Token::Byte(b),
+            };
         } else if let Some(part) = self.word_parts.next() {
             match part {
                 ExpandedWordPart::QuotedLiteral(lit) => {
                     self.inside_quoted_string = true;
-                    self.chars = lit.chars();
+                    self.chars = lit.chars_lossless();
                     self.advance();
                 }
                 ExpandedWordPart::UnquotedLiteral(lit)
                 | ExpandedWordPart::GeneratedUnquotedLiteral(lit) => {
                     self.inside_quoted_string = false;
-                    self.chars = lit.chars();
+                    self.chars = lit.chars_lossless();
                     self.advance();
                 }
                 ExpandedWordPart::FieldEnd | ExpandedWordPart::SoftFieldEnd => {
@@ -162,7 +172,7 @@ impl<'w> Parser<'w> {
                     // field per positional parameter; join them with a space,
                     // as dash and bash do.
                     self.inside_quoted_string = false;
-                    self.chars = " ".chars();
+                    self.chars = crate::shstr::ShStr::new(" ").chars_lossless();
                     self.advance();
                 }
             }
@@ -175,6 +185,7 @@ impl<'w> Parser<'w> {
         items.push(match self.lookahead {
             Token::Char(c) => PatternItem::Char(c),
             Token::QuotedChar(c) => PatternItem::Char(c),
+            Token::Byte(b) => PatternItem::Byte(b),
             Token::Eof => return,
         });
         self.advance();
@@ -337,6 +348,10 @@ impl<'w> Parser<'w> {
 
         loop {
             match self.lookahead {
+                Token::Byte(b) => {
+                    expression_items.push(BracketItem::Char(char::from(b)));
+                    self.advance();
+                }
                 Token::Char(']') => {
                     self.advance();
                     return Ok(BracketExpression {
@@ -419,6 +434,9 @@ impl<'w> Parser<'w> {
                     other => items.push(PatternItem::Char(other)),
                 },
                 Token::QuotedChar(c) => items.push(PatternItem::Char(c)),
+                // A byte that is not part of a character has no special
+                // meaning; it stands for itself.
+                Token::Byte(b) => items.push(PatternItem::Byte(b)),
                 Token::Eof => break,
             }
             self.advance();
@@ -434,7 +452,7 @@ pub fn parse_pattern(
     let mut parser = Parser {
         lookahead: Token::Eof,
         inside_quoted_string: false,
-        chars: "".chars(),
+        chars: crate::shstr::ShStr::new("").chars_lossless(),
         word_parts: pattern.into_iter(),
         used_in_filename_expansion,
     };
@@ -445,6 +463,7 @@ pub fn parse_pattern(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shstr::ShString;
 
     fn parse_correct_pattern(pattern: ExpandedWord) -> ParsedPattern {
         parse_pattern(&pattern, false).unwrap()
@@ -479,10 +498,10 @@ mod tests {
     fn parse_pattern_from_mixed_expanded_word() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord::from_parts(vec![
-                ExpandedWordPart::UnquotedLiteral("a".to_string()),
-                ExpandedWordPart::QuotedLiteral("b".to_string()),
-                ExpandedWordPart::UnquotedLiteral("cd".to_string()),
-                ExpandedWordPart::QuotedLiteral("ef".to_string()),
+                ExpandedWordPart::UnquotedLiteral(ShString::from("a")),
+                ExpandedWordPart::QuotedLiteral(ShString::from("b")),
+                ExpandedWordPart::UnquotedLiteral(ShString::from("cd")),
+                ExpandedWordPart::QuotedLiteral(ShString::from("ef")),
             ])),
             vec![
                 PatternItem::Char('a'),
@@ -511,9 +530,9 @@ mod tests {
     fn quoted_question_mark_is_parsed_as_char() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord::from_parts(vec![
-                ExpandedWordPart::UnquotedLiteral("a".to_string()),
-                ExpandedWordPart::QuotedLiteral("?".to_string()),
-                ExpandedWordPart::UnquotedLiteral("c".to_string()),
+                ExpandedWordPart::UnquotedLiteral(ShString::from("a")),
+                ExpandedWordPart::QuotedLiteral(ShString::from("?")),
+                ExpandedWordPart::UnquotedLiteral(ShString::from("c")),
             ])),
             vec![
                 PatternItem::Char('a'),
@@ -539,9 +558,9 @@ mod tests {
     fn quoted_asterisk_is_parsed_as_char() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord::from_parts(vec![
-                ExpandedWordPart::UnquotedLiteral("a".to_string()),
-                ExpandedWordPart::QuotedLiteral("*".to_string()),
-                ExpandedWordPart::UnquotedLiteral("c".to_string()),
+                ExpandedWordPart::UnquotedLiteral(ShString::from("a")),
+                ExpandedWordPart::QuotedLiteral(ShString::from("*")),
+                ExpandedWordPart::UnquotedLiteral(ShString::from("c")),
             ])),
             vec![
                 PatternItem::Char('a'),
@@ -673,9 +692,9 @@ mod tests {
     fn quoted_minus_is_parsed_as_char() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord::from_parts(vec![
-                ExpandedWordPart::UnquotedLiteral("[".to_string()),
-                ExpandedWordPart::QuotedLiteral("-".to_string()),
-                ExpandedWordPart::UnquotedLiteral("]".to_string())
+                ExpandedWordPart::UnquotedLiteral(ShString::from("[")),
+                ExpandedWordPart::QuotedLiteral(ShString::from("-")),
+                ExpandedWordPart::UnquotedLiteral(ShString::from("]"))
             ])),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: true,

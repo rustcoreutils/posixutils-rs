@@ -14,7 +14,7 @@ use crate::os::read;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
 use crate::wordexp::expanded_word::ExpandedWord;
-use crate::wordexp::split_fields;
+use crate::wordexp::{sh_string_to_string, split_fields};
 use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
@@ -366,7 +366,11 @@ impl BuiltinUtility for BuiltinRead {
         let mut assignment_failed = false;
         for i in 0..fields.len() {
             if shell
-                .assign_global(vars[i].clone(), fields[i].to_string())
+                .assign_global(
+                    vars[i].clone(),
+                    sh_string_to_string(fields[i].to_sh_string())
+                        .map_err(|e| BuiltinError::CustomError(e.to_string()))?,
+                )
                 .is_err()
             {
                 opened_files.write_err(format!(

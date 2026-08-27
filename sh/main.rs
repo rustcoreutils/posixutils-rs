@@ -34,6 +34,7 @@ mod os;
 mod parse;
 pub mod pattern;
 mod shell;
+mod shstr;
 mod utils;
 mod wordexp;
 

@@ -7,11 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::shstr::ShString;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpandedWordPart {
-    QuotedLiteral(String),
-    UnquotedLiteral(String),
-    GeneratedUnquotedLiteral(String),
+    QuotedLiteral(ShString),
+    UnquotedLiteral(ShString),
+    GeneratedUnquotedLiteral(ShString),
     // terminates a field
     /// Ends a field regardless of IFS: `"$@"` separates its parameters even
     /// when they are empty and even when IFS is null.
@@ -23,7 +25,7 @@ pub enum ExpandedWordPart {
 }
 
 impl ExpandedWordPart {
-    pub fn new(value: String, quoted: bool, generated: bool) -> Self {
+    pub fn new(value: ShString, quoted: bool, generated: bool) -> Self {
         if quoted {
             ExpandedWordPart::QuotedLiteral(value)
         } else if generated {
@@ -52,23 +54,32 @@ pub struct ExpandedWord {
     quoted_at_expanded_to_nothing: bool,
 }
 
-impl From<ExpandedWord> for String {
+impl From<ExpandedWord> for ShString {
     fn from(value: ExpandedWord) -> Self {
-        value.to_string()
+        value.to_sh_string()
     }
 }
 
-impl std::fmt::Display for ExpandedWord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ExpandedWord {
+    /// The word's bytes with the field markers dropped. Deliberately not
+    /// `Display`: the result is a *value*, and a lossy conversion here would
+    /// corrupt it silently.
+    pub fn to_sh_string(&self) -> ShString {
+        let mut result = ShString::new();
         for p in &self.parts {
             match p {
-                ExpandedWordPart::UnquotedLiteral(s) => f.write_str(s)?,
-                ExpandedWordPart::QuotedLiteral(s) => f.write_str(s)?,
-                ExpandedWordPart::GeneratedUnquotedLiteral(s) => f.write_str(s)?,
+                ExpandedWordPart::UnquotedLiteral(s)
+                | ExpandedWordPart::QuotedLiteral(s)
+                | ExpandedWordPart::GeneratedUnquotedLiteral(s) => result.push_bytes(s),
                 ExpandedWordPart::FieldEnd | ExpandedWordPart::SoftFieldEnd => {}
             }
         }
-        Ok(())
+        result
+    }
+
+    /// The word as bytes, for matching and for building a field.
+    pub fn as_bytes_vec(&self) -> Vec<u8> {
+        self.to_sh_string().into_bytes()
     }
 }
 
@@ -91,14 +102,14 @@ impl<'a> IntoIterator for &'a ExpandedWord {
 }
 
 impl ExpandedWord {
-    pub fn unquoted_literal<S: Into<String>>(s: S) -> Self {
+    pub fn unquoted_literal<S: Into<ShString>>(s: S) -> Self {
         Self {
             parts: vec![ExpandedWordPart::UnquotedLiteral(s.into())],
             quoted_at_expanded_to_nothing: false,
         }
     }
 
-    pub fn append<S: AsRef<str> + Into<String>>(
+    pub fn append<S: AsRef<[u8]> + Into<ShString>>(
         &mut self,
         value: S,
         quoted: bool,
@@ -107,13 +118,13 @@ impl ExpandedWord {
         if let Some(last) = self.parts.last_mut() {
             match last {
                 ExpandedWordPart::GeneratedUnquotedLiteral(last) if generated && !quoted => {
-                    last.push_str(value.as_ref());
+                    last.push_bytes(value.as_ref());
                 }
                 ExpandedWordPart::UnquotedLiteral(last) if !generated && !quoted => {
-                    last.push_str(value.as_ref())
+                    last.push_bytes(value.as_ref())
                 }
                 ExpandedWordPart::QuotedLiteral(last) if quoted => {
-                    last.push_str(value.as_ref());
+                    last.push_bytes(value.as_ref());
                 }
                 _ => self
                     .parts
@@ -168,15 +179,15 @@ impl ExpandedWord {
                     (
                         ExpandedWordPart::UnquotedLiteral(lit),
                         ExpandedWordPart::UnquotedLiteral(dest),
-                    ) => dest.push_str(&lit),
+                    ) => dest.push_bytes(&lit),
                     (
                         ExpandedWordPart::GeneratedUnquotedLiteral(lit),
                         ExpandedWordPart::GeneratedUnquotedLiteral(dest),
-                    ) => dest.push_str(&lit),
+                    ) => dest.push_bytes(&lit),
                     (
                         ExpandedWordPart::QuotedLiteral(lit),
                         ExpandedWordPart::QuotedLiteral(dest),
-                    ) => dest.push_str(&lit),
+                    ) => dest.push_bytes(&lit),
                     (part, _) => self.parts.push(part),
                 }
             }
@@ -200,14 +211,16 @@ pub mod tests {
     impl ExpandedWord {
         pub fn quoted_literal(s: &str) -> Self {
             Self {
-                parts: vec![ExpandedWordPart::QuotedLiteral(s.to_string())],
+                parts: vec![ExpandedWordPart::QuotedLiteral(ShString::from(s))],
                 quoted_at_expanded_to_nothing: false,
             }
         }
 
         pub fn generated_unquoted_literal(s: &str) -> Self {
             Self {
-                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(s.to_string())],
+                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from(
+                    s,
+                ))],
                 quoted_at_expanded_to_nothing: false,
             }
         }

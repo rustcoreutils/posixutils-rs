@@ -9,6 +9,7 @@
 
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 use crate::shell::{CommandExecutionError, Shell};
+use crate::wordexp::sh_string_to_string;
 use crate::wordexp::tilde::TildeMode;
 use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
@@ -125,10 +126,16 @@ fn expand_simple_parameter_into(
                             false,
                         );
                     } else {
+                        // POSIX: `$*` joins with the *first character* of
+                        // IFS. Slicing one byte split a multi-byte character
+                        // and panicked (`IFS=é`).
                         let separator = shell
                             .environment
                             .get_str_value("IFS")
-                            .map(|v| if v.is_empty() { "" } else { &v[..1] })
+                            .map(|v| match v.chars().next() {
+                                Some(c) => &v[..c.len_utf8()],
+                                None => "",
+                            })
                             .unwrap_or(" ");
                         expanded_word.append(
                             shell.positional_parameters.join(separator),
@@ -328,7 +335,11 @@ pub fn expand_parameter_into(
             }
             // POSIX: length in characters, not bytes.
             expanded_word.append(
-                expanded_parameter.to_string().chars().count().to_string(),
+                expanded_parameter
+                    .to_sh_string()
+                    .chars_lossless()
+                    .count()
+                    .to_string(),
                 inside_double_quotes,
                 true,
             );
@@ -352,7 +363,8 @@ pub fn expand_parameter_into(
                     "sh: parameter is unset".to_string(),
                 ));
             }
-            let param_str = expanded_parameter.to_string();
+            // SCAFFOLD(byte-core stage 1): affix removal still takes a String.
+            let param_str = sh_string_to_string(expanded_parameter.to_sh_string())?;
 
             let pattern = word_to_pattern(pattern, shell)?;
             let result = if *remove_prefix {
@@ -378,6 +390,7 @@ mod tests {
     use crate::jobs::JobState;
     use crate::parse::word::test_utils::unquoted_literal;
     use crate::parse::word::Word;
+    use crate::shstr::ShString;
     use crate::wordexp::expanded_word::ExpandedWordPart;
 
     fn shell_with_env(env: &[(&str, &str)]) -> Shell {
@@ -411,7 +424,7 @@ mod tests {
             shell,
         )
         .unwrap();
-        expanded_word.to_string()
+        String::from_utf8(expanded_word.as_bytes_vec()).unwrap()
     }
 
     fn expand_parameter(
@@ -972,11 +985,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(
@@ -987,11 +1000,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::QuotedLiteral("arg1".to_string()),
+                ExpandedWordPart::QuotedLiteral(ShString::from("arg1")),
                 ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::QuotedLiteral("arg2".to_string()),
+                ExpandedWordPart::QuotedLiteral(ShString::from("arg2")),
                 ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::QuotedLiteral("arg3".to_string())
+                ExpandedWordPart::QuotedLiteral(ShString::from("arg3"))
             ])
         );
     }
@@ -1016,11 +1029,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(
@@ -1058,11 +1071,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(
@@ -1097,11 +1110,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(
@@ -1139,11 +1152,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
                 ExpandedWordPart::SoftFieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(

@@ -8,13 +8,14 @@
 //
 
 use crate::pattern::parse::{parse_pattern, ParsedPattern, PatternItem};
+use crate::shstr::ShString;
 use crate::wordexp::expanded_word::ExpandedWord;
 
 mod matcher;
 mod parse;
 
 pub struct Pattern {
-    pattern_string: String,
+    pattern_string: ShString,
     items: ParsedPattern,
 }
 
@@ -23,7 +24,7 @@ impl Pattern {
         let items = parse_pattern(word, false)?;
         matcher::validate(&items)?;
         Ok(Self {
-            pattern_string: word.to_string(),
+            pattern_string: word.to_sh_string(),
             items,
         })
     }
@@ -68,7 +69,7 @@ impl Pattern {
     }
 }
 
-impl From<Pattern> for String {
+impl From<Pattern> for ShString {
     fn from(value: Pattern) -> Self {
         value.pattern_string
     }
@@ -81,7 +82,7 @@ struct FilenamePatternPart {
 
 pub struct FilenamePattern {
     path_parts: Vec<FilenamePatternPart>,
-    pattern_string: String,
+    pattern_string: ShString,
     /// A pattern ending in `/` matches directories only, and the `/` is part of
     /// the result: `*/` lists subdirectories as `sub/`, not `sub`.
     has_trailing_slash: bool,
@@ -89,7 +90,7 @@ pub struct FilenamePattern {
 
 impl FilenamePattern {
     pub fn new(word: &ExpandedWord) -> Result<Self, String> {
-        let pattern_string = word.to_string();
+        let pattern_string = word.to_sh_string();
         let parsed_pattern = parse_pattern(word, true)?;
         // Splitting on `/` drops the empty component a trailing slash leaves
         // behind, so the distinction has to be recorded before that happens.
@@ -139,7 +140,7 @@ impl FilenamePattern {
     }
 
     pub fn is_absolute(&self) -> bool {
-        self.pattern_string.starts_with('/')
+        self.pattern_string.starts_with(b"/")
     }
 
     /// True when the pattern ends in `/`, so only directories match its last
@@ -149,16 +150,16 @@ impl FilenamePattern {
     }
 }
 
-impl From<FilenamePattern> for String {
+impl From<FilenamePattern> for ShString {
     fn from(value: FilenamePattern) -> Self {
         value.pattern_string
     }
 }
 
-impl TryFrom<String> for FilenamePattern {
+impl TryFrom<ShString> for FilenamePattern {
     type Error = String;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+    fn try_from(value: ShString) -> Result<Self, Self::Error> {
         let value = ExpandedWord::unquoted_literal(value);
         FilenamePattern::new(&value)
     }

@@ -665,3 +665,43 @@ are not characters, and the affix boundaries.
 
 Not a defect: `?` matches one *character*, so `case héllo in h?llo` matches
 here and in `bash --posix`, while byte-oriented dash does not.
+
+### Phase 8 — the byte core (stage 1 of 4: expansion)
+
+POSIX XCU 2.6.5 is explicit that "the shell processes arbitrary bytes from the
+input fields; there is no requirement that those bytes form valid characters",
+and the same holds for arguments, environment entries, file names and script
+text. The crate was `String`/`char`-typed throughout, which is why `IFS=é`
+panicked, a non-UTF-8 file name could not survive globbing, and a script with
+one Latin-1 byte was refused outright.
+
+`shstr.rs` introduces `ShStr`/`ShString` — a borrowed and an owned byte string
+shaped like `Path`/`PathBuf`, with `Deref` to `[u8]` so the whole slice API
+comes for free. Deliberately **no** `Display`: a blanket lossy one would be a
+trap, since `format!("{name}={value}")` builds an *environment entry* rather
+than a message and would be corrupted silently. Callers ask for `.display()`,
+which makes `grep -rn '\.display()'` the exact list of intentional byte loss.
+`Debug` prints escaped-ASCII so a failing assertion stays readable.
+
+This stage converts the expansion pipeline:
+
+- `ExpandedWordPart` carries `ShString`. `append`'s two-bound signature is
+  preserved (`AsRef<[u8]> + Into<ShString>`) so the merge path still appends
+  without allocating, and every existing call site passing `&str`/`String`
+  compiles unchanged.
+- `ExpandedWord::to_sh_string()` replaces the `Display` impl.
+- Pattern text is byte-aware: `ShStr::chars_lossless()` yields each character
+  or, for a byte that is not part of one, that byte — nothing collapses to
+  U+FFFD, so a value can be taken apart and reassembled unchanged.
+  `PatternItem::Byte` carries such a byte and matches exactly itself.
+- [x] **`IFS=é` panicked.** `$*` joins on the *first character* of IFS, but the
+  separator was `&v[..1]` — a byte slice, which split a multi-byte character.
+  `IFS=é; set -- a b; echo "$*"` now gives `aéb`, as `bash --posix` does;
+  byte-oriented dash gives `a\xc3b`.
+
+One scaffold remains, marked `SCAFFOLD(byte-core stage 1)`: `expand_word` and
+friends convert back to `String` at their return, because `Shell` and the
+builtins still hold `String`. It errors rather than losing bytes, which is what
+that path already did, so nothing regresses. Stages 2–4 (environment values and
+positional parameters; the argv/environ boundary and the builtin trait; the
+lexer and script text) remove it and finish the conversion.

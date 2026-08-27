@@ -3186,4 +3186,23 @@ mod audit_regressions {
         test_script("case 'é' in ?) echo M;; *) echo NO;; esac\n", "M\n");
         test_script("x=héllo\necho \"${x#?}\"\n", "éllo\n");
     }
+
+    // ---- Phase 8: the byte core --------------------------------------------
+
+    #[test]
+    fn dollar_star_joins_on_the_first_character_of_ifs() {
+        // The separator was `&v[..1]`, a *byte* slice of IFS, so a multi-byte
+        // first character split mid-character and panicked.
+        test_script("IFS=é\nset -- a b\necho \"$*\"\n", "aéb\n");
+        test_script("IFS=éx\nset -- a b c\necho \"$*\"\n", "aébéc\n");
+        test_script("IFS=:\nset -- a b\necho \"$*\"\n", "a:b\n");
+        test_script("IFS=\nset -- a b\necho \"$*\"\n", "ab\n");
+        test_script("set -- a b\necho \"$*\"\n", "a b\n");
+    }
+
+    #[test]
+    fn parameter_length_counts_characters() {
+        test_script("x=héllo\necho \"${#x}\"\n", "5\n");
+        test_script("x=abc\necho \"${#x}\"\n", "3\n");
+    }
 }

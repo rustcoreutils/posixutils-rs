@@ -423,7 +423,8 @@ impl ViEditor {
                     let word =
                         into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
                     let pattern =
-                        FilenamePattern::try_from(word.into_owned()).map_err(|_| CommandError)?;
+                        FilenamePattern::try_from(crate::shstr::ShString::from(word.into_owned()))
+                            .map_err(|_| CommandError)?;
                     let expansions = glob(&pattern, Path::new(&shell.current_directory));
                     if expansions.is_empty() {
                         return Err(CommandError);
@@ -444,7 +445,8 @@ impl ViEditor {
                     let word =
                         into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
                     let pattern =
-                        FilenamePattern::try_from(word.into_owned()).map_err(|_| CommandError)?;
+                        FilenamePattern::try_from(crate::shstr::ShString::from(word.into_owned()))
+                            .map_err(|_| CommandError)?;
                     let expansions = glob(&pattern, Path::new(&shell.current_directory));
                     if expansions.is_empty() {
                         return Err(CommandError);

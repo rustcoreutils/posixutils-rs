@@ -10,6 +10,7 @@
 use crate::parse::word::{Word, WordPart};
 use crate::pattern::{FilenamePattern, Pattern};
 use crate::shell::{CommandExecutionError, Shell};
+use crate::shstr::{CharOrByte, ShString};
 use crate::wordexp::arithmetic::expand_arithmetic_expression_into;
 use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 use crate::wordexp::parameter::expand_parameter_into;
@@ -24,6 +25,17 @@ pub mod pathname;
 mod tilde;
 
 pub type ExpansionResult<T> = Result<T, CommandExecutionError>;
+
+/// SCAFFOLD(byte-core stage 1): the expansion pipeline now carries bytes, but
+/// the shell around it still holds `String`. Converting here keeps the two
+/// halves compiling without introducing any loss the crate did not already
+/// have — this path already refused a glob result that was not valid text.
+/// Removed when `Shell` and the builtins take bytes.
+pub(crate) fn sh_string_to_string(value: ShString) -> ExpansionResult<String> {
+    String::from_utf8(value.clone().into_bytes()).map_err(|_| {
+        CommandExecutionError::ExpansionError(format!("{} contains invalid utf8", value.display()))
+    })
+}
 
 /// Field splitting, POSIX XCU 2.6.5.
 ///
@@ -91,17 +103,26 @@ impl<'a> FieldSplitter<'a> {
         }
     }
 
-    fn push_literal(&mut self, value: String, quoted: bool) {
+    fn push_literal(&mut self, value: ShString, quoted: bool) {
         // Bytes that did not come from an expansion never delimit, but they do
         // end any run that was still open.
         self.end_delimiter_run(false);
         self.current.append(value, quoted, false);
     }
 
-    fn push_generated(&mut self, value: String) {
-        let mut accumulator = String::new();
-        for c in value.chars() {
-            if self.is_ifs(c) && !self.reached_max_fields() {
+    fn push_generated(&mut self, value: ShString) {
+        let mut accumulator = ShString::new();
+        for element in value.chars_lossless() {
+            // Only a character can be an IFS delimiter; a byte that is not part
+            // of one is ordinary text.
+            let delimiter = match element {
+                CharOrByte::Char(c) => self.is_ifs(c) && !self.reached_max_fields(),
+                CharOrByte::Byte(_) => false,
+            };
+            if delimiter {
+                let CharOrByte::Char(c) = element else {
+                    unreachable!("only a character can be a delimiter")
+                };
                 // Everything read so far belongs to the field being delimited.
                 if !accumulator.is_empty() {
                     self.current
@@ -114,10 +135,13 @@ impl<'a> FieldSplitter<'a> {
                     self.end_delimiter_run(true);
                 }
             } else {
-                // An ordinary character ends any run without delimiting on its
+                // An ordinary element ends any run without delimiting on its
                 // own account.
                 self.end_delimiter_run(false);
-                accumulator.push(c);
+                match element {
+                    CharOrByte::Char(c) => accumulator.push_char(c),
+                    CharOrByte::Byte(b) => accumulator.push_bytes([b]),
+                }
             }
         }
         if !accumulator.is_empty() {
@@ -195,7 +219,7 @@ pub fn split_fields(
     let fields = splitter.finish();
     // A word that is nothing but a `"$@"` with no parameters yields no fields;
     // the sole field here is the one its own quotes contributed.
-    if quoted_at_expanded_to_nothing && fields.len() == 1 && fields[0].to_string().is_empty() {
+    if quoted_at_expanded_to_nothing && fields.len() == 1 && fields[0].to_sh_string().is_empty() {
         return Vec::new();
     }
     fields
@@ -258,7 +282,9 @@ pub fn expand_word_to_string(
     };
     let mut expanded_word = ExpandedWord::default();
     simple_word_expansion_into(&mut expanded_word, word, tilde_mode, shell)?;
-    Ok(expanded_word.to_string())
+    // SCAFFOLD(byte-core stage 1): removed once the shell's values are bytes.
+    // Errors rather than losing bytes, which is what this path already did.
+    sh_string_to_string(expanded_word.to_sh_string())
 }
 
 /// Expands a `name=value` operand of a declaration utility (POSIX 2.9.1): the
@@ -272,7 +298,9 @@ pub fn expand_declaration_operand(word: &Word, shell: &mut Shell) -> ExpansionRe
         TildeMode::DeclarationOperand,
         shell,
     )?;
-    Ok(expanded_word.to_string())
+    // SCAFFOLD(byte-core stage 1): removed once the shell's values are bytes.
+    // Errors rather than losing bytes, which is what this path already did.
+    sh_string_to_string(expanded_word.to_sh_string())
 }
 
 /// performs general word expansion (similar to `wordexp` from libc)
@@ -292,13 +320,13 @@ pub fn expand_word(
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs, usize::MAX) {
         if shell.set_options.noglob {
-            result.push(field.to_string())
+            result.push(sh_string_to_string(field.to_sh_string())?)
         } else {
             let pattern =
                 FilenamePattern::new(&field).map_err(CommandExecutionError::ExpansionError)?;
             let files = glob(&pattern, Path::new(&shell.current_directory));
             if files.is_empty() {
-                result.push(pattern.into())
+                result.push(sh_string_to_string(pattern.into())?)
             } else {
                 result.reserve(files.len());
                 for file in files {
@@ -327,6 +355,7 @@ pub fn word_to_pattern(word: &Word, shell: &mut Shell) -> ExpansionResult<Patter
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::shstr::ShString;
 
     #[test]
     fn split_fields_on_empty_literal() {
@@ -475,9 +504,9 @@ pub mod tests {
         assert_eq!(
             split_fields(
                 ExpandedWord::from_parts(vec![
-                    ExpandedWordPart::UnquotedLiteral("a:".to_string()),
-                    ExpandedWordPart::GeneratedUnquotedLiteral("b:c".to_string()),
-                    ExpandedWordPart::UnquotedLiteral(":d".to_string())
+                    ExpandedWordPart::UnquotedLiteral(ShString::from("a:")),
+                    ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("b:c")),
+                    ExpandedWordPart::UnquotedLiteral(ShString::from(":d"))
                 ]),
                 Some(":"),
                 usize::MAX

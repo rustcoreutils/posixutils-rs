@@ -86,11 +86,10 @@ wrong build.
   UndefinedMacro("UNDEF")`; `echo $(HOME)` fails identically without `-e`; and
   because substitution runs over comment text, `# price is $5` aborts the whole
   parse with `UndefinedMacro("5")`.
-- [ ] **#35 — Include processing is handed an empty macro table.**
-  `parser/preprocessor.rs` calls `process_include_lines(&source, &HashMap::new())`,
-  discarding the `table` computed on the line above. `include $(TOP)/inc.mk`
-  fails with `UndefinedMacro("TOP")` even when `TOP` is defined immediately
-  before it.
+- [x] **#35 — Include processing is handed an empty macro table.** ✓ fixed
+  2026-08-27 (P1 step 1). `expand_includes` threads the real macro table through
+  `process_include_lines`, which was being handed `&HashMap::new()`, so
+  `include $(TOP)/inc.mk` now resolves. Test `test_include_path_may_use_a_macro`.
 - [ ] **#36 — No `VARIABLE` node is ever built, so `SHELL` and the recipe
   environment are dead.** `parser/parse.rs`. `Makefile::variable_definitions()`
   always returns empty and `Make::macros` is always `[]`, which makes `Macro`,

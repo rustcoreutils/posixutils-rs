@@ -56,11 +56,40 @@ pub fn handle_signals(signal_code: libc::c_int) {
     }
 }
 
-pub fn register_signals() {
+/// Install `handle_signals` for one signal, unless the signal was ignored on
+/// entry.
+///
+/// POSIX requires a signal ignored by the invoking process to stay ignored, so
+/// a wrapper that masks SIGINT is not overridden. `sigaction` is used rather
+/// than `signal` so the disposition can be read first, and so the handler's
+/// mask and flags are specified rather than inherited from whatever `signal`
+/// happens to do on this platform.
+fn install(signum: libc::c_int) {
     unsafe {
-        signal(SIGINT, handle_signals as *const () as usize);
-        signal(SIGQUIT, handle_signals as *const () as usize);
-        signal(SIGTERM, handle_signals as *const () as usize);
-        signal(SIGHUP, handle_signals as *const () as usize);
+        let mut current: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(signum, std::ptr::null(), &mut current) != 0 {
+            return;
+        }
+        if current.sa_sigaction == libc::SIG_IGN {
+            return;
+        }
+
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_signals as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(signum, &action, std::ptr::null_mut());
     }
+}
+
+/// Install the interrupt handlers. Idempotent: called once per build rather
+/// than once per recipe line, and re-registering would in any case re-read the
+/// disposition it just installed.
+pub fn register_signals() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for signum in [SIGINT, SIGQUIT, SIGTERM, SIGHUP] {
+            install(signum);
+        }
+    });
 }

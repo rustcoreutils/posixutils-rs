@@ -22,7 +22,6 @@ use posixutils_make::{
     config::Config,
     error_code::ErrorCode::{self, *},
     parser::{preprocessor::ENV_MACROS, Makefile},
-    rule::KEEP_GOING_ERROR,
     Make,
 };
 
@@ -163,6 +162,32 @@ fn target_not_remade(target: &str) -> String {
 /// words containing `=` are macro operands; words already starting with `-` are
 /// passed verbatim. `MAKEFLAGS` is inherited by recipe sub-processes via the
 /// environment, so it propagates to sub-makes.
+/// Build the `MAKEFLAGS` value a sub-make should inherit.
+///
+/// POSIX 105866 requires make to pass its options down through `MAKEFLAGS`.
+/// Only options that make sense to inherit are forwarded; `-f`, `-C` and the
+/// target operands are specific to this invocation. The letters-only first word
+/// is the form POSIX describes and the form `args_with_makeflags` parses back.
+fn makeflags_for_children(config: &Config) -> String {
+    let mut letters = String::new();
+    for (flag, ch) in [
+        (config.ignore, 'i'),
+        (config.dry_run, 'n'),
+        (config.silent, 's'),
+        (config.quit, 'q'),
+        (config.keep_going, 'k'),
+        (config.terminate, 'S'),
+        (config.env_macros, 'e'),
+        (config.touch, 't'),
+        (config.clear, 'r'),
+    ] {
+        if flag {
+            letters.push(ch);
+        }
+    }
+    letters
+}
+
 fn args_with_makeflags() -> Vec<OsString> {
     let mut args: Vec<OsString> = env::args_os().collect();
     let Ok(flags) = env::var("MAKEFLAGS") else {
@@ -302,6 +327,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ENV_MACROS.store(env_macros, Relaxed);
 
+    // POSIX 105866: make passes its options to sub-makes through MAKEFLAGS.
+    // Only the flags worth inheriting go in; -f, -C and the target operands
+    // belong to this invocation (audit #40).
+    let inherited = makeflags_for_children(&config);
+    if !inherited.is_empty() {
+        env::set_var("MAKEFLAGS", inherited);
+    }
+
     // Separate command-line `macro=value` operands from target operands
     // (POSIX SYNOPSIS allows them to be intermixed).
     let mut cmdline_macros: Vec<String> = Vec::new();
@@ -356,17 +389,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut had_error = false;
     for target in targets {
-        let target = target.into_string().unwrap();
-        KEEP_GOING_ERROR.store(false, Relaxed);
+        // A target is a filename, so it need not be valid UTF-8. Diagnose it
+        // rather than panicking (audit #39); the rest of the crate is
+        // String-based, so a non-UTF-8 operand cannot be built, but it can at
+        // least be reported.
+        let target = match target.into_string() {
+            Ok(target) => target,
+            Err(raw) => {
+                eprintln!(
+                    "make: {}: {}",
+                    raw.to_string_lossy(),
+                    gettext("target name is not valid text")
+                );
+                had_error = true;
+                continue;
+            }
+        };
         match make.build_target(&target) {
             Ok(updated) => {
-                // Under `-k` a failed recipe is reported and swallowed so the
-                // build can continue; the flag tells us this target could not
-                // actually be remade.
-                if KEEP_GOING_ERROR.load(Relaxed) {
-                    eprintln!("{}", target_not_remade(&target));
-                    had_error = true;
-                } else if !updated {
+                if !updated {
                     println!(
                         "{}: `{}` {}",
                         gettext("make"),

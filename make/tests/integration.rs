@@ -1426,3 +1426,89 @@ mod inference {
         assert_eq!(code, Some(0));
     }
 }
+
+// Recipe execution and command-line semantics.
+mod execution {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #33: -k means "keep building the other targets", not "build this
+    // target's dependents anyway". The failing recipe used to return Ok, so
+    // `all` ran against inputs that were never produced.
+    #[test]
+    fn keep_going_skips_a_target_whose_prerequisite_failed() {
+        let (stdout, _, code) = run(&[
+            "-f",
+            "tests/makefiles/execution/keep_going_skips.mk",
+            "-k",
+            "all",
+        ]);
+        assert!(!stdout.contains("SHOULD-NOT-RUN"), "stdout: {stdout}");
+        // ...but an independent sibling still gets built, which is the point of -k.
+        assert!(stdout.contains("B-RAN"), "stdout: {stdout}");
+        assert_eq!(code, Some(2));
+    }
+
+    // Audit #42: `-t` on a .PHONY target used to create a file named after it,
+    // after which every `make <target>` reported it up to date forever.
+    #[test]
+    fn touch_does_not_materialize_a_phony_target() {
+        let _ = fs::remove_file("phony_probe");
+        let (_, _, code) = run(&[
+            "-f",
+            "tests/makefiles/execution/phony_touch.mk",
+            "-t",
+            "phony_probe",
+        ]);
+        assert_eq!(code, Some(0));
+        assert!(
+            !std::path::Path::new("phony_probe").exists(),
+            "-t created a file for a .PHONY target"
+        );
+    }
+
+    // Audit #39: a target is a filename and need not be valid UTF-8.
+    #[test]
+    fn a_non_utf8_target_is_diagnosed_not_a_panic() {
+        use std::os::unix::ffi::OsStrExt;
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .arg("-f")
+            .arg("tests/makefiles/execution/makeflags.mk")
+            .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+            .output()
+            .expect("failed to run make");
+        // 101 is the Rust panic exit status.
+        assert_ne!(output.status.code(), Some(101), "make panicked");
+        assert_eq!(output.status.code(), Some(2));
+    }
+
+    // Audit #40: POSIX 105866 -- make passes its options down through
+    // MAKEFLAGS. It was never constructed, so a sub-make saw nothing.
+    #[test]
+    fn makeflags_carries_options_to_children() {
+        let (stdout, _, _) = run(&["-f", "tests/makefiles/execution/makeflags.mk", "-k", "all"]);
+        assert!(stdout.contains("MAKEFLAGS=[k]"), "stdout: {stdout}");
+    }
+
+    #[test]
+    fn makeflags_is_empty_when_no_options_are_given() {
+        let (stdout, _, _) = run(&["-f", "tests/makefiles/execution/makeflags.mk", "all"]);
+        assert!(stdout.contains("MAKEFLAGS=[]"), "stdout: {stdout}");
+    }
+}

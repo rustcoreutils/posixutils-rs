@@ -50,12 +50,6 @@ pub struct InterruptInfo {
 pub static INTERRUPT_FLAG: LazyArcMutex<Option<InterruptInfo>> =
     LazyLock::new(|| Arc::new(Mutex::new(None)));
 
-/// Set when a non-ignored recipe error is swallowed under `-k` (keep going) so
-/// that `make` can report the failure and exit nonzero even though the build
-/// loop continued with the remaining, independent targets.
-pub static KEEP_GOING_ERROR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rule {
     /// The targets of the rule
@@ -234,8 +228,8 @@ impl Rule {
             quit: global_quit,
             clear: _,
             print: global_print,
-            keep_going: global_keep_going,
-            terminate: global_terminate,
+            keep_going: _,
+            terminate: _,
             precious: global_precious,
             jobs: _,
             not_parallel: _,
@@ -273,8 +267,6 @@ impl Rule {
                 let quit = global_quit;
                 let print = global_print;
                 let precious = global_precious || rule_precious;
-                let keep_going = global_keep_going;
-                let terminate = global_terminate;
 
                 *INTERRUPT_FLAG.lock().unwrap() = Some(InterruptInfo {
                     target: target.as_ref().to_string(),
@@ -353,30 +345,29 @@ impl Rule {
                         }
                     }
                 };
+                // A failed recipe fails its target, whatever -k says. `-k`
+                // means keep building the *other* targets, not build this
+                // one's dependents anyway: returning Ok here let every
+                // dependent run against inputs that were never produced
+                // (audit #33). Whether siblings continue is decided by the
+                // traversal, and the diagnostic is printed by the caller.
                 if !status.success() && !ignore {
-                    // -S and -k flags
-                    if !terminate && keep_going {
-                        eprintln!(
-                            "make: {}",
-                            ExecutionError {
-                                exit_code: status.code(),
-                            }
-                        );
-                        KEEP_GOING_ERROR.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    } else {
-                        return Err(ExecutionError {
-                            exit_code: status.code(),
-                        });
-                    }
+                    return Err(ExecutionError {
+                        exit_code: status.code(),
+                    });
                 }
             }
 
             let silent = global_silent || rule_silent;
             let touch = global_touch;
 
-            // -t flag
+            // -t flag. A .PHONY target names no file, so touching it would
+            // create one and make every later `make <target>` report it up to
+            // date forever (audit #42).
             if touch {
+                if rule_phony {
+                    return Ok(());
+                }
                 if !silent {
                     println!("{} {target}", gettext("touch"));
                 }

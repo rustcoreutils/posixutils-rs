@@ -81,13 +81,13 @@ wrong build.
   `macro expansion does not terminate` instead of growing the text forever.
   Tests `include_recursion_is_capped`, `recursive_macro_is_capped`.
 
-- [ ] **#33 — Under `-k`, a target whose prerequisite failed still runs its
-  recipe.** `rule.rs`. The failed prerequisite `break`s out with `Ok`, so the
-  dependent builds from inputs that were never produced. `all: a b` with
-  `a:` → `false` prints `make: execution error: 1` and then runs `echo all`.
-  `-k` must skip such targets. The `KEEP_GOING_ERROR` global also cannot say
-  *which* target failed under `-j`.
-
+- [x] **#33 — Under `-k`, a target whose prerequisite failed still runs its
+  recipe.** ✓ fixed 2026-08-27 (P6). A failed recipe now fails its target
+  whatever `-k` says; `-k` means keep building the *other* targets, which the
+  traversal decides. `KEEP_GOING_ERROR`, the process-global flag that could not
+  say which target failed under `-j`, is deleted. Test
+  `keep_going_skips_a_target_whose_prerequisite_failed`, which also pins that an
+  independent sibling still builds.
 ## Major
 
 - [x] **#34 — An undefined macro is fatal, environment variables are not macros,
@@ -132,25 +132,28 @@ wrong build.
   scanned the working directory: a dot-target that only looked like an inference
   rule found no files and silently ran no recipe. Tests
   `a_dot_target_is_not_an_inference_rule`, `default_target_skips_a_dot_target`.
-- [ ] **#39 — A non-UTF-8 target operand panics.** `main.rs` calls
-  `target.into_string().unwrap()`. `make $'\xff'` → `panicked at … called
-  Result::unwrap() on an Err value: "\xFF"`, exit 101. Targets are filenames and
-  must not be required to be UTF-8; `Target` is `String`-based throughout.
-- [ ] **#40 — `MAKEFLAGS` is never synthesized from the command line, so it does
-  not reach sub-makes.** `rule.rs`. POSIX requires make to propagate its options.
-  `make -k` invoking `$(MAKE)` gives the sub-make `MAKEFLAGS=[]`. Only
-  env-provided flags propagate today (see the provenance note above).
-- [ ] **#41 — `register_signals()` overrides an inherited `SIG_IGN`, and runs
-  once per recipe.** `rule.rs` installs handlers unconditionally inside the
-  per-recipe loop. POSIX requires a signal ignored on entry to stay ignored, so
-  make invoked with SIGINT masked dies on a Ctrl-C the caller deliberately
-  suppressed. Probed: make run under `trap '' INT` with a `sleep` recipe still
-  dies on SIGINT. This refutes old #17, which claimed registration was correctly
-  gated.
-- [ ] **#42 — `-t` touches `.PHONY` targets.** `rule.rs`. `make -t clean`
-  creates a file named `clean`, after which every `make clean` reports it up to
-  date and never runs the recipe.
-
+- [x] **#39 — A non-UTF-8 target operand panics.** ✓ fixed 2026-08-27 (P6).
+  Diagnosed and skipped rather than unwrapped, so `make $'\xff'` exits 2 instead
+  of 101. The crate is `String`-based throughout, so such a target still cannot
+  be *built*; it can now at least be reported. Test
+  `a_non_utf8_target_is_diagnosed_not_a_panic`.
+- [x] **#40 — `MAKEFLAGS` is never synthesized, so it does not reach
+  sub-makes.** ✓ fixed 2026-08-27 (P6). `makeflags_for_children` builds the
+  letters-only form POSIX 105866 describes — and that `args_with_makeflags`
+  already parses back — from the inheritable options. `-f`, `-C` and the target
+  operands are excluded as specific to the invocation. Verified end to end: a
+  sub-make invoked through `$(MAKE)` sees `MAKEFLAGS=[k]`. Tests
+  `makeflags_carries_options_to_children`,
+  `makeflags_is_empty_when_no_options_are_given`.
+- [x] **#41 — `register_signals()` overrides an inherited `SIG_IGN`, and runs
+  once per recipe.** ✓ fixed 2026-08-27 (P6). `sigaction` replaces `signal`, the
+  existing disposition is read first and left alone when it is `SIG_IGN`, and
+  registration happens once via `Once` rather than per recipe line. Probed: make
+  run under `trap '' INT` survives a SIGINT that used to kill it.
+- [x] **#42 — `-t` touches `.PHONY` targets.** ✓ fixed 2026-08-27 (P6). A phony
+  target names no file, so `-t` skips it instead of creating one that made every
+  later `make <target>` report it up to date forever. Test
+  `touch_does_not_materialize_a_phony_target`.
 - [x] **#47 — `.SUFFIXES` order does not drive inference-rule selection.**
   ✓ fixed 2026-08-27 (P5). `find_inference_rule` iterates `Config::suffixes` and
   looks up the rule for each, rather than iterating the rules in file order.

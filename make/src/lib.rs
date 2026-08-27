@@ -374,10 +374,21 @@ impl Make {
     /// cannot obtain a token is built inline so the build always progresses.
     fn build_segment(&self, names: &[&str], parallel: bool) -> Result<(), ErrorCode> {
         if !parallel || names.len() <= 1 {
+            // Under -k a failed prerequisite must not stop its *siblings*; the
+            // first error is still returned, so the dependent target is skipped.
+            let mut first_error = None;
             for name in names {
-                self.build_target(name)?;
+                if let Err(err) = self.build_target(name) {
+                    if !self.config.keep_going || self.config.terminate {
+                        return Err(err);
+                    }
+                    first_error.get_or_insert(err);
+                }
             }
-            return Ok(());
+            return match first_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            };
         }
 
         let errors: std::sync::Mutex<Vec<ErrorCode>> = std::sync::Mutex::new(Vec::new());

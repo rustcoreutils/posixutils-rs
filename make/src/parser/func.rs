@@ -18,7 +18,7 @@
 //! three that need their arguments *unexpanded* (`if`, `foreach`, `call`) are
 //! handled separately, before argument expansion.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// How deep the expansion cycle may recurse before we call it non-terminating.
@@ -30,14 +30,58 @@ use std::collections::HashMap;
 const MAX_EXPANSION_DEPTH: usize = 200;
 
 /// Per-expansion state shared by every nested `Ctx`.
+///
+/// `pending` is where `$(eval ...)` leaves text for the reader to read back as
+/// makefile source. A function cannot reach the reader -- it owns the macro
+/// table and the output buffer, and expansion runs inside a `&mut self` call on
+/// it -- so eval records its expansion here instead and the reader drains it.
+///
+/// `None` means eval is not usable in this context: command lines are expanded
+/// after the reader has finished, where queued text would have no consumer.
 #[derive(Default)]
 pub(crate) struct Expansion {
     depth: Cell<usize>,
+    pending: Option<RefCell<Vec<String>>>,
 }
 
 impl Expansion {
+    /// State for a context that can accept `$(eval ...)`.
     pub(crate) fn new() -> Self {
-        Self::default()
+        Expansion {
+            depth: Cell::new(0),
+            pending: Some(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// State for a context that cannot -- a command line.
+    pub(crate) fn without_eval() -> Self {
+        Expansion {
+            depth: Cell::new(0),
+            pending: None,
+        }
+    }
+
+    /// Queue text for the reader. Whitespace-only text is dropped: an eval that
+    /// expanded to nothing has nothing to read back.
+    fn queue(&self, text: String) -> Result<(), String> {
+        let Some(pending) = &self.pending else {
+            return Err("$(eval ...) is not usable in a command line".to_string());
+        };
+        if !text.trim().is_empty() {
+            pending.borrow_mut().push(text);
+        }
+        Ok(())
+    }
+
+    /// Take everything queued so far.
+    ///
+    /// Borrowing is confined here so no caller can hold a `RefMut` across a
+    /// recursive expansion, which would panic.
+    pub(crate) fn take_pending(&self) -> Vec<String> {
+        match &self.pending {
+            Some(pending) => pending.borrow_mut().drain(..).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Enter one level of nested expansion, or report that it is too deep.
@@ -363,8 +407,32 @@ fn call_lazy(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Option<Result<
         "and" => Some(f_or_and(raw, ctx, expand, false)),
         "foreach" => Some(f_foreach(raw, ctx, expand)),
         "call" => Some(f_call(raw, ctx, expand)),
+        "eval" => Some(f_eval(raw, ctx, expand)),
         _ => None,
     }
+}
+
+/// `$(eval text)` — expand `text`, then hand it to the reader to be read back
+/// as makefile source.
+///
+/// Eager argument splitting would be wrong here: eval takes a single argument,
+/// commas inside it are literal, and `split_args` would cut a `$(...)`
+/// reference in half if a shell `case` pattern in a `define` body had already
+/// driven its paren depth to the floor.
+///
+/// One `$` level is consumed, matching GNU: a template writes `$$(CC)` so that
+/// the recipe it generates still says `$(CC)`. Our `substitute` passes `$$`
+/// through untouched, so without this the generated recipe would keep both
+/// dollars and reach the shell as a command substitution.
+fn f_eval(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
+    // `R = $(eval $(R))` recurses through `expand` without ever reaching
+    // `$(call)` or `$(foreach)`, so eval needs the depth guard of its own.
+    let _guard = ctx.state.enter()?;
+    // Two statements deliberately: writing `queue(expand(..)?)` would hold the
+    // queue's borrow across a nested eval and panic.
+    let text = expand(raw, ctx)?;
+    ctx.state.queue(text.replace("$$", "$"))?;
+    Ok(String::new())
 }
 
 fn f_if(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
@@ -493,11 +561,6 @@ pub(crate) fn call(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Result<S
             .unwrap_or_default(),
         "wildcard" => f_wildcard(arg(0)),
         "shell" => f_shell(&all)?,
-        // `$(eval text)` reads its expansion back as makefile source, which
-        // means re-entering the reader mid-expansion. Deferred to its own
-        // phase; refusing loudly beats expanding to nothing, which would
-        // silently drop whatever the makefile was defining.
-        "eval" => return Err("eval is not implemented".to_string()),
         "error" => return Err(all),
         "warning" | "info" => {
             eprintln!("{all}");

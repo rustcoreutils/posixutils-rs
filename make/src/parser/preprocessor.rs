@@ -40,6 +40,8 @@ pub enum PreprocError {
     RecursiveMacro,
     /// A function reported an error, or does not exist.
     FunctionFailed(String),
+    /// `$(eval ...)` re-entered the reader too many times.
+    EvalTooDeep,
 }
 
 impl Display for PreprocError {
@@ -67,6 +69,9 @@ impl Display for PreprocError {
             // per nesting level, and each `to_string()` would otherwise append
             // another newline -- 200 of them for a deep recursion.
             PreprocError::FunctionFailed(msg) => write!(f, "{msg}"),
+            PreprocError::EvalTooDeep => {
+                writeln!(f, "$(eval ...) nested too deeply (recursive definition?)")
+            }
             other => writeln!(f, "{:?}", other),
         }
     }
@@ -723,6 +728,15 @@ struct Branch {
 /// at least 16; the cap exists so a self-including file terminates.
 const MAX_INCLUDE_DEPTH: usize = 64;
 
+/// How deep `$(eval ...)` may re-enter the reader. Separate from the include
+/// cap: they are independent resources, and sharing one would make an `include`
+/// inside eval'd text trip the eval limit.
+const MAX_EVAL_DEPTH: usize = 64;
+
+/// A ceiling on how much text one line's evals may inject, so a self-producing
+/// eval that stays shallow still terminates.
+const MAX_EVAL_CHUNKS: usize = 1000;
+
 /// Walks makefile text once, evaluating directives in order.
 ///
 /// Macro definitions, conditionals and includes are interleaved because they
@@ -734,8 +748,10 @@ struct Reader {
     branches: Vec<Branch>,
     out: String,
     depth: usize,
+    eval_depth: usize,
     vpaths: Vec<VPathEntry>,
-    /// Shared by every expansion this reader performs, so recursion is bounded.
+    /// Shared by every expansion this reader performs, so recursion is bounded
+    /// and `$(eval ...)` has somewhere to leave text.
     state: func::Expansion,
 }
 
@@ -746,6 +762,7 @@ impl Reader {
             branches: Vec::new(),
             out: String::new(),
             depth: 0,
+            eval_depth: 0,
             vpaths: Vec::new(),
             state: func::Expansion::new(),
         }
@@ -773,6 +790,10 @@ impl Reader {
             // must not run (audit #51).
             let code = super::scan::strip_comment(line);
             let expanded = substitute_to_fixpoint(code, self.table.values(), &self.state)?;
+            // Anything `$(eval ...)` queued belongs *before* this line. A rule
+            // header emitted by an eval on a rule line would otherwise close
+            // the enclosing rule and steal its recipe.
+            self.drain_evals()?;
             self.out.push_str(&expanded);
         }
         self.out.push('\n');
@@ -974,8 +995,71 @@ impl Reader {
         Ok(())
     }
 
-    /// Handle one line; returns the index of the last line it consumed.
+    /// Read text produced by `$(eval ...)` with its own conditional stack.
+    ///
+    /// Sharing the enclosing stack lets an eval'd `endif` close a conditional
+    /// belonging to the outer file, silently un-gating it. GNU isolates here
+    /// for the same reason, and reports an unbalanced conditional on exit.
+    /// Taking the stack also makes the eval'd text unconditionally active,
+    /// which is right: the queue can only be filled while active.
+    fn read_isolated(&mut self, text: &str) -> Result<()> {
+        let saved = std::mem::take(&mut self.branches);
+        let result = self.read(text);
+        let balanced = self.branches.is_empty();
+        self.branches = saved;
+        result?;
+        if !balanced {
+            return Err(PreprocError::UnmatchedConditional("endif".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Read back everything `$(eval ...)` queued, and anything those reads
+    /// queue in turn.
+    fn drain_evals(&mut self) -> Result<()> {
+        let mut chunks = 0usize;
+        loop {
+            let pending = self.state.take_pending();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            if self.eval_depth >= MAX_EVAL_DEPTH {
+                return Err(PreprocError::EvalTooDeep);
+            }
+            self.eval_depth += 1;
+            let result = self.read_chunks(pending, &mut chunks);
+            self.eval_depth -= 1;
+            result?;
+        }
+    }
+
+    fn read_chunks(&mut self, pending: Vec<String>, chunks: &mut usize) -> Result<()> {
+        for text in pending {
+            *chunks += 1;
+            if *chunks > MAX_EVAL_CHUNKS {
+                return Err(PreprocError::EvalTooDeep);
+            }
+            // Deliberately not folded: eval'd text usually comes from a
+            // `define` body, whose lines were already folded when the file was
+            // read. Folding again would eat a literal backslash.
+            self.read_isolated(&text)?;
+        }
+        Ok(())
+    }
+
+    /// Handle one line, then read back anything its expansion queued.
+    ///
+    /// Wrapping rather than draining inside each arm covers every path that can
+    /// expand: a conditional's condition, an include path, and a macro
+    /// definition's body can all contain `$(eval ...)`.
     fn handle(&mut self, lines: &[&str], i: usize) -> Result<usize> {
+        let last = self.handle_line(lines, i)?;
+        self.drain_evals()?;
+        Ok(last)
+    }
+
+    /// Handle one line; returns the index of the last line it consumed.
+    fn handle_line(&mut self, lines: &[&str], i: usize) -> Result<usize> {
         let line = lines[i];
 
         if let Some(directive) = parse_directive(line) {
@@ -1048,7 +1132,9 @@ impl Reader {
 /// the recipe's <tab>, so every line stays a command line rather than becoming
 /// a bogus rule.
 fn expand_command_lines(text: &str, table: &HashMap<String, String>) -> Result<String> {
-    let state = func::Expansion::new();
+    // A command line is expanded after the reader has finished, so text
+    // queued here would have no consumer: `$(eval ...)` is refused instead.
+    let state = func::Expansion::without_eval();
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         if line.starts_with('\t') {

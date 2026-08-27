@@ -178,12 +178,31 @@ wrong build.
   putting them there is also what makes them visible to recipes, since #49's
   filter exports a macro only if make already inherited its name. `MAKEFLAGS`
   and `SHELL` are excluded as the spec requires.
-- [ ] **#52 — `$(eval ...)` is unimplemented.** 53 occurrences in the sample
-  corpus. It expands its argument and then reads the result back as makefile
-  source, which means re-entering the reader mid-expansion — the reader owns the
-  macro table and the output buffer, and `substitute` has no handle on it.
-  Refused loudly rather than expanded to nothing, so a makefile using it fails
-  instead of silently losing whatever it was defining. Needs its own phase.
+- [x] **#52 — `$(eval ...)` is unimplemented.** ✓ fixed 2026-08-27. It expands
+  its argument and hands the text to the reader to be read back as makefile
+  source, so it can define macros, rules and conditionals.
+
+  A function cannot reach the reader — the reader owns the macro table and the
+  output buffer, and expansion runs inside a `&mut self` call on it — so eval
+  leaves text in a queue on the shared `func::Expansion` and the reader drains
+  it, re-entering `read` the way `include` already does. Four things this design
+  had to get right, each now a test:
+  * **Ordering.** The drain runs *before* the producing line is emitted. A rule
+    header emitted after it would close the enclosing rule and steal its recipe.
+  * **`$$`.** One `$` level is consumed, matching GNU. `substitute` passes `$$`
+    through untouched, so a template's `$$(CC)` would otherwise keep both
+    dollars and reach the shell as a command substitution — a silent wrong
+    build, not an error.
+  * **Isolation.** Eval'd text gets its own conditional stack; sharing let an
+    eval'd `endif` close a conditional belonging to the enclosing file.
+  * **Laziness.** eval takes one argument, so its text is never split on commas.
+
+  Verified byte-identical to GNU Make 4.3 on the generated-rules idiom
+  `$(foreach p,foo bar,$(eval $(call tpl,$(p))))`. Thirteen tests in
+  `parser.rs` `mod eval`.
+  _Recipe lines are expanded after the reader has finished, so `$(eval ...)`
+  there is refused rather than silently dropped._
+
 - [x] **#53 — `VPATH`/`vpath` are unimplemented.** ✓ partially fixed 2026-08-27
   (P7). The `VPATH` macro is honoured: a prerequisite that does not exist as
   written is looked up in each listed directory, for both staleness checks and
@@ -238,6 +257,14 @@ wrong build.
   used `writeln!`, so each `to_string()` appended another newline — a 200-deep
   recursion printed its one-line message followed by 202 blank lines. Test
   `a_depth_error_is_reported_once`.
+
+- [x] **#60 — `$<` is empty in an ordinary rule.** ✓ fixed 2026-08-27. POSIX
+  defines `$<` only for inference rules, but GNU sets it to the first
+  prerequisite in an explicit rule too, and generated rules lean on it: a
+  template emitting `$(1).o: $(1).c` with `$<` in its recipe is the common
+  shape. `Rule::run` now supplies the first prerequisite as the input file,
+  which is what `run_for_pattern` already did — so that near-duplicate collapses
+  into it. Found while checking #52 against GNU.
 
 ## Minor
 

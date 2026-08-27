@@ -665,10 +665,10 @@ mod functions {
         assert!(preprocess("all:\n\t@echo $(error boom)\n").is_err());
     }
 
-    // $(eval) needs the reader re-entered mid-expansion; refusing loudly beats
-    // silently expanding to nothing.
+    // A recipe is expanded after the reader has finished, so text queued there
+    // would have no consumer. Refused rather than silently dropped.
     #[test]
-    fn eval_is_refused_not_ignored() {
+    fn eval_in_a_recipe_is_refused() {
         assert!(preprocess("all:\n\t@echo $(eval X = 1)\n").is_err());
     }
 
@@ -758,5 +758,143 @@ mod vpath {
     fn a_longer_word_is_not_the_directive() {
         let got = entries("vpathological: dep\n\techo hi\n");
         assert!(got.is_empty());
+    }
+}
+
+// `$(eval ...)`: expand text, then read it back as makefile source.
+mod eval {
+    use posixutils_make::parser::preprocessor::preprocess;
+    use posixutils_make::parser::Makefile;
+    use std::str::FromStr;
+
+    fn text(source: &str) -> String {
+        preprocess(source).expect("must preprocess").text
+    }
+
+    fn macro_value(source: &str, name: &str) -> String {
+        preprocess(source)
+            .expect("must preprocess")
+            .macros
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    fn rule_prereqs(source: &str, target: &str) -> Vec<String> {
+        Makefile::from_str(source)
+            .expect("must parse")
+            .rules()
+            .find(|r| r.targets().any(|t| t == target))
+            .map(|r| r.prerequisites().map(String::from).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn defines_a_macro() {
+        assert_eq!(macro_value("$(eval X = 1)\nall:\n\techo hi\n", "X"), "1");
+    }
+
+    #[test]
+    fn defines_a_rule() {
+        assert_eq!(
+            rule_prereqs("$(eval gen: dep)\nall:\n\techo hi\n", "gen"),
+            vec!["dep".to_string()]
+        );
+    }
+
+    // The idiom eval exists for. Each iteration must queue separately, in order.
+    #[test]
+    fn generates_a_rule_per_foreach_iteration() {
+        let src = "define tpl\n$(1): $(1).in\nendef\n                   $(foreach p,foo bar,$(eval $(call tpl,$(p))))\nall:\n\techo hi\n";
+        assert_eq!(rule_prereqs(src, "foo"), vec!["foo.in".to_string()]);
+        assert_eq!(rule_prereqs(src, "bar"), vec!["bar.in".to_string()]);
+    }
+
+    // A template writes `$$(CC)` so the *generated* recipe says `$(CC)`. Our
+    // `substitute` passes `$$` through untouched, so eval consumes one level to
+    // match GNU. Without it the recipe would reach the shell as a command
+    // substitution and try to run `CC` as a program.
+    #[test]
+    fn consumes_one_dollar_level() {
+        let src = "define tpl\n$(1).o: $(1).c\n\t@echo $$(CC)\nendef\n                   $(eval $(call tpl,foo))\nall:\n\techo hi\n";
+        let out = text(src);
+        assert!(
+            !out.contains("$$(CC)"),
+            "one level should be consumed: {out:?}"
+        );
+    }
+
+    // A rule header from an eval must land *before* the line that produced it,
+    // or it closes the enclosing rule and steals its recipe.
+    #[test]
+    fn a_generated_rule_does_not_steal_the_enclosing_recipe() {
+        let src = "all: $(eval dep: ; @echo DEP)\n\t@echo ALL-RECIPE\n";
+        let mk = Makefile::from_str(src).expect("must parse");
+        let all = mk
+            .rules()
+            .find(|r| r.targets().any(|t| t == "all"))
+            .expect("all");
+        assert!(
+            all.recipes().any(|r| r.contains("ALL-RECIPE")),
+            "recipe attached to the wrong rule"
+        );
+    }
+
+    // eval reachable from a conditional's condition, an include path, and a
+    // macro body -- every path the reader expands, not just plain lines.
+    #[test]
+    fn works_inside_a_conditional_condition() {
+        let src = "ifeq ($(eval X=1)x,x)\nY = taken\nendif\nall:\n\techo hi\n";
+        assert_eq!(macro_value(src, "X"), "1");
+        assert_eq!(macro_value(src, "Y"), "taken");
+    }
+
+    #[test]
+    fn works_in_an_immediate_assignment() {
+        let src = "Y := $(eval X = 1)\nall:\n\techo hi\n";
+        assert_eq!(macro_value(src, "X"), "1");
+        assert_eq!(macro_value(src, "Y"), "");
+    }
+
+    // Commas inside eval's text are literal: it takes one argument, and
+    // splitting on them would cut a reference in half.
+    #[test]
+    fn commas_are_literal() {
+        assert_eq!(
+            rule_prereqs("$(eval t: a,b)\nall:\n\techo hi\n", "t"),
+            vec!["a,b".to_string()]
+        );
+    }
+
+    // eval'd text gets its own conditional stack, so a stray `endif` cannot
+    // un-gate a conditional belonging to the enclosing file.
+    #[test]
+    fn an_eval_endif_cannot_close_an_outer_conditional() {
+        let src = "ifeq (a,b)\n$(eval endif)\nGATED = leaked\nendif\nall:\n\techo hi\n";
+        assert_eq!(macro_value(src, "GATED"), "");
+    }
+
+    #[test]
+    fn an_unbalanced_conditional_inside_eval_is_refused() {
+        assert!(preprocess("$(eval ifeq (1,1))\nall:\n\techo hi\n").is_err());
+    }
+
+    #[test]
+    fn nested_eval_works() {
+        assert_eq!(
+            macro_value("$(eval $(eval X=1))\nall:\n\techo hi\n", "X"),
+            "1"
+        );
+    }
+
+    #[test]
+    fn self_producing_eval_terminates() {
+        assert!(preprocess("R = $(eval $(R))\nall:\n\t@echo $(R)\n").is_err());
+    }
+
+    #[test]
+    fn evaluating_to_nothing_is_a_noop() {
+        assert!(preprocess("$(eval )\nall:\n\techo hi\n").is_ok());
     }
 }

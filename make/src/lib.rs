@@ -304,7 +304,7 @@ impl Make {
                             .prerequisites()
                             .map(|p| p.as_ref().to_string())
                             .collect();
-                        rule.run_for_pattern(&self.config, &self.macros, &target, false, &newer)?;
+                        rule.run(&self.config, &self.macros, &target, false, &newer)?;
                         return Ok(true);
                     }
                     // No target rule named `name`: try to infer one (single- or

@@ -171,25 +171,6 @@ impl Rule {
         self.run_with_files(global_config, macros, target, up_to_date, files, newer)
     }
 
-    /// Runs an instantiated pattern rule, with the matched prerequisite as the
-    /// input file so `$<` and `$*` resolve.
-    pub fn run_for_pattern(
-        &self,
-        global_config: &GlobalConfig,
-        macros: &[Macro],
-        target: &Target,
-        up_to_date: bool,
-        newer: &[String],
-    ) -> Result<(), ErrorCode> {
-        let input = self
-            .prerequisites()
-            .next()
-            .map(|p| PathBuf::from(p.as_ref()))
-            .unwrap_or_default();
-        let files = vec![(input, PathBuf::from(target.as_ref()))];
-        self.run_with_files(global_config, macros, target, up_to_date, files, newer)
-    }
-
     /// Runs the rule with the global config and macros passed in.
     ///
     /// Returns `Ok` on success and `Err` on any errors while running the rule.
@@ -201,14 +182,22 @@ impl Rule {
         up_to_date: bool,
         newer: &[String],
     ) -> Result<(), ErrorCode> {
-        // One pass, with no input/output pair: an inference rule applied to a
-        // real target goes through `run_for_target`, which knows the stem.
+        // One pass. The first prerequisite is the input file, so `$<` names it
+        // in an ordinary rule as well as an inferred one -- POSIX defines `$<`
+        // only for inference rules, but GNU sets it here too and generated
+        // rules (`$(eval $(call tpl,...))`) lean on it heavily.
         //
-        // This used to scan the working directory for every file with the
-        // rule's source suffix, which meant a dot-target that merely *looked*
-        // like an inference rule (`.config:`) found no files and silently ran
-        // no recipe at all (audit #38, #46).
-        let files = vec![(PathBuf::from(""), PathBuf::from(""))];
+        // An inference rule applied to a real target goes through
+        // `run_for_target` instead, which knows the stem. This used to scan the
+        // working directory for every file with the rule's source suffix, which
+        // meant a dot-target that merely *looked* like an inference rule
+        // (`.config:`) found no files and silently ran no recipe (audit #38, #46).
+        let input = self
+            .prerequisites()
+            .next()
+            .map(|p| PathBuf::from(p.as_ref()))
+            .unwrap_or_default();
+        let files = vec![(input, PathBuf::from(target.as_ref()))];
         self.run_with_files(global_config, macros, target, up_to_date, files, newer)
     }
 

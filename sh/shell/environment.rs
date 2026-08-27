@@ -8,6 +8,7 @@
 //
 
 use crate::shell::Display;
+use crate::shstr::{ShStr, ShString};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::Formatter;
@@ -15,23 +16,23 @@ use std::fmt::Formatter;
 #[derive(Clone, Default)]
 pub struct Value {
     /// `None` if `Value` is unset
-    pub value: Option<String>,
+    pub value: Option<ShString>,
     pub export: bool,
     pub readonly: bool,
 }
 
 impl Value {
-    pub fn new_exported(value: String) -> Self {
+    pub fn new_exported<V: Into<ShString>>(value: V) -> Self {
         Value {
-            value: Some(value),
+            value: Some(value.into()),
             export: true,
             readonly: false,
         }
     }
 
-    pub fn new(value: String) -> Self {
+    pub fn new<V: Into<ShString>>(value: V) -> Self {
         Value {
-            value: Some(value),
+            value: Some(value.into()),
             export: false,
             readonly: false,
         }
@@ -43,7 +44,7 @@ impl Value {
 }
 
 pub type GlobalScope = HashMap<String, Value>;
-pub type LocalScope = HashMap<String, String>;
+pub type LocalScope = HashMap<String, ShString>;
 
 #[derive(Default, Clone)]
 pub struct Environment {
@@ -68,11 +69,12 @@ impl Display for CannotModifyReadonly {
 }
 
 impl Environment {
-    pub fn set_global(
+    pub fn set_global<V: Into<ShString>>(
         &mut self,
         name: String,
-        value: String,
+        value: V,
     ) -> Result<&mut Value, CannotModifyReadonly> {
+        let value = value.into();
         self.remove_from_local_scope(&name);
         match self.global_scope.entry(name) {
             Entry::Occupied(mut e) => {
@@ -90,7 +92,8 @@ impl Environment {
         }
     }
 
-    pub fn set_global_forced(&mut self, name: String, value: String) -> &mut Value {
+    pub fn set_global_forced<V: Into<ShString>>(&mut self, name: String, value: V) -> &mut Value {
+        let value = value.into();
         self.remove_from_local_scope(&name);
         match self.global_scope.entry(name) {
             Entry::Occupied(mut e) => {
@@ -108,11 +111,16 @@ impl Environment {
     pub fn set_global_if_unset(&mut self, name: &str, value: &str) {
         if !self.global_scope.contains_key(name) {
             self.global_scope
-                .insert(name.to_string(), Value::new(value.to_string()));
+                .insert(name.to_string(), Value::new(ShString::from(value)));
         }
     }
 
-    pub fn set(&mut self, name: String, value: String) -> Result<(), CannotModifyReadonly> {
+    pub fn set<V: Into<ShString>>(
+        &mut self,
+        name: String,
+        value: V,
+    ) -> Result<(), CannotModifyReadonly> {
+        let value = value.into();
         if let Some(innermost_scope) = self.local_scopes.last_mut() {
             innermost_scope.insert(name, value);
         } else {
@@ -121,15 +129,25 @@ impl Environment {
         Ok(())
     }
 
+    /// The value as text, for the variables whose meaning *is* text — a number
+    /// to parse, a locale name, an editor setting. Yields `None` when the value
+    /// is not valid UTF-8, which for those variables is not a usable value
+    /// anyway. Anything that must survive arbitrary bytes uses
+    /// [`Self::get_value`].
     pub fn get_str_value(&self, name: &str) -> Option<&str> {
+        self.get_value(name).and_then(|v| v.to_str())
+    }
+
+    /// The value as bytes. A shell variable may hold anything.
+    pub fn get_value(&self, name: &str) -> Option<&ShStr> {
         for local_scope in self.local_scopes.iter().rev() {
-            if let Some(value) = local_scope.get(name).map(|val| val.as_str()) {
+            if let Some(value) = local_scope.get(name).map(|val| val.as_sh_str()) {
                 return Some(value);
             }
         }
         self.global_scope
             .get(name)
-            .and_then(|val| val.value.as_deref())
+            .and_then(|val| val.value.as_ref().map(|v| v.as_sh_str()))
     }
 
     pub fn promote_local_or_get_global(&mut self, name: String) -> &mut Value {
@@ -173,18 +191,18 @@ impl Environment {
         &self.global_scope
     }
 
-    pub fn exported(&self) -> impl Iterator<Item = (&String, &String)> {
+    pub fn exported(&self) -> impl Iterator<Item = (&String, &ShStr)> {
         let mut exported = HashMap::with_capacity(self.global_scope.len());
         for (name, var) in &self.global_scope {
             if var.export {
                 if let Some(value) = &var.value {
-                    exported.insert(name, value);
+                    exported.insert(name, value.as_sh_str());
                 }
             }
         }
         for local_scope in &self.local_scopes {
             for (name, value) in local_scope {
-                exported.insert(name, value);
+                exported.insert(name, value.as_sh_str());
             }
         }
         exported.into_iter()

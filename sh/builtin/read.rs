@@ -7,14 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::errno::Errno;
 use crate::os::read;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use crate::wordexp::expanded_word::ExpandedWord;
-use crate::wordexp::{sh_string_to_string, split_fields};
+use crate::wordexp::split_fields;
 use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
@@ -301,10 +302,11 @@ pub struct BuiltinRead;
 impl BuiltinUtility for BuiltinRead {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("read", args)?;
         let mut option_parser = OptionParser::new(args);
 
         let mut delim = None;
@@ -366,11 +368,7 @@ impl BuiltinUtility for BuiltinRead {
         let mut assignment_failed = false;
         for i in 0..fields.len() {
             if shell
-                .assign_global(
-                    vars[i].clone(),
-                    sh_string_to_string(fields[i].to_sh_string())
-                        .map_err(|e| BuiltinError::CustomError(e.to_string()))?,
-                )
+                .assign_global(vars[i].to_string(), fields[i].to_sh_string())
                 .is_err()
             {
                 opened_files.write_err(format!(
@@ -383,7 +381,10 @@ impl BuiltinUtility for BuiltinRead {
         }
         if fields.len() < vars.len() {
             for var in &vars[fields.len()..] {
-                if shell.assign_global(var.clone(), String::new()).is_err() {
+                if shell
+                    .assign_global(var.to_string(), ShString::new())
+                    .is_err()
+                {
                     opened_files.write_err(format!(
                         "read: {} {}\n",
                         gettext("cannot set readonly variable"),

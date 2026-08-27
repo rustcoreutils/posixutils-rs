@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 pub struct Unalias;
@@ -17,11 +18,12 @@ pub struct Unalias;
 impl BuiltinUtility for Unalias {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        if args.first().is_some_and(|arg| arg == "-a") {
+        let args = &args_as_str("unalias", args)?;
+        if args.first().is_some_and(|arg| *arg == "-a") {
             // `-a` removes every alias; any further operands are redundant but
             // not an error (dash and bash accept them too).
             shell.alias_table.clear();
@@ -31,7 +33,7 @@ impl BuiltinUtility for Unalias {
         let mut status = 0;
         let args = skip_option_terminator(args);
         for alias in args {
-            if shell.alias_table.remove(alias).is_none() {
+            if shell.alias_table.remove(*alias).is_none() {
                 opened_files.write_err(format!("unalias: '{alias}' {}\n", gettext("not found")));
                 status = 1;
             }

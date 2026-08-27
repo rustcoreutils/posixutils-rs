@@ -9,7 +9,7 @@
 
 mod pty;
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{run_test, run_test_u8, run_test_with_checker, TestPlan, TestPlanU8};
 use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3262,5 +3262,62 @@ mod audit_regressions {
         expect_exit_code("[ 1 -eq 2 ]\n", 1);
         expect_exit_code("[ 1 -eq 1\n", 2);
         expect_exit_code("[ -q x ]\n", 2);
+    }
+
+    // ---- Phase 8: values are byte strings ----------------------------------
+
+    /// Byte-exact: the shapes below cannot be written as a `.sh`/`.out` fixture
+    /// pair, which is `include_str!`-based UTF-8.
+    fn expect_stdout_bytes(script: &[u8], expected: &[u8]) {
+        set_env_vars();
+        run_test_u8(TestPlanU8 {
+            cmd: "sh".to_string(),
+            args: vec!["-s".to_string()],
+            stdin_data: script.to_vec(),
+            expected_out: expected.to_vec(),
+            expected_err: Vec::new(),
+            expected_exit_code: 0,
+        });
+    }
+
+    #[test]
+    fn a_command_substitution_keeps_bytes_that_are_not_text() {
+        // The result used to go through String::from_utf8_lossy, so every byte
+        // that was not part of a character became U+FFFD.
+        expect_stdout_bytes(b"V=$(printf 'a\\377b')\necho \"$V\"\n", b"a\xffb\n");
+    }
+
+    #[test]
+    fn a_variable_holds_bytes_that_are_not_text() {
+        expect_stdout_bytes(
+            b"V=$(printf 'a\\377b')\nW=\"$V$V\"\necho \"$W\"\n",
+            b"a\xffba\xffb\n",
+        );
+    }
+
+    #[test]
+    fn export_p_output_round_trips_bytes() {
+        // `export -p` is meant to be read back by the shell, so a value that is
+        // not text has to survive it rather than being flattened.
+        expect_stdout_bytes(
+            b"V=$(printf 'a\\377b')\nexport V\nexport -p | grep '^export V'\n",
+            b"export V='a\xffb'\n",
+        );
+    }
+
+    #[test]
+    fn dollar_star_joins_on_a_byte_that_is_not_a_character() {
+        // The separator is the first *element* of IFS, which may be a byte that
+        // does not form a character.
+        expect_stdout_bytes(
+            b"V=$(printf 'a\\377b')\nset -- x y\nIFS=$V\necho \"$*\"\n",
+            b"xay\n",
+        );
+    }
+
+    #[test]
+    fn the_length_of_a_value_counts_characters_and_stray_bytes_alike() {
+        expect_stdout_bytes(b"V=$(printf 'a\\377b')\necho ${#V}\n", b"3\n");
+        expect_stdout_bytes(b"V=h\xc3\xa9llo\necho ${#V}\n", b"5\n");
     }
 }

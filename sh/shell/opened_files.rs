@@ -199,13 +199,21 @@ impl OpenedFiles {
             match &redir.kind {
                 RedirectionKind::IORedirection { kind, file } => {
                     let file = expand_word_to_string(&file.word, false, shell)?;
-                    self.io_redirect(kind, &file, redir.file_descriptor, shell)?;
+                    // A redirection target is a path: bytes.
+                    self.io_redirect(
+                        kind,
+                        &file.display().to_string(),
+                        redir.file_descriptor,
+                        shell,
+                    )?;
                 }
                 RedirectionKind::HereDocument { contents, .. } => {
                     let contents = expand_word_to_string(&contents.word, false, shell)?;
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
-                        OpenedFile::HereDocument(Rc::new(RefCell::new(contents))),
+                        OpenedFile::HereDocument(Rc::new(RefCell::new(
+                            contents.display().to_string(),
+                        ))),
                     );
                 }
                 RedirectionKind::QuotedHereDocument { contents, .. } => {
@@ -219,12 +227,12 @@ impl OpenedFiles {
         Ok(())
     }
 
-    fn write_file(&self, fileno: u32, contents: &str) {
+    fn write_file(&self, fileno: u32, contents: &[u8]) {
         let result = match self.opened_files.get(&fileno) {
-            Some(OpenedFile::Stdout) => std::io::stdout().write_all(contents.as_bytes()),
-            Some(OpenedFile::Stderr) => std::io::stderr().write_all(contents.as_bytes()),
+            Some(OpenedFile::Stdout) => std::io::stdout().write_all(contents),
+            Some(OpenedFile::Stderr) => std::io::stderr().write_all(contents),
             Some(OpenedFile::WriteFile(file)) | Some(OpenedFile::ReadWriteFile(file)) => {
-                write(file.as_raw_fd(), contents.as_bytes())
+                write(file.as_raw_fd(), contents)
                     .map_err(|_| std::io::Error::last_os_error())
                     .map(|_| ())
             }
@@ -236,7 +244,7 @@ impl OpenedFiles {
             | None => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
             // `exec 1<&0`: writing goes to the shell's stdin descriptor, which
             // succeeds when it is open for writing too (a terminal).
-            Some(OpenedFile::Stdin) => write(libc::STDIN_FILENO, contents.as_bytes())
+            Some(OpenedFile::Stdin) => write(libc::STDIN_FILENO, contents)
                 .map_err(|_| std::io::Error::last_os_error())
                 .map(|_| ()),
         };
@@ -248,11 +256,13 @@ impl OpenedFiles {
         }
     }
 
-    pub fn write_out<S: AsRef<str>>(&self, string: S) {
+    /// Takes bytes: output such as `export -p` is meant to be read back by the
+    /// shell, so a value that is not valid text has to survive it.
+    pub fn write_out<S: AsRef<[u8]>>(&self, string: S) {
         self.write_file(STDOUT_FILENO, string.as_ref());
     }
 
-    pub fn write_err<S: AsRef<str>>(&self, string: S) {
+    pub fn write_err<S: AsRef<[u8]>>(&self, string: S) {
         self.write_file(STDERR_FILENO, string.as_ref());
     }
 

@@ -26,17 +26,6 @@ mod tilde;
 
 pub type ExpansionResult<T> = Result<T, CommandExecutionError>;
 
-/// SCAFFOLD(byte-core stage 1): the expansion pipeline now carries bytes, but
-/// the shell around it still holds `String`. Converting here keeps the two
-/// halves compiling without introducing any loss the crate did not already
-/// have — this path already refused a glob result that was not valid text.
-/// Removed when `Shell` and the builtins take bytes.
-pub(crate) fn sh_string_to_string(value: ShString) -> ExpansionResult<String> {
-    String::from_utf8(value.clone().into_bytes()).map_err(|_| {
-        CommandExecutionError::ExpansionError(format!("{} contains invalid utf8", value.display()))
-    })
-}
-
 /// Field splitting, POSIX XCU 2.6.5.
 ///
 /// The standard describes a single pass over the bytes of the expanded word,
@@ -274,7 +263,7 @@ pub fn expand_word_to_string(
     word: &Word,
     is_assignment: bool,
     shell: &mut Shell,
-) -> ExpansionResult<String> {
+) -> ExpansionResult<ShString> {
     let tilde_mode = if is_assignment {
         TildeMode::AssignmentValue
     } else {
@@ -282,15 +271,13 @@ pub fn expand_word_to_string(
     };
     let mut expanded_word = ExpandedWord::default();
     simple_word_expansion_into(&mut expanded_word, word, tilde_mode, shell)?;
-    // SCAFFOLD(byte-core stage 1): removed once the shell's values are bytes.
-    // Errors rather than losing bytes, which is what this path already did.
-    sh_string_to_string(expanded_word.to_sh_string())
+    Ok(expanded_word.to_sh_string())
 }
 
 /// Expands a `name=value` operand of a declaration utility (POSIX 2.9.1): the
 /// value gets the tilde expansion of an assignment, and the result is a single
 /// field (no field splitting, no pathname expansion).
-pub fn expand_declaration_operand(word: &Word, shell: &mut Shell) -> ExpansionResult<String> {
+pub fn expand_declaration_operand(word: &Word, shell: &mut Shell) -> ExpansionResult<ShString> {
     let mut expanded_word = ExpandedWord::default();
     simple_word_expansion_into(
         &mut expanded_word,
@@ -298,9 +285,7 @@ pub fn expand_declaration_operand(word: &Word, shell: &mut Shell) -> ExpansionRe
         TildeMode::DeclarationOperand,
         shell,
     )?;
-    // SCAFFOLD(byte-core stage 1): removed once the shell's values are bytes.
-    // Errors rather than losing bytes, which is what this path already did.
-    sh_string_to_string(expanded_word.to_sh_string())
+    Ok(expanded_word.to_sh_string())
 }
 
 /// performs general word expansion (similar to `wordexp` from libc)
@@ -308,7 +293,7 @@ pub fn expand_word(
     word: &Word,
     is_assignment: bool,
     shell: &mut Shell,
-) -> ExpansionResult<Vec<String>> {
+) -> ExpansionResult<Vec<ShString>> {
     let tilde_mode = if is_assignment {
         TildeMode::AssignmentValue
     } else {
@@ -320,26 +305,18 @@ pub fn expand_word(
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs, usize::MAX) {
         if shell.set_options.noglob {
-            result.push(sh_string_to_string(field.to_sh_string())?)
+            result.push(field.to_sh_string())
         } else {
             let pattern =
                 FilenamePattern::new(&field).map_err(CommandExecutionError::ExpansionError)?;
             let files = glob(&pattern, Path::new(&shell.current_directory));
             if files.is_empty() {
-                result.push(sh_string_to_string(pattern.into())?)
+                result.push(pattern.into())
             } else {
                 result.reserve(files.len());
-                for file in files {
-                    match file.into_string() {
-                        Ok(string) => result.push(string),
-                        Err(os_string) => {
-                            return Err(CommandExecutionError::ExpansionError(format!(
-                                "{} contains invalid utf8",
-                                os_string.to_string_lossy()
-                            )))
-                        }
-                    }
-                }
+                // A file name need not be valid text, and now does not have to
+                // be: the bytes go through as they came off the directory.
+                result.extend(files.into_iter().map(ShString::from));
             }
         }
     }

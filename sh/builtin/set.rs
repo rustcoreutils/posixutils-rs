@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use crate::utils::strcoll;
 use std::ffi::CString;
 
@@ -18,11 +19,14 @@ pub struct SetSpecialBuiltin;
 impl SpecialBuiltinUtility for SetSpecialBuiltin {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        match shell.set_options.parse_args_and_update(args) {
+        // Options are text; the operands become the positional parameters and
+        // so must keep their bytes.
+        let options = args_as_str("set", args)?;
+        match shell.set_options.parse_args_and_update(&options) {
             Err(err) => Err(format!("set: {}\n", err).into()),
             Ok(parsed_args) => {
                 match parsed_args {
@@ -43,17 +47,18 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
                             .filter_map(|(var, val)| {
                                 val.value
                                     .as_ref()
-                                    .map(|v| (CString::new(var.as_str()).unwrap(), v.as_str()))
+                                    .map(|v| (CString::new(var.as_str()).unwrap(), v.as_sh_str()))
                             })
                             .collect::<Vec<_>>();
                         sorted_vars.sort_by(|(k1, _), (k2, _)| strcoll(k1, k2));
                         for (key, value) in sorted_vars {
-                            // key should only contain valid ascii
-                            opened_files.write_out(format!(
-                                "{}={}\n",
-                                key.to_str().unwrap(),
-                                crate::utils::shell_quote(value)
-                            ));
+                            // The key is ASCII by construction. Built as bytes: `set` output is meant to be read
+                            // back, so a value that is not text must survive it.
+                            let mut line = ShString::from(key.to_str().unwrap().to_string());
+                            line.push_bytes(b"=");
+                            line.push_bytes(crate::utils::shell_quote(value));
+                            line.push_bytes(b"\n");
+                            opened_files.write_out(line);
                         }
                     }
                     ParsedArgs::ArgsStart(i) => {
@@ -259,12 +264,12 @@ impl SetOptions {
         result
     }
 
-    pub fn parse_args_and_update(&mut self, args: &[String]) -> Result<ParsedArgs, String> {
+    pub fn parse_args_and_update(&mut self, args: &[&str]) -> Result<ParsedArgs, String> {
         if args.is_empty() {
             return Ok(ParsedArgs::PrintVars);
         }
         if args.len() == 1 {
-            match args[0].as_str() {
+            match args[0] {
                 "-o" => return Ok(ParsedArgs::PrintSettingsHumanReadable),
                 "+o" => return Ok(ParsedArgs::PrintSettingsShellReadable),
                 "--" => return Ok(ParsedArgs::ResetPositionalParameters),
@@ -273,7 +278,7 @@ impl SetOptions {
         }
         let mut i = 0;
         while i < args.len() {
-            match args[i].as_str() {
+            match args[i] {
                 // POSIX: `--` terminates the options wherever it appears, not
                 // only in first position (`set -f -- "$@"` is the common form).
                 "--" => {
@@ -282,10 +287,7 @@ impl SetOptions {
                 }
                 "-o" | "+o" => {
                     i += 1;
-                    let option = args
-                        .get(i)
-                        .ok_or_else(|| "expected option".to_string())?
-                        .as_str();
+                    let option = args.get(i).ok_or_else(|| "expected option".to_string())?;
                     self.set_long(option, args[i - 1] == "-o")?
                 }
                 s if s.starts_with('-') || s.starts_with('+') => {
@@ -307,7 +309,6 @@ mod tests {
     use super::*;
 
     fn parse_args(args: Vec<&str>) -> (SetOptions, ParsedArgs) {
-        let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut options = SetOptions::default();
         let parsed_args = options
             .parse_args_and_update(&args)

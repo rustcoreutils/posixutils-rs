@@ -10,13 +10,14 @@
 use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 
 /// `true` — do nothing, successfully. POSIX XCU lists it as a utility, and
 /// every shell builds it in: a loop that calls it should not fork.
 pub struct True;
 
 impl BuiltinUtility for True {
-    fn exec(&self, _: &[String], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, _: &[ShString], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         Ok(0)
     }
 }
@@ -25,7 +26,7 @@ impl BuiltinUtility for True {
 pub struct False;
 
 impl BuiltinUtility for False {
-    fn exec(&self, _: &[String], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, _: &[ShString], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         Ok(1)
     }
 }

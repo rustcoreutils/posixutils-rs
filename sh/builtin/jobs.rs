@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -46,10 +47,11 @@ pub struct Jobs;
 impl BuiltinUtility for Jobs {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("jobs", args)?;
         let mut print_option = PrintOptions::Default;
         let mut options_parser = OptionParser::new(args);
         while let Some(option) = options_parser

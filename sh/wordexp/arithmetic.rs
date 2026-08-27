@@ -709,7 +709,12 @@ pub fn expand_arithmetic_expression_into(
     shell: &mut Shell,
 ) -> ExpansionResult<()> {
     let expr = expand_word_to_string(expr, false, shell)?;
-    let expr = parse_expression(&expr).map_err(CommandExecutionError::ExpansionError)?;
+    // An arithmetic expression is a numeric expression: bytes that are not text
+    // cannot be part of one.
+    let expr = expr.to_str().ok_or_else(|| {
+        CommandExecutionError::ExpansionError("arithmetic expression is not valid text".to_string())
+    })?;
+    let expr = parse_expression(expr).map_err(CommandExecutionError::ExpansionError)?;
     let value = interpret_expression(&expr, shell, 0)?;
     expanded_word.append(value.to_string(), inside_double_quotes, true);
     Ok(())

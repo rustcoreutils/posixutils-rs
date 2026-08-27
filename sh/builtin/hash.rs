@@ -8,11 +8,12 @@
 //
 
 use crate::builtin::{
-    get_builtin_utility, get_special_builtin_utility, skip_option_terminator, BuiltinResult,
-    BuiltinUtility,
+    args_as_str, get_builtin_utility, get_special_builtin_utility, skip_option_terminator,
+    BuiltinResult, BuiltinUtility,
 };
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 pub struct Hash;
@@ -20,11 +21,12 @@ pub struct Hash;
 impl BuiltinUtility for Hash {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        if args.first().is_some_and(|arg| arg == "-r") {
+        let args = &args_as_str("hash", args)?;
+        if args.first().is_some_and(|arg| *arg == "-r") {
             if args.len() > 1 {
                 return Err(gettext("hash: too many arguments").into());
             }
@@ -36,16 +38,22 @@ impl BuiltinUtility for Hash {
 
         if args.is_empty() {
             for (command_name, path) in &shell.saved_command_locations {
-                opened_files.write_out(format!("{}: {}\n", command_name, path.to_string_lossy()));
+                opened_files.write_out(format!(
+                    "{}: {}\n",
+                    crate::shstr::ShStr::new(command_name).display(),
+                    path.to_string_lossy()
+                ));
             }
             Ok(0)
         } else {
             let mut status = 0;
             for arg in args {
-                if get_special_builtin_utility(arg.as_str()).is_none()
-                    && !shell.functions.contains_key(arg.as_str())
-                    && get_builtin_utility(arg.as_str()).is_none()
-                    && shell.find_command(arg, "", true).is_none()
+                if get_special_builtin_utility(arg).is_none()
+                    && !shell.functions.contains_key(*arg)
+                    && get_builtin_utility(arg).is_none()
+                    && shell
+                        .find_command(crate::shstr::ShStr::new(arg), "", true)
+                        .is_none()
                 {
                     opened_files.write_err(format!("hash: command {} was not found\n", arg));
                     status = 1;

@@ -11,6 +11,7 @@ use crate::os::errno::{get_current_errno_value, Errno};
 use crate::os::signals::TermSignal;
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
+use crate::shstr::ShString;
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt::{Display, Formatter};
@@ -290,6 +291,9 @@ pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
 pub enum ExecError {
     OsError(OsError),
     CannotExecute(Errno),
+    /// A command name, argument or environment entry contained a NUL, which
+    /// `execve` cannot carry.
+    InteriorNul,
 }
 
 impl From<OsError> for ExecError {
@@ -313,7 +317,7 @@ fn dup_above(fd: RawFd, floor: RawFd) -> OsResult<RawFd> {
 
 pub fn exec(
     command: OsString,
-    args: &[String],
+    args: &[ShString],
     opened_files: &OpenedFiles,
     env: &Environment,
 ) -> Result<Infallible, ExecError> {
@@ -362,17 +366,29 @@ pub fn exec(
     for fd in to_close {
         let _ = close(fd);
     }
-    let command = CString::new(command.into_vec()).unwrap();
+    // An interior NUL cannot be passed through execve. A shell value may
+    // contain one, so this is an error to report, not a reason to abort in the
+    // child after the fork.
+    let command = CString::new(command.into_vec()).map_err(|_| ExecError::InteriorNul)?;
     let args = args
         .iter()
-        .map(|s| CString::new(s.as_str()).unwrap())
-        .collect::<Vec<_>>();
+        .map(|s| s.to_c_string())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ExecError::InteriorNul)?;
     let mut args_ptr_vec = args.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
     args_ptr_vec.push(std::ptr::null());
+    // Built by byte concatenation, not `format!`: an environment entry is a
+    // value, and a lossy conversion here would corrupt it silently.
     let env = env
         .exported()
-        .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap())
-        .collect::<Vec<CString>>();
+        .map(|(name, value)| {
+            let mut entry = Vec::with_capacity(name.len() + 1 + value.len());
+            entry.extend_from_slice(name.as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            CString::new(entry).map_err(|_| ExecError::InteriorNul)
+        })
+        .collect::<Result<Vec<CString>, _>>()?;
     let mut env_ptr_vec = env.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
     env_ptr_vec.push(std::ptr::null());
     // execve only returns on failure
@@ -410,7 +426,7 @@ pub fn is_process_in_foreground() -> bool {
     }
 }
 
-pub fn find_in_path(command: &str, env_path: &str) -> Option<OsString> {
+pub fn find_in_path(command: &std::ffi::OsStr, env_path: &str) -> Option<OsString> {
     for path in env_path.split(':') {
         let mut command_path = PathBuf::from(path);
         command_path.push(command);
@@ -421,16 +437,16 @@ pub fn find_in_path(command: &str, env_path: &str) -> Option<OsString> {
     None
 }
 
-pub fn find_command(command: &str, env_path: &str) -> Option<OsString> {
-    if command.contains('/') {
-        let path = PathBuf::from(command);
+pub fn find_command(command: &crate::shstr::ShStr, env_path: &str) -> Option<OsString> {
+    if command.contains(&b'/') {
+        let path = PathBuf::from(command.as_os_str());
         if path.exists() {
             Some(path.into_os_string())
         } else {
             None
         }
     } else {
-        find_in_path(command, env_path)
+        find_in_path(command.as_os_str(), env_path)
     }
 }
 

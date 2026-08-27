@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::chdir;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::{ShStr, ShString};
 use gettextrs::gettext;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
@@ -21,17 +22,17 @@ use std::path::PathBuf;
 #[derive(Debug, PartialEq, Eq)]
 enum CdArgs<'a> {
     ChangeDir {
-        directory: Option<&'a str>,
+        directory: Option<&'a ShStr>,
         handle_dot_dot_physically: bool,
     },
     GoBack,
 }
 
 impl<'a> CdArgs<'a> {
-    fn parse(args: &'a [String]) -> Result<Self, String> {
+    fn parse(args: &'a [ShString], options: &'a [&'a str]) -> Result<Self, String> {
         let mut handle_dot_dot_physically = false;
 
-        let mut option_parser = OptionParser::new(args);
+        let mut option_parser = OptionParser::new(options);
 
         while let Some(option) = option_parser
             .next_option()
@@ -50,8 +51,10 @@ impl<'a> CdArgs<'a> {
             }
         }
 
-        let directory = args.get(option_parser.next_argument()).map(|s| s.as_str());
-        if directory.is_some_and(|op| op == "-") {
+        let directory = args
+            .get(option_parser.next_argument())
+            .map(|s| s.as_sh_str());
+        if directory.is_some_and(|op| *op == "-") {
             return Ok(Self::GoBack);
         }
         Ok(Self::ChangeDir {
@@ -130,11 +133,12 @@ pub struct Cd;
 impl BuiltinUtility for Cd {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        let args = match CdArgs::parse(args) {
+        let options = args_as_str("cd", args)?;
+        let args = match CdArgs::parse(args, &options) {
             Ok(args) => args,
             Err(err) => {
                 return Err(format!("cd: {}\n", err).into());
@@ -148,7 +152,7 @@ impl BuiltinUtility for Cd {
             } => {
                 let dir = if let Some(dir) = directory {
                     dir
-                } else if let Some(home_dir) = shell.environment.get_str_value("HOME") {
+                } else if let Some(home_dir) = shell.environment.get_value("HOME") {
                     home_dir
                 } else {
                     // behaviour is implementation defined, bash just returns 0
@@ -162,11 +166,11 @@ impl BuiltinUtility for Cd {
                 let mut curr_path = OsString::new();
                 let mut used_cdpath = false;
 
-                if !dir.starts_with('/') {
-                    if !dir.starts_with("./")
-                        && !dir.starts_with("../")
-                        && dir != "."
-                        && dir != ".."
+                if !dir.starts_with(b"/") {
+                    if !dir.starts_with(b"./")
+                        && !dir.starts_with(b"../")
+                        && *dir != "."
+                        && *dir != ".."
                     {
                         if let Some(cdpath) = shell.environment.get_str_value("CDPATH") {
                             for component in cdpath.split(':') {
@@ -254,9 +258,9 @@ impl BuiltinUtility for Cd {
 mod tests {
     use super::*;
 
-    fn parse_and_check_eq(args: Vec<&str>, correct: CdArgs<'static>) {
-        let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let parsed_args = CdArgs::parse(&args).expect("invalid args");
+    fn parse_and_check_eq(args: Vec<&str>, correct: CdArgs<'_>) {
+        let bytes = args.iter().map(|s| ShString::from(*s)).collect::<Vec<_>>();
+        let parsed_args = CdArgs::parse(&bytes, &args).expect("invalid args");
         assert_eq!(parsed_args, correct);
     }
 
@@ -276,7 +280,7 @@ mod tests {
         parse_and_check_eq(
             vec!["some_dir/some_other_dir"],
             CdArgs::ChangeDir {
-                directory: Some("some_dir/some_other_dir"),
+                directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: false,
             },
         )
@@ -287,14 +291,14 @@ mod tests {
         parse_and_check_eq(
             vec!["-L", "some_dir/some_other_dir"],
             CdArgs::ChangeDir {
-                directory: Some("some_dir/some_other_dir"),
+                directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: false,
             },
         );
         parse_and_check_eq(
             vec!["-P", "some_dir/some_other_dir"],
             CdArgs::ChangeDir {
-                directory: Some("some_dir/some_other_dir"),
+                directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: true,
             },
         )
@@ -305,28 +309,28 @@ mod tests {
         parse_and_check_eq(
             vec!["-L", "-P", "some_dir/some_other_dir"],
             CdArgs::ChangeDir {
-                directory: Some("some_dir/some_other_dir"),
+                directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: true,
             },
         );
         parse_and_check_eq(
             vec!["-P", "-L", "some_dir/some_other_dir"],
             CdArgs::ChangeDir {
-                directory: Some("some_dir/some_other_dir"),
+                directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: false,
             },
         );
         parse_and_check_eq(
             vec!["-PL", "some_dir/some_other_dir"],
             CdArgs::ChangeDir {
-                directory: Some("some_dir/some_other_dir"),
+                directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: false,
             },
         );
         parse_and_check_eq(
             vec!["-PLPPLLP", "some_dir/some_other_dir"],
             CdArgs::ChangeDir {
-                directory: Some("some_dir/some_other_dir"),
+                directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: true,
             },
         )
@@ -349,14 +353,14 @@ mod tests {
         parse_and_check_eq(
             vec!["--", "-L"],
             CdArgs::ChangeDir {
-                directory: Some("-L"),
+                directory: Some(ShStr::new("-L")),
                 handle_dot_dot_physically: false,
             },
         );
         parse_and_check_eq(
             vec!["--", "-L"],
             CdArgs::ChangeDir {
-                directory: Some("-L"),
+                directory: Some(ShStr::new("-L")),
                 handle_dot_dot_physically: false,
             },
         );
@@ -364,7 +368,7 @@ mod tests {
         parse_and_check_eq(
             vec!["-P", "--", "some_dir"],
             CdArgs::ChangeDir {
-                directory: Some("some_dir"),
+                directory: Some(ShStr::new("some_dir")),
                 handle_dot_dot_physically: true,
             },
         );

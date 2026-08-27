@@ -9,7 +9,7 @@
 
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 use crate::shell::{CommandExecutionError, Shell};
-use crate::wordexp::sh_string_to_string;
+use crate::shstr::{CharOrByte, ShStr, ShString};
 use crate::wordexp::tilde::TildeMode;
 use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
@@ -35,7 +35,7 @@ impl ParameterExpansionResult {
 
 fn add_option_to_expanded_word(
     word: &mut ExpandedWord,
-    str: Option<&str>,
+    str: Option<&ShStr>,
     inside_double_quotes: bool,
 ) -> ParameterExpansionResult {
     if let Some(s) = str {
@@ -50,9 +50,21 @@ fn add_option_to_expanded_word(
     }
 }
 
+/// Joins the positional parameters with `separator`, byte-wise.
+fn join_parameters(parameters: &[ShString], separator: &[u8]) -> ShString {
+    let mut result = ShString::new();
+    for (index, parameter) in parameters.iter().enumerate() {
+        if index > 0 {
+            result.push_bytes(separator);
+        }
+        result.push_bytes(parameter);
+    }
+    result
+}
+
 fn add_split_parameters_to_expanded_word(
     word: &mut ExpandedWord,
-    parameters: &[String],
+    parameters: &[ShString],
     quoted: bool,
 ) {
     if parameters.is_empty() {
@@ -86,12 +98,12 @@ fn expand_simple_parameter_into(
             shell
                 .positional_parameters
                 .get(*n as usize - 1)
-                .map(|s| s.as_str()),
+                .map(|s| s.as_sh_str()),
             inside_double_quotes,
         ),
         Parameter::Variable(var_name) => add_option_to_expanded_word(
             expanded_word,
-            shell.environment.get_str_value(var_name.as_ref()),
+            shell.environment.get_value(var_name.as_ref()),
             inside_double_quotes,
         ),
         Parameter::Special(special_parameter) => {
@@ -106,7 +118,7 @@ fn expand_simple_parameter_into(
                     }
                     if !field_splitting_will_be_performed {
                         expanded_word.append(
-                            shell.positional_parameters.join(" "),
+                            join_parameters(&shell.positional_parameters, b" "),
                             inside_double_quotes,
                             true,
                         );
@@ -126,19 +138,21 @@ fn expand_simple_parameter_into(
                             false,
                         );
                     } else {
-                        // POSIX: `$*` joins with the *first character* of
-                        // IFS. Slicing one byte split a multi-byte character
-                        // and panicked (`IFS=é`).
-                        let separator = shell
-                            .environment
-                            .get_str_value("IFS")
-                            .map(|v| match v.chars().next() {
-                                Some(c) => &v[..c.len_utf8()],
-                                None => "",
-                            })
-                            .unwrap_or(" ");
+                        // POSIX: `$*` joins with the *first character* of IFS.
+                        // Slicing one byte split a multi-byte character and
+                        // panicked (`IFS=é`); IFS may also hold bytes that are
+                        // not characters at all, and the first of those is
+                        // still the separator.
+                        let separator = match shell.environment.get_value("IFS") {
+                            Some(ifs) => match ifs.chars_lossless().next() {
+                                Some(CharOrByte::Char(c)) => ShString::from(&ifs[..c.len_utf8()]),
+                                Some(CharOrByte::Byte(b)) => ShString::from(vec![b]),
+                                None => ShString::new(),
+                            },
+                            None => ShString::from(" "),
+                        };
                         expanded_word.append(
-                            shell.positional_parameters.join(separator),
+                            join_parameters(&shell.positional_parameters, separator.as_bytes()),
                             inside_double_quotes,
                             true,
                         );
@@ -294,7 +308,10 @@ pub fn expand_parameter_into(
                         "parameter not set".to_string()
                     }
                 } else {
+                    // A diagnostic, so a lossy view is the right conversion.
                     expand_word_to_string(word, false, shell)?
+                        .display()
+                        .to_string()
                 };
                 return Err(CommandExecutionError::ExpansionError(message));
             }
@@ -363,8 +380,7 @@ pub fn expand_parameter_into(
                     "sh: parameter is unset".to_string(),
                 ));
             }
-            // SCAFFOLD(byte-core stage 1): affix removal still takes a String.
-            let param_str = sh_string_to_string(expanded_parameter.to_sh_string())?;
+            let param_str = expanded_parameter.to_sh_string();
 
             let pattern = word_to_pattern(pattern, shell)?;
             let result = if *remove_prefix {
@@ -406,7 +422,7 @@ mod tests {
 
     fn shell_with_positional_arguments(args: Vec<&str>) -> Shell {
         Shell {
-            positional_parameters: args.iter().map(|s| s.to_string()).collect(),
+            positional_parameters: args.iter().map(|s| ShString::from(*s)).collect(),
             ..Default::default()
         }
     }

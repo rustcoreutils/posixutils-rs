@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinError, BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinError, BuiltinResult, SpecialBuiltinUtility};
 use crate::os::signals::Signal;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -41,7 +42,7 @@ fn print_action<C: Display>(
         TrapAction::Commands(cmd) => {
             opened_files.write_out(format!(
                 "trap -- {} {}\n",
-                crate::utils::shell_quote(cmd),
+                crate::utils::shell_quote(cmd).display(),
                 condition
             ));
         }
@@ -64,14 +65,14 @@ fn print_commands(shell: &mut Shell, opened_files: &mut OpenedFiles, print_defau
 fn print_selected_commands(
     shell: &mut Shell,
     opened_files: &mut OpenedFiles,
-    conditions: &[String],
+    conditions: &[&str],
 ) -> BuiltinResult {
     if conditions.is_empty() {
         print_commands(shell, opened_files, true);
         return Ok(0);
     }
     for condition in conditions {
-        if condition.eq_ignore_ascii_case("EXIT") || condition == "0" {
+        if condition.eq_ignore_ascii_case("EXIT") || condition == &"0" {
             print_action("EXIT", &shell.exit_action, opened_files, true);
             continue;
         }
@@ -106,10 +107,11 @@ pub struct Trap;
 impl SpecialBuiltinUtility for Trap {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("trap", args)?;
         if args.is_empty() {
             print_commands(shell, opened_files, false);
             return Ok(0);
@@ -129,13 +131,13 @@ impl SpecialBuiltinUtility for Trap {
             0
         };
 
-        let action = if &args[first_index] == "-" {
+        let action = if args[first_index] == "-" {
             TrapArg::Reset
-        } else if is_unsigned_int(&args[first_index]) {
-            if &args[first_index] == "0" {
+        } else if is_unsigned_int(args[first_index]) {
+            if args[first_index] == "0" {
                 shell.exit_action = TrapAction::Default;
                 TrapArg::Reset
-            } else if let Ok(condition) = Signal::from_str(&args[first_index]) {
+            } else if let Ok(condition) = Signal::from_str(args[first_index]) {
                 shell
                     .signal_manager
                     .set_action(condition, TrapAction::Default);
@@ -146,11 +148,11 @@ impl SpecialBuiltinUtility for Trap {
         } else if args[first_index].is_empty() {
             TrapArg::Ignore
         } else {
-            TrapArg::Command(&args[first_index])
+            TrapArg::Command(args[first_index])
         };
 
         for condition in &args[first_index + 1..] {
-            if condition.eq_ignore_ascii_case("EXIT") || condition == "0" {
+            if condition.eq_ignore_ascii_case("EXIT") || condition == &"0" {
                 shell.exit_action = match action {
                     TrapArg::Reset => TrapAction::Default,
                     TrapArg::Ignore => TrapAction::Ignore,

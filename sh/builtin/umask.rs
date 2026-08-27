@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 fn format_mode(mode: u32) -> String {
@@ -85,10 +86,11 @@ pub struct Umask;
 impl BuiltinUtility for Umask {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("umask", args)?;
         let mut option_parser = OptionParser::new(args);
 
         let mut produce_symbolic_output = false;

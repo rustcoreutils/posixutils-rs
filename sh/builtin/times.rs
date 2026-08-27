@@ -12,6 +12,7 @@ use crate::os::errno::get_current_errno_value;
 use crate::os::LibcResult;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 /// Formats a CPU time as POSIX `%dm%fs` — integer minutes and the remaining
@@ -37,7 +38,7 @@ pub struct Times;
 impl SpecialBuiltinUtility for Times {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         _: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {

@@ -7,22 +7,25 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility};
+use crate::builtin::{
+    args_as_str, parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility,
+};
 use crate::os::signals::{kill, Signal, SIGNALS};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use std::str::FromStr;
 
 enum KillArgs<'a> {
     SendSignal {
         signal: Option<Signal>,
-        pids: &'a [String],
+        pids: &'a [&'a str],
     },
     ListAllSignals,
     NumberToSignal(&'a str),
 }
 
-fn get_pids(args: &[String]) -> Result<&[String], String> {
+fn get_pids<'a>(args: &'a [&'a str]) -> Result<&'a [&'a str], String> {
     let pids = skip_option_terminator(args);
     if pids.is_empty() {
         return Err("kill: missing operand".to_string());
@@ -31,7 +34,7 @@ fn get_pids(args: &[String]) -> Result<&[String], String> {
 }
 
 impl<'a> KillArgs<'a> {
-    fn parse(args: &'a [String]) -> Result<Self, String> {
+    fn parse(args: &'a [&'a str]) -> Result<Self, String> {
         if args.is_empty() {
             return Err("kill: missing operand".to_string());
         }
@@ -42,13 +45,13 @@ impl<'a> KillArgs<'a> {
                 return Err("kill: too many arguments".to_string());
             }
             if args.len() == 1 {
-                return Ok(Self::NumberToSignal(&args[0]));
+                return Ok(Self::NumberToSignal(args[0]));
             }
             return Ok(Self::ListAllSignals);
         }
 
         if args[0] == "-s" && args.len() > 2 {
-            let signal = Signal::from_str(&args[1])
+            let signal = Signal::from_str(args[1])
                 .map_err(|_| format!("kill: invalid signal '{}'", args[1]))?;
             let pids = get_pids(&args[2..])?;
             return Ok(KillArgs::SendSignal {
@@ -57,8 +60,8 @@ impl<'a> KillArgs<'a> {
             });
         }
 
-        if args[0].starts_with('-') && &args[0] != "--" {
-            let signal = if &args[0][1..] == "0" {
+        if args[0].starts_with('-') && args[0] != "--" {
+            let signal = if args[0][1..] == *"0" {
                 None
             } else {
                 Some(
@@ -83,10 +86,11 @@ pub struct Kill;
 impl BuiltinUtility for Kill {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("kill", args)?;
         let args = KillArgs::parse(args)?;
 
         match args {

@@ -11,6 +11,7 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtilit
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 pub struct ReadOnly;
@@ -18,11 +19,11 @@ pub struct ReadOnly;
 impl SpecialBuiltinUtility for ReadOnly {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        if args.first().is_some_and(|arg| arg == "-p") {
+        if args.first().is_some_and(|arg| *arg == "-p") {
             if args.len() > 1 && !(args.len() == 2 && args[1] == "--") {
                 return Err(gettext("readonly: too many arguments").into());
             }
@@ -35,11 +36,12 @@ impl SpecialBuiltinUtility for ReadOnly {
             pairs.sort_by_key(|(k, _)| k.as_str());
             for (var, var_value) in pairs {
                 if let Some(val) = &var_value.value {
-                    opened_files.write_out(format!(
-                        "readonly {}={}\n",
-                        var,
-                        crate::utils::shell_quote(val)
-                    ));
+                    // Built as bytes: this output is meant to be read back by
+                    // the shell, so a value that is not text must survive it.
+                    let mut line = ShString::from(format!("readonly {}=", var));
+                    line.push_bytes(crate::utils::shell_quote(val));
+                    line.push_bytes(b"\n");
+                    opened_files.write_out(line);
                 } else {
                     opened_files.write_out(format!("readonly {}\n", var));
                 }
@@ -53,17 +55,29 @@ impl SpecialBuiltinUtility for ReadOnly {
         }
 
         for arg in args {
-            let (name, value) = if let Some(pos) = arg.find('=') {
-                let (name, value) = arg.split_at(pos);
+            // A *name* is restricted to the portable character set, but the
+            // value it is being given is an arbitrary byte string.
+            let (name, value) = if let Some(pos) = arg.iter().position(|&b| b == b'=') {
+                let name = std::str::from_utf8(&arg[..pos]).unwrap_or("");
                 if !is_valid_name(name) {
-                    return Err(format!("readonly: '{name}' is not a valid name").into());
+                    return Err(format!(
+                        "readonly: '{}' is not a valid name",
+                        crate::shstr::ShStr::new(&arg[..pos]).display()
+                    )
+                    .into());
                 }
-                (name.to_string(), Some(value[1..].to_string()))
+                (
+                    name.to_string(),
+                    Some(ShString::from(arg[pos + 1..].to_vec())),
+                )
             } else {
-                if !is_valid_name(arg) {
-                    return Err(format!("readonly: '{arg}' is not a valid name\n").into());
+                let name = arg.to_str().unwrap_or("");
+                if !is_valid_name(name) {
+                    return Err(
+                        format!("readonly: '{}' is not a valid name\n", arg.display()).into(),
+                    );
                 }
-                (arg.clone(), None)
+                (name.to_string(), None)
             };
             if let Some(value) = value {
                 shell.assign_global(name, value)?.readonly = true;

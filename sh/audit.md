@@ -699,12 +699,59 @@ This stage converts the expansion pipeline:
   `IFS=é; set -- a b; echo "$*"` now gives `aéb`, as `bash --posix` does;
   byte-oriented dash gives `a\xc3b`.
 
-One scaffold remains, marked `SCAFFOLD(byte-core stage 1)`: `expand_word` and
-friends convert back to `String` at their return, because `Shell` and the
-builtins still hold `String`. It errors rather than losing bytes, which is what
-that path already did, so nothing regresses. Stages 2–4 (environment values and
-positional parameters; the argv/environ boundary and the builtin trait; the
-lexer and script text) remove it and finish the conversion.
+One scaffold remained after that stage, marked `SCAFFOLD(byte-core stage 1)`:
+`expand_word` converted back to `String` at its return. Stage 2 removes it.
+
+### Phase 8 — the byte core (stage 2 of 3: values, environment, argv, builtins)
+
+The scaffold is gone and the conversion now reaches every path that carries a
+*value*.
+
+- `Value`, `LocalScope`, `positional_parameters`, `program_name` and the
+  command-location cache hold bytes. **Variable *names* stay `String`**: POSIX
+  XBD 3.231 restricts a name to the portable character set, and `is_valid_name`
+  already enforced exactly that, so a name cannot contain a byte that is not
+  text. That asymmetry is what kept the diff tractable.
+- `Environment::get_value` returns `&ShStr`; `get_str_value` is kept for the
+  variables whose meaning *is* text (`OPTIND`, `LINENO`, `FCEDIT`) and yields
+  `None` when the value is not valid UTF-8, which for those is not a usable
+  value anyway.
+- The builtin trait takes `&[ShString]`. Utilities whose operands are only
+  option letters, signal names or numbers convert once at entry with
+  `args_as_str`, which reports a byte string that cannot be any of those rather
+  than mangling it; the ones that carry values — `export`, `readonly`, `read`,
+  `cd`, `set`, `command`, `getopts`, `test` — take the bytes.
+- `OpenedFiles::write_out`/`write_err` take bytes, and `export -p`,
+  `readonly -p` and `set` build their output by byte concatenation, so a value
+  that is not text **round-trips** instead of being flattened.
+  `utils::shell_quote` operates on bytes for the same reason.
+- `os::exec` builds each environment entry by byte concatenation rather than
+  `format!`, and the four post-fork `CString::new(..).unwrap()` calls are gone:
+  an interior NUL is now `ExecError::InteriorNul`, reported rather than an abort
+  in the child.
+- [x] **A non-UTF-8 argument aborted the shell.** `std::env::args()` panics
+  inside libstd; `args_os()` cannot.
+- [x] **A non-UTF-8 environment entry aborted the shell at startup.**
+  `std::env::vars()` → `vars_os()`. An entry whose *name* is not text cannot be
+  addressed as a shell variable, so it is kept aside rather than dropped —
+  POSIX still requires passing it to children.
+- [x] **Command substitution flattened bytes to U+FFFD.** The output was run
+  through `String::from_utf8_lossy`; it is now kept exactly as the command
+  wrote it (NULs still dropped, which POSIX leaves unspecified).
+- [x] **`for f in *` could not carry a non-UTF-8 file name.** The glob result
+  had to become a `String` and was refused; it now goes through as bytes.
+- [x] **`$*` fell back to a space when IFS was not valid text.** The separator
+  is the first *element* of IFS, which may be a byte that is not a character.
+
+**Stage 3, still to do: the lexer and script text.** `execute_program` takes
+`&str`, so a script — or a `-c` string, or `eval`/`.` input — must still be
+valid UTF-8, and `sh script-with-a-latin1-byte` is refused with a diagnostic
+rather than run. The insight that makes it tractable is that every
+syntactically significant character in the shell grammar is ASCII, so
+`Lexer::lookahead` becomes a byte and any byte >= 0x80 is by definition an
+ordinary word character. `cli/vi/` stays on `String` deliberately: terminal
+line editing is character-and-column oriented, and converting it would break
+cursor movement for no gain.
 
 ### Phase 9 — missing builtins and interactive output
 

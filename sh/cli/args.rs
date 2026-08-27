@@ -8,27 +8,28 @@
 //
 
 use crate::builtin::set::SetOptions;
+use crate::shstr::ShString;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
     Interactive,
     ReadCommandsFromStdin,
-    ReadCommandsFromString(String),
-    ReadFromFile(String),
+    ReadCommandsFromString(ShString),
+    ReadFromFile(ShString),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ShellArgs {
-    pub program_name: String,
+    pub program_name: ShString,
     pub execution_mode: ExecutionMode,
-    pub arguments: Vec<String>,
+    pub arguments: Vec<ShString>,
     pub set_options: SetOptions,
 }
 
 impl Default for ShellArgs {
     fn default() -> Self {
         ShellArgs {
-            program_name: String::default(),
+            program_name: ShString::default(),
             execution_mode: ExecutionMode::Interactive,
             arguments: Vec::new(),
             set_options: SetOptions::default(),
@@ -36,7 +37,7 @@ impl Default for ShellArgs {
     }
 }
 
-pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<ShellArgs, String> {
+pub fn parse_args(args: Vec<ShString>, is_attached_to_terminal: bool) -> Result<ShellArgs, String> {
     assert!(!args.is_empty(), "missing program name");
     let mut execution_option = None;
     let mut set_options = SetOptions::default();
@@ -47,15 +48,17 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
     let mut monitor_turned_off_explicitly = false;
 
     while let Some(next) = iter.next() {
-        match next.as_str() {
+        // Option letters are ASCII; an argument that is not text cannot be one,
+        // so it falls through to the operand arm below.
+        match next.to_str().unwrap_or("\u{0}") {
             "-o" | "+o" => {
                 let option = iter
                     .next()
-                    .ok_or_else(|| format!("{} requires an option name", next))?;
+                    .ok_or_else(|| format!("{} requires an option name", next.display()))?;
                 if option == "monitor" && next == "+o" {
                     monitor_turned_off_explicitly = true;
                 }
-                set_options.set_long(&option, next == "-o")?;
+                set_options.set_long(option.to_str().unwrap_or(""), next == "-o")?;
             }
             // "--" marks the end of options; it is consumed and the remaining
             // arguments are operands.
@@ -141,7 +144,7 @@ mod tests {
     use super::*;
 
     fn parse_args(args: Vec<&str>, is_interactive: bool) -> ShellArgs {
-        let args = args.iter().map(|s| s.to_string()).collect();
+        let args = args.iter().map(|s| ShString::from(*s)).collect();
         super::parse_args(args, is_interactive).expect("could not parse args")
     }
 
@@ -150,7 +153,7 @@ mod tests {
         let parsed_args = parse_args(vec!["sh", "-c", "ls -la"], false);
         assert_eq!(
             parsed_args.execution_mode,
-            ExecutionMode::ReadCommandsFromString("ls -la".to_string())
+            ExecutionMode::ReadCommandsFromString(ShString::from("ls -la"))
         );
         assert_eq!(parsed_args.program_name, "sh");
         assert_eq!(parsed_args.set_options, SetOptions::default());
@@ -163,7 +166,7 @@ mod tests {
         let parsed_args = parse_args(vec!["sh", "-c", "ls -la", "arg1", "arg2"], false);
         assert_eq!(
             parsed_args.execution_mode,
-            ExecutionMode::ReadCommandsFromString("ls -la".to_string())
+            ExecutionMode::ReadCommandsFromString(ShString::from("ls -la"))
         );
         assert_eq!(parsed_args.program_name, "arg1");
         assert_eq!(parsed_args.arguments, vec!["arg2"]);
@@ -182,7 +185,7 @@ mod tests {
         );
         assert_eq!(
             parsed_args.execution_mode,
-            ExecutionMode::ReadCommandsFromString("ls -la".to_string())
+            ExecutionMode::ReadCommandsFromString(ShString::from("ls -la"))
         );
         assert_eq!(parsed_args.program_name, "sh");
         assert!(parsed_args.arguments.is_empty());
@@ -222,7 +225,7 @@ mod tests {
         );
         assert_eq!(
             parsed_args.execution_mode,
-            ExecutionMode::ReadCommandsFromString("ls -la".to_string())
+            ExecutionMode::ReadCommandsFromString(ShString::from("ls -la"))
         );
         assert_eq!(parsed_args.program_name, "arg1");
         assert_eq!(parsed_args.arguments, vec!["arg2"]);
@@ -355,7 +358,7 @@ mod tests {
         let parsed_args = parse_args(vec!["sh", "file.sh", "arg2"], true);
         assert_eq!(
             parsed_args.execution_mode,
-            ExecutionMode::ReadFromFile("file.sh".to_string())
+            ExecutionMode::ReadFromFile(ShString::from("file.sh"))
         );
         assert_eq!(parsed_args.program_name, "file.sh");
         assert_eq!(parsed_args.arguments, vec!["arg2"]);
@@ -388,7 +391,7 @@ mod tests {
         let parsed_args = parse_args(vec!["sh", "+o", "allexport", "file.sh", "arg2"], true);
         assert_eq!(
             parsed_args.execution_mode,
-            ExecutionMode::ReadFromFile("file.sh".to_string())
+            ExecutionMode::ReadFromFile(ShString::from("file.sh"))
         );
         assert_eq!(parsed_args.program_name, "file.sh");
         assert_eq!(parsed_args.arguments, vec!["arg2"]);

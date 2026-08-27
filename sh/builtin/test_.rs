@@ -10,6 +10,7 @@
 use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 use plib::test_expr::{eval_posix_strict, EvalResult};
 
@@ -28,11 +29,11 @@ pub struct Test {
 impl BuiltinUtility for Test {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         _: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        let mut args = args.to_vec();
+        let mut args: Vec<String> = args.iter().map(|a| a.display().to_string()).collect();
         if self.requires_closing_bracket {
             if args.last().map(String::as_str) != Some("]") {
                 // A usage error, not a false expression: POSIX distinguishes

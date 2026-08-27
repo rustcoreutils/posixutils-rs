@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job, JobState};
 use crate::os::signals::{kill, Signal};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 fn run_background_job(
@@ -40,10 +41,11 @@ pub struct Bg;
 impl BuiltinUtility for Bg {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("bg", args)?;
         if !shell.set_options.monitor {
             return Err(gettext("bg: cannot use bg when job control is disabled").into());
         }

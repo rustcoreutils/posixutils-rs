@@ -13,6 +13,7 @@ use crate::cli::{clear_line, set_cursor_pos};
 use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp, wait_for_input};
 use crate::parse::ParserError;
 use crate::shell::Shell;
+use crate::shstr::{ShStr, ShString};
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -43,7 +44,7 @@ mod wordexp;
 /// was found but cannot serve as a script, and 128 only for an unrecoverable
 /// read error. The distinction is which step failed, not which errno came
 /// back, so the open and the read are done separately.
-fn read_command_file(path: &str) -> Result<String, (io::Error, i32)> {
+fn read_command_file(path: &ShStr) -> Result<String, (io::Error, i32)> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -359,7 +360,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let args = match parse_args(std::env::args().collect(), is_attached_to_terminal()) {
+    // `args()` panics inside libstd on an argument that is not valid UTF-8;
+    // `args_os()` cannot. POSIX argv is a list of byte strings.
+    let args = match parse_args(
+        std::env::args_os().map(ShString::from).collect(),
+        is_attached_to_terminal(),
+    ) {
         Ok(args) => args,
         Err(err) => {
             eprintln!("{err}");
@@ -368,7 +374,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut shell = Shell::initialize_from_system(
         args.program_name,
-        args.arguments,
+        args.arguments.into_iter().collect(),
         args.set_options,
         args.execution_mode == ExecutionMode::Interactive,
     );
@@ -411,12 +417,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         other => match other {
             ExecutionMode::ReadCommandsFromString(command_string) => {
-                execute_string(&command_string, &mut shell);
+                // The lexer works on text; carrying arbitrary bytes through the
+                // grammar is the remaining stage of the byte conversion.
+                match command_string.to_str() {
+                    Some(text) => execute_string(text, &mut shell),
+                    None => {
+                        eprintln!("sh: command string is not valid text");
+                        std::process::exit(2);
+                    }
+                }
             }
             ExecutionMode::ReadFromFile(file) => match read_command_file(&file) {
                 Ok(file_contents) => execute_string(&file_contents, &mut shell),
                 Err((err, status)) => {
-                    eprintln!("sh: {file}: {err}");
+                    eprintln!("sh: {}: {err}", file.display());
                     std::process::exit(status);
                 }
             },

@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::errno::get_current_errno_value;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use std::fmt::Display;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -94,7 +95,7 @@ struct UlimitArgs {
 }
 
 impl UlimitArgs {
-    fn parse(args: &[String]) -> Result<Self, String> {
+    fn parse(args: &[&str]) -> Result<Self, String> {
         if args.is_empty() {
             // POSIX: with no options other than -H/-S, -f is implied, and
             // without a newlimit operand the default is -S.
@@ -318,10 +319,11 @@ pub struct Ulimit;
 impl BuiltinUtility for Ulimit {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         _: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("ulimit", args)?;
         let args = UlimitArgs::parse(args)?;
 
         if let Some(newlimit) = args.newlimit {

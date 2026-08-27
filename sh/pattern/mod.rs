@@ -37,33 +37,33 @@ impl Pattern {
 
     /// Longest prefix the pattern matches entirely, removed. On no match the
     /// value is returned unchanged.
-    pub fn remove_largest_prefix(&self, s: String) -> String {
+    pub fn remove_largest_prefix(&self, s: ShString) -> ShString {
         match matcher::longest_prefix_end(&self.items, s.as_bytes()) {
-            Some(end) => s[end..].to_string(),
+            Some(end) => ShString::from(s[end..].to_vec()),
             None => s,
         }
     }
 
     /// Shortest prefix the pattern matches entirely, removed.
-    pub fn remove_shortest_prefix(&self, s: String) -> String {
+    pub fn remove_shortest_prefix(&self, s: ShString) -> ShString {
         match matcher::shortest_prefix_end(&self.items, s.as_bytes()) {
-            Some(end) => s[end..].to_string(),
+            Some(end) => ShString::from(s[end..].to_vec()),
             None => s,
         }
     }
 
     /// Longest suffix the pattern matches entirely, removed.
-    pub fn remove_largest_suffix(&self, s: String) -> String {
+    pub fn remove_largest_suffix(&self, s: ShString) -> ShString {
         match matcher::longest_suffix_start(&self.items, s.as_bytes()) {
-            Some(begin) => s[..begin].to_string(),
+            Some(begin) => ShString::from(s[..begin].to_vec()),
             None => s,
         }
     }
 
     /// Shortest suffix the pattern matches entirely, removed.
-    pub fn remove_shortest_suffix(&self, s: String) -> String {
+    pub fn remove_shortest_suffix(&self, s: ShString) -> ShString {
         match matcher::shortest_suffix_start(&self.items, s.as_bytes()) {
-            Some(begin) => s[..begin].to_string(),
+            Some(begin) => ShString::from(s[..begin].to_vec()),
             None => s,
         }
     }
@@ -217,7 +217,7 @@ pub mod tests {
     #[test]
     fn remove_largest_prefix_from_empty_string() {
         assert_eq!(
-            pattern_from_str("abcd").remove_largest_prefix("".to_string()),
+            pattern_from_str("abcd").remove_largest_prefix(ShString::from("")),
             ""
         )
     }
@@ -225,7 +225,7 @@ pub mod tests {
     #[test]
     fn remove_smallest_prefix_from_empty_string() {
         assert_eq!(
-            pattern_from_str("abcd").remove_shortest_prefix("".to_string()),
+            pattern_from_str("abcd").remove_shortest_prefix(ShString::from("")),
             ""
         )
     }
@@ -233,7 +233,7 @@ pub mod tests {
     #[test]
     fn remove_largest_suffix_from_empty_string() {
         assert_eq!(
-            pattern_from_str("abcd").remove_largest_suffix("".to_string()),
+            pattern_from_str("abcd").remove_largest_suffix(ShString::from("")),
             ""
         )
     }
@@ -241,7 +241,7 @@ pub mod tests {
     #[test]
     fn remove_smallest_suffix_from_empty_string() {
         assert_eq!(
-            pattern_from_str("abcd").remove_shortest_suffix("".to_string()),
+            pattern_from_str("abcd").remove_shortest_suffix(ShString::from("")),
             ""
         )
     }
@@ -249,7 +249,7 @@ pub mod tests {
     #[test]
     fn remove_largest_prefix() {
         assert_eq!(
-            pattern_from_str("*b").remove_largest_prefix("abaaaaabtest".to_string()),
+            pattern_from_str("*b").remove_largest_prefix(ShString::from("abaaaaabtest")),
             "test"
         )
     }
@@ -257,7 +257,7 @@ pub mod tests {
     #[test]
     fn remove_smallest_prefix() {
         assert_eq!(
-            pattern_from_str("*b").remove_shortest_prefix("abaaaaabtest".to_string()),
+            pattern_from_str("*b").remove_shortest_prefix(ShString::from("abaaaaabtest")),
             "aaaaabtest"
         )
     }
@@ -265,7 +265,7 @@ pub mod tests {
     #[test]
     fn remove_largest_suffix() {
         assert_eq!(
-            pattern_from_str("b*").remove_largest_suffix("testbaaaaaba".to_string()),
+            pattern_from_str("b*").remove_largest_suffix(ShString::from("testbaaaaaba")),
             "test"
         )
     }
@@ -273,7 +273,7 @@ pub mod tests {
     #[test]
     fn remove_smallest_suffix() {
         assert_eq!(
-            pattern_from_str("b*").remove_shortest_suffix("testbaaaaaba".to_string()),
+            pattern_from_str("b*").remove_shortest_suffix(ShString::from("testbaaaaaba")),
             "testbaaaaa"
         )
     }
@@ -328,19 +328,19 @@ pub mod tests {
         // the length *including* a pushed NUL, then `drain` past the end and
         // abort the process; the other three each got it wrong differently.
         assert_eq!(
-            pattern_from_str("z").remove_shortest_suffix("abc".into()),
+            pattern_from_str("z").remove_shortest_suffix(ShString::from("abc")),
             "abc"
         );
         assert_eq!(
-            pattern_from_str("z").remove_largest_suffix("abc".into()),
+            pattern_from_str("z").remove_largest_suffix(ShString::from("abc")),
             "abc"
         );
         assert_eq!(
-            pattern_from_str("z").remove_shortest_prefix("abc".into()),
+            pattern_from_str("z").remove_shortest_prefix(ShString::from("abc")),
             "abc"
         );
         assert_eq!(
-            pattern_from_str("z").remove_largest_prefix("abc".into()),
+            pattern_from_str("z").remove_largest_prefix(ShString::from("abc")),
             "abc"
         );
     }
@@ -350,28 +350,28 @@ pub mod tests {
         // "b" occurs inside "abc" but is neither a prefix nor a suffix of it;
         // the removal loops used the *unanchored* `Regex::matches`.
         assert_eq!(
-            pattern_from_str("b").remove_shortest_suffix("abc".into()),
+            pattern_from_str("b").remove_shortest_suffix(ShString::from("abc")),
             "abc"
         );
         assert_eq!(
-            pattern_from_str("b").remove_largest_suffix("abc".into()),
+            pattern_from_str("b").remove_largest_suffix(ShString::from("abc")),
             "abc"
         );
         assert_eq!(
-            pattern_from_str("b").remove_shortest_prefix("abc".into()),
+            pattern_from_str("b").remove_shortest_prefix(ShString::from("abc")),
             "abc"
         );
         assert_eq!(
-            pattern_from_str("b").remove_largest_prefix("abc".into()),
+            pattern_from_str("b").remove_largest_prefix(ShString::from("abc")),
             "abc"
         );
         // ... while a genuine one-character affix is removed.
         assert_eq!(
-            pattern_from_str("c").remove_shortest_suffix("abc".into()),
+            pattern_from_str("c").remove_shortest_suffix(ShString::from("abc")),
             "ab"
         );
         assert_eq!(
-            pattern_from_str("a").remove_shortest_prefix("abc".into()),
+            pattern_from_str("a").remove_shortest_prefix(ShString::from("abc")),
             "bc"
         );
     }
@@ -381,19 +381,19 @@ pub mod tests {
         // The loops ran `1..len - 1`, so a pattern matching the entire value
         // was never tested and never removed.
         assert_eq!(
-            pattern_from_str("abc").remove_shortest_prefix("abc".into()),
+            pattern_from_str("abc").remove_shortest_prefix(ShString::from("abc")),
             ""
         );
         assert_eq!(
-            pattern_from_str("abc").remove_largest_prefix("abc".into()),
+            pattern_from_str("abc").remove_largest_prefix(ShString::from("abc")),
             ""
         );
         assert_eq!(
-            pattern_from_str("abc").remove_shortest_suffix("abc".into()),
+            pattern_from_str("abc").remove_shortest_suffix(ShString::from("abc")),
             ""
         );
         assert_eq!(
-            pattern_from_str("abc").remove_largest_suffix("abc".into()),
+            pattern_from_str("abc").remove_largest_suffix(ShString::from("abc")),
             ""
         );
     }
@@ -402,19 +402,19 @@ pub mod tests {
     fn remove_affix_with_asterisk_spans_empty_and_whole() {
         // `*` matches the empty affix (shortest) and the whole value (largest).
         assert_eq!(
-            pattern_from_str("*").remove_shortest_prefix("abc".into()),
+            pattern_from_str("*").remove_shortest_prefix(ShString::from("abc")),
             "abc"
         );
         assert_eq!(
-            pattern_from_str("*").remove_largest_prefix("abc".into()),
+            pattern_from_str("*").remove_largest_prefix(ShString::from("abc")),
             ""
         );
         assert_eq!(
-            pattern_from_str("*").remove_shortest_suffix("abc".into()),
+            pattern_from_str("*").remove_shortest_suffix(ShString::from("abc")),
             "abc"
         );
         assert_eq!(
-            pattern_from_str("*").remove_largest_suffix("abc".into()),
+            pattern_from_str("*").remove_largest_suffix(ShString::from("abc")),
             ""
         );
     }
@@ -425,19 +425,19 @@ pub mod tests {
         // so a multi-byte character could be cut in half and the trailing
         // `String::from_utf8(..).expect(..)` aborted the process.
         assert_eq!(
-            pattern_from_str("z").remove_shortest_suffix("héllo".into()),
+            pattern_from_str("z").remove_shortest_suffix(ShString::from("héllo")),
             "héllo"
         );
         assert_eq!(
-            pattern_from_str("z").remove_shortest_prefix("héllo".into()),
+            pattern_from_str("z").remove_shortest_prefix(ShString::from("héllo")),
             "héllo"
         );
         assert_eq!(
-            pattern_from_str("?").remove_shortest_prefix("héllo".into()),
+            pattern_from_str("?").remove_shortest_prefix(ShString::from("héllo")),
             "éllo"
         );
         assert_eq!(
-            pattern_from_str("o").remove_shortest_suffix("héllo".into()),
+            pattern_from_str("o").remove_shortest_suffix(ShString::from("héllo")),
             "héll"
         );
     }
@@ -446,11 +446,11 @@ pub mod tests {
     fn remove_affix_with_interior_nul_does_not_panic() {
         // The two "largest" variants used `CString::new(s).expect(..)`.
         assert_eq!(
-            pattern_from_str("z").remove_largest_prefix("a\0b".into()),
+            pattern_from_str("z").remove_largest_prefix(ShString::from("a\0b")),
             "a\0b"
         );
         assert_eq!(
-            pattern_from_str("z").remove_largest_suffix("a\0b".into()),
+            pattern_from_str("z").remove_largest_suffix(ShString::from("a\0b")),
             "a\0b"
         );
     }

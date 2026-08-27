@@ -7,20 +7,22 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinResult, SpecialBuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 
 pub struct BuiltinUnset;
 
 impl SpecialBuiltinUtility for BuiltinUnset {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("unset", args)?;
         let mut unset_var = false;
         let mut unset_function = false;
         let mut parser = OptionParser::new(args);
@@ -60,7 +62,7 @@ impl SpecialBuiltinUtility for BuiltinUnset {
                     );
                 }
             } else {
-                shell.functions.remove(name.as_str());
+                shell.functions.remove(*name);
             }
         }
 

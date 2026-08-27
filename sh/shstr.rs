@@ -151,6 +151,12 @@ impl AsRef<ShStr> for ShStr {
     }
 }
 
+impl AsRef<[u8]> for ShStr {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 impl AsRef<[u8]> for ShString {
     fn as_ref(&self) -> &[u8] {
         &self.0
@@ -199,9 +205,21 @@ impl From<String> for ShString {
     }
 }
 
+impl From<&[u8]> for ShString {
+    fn from(value: &[u8]) -> Self {
+        Self(value.to_vec())
+    }
+}
+
 impl From<Vec<u8>> for ShString {
     fn from(value: Vec<u8>) -> Self {
         Self(value)
+    }
+}
+
+impl From<&ShString> for ShString {
+    fn from(value: &ShString) -> Self {
+        value.clone()
     }
 }
 

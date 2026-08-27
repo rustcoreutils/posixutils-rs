@@ -43,6 +43,7 @@ use crate::os::{OsError, Pid};
 use crate::shell::environment::CannotModifyReadonly;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use std::fmt::{Display, Formatter};
 
 pub mod alias;
@@ -127,7 +128,7 @@ pub type BuiltinResult = Result<i32, BuiltinError>;
 pub trait SpecialBuiltinUtility {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult;
@@ -136,7 +137,7 @@ pub trait SpecialBuiltinUtility {
 struct BuiltinNull;
 
 impl SpecialBuiltinUtility for BuiltinNull {
-    fn exec(&self, _: &[String], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, _: &[ShString], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         Ok(0)
     }
 }
@@ -165,7 +166,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtil
 pub trait BuiltinUtility {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult;
@@ -207,8 +208,26 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     }
 }
 
-fn skip_option_terminator(args: &[String]) -> &[String] {
-    if args.first().is_some_and(|arg| arg == "--") {
+/// Reinterprets arguments as text, for the utilities whose operands are only
+/// ever option letters, signal names, numbers or variable names. A byte string
+/// that is not valid text cannot be any of those, so it is reported rather than
+/// silently mangled. Utilities that carry *values* — `export`, `read`, `cd`,
+/// `test` — take the bytes instead.
+fn args_as_str<'a>(utility: &str, args: &'a [ShString]) -> Result<Vec<&'a str>, BuiltinError> {
+    args.iter()
+        .map(|arg| {
+            arg.to_str().ok_or_else(|| {
+                BuiltinError::CustomError(format!(
+                    "{utility}: '{}' is not valid text",
+                    arg.display()
+                ))
+            })
+        })
+        .collect()
+}
+
+fn skip_option_terminator<S: AsRef<[u8]>>(args: &[S]) -> &[S] {
+    if args.first().is_some_and(|arg| arg.as_ref() == b"--") {
         &args[1..]
     } else {
         args

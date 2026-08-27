@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use std::path::{Component, Path};
 
 pub struct Pwd;
@@ -28,10 +29,11 @@ fn pwd_is_usable(value: &str) -> bool {
 impl BuiltinUtility for Pwd {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("pwd", args)?;
         // `cd` is a builtin and updates the shell's own idea of where it is, so
         // `pwd` has to be one too: forking /bin/pwd would report the *process*
         // working directory, which differs from the logical one after `cd`

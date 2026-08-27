@@ -12,6 +12,7 @@ use crate::os::errno::Errno;
 use crate::os::Pid;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 
 /// Waits for `pid`, returning its status and whether it actually terminated
 /// (the wait also ends when the child merely stops).
@@ -29,7 +30,7 @@ fn wait_for_pid(pid: Pid, shell: &mut Shell) -> (i32, bool) {
 pub struct Wait;
 
 impl BuiltinUtility for Wait {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, args: &[ShString], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         let pids = skip_option_terminator(args);
 
         let mut status = 0;
@@ -39,7 +40,8 @@ impl BuiltinUtility for Wait {
             }
         } else {
             for pid in pids {
-                let pid = parse_pid(pid, shell).map_err(|err| format!("wait: {err}"))?;
+                let pid = parse_pid(&pid.display().to_string(), shell)
+                    .map_err(|err| format!("wait: {err}"))?;
                 let terminated;
                 (status, terminated) = wait_for_pid(pid, shell);
                 if terminated {

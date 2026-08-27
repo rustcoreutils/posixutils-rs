@@ -8,12 +8,14 @@
 //
 
 use crate::builtin::{
-    get_builtin_utility, get_special_builtin_utility, BuiltinError, BuiltinResult, BuiltinUtility,
+    args_as_str, get_builtin_utility, get_special_builtin_utility, BuiltinError, BuiltinResult,
+    BuiltinUtility,
 };
 use crate::option_parser::OptionParser;
 use crate::os::DEFAULT_PATH;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::{ShStr, ShString};
 use gettextrs::gettext;
 
 #[derive(PartialEq, Eq)]
@@ -26,17 +28,17 @@ enum Action {
 struct CommandArgs<'a> {
     use_default_path: bool,
     action: Action,
-    command_name: &'a str,
+    command_name: &'a ShStr,
     /// includes command_name
-    args: &'a [String],
+    args: &'a [ShString],
 }
 
 impl CommandArgs<'_> {
-    fn parse(args: &[String]) -> Result<CommandArgs<'_>, String> {
+    fn parse<'a>(args: &'a [ShString], options: &'a [&'a str]) -> Result<CommandArgs<'a>, String> {
         let mut use_default_path = false;
         let mut action = Action::Execute;
 
-        let mut option_parser = OptionParser::new(args);
+        let mut option_parser = OptionParser::new(options);
 
         while let Some(option) = option_parser
             .next_option()
@@ -73,7 +75,7 @@ impl CommandArgs<'_> {
         Ok(CommandArgs {
             use_default_path,
             action,
-            command_name: &args[first_operand],
+            command_name: args[first_operand].as_sh_str(),
             args: &args[first_operand..],
         })
     }
@@ -84,19 +86,31 @@ pub struct Command;
 impl BuiltinUtility for Command {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        let args = CommandArgs::parse(args)?;
+        // Options are text; the command name and its operands are values.
+        let options = args_as_str("command", args)?;
+        let args = CommandArgs::parse(args, &options)?;
 
         if args.action != Action::Execute {
-            if let Some(alias) = shell.alias_table.get(args.command_name) {
+            if let Some(alias) = shell
+                .alias_table
+                .get(&args.command_name.display().to_string())
+            {
                 if args.action == Action::PrintLong {
-                    opened_files
-                        .write_out(format!("{} is aliased to '{}'\n", args.command_name, alias));
+                    opened_files.write_out(format!(
+                        "{} is aliased to '{}'\n",
+                        args.command_name.display(),
+                        alias
+                    ));
                 } else {
-                    opened_files.write_out(format!("alias {}='{}'\n", args.command_name, alias));
+                    opened_files.write_out(format!(
+                        "alias {}='{}'\n",
+                        args.command_name.display(),
+                        alias
+                    ));
                 }
 
                 return Ok(0);
@@ -110,9 +124,13 @@ impl BuiltinUtility for Command {
         };
 
         if args.action == Action::Execute {
-            if let Some(special_builtin_utility) = get_special_builtin_utility(args.command_name) {
+            if let Some(special_builtin_utility) =
+                get_special_builtin_utility(&args.command_name.display().to_string())
+            {
                 return special_builtin_utility.exec(&args.args[1..], shell, opened_files);
-            } else if let Some(builtin_utility) = get_builtin_utility(args.command_name) {
+            } else if let Some(builtin_utility) =
+                get_builtin_utility(&args.command_name.display().to_string())
+            {
                 return builtin_utility.exec(&args.args[1..], shell, opened_files);
             } else if let Some(command) = shell.find_command(args.command_name, default_path, true)
             {
@@ -121,30 +139,39 @@ impl BuiltinUtility for Command {
                     .map_err(BuiltinError::OsError);
             }
             // POSIX: a command that cannot be found exits with status 127.
-            opened_files.write_err(format!("command: {} not found\n", args.command_name));
+            opened_files.write_err(format!(
+                "command: {} not found\n",
+                args.command_name.display()
+            ));
             return Ok(127);
         }
 
-        if get_special_builtin_utility(args.command_name).is_some() {
+        if get_special_builtin_utility(&args.command_name.display().to_string()).is_some() {
             if args.action == Action::PrintShort {
-                opened_files.write_out(format!("{}\n", args.command_name))
+                opened_files.write_out(format!("{}\n", args.command_name.display()))
             } else {
                 opened_files.write_out(format!(
                     "{} is a special shell builtin\n",
-                    args.command_name
+                    args.command_name.display()
                 ))
             }
-        } else if shell.functions.contains_key(args.command_name) {
+        } else if shell
+            .functions
+            .contains_key(args.command_name.display().to_string().as_str())
+        {
             if args.action == Action::PrintShort {
-                opened_files.write_out(format!("{}\n", args.command_name))
+                opened_files.write_out(format!("{}\n", args.command_name.display()))
             } else {
-                opened_files.write_out(format!("{} is a function\n", args.command_name))
+                opened_files.write_out(format!("{} is a function\n", args.command_name.display()))
             }
-        } else if get_builtin_utility(args.command_name).is_some() {
+        } else if get_builtin_utility(&args.command_name.display().to_string()).is_some() {
             if args.action == Action::PrintShort {
-                opened_files.write_out(format!("{}\n", args.command_name))
+                opened_files.write_out(format!("{}\n", args.command_name.display()))
             } else {
-                opened_files.write_out(format!("{} is a shell builtin\n", args.command_name))
+                opened_files.write_out(format!(
+                    "{} is a shell builtin\n",
+                    args.command_name.display()
+                ))
             }
         } else if let Some(command) = shell.find_command(args.command_name, default_path, true) {
             if args.action == Action::PrintShort {
@@ -152,12 +179,12 @@ impl BuiltinUtility for Command {
             } else {
                 opened_files.write_out(format!(
                     "{} is {}\n",
-                    args.command_name,
+                    args.command_name.display(),
                     command.to_string_lossy()
                 ))
             }
         } else {
-            return Err(format!("command: {} not found", args.command_name).into());
+            return Err(format!("command: {} not found", args.command_name.display()).into());
         }
 
         Ok(0)

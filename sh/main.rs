@@ -11,6 +11,7 @@ use crate::cli::args::{parse_args, ExecutionMode};
 use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
 use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp};
+use crate::parse::ParserError;
 use crate::shell::Shell;
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
@@ -372,6 +373,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ExecutionMode::Interactive => interactive_shell(&mut shell),
         ExecutionMode::ReadCommandsFromStdin => {
             let mut buffer = String::new();
+            // A construct that is merely incomplete is not an error while more
+            // input may still arrive, but it becomes one at end of input.
+            let mut incomplete: Option<ParserError> = None;
             while io::stdin().read_line(&mut buffer).is_ok_and(|n| n > 0) {
                 if buffer.ends_with("\\\n") {
                     continue;
@@ -379,6 +383,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 match shell.execute_program(&buffer) {
                     Ok(_) => {
                         buffer.clear();
+                        incomplete = None;
                     }
                     Err(syntax_err) => {
                         if !syntax_err.could_be_resolved_with_more_input {
@@ -388,8 +393,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                             );
                             std::process::exit(2);
                         }
+                        incomplete = Some(syntax_err);
                     }
                 }
+            }
+            if let Some(syntax_err) = incomplete {
+                eprintln!(
+                    "sh({}): syntax error: {}",
+                    syntax_err.lineno, syntax_err.message
+                );
+                std::process::exit(2);
             }
         }
         other => match other {

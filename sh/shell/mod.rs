@@ -446,26 +446,39 @@ impl Shell {
         }
     }
 
+    /// Expands and applies each assignment in turn, returning the expanded
+    /// values for `set -x`.
+    ///
+    /// Expansion and assignment must interleave: POSIX processes the
+    /// assignments of a simple command left to right, and an earlier one is
+    /// visible to a later one, so `a=1 b=$a` sets `b` to `1`.
     fn assign_globals(
         &mut self,
         assignments: &[Assignment],
         export: bool,
-    ) -> CommandExecutionResult<()> {
+    ) -> CommandExecutionResult<Vec<(Name, String)>> {
+        let mut expanded = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value.word, true, self)?;
-            self.assign_global(assignment.name.to_string(), word_str)?
+            self.assign_global(assignment.name.to_string(), word_str.clone())?
                 .export_or(export);
+            expanded.push((assignment.name.clone(), word_str));
         }
-        Ok(())
+        Ok(expanded)
     }
 
-    fn assign_locals(&mut self, assignments: &[Assignment]) -> CommandExecutionResult<()> {
+    fn assign_locals(
+        &mut self,
+        assignments: &[Assignment],
+    ) -> CommandExecutionResult<Vec<(Name, String)>> {
+        let mut expanded = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value.word, true, self)?;
             self.environment
-                .set(assignment.name.to_string(), word_str)?;
+                .set(assignment.name.to_string(), word_str.clone())?;
+            expanded.push((assignment.name.clone(), word_str));
         }
-        Ok(())
+        Ok(expanded)
     }
 
     fn exec_special_builtin(
@@ -562,15 +575,25 @@ impl Shell {
         Ok(status)
     }
 
-    fn trace(&mut self, expanded_words: &[String]) {
+    /// `set -x`: report the command about to be executed, preceded by PS4.
+    /// Variable assignments are shown with their *expanded* values and precede
+    /// the command words; redirections are not shown. This matches dash.
+    fn trace(&mut self, assignments: &[(Name, String)], expanded_words: &[String]) {
+        if assignments.is_empty() && expanded_words.is_empty() {
+            return;
+        }
         let ps4 = self.get_ps4();
         self.eprint(&ps4);
-        for expanded_word in &expanded_words[..expanded_words.len() - 1] {
-            self.eprint(expanded_word);
-            self.eprint(" ");
+        let mut separator = "";
+        for (name, value) in assignments {
+            self.eprint(separator);
+            self.eprint(&format!("{name}={value}"));
+            separator = " ";
         }
-        if let Some(expanded_word) = expanded_words.last() {
+        for expanded_word in expanded_words {
+            self.eprint(separator);
             self.eprint(expanded_word);
+            separator = " ";
         }
         self.eprint("\n");
     }
@@ -630,17 +653,24 @@ impl Shell {
             }
             expanded_words.extend(fields);
         }
-        if self.set_options.xtrace {
-            self.trace(&expanded_words);
-        }
         if expanded_words.is_empty() {
-            // no commands to execute, perform assignments and redirections
-            self.assign_globals(&simple_command.assignments, false)?;
+            // No command to run: the assignments affect the shell itself, and
+            // `set -x` reports them with their expanded values.
+            let assigned = self.assign_globals(&simple_command.assignments, false)?;
+            if self.set_options.xtrace {
+                self.trace(&assigned, &expanded_words);
+            }
             if !simple_command.redirections.is_empty() {
                 let mut opened_files = self.opened_files.clone();
                 opened_files.redirect(&simple_command.redirections, self)?;
             }
             return Ok(self.last_command_substitution_status);
+        }
+
+        if self.set_options.xtrace {
+            // Any variable assignments are reported by the branches below,
+            // which is where they are expanded.
+            self.trace(&[], &expanded_words);
         }
 
         if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {

@@ -274,7 +274,9 @@ impl SetOptions {
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
-                "--" if i == 0 => {
+                // POSIX: `--` terminates the options wherever it appears, not
+                // only in first position (`set -f -- "$@"` is the common form).
+                "--" => {
                     i += 1;
                     break;
                 }

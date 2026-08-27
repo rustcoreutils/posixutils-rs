@@ -2701,4 +2701,101 @@ mod audit_regressions {
             |out| assert_eq!(out, format!("[{}/gone]\n", dir.display())),
         );
     }
+
+    // ---- Phase 1: panics that abort the shell -------------------------------
+    // Each of these aborted the process (exit 101) or killed a non-interactive
+    // shell outright. Expected values verified against dash 0.5.12.
+
+    #[test]
+    fn trailing_backslash_at_end_of_input_is_literal() {
+        // `WordToken::Backslash` is emitted even when `\` ends the word, so the
+        // unquoted arm's `next_char().unwrap()` saw `None` and panicked.
+        test_script("echo a\\", "a\\\n");
+    }
+
+    #[test]
+    fn unterminated_command_substitution_is_a_syntax_error_not_a_panic() {
+        // Three `.expect("invalid word")` sites in the word lexer discarded a
+        // real ParserError.
+        expect_clean_failure("echo $((1`))\n");
+        expect_clean_failure("echo `\n");
+        expect_clean_failure("echo $(\n");
+    }
+
+    #[test]
+    fn an_incomplete_construct_at_end_of_input_is_a_syntax_error() {
+        // Reading commands from stdin, a construct still awaiting more input
+        // was silently abandoned at EOF and the shell exited 0. There is no
+        // more input at EOF, so it is a syntax error; dash exits 2.
+        for script in [
+            "if true\n",
+            "while true; do\n",
+            "case x in\n",
+            "echo 'unterminated\n",
+            "echo $(\n",
+        ] {
+            expect_exit_code(script, 2);
+        }
+        // A complete script is unaffected.
+        expect_exit_code("echo ok\n", 0);
+    }
+
+    /// `set -x` output goes to stderr, so assert on stderr rather than stdout.
+    fn expect_stderr(script: &str, expected_stderr: &str) {
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-s".to_string()],
+                stdin_data: script.to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                assert_eq!(String::from_utf8_lossy(&output.stderr), expected_stderr);
+                assert!(output.status.success());
+            },
+        );
+    }
+
+    #[test]
+    fn xtrace_of_an_assignment_only_command_does_not_panic() {
+        // `trace()` sliced `..len - 1` and was called before the is_empty guard.
+        expect_stderr("set -x\na=1\n", "+ a=1\n");
+    }
+
+    #[test]
+    fn xtrace_reports_the_command_and_its_expanded_words() {
+        // Redirections are not traced, matching dash.
+        expect_stderr("set -x\ntrue > /dev/null\n", "+ true\n");
+        expect_stderr("x=ab\nset -x\ntrue $x\n", "+ true ab\n");
+    }
+
+    #[test]
+    fn assignments_of_a_simple_command_are_applied_left_to_right() {
+        // POSIX processes a simple command's assignments in order, and an
+        // earlier one is visible to a later one. Expanding them all up front
+        // would silently break this.
+        test_script("a=1 b=$a\necho \"[$b]\"\n", "[1]\n");
+        expect_stderr("set -x\na=1 b=$a\n", "+ a=1 b=1\n");
+        // A prefix assignment on a command is confined to that command.
+        test_script("a=1 b=$a true\necho \"[$b]\"\n", "[]\n");
+    }
+
+    #[test]
+    fn trap_with_an_empty_action_ignores_the_signal() {
+        // `is_unsigned_int("")` is vacuously true, so the empty action was
+        // parsed as a signal number and `trap` — a special builtin — exited.
+        test_script("trap '' INT\necho after\n", "after\n");
+        test_script("trap '' INT\ntrap -p INT\n", "trap -- '' INT\n");
+    }
+
+    #[test]
+    fn set_accepts_the_option_terminator_after_other_options() {
+        // `"--" if i == 0` only recognized `--` in first position, so the
+        // universal `set -f -- "$@"` idiom killed the script.
+        test_script("set -f -- a b c\necho $#\n", "3\n");
+        test_script("set -- x y\nset -f -- \"$@\"\necho $1 $2\n", "x y\n");
+    }
 }

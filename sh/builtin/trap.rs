@@ -59,8 +59,40 @@ fn print_commands(shell: &mut Shell, opened_files: &mut OpenedFiles, print_defau
     }
 }
 
+/// `trap -p [condition...]` (POSIX 2024): report the named conditions, or every
+/// condition when none are named.
+fn print_selected_commands(
+    shell: &mut Shell,
+    opened_files: &mut OpenedFiles,
+    conditions: &[String],
+) -> BuiltinResult {
+    if conditions.is_empty() {
+        print_commands(shell, opened_files, true);
+        return Ok(0);
+    }
+    for condition in conditions {
+        if condition.eq_ignore_ascii_case("EXIT") || condition == "0" {
+            print_action("EXIT", &shell.exit_action, opened_files, true);
+            continue;
+        }
+        let signal = Signal::from_str(condition).map_err(|_| {
+            BuiltinError::CustomError(format!("trap: '{condition}' is not a valid signal"))
+        })?;
+        let action = shell
+            .signal_manager
+            .iter()
+            .find(|(sig, _)| *sig == signal)
+            .map(|(_, action)| action.clone())
+            .unwrap_or(TrapAction::Default);
+        print_action(signal, &action, opened_files, true);
+    }
+    Ok(0)
+}
+
 fn is_unsigned_int(s: &str) -> bool {
-    s.chars().all(|c| c.is_ascii_digit())
+    // `all` is vacuously true for the empty string, but `trap '' SIG` uses an
+    // empty *action* to mean "ignore" — it must not be read as a signal number.
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
 enum TrapArg<'a> {
@@ -84,8 +116,7 @@ impl SpecialBuiltinUtility for Trap {
         }
 
         if args[0] == "-p" {
-            print_commands(shell, opened_files, true);
-            return Ok(0);
+            return print_selected_commands(shell, opened_files, &args[1..]);
         }
 
         let first_index = if args[0] == "--" {

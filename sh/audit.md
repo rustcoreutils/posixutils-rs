@@ -349,3 +349,68 @@ they were replaced by the category table — so there is no stage claim left to
 update there.)
 
 **Original audit verdict (pre-remediation).** Every Critical and most Major findings were reproduced on `target/release/sh` against `dash` and `bash --posix`; the `[V-refuted]` notes record agent-proposed findings that behavioral testing disproved (hash-store, `kill -l` SIGKILL, special-builtin redirect persistence, `read x y` without options, literal-`.` glob, arithmetic overflow/shift/`0x` panics in release, `${x:?}` exit). The defect list was finite, well-localized, and fixable without architectural change.
+
+## Robustness pass (2026-08-27) — Phase 1: process-aborting panics
+
+A fresh review found 15 defects beyond those recorded above, several of them
+process-aborting. This section records the staged remediation; each phase is a
+separate commit on `updates`, validated against `dash` 0.5.12 and
+`bash --posix` 5.2.21.
+
+### Phase 1 — panics and shell-killing errors
+
+- [x] **Affix removal was broken four ways and aborted the shell.**
+  `pattern/mod.rs` held two different matching models: the "largest" pair used
+  the *unanchored* `Regex::match_locations`, the "shortest" pair used an
+  anchored test over a hand-truncated buffer. Consequences, all verified:
+  (a) `remove_shortest_suffix` derived its no-match sentinel from the length
+  *including* a pushed NUL, so `x=abc; echo ${x%z}` ran `Vec::drain` past the
+  end and aborted the process — `${f%.c}` on a name without `.c` killed any
+  script; (b) matching was unanchored, so `${x#b}` on `abc` gave `c` and
+  `${x%b}` gave `a`, where both must give `abc`; (c) the loops ran
+  `1..len - 1`, so a pattern matching the *entire* value was never removed
+  (`${x#abc}` → `abc`); (d) `remove_largest_suffix` seeded `len - 1` and so ate
+  a byte on no match (`${x%%zzz}` → `ab`); (e) the "shortest" pair walked *byte*
+  indices, so a multi-byte character could be split and the trailing
+  `String::from_utf8(..).expect(..)` aborted; (f) the "largest" pair used
+  `CString::new(s).expect(..)`, aborting on an interior NUL.
+  All four are now expressed against a single anchored whole-candidate
+  predicate that iterates character boundaries and returns the value unchanged
+  when the pattern does not match.
+- [x] **A trailing backslash aborted the shell.** `parse/word_parser.rs`'s
+  unquoted `Backslash` arm called `next_char().unwrap()`, but the lexer emits
+  `Backslash` even when `\` ends the input. `echo a\` now yields a literal
+  backslash, as the double-quoted arm immediately above it already did.
+- [x] **The word lexer discarded real parser errors.** `WordLexer::next_token`
+  returned `WordToken` rather than `ParseResult`, so three skip helpers that do
+  return errors used `.expect("invalid word")`; ``echo $((1`))`` aborted.
+  `next_token` and `remove_quotes` are now fallible, and both here-document
+  call sites propagate.
+- [x] **`set -x` on an assignment-only command aborted.** `trace()` sliced
+  `..len - 1` on an empty word list and was called *before* the `is_empty()`
+  guard. It now reports assignments with their expanded values in that path
+  (`+ a=1`, matching dash). Prefix assignments on a command are not yet traced;
+  that is deferred to the scope rework in Phase 3.
+- [x] **`trap '' SIG` killed a non-interactive shell.** `is_unsigned_int("")`
+  is vacuously true, so the empty *action* was parsed as a signal number,
+  `Signal::from_str("")` failed, and `trap` — a special builtin — exited.
+  `TrapArg::Ignore` was dead code. Also fixed alongside: `trap -p` ignored its
+  operands and dumped every condition, where POSIX 2024 specifies
+  `trap -p [condition...]`.
+- [x] **`set -f -- "$@"` killed the script.** The option terminator was
+  recognized only in first position (`"--" if i == 0`), so `--` after any other
+  option fell through to `set_short('-')` and errored.
+- [x] **`FilenamePattern::matches_all` indexed `s.to_bytes()[0]`** with no
+  emptiness guard.
+- [x] **An incomplete construct at end of input exited 0 silently.** Reading
+  commands from stdin, a construct still awaiting input was abandoned at EOF
+  without a diagnostic — `if true`, `while true; do`, `case x in`,
+  `echo 'unterminated` and `echo $(` all exited **0**. There is no more input
+  at EOF, so each is a syntax error; all now exit 2 with a diagnostic, matching
+  dash. `-c` and script files were already correct.
+
+A near-miss worth recording: hoisting assignment expansion out of
+`assign_globals`/`assign_locals` to feed the trace silently broke POSIX's
+left-to-right assignment visibility (`a=1 b=$a` set `b` to empty instead of
+`1`). Expansion and assignment must interleave. There is now a regression test
+pinning it.

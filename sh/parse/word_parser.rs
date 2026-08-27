@@ -21,23 +21,23 @@ struct WordParser<'src> {
 }
 
 impl<'src> WordParser<'src> {
-    fn advance(&mut self) -> WordToken<'src> {
+    fn advance(&mut self) -> ParseResult<WordToken<'src>> {
         let prev_lookahead = self.lookahead;
-        self.lookahead = self.lexer.next_token();
-        prev_lookahead
+        self.lookahead = self.lexer.next_token()?;
+        Ok(prev_lookahead)
     }
 
-    fn matches_token(&mut self, token: WordToken) -> bool {
+    fn matches_token(&mut self, token: WordToken) -> ParseResult<bool> {
         if self.lookahead == token {
-            self.advance();
-            true
+            self.advance()?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
     fn match_token(&mut self, token: WordToken) -> ParseResult<()> {
-        if self.matches_token(token) {
+        if self.matches_token(token)? {
             Ok(())
         } else {
             Err(ParserError::new(
@@ -49,7 +49,7 @@ impl<'src> WordParser<'src> {
     }
 
     fn parse_parameter(&mut self, only_consider_first_digit: bool) -> ParseResult<Parameter> {
-        match self.advance() {
+        match self.advance()? {
             WordToken::Char('@') => Ok(Parameter::Special(SpecialParameter::At)),
             WordToken::Char('*') => Ok(Parameter::Special(SpecialParameter::Asterisk)),
             WordToken::Char('#') => Ok(Parameter::Special(SpecialParameter::Hash)),
@@ -75,7 +75,7 @@ impl<'src> WordParser<'src> {
                         } else {
                             break;
                         }
-                        self.advance();
+                        self.advance()?;
                     }
                     Ok(Parameter::Number(number.parse().expect("invalid number")))
                 }
@@ -89,7 +89,7 @@ impl<'src> WordParser<'src> {
                     } else {
                         break;
                     }
-                    self.advance();
+                    self.advance()?;
                 }
                 Ok(Parameter::Variable(Rc::from(name)))
             }
@@ -103,13 +103,13 @@ impl<'src> WordParser<'src> {
 
     fn parse_parameter_expansion(&mut self) -> ParseResult<ParameterExpansion> {
         // skip '$'
-        self.advance();
+        self.advance()?;
 
         if self.lookahead == WordToken::Char('{') {
-            self.advance();
+            self.advance()?;
 
             if self.lookahead == WordToken::Char('#') {
-                self.advance();
+                self.advance()?;
                 let parameter = self.parse_parameter(false)?;
                 let expansion = match parameter {
                     Parameter::Special(SpecialParameter::Asterisk)
@@ -128,10 +128,10 @@ impl<'src> WordParser<'src> {
             let parameter = self.parse_parameter(false)?;
 
             let operator_loc = self.line_no;
-            match self.advance() {
+            match self.advance()? {
                 WordToken::Char('}') => Ok(ParameterExpansion::Simple(parameter)),
                 WordToken::Char('%') => {
-                    let remove_largest = self.matches_token(WordToken::Char('%'));
+                    let remove_largest = self.matches_token(WordToken::Char('%'))?;
                     let word = self.parse_word_until(WordToken::Char('}'))?;
                     self.match_token(WordToken::Char('}'))?;
                     Ok(ParameterExpansion::RemovePattern {
@@ -142,7 +142,7 @@ impl<'src> WordParser<'src> {
                     })
                 }
                 WordToken::Char('#') => {
-                    let remove_largest = self.matches_token(WordToken::Char('#'));
+                    let remove_largest = self.matches_token(WordToken::Char('#'))?;
                     let word = self.parse_word_until(WordToken::Char('}'))?;
                     self.match_token(WordToken::Char('}'))?;
                     Ok(ParameterExpansion::RemovePattern {
@@ -154,7 +154,7 @@ impl<'src> WordParser<'src> {
                 }
                 mut operation => {
                     let alternative_version = if operation == WordToken::Char(':') {
-                        operation = self.advance();
+                        operation = self.advance()?;
                         true
                     } else {
                         false
@@ -242,7 +242,7 @@ impl<'src> WordParser<'src> {
                         push_literal(&mut current_literal, &mut word_parts, false);
                     }
                     inside_double_quotes = !inside_double_quotes;
-                    self.advance();
+                    self.advance()?;
                 }
                 WordToken::SingleQuote => {
                     if inside_double_quotes {
@@ -269,7 +269,7 @@ impl<'src> WordParser<'src> {
                         }
                         push_literal(&mut current_literal, &mut word_parts, true);
                     }
-                    self.advance();
+                    self.advance()?;
                 }
                 WordToken::Dollar => {
                     push_literal_and_insert(
@@ -300,12 +300,24 @@ impl<'src> WordParser<'src> {
                             }
                             None => current_literal.push('\\'),
                         }
-                        self.advance();
+                        self.advance()?;
                     } else {
                         push_literal(&mut current_literal, &mut word_parts, false);
-                        current_literal.push(self.lexer.next_char().unwrap());
-                        push_literal(&mut current_literal, &mut word_parts, true);
-                        self.advance();
+                        // The lexer emits `Backslash` even when the `\` is the
+                        // last character of the input, in which case there is
+                        // nothing to escape and the backslash stands for
+                        // itself, as in the double-quoted arm above.
+                        match self.lexer.next_char() {
+                            Some(c) => {
+                                current_literal.push(c);
+                                push_literal(&mut current_literal, &mut word_parts, true);
+                            }
+                            None => {
+                                current_literal.push('\\');
+                                push_literal(&mut current_literal, &mut word_parts, false);
+                            }
+                        }
+                        self.advance()?;
                     }
                 }
                 WordToken::QuotedBacktick => {
@@ -319,7 +331,7 @@ impl<'src> WordParser<'src> {
                             false,
                         );
                     }
-                    self.advance();
+                    self.advance()?;
                 }
                 WordToken::CommandSubstitution(commands) => {
                     push_literal_and_insert(
@@ -331,7 +343,7 @@ impl<'src> WordParser<'src> {
                         },
                         inside_double_quotes,
                     );
-                    self.advance();
+                    self.advance()?;
                 }
                 WordToken::BacktickCommandSubstitution(commands) => {
                     push_literal_and_insert(
@@ -343,7 +355,7 @@ impl<'src> WordParser<'src> {
                         },
                         inside_double_quotes,
                     );
-                    self.advance();
+                    self.advance()?;
                 }
                 WordToken::ArithmeticExpansion(expr) => {
                     push_literal_and_insert(
@@ -355,7 +367,7 @@ impl<'src> WordParser<'src> {
                         },
                         inside_double_quotes,
                     );
-                    self.advance();
+                    self.advance()?;
                 }
                 WordToken::DollarSingleQuote(content) => {
                     if inside_double_quotes {
@@ -375,11 +387,11 @@ impl<'src> WordParser<'src> {
                             false,
                         );
                     }
-                    self.advance();
+                    self.advance()?;
                 }
                 WordToken::Char(c) => {
                     current_literal.push(c);
-                    self.advance();
+                    self.advance()?;
                 }
                 WordToken::Eof => break,
             }
@@ -398,14 +410,14 @@ impl<'src> WordParser<'src> {
         Ok(Word { parts: word_parts })
     }
 
-    fn new(text: &'src str, line_no: u32) -> Self {
+    fn new(text: &'src str, line_no: u32) -> ParseResult<Self> {
         let mut lexer = WordLexer::new(text);
-        let lookahead = lexer.next_token();
-        Self {
+        let lookahead = lexer.next_token()?;
+        Ok(Self {
             lexer,
             lookahead,
             line_no,
-        }
+        })
     }
 }
 
@@ -425,7 +437,7 @@ fn quote_literals(word: Word) -> Result<Word, ParserError> {
 }
 
 pub fn parse_word(text: &str, line_no: u32, contents_are_quoted: bool) -> ParseResult<Word> {
-    let mut parser = WordParser::new(text, line_no);
+    let mut parser = WordParser::new(text, line_no)?;
     let word = parser.parse_word_until(WordToken::Eof)?;
     if contents_are_quoted {
         quote_literals(word)

@@ -62,11 +62,6 @@ impl Regex {
             inner: self.inner.find_iter(s),
         }
     }
-
-    pub fn matches(&self, string: &CStr) -> bool {
-        let s = string.to_str().unwrap_or("");
-        self.inner.is_match(s)
-    }
 }
 
 impl fmt::Display for Regex {

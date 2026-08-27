@@ -66,7 +66,7 @@ trait Lexer {
         while is_blank(self.lookahead()) {
             self.advance();
         }
-        let (_, end) = remove_quotes(self.next_word()?.as_ref());
+        let (_, end) = remove_quotes(self.next_word()?.as_ref())?;
         loop {
             if self.reached_eof() {
                 return Err(ParserError::new(

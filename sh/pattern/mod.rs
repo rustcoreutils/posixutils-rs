@@ -42,94 +42,66 @@ impl Pattern {
         }
     }
 
+    /// Byte offsets at which an affix of `s` may begin or end: every character
+    /// boundary, including both ends. Removal must never split a character.
+    fn boundaries(s: &str) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        s.char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(s.len()))
+    }
+
+    /// Does the pattern match the whole of `candidate`, anchored at both ends?
+    ///
+    /// The affix-removal operators are defined in terms of affixes that the
+    /// pattern matches *in their entirety* (POSIX 2.6.2), so a substring test
+    /// is the wrong question to ask. The underlying engine is NUL-terminated,
+    /// so a candidate containing an interior NUL cannot be expressed and never
+    /// matches; the byte matcher that replaces this engine removes that
+    /// limitation.
+    fn matches_entire(&self, candidate: &str) -> bool {
+        CString::new(candidate).is_ok_and(|c| self.matches(&c))
+    }
+
+    /// Longest prefix the pattern matches entirely, removed. On no match the
+    /// value is returned unchanged.
     pub fn remove_largest_prefix(&self, s: String) -> String {
-        if self.pattern_string.is_empty() || s.is_empty() {
-            return s;
+        let found = Self::boundaries(&s)
+            .rev()
+            .find(|&e| self.matches_entire(&s[..e]));
+        match found {
+            Some(end) => s[end..].to_string(),
+            None => s,
         }
-        let cstring = CString::new(s).expect("trying to match a string containing null");
-        let mut prefix_end = 0;
-        if let Some(regex_match) = self.regex.match_locations(&cstring).next() {
-            if regex_match.start == 0 {
-                prefix_end = regex_match.end;
-            }
-        }
-        let mut bytes = cstring.into_bytes();
-        bytes.drain(..prefix_end);
-        String::from_utf8(bytes).expect("failed to create string after removing largest prefix")
     }
 
+    /// Shortest prefix the pattern matches entirely, removed.
     pub fn remove_shortest_prefix(&self, s: String) -> String {
-        if self.pattern_string.is_empty() || s.is_empty() {
-            return s;
+        let found = Self::boundaries(&s).find(|&e| self.matches_entire(&s[..e]));
+        match found {
+            Some(end) => s[end..].to_string(),
+            None => s,
         }
-        // A NUL terminates the byte string used for matching, so it cannot be
-        // part of the subject; drop any that slipped in.
-        let mut bytes = s.into_bytes();
-        bytes.retain(|&b| b != 0);
-        bytes.push(b'\0');
-        let mut prefix_end = 0;
-        for i in 1..bytes.len() - 1 {
-            let t = bytes[i];
-            bytes[i] = b'\0';
-            // we know there is a null, so this unwrap will never fail
-            if self
-                .regex
-                .matches(CStr::from_bytes_until_nul(&bytes).unwrap())
-            {
-                prefix_end = i;
-                bytes[i] = t;
-                break;
-            }
-            bytes[i] = t;
-        }
-        // remove '\0'
-        bytes.pop();
-        bytes.drain(..prefix_end);
-        String::from_utf8(bytes).expect("failed to create string after removing shortest prefix")
     }
 
+    /// Longest suffix the pattern matches entirely, removed. The longest suffix
+    /// is the one starting earliest.
     pub fn remove_largest_suffix(&self, s: String) -> String {
-        if self.pattern_string.is_empty() || s.is_empty() {
-            return s;
+        let found = Self::boundaries(&s).find(|&b| self.matches_entire(&s[b..]));
+        match found {
+            Some(begin) => s[..begin].to_string(),
+            None => s,
         }
-        let cstring = CString::new(s).expect("trying to match a string containing null");
-        let len = cstring.as_bytes().len();
-        let mut suffix_start = len - 1;
-        for regex_match in self.regex.match_locations(&cstring) {
-            if regex_match.end == len {
-                suffix_start = regex_match.start;
-                break;
-            }
-        }
-        let mut bytes = cstring.into_bytes();
-        bytes.drain(suffix_start..);
-        String::from_utf8(bytes).expect("failed to create string after removing largest suffix")
     }
 
+    /// Shortest suffix the pattern matches entirely, removed.
     pub fn remove_shortest_suffix(&self, s: String) -> String {
-        if self.pattern_string.is_empty() || s.is_empty() {
-            return s;
+        let found = Self::boundaries(&s)
+            .rev()
+            .find(|&b| self.matches_entire(&s[b..]));
+        match found {
+            Some(begin) => s[..begin].to_string(),
+            None => s,
         }
-        // A NUL terminates the byte string used for matching, so it cannot be
-        // part of the subject; drop any that slipped in.
-        let mut bytes = s.into_bytes();
-        bytes.retain(|&b| b != 0);
-        bytes.push(b'\0');
-        let mut suffix_start = bytes.len();
-        for i in (1..bytes.len() - 1).rev() {
-            // we know there is a null, so this unwrap will never fail
-            if self
-                .regex
-                .matches(CStr::from_bytes_until_nul(&bytes[i..]).unwrap())
-            {
-                suffix_start = i;
-                break;
-            }
-        }
-        // remove terminating '\0'
-        bytes.pop();
-        bytes.drain(suffix_start..);
-        String::from_utf8(bytes).expect("failed to create string after removing shortest suffix")
     }
 }
 
@@ -182,7 +154,8 @@ impl FilenamePattern {
             "invalid depth"
         );
         let component_index = depth - 1;
-        if s.to_bytes()[0] == b'.' && !self.path_parts[component_index].starts_with_dot {
+        if s.to_bytes().first() == Some(&b'.') && !self.path_parts[component_index].starts_with_dot
+        {
             // dot at the start is only matched explicitly
             return false;
         }
@@ -382,5 +355,149 @@ pub mod tests {
 
         let pattern = HistoryPattern::new("^arg".to_string()).unwrap();
         assert!(!pattern.matches("cmd arg"));
+    }
+
+    // POSIX 2.6.2: when the pattern does not match, the parameter's value is
+    // used unchanged. Verified against dash 0.5.12 and bash 5.2.21, which
+    // agree on every case below.
+
+    #[test]
+    fn remove_affix_that_does_not_match_returns_the_subject_unchanged() {
+        // `remove_shortest_suffix` used to compute the no-match sentinel from
+        // the length *including* a pushed NUL, then `drain` past the end and
+        // abort the process; the other three each got it wrong differently.
+        assert_eq!(
+            pattern_from_str("z").remove_shortest_suffix("abc".into()),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_largest_suffix("abc".into()),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_shortest_prefix("abc".into()),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_largest_prefix("abc".into()),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn remove_affix_matches_are_anchored() {
+        // "b" occurs inside "abc" but is neither a prefix nor a suffix of it;
+        // the removal loops used the *unanchored* `Regex::matches`.
+        assert_eq!(
+            pattern_from_str("b").remove_shortest_suffix("abc".into()),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("b").remove_largest_suffix("abc".into()),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("b").remove_shortest_prefix("abc".into()),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("b").remove_largest_prefix("abc".into()),
+            "abc"
+        );
+        // ... while a genuine one-character affix is removed.
+        assert_eq!(
+            pattern_from_str("c").remove_shortest_suffix("abc".into()),
+            "ab"
+        );
+        assert_eq!(
+            pattern_from_str("a").remove_shortest_prefix("abc".into()),
+            "bc"
+        );
+    }
+
+    #[test]
+    fn remove_affix_can_consume_the_whole_subject() {
+        // The loops ran `1..len - 1`, so a pattern matching the entire value
+        // was never tested and never removed.
+        assert_eq!(
+            pattern_from_str("abc").remove_shortest_prefix("abc".into()),
+            ""
+        );
+        assert_eq!(
+            pattern_from_str("abc").remove_largest_prefix("abc".into()),
+            ""
+        );
+        assert_eq!(
+            pattern_from_str("abc").remove_shortest_suffix("abc".into()),
+            ""
+        );
+        assert_eq!(
+            pattern_from_str("abc").remove_largest_suffix("abc".into()),
+            ""
+        );
+    }
+
+    #[test]
+    fn remove_affix_with_asterisk_spans_empty_and_whole() {
+        // `*` matches the empty affix (shortest) and the whole value (largest).
+        assert_eq!(
+            pattern_from_str("*").remove_shortest_prefix("abc".into()),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("*").remove_largest_prefix("abc".into()),
+            ""
+        );
+        assert_eq!(
+            pattern_from_str("*").remove_shortest_suffix("abc".into()),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("*").remove_largest_suffix("abc".into()),
+            ""
+        );
+    }
+
+    #[test]
+    fn remove_affix_does_not_split_a_multibyte_character() {
+        // The two "shortest" variants walked *byte* indices and sliced at them,
+        // so a multi-byte character could be cut in half and the trailing
+        // `String::from_utf8(..).expect(..)` aborted the process.
+        assert_eq!(
+            pattern_from_str("z").remove_shortest_suffix("héllo".into()),
+            "héllo"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_shortest_prefix("héllo".into()),
+            "héllo"
+        );
+        assert_eq!(
+            pattern_from_str("?").remove_shortest_prefix("héllo".into()),
+            "éllo"
+        );
+        assert_eq!(
+            pattern_from_str("o").remove_shortest_suffix("héllo".into()),
+            "héll"
+        );
+    }
+
+    #[test]
+    fn remove_affix_with_interior_nul_does_not_panic() {
+        // The two "largest" variants used `CString::new(s).expect(..)`.
+        assert_eq!(
+            pattern_from_str("z").remove_largest_prefix("a\0b".into()),
+            "a\0b"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_largest_suffix("a\0b".into()),
+            "a\0b"
+        );
+    }
+
+    #[test]
+    fn filename_pattern_matches_all_accepts_an_empty_component() {
+        // `matches_all` indexed `s.to_bytes()[0]` with no emptiness guard.
+        let pattern = filename_pattern_from_str("*");
+        assert!(pattern.matches_all(1, &cstring_from_str("")));
     }
 }

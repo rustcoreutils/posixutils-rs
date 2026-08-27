@@ -205,9 +205,9 @@ impl Lexer for WordLexer<'_> {
 }
 
 impl<'src> WordLexer<'src> {
-    pub fn next_token(&mut self) -> WordToken<'src> {
+    pub fn next_token(&mut self) -> ParseResult<WordToken<'src>> {
         if self.reached_eof {
-            return WordToken::Eof;
+            return Ok(WordToken::Eof);
         }
         let result = match self.lookahead {
             '"' => advance_and_return(self, WordToken::DoubleQuote),
@@ -215,8 +215,7 @@ impl<'src> WordLexer<'src> {
             '`' => {
                 self.advance();
                 let start = self.position;
-                self.skip_backquoted_command_substitution()
-                    .expect("invalid word");
+                self.skip_backquoted_command_substitution()?;
                 let end = self.position;
                 self.advance();
                 WordToken::BacktickCommandSubstitution(&self.source[start..end])
@@ -227,7 +226,7 @@ impl<'src> WordLexer<'src> {
                     '`' => advance_and_return(self, WordToken::QuotedBacktick),
                     '\n' => {
                         self.advance();
-                        self.next_token()
+                        return self.next_token();
                     }
                     _ => WordToken::Backslash,
                 }
@@ -239,11 +238,11 @@ impl<'src> WordLexer<'src> {
                     if self.lookahead == '(' {
                         self.advance();
                         let start = self.position;
-                        self.skip_arithmetic_expansion().expect("invalid word");
+                        self.skip_arithmetic_expansion()?;
                         WordToken::ArithmeticExpansion(&self.source[start..self.position - 1])
                     } else {
                         let start = self.position;
-                        self.skip_command_substitution().expect("invalid word");
+                        self.skip_command_substitution()?;
                         let end = self.position;
                         self.advance();
                         WordToken::CommandSubstitution(&self.source[start..end])
@@ -275,7 +274,7 @@ impl<'src> WordLexer<'src> {
             }
             other => advance_and_return(self, WordToken::Char(other)),
         };
-        result
+        Ok(result)
     }
 
     pub fn next_char(&mut self) -> Option<char> {
@@ -301,12 +300,12 @@ impl<'src> WordLexer<'src> {
     }
 }
 
-pub fn remove_quotes(word: &str) -> (bool, String) {
+pub fn remove_quotes(word: &str) -> ParseResult<(bool, String)> {
     let mut lex = WordLexer::new(word);
     let mut result = String::with_capacity(word.len());
     let mut is_quoted = false;
     let mut inside_double_quotes = false;
-    let mut next = lex.next_token();
+    let mut next = lex.next_token()?;
     loop {
         match next {
             WordToken::DoubleQuote => {
@@ -331,7 +330,7 @@ pub fn remove_quotes(word: &str) -> (bool, String) {
             WordToken::Backslash => {
                 is_quoted = true;
                 if inside_double_quotes {
-                    match lex.next_token() {
+                    match lex.next_token()? {
                         WordToken::Dollar => {
                             result.push('$');
                         }
@@ -370,9 +369,9 @@ pub fn remove_quotes(word: &str) -> (bool, String) {
             WordToken::Char(c) => result.push(c),
             WordToken::Eof => break,
         }
-        next = lex.next_token()
+        next = lex.next_token()?
     }
-    (is_quoted, result)
+    Ok((is_quoted, result))
 }
 
 #[cfg(test)]
@@ -381,8 +380,11 @@ mod tests {
 
     fn lex_token(s: &str) -> WordToken<'_> {
         let mut lex = WordLexer::new(s);
-        let token = lex.next_token();
-        assert_eq!(lex.next_token(), WordToken::Eof);
+        let token = lex.next_token().expect("failed to lex token");
+        assert_eq!(
+            lex.next_token().expect("failed to lex token"),
+            WordToken::Eof
+        );
         token
     }
 

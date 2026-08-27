@@ -554,7 +554,7 @@ impl<'src> CommandLexer<'src> {
                 self.reached_eof(),
             ));
         }
-        let (is_quoted, end_delimiter) = remove_quotes(start_delimiter.as_ref());
+        let (is_quoted, end_delimiter) = remove_quotes(start_delimiter.as_ref())?;
 
         // Save the rest of the `<<` line; it is re-inserted below.
         let rest_of_line_start = self.source.read_state.clone();

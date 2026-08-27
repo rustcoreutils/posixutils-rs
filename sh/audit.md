@@ -500,3 +500,48 @@ both reject `{ word }` and require the separator.
 Re-probed from the feature backlog: **`set -o pipefail` is implemented and
 correct** (`set -o pipefail; false | true` → 1, without it → 0), so the entry
 listing it as missing is stale.
+
+### Phase 4 — field splitting
+
+The three defects below were three places independently deciding what a field
+boundary is. They are replaced by a single `FieldSplitter` transcribing POSIX
+XCU 2.6.5 directly, which the `ExpandedWord` representation already supports:
+its parts record which bytes came from an expansion, and only those may
+delimit.
+
+- [x] **A run of IFS white space followed by a non-white-space IFS character
+  produced a spurious empty field.** The old code consumed a delimiter and then
+  skipped IFS white space, leaving the next non-white-space IFS character to be
+  processed as a *second* delimiter. `IFS=' :'; x='  a : b  '` gave
+  `[a][][b]` where dash gives `[a][b]`. Every `IFS=', '`-style split was
+  affected. A white-space run is one delimiter and may absorb one
+  non-white-space IFS character; a non-white-space IFS character on its own
+  always delimits, which is what keeps `IFS=:` turning `a::b` into three fields.
+- [x] **`"$@"` with no positional parameters produced one empty field.** POSIX
+  2.5.2 requires zero, so `exec prog "$@"` invoked `prog ""`. The quotes around
+  the expansion contribute an empty literal of their own, so the emptiness is
+  recorded on the `ExpandedWord` rather than inferred from it. (The standard
+  leaves the result unspecified when the word holds other parts inside the same
+  double quotes; the tests do not pin that shape down.)
+- [x] **`IFS=` merged the parameters of `"$@"`.** `split_fields` early-returned
+  when IFS was null, discarding the boundaries `"$@"` had planted — but IFS has
+  no bearing on those. `IFS=` is *the* idiom for disabling splitting, so any
+  script combining it with `"$@"` silently merged its arguments.
+- [x] **Unquoted `$@`/`$*` kept null parameters as empty fields.** A boundary
+  was planted between parameters regardless of quoting. Quoted, a null
+  parameter is an empty field; unquoted, POSIX 2.5.2 allows it to be discarded,
+  which is a distinct kind of boundary — now `ExpandedWordPart::SoftFieldEnd`,
+  which yields nothing when no field has accumulated. This also covers a
+  parameter consisting entirely of IFS white space.
+- [x] **`${*:-word}` never substituted.** `expand_simple_parameter_into`
+  returned `Set` for every special parameter unconditionally. `$@` and `$*` are
+  always set but *null* when they expand to nothing, so `${*:-D}` substitutes
+  while `${*-D}` does not — verified against dash for all three of no
+  parameters, one null parameter, and one non-empty parameter.
+- [x] **`${#}` was a syntax error.** It was parsed as a length operator with a
+  missing operand rather than the `#` special parameter in braces.
+
+Two unit tests asserted an internal representation that changed: an empty field
+now carries no parts rather than one part holding the empty string (nothing
+downstream distinguishes them), and unquoted `$@` plants `SoftFieldEnd`.
+`${#*}`/`${#@}` remain an error; POSIX leaves the length of `*`/`@` unspecified.

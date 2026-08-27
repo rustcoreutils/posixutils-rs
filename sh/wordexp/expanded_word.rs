@@ -13,7 +13,13 @@ pub enum ExpandedWordPart {
     UnquotedLiteral(String),
     GeneratedUnquotedLiteral(String),
     // terminates a field
+    /// Ends a field regardless of IFS: `"$@"` separates its parameters even
+    /// when they are empty and even when IFS is null.
     FieldEnd,
+    /// Ends a field only if one has been accumulated. Unquoted `$@`/`$*` also
+    /// separate their parameters, but POSIX 2.5.2 lets an empty one be
+    /// discarded rather than producing an empty field.
+    SoftFieldEnd,
 }
 
 impl ExpandedWordPart {
@@ -38,6 +44,12 @@ impl ExpandedWordPart {
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedWord {
     parts: Vec<ExpandedWordPart>,
+    /// Set when a double-quoted `"$@"` in this word expanded to no positional
+    /// parameters. POSIX 2.5.2: "If there are no positional parameters, the
+    /// expansion of '@' shall generate zero fields, even when '@' is within
+    /// double-quotes" — but the quotes around it still contribute an empty
+    /// literal, so the emptiness has to be remembered rather than inferred.
+    quoted_at_expanded_to_nothing: bool,
 }
 
 impl From<ExpandedWord> for String {
@@ -53,7 +65,7 @@ impl std::fmt::Display for ExpandedWord {
                 ExpandedWordPart::UnquotedLiteral(s) => f.write_str(s)?,
                 ExpandedWordPart::QuotedLiteral(s) => f.write_str(s)?,
                 ExpandedWordPart::GeneratedUnquotedLiteral(s) => f.write_str(s)?,
-                ExpandedWordPart::FieldEnd => {}
+                ExpandedWordPart::FieldEnd | ExpandedWordPart::SoftFieldEnd => {}
             }
         }
         Ok(())
@@ -82,6 +94,7 @@ impl ExpandedWord {
     pub fn unquoted_literal<S: Into<String>>(s: S) -> Self {
         Self {
             parts: vec![ExpandedWordPart::UnquotedLiteral(s.into())],
+            quoted_at_expanded_to_nothing: false,
         }
     }
 
@@ -113,14 +126,38 @@ impl ExpandedWord {
     }
 
     /// # Panics
-    /// Panics if the last part is `ExpandedWordPart::FieldEnd` or if the word is empty
+    /// Panics if the last part is a field end or if the word is empty
     pub fn end_field(&mut self) {
         assert_ne!(self.parts.last(), Some(&ExpandedWordPart::FieldEnd));
+        assert_ne!(self.parts.last(), Some(&ExpandedWordPart::SoftFieldEnd));
         assert!(!self.parts.is_empty());
         self.parts.push(ExpandedWordPart::FieldEnd);
     }
 
+    /// Records that a double-quoted `"$@"` here had no positional parameters.
+    pub fn note_quoted_at_expanded_to_nothing(&mut self) {
+        self.quoted_at_expanded_to_nothing = true;
+    }
+
+    pub fn had_quoted_at_expanded_to_nothing(&self) -> bool {
+        self.quoted_at_expanded_to_nothing
+    }
+
+    /// A field boundary that yields nothing when no field has accumulated.
+    /// Unlike [`Self::end_field`] this may follow an empty word, since dropping
+    /// the empty field is exactly its purpose.
+    pub fn end_field_soft(&mut self) {
+        if matches!(
+            self.parts.last(),
+            None | Some(ExpandedWordPart::FieldEnd) | Some(ExpandedWordPart::SoftFieldEnd)
+        ) {
+            return;
+        }
+        self.parts.push(ExpandedWordPart::SoftFieldEnd);
+    }
+
     pub fn extend(&mut self, other: Self) {
+        self.quoted_at_expanded_to_nothing |= other.quoted_at_expanded_to_nothing;
         self.parts.reserve(other.parts.len());
         let mut iter = other.parts.into_iter();
         if let Some(first) = iter.next() {
@@ -164,17 +201,22 @@ pub mod tests {
         pub fn quoted_literal(s: &str) -> Self {
             Self {
                 parts: vec![ExpandedWordPart::QuotedLiteral(s.to_string())],
+                quoted_at_expanded_to_nothing: false,
             }
         }
 
         pub fn generated_unquoted_literal(s: &str) -> Self {
             Self {
                 parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(s.to_string())],
+                quoted_at_expanded_to_nothing: false,
             }
         }
 
         pub fn from_parts(parts: Vec<ExpandedWordPart>) -> Self {
-            Self { parts }
+            Self {
+                parts,
+                quoted_at_expanded_to_nothing: false,
+            }
         }
     }
 }

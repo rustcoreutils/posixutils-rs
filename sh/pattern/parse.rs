@@ -157,7 +157,7 @@ impl<'w> Parser<'w> {
                     self.chars = lit.chars();
                     self.advance();
                 }
-                ExpandedWordPart::FieldEnd => {
+                ExpandedWordPart::FieldEnd | ExpandedWordPart::SoftFieldEnd => {
                     // A pattern is a single word, but `$@` still expands to one
                     // field per positional parameter; join them with a space,
                     // as dash and bash do.

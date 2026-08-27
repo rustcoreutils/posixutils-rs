@@ -110,6 +110,14 @@ impl<'src> WordParser<'src> {
 
             if self.lookahead == WordToken::Char('#') {
                 self.advance()?;
+                // `${#}` is the `#` special parameter in braces — the number of
+                // positional parameters — not a length with its operand missing.
+                if self.lookahead == WordToken::Char('}') {
+                    self.advance()?;
+                    return Ok(ParameterExpansion::Simple(Parameter::Special(
+                        SpecialParameter::Hash,
+                    )));
+                }
                 let parameter = self.parse_parameter(false)?;
                 let expansion = match parameter {
                     Parameter::Special(SpecialParameter::Asterisk)

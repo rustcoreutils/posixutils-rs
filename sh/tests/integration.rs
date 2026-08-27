@@ -2967,4 +2967,91 @@ mod audit_regressions {
         // -n must not execute anything.
         run_successfully_and("true\n", |out| assert_eq!(out, ""));
     }
+
+    // ---- Phase 4: field splitting, POSIX XCU 2.6.5 --------------------------
+
+    /// Runs `script` and compares stdout, for cases where the interesting
+    /// answer is a field count reported by a child shell.
+    fn expect_stdout(script: &str, expected: &str) {
+        run_successfully_and(script, |out| assert_eq!(out, expected));
+    }
+
+    #[test]
+    fn a_run_of_ifs_whitespace_is_one_delimiter() {
+        // The splitter consumed a delimiter and then skipped IFS whitespace,
+        // leaving a following non-whitespace IFS character to be processed as a
+        // second delimiter and emit a spurious empty field.
+        expect_stdout(
+            "IFS=' :'\nx='  a : b  '\nprintf '[%s]' $x\necho\n",
+            "[a][b]\n",
+        );
+        expect_stdout(
+            "IFS=' :'\nx='a:  :b'\nprintf '[%s]' $x\necho\n",
+            "[a][][b]\n",
+        );
+        // A non-whitespace IFS character still delimits on its own.
+        expect_stdout("IFS=:\nx='a::b'\nprintf '[%s]' $x\necho\n", "[a][][b]\n");
+        expect_stdout(
+            "IFS=:\nx='a:b:c::'\nprintf '[%s]' $x\necho\n",
+            "[a][b][c][]\n",
+        );
+        expect_stdout("IFS=:\nx=':a'\nprintf '[%s]' $x\necho\n", "[][a]\n");
+        expect_stdout("IFS=:\nx='a:'\nprintf '[%s]' $x\necho\n", "[a]\n");
+    }
+
+    #[test]
+    fn quoted_dollar_at_with_no_parameters_generates_zero_fields() {
+        // POSIX 2.5.2. The surrounding quotes contribute an empty literal, so
+        // the shell produced one empty field and `exec prog "$@"` invoked
+        // `prog ""`.
+        expect_stdout("set --\n/bin/sh -c 'echo $#' x \"$@\"\n", "0\n");
+        expect_stdout("set -- a b\n/bin/sh -c 'echo $#' x \"$@\"\n", "2\n");
+    }
+
+    #[test]
+    fn a_null_ifs_does_not_merge_the_parameters_of_quoted_dollar_at() {
+        // `split_fields` early-returned when IFS was null, discarding the field
+        // boundaries `"$@"` had planted — but IFS has no say over those.
+        // `IFS=` is *the* idiom for disabling splitting.
+        expect_stdout(
+            "set -- a b c\nIFS=\nfor i in \"$@\"; do echo \"<$i>\"; done\n",
+            "<a>\n<b>\n<c>\n",
+        );
+    }
+
+    #[test]
+    fn unquoted_dollar_at_discards_null_parameters() {
+        // A `FieldEnd` was planted between parameters regardless of quoting, so
+        // an unquoted `$@` kept null parameters as empty fields.
+        expect_stdout("set -- a '' b\n/bin/sh -c 'echo $#' x $@\n", "2\n");
+        expect_stdout("set -- '' ''\n/bin/sh -c 'echo $#' x $@\n", "0\n");
+        // Quoted, they are kept.
+        expect_stdout("set -- a '' b\n/bin/sh -c 'echo $#' x \"$@\"\n", "3\n");
+        // Parameters stay separate whatever IFS says; only their contents split.
+        expect_stdout("set -- 'a b' c\nIFS=:\n/bin/sh -c 'echo $#' x $@\n", "2\n");
+        // A parameter that is entirely IFS white space contributes no field.
+        expect_stdout("set -- ' ' x\n/bin/sh -c 'echo $#' p $@\n", "1\n");
+    }
+
+    #[test]
+    fn dollar_star_and_dollar_at_are_null_rather_than_unset() {
+        // Every special parameter reported itself as Set, so `${*:-word}` never
+        // substituted. They are always set, but null when they expand to
+        // nothing, so `:-` substitutes and `-` does not.
+        expect_stdout("set --\necho \"${*:-D}\"\n", "D\n");
+        expect_stdout("set --\necho \"${@:-D}\"\n", "D\n");
+        expect_stdout("set -- ''\necho \"${*:-D}\"\n", "D\n");
+        expect_stdout("set --\necho \"[${*-D}]\"\n", "[]\n");
+        expect_stdout("set -- a\necho \"${*:-D}\"\n", "a\n");
+        expect_stdout("set --\necho \"[${*:+S}]\"\n", "[]\n");
+        expect_stdout("set -- a\necho \"${*:+S}\"\n", "S\n");
+    }
+
+    #[test]
+    fn braced_hash_is_the_positional_parameter_count() {
+        // `${#}` was parsed as a length operator with its operand missing.
+        expect_stdout("set -- a b\necho \"${#}\"\n", "2\n");
+        expect_stdout("set --\necho \"${#}\"\n", "0\n");
+        expect_stdout("x=abc\necho \"${#x}\"\n", "3\n");
+    }
 }

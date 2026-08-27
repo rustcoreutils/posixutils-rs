@@ -25,83 +25,139 @@ mod tilde;
 
 pub type ExpansionResult<T> = Result<T, CommandExecutionError>;
 
-fn split_generated_unquoted_literal(
-    mut lit: String,
-    last_word: &mut ExpandedWord,
-    result: &mut Vec<ExpandedWord>,
-    ifs: &str,
+/// Field splitting, POSIX XCU 2.6.5.
+///
+/// The standard describes a single pass over the bytes of the expanded word,
+/// distinguishing bytes that came from an expansion (which may delimit fields)
+/// from bytes that did not (which never do). `ExpandedWord` already records
+/// that distinction, so the algorithm is transcribed directly rather than
+/// spread over the callers.
+///
+/// The subtle part is the delimiter run. A run of IFS *white space* is one
+/// delimiter, and it may additionally absorb a single non-white-space IFS
+/// character; a non-white-space IFS character on its own always delimits, which
+/// is what makes `IFS=:` turn `a::b` into three fields while `IFS=' :'` turns
+/// `a : b` into two.
+struct FieldSplitter<'a> {
+    ifs: &'a str,
     max_fields: usize,
-) {
-    if lit.is_empty() {
-        return;
-    }
-    let ifs_whitespace = ifs
-        .chars()
-        .filter(|c| c.is_ascii_whitespace())
-        .collect::<String>();
-    if !ifs_whitespace.is_empty() {
-        lit = lit.trim_matches(|c| ifs_whitespace.contains(c)).to_string();
-        if lit.is_empty() {
-            return;
+    result: Vec<ExpandedWord>,
+    current: ExpandedWord,
+    /// Inside a run of IFS characters that has not yet been resolved.
+    in_delimiter_run: bool,
+}
+
+impl<'a> FieldSplitter<'a> {
+    fn new(ifs: &'a str, max_fields: usize) -> Self {
+        Self {
+            ifs,
+            max_fields,
+            result: Vec::new(),
+            current: ExpandedWord::default(),
+            in_delimiter_run: false,
         }
     }
-    let mut accumulator = String::new();
-    let mut iter = lit.chars();
-    // we know that lit isn't empty, from above
-    let mut next_char = iter.next().unwrap();
-    'outer: loop {
-        if result.len() == max_fields - 1 {
-            accumulator.push(next_char);
-            accumulator.extend(iter);
-            last_word.append(accumulator, false, false);
+
+    fn is_ifs_whitespace(&self, c: char) -> bool {
+        // POSIX names <space>, <tab> and <newline> as IFS white space whenever
+        // they appear in IFS.
+        matches!(c, ' ' | '\t' | '\n') && self.ifs.contains(c)
+    }
+
+    fn is_ifs(&self, c: char) -> bool {
+        self.ifs.contains(c)
+    }
+
+    /// True once no further splitting may happen and everything left belongs to
+    /// the final field.
+    fn reached_max_fields(&self) -> bool {
+        self.result.len() + 1 == self.max_fields
+    }
+
+    fn delimit(&mut self) {
+        let field = std::mem::take(&mut self.current);
+        self.result.push(field);
+    }
+
+    /// Resolve a pending delimiter run. `saw_non_whitespace` records whether it
+    /// contained an IFS character that is not white space.
+    fn end_delimiter_run(&mut self, saw_non_whitespace: bool) {
+        if !self.in_delimiter_run {
             return;
         }
-        if ifs.contains(next_char) {
-            loop {
-                match iter.next() {
-                    Some(c) => {
-                        next_char = c;
-                        if !ifs_whitespace.contains(next_char) {
-                            break;
-                        }
-                    }
-                    None => break 'outer,
+        self.in_delimiter_run = false;
+        if !self.current.is_empty() || saw_non_whitespace {
+            self.delimit();
+        }
+    }
+
+    fn push_literal(&mut self, value: String, quoted: bool) {
+        // Bytes that did not come from an expansion never delimit, but they do
+        // end any run that was still open.
+        self.end_delimiter_run(false);
+        self.current.append(value, quoted, false);
+    }
+
+    fn push_generated(&mut self, value: String) {
+        let mut accumulator = String::new();
+        for c in value.chars() {
+            if self.is_ifs(c) && !self.reached_max_fields() {
+                // Everything read so far belongs to the field being delimited.
+                if !accumulator.is_empty() {
+                    self.current
+                        .append(std::mem::take(&mut accumulator), false, false);
                 }
-            }
-
-            last_word.append(accumulator, false, false);
-            accumulator = String::new();
-            let mut temp = ExpandedWord::default();
-            std::mem::swap(&mut temp, last_word);
-            result.push(temp);
-        } else {
-            accumulator.push(next_char);
-            if let Some(c) = iter.next() {
-                next_char = c;
+                self.in_delimiter_run = true;
+                if !self.is_ifs_whitespace(c) {
+                    // A non-white-space IFS character always delimits, and ends
+                    // the run it belongs to.
+                    self.end_delimiter_run(true);
+                }
             } else {
-                break;
+                // An ordinary character ends any run without delimiting on its
+                // own account.
+                self.end_delimiter_run(false);
+                accumulator.push(c);
             }
         }
-    }
-    last_word.append(accumulator, false, false);
-}
-
-fn insert_remaining_parts_into(
-    word: &mut ExpandedWord,
-    iter: impl Iterator<Item = ExpandedWordPart>,
-) {
-    for part in iter {
-        match part {
-            ExpandedWordPart::QuotedLiteral(val) => word.append(val, true, false),
-            ExpandedWordPart::UnquotedLiteral(val) => word.append(val, false, false),
-            ExpandedWordPart::GeneratedUnquotedLiteral(val) => word.append(val, false, true),
-            ExpandedWordPart::FieldEnd => word.end_field(),
+        if !accumulator.is_empty() {
+            // Splitting has consumed the "came from an expansion" property, and
+            // nothing downstream distinguishes the two kinds.
+            self.current.append(accumulator, false, false);
         }
     }
+
+    /// `"$@"` plants an explicit boundary that IFS has no say over.
+    fn end_field(&mut self) {
+        self.end_delimiter_run(false);
+        self.delimit();
+    }
+
+    /// Unquoted `$@`/`$*` separate their parameters, but a parameter that
+    /// contributes nothing is discarded rather than yielding an empty field.
+    fn end_field_soft(&mut self) {
+        self.end_delimiter_run(false);
+        if !self.current.is_empty() {
+            self.delimit();
+        }
+    }
+
+    fn finish(mut self) -> Vec<ExpandedWord> {
+        // POSIX: once the input is empty the candidate becomes a field only if
+        // it is not empty. A run still open here delimits nothing further.
+        self.in_delimiter_run = false;
+        if !self.current.is_empty() {
+            self.delimit();
+        }
+        self.result
+    }
 }
 
-/// If there are more fields than `max_fields`, the remaining parts of `expanded_word`
-/// will be put into the last entry of the result
+/// Splits `expanded_word` into fields according to POSIX XCU 2.6.5.
+///
+/// If there are more fields than `max_fields`, everything left goes into the
+/// last entry of the result.
+///
 /// # Panic
 /// Panics if `max_fields` is 0
 pub fn split_fields(
@@ -115,42 +171,34 @@ pub fn split_fields(
         return Vec::new();
     }
 
+    // An unset IFS behaves as <space><tab><newline>. An IFS set to the empty
+    // string suppresses splitting, but it has no bearing on the field
+    // boundaries `"$@"` plants, which is why those are still honoured below.
     let ifs = ifs.unwrap_or(" \t\n");
-    if ifs.is_empty() {
-        return vec![expanded_word];
-    }
-
-    let mut result = Vec::with_capacity(expanded_word.len());
-    let mut last_word = ExpandedWord::default();
-    let mut iter = expanded_word.into_iter();
-    // we need the iterator later to insert the remaining parts into the last word
-    // so we can't use a for loop
-    #[allow(clippy::while_let_on_iterator)]
-    while let Some(part) = iter.next() {
+    let quoted_at_expanded_to_nothing = expanded_word.had_quoted_at_expanded_to_nothing();
+    let mut splitter = FieldSplitter::new(ifs, max_fields);
+    for part in expanded_word {
         match part {
-            ExpandedWordPart::UnquotedLiteral(lit) => {
-                last_word.append(lit, false, false);
-            }
-            ExpandedWordPart::QuotedLiteral(lit) => {
-                last_word.append(lit, true, false);
-            }
-            ExpandedWordPart::FieldEnd => {
-                result.push(last_word);
-                last_word = ExpandedWord::default();
-            }
+            ExpandedWordPart::UnquotedLiteral(lit) => splitter.push_literal(lit, false),
+            ExpandedWordPart::QuotedLiteral(lit) => splitter.push_literal(lit, true),
             ExpandedWordPart::GeneratedUnquotedLiteral(lit) => {
-                split_generated_unquoted_literal(lit, &mut last_word, &mut result, ifs, max_fields);
+                if ifs.is_empty() {
+                    splitter.push_literal(lit, false)
+                } else {
+                    splitter.push_generated(lit)
+                }
             }
-        }
-        if result.len() == max_fields {
-            break;
+            ExpandedWordPart::FieldEnd => splitter.end_field(),
+            ExpandedWordPart::SoftFieldEnd => splitter.end_field_soft(),
         }
     }
-    insert_remaining_parts_into(&mut last_word, iter);
-    if !last_word.is_empty() {
-        result.push(last_word);
+    let fields = splitter.finish();
+    // A word that is nothing but a `"$@"` with no parameters yields no fields;
+    // the sole field here is the one its own quotes contributed.
+    if quoted_at_expanded_to_nothing && fields.len() == 1 && fields[0].to_string().is_empty() {
+        return Vec::new();
     }
-    result
+    fields
 }
 
 /// performs:
@@ -316,7 +364,10 @@ pub mod tests {
                 ExpandedWord::unquoted_literal("a"),
                 ExpandedWord::unquoted_literal("b"),
                 ExpandedWord::unquoted_literal("c"),
-                ExpandedWord::unquoted_literal(""),
+                // An empty field carries no parts at all, rather than one part
+                // holding the empty string; both render as an empty field and
+                // nothing downstream distinguishes them.
+                ExpandedWord::default(),
             ]
         );
     }
@@ -334,8 +385,8 @@ pub mod tests {
                 ExpandedWord::unquoted_literal("b"),
                 ExpandedWord::unquoted_literal("c"),
                 ExpandedWord::unquoted_literal("d"),
-                ExpandedWord::unquoted_literal(""),
-                ExpandedWord::unquoted_literal(""),
+                ExpandedWord::default(),
+                ExpandedWord::default(),
                 ExpandedWord::unquoted_literal("x y")
             ]
         );

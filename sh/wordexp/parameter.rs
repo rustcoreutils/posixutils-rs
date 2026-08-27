@@ -60,7 +60,13 @@ fn add_split_parameters_to_expanded_word(
     let mut i = 0;
     while i < parameters.len() - 1 {
         word.append(&parameters[i], quoted, true);
-        word.end_field();
+        // `"$@"` keeps a null parameter as an empty field; unquoted `$@` may
+        // discard it (POSIX 2.5.2).
+        if quoted {
+            word.end_field();
+        } else {
+            word.end_field_soft();
+        }
         i += 1;
     }
     word.append(&parameters[i], quoted, true);
@@ -90,6 +96,13 @@ fn expand_simple_parameter_into(
         Parameter::Special(special_parameter) => {
             match special_parameter {
                 SpecialParameter::At => {
+                    if inside_double_quotes && shell.positional_parameters.is_empty() {
+                        // POSIX 2.5.2: `"$@"` with no positional parameters
+                        // generates zero fields, not one empty field. The
+                        // surrounding quotes still contribute an empty literal,
+                        // so record it for the field splitter.
+                        expanded_word.note_quoted_at_expanded_to_nothing();
+                    }
                     if !field_splitting_will_be_performed {
                         expanded_word.append(
                             shell.positional_parameters.join(" "),
@@ -160,8 +173,22 @@ fn expand_simple_parameter_into(
                     expanded_word.append(shell.program_name.clone(), inside_double_quotes, true);
                 }
             }
-            // special parameters are always set
-            ParameterExpansionResult::Set
+            // `$@` and `$*` follow the positional parameters: with none set
+            // they are unset, and `${*:-word}` must substitute. The rest are
+            // always set.
+            match special_parameter {
+                SpecialParameter::At | SpecialParameter::Asterisk => {
+                    // Always set, but null when they expand to nothing — so
+                    // `${*:-word}` substitutes with no positional parameters
+                    // while `${*-word}` does not.
+                    if shell.positional_parameters.iter().all(|p| p.is_empty()) {
+                        ParameterExpansionResult::Null
+                    } else {
+                        ParameterExpansionResult::Set
+                    }
+                }
+                _ => ParameterExpansionResult::Set,
+            }
         }
     }
 }
@@ -946,9 +973,9 @@ mod tests {
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
             ])
         );
@@ -990,9 +1017,9 @@ mod tests {
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
             ])
         );
@@ -1032,9 +1059,9 @@ mod tests {
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
             ])
         );
@@ -1071,9 +1098,9 @@ mod tests {
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
             ])
         );
@@ -1113,9 +1140,9 @@ mod tests {
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
+                ExpandedWordPart::SoftFieldEnd,
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
             ])
         );

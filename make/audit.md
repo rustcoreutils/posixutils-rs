@@ -222,6 +222,23 @@ wrong build.
   Since telling the user what will run is exactly what `-n` is for, the
   expansion now happens first. Found by the corpus.
 
+- [x] **#58 — A self-referential `$(call ...)` exhausts the stack.** ✓ fixed
+  2026-08-27. `A = $(call A)` aborted with `fatal runtime error: stack overflow`
+  and dumped core. `MAX_EXPANSION_ROUNDS` bounds the rounds *within* one
+  expansion frame, but `substitute → func::call → expand → substitute` is a real
+  recursion and had no depth bound at all. A shared `func::Expansion` carries a
+  depth counter through every nested `Ctx`, capped at 200, and reports a
+  recursive definition instead. Found while designing #52, which multiplies the
+  ways to reach it. Tests `self_referential_call_is_capped_not_a_crash`,
+  `mutually_recursive_calls_are_capped`, `recursion_through_foreach_is_capped`,
+  `finite_nesting_still_expands`.
+- [x] **#59 — A function error grows a newline per nesting level.** ✓ fixed
+  2026-08-27. The error crosses the `Result<String, String>` boundary between
+  `func` and the preprocessor once per level, and `FunctionFailed`'s `Display`
+  used `writeln!`, so each `to_string()` appended another newline — a 200-deep
+  recursion printed its one-line message followed by 202 blank lines. Test
+  `a_depth_error_is_reported_once`.
+
 ## Minor
 
 - [ ] **#43 — `-p` prints a `Debug` dump of the built-in table, never the

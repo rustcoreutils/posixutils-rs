@@ -62,7 +62,11 @@ impl Display for PreprocError {
                     "macro expansion does not terminate (recursive definition?)"
                 )
             }
-            PreprocError::FunctionFailed(msg) => writeln!(f, "{msg}"),
+            // `write!`, not `writeln!`: a function error crosses the
+            // `Result<String, String>` boundary between `func` and here once
+            // per nesting level, and each `to_string()` would otherwise append
+            // another newline -- 200 of them for a deep recursion.
+            PreprocError::FunctionFailed(msg) => write!(f, "{msg}"),
             other => writeln!(f, "{:?}", other),
         }
     }
@@ -275,7 +279,7 @@ fn read_balanced(
 
 /// Expand text on a function's behalf.
 fn expand_for_function(text: &str, ctx: &func::Ctx) -> std::result::Result<String, String> {
-    expand_to_fixpoint(text, ctx.table).map_err(|e| e.to_string())
+    expand_to_fixpoint(text, ctx.table, ctx.state).map_err(|e| e.to_string())
 }
 
 fn take_till_eol(letters: &mut Peekable<impl Iterator<Item = char>>) -> String {
@@ -395,10 +399,14 @@ fn parse_operator(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<Ope
 /// that re-introduces its own reference (`A = $(A)x`) never converges.
 const MAX_EXPANSION_ROUNDS: usize = 256;
 
-fn expand_to_fixpoint(body: &str, table: &HashMap<String, String>) -> Result<String> {
+fn expand_to_fixpoint(
+    body: &str,
+    table: &HashMap<String, String>,
+    state: &func::Expansion,
+) -> Result<String> {
     let mut body = body.to_string();
     for _ in 0..MAX_EXPANSION_ROUNDS {
-        let (result, substitutions) = substitute(&body, table)?;
+        let (result, substitutions) = substitute(&body, table, state)?;
         if substitutions == 0 {
             return Ok(body);
         }
@@ -408,10 +416,14 @@ fn expand_to_fixpoint(body: &str, table: &HashMap<String, String>) -> Result<Str
 }
 
 /// Expand every macro reference in `source` until it stops changing.
-fn substitute_to_fixpoint(source: &str, table: &HashMap<String, String>) -> Result<String> {
+fn substitute_to_fixpoint(
+    source: &str,
+    table: &HashMap<String, String>,
+    state: &func::Expansion,
+) -> Result<String> {
     let mut source = source.to_string();
     for _ in 0..MAX_EXPANSION_ROUNDS {
-        let (result, substitutions) = substitute(&source, table)?;
+        let (result, substitutions) = substitute(&source, table, state)?;
         if substitutions == 0 {
             return Ok(result);
         }
@@ -444,12 +456,13 @@ fn apply_operator(
     name: &str,
     body: String,
     table: &MacroTable,
+    state: &func::Expansion,
 ) -> Result<String> {
     match operator {
         Operator::Equals => Ok(body),
-        Operator::Colon | Operator::Colon2 => expand_to_fixpoint(&body, table.values()),
-        Operator::Colon3 => Ok(substitute(&body, table.values())?.0),
-        Operator::Bang => shell_assign(&substitute(&body, table.values())?.0),
+        Operator::Colon | Operator::Colon2 => expand_to_fixpoint(&body, table.values(), state),
+        Operator::Colon3 => Ok(substitute(&body, table.values(), state)?.0),
+        Operator::Bang => shell_assign(&substitute(&body, table.values(), state)?.0),
         Operator::QuestionMark => Ok(match table.get(name) {
             Some(existing) => existing.clone(),
             None => body,
@@ -473,7 +486,11 @@ fn parse_macro_name(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<S
 
 /// Parse one macro-definition line into the name and the value its operator
 /// assigns, resolving against what is already defined.
-fn parse_macro_definition(line: &str, table: &MacroTable) -> Result<(String, String)> {
+fn parse_macro_definition(
+    line: &str,
+    table: &MacroTable,
+    state: &func::Expansion,
+) -> Result<(String, String)> {
     let mut text = line.chars().peekable();
     // A definition may be indented with spaces, which is common inside a
     // conditional. (A <tab> would make it a command line, handled elsewhere.)
@@ -483,7 +500,7 @@ fn parse_macro_definition(line: &str, table: &MacroTable) -> Result<(String, Str
     let operator = parse_operator(&mut text)?;
     skip_blank(&mut text);
     let body = take_till_eol(&mut text);
-    let body = apply_operator(operator, &name, body, table)?;
+    let body = apply_operator(operator, &name, body, table, state)?;
     Ok((name, body))
 }
 
@@ -506,7 +523,11 @@ fn lookup_macro(name: &str, table: &HashMap<String, String>, env_wins: bool) -> 
     resolved.unwrap_or_default()
 }
 
-fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, u32)> {
+fn substitute(
+    source: &str,
+    table: &HashMap<String, String>,
+    state: &func::Expansion,
+) -> Result<(String, u32)> {
     let env_macros = ENV_MACROS.load(Acquire);
 
     let mut substitutions = 0;
@@ -571,6 +592,7 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                     let ctx = func::Ctx {
                         table,
                         env_wins: env_macros,
+                        state,
                     };
                     let out = func::call(&macro_name, &raw, &ctx, &expand_for_function)
                         .map_err(PreprocError::FunctionFailed)?;
@@ -600,7 +622,7 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                     // holds unexpanded text, and `$(SRC:.c=.o)` has to see the
                     // words, not `$(wildcard *.c)`.
                     let macro_body = lookup_macro(&macro_name, table, env_macros);
-                    let macro_body = expand_to_fixpoint(&macro_body, table)?;
+                    let macro_body = expand_to_fixpoint(&macro_body, table, state)?;
                     result.push_str(&apply_substitution(&macro_body, &spec));
                     substitutions += 1;
                     continue;
@@ -713,6 +735,8 @@ struct Reader {
     out: String,
     depth: usize,
     vpaths: Vec<VPathEntry>,
+    /// Shared by every expansion this reader performs, so recursion is bounded.
+    state: func::Expansion,
 }
 
 impl Reader {
@@ -723,6 +747,7 @@ impl Reader {
             out: String::new(),
             depth: 0,
             vpaths: Vec::new(),
+            state: func::Expansion::new(),
         }
     }
 
@@ -747,7 +772,7 @@ impl Reader {
             // is never evaluated -- a commented-out `$(shell rm -rf ...)`
             // must not run (audit #51).
             let code = super::scan::strip_comment(line);
-            let expanded = substitute_to_fixpoint(code, self.table.values())?;
+            let expanded = substitute_to_fixpoint(code, self.table.values(), &self.state)?;
             self.out.push_str(&expanded);
         }
         self.out.push('\n');
@@ -762,7 +787,7 @@ impl Reader {
     /// Expand macro references in a directive's condition, using what is
     /// defined so far.
     fn expand(&self, text: &str) -> Result<String> {
-        expand_to_fixpoint(text, self.table.values())
+        expand_to_fixpoint(text, self.table.values(), &self.state)
     }
 
     fn eval_compare(&self, equal: bool, args: &str) -> Result<bool> {
@@ -996,7 +1021,7 @@ impl Reader {
     }
 
     fn define_macro(&mut self, line: &str) -> Result<()> {
-        let (name, body) = parse_macro_definition(line, &self.table)?;
+        let (name, body) = parse_macro_definition(line, &self.table, &self.state)?;
         self.table.set(name, body);
         Ok(())
     }
@@ -1023,10 +1048,11 @@ impl Reader {
 /// the recipe's <tab>, so every line stays a command line rather than becoming
 /// a bogus rule.
 fn expand_command_lines(text: &str, table: &HashMap<String, String>) -> Result<String> {
+    let state = func::Expansion::new();
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         if line.starts_with('\t') {
-            let expanded = substitute_to_fixpoint(line, table)?;
+            let expanded = substitute_to_fixpoint(line, table, &state)?;
             out.push_str(&expanded.replace('\n', "\n\t"));
         } else {
             out.push_str(line);

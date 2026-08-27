@@ -593,6 +593,47 @@ mod functions {
         assert!(out.contains("[hi a and b]"), "got: {out:?}");
     }
 
+    // A self-referential $(call) recursed through
+    // substitute -> func::call -> expand -> substitute until the stack was
+    // exhausted: "fatal runtime error: stack overflow", core dumped.
+    // MAX_EXPANSION_ROUNDS bounds the rounds within one frame, not the depth of
+    // that cycle, so a separate depth guard was needed.
+    #[test]
+    fn self_referential_call_is_capped_not_a_crash() {
+        let err = preprocess("A = $(call A)\nall:\n\t@echo $(A)\n");
+        assert!(err.is_err(), "expected a depth error");
+    }
+
+    #[test]
+    fn mutually_recursive_calls_are_capped() {
+        let err = preprocess("A = $(call B)\nB = $(call A)\nall:\n\t@echo $(A)\n");
+        assert!(err.is_err(), "expected a depth error");
+    }
+
+    #[test]
+    fn recursion_through_foreach_is_capped() {
+        let err = preprocess("A = $(foreach x,1,$(call A))\nall:\n\t@echo $(A)\n");
+        assert!(err.is_err(), "expected a depth error");
+    }
+
+    // The cap must not reject legitimate nesting.
+    #[test]
+    fn finite_nesting_still_expands() {
+        let src = "f = [$(1)]\nall:\n\t@echo $(call f,$(call f,$(call f,x)))\n";
+        let out = preprocess(src).expect("must preprocess").text;
+        assert!(out.contains("[[[x]]]"), "got: {out:?}");
+    }
+
+    // The depth error crosses the func/preprocessor String boundary once per
+    // level; it must not accumulate a newline each time.
+    #[test]
+    fn a_depth_error_is_reported_once() {
+        let err = preprocess("A = $(call A)\nall:\n\t@echo $(A)\n")
+            .expect_err("must error")
+            .to_string();
+        assert_eq!(err.lines().count(), 1, "got: {err:?}");
+    }
+
     #[test]
     fn functions_nest() {
         assert_eq!(echoed("$(sort $(patsubst %.c,%.o,b.c a.c))"), "a.o b.o");

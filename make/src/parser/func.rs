@@ -18,12 +18,59 @@
 //! three that need their arguments *unexpanded* (`if`, `foreach`, `call`) are
 //! handled separately, before argument expansion.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+
+/// How deep the expansion cycle may recurse before we call it non-terminating.
+///
+/// `substitute` -> `func::call` -> `expand` -> `substitute` is a real recursion,
+/// and `MAX_EXPANSION_ROUNDS` bounds only the rounds *within* one frame. A
+/// self-referential `$(call ...)` therefore used to exhaust the stack and abort
+/// the process rather than report anything.
+const MAX_EXPANSION_DEPTH: usize = 200;
+
+/// Per-expansion state shared by every nested `Ctx`.
+#[derive(Default)]
+pub(crate) struct Expansion {
+    depth: Cell<usize>,
+}
+
+impl Expansion {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enter one level of nested expansion, or report that it is too deep.
+    ///
+    /// The returned guard restores the previous depth however the caller
+    /// leaves, including via `?`.
+    fn enter(&self) -> Result<DepthGuard<'_>, String> {
+        let depth = self.depth.get();
+        if depth >= MAX_EXPANSION_DEPTH {
+            return Err(format!(
+                "expansion nested more than {MAX_EXPANSION_DEPTH} deep (recursive definition?)"
+            ));
+        }
+        self.depth.set(depth + 1);
+        Ok(DepthGuard(self))
+    }
+}
+
+/// Restores the expansion depth when dropped.
+struct DepthGuard<'a>(&'a Expansion);
+
+impl Drop for DepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.depth.set(self.0.depth.get() - 1);
+    }
+}
 
 /// What a function needs to expand text of its own.
 pub(crate) struct Ctx<'a> {
     pub table: &'a HashMap<String, String>,
     pub env_wins: bool,
+    /// Shared across every nested `Ctx`, so recursion is bounded end to end.
+    pub state: &'a Expansion,
 }
 
 type Expand<'a> = &'a dyn Fn(&str, &Ctx) -> Result<String, String>;
@@ -353,6 +400,7 @@ fn f_foreach(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     if args.len() < 3 {
         return Err("foreach: needs three arguments".to_string());
     }
+    let _guard = ctx.state.enter()?;
     let var = expand(&args[0], ctx)?.trim().to_string();
     let list = expand(&args[1], ctx)?;
     let mut results = Vec::new();
@@ -362,6 +410,7 @@ fn f_foreach(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
         let inner = Ctx {
             table: &table,
             env_wins: ctx.env_wins,
+            state: ctx.state,
         };
         results.push(expand(&args[2], &inner)?);
     }
@@ -374,6 +423,7 @@ fn f_call(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     let Some(name) = args.first() else {
         return Err("call: needs a macro name".to_string());
     };
+    let _guard = ctx.state.enter()?;
     let name = expand(name, ctx)?.trim().to_string();
     let Some(body) = ctx.table.get(&name).cloned() else {
         return Ok(String::new());
@@ -386,6 +436,7 @@ fn f_call(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     let inner = Ctx {
         table: &table,
         env_wins: ctx.env_wins,
+        state: ctx.state,
     };
     expand(&body, &inner)
 }
@@ -471,9 +522,11 @@ mod tests {
 
     fn run(name: &str, raw: &str) -> String {
         let table = ctx_table();
+        let state = Expansion::new();
         let ctx = Ctx {
             table: &table,
             env_wins: false,
+            state: &state,
         };
         call(name, raw, &ctx, &plain).expect("function should succeed")
     }
@@ -542,9 +595,11 @@ mod tests {
     #[test]
     fn error_function_reports() {
         let table = ctx_table();
+        let state = Expansion::new();
         let ctx = Ctx {
             table: &table,
             env_wins: false,
+            state: &state,
         };
         assert!(call("error", "boom", &ctx, &plain).is_err());
     }

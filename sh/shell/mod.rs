@@ -32,19 +32,19 @@ use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
 use crate::shell::opened_files::OpenedFiles;
+use crate::shstr::{ShStr, ShString};
 use crate::wordexp::{
     expand_declaration_operand, expand_word, expand_word_to_string, word_to_pattern,
 };
 use gettextrs::gettext;
 use std::collections::HashMap;
-use std::ffi::{CString, OsString};
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Duration;
 use std::{env, io};
 
 /// Default capacity for cached command locations HashMap
@@ -152,7 +152,7 @@ pub fn execute_file_as_script(shell: &mut Shell, path: &Path) -> Result<i32, Scr
 
     let lineno = shell.last_lineno;
     shell.last_lineno = 0;
-    let execution_result = shell.execute_program(&source);
+    let execution_result = shell.execute_program(source.as_bytes());
     shell.last_lineno = lineno;
     execution_result.map_err(ScriptExecutionError::ParsingError)
 }
@@ -160,8 +160,8 @@ pub fn execute_file_as_script(shell: &mut Shell, path: &Path) -> Result<i32, Scr
 #[derive(Clone)]
 pub struct Shell {
     pub environment: Environment,
-    pub program_name: String,
-    pub positional_parameters: Vec<String>,
+    pub program_name: ShString,
+    pub positional_parameters: Vec<ShString>,
     pub opened_files: OpenedFiles,
     pub functions: HashMap<Name, Rc<CompoundCommand>>,
     pub last_pipeline_exit_status: i32,
@@ -181,7 +181,7 @@ pub struct Shell {
     pub background_jobs: JobManager,
     pub history: History,
     pub umask: u32,
-    pub saved_command_locations: HashMap<String, OsString>,
+    pub saved_command_locations: HashMap<Vec<u8>, OsString>,
     pub is_subshell: bool,
     pub last_pipeline_command: String,
     pub terminal: Terminal,
@@ -236,18 +236,18 @@ enum DeclarationUtility {
 
 impl DeclarationUtility {
     /// Classifies the command name, as an already-expanded field.
-    fn from_name(name: &str) -> Self {
-        match name {
-            "export" | "readonly" => Self::Yes,
-            "command" => Self::Pending,
+    fn from_name(name: &ShStr) -> Self {
+        match name.as_bytes() {
+            b"export" | b"readonly" => Self::Yes,
+            b"command" => Self::Pending,
             _ => Self::No,
         }
     }
 
     /// Refines a `Pending` verdict with `command`'s next expanded word.
-    fn resolve(self, word: &str) -> Self {
+    fn resolve(self, word: &ShStr) -> Self {
         match self {
-            Self::Pending if word.starts_with('-') => Self::Pending,
+            Self::Pending if word.starts_with(b"-") => Self::Pending,
             Self::Pending => Self::from_name(word),
             other => other,
         }
@@ -256,14 +256,22 @@ impl DeclarationUtility {
 
 /// True for a word of the form `name=…`, whose value a declaration utility
 /// expands as if it were an assignment.
-fn is_assignment_shaped(word: &str) -> bool {
-    word.split_once('=')
-        .is_some_and(|(name, _)| is_valid_name(name))
+fn is_assignment_shaped(word: &[u8]) -> bool {
+    // A name is restricted to the portable character set, so the bytes before
+    // the first `=` must be valid text to be one at all.
+    match word.iter().position(|&b| b == b'=') {
+        Some(pos) => std::str::from_utf8(&word[..pos]).is_ok_and(is_valid_name),
+        None => false,
+    }
 }
 
 impl Shell {
+    /// POSIX 2.12: a subshell starts with every trap the parent *caught* reset
+    /// to its default action; ignored traps stay ignored. That covers the EXIT
+    /// trap too, which is held separately from the signal traps.
     fn become_subshell(&mut self) {
         self.signal_manager.reset();
+        self.exit_action = TrapAction::Default;
         self.is_subshell = true;
     }
 
@@ -297,7 +305,14 @@ impl Shell {
     /// and must stay in the job table.
     pub fn wait_child_process_result(&mut self, child_pid: Pid) -> OsResult<(i32, bool)> {
         loop {
-            match waitpid(child_pid, true, true)? {
+            // Block. Signal handlers are installed without SA_RESTART and write
+            // to a self-pipe, so a signal interrupts the wait with EINTR and the
+            // trap runs below; polling with WNOHANG and sleeping instead cost a
+            // full tick per foreground command.
+            match waitpid(child_pid, false, true)? {
+                WaitStatus::Interrupted => {
+                    self.handle_async_events();
+                }
                 WaitStatus::Exited { exit_status } => return Ok((exit_status, true)),
                 WaitStatus::Signaled { signal, .. } => return Ok((signal.exit_status(), true)),
                 WaitStatus::Stopped { signal } => {
@@ -313,8 +328,9 @@ impl Shell {
                     return Ok((signal.exit_status(), false));
                 }
                 WaitStatus::StillAlive => {
+                    // Only reachable for a status this shell does not ask for
+                    // (WIFCONTINUED); the child is still running, so wait again.
                     self.handle_async_events();
-                    std::thread::sleep(Duration::from_millis(16));
                 }
             }
         }
@@ -322,21 +338,26 @@ impl Shell {
 
     pub fn handle_async_events(&mut self) {
         self.process_signals();
-        if self.set_options.monitor {
-            if let Err(err) = self.background_jobs.update_jobs() {
-                self.eprint(&format!("sh: error updating background jobs ({err})\n"));
-            }
-            if self.set_options.notify {
-                self.background_jobs
-                    .write_report(|job| self.opened_files.write_err(job.to_string_short()));
-            }
+        // Reap terminated background jobs whether or not job control is on:
+        // without this a non-interactive `cmd &` loop leaves one zombie per
+        // iteration. Only the *reporting* of state changes is a job-control
+        // feature.
+        if let Err(err) = self.background_jobs.update_jobs() {
+            self.eprint(&format!("sh: error updating background jobs ({err})\n"));
+        }
+        if self.set_options.monitor && self.set_options.notify {
+            self.background_jobs
+                .write_report(|job| self.opened_files.write_err(job.to_string_short()));
+        }
+        if !self.set_options.monitor {
+            self.background_jobs.collect_terminated_jobs();
         }
     }
 
-    pub fn assign_global(
+    pub fn assign_global<V: Into<ShString>>(
         &mut self,
         name: String,
-        value: String,
+        value: V,
     ) -> Result<&mut Value, CannotModifyReadonly> {
         // Changing PATH invalidates the remembered command locations (hash).
         if name == "PATH" {
@@ -353,7 +374,7 @@ impl Shell {
     pub fn execute_action(&mut self, action: TrapAction) {
         if let TrapAction::Commands(commands) = action {
             let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
-            if let Err(err) = self.execute_program(&commands) {
+            if let Err(err) = self.execute_program(commands.as_bytes()) {
                 eprintln!("sh: error parsing action: {}", err.message);
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
@@ -389,7 +410,7 @@ impl Shell {
     pub fn try_exec(
         &mut self,
         command: OsString,
-        args: &[String],
+        args: &[ShString],
         opened_files: &OpenedFiles,
     ) -> (String, i32) {
         let saved_signals = self.signal_manager.clone();
@@ -397,6 +418,10 @@ impl Shell {
         let failure =
             match exec(command.clone(), args, opened_files, &self.environment).unwrap_err() {
                 ExecError::OsError(err) => (format!("{err}\n"), 126),
+                ExecError::InteriorNul => (
+                    "sh: command, argument or environment entry contains a NUL\n".to_string(),
+                    126,
+                ),
                 ExecError::CannotExecute(errno) => {
                     if errno == Errno::ENOEXEC {
                         match execute_file_as_script(self, Path::new(&command)) {
@@ -428,7 +453,7 @@ impl Shell {
         failure
     }
 
-    pub fn exec(&mut self, command: OsString, args: &[String], opened_files: &OpenedFiles) -> ! {
+    pub fn exec(&mut self, command: OsString, args: &[ShString], opened_files: &OpenedFiles) -> ! {
         let (message, status) = self.try_exec(command, args, opened_files);
         self.eprint(&message);
         self.exit(status)
@@ -437,41 +462,63 @@ impl Shell {
     pub fn fork_and_exec(
         &mut self,
         command: OsString,
-        args: &[String],
+        args: &[ShString],
         opened_files: &OpenedFiles,
     ) -> OsResult<i32> {
         match fork()? {
-            ForkResult::Child => self.exec(command, args, opened_files),
-            ForkResult::Parent { child } => self.wait_child_process(child),
+            ForkResult::Child => {
+                self.become_subshell();
+                self.exec(command, args, opened_files)
+            }
+            ForkResult::Parent { child } => {
+                let status = self.wait_child_process(child);
+                // A background job may have finished while this one ran.
+                // `update_jobs` is a no-op when nothing is tracked.
+                self.handle_async_events();
+                status
+            }
         }
     }
 
+    /// Expands and applies each assignment in turn, returning the expanded
+    /// values for `set -x`.
+    ///
+    /// Expansion and assignment must interleave: POSIX processes the
+    /// assignments of a simple command left to right, and an earlier one is
+    /// visible to a later one, so `a=1 b=$a` sets `b` to `1`.
     fn assign_globals(
         &mut self,
         assignments: &[Assignment],
         export: bool,
-    ) -> CommandExecutionResult<()> {
+    ) -> CommandExecutionResult<Vec<(Name, ShString)>> {
+        let mut expanded = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value.word, true, self)?;
-            self.assign_global(assignment.name.to_string(), word_str)?
+            self.assign_global(assignment.name.to_string(), word_str.clone())?
                 .export_or(export);
+            expanded.push((assignment.name.clone(), word_str));
         }
-        Ok(())
+        Ok(expanded)
     }
 
-    fn assign_locals(&mut self, assignments: &[Assignment]) -> CommandExecutionResult<()> {
+    fn assign_locals(
+        &mut self,
+        assignments: &[Assignment],
+    ) -> CommandExecutionResult<Vec<(Name, ShString)>> {
+        let mut expanded = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value.word, true, self)?;
             self.environment
-                .set(assignment.name.to_string(), word_str)?;
+                .set(assignment.name.to_string(), word_str.clone())?;
+            expanded.push((assignment.name.clone(), word_str));
         }
-        Ok(())
+        Ok(expanded)
     }
 
     fn exec_special_builtin(
         &mut self,
         simple_command: &SimpleCommand,
-        args: &[String],
+        args: &[ShString],
         special_builtin_utility: &dyn SpecialBuiltinUtility,
     ) -> CommandExecutionResult<i32> {
         // the standard does not specify if the variables should have the export attribute.
@@ -500,18 +547,22 @@ impl Shell {
     fn exec_function(
         &mut self,
         simple_command: &SimpleCommand,
-        expanded_words: &[String],
+        expanded_words: &[ShString],
         function_body: &CompoundCommand,
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         self.environment.push_scope();
 
-        self.assign_locals(&simple_command.assignments)?;
+        // The scope must be popped even when the assignment fails, or the
+        // variable stays set and, because `Environment::exported` exports every
+        // local scope, leaks into every later child.
+        if let Err(err) = self.assign_locals(&simple_command.assignments) {
+            self.environment.pop_scope();
+            return Err(err);
+        }
 
-        let mut previous_opened_files = self.opened_files.clone();
-        previous_opened_files.redirect(&simple_command.redirections, self)?;
-        std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
-
+        // The redirections are applied by `interpret_compound_command` below;
+        // applying them here as well opened every one of them twice.
         let mut args = expanded_words[1..].to_vec();
         std::mem::swap(&mut args, &mut self.positional_parameters);
 
@@ -535,7 +586,6 @@ impl Shell {
         self.loop_depth = saved_loop_depth;
         self.last_lineno = saved_lineno;
         std::mem::swap(&mut args, &mut self.positional_parameters);
-        std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
         self.environment.pop_scope();
         result
     }
@@ -543,45 +593,61 @@ impl Shell {
     fn exec_builtin_utility(
         &mut self,
         simple_command: &SimpleCommand,
-        args: &[String],
+        args: &[ShString],
         builtin_utility: &dyn BuiltinUtility,
     ) -> CommandExecutionResult<i32> {
         let mut opened_files = self.opened_files.clone();
         opened_files.redirect(&simple_command.redirections, self)?;
 
+        // The prefix assignments live in a scope of their own, which must be
+        // popped even when the assignment fails: `Environment::exported`
+        // exports every local scope, so a leaked one would put the variable in
+        // the environment of every later child.
         self.environment.push_scope();
-        self.assign_locals(&simple_command.assignments)?;
-        let status = match builtin_utility.exec(args, self, &mut opened_files) {
-            Ok(status) => status,
-            Err(err) => {
-                opened_files.write_err(format!("{err}\n"));
-                1
-            }
-        };
+        let result =
+            self.assign_locals(&simple_command.assignments).map(|_| {
+                match builtin_utility.exec(args, self, &mut opened_files) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        opened_files.write_err(format!("{err}\n"));
+                        1
+                    }
+                }
+            });
         self.environment.pop_scope();
-        Ok(status)
+        result
     }
 
-    fn trace(&mut self, expanded_words: &[String]) {
+    /// `set -x`: report the command about to be executed, preceded by PS4.
+    /// Variable assignments are shown with their *expanded* values and precede
+    /// the command words; redirections are not shown. This matches dash.
+    fn trace(&mut self, assignments: &[(Name, ShString)], expanded_words: &[ShString]) {
+        if assignments.is_empty() && expanded_words.is_empty() {
+            return;
+        }
         let ps4 = self.get_ps4();
         self.eprint(&ps4);
-        for expanded_word in &expanded_words[..expanded_words.len() - 1] {
-            self.eprint(expanded_word);
-            self.eprint(" ");
+        let mut separator = "";
+        for (name, value) in assignments {
+            self.eprint(separator);
+            self.eprint(&format!("{name}={}", value.display()));
+            separator = " ";
         }
-        if let Some(expanded_word) = expanded_words.last() {
-            self.eprint(expanded_word);
+        for expanded_word in expanded_words {
+            self.eprint(separator);
+            self.eprint(&expanded_word.display().to_string());
+            separator = " ";
         }
         self.eprint("\n");
     }
 
     pub fn find_command(
         &mut self,
-        command_name: &str,
+        command_name: &ShStr,
         default_path: &str,
         remember_location: bool,
     ) -> Option<OsString> {
-        if let Some(command) = self.saved_command_locations.get(command_name) {
+        if let Some(command) = self.saved_command_locations.get(command_name.as_bytes()) {
             return Some(command.clone());
         }
         let path = self
@@ -591,7 +657,7 @@ impl Shell {
         if let Some(command) = find_command(command_name, path) {
             if remember_location {
                 self.saved_command_locations
-                    .insert(command_name.to_string(), command.clone());
+                    .insert(command_name.as_bytes().to_vec(), command.clone());
             }
             Some(command)
         } else {
@@ -615,7 +681,7 @@ impl Shell {
         for (index, word_pair) in simple_command.words.iter().enumerate() {
             if declaration_utility == DeclarationUtility::Yes
                 && index > 0
-                && is_assignment_shaped(&word_pair.as_string)
+                && is_assignment_shaped(word_pair.as_string.as_bytes())
             {
                 expanded_words.push(expand_declaration_operand(&word_pair.word, self)?);
                 continue;
@@ -630,12 +696,13 @@ impl Shell {
             }
             expanded_words.extend(fields);
         }
-        if self.set_options.xtrace {
-            self.trace(&expanded_words);
-        }
         if expanded_words.is_empty() {
-            // no commands to execute, perform assignments and redirections
-            self.assign_globals(&simple_command.assignments, false)?;
+            // No command to run: the assignments affect the shell itself, and
+            // `set -x` reports them with their expanded values.
+            let assigned = self.assign_globals(&simple_command.assignments, false)?;
+            if self.set_options.xtrace {
+                self.trace(&assigned, &expanded_words);
+            }
             if !simple_command.redirections.is_empty() {
                 let mut opened_files = self.opened_files.clone();
                 opened_files.redirect(&simple_command.redirections, self)?;
@@ -643,36 +710,44 @@ impl Shell {
             return Ok(self.last_command_substitution_status);
         }
 
-        if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
+        if self.set_options.xtrace {
+            // Any variable assignments are reported by the branches below,
+            // which is where they are expanded.
+            self.trace(&[], &expanded_words);
+        }
+
+        let command_name = expanded_words[0].display().to_string();
+        if let Some(special_builtin_utility) = get_special_builtin_utility(&command_name) {
             self.exec_special_builtin(
                 simple_command,
                 &expanded_words[1..],
                 special_builtin_utility,
             )
-        } else if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned()
-        {
+        } else if let Some(function_body) = self.functions.get(command_name.as_str()).cloned() {
             self.exec_function(
                 simple_command,
                 &expanded_words,
                 &function_body,
                 ignore_errexit,
             )
-        } else if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
+        } else if let Some(builtin_utility) = get_builtin_utility(&command_name) {
             self.exec_builtin_utility(simple_command, &expanded_words[1..], builtin_utility)
         } else {
             let command = self
                 .find_command(&expanded_words[0], "", self.set_options.hashall)
                 .ok_or(CommandExecutionError::CommandNotFound(
-                    expanded_words[0].to_string(),
+                    expanded_words[0].display().to_string(),
                 ))?;
 
             self.environment.push_scope();
-            self.assign_locals(&simple_command.assignments)?;
-            let mut opened_files = self.opened_files.clone();
-            opened_files.redirect(&simple_command.redirections, self)?;
             let result = self
-                .fork_and_exec(command, &expanded_words, &opened_files)
-                .map_err(|err| err.into());
+                .assign_locals(&simple_command.assignments)
+                .and_then(|_| {
+                    let mut opened_files = self.opened_files.clone();
+                    opened_files.redirect(&simple_command.redirections, self)?;
+                    self.fork_and_exec(command, &expanded_words, &opened_files)
+                        .map_err(|err| err.into())
+                });
             self.environment.pop_scope();
             result
         }
@@ -723,18 +798,11 @@ impl Shell {
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let arg = expand_word_to_string(&arg.word, false, self)?;
-        // A NUL cannot appear in a C string; treat the value as ending there.
-        let arg_cstr = CString::new(arg).unwrap_or_else(|err| {
-            let pos = err.nul_position();
-            let mut bytes = err.into_vec();
-            bytes.truncate(pos);
-            CString::new(bytes).expect("truncated at the first NUL")
-        });
         for (index, case) in cases.iter().enumerate() {
             let mut matched = false;
             for pattern in &case.pattern {
                 let pattern = word_to_pattern(&pattern.word, self)?;
-                if pattern.matches(&arg_cstr) {
+                if pattern.matches(arg.as_bytes()) {
                     matched = true;
                     break;
                 }
@@ -742,7 +810,10 @@ impl Shell {
             if !matched {
                 continue;
             }
-            let mut result = self.interpret(&case.body, ignore_errexit);
+            let mut result = match &case.body {
+                Some(body) => self.interpret(body, ignore_errexit),
+                None => 0,
+            };
             // `;&` falls through: execute subsequent items' bodies without
             // pattern matching, stopping at a `;;` item, the end, or once a
             // break/continue/return is pending.
@@ -752,7 +823,10 @@ impl Shell {
                 && self.control_flow_state == ControlFlowState::None
             {
                 idx += 1;
-                result = self.interpret(&cases[idx].body, ignore_errexit);
+                result = match &cases[idx].body {
+                    Some(body) => self.interpret(body, ignore_errexit),
+                    None => 0,
+                };
             }
             return Ok(result);
         }
@@ -784,14 +858,16 @@ impl Shell {
         continue_if_zero: bool,
         ignore_errexit: bool,
     ) -> i32 {
-        let status = 0;
+        // POSIX: a loop's exit status is that of the last command executed in
+        // its body, or zero if the body never ran.
+        let mut status = 0;
         loop {
             let condition = self.interpret(condition, true);
             if (condition == 0 && !continue_if_zero) || (condition != 0 && continue_if_zero) {
                 break;
             }
             self.loop_depth += 1;
-            self.interpret(body, ignore_errexit);
+            status = self.interpret(body, ignore_errexit);
             self.loop_depth -= 1;
             match self.control_flow_state {
                 ControlFlowState::Break(_) => {
@@ -869,9 +945,10 @@ impl Shell {
     }
 
     fn interpret_command(&mut self, command: &Command, ignore_errexit: bool) -> i32 {
-        let lineno_var = self
-            .environment
-            .set_global_forced("LINENO".to_string(), command.lineno.to_string());
+        let lineno_var = self.environment.set_global_forced(
+            "LINENO".to_string(),
+            ShString::from(command.lineno.to_string()),
+        );
         if lineno_var.readonly {
             self.opened_files
                 .write_err("sh: setting LINENO to readonly has no effect");
@@ -993,7 +1070,9 @@ impl Shell {
                 }
                 ForkResult::Parent { child } => {
                     loop {
-                        match waitpid(child, true, true)? {
+                        // Blocking; a signal interrupts with EINTR and is
+                        // handled below rather than being polled for.
+                        match waitpid(child, false, true)? {
                             WaitStatus::Exited { .. } => {
                                 // the only way this happened is if there was an error before going
                                 // the child went to sleep
@@ -1027,9 +1106,8 @@ impl Shell {
                                     break;
                                 }
                             }
-                            WaitStatus::StillAlive => {
+                            WaitStatus::StillAlive | WaitStatus::Interrupted => {
                                 self.handle_async_events();
-                                std::thread::sleep(Duration::from_millis(16));
                             }
                         }
                     }
@@ -1053,10 +1131,27 @@ impl Shell {
         ignore_errexit: bool,
     ) -> i32 {
         let mut status = 0;
-        let mut i = 0;
-        while i < list.len() {
-            let (pipeline, op) = &list[i];
-            let ignore_errexit = i == list.len() - 1 && ignore_errexit;
+        for i in 0..list.len() {
+            let (pipeline, _) = &list[i];
+            // The first pipeline always runs. Each later one runs only if the
+            // operator joining it to the previous pipeline is satisfied by the
+            // status so far; otherwise it is skipped and the status carries
+            // through. Skipping one element at a time is what makes
+            // `false && a && b` run neither a nor b.
+            if i > 0 {
+                let run = match list[i - 1].1 {
+                    LogicalOp::And => status == 0,
+                    LogicalOp::Or => status != 0,
+                    LogicalOp::None => true,
+                };
+                if !run {
+                    continue;
+                }
+            }
+            // POSIX 2.11: `set -e` exempts every command of an AND-OR list
+            // except the last, since the earlier ones' failure is what the
+            // operators are testing.
+            let ignore_errexit = i != list.len() - 1 || ignore_errexit;
             status = match self.interpret_pipeline(pipeline, ignore_errexit) {
                 Ok(status) => status,
                 Err(err) => {
@@ -1067,14 +1162,6 @@ impl Shell {
             if self.control_flow_state != ControlFlowState::None {
                 return status;
             }
-            if status != 0 && *op == LogicalOp::And {
-                // false && other ... -> skip other
-                i += 1;
-            } else if status == 0 && *op == LogicalOp::Or {
-                // true || other ... -> skip other
-                i += 1;
-            }
-            i += 1;
         }
         status
     }
@@ -1104,6 +1191,10 @@ impl Shell {
                     self.last_background_pid = Some(child);
                     self.background_jobs
                         .add_job(child, conjunction.to_string(), JobState::Running);
+                    // Reap whatever has already finished, so a loop that starts
+                    // background jobs does not accumulate a zombie per
+                    // iteration.
+                    self.handle_async_events();
                     0
                 }
                 Err(_) => {
@@ -1131,7 +1222,7 @@ impl Shell {
         status
     }
 
-    pub fn execute_in_subshell(&mut self, program: &str) -> CommandExecutionResult<String> {
+    pub fn execute_in_subshell(&mut self, program: &[u8]) -> CommandExecutionResult<ShString> {
         let (read_pipe, write_pipe) = pipe()?;
         match fork()? {
             ForkResult::Child => {
@@ -1158,29 +1249,36 @@ impl Shell {
                 // POSIX 2.9.1: when a command consists only of substitutions,
                 // its exit status is that of the last one, so the status has
                 // to be recorded rather than discarded.
-                self.last_command_substitution_status = match waitpid(child, false, false)? {
-                    WaitStatus::Exited { exit_status } => exit_status,
-                    WaitStatus::Signaled { signal } => signal.exit_status(),
-                    WaitStatus::Stopped { .. } | WaitStatus::StillAlive => 0,
+                // Blocking, so EINTR must be retried like every other wait
+                // site: handlers are installed without SA_RESTART, and folding
+                // `Interrupted` into 0 would report success for whatever the
+                // child actually did and leave it unreaped.
+                self.last_command_substitution_status = loop {
+                    match waitpid(child, false, false)? {
+                        WaitStatus::Exited { exit_status } => break exit_status,
+                        WaitStatus::Signaled { signal } => break signal.exit_status(),
+                        WaitStatus::Interrupted | WaitStatus::StillAlive => {
+                            self.handle_async_events()
+                        }
+                        WaitStatus::Stopped { .. } => break 0,
+                    }
                 };
-                // The shell represents words as UTF-8 strings; bytes that are
-                // not valid UTF-8 cannot be carried through, so substitute
-                // replacement characters rather than aborting.
                 // POSIX leaves NUL bytes in command output unspecified; drop
-                // them (as bash does) so they cannot reach the pattern and
-                // C-string code paths.
+                // them (as bash does) so they cannot reach the C-string paths.
+                // Everything else is kept exactly as the command wrote it — the
+                // output of a command substitution is a value, not text.
                 bytes.retain(|&b| b != 0);
-                let mut output = String::from_utf8_lossy(&bytes).into_owned();
-                let new_len = output.trim_end_matches('\n').len();
-                output.truncate(new_len);
-                Ok(output)
+                while bytes.last() == Some(&b'\n') {
+                    bytes.pop();
+                }
+                Ok(ShString::from(bytes))
             }
         }
     }
 
-    pub fn execute_program(&mut self, program: &str) -> Result<i32, ParserError> {
+    pub fn execute_program(&mut self, program: &[u8]) -> Result<i32, ParserError> {
         if self.set_options.verbose {
-            self.eprint(program)
+            self.eprint(&String::from_utf8_lossy(program))
         }
         if let Err(err) = self.background_jobs.update_jobs() {
             self.eprint(&format!("sh: error updating background jobs ({err})"));
@@ -1191,7 +1289,14 @@ impl Shell {
         loop {
             let command = parser.parse_next_command(&self.alias_table)?;
             if !self.is_interactive && self.set_options.noexec {
-                return Ok(result);
+                // `set -n` reads and parses without executing, so the whole
+                // input must be parsed: returning here checked only the first
+                // command and reported success for a script whose later
+                // commands do not parse.
+                if command.is_none() {
+                    return Ok(result);
+                }
+                continue;
             }
             if let Some(command) = command {
                 if self.is_interactive {
@@ -1210,14 +1315,14 @@ impl Shell {
             self.background_jobs
                 .write_report(|job| self.opened_files.write_err(job.to_string_short()));
         }
-        self.background_jobs.cleanup_terminated_jobs();
+        self.background_jobs.collect_terminated_jobs();
         self.last_lineno = parser.lineno() - 1;
         Ok(result)
     }
 
     pub fn initialize_from_system(
-        program_name: String,
-        args: Vec<String>,
+        program_name: ShString,
+        args: Vec<ShString>,
         mut set_options: SetOptions,
         is_interactive: bool,
     ) -> Shell {
@@ -1226,7 +1331,16 @@ impl Shell {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
         let mut environment =
-            Environment::from(std::env::vars().map(|(k, v)| (k, Value::new_exported(v))));
+            // `vars()` panics inside libstd on an entry that is not valid
+            // UTF-8; `vars_os()` cannot. A *name* is restricted to the portable
+            // character set, so one that is not text cannot be addressed as a
+            // shell variable — but POSIX still requires passing it on to
+            // children, so it is kept aside rather than dropped.
+            Environment::from(std::env::vars_os().filter_map(|(k, v)| {
+                k.into_string()
+                    .ok()
+                    .map(|k| (k, Value::new_exported(ShString::from(v))))
+            }));
         let ppid = unsafe { libc::getppid() };
         environment.set_global_forced("PPID".to_string(), ppid.to_string());
         environment.set_global_if_unset("IFS", " \t\n");
@@ -1316,10 +1430,11 @@ impl Shell {
     }
 
     pub fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
+        // PS1/PS2/PS4 are written to the terminal, so a lossy view is right.
         let var = self.environment.get_str_value(var).unwrap_or_default();
-        match parse_word(var, 0, false) {
+        match parse_word(var.as_bytes(), 0, false) {
             Ok(word) => match expand_word_to_string(&word, false, self) {
-                Ok(str) => str,
+                Ok(str) => str.display().to_string(),
                 Err(err) => {
                     self.handle_error(err);
                     default_if_err.to_string()
@@ -1355,7 +1470,7 @@ impl Default for Shell {
     fn default() -> Self {
         Shell {
             environment: Environment::from([("IFS".to_string(), Value::new(" \t\n".to_string()))]),
-            program_name: "sh".to_string(),
+            program_name: ShString::from("sh"),
             positional_parameters: Vec::default(),
             opened_files: OpenedFiles::default(),
             functions: HashMap::default(),
@@ -1375,7 +1490,9 @@ impl Default for Shell {
             signal_manager: SignalManager::new(false),
             background_jobs: JobManager::default(),
             history: History::new(32767),
-            umask: !0o022 & 0o777,
+            // Stored as the complement: the permission bits a new file may
+            // keep. Seeded from the inherited process mask rather than assumed.
+            umask: !crate::os::get_umask() & 0o777,
             saved_command_locations: HashMap::with_capacity(DEFAULT_COMMAND_CACHE_CAPACITY),
             is_subshell: false,
             last_pipeline_command: String::new(),

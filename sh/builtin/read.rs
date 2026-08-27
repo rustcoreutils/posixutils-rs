@@ -7,22 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::errno::Errno;
 use crate::os::read;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::split_fields;
 use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::Duration;
-
-fn bytes_to_string(bytes: Vec<u8>) -> Result<String, BuiltinError> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| gettext("read: invalid UTF-8").into())
-}
 
 fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     let mut buffer = [0u8; 1];
@@ -90,8 +86,8 @@ fn read_until_from_non_blocking_fd(
                 } else if next == b'\\' {
                     buffer.push(b'\\');
                 } else {
-                    result.append(bytes_to_string(std::mem::take(&mut buffer))?, false, true);
-                    result.append(bytes_to_string(vec![next])?, true, true);
+                    result.append(std::mem::take(&mut buffer), false, true);
+                    result.append(vec![next], true, true);
                 }
                 continue;
             }
@@ -106,10 +102,12 @@ fn read_until_from_non_blocking_fd(
         }
         // might receive signals while reading
         shell.handle_async_events();
-        std::thread::sleep(Duration::from_millis(16));
+        // Wait for the next byte instead of sleeping a tick between polls; the
+        // signal pipe is watched too, so a trap is still handled promptly.
+        crate::os::wait_for_input(fd)?;
     }
     if !buffer.is_empty() {
-        result.append(bytes_to_string(buffer)?, false, true);
+        result.append(buffer, false, true);
     }
     Ok(ReadResult {
         contents: result,
@@ -141,8 +139,8 @@ fn read_until_from_file(
             } else if next == b'\\' {
                 buffer.push(b'\\');
             } else {
-                result.append(bytes_to_string(std::mem::take(&mut buffer))?, false, true);
-                result.append(bytes_to_string(vec![next])?, true, true);
+                result.append(std::mem::take(&mut buffer), false, true);
+                result.append(vec![next], true, true);
             }
             continue;
         }
@@ -158,7 +156,7 @@ fn read_until_from_file(
     }
 
     if !buffer.is_empty() {
-        result.append(bytes_to_string(buffer)?, false, true);
+        result.append(buffer, false, true);
     }
     Ok(ReadResult {
         contents: result,
@@ -198,38 +196,40 @@ fn read_from_stdin(
     }
 }
 
-fn read_from_here_document(content: &str, delimiter: u8, backslash_escape: bool) -> ReadResult {
-    let mut buffer = String::new();
+fn read_from_here_document(content: &[u8], delimiter: u8, backslash_escape: bool) -> ReadResult {
+    // Scanned over bytes: the delimiter and the backslash are ASCII, so nothing
+    // here needs decoding and the contents survive unchanged.
+    let mut buffer = ShString::new();
     let mut result = ExpandedWord::default();
     let mut reached_eof = true;
     let mut escape_next = false;
     let mut consumed_bytes = content.len();
-    for (offset, c) in content.char_indices() {
+    for (offset, c) in content.iter().copied().enumerate() {
         // An escaped character is taken literally, so the delimiter test must
         // come after this one: backslash-<delimiter> is a line continuation,
         // not the end of the line (same rule as `read_until_from_file`).
         if escape_next {
             escape_next = false;
-            if c == delimiter as char {
+            if c == delimiter {
                 continue;
-            } else if c == '\\' {
-                buffer.push('\\');
+            } else if c == b'\\' {
+                buffer.push_bytes(b"\\");
             } else {
                 result.append(std::mem::take(&mut buffer), false, true);
-                result.append(c.to_string(), true, true);
+                result.append(ShString::from(vec![c]), true, true);
             }
             continue;
         }
-        if c == delimiter as char {
+        if c == delimiter {
             reached_eof = false;
-            consumed_bytes = offset + c.len_utf8();
+            consumed_bytes = offset + 1;
             break;
         }
-        if backslash_escape && c == '\\' {
+        if backslash_escape && c == b'\\' {
             escape_next = true;
             continue;
         }
-        buffer.push(c);
+        buffer.push_bytes([c]);
     }
     if !buffer.is_empty() {
         result.append(buffer, false, true);
@@ -285,10 +285,11 @@ fn read_until(
             // A here-document has no file offset, so the text just read is
             // removed from the shared buffer; the next `read` continues after
             // it, as it would with a real descriptor.
-            let result = read_from_here_document(&contents.borrow(), delimiter, backslash_escape);
+            let result =
+                read_from_here_document(contents.borrow().as_bytes(), delimiter, backslash_escape);
             let mut remaining = contents.borrow_mut();
             let consumed = result.consumed_bytes.min(remaining.len());
-            remaining.drain(..consumed);
+            *remaining = ShString::from(remaining[consumed..].to_vec());
             Ok(result)
         }
         _ => Err(gettext("read: invalid standard input").into()),
@@ -300,10 +301,11 @@ pub struct BuiltinRead;
 impl BuiltinUtility for BuiltinRead {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("read", args)?;
         let mut option_parser = OptionParser::new(args);
 
         let mut delim = None;
@@ -365,7 +367,7 @@ impl BuiltinUtility for BuiltinRead {
         let mut assignment_failed = false;
         for i in 0..fields.len() {
             if shell
-                .assign_global(vars[i].clone(), fields[i].to_string())
+                .assign_global(vars[i].to_string(), fields[i].to_sh_string())
                 .is_err()
             {
                 opened_files.write_err(format!(
@@ -378,7 +380,10 @@ impl BuiltinUtility for BuiltinRead {
         }
         if fields.len() < vars.len() {
             for var in &vars[fields.len()..] {
-                if shell.assign_global(var.clone(), String::new()).is_err() {
+                if shell
+                    .assign_global(var.to_string(), ShString::new())
+                    .is_err()
+                {
                     opened_files.write_err(format!(
                         "read: {} {}\n",
                         gettext("cannot set readonly variable"),

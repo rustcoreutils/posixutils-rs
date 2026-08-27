@@ -10,6 +10,7 @@
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 pub struct Exec;
@@ -17,7 +18,7 @@ pub struct Exec;
 impl SpecialBuiltinUtility for Exec {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
@@ -33,7 +34,7 @@ impl SpecialBuiltinUtility for Exec {
             opened_files.write_err(format!(
                 "{}: {}: {}\n",
                 gettext("exec"),
-                args[0],
+                args[0].display(),
                 gettext("command not found")
             ));
             if shell.is_interactive && !shell.is_subshell {

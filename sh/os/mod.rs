@@ -11,6 +11,7 @@ use crate::os::errno::{get_current_errno_value, Errno};
 use crate::os::signals::TermSignal;
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
+use crate::shstr::ShString;
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt::{Display, Formatter};
@@ -101,6 +102,55 @@ pub enum ForkResult {
 }
 
 #[allow(clippy::comparison_chain)]
+/// Sets the process file-mode creation mask and returns the previous one.
+/// `umask(2)` cannot fail.
+pub fn umask(mask: u32) -> u32 {
+    unsafe { libc::umask(mask as libc::mode_t) as u32 }
+}
+
+/// Reads the process file-mode creation mask without changing it. There is no
+/// query form of `umask(2)`, so it has to be set and put back.
+pub fn get_umask() -> u32 {
+    // The mask is the most restrictive one available, so that a file created
+    // between the two calls -- from a signal handler, say -- is not left more
+    // permissive than the caller asked for.
+    let previous = umask(0o777);
+    umask(previous);
+    previous
+}
+
+/// Blocks until `fd` has input available or a signal arrives, whichever comes
+/// first. Replaces polling with a sleep: an idle shell should not wake up at
+/// all, and a signal must not have to wait out a tick to be seen.
+pub fn wait_for_input(fd: RawFd) -> OsResult<()> {
+    let signal_fd = crate::os::signals::signal_read_fd();
+    let mut fds = [
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: signal_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+    if result < 0 {
+        let errno = get_current_errno_value();
+        // A signal without SA_RESTART interrupts the poll; that is the wake-up
+        // it was waiting for, not a failure.
+        if errno != Errno::EINTR {
+            return Err(OsError {
+                command: "poll",
+                errno,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn fork() -> OsResult<ForkResult> {
     // fork in general is not safe for multithreaded programs, but all code in this module is single
     // threaded, so this is safe
@@ -144,9 +194,17 @@ pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
 }
 
 pub enum WaitStatus {
-    Exited { exit_status: libc::c_int },
-    Signaled { signal: TermSignal },
-    Stopped { signal: TermSignal },
+    /// `waitpid` returned EINTR: no status yet, but a signal is pending.
+    Interrupted,
+    Exited {
+        exit_status: libc::c_int,
+    },
+    Signaled {
+        signal: TermSignal,
+    },
+    Stopped {
+        signal: TermSignal,
+    },
     StillAlive,
 }
 
@@ -161,7 +219,17 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
     }
     let wait_result = unsafe { libc::waitpid(pid, &mut status, options) };
     if wait_result < 0 {
-        Err(OsError::from_current_errno("waitpid"))
+        let errno = get_current_errno_value();
+        if errno == Errno::EINTR {
+            // A signal arrived while blocked. The handler has recorded it on
+            // the signal pipe; report it so the caller can run any trap and
+            // wait again, rather than treating it as a failure.
+            return Ok(WaitStatus::Interrupted);
+        }
+        Err(OsError {
+            command: "waitpid",
+            errno,
+        })
     } else if wait_result == 0 && no_hang {
         Ok(WaitStatus::StillAlive)
     } else if libc::WIFEXITED(status) {
@@ -226,6 +294,9 @@ pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
 pub enum ExecError {
     OsError(OsError),
     CannotExecute(Errno),
+    /// A command name, argument or environment entry contained a NUL, which
+    /// `execve` cannot carry.
+    InteriorNul,
 }
 
 impl From<OsError> for ExecError {
@@ -234,12 +305,40 @@ impl From<OsError> for ExecError {
     }
 }
 
+/// Duplicates `fd` onto a descriptor strictly greater than `floor`, so that it
+/// cannot collide with any redirection destination.
+fn dup_above(fd: RawFd, floor: RawFd) -> OsResult<RawFd> {
+    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor + 1) };
+    if new_fd < 0 {
+        return Err(OsError {
+            command: "fcntl",
+            errno: get_current_errno_value(),
+        });
+    }
+    Ok(new_fd)
+}
+
 pub fn exec(
     command: OsString,
-    args: &[String],
+    args: &[ShString],
     opened_files: &OpenedFiles,
     env: &Environment,
 ) -> Result<Infallible, ExecError> {
+    // A source descriptor may itself be another redirection's destination
+    // (`3>&1 1>&2 2>&3`), and the map is iterated in an arbitrary order, so
+    // placing them one at a time can clobber a source before it is read. Move
+    // every source out of the way first, above every destination, then put them
+    // where they belong.
+    let highest_dest = opened_files
+        .opened_files
+        .keys()
+        .map(|id| *id as i32)
+        .max()
+        .unwrap_or(libc::STDERR_FILENO);
+    let mut staged: Vec<(RawFd, RawFd)> = Vec::with_capacity(opened_files.opened_files.len());
+    let mut to_close: Vec<RawFd> = Vec::new();
+    // Descriptors this function opened and must not leave behind.
+    let mut temporaries: Vec<RawFd> = Vec::new();
     for (id, file) in &opened_files.opened_files {
         let dest = *id as i32;
         let src = match file {
@@ -250,30 +349,59 @@ pub fn exec(
             | OpenedFile::WriteFile(file)
             | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
             OpenedFile::HereDocument(contents) => {
-                let here_document = here_document_fd(contents.borrow().as_bytes())?.into_raw_fd();
-                // mkstemp may well hand back the descriptor the redirection
-                // targets (e.g. `exec 3<<EOF` with fd 3 free), and closing it
-                // after a no-op dup2 would leave the target closed.
-                if here_document != dest {
-                    dup2(here_document, dest)?;
-                    close(here_document)?;
-                }
+                // Owned here: the temporary must be closed once it has been
+                // duplicated into place, or it is inherited by the exec'd
+                // process as a stray descriptor.
+                let fd = here_document_fd(contents.borrow().as_bytes())?.into_raw_fd();
+                temporaries.push(fd);
+                fd
+            }
+            OpenedFile::Closed => {
+                // `2>&-`: the descriptor must actually be closed, not merely
+                // dropped from the table and inherited. Deferred until every
+                // other redirection is in place: closing fd 5 for `5<&-` frees
+                // it, so a later `<file` in the same command may well have been
+                // handed fd 5 by the kernel, and closing it here would take
+                // that descriptor with it.
+                to_close.push(dest);
                 continue;
             }
         };
-        dup2(src, dest)?;
+        staged.push((dup_above(src, highest_dest)?, dest));
     }
-    let command = CString::new(command.into_vec()).unwrap();
+    for (src, dest) in staged {
+        dup2(src, dest)?;
+        close(src)?;
+    }
+    for fd in temporaries {
+        let _ = close(fd);
+    }
+    for fd in to_close {
+        let _ = close(fd);
+    }
+    // An interior NUL cannot be passed through execve. A shell value may
+    // contain one, so this is an error to report, not a reason to abort in the
+    // child after the fork.
+    let command = CString::new(command.into_vec()).map_err(|_| ExecError::InteriorNul)?;
     let args = args
         .iter()
-        .map(|s| CString::new(s.as_str()).unwrap())
-        .collect::<Vec<_>>();
+        .map(|s| s.to_c_string())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ExecError::InteriorNul)?;
     let mut args_ptr_vec = args.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
     args_ptr_vec.push(std::ptr::null());
+    // Built by byte concatenation, not `format!`: an environment entry is a
+    // value, and a lossy conversion here would corrupt it silently.
     let env = env
         .exported()
-        .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap())
-        .collect::<Vec<CString>>();
+        .map(|(name, value)| {
+            let mut entry = Vec::with_capacity(name.len() + 1 + value.len());
+            entry.extend_from_slice(name.as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            CString::new(entry).map_err(|_| ExecError::InteriorNul)
+        })
+        .collect::<Result<Vec<CString>, _>>()?;
     let mut env_ptr_vec = env.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
     env_ptr_vec.push(std::ptr::null());
     // execve only returns on failure
@@ -311,7 +439,7 @@ pub fn is_process_in_foreground() -> bool {
     }
 }
 
-pub fn find_in_path(command: &str, env_path: &str) -> Option<OsString> {
+pub fn find_in_path(command: &std::ffi::OsStr, env_path: &str) -> Option<OsString> {
     for path in env_path.split(':') {
         let mut command_path = PathBuf::from(path);
         command_path.push(command);
@@ -322,16 +450,16 @@ pub fn find_in_path(command: &str, env_path: &str) -> Option<OsString> {
     None
 }
 
-pub fn find_command(command: &str, env_path: &str) -> Option<OsString> {
-    if command.contains('/') {
-        let path = PathBuf::from(command);
+pub fn find_command(command: &crate::shstr::ShStr, env_path: &str) -> Option<OsString> {
+    if command.contains(&b'/') {
+        let path = PathBuf::from(command.as_os_str());
         if path.exists() {
             Some(path.into_os_string())
         } else {
             None
         }
     } else {
-        find_in_path(command, env_path)
+        find_in_path(command.as_os_str(), env_path)
     }
 }
 

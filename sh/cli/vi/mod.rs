@@ -405,7 +405,8 @@ impl ViEditor {
                 if let Some(word_range) = current_bigword(current_line, self.cursor.position) {
                     let word =
                         into_expansion_word(&current_line[word_range.start..word_range.end])?;
-                    let parsed_word = parse_word(&word, 0, false).map_err(|_| CommandError)?;
+                    let parsed_word =
+                        parse_word(word.as_bytes(), 0, false).map_err(|_| CommandError)?;
                     let expansions =
                         expand_word(&parsed_word, false, shell).map_err(|_| CommandError)?;
                     if expansions.is_empty() {
@@ -413,7 +414,10 @@ impl ViEditor {
                     }
                     println!();
                     for (i, e) in expansions.into_iter().enumerate() {
-                        println!("{i}) {}", add_terminating_slash_if_directory(e));
+                        println!(
+                            "{i}) {}",
+                            add_terminating_slash_if_directory(e.display().to_string())
+                        );
                     }
                 }
             }
@@ -423,7 +427,8 @@ impl ViEditor {
                     let word =
                         into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
                     let pattern =
-                        FilenamePattern::try_from(word.into_owned()).map_err(|_| CommandError)?;
+                        FilenamePattern::try_from(crate::shstr::ShString::from(word.into_owned()))
+                            .map_err(|_| CommandError)?;
                     let expansions = glob(&pattern, Path::new(&shell.current_directory));
                     if expansions.is_empty() {
                         return Err(CommandError);
@@ -444,7 +449,8 @@ impl ViEditor {
                     let word =
                         into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
                     let pattern =
-                        FilenamePattern::try_from(word.into_owned()).map_err(|_| CommandError)?;
+                        FilenamePattern::try_from(crate::shstr::ShString::from(word.into_owned()))
+                            .map_err(|_| CommandError)?;
                     let expansions = glob(&pattern, Path::new(&shell.current_directory));
                     if expansions.is_empty() {
                         return Err(CommandError);
@@ -507,14 +513,21 @@ impl ViEditor {
                     .unwrap_or("vi")
                     .to_string();
                 let command_path = shell
-                    .find_command(&editor, "", shell.set_options.hashall)
+                    .find_command(
+                        crate::shstr::ShStr::new(&editor),
+                        "",
+                        shell.set_options.hashall,
+                    )
                     .ok_or(CommandError)?;
                 let (fd, path) = mkstemp("/tmp/sh-vi.XXXXXX").map_err(|_| CommandError)?;
                 write(fd, &content).map_err(|_| CommandError)?;
                 let opened = shell.opened_files.clone();
                 // restore cooked mode for the editor, then return to raw mode
                 shell.terminal.reset();
-                let args = vec![editor.clone(), path.to_string_lossy().into_owned()];
+                let args = vec![
+                    crate::shstr::ShString::from(editor.clone()),
+                    crate::shstr::ShString::from(path.as_os_str()),
+                ];
                 let _ = shell.fork_and_exec(command_path, &args, &opened);
                 shell.terminal.set_nonblocking_no_echo();
                 // read the edited file back (a fresh handle avoids fd-offset issues)

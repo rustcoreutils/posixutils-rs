@@ -19,17 +19,19 @@ struct IndexIter {
 }
 
 impl IndexIter {
-    fn next(&mut self, string: &str) -> Option<char> {
+    /// A byte cursor. Every character the grammar cares about is ASCII, so the
+    /// lexer never decodes: a byte >= 0x80 is an ordinary word character.
+    fn next(&mut self, string: &[u8]) -> Option<u8> {
         if let Some(c) = self.peek(string) {
-            self.pos += c.len_utf8();
+            self.pos += 1;
             Some(c)
         } else {
             None
         }
     }
 
-    fn peek(&self, string: &str) -> Option<char> {
-        string[self.pos..].chars().next()
+    fn peek(&self, string: &[u8]) -> Option<u8> {
+        string.get(self.pos).copied()
     }
 }
 
@@ -42,7 +44,7 @@ struct SourceReadState {
 }
 
 struct SourcePart<'s> {
-    text: Cow<'s, str>,
+    text: Cow<'s, [u8]>,
     in_original_string: bool,
     provenance: String,
 }
@@ -93,7 +95,7 @@ struct SourceString<'s> {
 }
 
 impl<'s> SourceString<'s> {
-    fn new(s: &'s str) -> Self {
+    fn new(s: &'s [u8]) -> Self {
         Self {
             parts: vec![SourcePart {
                 text: s.into(),
@@ -109,11 +111,11 @@ impl<'s> SourceString<'s> {
         }
     }
 
-    fn current_str(&self) -> &str {
+    fn current_str(&self) -> &[u8] {
         self.parts[self.read_state.current_part].text.as_ref()
     }
 
-    fn peek(&self) -> Option<char> {
+    fn peek(&self) -> Option<u8> {
         self.read_state
             .current_part_char_iter
             .peek(self.current_str())
@@ -131,7 +133,7 @@ impl<'s> SourceString<'s> {
                 .current_part_char_iter
                 .next(self.parts[self.read_state.current_part].text.as_ref())
             {
-                if char == '\n' && self.parts[self.read_state.current_part].in_original_string {
+                if char == b'\n' && self.parts[self.read_state.current_part].in_original_string {
                     self.read_state.line_no += 1;
                 }
                 if self.read_state.current_part == self.parts.len() - 1 && self.peek().is_none() {
@@ -148,7 +150,7 @@ impl<'s> SourceString<'s> {
         }
     }
 
-    fn substr(&self, start: &SourceReadState, end: &SourceReadState) -> Cow<'s, str> {
+    fn substr(&self, start: &SourceReadState, end: &SourceReadState) -> Cow<'s, [u8]> {
         assert!(start.current_part <= end.current_part);
         if start.current_part == end.current_part {
             match self.parts[start.current_part].text {
@@ -161,18 +163,21 @@ impl<'s> SourceString<'s> {
                 }
             }
         } else {
-            let mut result = String::new();
-            result
-                .push_str(&self.parts[start.current_part].text[start.current_part_char_iter.pos..]);
+            let mut result: Vec<u8> = Vec::new();
+            result.extend_from_slice(
+                &self.parts[start.current_part].text[start.current_part_char_iter.pos..],
+            );
             for part_idx in start.current_part + 1..end.current_part {
-                result.push_str(self.parts[part_idx].text.as_ref());
+                result.extend_from_slice(self.parts[part_idx].text.as_ref());
             }
-            result.push_str(&self.parts[end.current_part].text[..end.current_part_char_iter.pos]);
+            result.extend_from_slice(
+                &self.parts[end.current_part].text[..end.current_part_char_iter.pos],
+            );
             result.into()
         }
     }
 
-    fn insert_string_after_last_char(&mut self, string: Cow<'s, str>, tag: &str) {
+    fn insert_string_after_last_char(&mut self, string: Cow<'s, [u8]>, tag: &str) {
         if string.is_empty() {
             return;
         }
@@ -210,19 +215,14 @@ impl<'s> SourceString<'s> {
         self.read_state.line_no
     }
 
-    fn lookahead(&self) -> char {
+    fn lookahead(&self) -> u8 {
         if let Some(c) = self.peek() {
             c
         } else {
             if self.read_state.current_part == self.parts.len() - 1 {
-                return '\0';
+                return b'\0';
             }
-            self.parts[self.read_state.current_part + 1]
-                .text
-                .as_ref()
-                .chars()
-                .next()
-                .unwrap()
+            self.parts[self.read_state.current_part + 1].text[0]
         }
     }
 
@@ -232,10 +232,10 @@ impl<'s> SourceString<'s> {
     /// reserved words may all be split across lines.
     fn skip_line_continuations(&mut self) -> bool {
         let mut removed = false;
-        while self.lookahead() == '\\' {
+        while self.lookahead() == b'\\' {
             let before_backslash = self.read_state.clone();
             self.advance_char();
-            if self.lookahead() == '\n' {
+            if self.lookahead() == b'\n' {
                 self.advance_char();
                 removed = true;
             } else {
@@ -299,15 +299,15 @@ pub enum CommandToken<'src> {
     // number followed by a redirection operator
     IoNumber(u32),
 
-    Word(Cow<'src, str>),
+    Word(Cow<'src, [u8]>),
     HereDocument {
-        delimiter: Cow<'src, str>,
-        contents: Cow<'src, str>,
+        delimiter: Cow<'src, [u8]>,
+        contents: Cow<'src, [u8]>,
     },
     QuotedHereDocument {
-        start_delimiter: Cow<'src, str>,
-        end_delimiter: Cow<'src, str>,
-        contents: Cow<'src, str>,
+        start_delimiter: Cow<'src, [u8]>,
+        end_delimiter: Cow<'src, [u8]>,
+        contents: Cow<'src, [u8]>,
     },
 
     Eof,
@@ -360,6 +360,45 @@ impl Display for CommandToken<'_> {
 }
 
 impl<'src> CommandToken<'src> {
+    /// A reserved word can only occur in command position (POSIX 2.4), so one
+    /// appearing while a simple command is being read means that command has
+    /// ended.
+    pub fn is_reserved_word(&self) -> bool {
+        matches!(
+            self,
+            CommandToken::Bang
+                | CommandToken::LBrace
+                | CommandToken::RBrace
+                | CommandToken::Case
+                | CommandToken::Do
+                | CommandToken::Done
+                | CommandToken::Elif
+                | CommandToken::Else
+                | CommandToken::Esac
+                | CommandToken::Fi
+                | CommandToken::For
+                | CommandToken::If
+                | CommandToken::In
+                | CommandToken::Then
+                | CommandToken::Until
+                | CommandToken::While
+        )
+    }
+
+    /// The token's text as bytes, for the positions where any word is allowed.
+    /// A reserved word maps back to its spelling; anything that is not a word
+    /// yields `None`.
+    pub fn as_word_bytes(&self) -> Option<&[u8]> {
+        match self {
+            CommandToken::Word(word) => Some(word.as_ref()),
+            other => other.as_word_str().map(str::as_bytes),
+        }
+    }
+
+    /// As [`Self::as_word_bytes`], but only for text. A `Word` holding bytes
+    /// that are not a character yields `None`, so this is for comparisons
+    /// against fixed spellings, never for deciding whether something *is* a
+    /// word.
     pub fn as_word_str(&self) -> Option<&str> {
         match self {
             CommandToken::Bang => Some("!"),
@@ -378,59 +417,62 @@ impl<'src> CommandToken<'src> {
             CommandToken::Then => Some("then"),
             CommandToken::Until => Some("until"),
             CommandToken::While => Some("while"),
-            CommandToken::Word(word) => Some(word.as_ref()),
+            CommandToken::Word(word) => std::str::from_utf8(word.as_ref()).ok(),
             _ => None,
         }
     }
 
-    pub fn into_word_cow(self) -> Option<Cow<'src, str>> {
+    pub fn into_word_cow(self) -> Option<Cow<'src, [u8]>> {
         match self {
-            CommandToken::Bang => Some("!".into()),
-            CommandToken::LBrace => Some("{".into()),
-            CommandToken::RBrace => Some("}".into()),
-            CommandToken::Case => Some("case".into()),
-            CommandToken::Do => Some("do".into()),
-            CommandToken::Done => Some("done".into()),
-            CommandToken::Elif => Some("elif".into()),
-            CommandToken::Else => Some("else".into()),
-            CommandToken::Esac => Some("esac".into()),
-            CommandToken::Fi => Some("fi".into()),
-            CommandToken::For => Some("for".into()),
-            CommandToken::If => Some("if".into()),
-            CommandToken::In => Some("in".into()),
-            CommandToken::Then => Some("then".into()),
-            CommandToken::Until => Some("until".into()),
-            CommandToken::While => Some("while".into()),
+            CommandToken::Bang => Some(Cow::Borrowed(b"!".as_slice())),
+            CommandToken::LBrace => Some(Cow::Borrowed(b"{".as_slice())),
+            CommandToken::RBrace => Some(Cow::Borrowed(b"}".as_slice())),
+            CommandToken::Case => Some(Cow::Borrowed(b"case".as_slice())),
+            CommandToken::Do => Some(Cow::Borrowed(b"do".as_slice())),
+            CommandToken::Done => Some(Cow::Borrowed(b"done".as_slice())),
+            CommandToken::Elif => Some(Cow::Borrowed(b"elif".as_slice())),
+            CommandToken::Else => Some(Cow::Borrowed(b"else".as_slice())),
+            CommandToken::Esac => Some(Cow::Borrowed(b"esac".as_slice())),
+            CommandToken::Fi => Some(Cow::Borrowed(b"fi".as_slice())),
+            CommandToken::For => Some(Cow::Borrowed(b"for".as_slice())),
+            CommandToken::If => Some(Cow::Borrowed(b"if".as_slice())),
+            CommandToken::In => Some(Cow::Borrowed(b"in".as_slice())),
+            CommandToken::Then => Some(Cow::Borrowed(b"then".as_slice())),
+            CommandToken::Until => Some(Cow::Borrowed(b"until".as_slice())),
+            CommandToken::While => Some(Cow::Borrowed(b"while".as_slice())),
             CommandToken::Word(word) => Some(word),
             _ => None,
         }
     }
 
-    fn word(word: Cow<'src, str>) -> Self {
+    fn word(word: Cow<'src, [u8]>, recognize_reserved: bool) -> Self {
+        if !recognize_reserved {
+            return CommandToken::Word(word);
+        }
         // A reserved word may be split by a line continuation (`i\`+newline+`f`),
         // which is removed before token recognition.
-        let unsplit = if word.contains('\\') {
+        let unsplit = if word.contains(&b'\\') {
             strip_line_continuations(word.as_ref())
         } else {
             None
         };
         match unsplit.as_deref().unwrap_or(word.as_ref()) {
-            "!" => CommandToken::Bang,
-            "{" => CommandToken::LBrace,
-            "}" => CommandToken::RBrace,
-            "case" => CommandToken::Case,
-            "do" => CommandToken::Do,
-            "done" => CommandToken::Done,
-            "elif" => CommandToken::Elif,
-            "else" => CommandToken::Else,
-            "esac" => CommandToken::Esac,
-            "fi" => CommandToken::Fi,
-            "for" => CommandToken::For,
-            "if" => CommandToken::If,
-            "in" => CommandToken::In,
-            "then" => CommandToken::Then,
-            "until" => CommandToken::Until,
-            "while" => CommandToken::While,
+            b"!" => CommandToken::Bang,
+            b"{" => CommandToken::LBrace,
+            b"}" => CommandToken::RBrace,
+            b"case" => CommandToken::Case,
+            b"do" => CommandToken::Do,
+            b"done" => CommandToken::Done,
+            b"elif" => CommandToken::Elif,
+            b"else" => CommandToken::Else,
+            b"esac" => CommandToken::Esac,
+            b"fi" => CommandToken::Fi,
+            b"for" => CommandToken::For,
+            b"if" => CommandToken::If,
+            b"in" => CommandToken::In,
+            b"then" => CommandToken::Then,
+            b"until" => CommandToken::Until,
+            b"while" => CommandToken::While,
             _ => CommandToken::Word(word),
         }
     }
@@ -439,13 +481,17 @@ impl<'src> CommandToken<'src> {
 /// Removes `\`-newline line continuations from a word so that a reserved word
 /// split across lines is still recognized. Returns `None` when the word carries
 /// any other quoting, which would keep it an ordinary word regardless.
-fn strip_line_continuations(word: &str) -> Option<String> {
-    let mut result = String::with_capacity(word.len());
-    let mut chars = word.chars();
-    while let Some(c) = chars.next() {
+fn strip_line_continuations(word: &[u8]) -> Option<Vec<u8>> {
+    let mut result: Vec<u8> = Vec::with_capacity(word.len());
+    let mut bytes = word.iter().copied().peekable();
+    while let Some(c) = bytes.next() {
         match c {
-            '\\' if chars.next() == Some('\n') => {}
-            '\\' | '\'' | '"' | '`' | '$' => return None,
+            // Peek rather than consume: a guard that calls `next()` swallows
+            // the byte even when the guard fails.
+            b'\\' if bytes.peek() == Some(&b'\n') => {
+                bytes.next();
+            }
+            b'\\' | b'\'' | b'"' | b'`' | b'$' => return None,
             _ => result.push(c),
         }
     }
@@ -457,16 +503,16 @@ fn advance_and_return<Tok>(lex: &mut CommandLexer, complete_token: Tok) -> Tok {
     complete_token
 }
 
-fn char_to_operator_token(c: char) -> Option<CommandToken<'static>> {
+fn char_to_operator_token(c: u8) -> Option<CommandToken<'static>> {
     match c {
-        '&' => Some(CommandToken::And),
-        '(' => Some(CommandToken::LParen),
-        ')' => Some(CommandToken::RParen),
-        ';' => Some(CommandToken::SemiColon),
-        '\n' => Some(CommandToken::Newline),
-        '|' => Some(CommandToken::Pipe),
-        '<' => Some(CommandToken::Less),
-        '>' => Some(CommandToken::Greater),
+        b'&' => Some(CommandToken::And),
+        b'(' => Some(CommandToken::LParen),
+        b')' => Some(CommandToken::RParen),
+        b';' => Some(CommandToken::SemiColon),
+        b'\n' => Some(CommandToken::Newline),
+        b'|' => Some(CommandToken::Pipe),
+        b'<' => Some(CommandToken::Less),
+        b'>' => Some(CommandToken::Greater),
         _ => None,
     }
 }
@@ -485,7 +531,7 @@ impl Lexer for CommandLexer<'_> {
         self.source.reached_eof()
     }
 
-    fn lookahead(&mut self) -> char {
+    fn lookahead(&mut self) -> u8 {
         self.source.lookahead()
     }
 
@@ -493,19 +539,19 @@ impl Lexer for CommandLexer<'_> {
         self.source.line_no()
     }
 
-    fn next_line(&mut self) -> Cow<'_, str> {
+    fn next_line(&mut self) -> Cow<'_, [u8]> {
         let start = self.source.read_state.clone();
         while !self.reached_eof() {
             let lookahead = self.lookahead();
             self.advance();
-            if lookahead == '\n' {
+            if lookahead == b'\n' {
                 break;
             }
         }
         self.source.substr(&start, &self.source.read_state)
     }
 
-    fn next_word(&mut self) -> ParseResult<Cow<'_, str>> {
+    fn next_word(&mut self) -> ParseResult<Cow<'_, [u8]>> {
         self.read_word_token()
     }
 }
@@ -521,7 +567,7 @@ impl<'src> CommandLexer<'src> {
         }
     }
 
-    fn read_word_token(&mut self) -> ParseResult<Cow<'src, str>> {
+    fn read_word_token(&mut self) -> ParseResult<Cow<'src, [u8]>> {
         let start = self.source.read_state.clone();
         self.skip_word_token(None, false)?;
         let result = self.source.substr(&start, &self.source.read_state);
@@ -554,14 +600,14 @@ impl<'src> CommandLexer<'src> {
                 self.reached_eof(),
             ));
         }
-        let (is_quoted, end_delimiter) = remove_quotes(start_delimiter.as_ref());
+        let (is_quoted, end_delimiter) = remove_quotes(start_delimiter.as_ref())?;
 
         // Save the rest of the `<<` line; it is re-inserted below.
         let rest_of_line_start = self.source.read_state.clone();
         while !self.reached_eof() {
             let c = self.source.lookahead();
             self.source.advance_char();
-            if c == '\n' {
+            if c == b'\n' {
                 break;
             }
         }
@@ -581,14 +627,18 @@ impl<'src> CommandLexer<'src> {
             }
             let line_start = self.source.read_state.clone();
             let line = self.next_line();
-            let line = line.trim_end_matches('\n');
+            let line = line.strip_suffix(b"\n").unwrap_or(&line);
             // `<<-` also strips leading tabs from the terminator line.
             let line = if remove_leading_tabs {
-                line.trim_start_matches('\t')
+                let mut l = line;
+                while let Some(rest) = l.strip_prefix(b"\t") {
+                    l = rest;
+                }
+                l
             } else {
                 line
             };
-            if line == end_delimiter {
+            if line == end_delimiter.as_slice() {
                 body_end = line_start;
                 break;
             }
@@ -598,10 +648,19 @@ impl<'src> CommandLexer<'src> {
             .insert_string_after_last_char(rest_of_line, "here-document");
 
         let contents = if remove_leading_tabs {
-            let mut stripped = String::new();
-            for line in contents.lines() {
-                stripped.push_str(line.trim_start_matches('\t'));
-                stripped.push('\n');
+            let mut stripped: Vec<u8> = Vec::new();
+            for line in contents.split(|&b| b == b'\n') {
+                let mut l = line;
+                while let Some(rest) = l.strip_prefix(b"\t") {
+                    l = rest;
+                }
+                stripped.extend_from_slice(l);
+                stripped.push(b'\n');
+            }
+            // `split` yields a trailing empty piece for a body ending in a
+            // newline; drop the extra newline it just added.
+            if contents.last() == Some(&b'\n') {
+                stripped.pop();
             }
             Cow::Owned(stripped)
         } else {
@@ -622,7 +681,13 @@ impl<'src> CommandLexer<'src> {
         }
     }
 
-    pub fn next_token(&mut self) -> ParseResult<(CommandToken<'src>, u32)> {
+    /// `recognize_reserved` implements POSIX 2.4: a reserved word is only a
+    /// reserved word in specific grammatical positions, and an ordinary word
+    /// everywhere else. The parser decides, since only it knows the position.
+    pub fn next_token(
+        &mut self,
+        recognize_reserved: bool,
+    ) -> ParseResult<(CommandToken<'src>, u32)> {
         self.prev_read_state = self.source.read_state.clone();
         self.skip_blanks();
         self.skip_comment();
@@ -642,25 +707,25 @@ impl<'src> CommandLexer<'src> {
 
             let complete_token = match partial_token {
                 CommandToken::And => match self.source.lookahead() {
-                    '&' => advance_and_return(self, CommandToken::AndIf),
+                    b'&' => advance_and_return(self, CommandToken::AndIf),
                     _ => CommandToken::And,
                 },
                 CommandToken::Pipe => match self.source.lookahead() {
-                    '|' => advance_and_return(self, CommandToken::OrIf),
+                    b'|' => advance_and_return(self, CommandToken::OrIf),
                     _ => CommandToken::Pipe,
                 },
                 CommandToken::SemiColon => match self.source.lookahead() {
-                    ';' => advance_and_return(self, CommandToken::DSemi),
-                    '&' => advance_and_return(self, CommandToken::SemiAnd),
+                    b';' => advance_and_return(self, CommandToken::DSemi),
+                    b'&' => advance_and_return(self, CommandToken::SemiAnd),
                     _ => CommandToken::SemiColon,
                 },
                 CommandToken::Less => match self.source.lookahead() {
-                    '&' => advance_and_return(self, CommandToken::LessAnd),
-                    '>' => advance_and_return(self, CommandToken::LessGreat),
-                    '<' => {
+                    b'&' => advance_and_return(self, CommandToken::LessAnd),
+                    b'>' => advance_and_return(self, CommandToken::LessGreat),
+                    b'<' => {
                         self.source.advance_char();
                         self.source.skip_line_continuations();
-                        if self.source.lookahead() == '-' {
+                        if self.lookahead() == b'-' {
                             self.source.advance_char();
                             self.read_here_document(true)?
                         } else {
@@ -670,9 +735,9 @@ impl<'src> CommandLexer<'src> {
                     _ => CommandToken::Less,
                 },
                 CommandToken::Greater => match self.source.lookahead() {
-                    '>' => advance_and_return(self, CommandToken::DGreat),
-                    '&' => advance_and_return(self, CommandToken::GreatAnd),
-                    '|' => advance_and_return(self, CommandToken::Clobber),
+                    b'>' => advance_and_return(self, CommandToken::DGreat),
+                    b'&' => advance_and_return(self, CommandToken::GreatAnd),
+                    b'|' => advance_and_return(self, CommandToken::Clobber),
                     _ => CommandToken::Greater,
                 },
                 other => other,
@@ -684,29 +749,30 @@ impl<'src> CommandLexer<'src> {
             d if d.is_ascii_digit() => {
                 let prev_read_state = self.source.read_state.clone();
 
-                let mut number = d.to_digit(10).unwrap();
+                let mut number = u32::from(d - b'0');
                 self.source.advance_char();
                 self.source.skip_line_continuations();
-                while let Some(d) = self.source.lookahead().to_digit(10) {
+                while self.source.lookahead().is_ascii_digit() {
+                    let d = u32::from(self.source.lookahead() - b'0');
                     number = number.saturating_mul(10);
                     number = number.saturating_add(d);
                     self.source.advance_char();
                     self.source.skip_line_continuations();
                 }
-                if self.source.lookahead() == '>' || self.source.lookahead() == '<' {
+                if self.lookahead() == b'>' || self.lookahead() == b'<' {
                     CommandToken::IoNumber(number)
                 } else {
                     self.source.read_state = prev_read_state;
-                    CommandToken::word(self.read_word_token()?)
+                    CommandToken::word(self.read_word_token()?, recognize_reserved)
                 }
             }
-            _ => CommandToken::word(self.read_word_token()?),
+            _ => CommandToken::word(self.read_word_token()?, recognize_reserved),
         };
         Ok((token, line_no))
     }
 
     /// Inserts text after the last returned token
-    pub fn insert_text_at_current_position(&mut self, text: Cow<'src, str>, tag: &str) {
+    pub fn insert_text_at_current_position(&mut self, text: Cow<'src, [u8]>, tag: &str) {
         self.source.insert_string_after_last_char(text, tag);
     }
 
@@ -717,12 +783,12 @@ impl<'src> CommandLexer<'src> {
     pub fn is_next_lparen(&mut self) -> bool {
         let rollback = self.source.read_state.clone();
         self.skip_blanks();
-        let result = self.source.lookahead() == '(';
+        let result = self.lookahead() == b'(';
         self.source.read_state = rollback;
         result
     }
 
-    pub fn new(source: &'src str) -> Self {
+    pub fn new(source: &'src [u8]) -> Self {
         let source = SourceString::new(source);
         let initial_read_state = source.read_state.clone();
         Self {
@@ -737,23 +803,23 @@ mod tests {
     use super::*;
 
     fn lex_word(text: &str) {
-        let mut lex = CommandLexer::new(text);
-        if let CommandToken::Word(word) = lex.next_token().unwrap().0 {
-            assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
-            assert_eq!(word, text);
+        let mut lex = CommandLexer::new(text.as_bytes());
+        if let CommandToken::Word(word) = lex.next_token(true).unwrap().0 {
+            assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
+            assert_eq!(word, text.as_bytes());
         } else {
             panic!("not a word")
         }
     }
 
     fn lex_token(token: &str) -> CommandToken<'_> {
-        let mut lex = CommandLexer::new(token);
-        let token = lex.next_token().unwrap().0;
+        let mut lex = CommandLexer::new(token.as_bytes());
+        let token = lex.next_token(true).unwrap().0;
         // A here-document pushes the remainder of its line back, so a trailing
         // newline may still be pending.
-        let mut next = lex.next_token().unwrap().0;
+        let mut next = lex.next_token(true).unwrap().0;
         if next == CommandToken::Newline {
-            next = lex.next_token().unwrap().0;
+            next = lex.next_token(true).unwrap().0;
         }
         assert_eq!(next, CommandToken::Eof);
         token
@@ -761,71 +827,71 @@ mod tests {
 
     #[test]
     fn lex_empty_string() {
-        let mut lex = CommandLexer::new("");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        let mut lex = CommandLexer::new(b"");
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 
     #[test]
     fn lex_skip_comment() {
-        let mut lex = CommandLexer::new("# this is a comment\n");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Newline);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        let mut lex = CommandLexer::new(b"# this is a comment\n");
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Newline);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
 
-        let mut lex = CommandLexer::new("cmd arg #comment");
+        let mut lex = CommandLexer::new(b"cmd arg #comment");
         assert_eq!(
-            lex.next_token().unwrap().0,
-            CommandToken::Word("cmd".into())
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word(b"cmd".as_slice().into())
         );
         assert_eq!(
-            lex.next_token().unwrap().0,
-            CommandToken::Word("arg".into())
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word(b"arg".as_slice().into())
         );
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 
     #[test]
     fn lex_operators() {
-        let mut lex = CommandLexer::new("&();\n|&&||;;< > >| >><&>&<>");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::And);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::LParen);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::RParen);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::SemiColon);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Newline);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Pipe);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::AndIf);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::OrIf);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::DSemi);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Less);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Greater);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Clobber);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::DGreat);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::LessAnd);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::GreatAnd);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::LessGreat);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        let mut lex = CommandLexer::new(b"&();\n|&&||;;< > >| >><&>&<>");
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::And);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::LParen);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::RParen);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::SemiColon);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Newline);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Pipe);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::AndIf);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::OrIf);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::DSemi);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Less);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Greater);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Clobber);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::DGreat);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::LessAnd);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::GreatAnd);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::LessGreat);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 
     #[test]
     fn test_lex_reserved_words() {
         let mut lex =
-            CommandLexer::new("! { } case do done elif else esac fi for if in then until while");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Bang);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::LBrace);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::RBrace);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Case);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Do);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Done);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Elif);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Else);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Esac);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Fi);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::For);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::If);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::In);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Then);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Until);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::While);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+            CommandLexer::new(b"! { } case do done elif else esac fi for if in then until while");
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Bang);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::LBrace);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::RBrace);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Case);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Do);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Done);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Elif);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Else);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Esac);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Fi);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::For);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::If);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::In);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Then);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Until);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::While);
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 
     #[test]
@@ -912,15 +978,15 @@ mod tests {
         assert_eq!(
             lex_token("<<end\nthis\nis\n\ta\ntest\nend\n"),
             CommandToken::HereDocument {
-                delimiter: "end".into(),
-                contents: "this\nis\n\ta\ntest\n".into()
+                delimiter: b"end".as_slice().into(),
+                contents: b"this\nis\n\ta\ntest\n".as_slice().into()
             }
         );
         assert_eq!(
             lex_token("<<-end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
             CommandToken::HereDocument {
-                delimiter: "end".into(),
-                contents: "this\nis\na\ntest\n".into()
+                delimiter: b"end".as_slice().into(),
+                contents: b"this\nis\na\ntest\n".as_slice().into()
             }
         )
     }
@@ -930,42 +996,57 @@ mod tests {
         assert_eq!(
             lex_token("<<\\end\nthis\nis\n\ta\ntest\nend\n"),
             CommandToken::QuotedHereDocument {
-                start_delimiter: "\\end".into(),
-                end_delimiter: "end".into(),
-                contents: "this\nis\n\ta\ntest\n".into()
+                start_delimiter: b"\\end".as_slice().into(),
+                end_delimiter: b"end".as_slice().into(),
+                contents: b"this\nis\n\ta\ntest\n".as_slice().into()
             }
         );
         assert_eq!(
             lex_token("<<-\\end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
             CommandToken::QuotedHereDocument {
-                start_delimiter: "\\end".into(),
-                end_delimiter: "end".into(),
-                contents: "this\nis\na\ntest\n".into()
+                start_delimiter: b"\\end".as_slice().into(),
+                end_delimiter: b"end".as_slice().into(),
+                contents: b"this\nis\na\ntest\n".as_slice().into()
             }
         )
     }
 
     #[test]
     fn lex_io_number() {
-        let mut lex = CommandLexer::new("123>");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::IoNumber(123));
-        let mut lex = CommandLexer::new("123");
+        let mut lex = CommandLexer::new(b"123>");
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::IoNumber(123));
+        let mut lex = CommandLexer::new(b"123");
         assert_eq!(
-            lex.next_token().unwrap().0,
-            CommandToken::Word("123".into())
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word(b"123".as_slice().into())
         );
     }
 
     #[test]
     fn insert_text() {
-        let mut lex = CommandLexer::new("a b c");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("a".into()));
-        lex.insert_text_at_current_position("x".into(), "x");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("x".into()));
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("b".into()));
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("c".into()));
-        lex.insert_text_at_current_position("y".into(), "y");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("y".into()));
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
+        let mut lex = CommandLexer::new(b"a b c");
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word(b"a".as_slice().into())
+        );
+        lex.insert_text_at_current_position(b"x".as_slice().into(), "x");
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word(b"x".as_slice().into())
+        );
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word(b"b".as_slice().into())
+        );
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word(b"c".as_slice().into())
+        );
+        lex.insert_text_at_current_position(b"y".as_slice().into(), "y");
+        assert_eq!(
+            lex.next_token(true).unwrap().0,
+            CommandToken::Word(b"y".as_slice().into())
+        );
+        assert_eq!(lex.next_token(true).unwrap().0, CommandToken::Eof);
     }
 }

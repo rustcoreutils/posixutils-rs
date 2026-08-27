@@ -14,12 +14,15 @@ use std::borrow::Cow;
 pub mod command_lexer;
 pub mod word_lexer;
 
-pub fn is_blank(c: char) -> bool {
-    c == ' ' || c == '\t'
+/// Every character with syntactic meaning in the shell grammar is ASCII, which
+/// is what lets the lexer work on bytes: a byte >= 0x80 is by definition an
+/// ordinary word character and cannot be mistaken for an operator or a quote.
+pub fn is_blank(c: u8) -> bool {
+    c == b' ' || c == b'\t'
 }
 
-fn is_operator(c: char) -> bool {
-    matches!(c, '&' | '(' | ')' | ';' | '\n' | '|' | '<' | '>')
+fn is_operator(c: u8) -> bool {
+    matches!(c, b'&' | b'(' | b')' | b';' | b'\n' | b'|' | b'<' | b'>')
 }
 
 trait Lexer {
@@ -27,17 +30,17 @@ trait Lexer {
 
     fn reached_eof(&self) -> bool;
 
-    fn lookahead(&mut self) -> char;
+    fn lookahead(&mut self) -> u8;
 
     fn line_no(&self) -> u32;
 
-    fn next_line(&mut self) -> Cow<'_, str>;
+    fn next_line(&mut self) -> Cow<'_, [u8]>;
 
-    fn next_word(&mut self) -> ParseResult<Cow<'_, str>>;
+    fn next_word(&mut self) -> ParseResult<Cow<'_, [u8]>>;
 
     fn skip_comment(&mut self) {
-        if self.lookahead() == '#' {
-            while self.lookahead() != '\n' && !self.reached_eof() {
+        if self.lookahead() == b'#' {
+            while self.lookahead() != b'\n' && !self.reached_eof() {
                 self.advance();
             }
         }
@@ -46,8 +49,8 @@ trait Lexer {
     fn skip_double_quoted_string(&mut self) -> ParseResult<()> {
         let quote_start_lineno = self.line_no();
         self.advance();
-        self.skip_word_token(Some('"'), true)?;
-        if self.lookahead() != '"' {
+        self.skip_word_token(Some(b'"'), true)?;
+        if self.lookahead() != b'"' {
             return Err(ParserError::new(
                 quote_start_lineno,
                 "missing closing '\"'",
@@ -66,7 +69,7 @@ trait Lexer {
         while is_blank(self.lookahead()) {
             self.advance();
         }
-        let (_, end) = remove_quotes(self.next_word()?.as_ref());
+        let (_, end) = remove_quotes(self.next_word()?.as_ref())?;
         loop {
             if self.reached_eof() {
                 return Err(ParserError::new(
@@ -76,9 +79,15 @@ trait Lexer {
                 ));
             }
             let line = self.next_line();
-            let line = line.trim_end_matches('\n');
+            let line = line.strip_suffix(b"\n").unwrap_or(&line);
             let line = if remove_leading_tabs {
-                line.trim_start_matches('\t')
+                {
+                    let mut l = line;
+                    while let Some(rest) = l.strip_prefix(b"\t") {
+                        l = rest;
+                    }
+                    l
+                }
             } else {
                 line
             };
@@ -100,7 +109,7 @@ trait Lexer {
                     true,
                 ));
             }
-            if self.lookahead() == '\'' {
+            if self.lookahead() == b'\'' {
                 break;
             }
             self.advance();
@@ -113,8 +122,8 @@ trait Lexer {
         // The word in `${param:-word}` / `:?` / `:=` / `:+` (and pattern in
         // `${param#pat}` etc.) may contain blanks and operators up to the
         // matching '}', so they must not terminate the token here.
-        self.skip_word_token(Some('}'), true)?;
-        if self.lookahead() != '}' {
+        self.skip_word_token(Some(b'}'), true)?;
+        if self.lookahead() != b'}' {
             return Err(ParserError::new(
                 self.line_no(),
                 "missing closing '}' in parameter expansion",
@@ -129,6 +138,16 @@ trait Lexer {
     fn skip_command_substitution(&mut self) -> ParseResult<()> {
         let start_lineno = self.line_no();
         let mut open_parens = 0;
+        // A `case` item's pattern ends in a `)` that never had a matching `(`,
+        // so paren counting alone mistakes it for the end of the substitution
+        // and `$(case a in a) echo A;; esac)` is cut short. Track how many
+        // `case`s are still open; while any is, a `)` at depth zero belongs to
+        // a pattern.
+        let mut open_cases: u32 = 0;
+        let mut word: Vec<u8> = Vec::new();
+        // `case`/`esac` are reserved words only in command position, so
+        // `$(echo case)` must not be counted (POSIX 2.4).
+        let mut at_command_start = true;
         self.skip_comment();
         loop {
             if self.reached_eof() {
@@ -138,24 +157,46 @@ trait Lexer {
                     true,
                 ));
             }
-            match self.lookahead() {
-                '"' => {
+            // A blank or operator ends the current word; `case` and `esac` are
+            // only reserved words when they stand alone.
+            let c = self.lookahead();
+            if is_blank(c) || is_operator(c) {
+                if !word.is_empty() {
+                    if at_command_start {
+                        match word.as_slice() {
+                            b"case" => open_cases += 1,
+                            b"esac" => open_cases = open_cases.saturating_sub(1),
+                            _ => {}
+                        }
+                    }
+                    at_command_start = false;
+                    word.clear();
+                }
+                if matches!(c, b';' | b'&' | b'|' | b'\n' | b'(' | b')') {
+                    at_command_start = true;
+                }
+            }
+            match c {
+                b'"' => {
                     self.skip_double_quoted_string()?;
                 }
-                '\'' => {
+                b'\'' => {
                     self.skip_single_quoted_string()?;
                     continue;
                 }
-                '(' => {
+                b'(' => {
                     open_parens += 1;
                 }
-                ')' if open_parens == 0 => {
+                b')' if open_parens == 0 && open_cases == 0 => {
                     break;
                 }
-                ')' => {
+                b')' if open_parens == 0 => {
+                    // closes a `case` item's pattern
+                }
+                b')' => {
                     open_parens -= 1;
                 }
-                '\\' => {
+                b'\\' => {
                     self.advance();
                     if self.reached_eof() {
                         return Err(ParserError::new(
@@ -165,11 +206,11 @@ trait Lexer {
                         ));
                     }
                 }
-                '<' => {
+                b'<' => {
                     self.advance();
-                    if self.lookahead() == '<' {
+                    if self.lookahead() == b'<' {
                         self.advance();
-                        let remove_leading_tabs = self.lookahead() == '-';
+                        let remove_leading_tabs = self.lookahead() == b'-';
                         if remove_leading_tabs {
                             self.advance();
                         }
@@ -179,14 +220,13 @@ trait Lexer {
                     continue;
                 }
                 other if is_blank(other) || is_operator(other) => {
-                    // unquoted blanks and operators are word delimiters
                     // when '#' is not inside a word it is a comment.
                     self.advance();
                     self.skip_comment();
                     // don't advance char
                     continue;
                 }
-                _ => {}
+                other => word.push(other),
             }
             self.advance();
         }
@@ -204,13 +244,13 @@ trait Lexer {
                 ));
             }
             match self.lookahead() {
-                '\\' => {
+                b'\\' => {
                     self.advance();
-                    if self.lookahead() == '`' {
+                    if self.lookahead() == b'`' {
                         self.advance();
                     }
                 }
-                '`' => {
+                b'`' => {
                     break;
                 }
                 _ => self.advance(),
@@ -231,20 +271,20 @@ trait Lexer {
                 ));
             }
             match self.lookahead() {
-                '"' => {
+                b'"' => {
                     self.skip_double_quoted_string()?;
                 }
-                '\'' => {
+                b'\'' => {
                     self.skip_single_quoted_string()?;
                     continue;
                 }
-                '\\' => {
+                b'\\' => {
                     self.advance();
                 }
-                '(' => open_parens += 1,
-                ')' if open_parens == 0 => {
+                b'(' => open_parens += 1,
+                b')' if open_parens == 0 => {
                     self.advance();
-                    if self.lookahead() == ')' {
+                    if self.lookahead() == b')' {
                         self.advance();
                         break;
                     } else {
@@ -255,7 +295,7 @@ trait Lexer {
                         ));
                     }
                 }
-                ')' => open_parens -= 1,
+                b')' => open_parens -= 1,
                 _ => {}
             }
             self.advance();
@@ -265,7 +305,7 @@ trait Lexer {
 
     fn skip_word_token(
         &mut self,
-        end: Option<char>,
+        end: Option<u8>,
         include_spaces_and_operators: bool,
     ) -> ParseResult<()> {
         let word_start_lineno = self.line_no();
@@ -276,19 +316,19 @@ trait Lexer {
             }
 
             match self.lookahead() {
-                '"' => {
+                b'"' => {
                     inside_double_quotes = !inside_double_quotes;
                     self.advance();
                 }
-                '\'' if !inside_double_quotes => {
+                b'\'' if !inside_double_quotes => {
                     self.skip_single_quoted_string()?;
                 }
-                '$' => {
+                b'$' => {
                     self.advance();
                     match self.lookahead() {
-                        '(' => {
+                        b'(' => {
                             self.advance();
-                            if self.lookahead() == '(' {
+                            if self.lookahead() == b'(' {
                                 self.advance();
                                 self.skip_arithmetic_expansion()?;
                             } else {
@@ -296,15 +336,15 @@ trait Lexer {
                                 self.advance();
                             }
                         }
-                        '{' => {
+                        b'{' => {
                             self.skip_parameter_expansion()?;
                         }
-                        '\'' => {
+                        b'\'' => {
                             // $'...' dollar-single-quote: a backslash escapes the
                             // next character (so \' does not close the string).
                             self.advance();
-                            while !self.reached_eof() && self.lookahead() != '\'' {
-                                if self.lookahead() == '\\' {
+                            while !self.reached_eof() && self.lookahead() != b'\'' {
+                                if self.lookahead() == b'\\' {
                                     self.advance();
                                     if self.reached_eof() {
                                         break;
@@ -317,12 +357,12 @@ trait Lexer {
                         _ => {}
                     }
                 }
-                '`' => {
+                b'`' => {
                     self.advance();
                     self.skip_backquoted_command_substitution()?;
                     self.advance();
                 }
-                '\\' => {
+                b'\\' => {
                     self.advance();
                     self.advance();
                 }

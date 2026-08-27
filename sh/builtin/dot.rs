@@ -11,6 +11,7 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtilit
 use crate::os::find_command;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{execute_file_as_script, ScriptExecutionError, Shell};
+use crate::shstr::ShString;
 use gettextrs::gettext;
 use std::fs::File;
 use std::path::Path;
@@ -20,7 +21,7 @@ pub struct Dot;
 impl SpecialBuiltinUtility for Dot {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
@@ -45,7 +46,9 @@ impl SpecialBuiltinUtility for Dot {
                 .into())
             }
             None => {
-                return Err(format!("dot: {}, no such file or directory\n", args[0]).into());
+                return Err(
+                    format!("dot: {}, no such file or directory\n", args[0].display()).into(),
+                );
             }
         };
 

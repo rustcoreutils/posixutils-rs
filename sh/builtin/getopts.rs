@@ -11,6 +11,7 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 struct OptsParser<'s> {
@@ -18,9 +19,9 @@ struct OptsParser<'s> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ParseResult<'s> {
+enum ParseResult {
     SimpleOption(char),
-    OptionWithArg { option: char, arg: &'s str },
+    OptionWithArg { option: char, arg: ShString },
     InvalidOption(char),
     MissingArg(char),
     EndOfOptions,
@@ -46,32 +47,41 @@ impl<'s> OptsParser<'s> {
         }
     }
 
-    fn parse<'a>(
+    fn parse(
         &self,
-        params: &'a [String],
+        params: &[ShString],
         param_index: &mut usize,
         option_index: &mut usize,
-    ) -> ParseResult<'a> {
+    ) -> ParseResult {
         let mut i = 0;
         while *param_index < params.len() {
             let param = &params[*param_index];
-            match param.as_str() {
-                "--" => {
+            match param.as_bytes() {
+                b"--" => {
                     *param_index += 1;
                     *option_index = 0;
                     return ParseResult::EndOfOptions;
                 }
-                options if options.starts_with("-") && options.len() > 1 => {
-                    for (pos, c) in options[1..].char_indices() {
+                options if options.starts_with(b"-") && options.len() > 1 => {
+                    // Scanned over the raw bytes: an option letter is ASCII, so
+                    // one byte each, and a byte that is not one simply is not an
+                    // option. Scanning a lossy view instead made every invalid
+                    // byte three bytes wide there but one here, so the offset of
+                    // an inline option-argument indexed past the end.
+                    for (pos, byte) in options[1..].iter().enumerate() {
+                        let c = char::from(*byte);
+                        if !byte.is_ascii() {
+                            return ParseResult::InvalidOption(c);
+                        }
                         if let Some(requires_argument) = self.get_option(c) {
                             if requires_argument {
-                                if pos + c.len_utf8() + 1 < options.len() {
+                                if pos + 2 < options.len() {
                                     if i == *option_index {
                                         *param_index += 1;
                                         *option_index = 0;
                                         return ParseResult::OptionWithArg {
                                             option: c,
-                                            arg: &options[1 + pos + c.len_utf8()..],
+                                            arg: ShString::from(options[pos + 2..].to_vec()),
                                         };
                                     }
                                     break;
@@ -79,7 +89,10 @@ impl<'s> OptsParser<'s> {
                                     *option_index = 0;
                                     if let Some(arg) = params.get(*param_index + 1) {
                                         *param_index += 2;
-                                        return ParseResult::OptionWithArg { option: c, arg };
+                                        return ParseResult::OptionWithArg {
+                                            option: c,
+                                            arg: arg.to_sh_string(),
+                                        };
                                     }
                                     *param_index += 1;
                                     return ParseResult::MissingArg(c);
@@ -88,7 +101,7 @@ impl<'s> OptsParser<'s> {
                                 advance_position(
                                     param_index,
                                     option_index,
-                                    pos + c.len_utf8() >= options.len() - 1,
+                                    pos + 1 >= options.len() - 1,
                                 );
                                 return ParseResult::SimpleOption(c);
                             }
@@ -96,7 +109,7 @@ impl<'s> OptsParser<'s> {
                             advance_position(
                                 param_index,
                                 option_index,
-                                pos + c.len_utf8() >= options.len() - 1,
+                                pos + 1 >= options.len() - 1,
                             );
                             return ParseResult::InvalidOption(c);
                         }
@@ -130,7 +143,7 @@ pub struct GetOpts;
 impl BuiltinUtility for GetOpts {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
@@ -139,8 +152,15 @@ impl BuiltinUtility for GetOpts {
             return Err(gettext("getopts: missing arguments").into());
         }
 
-        let quiet_errs = args[0].starts_with(':');
-        let parser = OptsParser::new(&args[0][quiet_errs as usize..])?;
+        // The option string is a list of option letters: text by definition.
+        let optstring = args[0].to_str().ok_or_else(|| {
+            format!(
+                "getopts: '{}' is not a valid option string",
+                args[0].display()
+            )
+        })?;
+        let quiet_errs = optstring.starts_with(':');
+        let parser = OptsParser::new(&optstring[quiet_errs as usize..])?;
         // OPTIND is a plain 1-based integer (the next argument to inspect). The
         // within-argument position for bundled options is tracked in shell state
         // and reset whenever the application changes OPTIND.
@@ -157,7 +177,7 @@ impl BuiltinUtility for GetOpts {
             0
         };
 
-        let var_name = args[1].as_str();
+        let var_name = args[1].to_str().unwrap_or("");
         if !is_valid_name(var_name) {
             return Err(format!("getopts: '{var_name}' is not a valid variable name").into());
         }
@@ -175,7 +195,6 @@ impl BuiltinUtility for GetOpts {
                 0
             }
             ParseResult::OptionWithArg { option, arg } => {
-                let arg = arg.to_string();
                 shell.assign_global(var_name.to_string(), option.to_string())?;
                 shell.assign_global("OPTARG".to_string(), arg)?;
                 0
@@ -222,7 +241,11 @@ mod tests {
 
     #[test]
     fn parse_simple_options_in_separate_params() {
-        let params = vec!["-a".to_string(), "-b".to_string(), "-c".to_string()];
+        let params = vec![
+            ShString::from("-a"),
+            ShString::from("-b"),
+            ShString::from("-c"),
+        ];
         let parser = OptsParser::new("abc").unwrap();
         let mut param_index = 0;
         let mut options_index = 0;
@@ -248,7 +271,7 @@ mod tests {
 
     #[test]
     fn parse_simple_options_in_same_param() {
-        let params = vec!["-abc".to_string()];
+        let params = vec![ShString::from("-abc")];
         let parser = OptsParser::new("abc").unwrap();
         let mut param_index = 0;
         let mut options_index = 0;
@@ -275,12 +298,12 @@ mod tests {
     #[test]
     fn parse_options_with_args_in_separate_params() {
         let params = vec![
-            "-a".to_string(),
-            "arg1".to_string(),
-            "-b".to_string(),
-            "arg2".to_string(),
-            "-c".to_string(),
-            "arg3".to_string(),
+            ShString::from("-a"),
+            ShString::from("arg1"),
+            ShString::from("-b"),
+            ShString::from("arg2"),
+            ShString::from("-c"),
+            ShString::from("arg3"),
         ];
         let parser = OptsParser::new("a:b:c:").unwrap();
         let mut param_index = 0;
@@ -289,7 +312,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'a',
-                arg: "arg1"
+                arg: ShString::from("arg1")
             }
         );
         assert_eq!(param_index, 2);
@@ -298,7 +321,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'b',
-                arg: "arg2"
+                arg: ShString::from("arg2")
             }
         );
         assert_eq!(param_index, 4);
@@ -307,7 +330,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'c',
-                arg: "arg3"
+                arg: ShString::from("arg3")
             }
         );
         assert_eq!(param_index, 6);
@@ -317,9 +340,9 @@ mod tests {
     #[test]
     fn parse_options_with_args_in_same_param() {
         let params = vec![
-            "-aarg1".to_string(),
-            "-barg2".to_string(),
-            "-carg3".to_string(),
+            ShString::from("-aarg1"),
+            ShString::from("-barg2"),
+            ShString::from("-carg3"),
         ];
         let parser = OptsParser::new("a:b:c:").unwrap();
         let mut param_index = 0;
@@ -328,7 +351,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'a',
-                arg: "arg1"
+                arg: ShString::from("arg1")
             }
         );
         assert_eq!(param_index, 1);
@@ -337,7 +360,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'b',
-                arg: "arg2"
+                arg: ShString::from("arg2")
             }
         );
         assert_eq!(param_index, 2);
@@ -346,7 +369,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'c',
-                arg: "arg3"
+                arg: ShString::from("arg3")
             }
         );
         assert_eq!(param_index, 3);
@@ -356,11 +379,11 @@ mod tests {
     #[test]
     fn parse_mixed_options() {
         let params = vec![
-            "-abc".to_string(),
-            "arg1".to_string(),
-            "-df".to_string(),
-            "arg2".to_string(),
-            "-larg3".to_string(),
+            ShString::from("-abc"),
+            ShString::from("arg1"),
+            ShString::from("-df"),
+            ShString::from("arg2"),
+            ShString::from("-larg3"),
         ];
         let parser = OptsParser::new("abc:df:l:").unwrap();
         let mut param_index = 0;
@@ -381,7 +404,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'c',
-                arg: "arg1"
+                arg: ShString::from("arg1")
             }
         );
         assert_eq!(param_index, 2);
@@ -396,7 +419,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'f',
-                arg: "arg2"
+                arg: ShString::from("arg2")
             }
         );
         assert_eq!(param_index, 4);
@@ -405,7 +428,7 @@ mod tests {
             parser.parse(&params, &mut param_index, &mut options_index),
             ParseResult::OptionWithArg {
                 option: 'l',
-                arg: "arg3"
+                arg: ShString::from("arg3")
             }
         );
         assert_eq!(param_index, 5);
@@ -414,7 +437,11 @@ mod tests {
 
     #[test]
     fn parse_options_followed_by_operands() {
-        let params = vec!["-ab".to_string(), "-c".to_string(), "op1".to_string()];
+        let params = vec![
+            ShString::from("-ab"),
+            ShString::from("-c"),
+            ShString::from("op1"),
+        ];
         let parser = OptsParser::new("abc").unwrap();
         let mut param_index = 0;
         let mut options_index = 0;
@@ -447,10 +474,10 @@ mod tests {
     #[test]
     fn parse_options_followed_by_operands_after_options_terminator() {
         let params = vec![
-            "-a".to_string(),
-            "-bc".to_string(),
-            "--".to_string(),
-            "op1".to_string(),
+            ShString::from("-a"),
+            ShString::from("-bc"),
+            ShString::from("--"),
+            ShString::from("op1"),
         ];
         let parser = OptsParser::new("abc").unwrap();
         let mut param_index = 0;

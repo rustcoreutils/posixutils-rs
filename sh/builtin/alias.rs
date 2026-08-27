@@ -7,19 +7,21 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinResult, BuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 
 pub struct AliasBuiltin;
 
 impl BuiltinUtility for AliasBuiltin {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("alias", args)?;
         // POSIX output format is "%s=%s\n" with the value quoted for re-input
         // (no "alias " prefix).
         if args.is_empty() {
@@ -27,7 +29,7 @@ impl BuiltinUtility for AliasBuiltin {
                 opened_files.write_out(format!(
                     "{}={}\n",
                     alias,
-                    crate::utils::shell_quote(command)
+                    crate::utils::shell_quote(command).display()
                 ));
             }
             return Ok(0);
@@ -41,8 +43,12 @@ impl BuiltinUtility for AliasBuiltin {
                 shell
                     .alias_table
                     .insert(alias.to_string(), command.to_string());
-            } else if let Some(command) = shell.alias_table.get(arg) {
-                opened_files.write_out(format!("{}={}\n", arg, crate::utils::shell_quote(command)));
+            } else if let Some(command) = shell.alias_table.get(*arg) {
+                opened_files.write_out(format!(
+                    "{}={}\n",
+                    arg,
+                    crate::utils::shell_quote(command).display()
+                ));
             } else {
                 // report the error but keep processing the remaining operands
                 opened_files.write_err(format!("alias: {}: not found\n", arg));

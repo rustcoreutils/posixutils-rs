@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::shstr::ShString;
 use std::ffi::CStr;
 
 pub fn strcoll(lhs: &CStr, rhs: &CStr) -> std::cmp::Ordering {
@@ -19,16 +20,19 @@ pub fn strcoll(lhs: &CStr, rhs: &CStr) -> std::cmp::Ordering {
 /// when `s` contains single-quote characters (each `'` becomes `'\''`). Used by
 /// the re-inputtable output of `export -p`, `readonly -p`, `set`, `trap`, and
 /// `alias`.
-pub fn shell_quote(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 2);
-    result.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            result.push_str("'\\''");
+/// Operates on bytes and passes them through untouched, so that a value which
+/// is not valid text still round-trips through `export -p` and friends.
+pub fn shell_quote<S: AsRef<[u8]>>(s: S) -> ShString {
+    let bytes = s.as_ref();
+    let mut result = ShString::new();
+    result.push_bytes(b"'");
+    for &byte in bytes {
+        if byte == b'\'' {
+            result.push_bytes(b"'\\''");
         } else {
-            result.push(c);
+            result.push_bytes([byte]);
         }
     }
-    result.push('\'');
+    result.push_bytes(b"'");
     result
 }

@@ -7,8 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::os::errno::Errno;
 use crate::os::signals::{Signal, TermSignal};
 use crate::os::{waitpid, OsResult, Pid, WaitStatus};
+use std::collections::VecDeque;
 use std::fmt::{Display, Formatter, Write};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,10 +123,19 @@ pub fn parse_job_id(text: &str) -> Result<JobId<'_>, ()> {
     }
 }
 
+/// How many collected statuses to keep. Nothing bounds how many background
+/// commands a script starts, and `wait` on a pid this far back is vanishingly
+/// rare, so the memory is a ring rather than a table that grows forever.
+const COLLECTED_MEMORY: usize = 32;
+
 #[derive(Clone)]
 pub struct JobManager {
     jobs: Vec<Job>,
     last_job_number: u64,
+    /// Statuses of jobs `wait` has already collected. A collected job leaves
+    /// the table -- `jobs` must not list it -- but `wait` on the same pid keeps
+    /// reporting its status, which is what dash and bash do.
+    collected: VecDeque<(Pid, i32)>,
 }
 
 impl JobManager {
@@ -151,7 +162,18 @@ impl JobManager {
             if matches!(job.state, JobState::Done(_) | JobState::Signaled(_)) {
                 continue;
             }
-            match waitpid(job.pid, true, true)? {
+            let status = match waitpid(job.pid, true, true) {
+                Ok(status) => status,
+                Err(err) if err.errno == Errno::ECHILD => {
+                    // Already reaped — `wait` collects a job directly, and the
+                    // shell may also be running without job control. There is
+                    // no status left to read, and nothing to report.
+                    job.state = JobState::Done(0);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            match status {
                 WaitStatus::Exited { exit_status } => {
                     job.state = JobState::Done(exit_status);
                     job.state_should_be_reported = true;
@@ -164,7 +186,8 @@ impl JobManager {
                     }
                     job.state_should_be_reported = true;
                 }
-                WaitStatus::StillAlive => {}
+                // EINTR while polling a background job: nothing to record.
+                WaitStatus::StillAlive | WaitStatus::Interrupted => {}
                 WaitStatus::Stopped { .. } => {
                     job.state = JobState::Stopped;
                     job.state_should_be_reported = true;
@@ -174,10 +197,63 @@ impl JobManager {
         Ok(())
     }
 
-    pub fn cleanup_terminated_jobs(&mut self) {
-        self.jobs
-            .retain(|j| !matches!(j.state, JobState::Done(_) | JobState::Signaled(_)));
+    /// The status of a job that has already terminated, taken from the job
+    /// table or from the memory of jobs already collected. `wait` asks this
+    /// before calling `waitpid`, which would fail with ECHILD once the periodic
+    /// sweep has reaped the child.
+    pub fn take_collected_status(&mut self, pid: Pid) -> Option<i32> {
+        if let Some(pos) = self.jobs.iter().position(|job| job.pid == pid) {
+            let status = match self.jobs[pos].state {
+                JobState::Done(status) => status,
+                JobState::Signaled(signal) => signal.exit_status(),
+                // still alive, so the caller has to wait for it after all
+                JobState::Running | JobState::Stopped => return None,
+            };
+            self.collect(pid, status);
+            return Some(status);
+        }
+        self.collected
+            .iter()
+            .find(|(collected, _)| *collected == pid)
+            .map(|(_, status)| *status)
+    }
+
+    /// Records the status of a terminated job and drops it from the table.
+    pub fn collect(&mut self, pid: Pid, status: i32) {
+        self.jobs.retain(|job| job.pid != pid);
         self.update_positions();
+        self.remember(pid, status);
+    }
+
+    /// Moves every terminated job out of the table, keeping its status. Nothing
+    /// bounds how many background commands a loop starts, so the table cannot
+    /// be allowed to keep one entry per iteration.
+    pub fn collect_terminated_jobs(&mut self) {
+        let mut terminated = Vec::new();
+        self.jobs.retain(|job| {
+            let status = match job.state {
+                JobState::Done(status) => status,
+                JobState::Signaled(signal) => signal.exit_status(),
+                JobState::Running | JobState::Stopped => return true,
+            };
+            terminated.push((job.pid, status));
+            false
+        });
+        if terminated.is_empty() {
+            return;
+        }
+        self.update_positions();
+        for (pid, status) in terminated {
+            self.remember(pid, status);
+        }
+    }
+
+    fn remember(&mut self, pid: Pid, status: i32) {
+        self.collected.retain(|(collected, _)| *collected != pid);
+        if self.collected.len() == COLLECTED_MEMORY {
+            self.collected.pop_front();
+        }
+        self.collected.push_back((pid, status));
     }
 
     pub fn add_job(&mut self, pid: Pid, command: String, initial_state: JobState) {
@@ -233,13 +309,6 @@ impl JobManager {
         }
     }
 
-    pub fn remove_job_by_pid(&mut self, pid: Pid) -> Option<Job> {
-        let index = self.jobs.iter().position(|job| job.pid == pid)?;
-        let job = self.jobs.remove(index);
-        self.update_positions();
-        Some(job)
-    }
-
     pub fn remove_job(&mut self, id: JobId) -> Option<Job> {
         if let Some(i) = self.job_index(id) {
             let job = self.jobs.remove(i);
@@ -248,12 +317,6 @@ impl JobManager {
         } else {
             None
         }
-    }
-
-    pub fn drain(&mut self) -> Vec<Job> {
-        let mut jobs = Vec::new();
-        std::mem::swap(&mut jobs, &mut self.jobs);
-        jobs
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
@@ -275,6 +338,7 @@ impl Default for JobManager {
         Self {
             jobs: Vec::new(),
             last_job_number: 1,
+            collected: VecDeque::new(),
         }
     }
 }

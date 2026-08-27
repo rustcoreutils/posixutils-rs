@@ -8,6 +8,7 @@
 //
 
 use crate::parse::command::Name;
+use crate::shstr::ShString;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,8 +73,8 @@ pub enum ParameterExpansion {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WordPart {
-    UnquotedLiteral(String),
-    QuotedLiteral(String),
+    UnquotedLiteral(ShString),
+    QuotedLiteral(ShString),
     ParameterExpansion {
         expansion: ParameterExpansion,
         inside_double_quotes: bool,
@@ -83,7 +84,7 @@ pub enum WordPart {
         inside_double_quotes: bool,
     },
     CommandSubstitution {
-        commands: String,
+        commands: ShString,
         inside_double_quotes: bool,
     },
 }
@@ -96,11 +97,14 @@ pub struct Word {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WordPair {
     pub word: Word,
-    pub as_string: String,
+    /// The word's source text, kept for `set -x`, history and the
+    /// reconstruction `Display` impls. It is bytes, like everything the shell
+    /// reads.
+    pub as_string: ShString,
 }
 
 impl WordPair {
-    pub fn new<S: Into<String>>(word: Word, contents: S) -> Self {
+    pub fn new<S: Into<ShString>>(word: Word, contents: S) -> Self {
         WordPair {
             word,
             as_string: contents.into(),
@@ -110,30 +114,31 @@ impl WordPair {
 
 impl Display for WordPair {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_string)
+        write!(f, "{}", self.as_string.display())
     }
 }
 
 #[cfg(test)]
 pub mod test_utils {
     use super::*;
+    use crate::shstr::ShString;
 
     pub fn quoted_literal(contents: &str) -> Word {
         Word {
-            parts: vec![WordPart::QuotedLiteral(contents.to_string())],
+            parts: vec![WordPart::QuotedLiteral(ShString::from(contents))],
         }
     }
 
     pub fn unquoted_literal(contents: &str) -> Word {
         Word {
-            parts: vec![WordPart::UnquotedLiteral(contents.to_string())],
+            parts: vec![WordPart::UnquotedLiteral(ShString::from(contents))],
         }
     }
 
     pub fn unquoted_literal_pair(contents: &str) -> WordPair {
         WordPair {
             word: unquoted_literal(contents),
-            as_string: contents.to_string(),
+            as_string: ShString::from(contents),
         }
     }
 

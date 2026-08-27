@@ -8,12 +8,13 @@
 //
 
 use crate::builtin::{
-    get_builtin_utility, get_special_builtin_utility, skip_option_terminator, BuiltinResult,
-    BuiltinUtility,
+    args_as_str, get_builtin_utility, get_special_builtin_utility, skip_option_terminator,
+    BuiltinResult, BuiltinUtility,
 };
 use crate::os::find_command;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 
 /// The POSIX shell reserved words (Section 2.4).
 const RESERVED_WORDS: &[&str] = &[
@@ -26,26 +27,27 @@ pub struct Type_;
 impl BuiltinUtility for Type_ {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("type", args)?;
         let args = skip_option_terminator(args);
         let mut status = 0;
         for command_name in args {
-            if let Some(alias) = shell.alias_table.get(command_name) {
+            if let Some(alias) = shell.alias_table.get(*command_name) {
                 opened_files.write_out(format!("{} is aliased to '{}'\n", command_name, alias));
-            } else if RESERVED_WORDS.contains(&command_name.as_str()) {
+            } else if RESERVED_WORDS.contains(command_name) {
                 opened_files.write_out(format!("{} is a shell keyword\n", command_name));
             } else if get_special_builtin_utility(command_name).is_some() {
                 opened_files.write_out(format!("{} is a special shell builtin\n", command_name));
-            } else if shell.functions.contains_key(command_name.as_str()) {
+            } else if shell.functions.contains_key(*command_name) {
                 opened_files.write_out(format!("{} is a function\n", command_name))
             } else if get_builtin_utility(command_name).is_some() {
                 opened_files.write_out(format!("{} is a shell builtin\n", command_name));
             } else {
                 let path = shell.environment.get_str_value("PATH").unwrap_or_default();
-                if let Some(command) = find_command(command_name, path) {
+                if let Some(command) = find_command(crate::shstr::ShStr::new(command_name), path) {
                     opened_files.write_out(format!(
                         "{} is {}\n",
                         command_name,

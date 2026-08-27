@@ -9,6 +9,7 @@
 
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 use crate::shell::{CommandExecutionError, Shell};
+use crate::shstr::{CharOrByte, ShStr, ShString};
 use crate::wordexp::tilde::TildeMode;
 use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
@@ -34,7 +35,7 @@ impl ParameterExpansionResult {
 
 fn add_option_to_expanded_word(
     word: &mut ExpandedWord,
-    str: Option<&str>,
+    str: Option<&ShStr>,
     inside_double_quotes: bool,
 ) -> ParameterExpansionResult {
     if let Some(s) = str {
@@ -49,9 +50,36 @@ fn add_option_to_expanded_word(
     }
 }
 
+/// Joins the positional parameters with `separator`, byte-wise.
+fn join_parameters(parameters: &[ShString], separator: &[u8]) -> ShString {
+    let mut result = ShString::new();
+    for (index, parameter) in parameters.iter().enumerate() {
+        if index > 0 {
+            result.push_bytes(separator);
+        }
+        result.push_bytes(parameter);
+    }
+    result
+}
+
+/// The separator `$*` joins with: the *first character* of IFS, or the first
+/// byte when that byte is not part of one. Slicing one byte unconditionally
+/// split a multi-byte character and panicked (`IFS=é`). An unset IFS behaves as
+/// a space; an empty IFS joins with nothing.
+fn dollar_star_separator(shell: &Shell) -> ShString {
+    match shell.environment.get_value("IFS") {
+        Some(ifs) => match ifs.chars_lossless().next() {
+            Some(CharOrByte::Char(c)) => ShString::from(&ifs[..c.len_utf8()]),
+            Some(CharOrByte::Byte(b)) => ShString::from(vec![b]),
+            None => ShString::new(),
+        },
+        None => ShString::from(" "),
+    }
+}
+
 fn add_split_parameters_to_expanded_word(
     word: &mut ExpandedWord,
-    parameters: &[String],
+    parameters: &[ShString],
     quoted: bool,
 ) {
     if parameters.is_empty() {
@@ -60,7 +88,13 @@ fn add_split_parameters_to_expanded_word(
     let mut i = 0;
     while i < parameters.len() - 1 {
         word.append(&parameters[i], quoted, true);
-        word.end_field();
+        // `"$@"` keeps a null parameter as an empty field; unquoted `$@` may
+        // discard it (POSIX 2.5.2).
+        if quoted {
+            word.end_field();
+        } else {
+            word.end_field_soft();
+        }
         i += 1;
     }
     word.append(&parameters[i], quoted, true);
@@ -79,20 +113,27 @@ fn expand_simple_parameter_into(
             shell
                 .positional_parameters
                 .get(*n as usize - 1)
-                .map(|s| s.as_str()),
+                .map(|s| s.as_sh_str()),
             inside_double_quotes,
         ),
         Parameter::Variable(var_name) => add_option_to_expanded_word(
             expanded_word,
-            shell.environment.get_str_value(var_name.as_ref()),
+            shell.environment.get_value(var_name.as_ref()),
             inside_double_quotes,
         ),
         Parameter::Special(special_parameter) => {
             match special_parameter {
                 SpecialParameter::At => {
+                    if inside_double_quotes && shell.positional_parameters.is_empty() {
+                        // POSIX 2.5.2: `"$@"` with no positional parameters
+                        // generates zero fields, not one empty field. The
+                        // surrounding quotes still contribute an empty literal,
+                        // so record it for the field splitter.
+                        expanded_word.note_quoted_at_expanded_to_nothing();
+                    }
                     if !field_splitting_will_be_performed {
                         expanded_word.append(
-                            shell.positional_parameters.join(" "),
+                            join_parameters(&shell.positional_parameters, b" "),
                             inside_double_quotes,
                             true,
                         );
@@ -112,13 +153,21 @@ fn expand_simple_parameter_into(
                             false,
                         );
                     } else {
-                        let separator = shell
-                            .environment
-                            .get_str_value("IFS")
-                            .map(|v| if v.is_empty() { "" } else { &v[..1] })
-                            .unwrap_or(" ");
+                        // POSIX: `$*` joins with the *first character* of IFS.
+                        // Slicing one byte split a multi-byte character and
+                        // panicked (`IFS=é`); IFS may also hold bytes that are
+                        // not characters at all, and the first of those is
+                        // still the separator.
+                        let separator = match shell.environment.get_value("IFS") {
+                            Some(ifs) => match ifs.chars_lossless().next() {
+                                Some(CharOrByte::Char(c)) => ShString::from(&ifs[..c.len_utf8()]),
+                                Some(CharOrByte::Byte(b)) => ShString::from(vec![b]),
+                                None => ShString::new(),
+                            },
+                            None => ShString::from(" "),
+                        };
                         expanded_word.append(
-                            shell.positional_parameters.join(separator),
+                            join_parameters(&shell.positional_parameters, separator.as_bytes()),
                             inside_double_quotes,
                             true,
                         );
@@ -160,8 +209,27 @@ fn expand_simple_parameter_into(
                     expanded_word.append(shell.program_name.clone(), inside_double_quotes, true);
                 }
             }
-            // special parameters are always set
-            ParameterExpansionResult::Set
+            // `$@` and `$*` follow the positional parameters: with none set
+            // they are unset, and `${*:-word}` must substitute. The rest are
+            // always set.
+            match special_parameter {
+                SpecialParameter::At | SpecialParameter::Asterisk => {
+                    // Always set, but null when the *joined* value is empty, so
+                    // `${*:-word}` substitutes with no positional parameters
+                    // while `${*-word}` does not. The separators count: two
+                    // empty parameters join to a single space and so are not
+                    // null, unless IFS is itself empty.
+                    let all_empty = shell.positional_parameters.iter().all(|p| p.is_empty());
+                    let joins_to_nothing = shell.positional_parameters.len() < 2
+                        || dollar_star_separator(shell).is_empty();
+                    if all_empty && joins_to_nothing {
+                        ParameterExpansionResult::Null
+                    } else {
+                        ParameterExpansionResult::Set
+                    }
+                }
+                _ => ParameterExpansionResult::Set,
+            }
         }
     }
 }
@@ -209,9 +277,12 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
+                // The default *replaces* the parameter, so its own expansion
+                // must not be appended as well.
                 simple_word_expansion_into(expanded_word, default, TildeMode::Word, shell)?;
+            } else {
+                expanded_word.extend(expanded_parameter);
             }
-            expanded_word.extend(expanded_parameter);
         }
         ParameterExpansion::UnsetAssignDefault {
             variable: variable_name,
@@ -260,7 +331,10 @@ pub fn expand_parameter_into(
                         "parameter not set".to_string()
                     }
                 } else {
+                    // A diagnostic, so a lossy view is the right conversion.
                     expand_word_to_string(word, false, shell)?
+                        .display()
+                        .to_string()
                 };
                 return Err(CommandExecutionError::ExpansionError(message));
             }
@@ -301,7 +375,11 @@ pub fn expand_parameter_into(
             }
             // POSIX: length in characters, not bytes.
             expanded_word.append(
-                expanded_parameter.to_string().chars().count().to_string(),
+                expanded_parameter
+                    .to_sh_string()
+                    .chars_lossless()
+                    .count()
+                    .to_string(),
                 inside_double_quotes,
                 true,
             );
@@ -325,7 +403,7 @@ pub fn expand_parameter_into(
                     "sh: parameter is unset".to_string(),
                 ));
             }
-            let param_str = expanded_parameter.to_string();
+            let param_str = expanded_parameter.to_sh_string();
 
             let pattern = word_to_pattern(pattern, shell)?;
             let result = if *remove_prefix {
@@ -351,6 +429,7 @@ mod tests {
     use crate::jobs::JobState;
     use crate::parse::word::test_utils::unquoted_literal;
     use crate::parse::word::Word;
+    use crate::shstr::ShString;
     use crate::wordexp::expanded_word::ExpandedWordPart;
 
     fn shell_with_env(env: &[(&str, &str)]) -> Shell {
@@ -366,7 +445,7 @@ mod tests {
 
     fn shell_with_positional_arguments(args: Vec<&str>) -> Shell {
         Shell {
-            positional_parameters: args.iter().map(|s| s.to_string()).collect(),
+            positional_parameters: args.iter().map(|s| ShString::from(*s)).collect(),
             ..Default::default()
         }
     }
@@ -384,7 +463,7 @@ mod tests {
             shell,
         )
         .unwrap();
-        expanded_word.to_string()
+        String::from_utf8(expanded_word.as_bytes_vec()).unwrap()
     }
 
     fn expand_parameter(
@@ -455,7 +534,8 @@ mod tests {
             ),
             "123".to_string()
         );
-        shell.background_jobs.remove_job_by_pid(123);
+        shell.background_jobs.current_mut().unwrap().state = JobState::Done(0);
+        shell.background_jobs.collect_terminated_jobs();
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),
@@ -945,11 +1025,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(
@@ -960,11 +1040,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::QuotedLiteral("arg1".to_string()),
+                ExpandedWordPart::QuotedLiteral(ShString::from("arg1")),
                 ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::QuotedLiteral("arg2".to_string()),
+                ExpandedWordPart::QuotedLiteral(ShString::from("arg2")),
                 ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::QuotedLiteral("arg3".to_string())
+                ExpandedWordPart::QuotedLiteral(ShString::from("arg3"))
             ])
         );
     }
@@ -989,11 +1069,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(
@@ -1031,11 +1111,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(
@@ -1070,11 +1150,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(
@@ -1112,11 +1192,11 @@ mod tests {
                 &mut shell
             ),
             ExpandedWord::from_parts(vec![
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg2".to_string()),
-                ExpandedWordPart::FieldEnd,
-                ExpandedWordPart::GeneratedUnquotedLiteral("arg3".to_string())
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg1")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg2")),
+                ExpandedWordPart::SoftFieldEnd,
+                ExpandedWordPart::GeneratedUnquotedLiteral(ShString::from("arg3"))
             ])
         );
         assert_eq!(

@@ -11,10 +11,11 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtilit
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::ControlFlowState;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 fn loop_control_flow(
-    args: &[String],
+    args: &[ShString],
     shell: &mut Shell,
     name: &str,
     state: fn(u32) -> ControlFlowState,
@@ -33,7 +34,7 @@ fn loop_control_flow(
         return Err(format!("{name}: too many arguments").into());
     }
     let n = if let Some(n) = args.first() {
-        match n.parse::<i32>() {
+        match n.to_str().unwrap_or("").parse::<i32>() {
             Ok(n) => n,
             Err(_) => {
                 return Err(format!("{name}: expected numeric argument").into());
@@ -53,7 +54,7 @@ fn loop_control_flow(
 pub struct Break;
 
 impl SpecialBuiltinUtility for Break {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, args: &[ShString], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         loop_control_flow(args, shell, "break", ControlFlowState::Break)
     }
 }
@@ -61,7 +62,7 @@ impl SpecialBuiltinUtility for Break {
 pub struct Continue;
 
 impl SpecialBuiltinUtility for Continue {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, args: &[ShString], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         loop_control_flow(args, shell, "continue", ControlFlowState::Continue)
     }
 }
@@ -69,7 +70,7 @@ impl SpecialBuiltinUtility for Continue {
 pub struct Return;
 
 impl SpecialBuiltinUtility for Return {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, args: &[ShString], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         if shell.function_call_depth == 0 && shell.dot_script_depth == 0 {
             return Err(
                 gettext("return: 'return' can only be used inside function or dot script").into(),
@@ -79,7 +80,7 @@ impl SpecialBuiltinUtility for Return {
             return Err(gettext("return: too many arguments").into());
         }
         let n = if let Some(n) = args.first() {
-            match n.parse::<i32>() {
+            match n.to_str().unwrap_or("").parse::<i32>() {
                 Ok(n) => n,
                 Err(_) => {
                     return Err(gettext("return: expected numeric argument").into());

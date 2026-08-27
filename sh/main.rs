@@ -10,8 +10,10 @@
 use crate::cli::args::{parse_args, ExecutionMode};
 use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
-use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp};
+use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp, wait_for_input};
+use crate::parse::ParserError;
 use crate::shell::Shell;
+use crate::shstr::{ShStr, ShString};
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -21,9 +23,8 @@ use os::signals::{
 use std::error::Error;
 use std::fs::File;
 use std::io;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
-use std::time::Duration;
 
 mod builtin;
 mod cli;
@@ -34,6 +35,7 @@ mod os;
 mod parse;
 pub mod pattern;
 mod shell;
+mod shstr;
 mod utils;
 mod wordexp;
 
@@ -42,7 +44,7 @@ mod wordexp;
 /// was found but cannot serve as a script, and 128 only for an unrecoverable
 /// read error. The distinction is which step failed, not which errno came
 /// back, so the open and the read are done separately.
-fn read_command_file(path: &str) -> Result<String, (io::Error, i32)> {
+fn read_command_file(path: &ShStr) -> Result<Vec<u8>, (io::Error, i32)> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -59,16 +61,17 @@ fn read_command_file(path: &str) -> Result<String, (io::Error, i32)> {
     if file.metadata().is_ok_and(|metadata| metadata.is_dir()) {
         return Err((io::Error::other(gettext("Is a directory")), 126));
     }
-    let mut contents = String::new();
-    match file.read_to_string(&mut contents) {
+    // Read as bytes: a script is not required to be text, and refusing one
+    // that contains a byte which is not part of a character would make the
+    // shell unable to run scripts other shells run.
+    let mut contents = Vec::new();
+    match file.read_to_end(&mut contents) {
         Ok(_) => Ok(contents),
-        // Not text at all: an [ENOEXEC] error, which POSIX maps to 126.
-        Err(err) if err.kind() == io::ErrorKind::InvalidData => Err((err, 126)),
         Err(err) => Err((err, 128)),
     }
 }
 
-fn execute_string(string: &str, shell: &mut Shell) {
+fn execute_string(string: &[u8], shell: &mut Shell) {
     match shell.execute_program(string) {
         Ok(_) => {}
         Err(syntax_err) => {
@@ -89,28 +92,28 @@ fn report_mail(shell: &mut Shell) {
     }
 }
 
-fn flush_stdout() {
-    // this is a basic operation, if this doesn't work,
-    // there's nothing else we can do
-    io::stdout().flush().expect("could not flush stdout");
+/// The interactive editor's own output goes to standard error, so that a shell
+/// whose stdout is redirected does not have its prompt and echoed input mixed
+/// into the redirected stream.
+fn flush_terminal() {
+    let _ = io::stderr().flush();
 }
 
-fn write_stdout(bytes: &[u8]) {
-    io::stdout()
-        .write_all(bytes)
-        .expect("failed to write to stdout");
+fn write_terminal(bytes: &[u8]) {
+    let _ = io::stderr().write_all(bytes);
 }
 
+/// Writes the prompt and returns its width in *characters*: the caller uses it
+/// as a cursor column, and a byte count misplaces the cursor for any prompt
+/// containing a multi-byte character.
 fn print_prompt(shell: &mut Shell, print_ps2: bool) -> usize {
-    if print_ps2 {
-        let ps2 = shell.get_ps2();
-        print!("{}", ps2);
-        ps2.len()
+    let prompt = if print_ps2 {
+        shell.get_ps2()
     } else {
-        let ps1 = shell.get_ps1();
-        print!("{}", ps1);
-        ps1.len()
-    }
+        shell.get_ps1()
+    };
+    write_terminal(prompt.as_bytes());
+    prompt.chars().count()
 }
 
 fn standard_repl(shell: &mut Shell) {
@@ -118,7 +121,7 @@ fn standard_repl(shell: &mut Shell) {
     let mut line_buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
-    flush_stdout();
+    flush_terminal();
     report_mail(shell);
     eprint!("{}", shell.get_ps1());
     loop {
@@ -140,17 +143,12 @@ fn standard_repl(shell: &mut Shell) {
                     if program_buffer.ends_with(b"\\\n") {
                         continue;
                     }
-                    let program_string = match std::str::from_utf8(&program_buffer) {
-                        Ok(buf) => buf,
-                        Err(_) => {
-                            eprintln!("sh: invalid utf-8 sequence");
-                            program_buffer.clear();
-                            continue;
-                        }
-                    };
-                    println!();
+                    let _ = writeln!(io::stderr());
                     shell.terminal.reset();
-                    match shell.execute_program(program_string) {
+                    // The line goes to the shell as the bytes that were typed:
+                    // the lexer takes bytes, so decoding it here would only
+                    // reject a line the shell can otherwise run.
+                    match shell.execute_program(&program_buffer) {
                         Ok(_) => {
                             program_buffer.clear();
                             print_ps2 = false;
@@ -175,17 +173,19 @@ fn standard_repl(shell: &mut Shell) {
             let mut cursor_position = line_buffer.len();
             clear_line();
             cursor_position += print_prompt(shell, print_ps2);
-            write_stdout(&line_buffer);
+            write_terminal(&line_buffer);
             set_cursor_pos(cursor_position);
-            flush_stdout();
+            flush_terminal();
         }
-        std::thread::sleep(Duration::from_millis(16));
+        // Wait for a keystroke or a signal rather than waking 62 times a
+        // second to find neither.
+        let _ = wait_for_input(io::stdin().as_raw_fd());
         shell.signal_manager.reset_sigint_count();
         shell.handle_async_events();
         if shell.signal_manager.get_sigint_count() > 0 {
             program_buffer.clear();
             line_buffer.clear();
-            println!();
+            let _ = writeln!(io::stderr());
             report_mail(shell);
             eprint!("{}", shell.get_ps1());
         }
@@ -200,7 +200,7 @@ fn vi_repl(shell: &mut Shell) {
     let mut program_buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
-    flush_stdout();
+    flush_terminal();
     report_mail(shell);
     eprint!("{}", shell.get_ps1());
     loop {
@@ -211,17 +211,12 @@ fn vi_repl(shell: &mut Shell) {
                     if program_buffer.ends_with(b"\\\n") {
                         continue;
                     }
-                    let program_string = match std::str::from_utf8(&program_buffer) {
-                        Ok(buf) => buf,
-                        Err(_) => {
-                            eprintln!("sh: invalid utf-8 sequence");
-                            program_buffer.clear();
-                            continue;
-                        }
-                    };
-                    println!();
+                    let _ = writeln!(io::stderr());
                     shell.terminal.reset();
-                    match shell.execute_program(program_string) {
+                    // The line goes to the shell as the bytes that were typed:
+                    // the lexer takes bytes, so decoding it here would only
+                    // reject a line the shell can otherwise run.
+                    match shell.execute_program(&program_buffer) {
                         Ok(_) => {
                             program_buffer.clear();
                             print_ps2 = false;
@@ -249,17 +244,19 @@ fn vi_repl(shell: &mut Shell) {
             let mut cursor_position = editor.cursor_position();
             clear_line();
             cursor_position += print_prompt(shell, print_ps2);
-            write_stdout(editor.current_line(shell));
+            write_terminal(editor.current_line(shell));
             set_cursor_pos(cursor_position);
-            flush_stdout()
+            flush_terminal()
         }
-        std::thread::sleep(Duration::from_millis(16));
+        // Wait for a keystroke or a signal rather than waking 62 times a
+        // second to find neither.
+        let _ = wait_for_input(io::stdin().as_raw_fd());
         shell.signal_manager.reset_sigint_count();
         shell.handle_async_events();
         if shell.signal_manager.get_sigint_count() > 0 {
             program_buffer.clear();
             editor.reset_current_line();
-            println!();
+            let _ = writeln!(io::stderr());
             report_mail(shell);
             eprint!("{}", shell.get_ps1());
         }
@@ -291,7 +288,7 @@ fn non_terminal_repl(shell: &mut Shell) -> ! {
             Err(_) => shell.exit(128),
         }
         program_buffer.push_str(&line);
-        match shell.execute_program(&program_buffer) {
+        match shell.execute_program(program_buffer.as_bytes()) {
             Ok(_) => program_buffer.clear(),
             Err(syntax_err) => {
                 if !syntax_err.could_be_resolved_with_more_input {
@@ -331,7 +328,7 @@ fn interactive_shell(shell: &mut Shell) {
             unsafe { libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() };
         if ids_match {
             if let Ok(contents) = std::fs::read_to_string(&env_file) {
-                if let Err(err) = shell.execute_program(&contents) {
+                if let Err(err) = shell.execute_program(contents.as_bytes()) {
                     eprintln!("sh: {env_file}: {}", err.message);
                 }
             }
@@ -354,7 +351,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let args = match parse_args(std::env::args().collect(), is_attached_to_terminal()) {
+    // `args()` panics inside libstd on an argument that is not valid UTF-8;
+    // `args_os()` cannot. POSIX argv is a list of byte strings.
+    let args = match parse_args(
+        std::env::args_os().map(ShString::from).collect(),
+        is_attached_to_terminal(),
+    ) {
         Ok(args) => args,
         Err(err) => {
             eprintln!("{err}");
@@ -363,7 +365,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut shell = Shell::initialize_from_system(
         args.program_name,
-        args.arguments,
+        args.arguments.into_iter().collect(),
         args.set_options,
         args.execution_mode == ExecutionMode::Interactive,
     );
@@ -371,14 +373,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     match args.execution_mode {
         ExecutionMode::Interactive => interactive_shell(&mut shell),
         ExecutionMode::ReadCommandsFromStdin => {
-            let mut buffer = String::new();
-            while io::stdin().read_line(&mut buffer).is_ok_and(|n| n > 0) {
-                if buffer.ends_with("\\\n") {
+            // Read as bytes: `read_line` needs valid UTF-8 and silently ends
+            // the loop on a script that is not text.
+            let mut buffer: Vec<u8> = Vec::new();
+            // A construct that is merely incomplete is not an error while more
+            // input may still arrive, but it becomes one at end of input.
+            let mut incomplete: Option<ParserError> = None;
+            while io::stdin()
+                .lock()
+                .read_until(b'\n', &mut buffer)
+                .is_ok_and(|n| n > 0)
+            {
+                if buffer.ends_with(b"\\\n") {
                     continue;
                 }
                 match shell.execute_program(&buffer) {
                     Ok(_) => {
                         buffer.clear();
+                        incomplete = None;
                     }
                     Err(syntax_err) => {
                         if !syntax_err.could_be_resolved_with_more_input {
@@ -388,18 +400,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                             );
                             std::process::exit(2);
                         }
+                        incomplete = Some(syntax_err);
                     }
                 }
+            }
+            if let Some(syntax_err) = incomplete {
+                eprintln!(
+                    "sh({}): syntax error: {}",
+                    syntax_err.lineno, syntax_err.message
+                );
+                std::process::exit(2);
             }
         }
         other => match other {
             ExecutionMode::ReadCommandsFromString(command_string) => {
-                execute_string(&command_string, &mut shell);
+                execute_string(command_string.as_bytes(), &mut shell);
             }
             ExecutionMode::ReadFromFile(file) => match read_command_file(&file) {
                 Ok(file_contents) => execute_string(&file_contents, &mut shell),
                 Err((err, status)) => {
-                    eprintln!("sh: {file}: {err}");
+                    eprintln!("sh: {}: {err}", file.display());
                     std::process::exit(status);
                 }
             },

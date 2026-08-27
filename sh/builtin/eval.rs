@@ -10,18 +10,27 @@
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 
 pub struct Eval;
 
 impl SpecialBuiltinUtility for Eval {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         let args = skip_option_terminator(args);
-        let program = args.join(" ");
+        // `eval` concatenates its operands and reparses them; the lexer works
+        // on bytes, so nothing has to be text.
+        let mut program: Vec<u8> = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if index > 0 {
+                program.push(b' ');
+            }
+            program.extend_from_slice(arg.as_bytes());
+        }
 
         std::mem::swap(&mut shell.opened_files, opened_files);
         let execution_result = shell.execute_program(&program);

@@ -7,14 +7,17 @@
 // SPDX-License-Identifier: MIT
 //
 
-pub struct OptionParser<'a> {
-    args: &'a [String],
+/// Generic over the argument representation so that it serves both the
+/// utilities that reinterpret their arguments as text and the ones that keep
+/// them as bytes.
+pub struct OptionParser<'a, S: AsRef<str>> {
+    args: &'a [S],
     arg_pos: usize,
     option_pos: usize,
 }
 
-impl<'a> OptionParser<'a> {
-    pub fn new(args: &'a [String]) -> Self {
+impl<'a, S: AsRef<str>> OptionParser<'a, S> {
+    pub fn new(args: &'a [S]) -> Self {
         Self {
             args,
             arg_pos: 0,
@@ -24,7 +27,7 @@ impl<'a> OptionParser<'a> {
 
     pub fn next_option(&mut self) -> Result<Option<char>, &str> {
         while self.arg_pos < self.args.len() {
-            let arg = &self.args[self.arg_pos];
+            let arg = self.args[self.arg_pos].as_ref();
             if self.option_pos == 0 {
                 if arg == "--" {
                     self.arg_pos += 1;
@@ -51,14 +54,14 @@ impl<'a> OptionParser<'a> {
 
     pub fn next_option_argument(&mut self) -> Option<&'a str> {
         if self.arg_pos < self.args.len() {
-            let arg = &self.args[self.arg_pos];
+            let arg = self.args[self.arg_pos].as_ref();
             if self.option_pos == arg.len() {
                 self.option_pos = 0;
-                let result = self.args.get(self.arg_pos + 1).map(|s| s.as_str());
+                let result = self.args.get(self.arg_pos + 1).map(|s| s.as_ref());
                 self.arg_pos += 2;
                 result
             } else {
-                let result = Some(&self.args[self.arg_pos][self.option_pos..]);
+                let result = Some(&arg[self.option_pos..]);
                 self.arg_pos += 1;
                 self.option_pos = 0;
                 result

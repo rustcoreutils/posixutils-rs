@@ -349,3 +349,644 @@ they were replaced by the category table — so there is no stage claim left to
 update there.)
 
 **Original audit verdict (pre-remediation).** Every Critical and most Major findings were reproduced on `target/release/sh` against `dash` and `bash --posix`; the `[V-refuted]` notes record agent-proposed findings that behavioral testing disproved (hash-store, `kill -l` SIGKILL, special-builtin redirect persistence, `read x y` without options, literal-`.` glob, arithmetic overflow/shift/`0x` panics in release, `${x:?}` exit). The defect list was finite, well-localized, and fixable without architectural change.
+
+## Robustness pass (2026-08-27) — Phase 1: process-aborting panics
+
+A fresh review found 15 defects beyond those recorded above, several of them
+process-aborting. This section records the staged remediation; each phase is a
+separate commit on `updates`, validated against `dash` 0.5.12 and
+`bash --posix` 5.2.21.
+
+### Phase 1 — panics and shell-killing errors
+
+- [x] **Affix removal was broken four ways and aborted the shell.**
+  `pattern/mod.rs` held two different matching models: the "largest" pair used
+  the *unanchored* `Regex::match_locations`, the "shortest" pair used an
+  anchored test over a hand-truncated buffer. Consequences, all verified:
+  (a) `remove_shortest_suffix` derived its no-match sentinel from the length
+  *including* a pushed NUL, so `x=abc; echo ${x%z}` ran `Vec::drain` past the
+  end and aborted the process — `${f%.c}` on a name without `.c` killed any
+  script; (b) matching was unanchored, so `${x#b}` on `abc` gave `c` and
+  `${x%b}` gave `a`, where both must give `abc`; (c) the loops ran
+  `1..len - 1`, so a pattern matching the *entire* value was never removed
+  (`${x#abc}` → `abc`); (d) `remove_largest_suffix` seeded `len - 1` and so ate
+  a byte on no match (`${x%%zzz}` → `ab`); (e) the "shortest" pair walked *byte*
+  indices, so a multi-byte character could be split and the trailing
+  `String::from_utf8(..).expect(..)` aborted; (f) the "largest" pair used
+  `CString::new(s).expect(..)`, aborting on an interior NUL.
+  All four are now expressed against a single anchored whole-candidate
+  predicate that iterates character boundaries and returns the value unchanged
+  when the pattern does not match.
+- [x] **A trailing backslash aborted the shell.** `parse/word_parser.rs`'s
+  unquoted `Backslash` arm called `next_char().unwrap()`, but the lexer emits
+  `Backslash` even when `\` ends the input. `echo a\` now yields a literal
+  backslash, as the double-quoted arm immediately above it already did.
+- [x] **The word lexer discarded real parser errors.** `WordLexer::next_token`
+  returned `WordToken` rather than `ParseResult`, so three skip helpers that do
+  return errors used `.expect("invalid word")`; ``echo $((1`))`` aborted.
+  `next_token` and `remove_quotes` are now fallible, and both here-document
+  call sites propagate.
+- [x] **`set -x` on an assignment-only command aborted.** `trace()` sliced
+  `..len - 1` on an empty word list and was called *before* the `is_empty()`
+  guard. It now reports assignments with their expanded values in that path
+  (`+ a=1`, matching dash). Prefix assignments on a command are not yet traced;
+  that is deferred to the scope rework in Phase 3.
+- [x] **`trap '' SIG` killed a non-interactive shell.** `is_unsigned_int("")`
+  is vacuously true, so the empty *action* was parsed as a signal number,
+  `Signal::from_str("")` failed, and `trap` — a special builtin — exited.
+  `TrapArg::Ignore` was dead code. Also fixed alongside: `trap -p` ignored its
+  operands and dumped every condition, where POSIX 2024 specifies
+  `trap -p [condition...]`.
+- [x] **`set -f -- "$@"` killed the script.** The option terminator was
+  recognized only in first position (`"--" if i == 0`), so `--` after any other
+  option fell through to `set_short('-')` and errored.
+- [x] **`FilenamePattern::matches_all` indexed `s.to_bytes()[0]`** with no
+  emptiness guard.
+- [x] **An incomplete construct at end of input exited 0 silently.** Reading
+  commands from stdin, a construct still awaiting input was abandoned at EOF
+  without a diagnostic — `if true`, `while true; do`, `case x in`,
+  `echo 'unterminated` and `echo $(` all exited **0**. There is no more input
+  at EOF, so each is a syntax error; all now exit 2 with a diagnostic, matching
+  dash. `-c` and script files were already correct.
+
+A near-miss worth recording: hoisting assignment expansion out of
+`assign_globals`/`assign_locals` to feed the trace silently broke POSIX's
+left-to-right assignment visibility (`a=1 b=$a` set `b` to empty instead of
+`1`). Expansion and assignment must interleave. There is now a regression test
+pinning it.
+
+### Phase 2 — reserved words are recognized only in command position
+
+- [x] **`while true; do echo done; break; done` hung forever.**
+  `CommandLexer::word()` mapped `if`/`do`/`done`/… to reserved tokens
+  **unconditionally**, with no notion of token position, and
+  `parse_simple_command` compensated by stopping at a threaded
+  `end: CommandToken`. So `done` used as an *argument* was taken for the loop
+  terminator, `break` landed outside the loop, and the loop never ended.
+  `for i in 1; do echo done; done` reported `sh: 'done' not found`.
+  The lexer now takes a `recognize_reserved` flag and the parser supplies it
+  from POSIX 2.4: a reserved word is one only as the first word of a command,
+  or the first word after a reserved word other than `case`, `for` or `in`.
+  The decision depends solely on the token being consumed, so it lives in
+  `advance()` rather than at ~50 call sites. `parse_simple_command` now stops
+  at any reserved word — a reserved word cannot be an argument — which made
+  the threaded `end: CommandToken` vestigial; it is deleted from all five
+  functions that carried it.
+- [x] **`in` as the third word of `case`/`for`.** POSIX 2.4 excludes `in` from
+  the "first word after a reserved word" rule, so the preceding word carries no
+  signal and the lexer reads `in` as ordinary. `match_reserved_word` accepts
+  either spelling, so `case in in in) …` and `for in in in; do …` work.
+  `esac` immediately after `in` closes an empty case list, and is accepted the
+  same way.
+- [x] **`case x in x) ;; esac` was rejected** though POSIX 2.9.4 permits an
+  empty body. `CaseItem::body` was a `CompleteCommand` holding a
+  `NonEmpty<Conjunction>`, so an empty body was unrepresentable; it is now
+  `Option<CompleteCommand>`.
+- [x] **`$(case a in a) …;; esac)` was cut short and executed anyway.** The
+  command-substitution scanner counted parentheses, but a `case` pattern's `)`
+  has no opener, so the substitution ended at the first pattern. The scanner
+  now tracks open `case`s, counting `case`/`esac` only in command position so
+  `$(echo case)` is unaffected.
+- [x] **An alias expanding to a compound command lost its first token.**
+  `alias_substitution` returned `Ok(None)` when the expansion did not start
+  with a plain word, and both callers then advanced past it, so
+  `alias f="if true; then echo t; fi"; f` reported `sh: 'then' not found`.
+  The replacement text takes the command word's place, so its first token is
+  read in command position, and `parse_command` re-dispatches on it.
+- [x] **A guard consumed the character it peeked at.**
+  `strip_line_continuations` matched `'\\' if chars.next() == Some('\n')`,
+  swallowing the following character even when the guard failed.
+
+One committed test encoded non-POSIX behavior and was corrected rather than
+preserved: `parse_brace_group` asserted that `{ word }` parses. `}` is a
+reserved word, so it is only recognized in command position — dash and bash
+both reject `{ word }` and require the separator.
+
+### Phase 3 — control flow, errexit, traps, `-n`
+
+- [x] **`false && echo A && echo B` ran `B`.** `interpret_and_or_list`'s
+  short-circuit added a single extra `i += 1`, skipping only the *next*
+  pipeline. Rewritten to the standard form: the first pipeline always runs, and
+  each later one runs only if the operator joining it to the previous pipeline
+  is satisfied by the status so far, so a skip naturally carries through the
+  whole run. `false && a && b` is now rc 1 with nothing run.
+- [x] **`set -e; false || echo recovered` exited 1 silently.** The errexit
+  predicate was `i == list.len() - 1 && ignore_errexit` — inverted. POSIX 2.11
+  exempts every element of an AND-OR list *except* the last, since the earlier
+  ones' failure is exactly what the operators test.
+- [x] **A loop always returned 0.** `interpret_loop_clause` bound
+  `let status = 0;` and never reassigned it, discarding the body's status.
+  `interpret_for_clause` alongside it was already correct.
+- [x] **The EXIT trap fired in every subshell.** `become_subshell` reset
+  `signal_manager` but left `exit_action`, and `fork_and_exec`'s child never
+  called it at all. POSIX 2.12 requires caught traps reset to their default in
+  a subshell, so the standard `trap 'rm -rf "$tmpdir"' EXIT` idiom deleted the
+  temporary directory at the first subshell or command substitution.
+- [x] **A failed prefix assignment leaked into the environment permanently.**
+  `exec_builtin_utility`, `exec_function` and the external-command branch each
+  called `push_scope()` and then `?`-returned past `pop_scope`, and
+  `Environment::exported` exports every local scope — so after
+  `FOO=bar cat </nonexistent`, `FOO` was set *and exported to every later
+  child*. All three now pop on every path.
+- [x] **A function's redirections were applied twice.** `exec_function`
+  redirected into its own copy of the file table and then passed the same
+  redirections to `interpret_compound_command`, which redirects again. Every
+  redirection was opened twice; the local copy is deleted.
+- [x] **`sh -n` only syntax-checked the first command.** The guard sat inside
+  the `parse_next_command` loop and returned on the first iteration, so
+  `printf 'true\n)))\n' > f; sh -n f` exited 0 where dash exits 2. It now
+  parses to end of input without executing.
+
+Re-probed from the feature backlog: **`set -o pipefail` is implemented and
+correct** (`set -o pipefail; false | true` → 1, without it → 0), so the entry
+listing it as missing is stale.
+
+### Phase 4 — field splitting
+
+The three defects below were three places independently deciding what a field
+boundary is. They are replaced by a single `FieldSplitter` transcribing POSIX
+XCU 2.6.5 directly, which the `ExpandedWord` representation already supports:
+its parts record which bytes came from an expansion, and only those may
+delimit.
+
+- [x] **A run of IFS white space followed by a non-white-space IFS character
+  produced a spurious empty field.** The old code consumed a delimiter and then
+  skipped IFS white space, leaving the next non-white-space IFS character to be
+  processed as a *second* delimiter. `IFS=' :'; x='  a : b  '` gave
+  `[a][][b]` where dash gives `[a][b]`. Every `IFS=', '`-style split was
+  affected. A white-space run is one delimiter and may absorb one
+  non-white-space IFS character; a non-white-space IFS character on its own
+  always delimits, which is what keeps `IFS=:` turning `a::b` into three fields.
+- [x] **`"$@"` with no positional parameters produced one empty field.** POSIX
+  2.5.2 requires zero, so `exec prog "$@"` invoked `prog ""`. The quotes around
+  the expansion contribute an empty literal of their own, so the emptiness is
+  recorded on the `ExpandedWord` rather than inferred from it. (The standard
+  leaves the result unspecified when the word holds other parts inside the same
+  double quotes; the tests do not pin that shape down.)
+- [x] **`IFS=` merged the parameters of `"$@"`.** `split_fields` early-returned
+  when IFS was null, discarding the boundaries `"$@"` had planted — but IFS has
+  no bearing on those. `IFS=` is *the* idiom for disabling splitting, so any
+  script combining it with `"$@"` silently merged its arguments.
+- [x] **Unquoted `$@`/`$*` kept null parameters as empty fields.** A boundary
+  was planted between parameters regardless of quoting. Quoted, a null
+  parameter is an empty field; unquoted, POSIX 2.5.2 allows it to be discarded,
+  which is a distinct kind of boundary — now `ExpandedWordPart::SoftFieldEnd`,
+  which yields nothing when no field has accumulated. This also covers a
+  parameter consisting entirely of IFS white space.
+- [x] **`${*:-word}` never substituted.** `expand_simple_parameter_into`
+  returned `Set` for every special parameter unconditionally. `$@` and `$*` are
+  always set but *null* when they expand to nothing, so `${*:-D}` substitutes
+  while `${*-D}` does not — verified against dash for all three of no
+  parameters, one null parameter, and one non-empty parameter.
+- [x] **`${#}` was a syntax error.** It was parsed as a length operator with a
+  missing operand rather than the `#` special parameter in braces.
+
+Two unit tests asserted an internal representation that changed: an empty field
+now carries no parts rather than one part holding the empty string (nothing
+downstream distinguishes them), and unquoted `$@` plants `SoftFieldEnd`.
+`${#*}`/`${#@}` remain an error; POSIX leaves the length of `*`/`@` unspecified.
+
+### Phase 5 — redirections, file descriptors, umask
+
+- [x] **Chained redirections could clobber a source before reading it.** The
+  child's descriptor setup iterated a `HashMap` and `dup2`'d in arbitrary order
+  with no collision analysis, so in `3>&1 1>&2 2>&3` — where each source is
+  another redirection's destination — the result depended on map order. Every
+  source is now duplicated above the highest destination first, then placed.
+- [x] **`2>&-` did not close anything.** The arm removed the entry from the
+  table, but an *absent* descriptor is simply inherited from the shell, so
+  `ls /nosuch 2>&-` still wrote to fd 2. There is now an explicit
+  `OpenedFile::Closed`.
+  Closing it has to happen **after** every other redirection is placed: `5<&-`
+  frees fd 5, so a later `<file` in the same command may be handed fd 5 by the
+  kernel, and closing during the placement pass took that descriptor with it.
+  That made `cat 5<file1.txt 5<&- <file1.txt` print its file or nothing
+  depending on map order — a nondeterministic result that the fixture caught
+  only intermittently.
+- [x] **A redirection created files with the execute bit set.** All five
+  `File::options()` sites passed `.mode(shell.umask)`, but `shell.umask` holds
+  the *complement* of the mask (the allowed permission bits, 0o755 by default),
+  so `> f` produced mode 755 and the mask was then applied a second time by the
+  kernel. POSIX asks for mode 0666 and lets the umask narrow it: `> f` under
+  `umask 022` now gives 644, matching dash.
+- [x] **`umask` never reached the commands the shell ran.** Nothing in the crate
+  called `libc::umask`, so the builtin updated only the shell's own bookkeeping
+  while every utility it started used the inherited mask —
+  `umask 077; touch f` gave 664. The builtin now sets the process mask, and the
+  shell seeds its own value from the inherited one instead of assuming 022.
+
+Deliberately **not** changed: a redirection error exits 1 here and in
+`bash --posix`, where dash exits 2. POSIX requires only a non-zero status.
+
+The `umask` fixture was corrected on both counts: it asserted the inherited mask
+was 022 (it varies by environment, so the script now sets one first) and it
+asserted the mode-755 behavior this phase fixes.
+
+### Phase 6 — wait instead of polling
+
+- [x] **Every foreground command cost a 16 ms tick.**
+  `wait_child_process_result` called `waitpid` with `WNOHANG` and slept 16 ms on
+  `StillAlive`. A loop running 200 external commands took **6.83 s** against
+  dash's 0.10 s — 68x. The same tick appeared in the pipeline wait, both
+  interactive REPL loops and the `read` builtin, so an idle interactive shell
+  woke 62 times a second.
+  The fix needed almost no new machinery, because the self-pipe was already
+  there: `os/signals.rs` installs handlers that write the signal number to
+  `SIGNAL_WRITE`, `SIGNAL_READ` is `O_NONBLOCK` and `FD_CLOEXEC`, and the
+  handlers use `SA_SIGINFO` **without `SA_RESTART`**, so a blocking syscall
+  already returns `EINTR`. `waitpid` now blocks and reports `EINTR` as
+  `WaitStatus::Interrupted`, which runs any pending trap and waits again; the
+  input loops `poll()` on stdin together with the signal pipe.
+  200 external commands now take **0.30 s**, and an idle interactive shell uses
+  **0 CPU ticks over 2 seconds**.
+- [x] **Background jobs were never reaped without job control.** `update_jobs`
+  ran only under `set -m`, so a non-interactive `cmd &` loop accumulated one
+  zombie per iteration — 20 for 20 jobs, where dash leaves none. Reaping is now
+  unconditional (only the *reporting* of state changes is a job-control
+  feature) and also runs after each foreground command, since one may have
+  finished while it ran.
+  Reaping unconditionally then exposed a second defect: `wait` collects a job
+  directly, so `update_jobs` could hit `ECHILD` for a job that was already
+  gone and printed that as an error. It is now read as "already reaped".
+
+The remaining gap to dash is ~5x per external command and is **not** polling:
+it is fork/exec cost plus the work done per command. The largest practical
+share of it is that `test` and `[` are not built in, so every `[ ... ]`
+conditional forks a process — dash and bash build both in. That belongs with
+the missing-builtin work rather than here.
+
+### Phase 7 — patterns match bytes directly; `pattern/regex.rs` is gone
+
+Shell patterns were translated to a POSIX BRE string and executed by
+`plib::regex`. The detour cost a regex compile per word, made anchoring a
+per-call-site decision (the root of Phase 1's affix bugs), forced every regex
+metacharacter to be escaped on the way through, and — decisively — could not
+carry bytes: `plib::regex` is `&str`-only, and the bridge used
+`CStr::to_str().unwrap_or("")`, silently turning a subject that is not valid
+text into the empty string.
+
+`pattern/matcher.rs` replaces it, matching `&[PatternItem]` against `&[u8]`
+directly. `pattern/regex.rs` is **deleted** (356 lines), and with it `sh`'s only
+use of `plib::regex`.
+
+- The engine simulates a Thompson-style state set: `O(subject × pattern)` time,
+  `O(pattern)` space, with no input that makes it blow up. `a*a*a*a*a*b` against
+  a long subject costs the same as any other pattern of that length, where a
+  backtracking matcher goes exponential.
+- Simulating the whole set also answers the question affix removal actually
+  asks. One pass yields *every* position a match can end at, so `${x#pat}` and
+  `${x##pat}` are the first and last of them; the previous implementation had to
+  truncate and retry. Suffixes reuse the same pass over reversed items and
+  reversed *steps* — never reversed bytes, which would shred multi-byte
+  characters.
+- The subject is split into "steps": one valid character, or one byte that is
+  not part of one. `?` matches a step, so it matches one character and removal
+  never cuts one in half — consistent with `${#x}` already counting characters.
+  A byte that is not a character belongs to no character class, but still
+  matches `*`, `?`, a literal of that byte, and a negated bracket.
+- Character classes use the locale's `iswalpha` and friends rather than Rust's
+  Unicode tables, since the shell calls `setlocale` at startup and sorts with
+  `strcoll`. An unknown class name is rejected at construction, as `regcomp`'s
+  `REG_ECTYPE` used to do.
+- [x] **`*/` matched plain files and dropped the slash.** `FilenamePattern::new`
+  split on `/` and filtered out empty components, discarding the trailing one
+  entirely, so `*/` behaved as `*` and `echo /etc/` printed `/etc`. A pattern
+  ending in `/` now matches directories only and keeps the slash.
+- Globbing matches directory entries as raw bytes, so a file name that is not
+  valid text is found rather than silently skipped. Carrying it through the
+  expansion still fails loudly ("contains invalid utf8") because a field is a
+  `String`; that is what the byte-core phase is for.
+
+The 16 `convert_*` tests in the deleted module asserted the *spelling* of the
+generated BRE, so they would have become meaningless rather than failing.
+Their intent is re-expressed as behavior tests in `pattern/matcher.rs`, plus
+coverage the old layer had none of: the exponential-blowup shape, bytes that
+are not characters, and the affix boundaries.
+
+Not a defect: `?` matches one *character*, so `case héllo in h?llo` matches
+here and in `bash --posix`, while byte-oriented dash does not.
+
+### Phase 8 — the byte core (stage 1 of 4: expansion)
+
+POSIX XCU 2.6.5 is explicit that "the shell processes arbitrary bytes from the
+input fields; there is no requirement that those bytes form valid characters",
+and the same holds for arguments, environment entries, file names and script
+text. The crate was `String`/`char`-typed throughout, which is why `IFS=é`
+panicked, a non-UTF-8 file name could not survive globbing, and a script with
+one Latin-1 byte was refused outright.
+
+`shstr.rs` introduces `ShStr`/`ShString` — a borrowed and an owned byte string
+shaped like `Path`/`PathBuf`, with `Deref` to `[u8]` so the whole slice API
+comes for free. Deliberately **no** `Display`: a blanket lossy one would be a
+trap, since `format!("{name}={value}")` builds an *environment entry* rather
+than a message and would be corrupted silently. Callers ask for `.display()`,
+which makes `grep -rn '\.display()'` the exact list of intentional byte loss.
+`Debug` prints escaped-ASCII so a failing assertion stays readable.
+
+This stage converts the expansion pipeline:
+
+- `ExpandedWordPart` carries `ShString`. `append`'s two-bound signature is
+  preserved (`AsRef<[u8]> + Into<ShString>`) so the merge path still appends
+  without allocating, and every existing call site passing `&str`/`String`
+  compiles unchanged.
+- `ExpandedWord::to_sh_string()` replaces the `Display` impl.
+- Pattern text is byte-aware: `ShStr::chars_lossless()` yields each character
+  or, for a byte that is not part of one, that byte — nothing collapses to
+  U+FFFD, so a value can be taken apart and reassembled unchanged.
+  `PatternItem::Byte` carries such a byte and matches exactly itself.
+- [x] **`IFS=é` panicked.** `$*` joins on the *first character* of IFS, but the
+  separator was `&v[..1]` — a byte slice, which split a multi-byte character.
+  `IFS=é; set -- a b; echo "$*"` now gives `aéb`, as `bash --posix` does;
+  byte-oriented dash gives `a\xc3b`.
+
+One scaffold remained after that stage, marked `SCAFFOLD(byte-core stage 1)`:
+`expand_word` converted back to `String` at its return. Stage 2 removes it.
+
+### Phase 8 — the byte core (stage 2 of 3: values, environment, argv, builtins)
+
+The scaffold is gone and the conversion now reaches every path that carries a
+*value*.
+
+- `Value`, `LocalScope`, `positional_parameters`, `program_name` and the
+  command-location cache hold bytes. **Variable *names* stay `String`**: POSIX
+  XBD 3.231 restricts a name to the portable character set, and `is_valid_name`
+  already enforced exactly that, so a name cannot contain a byte that is not
+  text. That asymmetry is what kept the diff tractable.
+- `Environment::get_value` returns `&ShStr`; `get_str_value` is kept for the
+  variables whose meaning *is* text (`OPTIND`, `LINENO`, `FCEDIT`) and yields
+  `None` when the value is not valid UTF-8, which for those is not a usable
+  value anyway.
+- The builtin trait takes `&[ShString]`. Utilities whose operands are only
+  option letters, signal names or numbers convert once at entry with
+  `args_as_str`, which reports a byte string that cannot be any of those rather
+  than mangling it; the ones that carry values — `export`, `readonly`, `read`,
+  `cd`, `set`, `command`, `getopts`, `test` — take the bytes.
+- `OpenedFiles::write_out`/`write_err` take bytes, and `export -p`,
+  `readonly -p` and `set` build their output by byte concatenation, so a value
+  that is not text **round-trips** instead of being flattened.
+  `utils::shell_quote` operates on bytes for the same reason.
+- `os::exec` builds each environment entry by byte concatenation rather than
+  `format!`, and the four post-fork `CString::new(..).unwrap()` calls are gone:
+  an interior NUL is now `ExecError::InteriorNul`, reported rather than an abort
+  in the child.
+- [x] **A non-UTF-8 argument aborted the shell.** `std::env::args()` panics
+  inside libstd; `args_os()` cannot.
+- [x] **A non-UTF-8 environment entry aborted the shell at startup.**
+  `std::env::vars()` → `vars_os()`. An entry whose *name* is not text cannot be
+  addressed as a shell variable, so it is kept aside rather than dropped —
+  POSIX still requires passing it to children.
+- [x] **Command substitution flattened bytes to U+FFFD.** The output was run
+  through `String::from_utf8_lossy`; it is now kept exactly as the command
+  wrote it (NULs still dropped, which POSIX leaves unspecified).
+- [x] **`for f in *` could not carry a non-UTF-8 file name.** The glob result
+  had to become a `String` and was refused; it now goes through as bytes.
+- [x] **`$*` fell back to a space when IFS was not valid text.** The separator
+  is the first *element* of IFS, which may be a byte that is not a character.
+
+### Phase 8 — the byte core (stage 3 of 3: the lexer and script text)
+
+The conversion is complete. What made it tractable is that **every
+syntactically significant character in the shell grammar is ASCII**, so the
+lexer never has to decode: `Lexer::lookahead` yields a `u8`, and a byte
+`>= 0x80` is by definition an ordinary word character that cannot be mistaken
+for an operator, a quote or a reserved word. The byte cursor that replaces
+`CharIndices` is *simpler* than what it replaced, since no `len_utf8`
+bookkeeping is needed.
+
+- `Lexer`, `CommandLexer`, `WordLexer` and their token payloads
+  (`Cow<'src, [u8]>`) work on bytes; `WordPart`, `WordPair::as_string` and the
+  here-document payloads hold `ShString`.
+- `execute_program` takes `&[u8]`, so a script file, a `-c` string, `eval` and
+  `.` all carry bytes. `read_command_file` reads with `read_to_end`, and the
+  stdin loop uses `read_until` — `read_line` needs valid UTF-8 and was silently
+  ending the loop on a script that is not text.
+- [x] **A script containing one Latin-1 byte was refused with exit 126.** It
+  now runs, as it does under dash.
+- [x] **A word could not contain a byte that is not part of a character.**
+  `CommandToken::as_word_str` returned `None` for such a word, so the parser did
+  not see it as a word at all and reported a syntax error. `as_word_bytes` is
+  used wherever any word is allowed; `as_word_str` remains only for comparing
+  against fixed spellings.
+- `$'\xNN'` now emits the **byte** NN rather than encoding U+00NN as two bytes
+  — a latent defect the conversion exposed.
+
+Names stay text throughout: a variable, function or alias name is restricted to
+the portable character set, so the few places that need one (`try_into_assignment`,
+function definitions, `is_valid_name`) assert ASCII rather than carrying bytes.
+
+Six lossy conversions remain, all deliberate and all diagnostics or ASCII
+scanning: four `WordToken` `Display` arms, `getopts` scanning option letters
+(the byte offsets still index the original bytes), and `set -v` echoing the
+program. `cli/vi/` stays on `String` deliberately: terminal line editing is
+character-and-column oriented, and converting it would break cursor movement for
+no gain.
+
+The safety net did its job — the lexer conversion touched 4945 lines and 186
+character literals, and all 92 inline parser/lexer tests plus the 198 fixtures
+passed unchanged, without a single expectation being edited to fit.
+
+One committed test had to change, and only because the behaviour it pinned was
+an artifact: `non_script_command_file_exits_126` asserted 126 for a binary
+command file, which followed from the UTF-8 refusal being removed here. The
+three reference shells disagree (dash 127, bash sniffs ELF magic and gives 126),
+so the test now pins only that it fails and executes nothing.
+
+### Phase 9 — missing builtins and interactive output
+
+- [x] **`pwd`, `true` and `false` were not builtins.** POSIX XCU lists all three
+  as utilities, and every shell builds them in. `pwd` in particular *must* be
+  built in, because `cd` is: `cd` updates the shell's own
+  `current_directory`/`PWD`, but a forked `/bin/pwd` reports the *process*
+  working directory, so the two diverge after `cd` through a symbolic link.
+  `pwd` implements both `-L` (default; uses `$PWD` when it is absolute and free
+  of `.`/`..`, per the POSIX algorithm) and `-P`. Extra operands are ignored, as
+  dash and bash both do, rather than rejected — POSIX defines no operands, but
+  rejecting them would break scripts for nothing.
+- [x] **The prompt and the line editor drew on standard output.** POSIX is
+  explicit for PS1: "After expansion, the value shall be written to standard
+  error." Ours wrote the prompt, the echoed input and every cursor escape to
+  stdout, so `sh -i > log` filled the log with `\x1b[K`. All of it now goes to
+  stderr, matching `bash --posix`. (dash writes its prompt to stdout, which is
+  the non-conforming choice here.)
+- [x] **`print_prompt` returned a byte count** that the caller uses as a cursor
+  column, so any prompt with a multi-byte character misplaced the cursor. It
+  now counts characters.
+
+Not a defect after probing: `find_command` passes an empty default `PATH`, but
+an unset `PATH` makes dash, `bash --posix` and this shell alike report the
+command as not found, so there is nothing to reconcile.
+
+One committed test had to change: `hash_forgets_remembered_locations_when_path_changes`
+used `hash true` as a stand-in for an external utility, and `true` is now a
+builtin (only external utilities are hashed). It uses `cat`.
+
+### Phase 10 — POSIX.2024 feature survey
+
+The feature backlog recorded above was re-probed against the current binary
+rather than trusted. **Almost all of it is stale**, and what remains is
+optional by the standard's own words:
+
+| Candidate | Status |
+|---|---|
+| `$'...'` | **Implemented** (`WordToken::DollarSingleQuote`), including `\t`, `\xNN` |
+| `;&` fall-through | **Implemented** (`CommandToken::SemiAnd`) |
+| `set -o pipefail` | **Implemented** and correct |
+| Arithmetic `?:`, `,` | **Implemented** |
+| `read -d` | Implemented (a bash extension, not POSIX) |
+| `getopts`, `ulimit`, `times`, `command -v` | Implemented |
+| `newgrp` | Available as an external utility; POSIX does not require it built in |
+| `{varname}<` IO_LOCATION | **Optional**: the grammar marks it "Optionally supported". dash does not have it either. Left unimplemented, and it is a syntax error rather than silent acceptance. |
+| Arithmetic `++`/`--` | **Not required**: XCU 2.6.4 says "the `sizeof( )` operator and the prefix and postfix `++` and `--` operators are not required". Rejected with a diagnostic, not silently accepted. |
+| `local` | Not in POSIX at all |
+
+So there is no *required* POSIX.2024 feature missing. The one thing the survey
+did turn up is a conformance-adjacent gap of a different kind:
+
+- [x] **`test` and `[` were not builtins.** Functionally they worked, by forking
+  `/usr/bin/[`, but a conditional is the most frequently executed command in a
+  shell script: `while [ $i -lt N ]` paid for a process per iteration, and that
+  was the single largest remaining share of the gap to dash. A 2000-iteration
+  arithmetic loop went from **1.75 s to 0.12 s**.
+  The evaluator was not duplicated: it moved from `misc/test.rs` into
+  `plib::test_expr`, and the standalone utility and the builtin now share it, so
+  they cannot drift apart. `misc`'s 37 `test` tests pass unchanged against the
+  extracted code. A usage error exits 2 and a false expression exits 1, matching
+  dash.
+
+### Review follow-up — byte-safety gaps left by the conversion
+
+A review of the branch found twelve defects, ten of them introduced by the byte
+conversion itself: places that had been converted to *carry* bytes but still
+*decoded* them at the last step. All are fixed.
+
+- [x] **`set` and `cd` rejected any non-text operand.** Both scanned their
+  options through the *fallible* `args_as_str`, which bails before the operand
+  is used — so `set -- "$@"`, the most common idiom in the shell, failed on any
+  argument that was not text. Option letters are ASCII, so a new
+  `args_for_option_scan` gives a lossy view for scanning while the operand is
+  still taken from the bytes.
+- [x] **The `test`/`[` builtin decoded every operand.** `a.display().to_string()`
+  turned an invalid byte into U+FFFD, so a file test probed the wrong path and
+  two distinct byte strings compared equal. `plib::test_expr` now evaluates over
+  `&[Vec<u8>]` — paths via `OsStr::from_bytes`, `=`/`!=` by byte comparison,
+  numbers and descriptor numbers still parsed as text — and both the standalone
+  utility and the builtin pass it bytes. `misc`'s 37 tests pass unchanged.
+- [x] **A redirection target was decoded on the way to `open`.** The comment said
+  "a redirection target is a path: bytes" and the code then passed
+  `file.display().to_string()`, so `> "$f"` created a file with U+FFFD in its
+  name. `io_redirect` takes `&ShStr` and opens through `OsStr`. Here-document
+  contents were decoded the same way and now stay bytes end to end.
+- [x] **`getopts` panicked on a non-text positional parameter.** Option letters
+  were scanned through a lossy view but the offset of an inline option-argument
+  indexed the *raw* bytes — an invalid byte is 3 bytes in the view and 1 in the
+  original, so the slice ran past the end. The scan is over raw bytes now; a
+  non-ASCII byte simply is not an option.
+- [x] **`read` stopped stripping IFS white space from the ends.** The new
+  splitter disables delimiter handling once `max_fields` is reached, which for
+  `read var` is immediately, so `read a` on `␣␣hello␣␣` kept the padding. The cap
+  must stop *creating fields*, not stop recognizing IFS white space at the ends:
+  white space is now held back and joins the final field only if ordinary text
+  follows.
+- [x] **A here-document leaked its descriptor into the exec'd process.** The
+  temporary is duplicated into place, but the original was never closed after
+  the staging rewrite, so the child inherited a stray fd on `/tmp/sh-heredoc-*`.
+- [x] **EINTR in a command substitution was reported as exit status 0.**
+  `WaitStatus::Interrupted` was folded into the `=> 0` arm instead of retrying,
+  so a trapped signal arriving before the `waitpid` reported success whatever
+  the child did, and left it unreaped. It loops like every other blocking wait.
+- [x] **`${*:-word}` substituted when it should not, and leaked.** Nullness was
+  "all parameters empty", but it follows the *joined* value: two empty
+  parameters join to a single space and so are not null, unless IFS is itself
+  empty. And when the default was used the parameter's own expansion was still
+  appended after it, so `set -- "" ""` gave `X ` instead of ` `.
+- [x] **A raw byte inside a bracket expression could never match.** It was
+  recorded as the Latin-1 *character*, but the subject step for such a byte
+  decodes to nothing, so `[<0xff>]` never matched while a bare `<0xff>` did —
+  the two paths disagreed. `BracketItem::Byte` mirrors `PatternItem::Byte`.
+- [x] **`#[allow(dead_code)]`** on `HistoryPattern::match_only_at_line_start`,
+  which CLAUDE.md forbids outright. The field was written and never read (the
+  anchoring is baked into `items`); it is deleted.
+- [x] A duplicated, self-contradicting comment in `eval` — one half written
+  before the lexer took bytes and one after — is reduced to the true half.
+
+The lesson is narrow and worth keeping: converting a *type* to bytes does not
+convert the *code*, and `.display()` is exactly where the two come apart. Every
+one of these was a `.display()`, a lossy view, or a fallible text conversion
+sitting on a path that had already been given bytes to carry.
+
+### CI and external-review follow-up — jobs, tildes, and test portability
+
+Three defects survived the branch's own gate, one of them because the gate is
+Linux-only.
+
+- [x] **`wait` reported 127 for a job it had already reaped.** Phase 6's zombie
+  fix made the shell reap background children eagerly, and `handle_async_events`
+  then *pruned* the finished jobs, discarding the status `wait` exists to
+  report. `wait $!` on a job that had had time to finish gave 127 — the status
+  POSIX reserves for a pid that was never a child. A terminated job now keeps
+  its status until `wait` collects it, and a collected status outlives the job
+  in a bounded ring, so a repeated `wait` on the same pid still answers, as dash
+  and bash both do. The Linux run was fast enough to win the race and pass; only
+  macOS CI failed. A terminated job still leaves the table promptly -- nothing
+  bounds how many background commands a loop starts -- it just leaves it into
+  the bounded memory of collected statuses rather than into nothing.
+- [x] **A tilde-prefix that was not text expanded to `$HOME`.** The login name
+  was decoded with `unwrap_or("")`, and an empty login name means "use HOME", so
+  `~<0xff>/x` silently became `$HOME/x`. Reported by an external review; the
+  same flaw was in both tilde paths, and the neighbouring `getpwnam` wrapper
+  would have panicked on a non-text home directory.
+- [x] **An unrecognized login name aborted the expansion**, where dash and bash
+  leave the tilde-prefix as written. POSIX leaves the case undefined, so this is
+  a compatibility fix rather than a conformance one — but it is what makes the
+  above fall out as one rule: a name the system does not recognize, for any
+  reason, is not a tilde-prefix.
+- [x] **A quoted tilde-prefix was expanded anyway.** POSIX 2.6.1: "If any of the
+  characters in the tilde-prefix are quoted, none of the characters in the
+  tilde-prefix shall be treated as a tilde-prefix." Only the leading unquoted
+  literal was examined, so `~"root"` gave `$HOME` + `root` and `~$u` likewise.
+  The prefix ends at the first *unquoted* slash, which is why `~root"/x"` is not
+  a tilde-prefix either.
+
+Two tests were wrong rather than the shell: `export -p | grep '^export V'` also
+matched the CI runner's `VCPKG_INSTALLATION_ROOT`, and two assertions compared
+`wc -l` output exactly, which BSD `wc` pads. A third asserted `ls` exits 2 on a
+missing file, which is a GNU-ism; it now asserts that writing to the closed
+descriptor fails, with the same probe run against an *open* descriptor so it
+cannot pass for an unrelated reason.
+
+Two more decodes of the same class as the byte-conversion follow-up, both found
+while making the `export -p` test independent of `grep`:
+
+- [x] **`read` rejected a line that is not text**, failing the whole built-in
+  with "read: invalid UTF-8". The decode was pure loss: `ExpandedWord::append`
+  already takes anything that is `Into<ShString>`, so the bytes were being
+  decoded only to be re-encoded. A shell loop could not carry a line every other
+  part of the shell had already been taught to carry.
+- [x] **The interactive REPL rejected a typed line that is not text**, with
+  "sh: invalid utf-8 sequence". The same pure round-trip: the decoded string was
+  handed straight to `execute_program` as `.as_bytes()`, and the lexer has taken
+  bytes since the conversion.
+
+A third round of test-portability fixes, all four failures being the test rather
+than the shell -- and two of them tests that could not have failed for the
+reason they claimed:
+
+- **The here-document descriptor test counted descriptors**, so it was really
+  measuring how many the test harness had open: on a busier run the shell
+  inherited fds 142 and 145 and the count went over. It now runs the same
+  command with and without the here-document and compares, so inherited
+  descriptors cancel out; the mechanism is checked by planting a deliberate
+  `9<file` leak, which it reports. It also asked `/proc` unconditionally, which
+  is why it failed differently again on macOS.
+- **Three byte-name probes create a file whose name is not valid text**, which
+  APFS rejects outright -- so on macOS they were measuring the filesystem. The
+  filesystem-free halves now run everywhere and the rest is gated on a probe
+  that creates such a name and checks, rather than on the platform name. The
+  probe fails loudly if the target temporary directory is unusable, so it cannot
+  quietly turn the tests off where they are supposed to run.
+
+The descriptor test for pipelines had the identical latent flaw -- it took its
+baseline in a *separate* shell process, so a change in the harness's own
+descriptors between the two runs would have failed it. It now takes the baseline
+in the same shell as the pipelines it compares against, and compares which
+descriptors are extra rather than how many there are.

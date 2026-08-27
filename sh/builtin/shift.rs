@@ -10,19 +10,20 @@
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use gettextrs::gettext;
 
 pub struct Shift;
 
 impl SpecialBuiltinUtility for Shift {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, args: &[ShString], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         let args = skip_option_terminator(args);
         if args.len() > 1 {
             return Err(gettext("shift: too many arguments").into());
         }
 
         let n = if let Some(n) = args.first() {
-            match n.parse::<usize>() {
+            match n.to_str().unwrap_or("").parse::<usize>() {
                 Ok(n) => {
                     if n > shell.positional_parameters.len() {
                         return Err(gettext("shift: count out of range").into());

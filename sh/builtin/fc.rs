@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
+use crate::builtin::{args_as_str, BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::{mkstemp, write};
 use crate::shell::history::EndPoint;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::FromRawFd;
@@ -54,7 +55,7 @@ enum FcArgs<'s> {
 }
 
 impl<'s> FcArgs<'s> {
-    fn parse(args: &'s [String]) -> Result<Self, String> {
+    fn parse(args: &'s [&'s str]) -> Result<Self, String> {
         let mut editor = None;
         let mut reverse = false;
         let mut suppress_command_number = false;
@@ -165,7 +166,7 @@ fn execute_history(
     keep_in_history: bool,
 ) -> Result<i32, BuiltinError> {
     std::mem::swap(opened_files, &mut shell.opened_files);
-    let result = shell.execute_program(history);
+    let result = shell.execute_program(history.as_bytes());
     std::mem::swap(opened_files, &mut shell.opened_files);
     if !keep_in_history {
         shell.history.remove_last_entry();
@@ -181,9 +182,16 @@ fn open_editor_with_file(
     opened_files: &OpenedFiles,
 ) -> Result<i32, BuiltinError> {
     let command_path = shell
-        .find_command(editor, "", shell.set_options.hashall)
+        .find_command(
+            crate::shstr::ShStr::new(editor),
+            "",
+            shell.set_options.hashall,
+        )
         .ok_or("fc: editor not found")?;
-    let args = vec![editor.to_string(), file_path.to_string_lossy().to_string()];
+    let args = vec![
+        ShString::from(editor),
+        ShString::from(file_path.as_os_str()),
+    ];
     Ok(shell.fork_and_exec(command_path, &args, opened_files)?)
 }
 
@@ -273,10 +281,11 @@ pub struct Fc;
 impl BuiltinUtility for Fc {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = &args_as_str("fc", args)?;
         let args = FcArgs::parse(args)?;
 
         let status = match args {
@@ -329,7 +338,10 @@ impl BuiltinUtility for Fc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::option_parser::tests::to_args;
+
+    fn to_str_args(args: Vec<&str>) -> Vec<&str> {
+        args
+    }
 
     #[test]
     fn parse_no_args() {
@@ -347,7 +359,7 @@ mod tests {
 
     #[test]
     fn parse_edit_with_editor() {
-        let args = to_args(vec!["-e", "vim"]);
+        let args = to_str_args(vec!["-e", "vim"]);
         assert_eq!(
             FcArgs::parse(&args),
             Ok(FcArgs::Edit {
@@ -361,7 +373,7 @@ mod tests {
 
     #[test]
     fn parse_edit_with_first() {
-        let args = to_args(vec!["-e", "vim", "1"]);
+        let args = to_str_args(vec!["-e", "vim", "1"]);
         assert_eq!(
             FcArgs::parse(&args),
             Ok(FcArgs::Edit {
@@ -375,7 +387,7 @@ mod tests {
 
     #[test]
     fn parse_edit_with_first_and_last() {
-        let args = to_args(vec!["-e", "vim", "1", "command"]);
+        let args = to_str_args(vec!["-e", "vim", "1", "command"]);
         assert_eq!(
             FcArgs::parse(&args),
             Ok(FcArgs::Edit {
@@ -389,7 +401,7 @@ mod tests {
 
     #[test]
     fn parse_reexecute_no_args() {
-        let args = to_args(vec!["-s"]);
+        let args = to_str_args(vec!["-s"]);
         assert_eq!(
             FcArgs::parse(&args),
             Ok(FcArgs::Reexecute {
@@ -401,7 +413,7 @@ mod tests {
 
     #[test]
     fn parse_reexecute_with_replace() {
-        let args = to_args(vec!["-s", "old=new"]);
+        let args = to_str_args(vec!["-s", "old=new"]);
         assert_eq!(
             FcArgs::parse(&args),
             Ok(FcArgs::Reexecute {
@@ -416,7 +428,7 @@ mod tests {
 
     #[test]
     fn parse_reexecute_with_first() {
-        let args = to_args(vec!["-s", "1"]);
+        let args = to_str_args(vec!["-s", "1"]);
         assert_eq!(
             FcArgs::parse(&args),
             Ok(FcArgs::Reexecute {
@@ -428,7 +440,7 @@ mod tests {
 
     #[test]
     fn parse_reexecute_with_replace_and_first() {
-        let args = to_args(vec!["-s", "old=new", "1"]);
+        let args = to_str_args(vec!["-s", "old=new", "1"]);
         assert_eq!(
             FcArgs::parse(&args),
             Ok(FcArgs::Reexecute {

@@ -709,7 +709,12 @@ pub fn expand_arithmetic_expression_into(
     shell: &mut Shell,
 ) -> ExpansionResult<()> {
     let expr = expand_word_to_string(expr, false, shell)?;
-    let expr = parse_expression(&expr).map_err(CommandExecutionError::ExpansionError)?;
+    // An arithmetic expression is a numeric expression: bytes that are not text
+    // cannot be part of one.
+    let expr = expr.to_str().ok_or_else(|| {
+        CommandExecutionError::ExpansionError("arithmetic expression is not valid text".to_string())
+    })?;
+    let expr = parse_expression(expr).map_err(CommandExecutionError::ExpansionError)?;
     let value = interpret_expression(&expr, shell, 0)?;
     expanded_word.append(value.to_string(), inside_double_quotes, true);
     Ok(())
@@ -726,7 +731,7 @@ mod tests {
         let mut result = ExpandedWord::default();
         expand_arithmetic_expression_into(&mut result, &quoted_literal(s), false, &mut shell)
             .expect("invalid expression");
-        result.to_string()
+        String::from_utf8(result.as_bytes_vec()).unwrap()
     }
 
     fn test_assignment_with_initial_value(expr: &str, var: &str, initial_value: &str) -> String {
@@ -738,7 +743,7 @@ mod tests {
         let mut result = ExpandedWord::default();
         expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell)
             .expect("invalid expression");
-        let result = result.to_string();
+        let result = String::from_utf8(result.as_bytes_vec()).unwrap();
         assert_eq!(shell.environment.get_str_value(var), Some(result.as_str()));
         result
     }
@@ -748,7 +753,10 @@ mod tests {
         let mut result = ExpandedWord::default();
         expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell)
             .expect("invalid expression");
-        (result.to_string(), shell.environment)
+        (
+            String::from_utf8(result.as_bytes_vec()).unwrap(),
+            shell.environment,
+        )
     }
 
     #[test]

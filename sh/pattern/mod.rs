@@ -7,152 +7,94 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::pattern::parse::{parse_pattern, PatternItem};
-use crate::pattern::regex::{parsed_pattern_to_regex, Regex};
+use crate::pattern::parse::{parse_pattern, ParsedPattern, PatternItem};
+use crate::shstr::ShString;
 use crate::wordexp::expanded_word::ExpandedWord;
-use std::ffi::{CStr, CString};
 
+mod matcher;
 mod parse;
-mod regex;
 
 pub struct Pattern {
-    pattern_string: String,
-    regex: Regex,
+    pattern_string: ShString,
+    items: ParsedPattern,
 }
 
 impl Pattern {
     pub fn new(word: &ExpandedWord) -> Result<Self, String> {
-        let parsed_pattern = parse_pattern(word, false)?;
-        let regex = parsed_pattern_to_regex(&parsed_pattern)?;
+        let items = parse_pattern(word, false)?;
+        matcher::validate(&items)?;
         Ok(Self {
-            pattern_string: word.to_string(),
-            regex,
+            pattern_string: word.to_sh_string(),
+            items,
         })
     }
 
-    pub fn matches(&self, s: &CStr) -> bool {
-        // A shell pattern must match the ENTIRE string (e.g. in `case`), unlike
-        // the substring semantics of the underlying regex engine. Because the
-        // engine is POSIX leftmost-longest, if any match begins at offset 0 then
-        // the leftmost match begins at 0 and is the longest there, so checking
-        // that it spans the whole string is a correct full-match test.
-        match self.regex.match_locations(s).next() {
-            Some(m) => m.start == 0 && m.end == s.to_bytes().len(),
-            None => false,
+    /// A shell pattern matches the ENTIRE string (POSIX 2.14), which is what
+    /// `case` needs and what each affix candidate is tested against.
+    pub fn matches(&self, s: &[u8]) -> bool {
+        matcher::matches_whole(&self.items, s)
+    }
+
+    /// Longest prefix the pattern matches entirely, removed. On no match the
+    /// value is returned unchanged.
+    pub fn remove_largest_prefix(&self, s: ShString) -> ShString {
+        match matcher::longest_prefix_end(&self.items, s.as_bytes()) {
+            Some(end) => ShString::from(s[end..].to_vec()),
+            None => s,
         }
     }
 
-    pub fn remove_largest_prefix(&self, s: String) -> String {
-        if self.pattern_string.is_empty() || s.is_empty() {
-            return s;
+    /// Shortest prefix the pattern matches entirely, removed.
+    pub fn remove_shortest_prefix(&self, s: ShString) -> ShString {
+        match matcher::shortest_prefix_end(&self.items, s.as_bytes()) {
+            Some(end) => ShString::from(s[end..].to_vec()),
+            None => s,
         }
-        let cstring = CString::new(s).expect("trying to match a string containing null");
-        let mut prefix_end = 0;
-        if let Some(regex_match) = self.regex.match_locations(&cstring).next() {
-            if regex_match.start == 0 {
-                prefix_end = regex_match.end;
-            }
-        }
-        let mut bytes = cstring.into_bytes();
-        bytes.drain(..prefix_end);
-        String::from_utf8(bytes).expect("failed to create string after removing largest prefix")
     }
 
-    pub fn remove_shortest_prefix(&self, s: String) -> String {
-        if self.pattern_string.is_empty() || s.is_empty() {
-            return s;
+    /// Longest suffix the pattern matches entirely, removed.
+    pub fn remove_largest_suffix(&self, s: ShString) -> ShString {
+        match matcher::longest_suffix_start(&self.items, s.as_bytes()) {
+            Some(begin) => ShString::from(s[..begin].to_vec()),
+            None => s,
         }
-        // A NUL terminates the byte string used for matching, so it cannot be
-        // part of the subject; drop any that slipped in.
-        let mut bytes = s.into_bytes();
-        bytes.retain(|&b| b != 0);
-        bytes.push(b'\0');
-        let mut prefix_end = 0;
-        for i in 1..bytes.len() - 1 {
-            let t = bytes[i];
-            bytes[i] = b'\0';
-            // we know there is a null, so this unwrap will never fail
-            if self
-                .regex
-                .matches(CStr::from_bytes_until_nul(&bytes).unwrap())
-            {
-                prefix_end = i;
-                bytes[i] = t;
-                break;
-            }
-            bytes[i] = t;
-        }
-        // remove '\0'
-        bytes.pop();
-        bytes.drain(..prefix_end);
-        String::from_utf8(bytes).expect("failed to create string after removing shortest prefix")
     }
 
-    pub fn remove_largest_suffix(&self, s: String) -> String {
-        if self.pattern_string.is_empty() || s.is_empty() {
-            return s;
+    /// Shortest suffix the pattern matches entirely, removed.
+    pub fn remove_shortest_suffix(&self, s: ShString) -> ShString {
+        match matcher::shortest_suffix_start(&self.items, s.as_bytes()) {
+            Some(begin) => ShString::from(s[..begin].to_vec()),
+            None => s,
         }
-        let cstring = CString::new(s).expect("trying to match a string containing null");
-        let len = cstring.as_bytes().len();
-        let mut suffix_start = len - 1;
-        for regex_match in self.regex.match_locations(&cstring) {
-            if regex_match.end == len {
-                suffix_start = regex_match.start;
-                break;
-            }
-        }
-        let mut bytes = cstring.into_bytes();
-        bytes.drain(suffix_start..);
-        String::from_utf8(bytes).expect("failed to create string after removing largest suffix")
-    }
-
-    pub fn remove_shortest_suffix(&self, s: String) -> String {
-        if self.pattern_string.is_empty() || s.is_empty() {
-            return s;
-        }
-        // A NUL terminates the byte string used for matching, so it cannot be
-        // part of the subject; drop any that slipped in.
-        let mut bytes = s.into_bytes();
-        bytes.retain(|&b| b != 0);
-        bytes.push(b'\0');
-        let mut suffix_start = bytes.len();
-        for i in (1..bytes.len() - 1).rev() {
-            // we know there is a null, so this unwrap will never fail
-            if self
-                .regex
-                .matches(CStr::from_bytes_until_nul(&bytes[i..]).unwrap())
-            {
-                suffix_start = i;
-                break;
-            }
-        }
-        // remove terminating '\0'
-        bytes.pop();
-        bytes.drain(suffix_start..);
-        String::from_utf8(bytes).expect("failed to create string after removing shortest suffix")
     }
 }
 
-impl From<Pattern> for String {
+impl From<Pattern> for ShString {
     fn from(value: Pattern) -> Self {
         value.pattern_string
     }
 }
 
 struct FilenamePatternPart {
-    regex: Regex,
+    items: ParsedPattern,
     starts_with_dot: bool,
 }
 
 pub struct FilenamePattern {
     path_parts: Vec<FilenamePatternPart>,
-    pattern_string: String,
+    pattern_string: ShString,
+    /// A pattern ending in `/` matches directories only, and the `/` is part of
+    /// the result: `*/` lists subdirectories as `sub/`, not `sub`.
+    has_trailing_slash: bool,
 }
 
 impl FilenamePattern {
     pub fn new(word: &ExpandedWord) -> Result<Self, String> {
-        let pattern_string = word.to_string();
+        let pattern_string = word.to_sh_string();
         let parsed_pattern = parse_pattern(word, true)?;
+        // Splitting on `/` drops the empty component a trailing slash leaves
+        // behind, so the distinction has to be recorded before that happens.
+        let has_trailing_slash = parsed_pattern.last() == Some(&PatternItem::Char('/'));
         let mut path_parts = Vec::new();
 
         parsed_pattern
@@ -160,9 +102,9 @@ impl FilenamePattern {
             .filter(|items| !items.is_empty())
             .try_for_each(|items| {
                 let starts_with_dot = items.starts_with(&[PatternItem::Char('.')]);
-                let regex = parsed_pattern_to_regex(items)?;
+                matcher::validate(items)?;
                 path_parts.push(FilenamePatternPart {
-                    regex,
+                    items: items.to_vec(),
                     starts_with_dot,
                 });
                 Ok::<(), String>(())
@@ -171,30 +113,23 @@ impl FilenamePattern {
         Ok(Self {
             path_parts,
             pattern_string,
+            has_trailing_slash,
         })
     }
 
     /// # Panics
     /// panics if `depth` is smaller than 1 or bigger than `component_count`
-    pub fn matches_all(&self, depth: usize, s: &CStr) -> bool {
+    pub fn matches_all(&self, depth: usize, s: &[u8]) -> bool {
         assert!(
             depth > 0 && depth <= self.component_count(),
             "invalid depth"
         );
         let component_index = depth - 1;
-        if s.to_bytes()[0] == b'.' && !self.path_parts[component_index].starts_with_dot {
+        if s.first() == Some(&b'.') && !self.path_parts[component_index].starts_with_dot {
             // dot at the start is only matched explicitly
             return false;
         }
-        if let Some(loc) = self.path_parts[component_index]
-            .regex
-            .match_locations(s)
-            .next()
-        {
-            loc.start == 0 && loc.end == s.count_bytes()
-        } else {
-            false
-        }
+        matcher::matches_whole(&self.path_parts[component_index].items, s)
     }
 
     /// Returns number of components in the path
@@ -205,61 +140,60 @@ impl FilenamePattern {
     }
 
     pub fn is_absolute(&self) -> bool {
-        self.pattern_string.starts_with('/')
+        self.pattern_string.starts_with(b"/")
+    }
+
+    /// True when the pattern ends in `/`, so only directories match its last
+    /// component and the slash belongs to the result.
+    pub fn matches_directories_only(&self) -> bool {
+        self.has_trailing_slash
     }
 }
 
-impl From<FilenamePattern> for String {
+impl From<FilenamePattern> for ShString {
     fn from(value: FilenamePattern) -> Self {
         value.pattern_string
     }
 }
 
-impl TryFrom<String> for FilenamePattern {
+impl TryFrom<ShString> for FilenamePattern {
     type Error = String;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+    fn try_from(value: ShString) -> Result<Self, Self::Error> {
         let value = ExpandedWord::unquoted_literal(value);
         FilenamePattern::new(&value)
     }
 }
 
 pub struct HistoryPattern {
-    regex: Regex,
-    match_only_at_line_start: bool,
+    /// The anchoring is baked in: an unanchored search is padded with `*` on
+    /// both sides, a `^`-anchored one only on the right.
+    items: ParsedPattern,
 }
 
 impl HistoryPattern {
     pub fn new(pattern: String) -> Result<Self, String> {
-        let parsed_pattern = parse_pattern(&ExpandedWord::unquoted_literal(pattern), false)?;
-        if parsed_pattern
-            .first()
-            .is_some_and(|p| *p == PatternItem::Char('^'))
-        {
-            let regex = parsed_pattern_to_regex(&parsed_pattern[1..])?;
-            Ok(Self {
-                regex,
-                match_only_at_line_start: true,
-            })
-        } else {
-            let regex = parsed_pattern_to_regex(&parsed_pattern)?;
-            Ok(Self {
-                regex,
-                match_only_at_line_start: false,
-            })
+        let parsed = parse_pattern(&ExpandedWord::unquoted_literal(pattern), false)?;
+        let match_only_at_line_start = parsed.first() == Some(&PatternItem::Char('^'));
+        // History search asks whether the command *contains* the pattern, which
+        // the whole-match engine expresses by padding with `*`. A leading `^`
+        // anchors it to the start, so only the trailing pad applies.
+        let mut items = Vec::with_capacity(parsed.len() + 2);
+        if !match_only_at_line_start {
+            items.push(PatternItem::Asterisk);
         }
+        items.extend(
+            parsed
+                .into_iter()
+                .skip(usize::from(match_only_at_line_start)),
+        );
+        items.push(PatternItem::Asterisk);
+        matcher::validate(&items)?;
+        Ok(Self { items })
     }
 
     pub fn matches(&self, s: &str) -> bool {
-        if let Ok(s_cstr) = CString::new(s) {
-            if let Some(first_match) = self.regex.match_locations(&s_cstr).next() {
-                if self.match_only_at_line_start && first_match.start != 0 {
-                    return false;
-                }
-                return true;
-            }
-        }
-        false
+        matcher::matches_whole(&self.items, s.as_bytes())
     }
 }
 
@@ -276,14 +210,10 @@ pub mod tests {
             .expect("failed to create filename pattern")
     }
 
-    fn cstring_from_str(s: &str) -> CString {
-        CString::new(s).unwrap()
-    }
-
     #[test]
     fn remove_largest_prefix_from_empty_string() {
         assert_eq!(
-            pattern_from_str("abcd").remove_largest_prefix("".to_string()),
+            pattern_from_str("abcd").remove_largest_prefix(ShString::from("")),
             ""
         )
     }
@@ -291,7 +221,7 @@ pub mod tests {
     #[test]
     fn remove_smallest_prefix_from_empty_string() {
         assert_eq!(
-            pattern_from_str("abcd").remove_shortest_prefix("".to_string()),
+            pattern_from_str("abcd").remove_shortest_prefix(ShString::from("")),
             ""
         )
     }
@@ -299,7 +229,7 @@ pub mod tests {
     #[test]
     fn remove_largest_suffix_from_empty_string() {
         assert_eq!(
-            pattern_from_str("abcd").remove_largest_suffix("".to_string()),
+            pattern_from_str("abcd").remove_largest_suffix(ShString::from("")),
             ""
         )
     }
@@ -307,7 +237,7 @@ pub mod tests {
     #[test]
     fn remove_smallest_suffix_from_empty_string() {
         assert_eq!(
-            pattern_from_str("abcd").remove_shortest_suffix("".to_string()),
+            pattern_from_str("abcd").remove_shortest_suffix(ShString::from("")),
             ""
         )
     }
@@ -315,7 +245,7 @@ pub mod tests {
     #[test]
     fn remove_largest_prefix() {
         assert_eq!(
-            pattern_from_str("*b").remove_largest_prefix("abaaaaabtest".to_string()),
+            pattern_from_str("*b").remove_largest_prefix(ShString::from("abaaaaabtest")),
             "test"
         )
     }
@@ -323,7 +253,7 @@ pub mod tests {
     #[test]
     fn remove_smallest_prefix() {
         assert_eq!(
-            pattern_from_str("*b").remove_shortest_prefix("abaaaaabtest".to_string()),
+            pattern_from_str("*b").remove_shortest_prefix(ShString::from("abaaaaabtest")),
             "aaaaabtest"
         )
     }
@@ -331,7 +261,7 @@ pub mod tests {
     #[test]
     fn remove_largest_suffix() {
         assert_eq!(
-            pattern_from_str("b*").remove_largest_suffix("testbaaaaaba".to_string()),
+            pattern_from_str("b*").remove_largest_suffix(ShString::from("testbaaaaaba")),
             "test"
         )
     }
@@ -339,7 +269,7 @@ pub mod tests {
     #[test]
     fn remove_smallest_suffix() {
         assert_eq!(
-            pattern_from_str("b*").remove_shortest_suffix("testbaaaaaba".to_string()),
+            pattern_from_str("b*").remove_shortest_suffix(ShString::from("testbaaaaaba")),
             "testbaaaaa"
         )
     }
@@ -347,29 +277,29 @@ pub mod tests {
     #[test]
     fn filename_pattern_matches_simple_components_in_path() {
         let pattern = filename_pattern_from_str("/path/to/file");
-        assert!(pattern.matches_all(1, &cstring_from_str("path")));
-        assert!(pattern.matches_all(2, &cstring_from_str("to")));
-        assert!(pattern.matches_all(3, &cstring_from_str("file")));
+        assert!(pattern.matches_all(1, b"path"));
+        assert!(pattern.matches_all(2, b"to"));
+        assert!(pattern.matches_all(3, b"file"));
     }
 
     #[test]
     fn period_at_the_start_is_only_matched_explicitly() {
         let pattern = filename_pattern_from_str("*test");
-        assert!(!pattern.matches_all(1, &cstring_from_str(".test")));
-        assert!(pattern.matches_all(1, &cstring_from_str("atest")));
+        assert!(!pattern.matches_all(1, b".test"));
+        assert!(pattern.matches_all(1, b"atest"));
 
         let pattern = filename_pattern_from_str("/dir/*file");
-        assert!(!pattern.matches_all(2, &cstring_from_str(".file")));
+        assert!(!pattern.matches_all(2, b".file"));
 
         let pattern = filename_pattern_from_str(".test");
-        assert!(pattern.matches_all(1, &cstring_from_str(".test")));
+        assert!(pattern.matches_all(1, b".test"));
     }
 
     #[test]
     fn period_at_the_start_is_not_matched_by_bracket_expression_with_multiple_chars() {
         // the standard leaves this case to the implementation, here we follow what bash does
         let pattern = filename_pattern_from_str("[.abc]*");
-        assert!(!pattern.matches_all(1, &cstring_from_str(".a")));
+        assert!(!pattern.matches_all(1, b".a"));
     }
 
     #[test]
@@ -382,5 +312,149 @@ pub mod tests {
 
         let pattern = HistoryPattern::new("^arg".to_string()).unwrap();
         assert!(!pattern.matches("cmd arg"));
+    }
+
+    // POSIX 2.6.2: when the pattern does not match, the parameter's value is
+    // used unchanged. Verified against dash 0.5.12 and bash 5.2.21, which
+    // agree on every case below.
+
+    #[test]
+    fn remove_affix_that_does_not_match_returns_the_subject_unchanged() {
+        // `remove_shortest_suffix` used to compute the no-match sentinel from
+        // the length *including* a pushed NUL, then `drain` past the end and
+        // abort the process; the other three each got it wrong differently.
+        assert_eq!(
+            pattern_from_str("z").remove_shortest_suffix(ShString::from("abc")),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_largest_suffix(ShString::from("abc")),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_shortest_prefix(ShString::from("abc")),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_largest_prefix(ShString::from("abc")),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn remove_affix_matches_are_anchored() {
+        // "b" occurs inside "abc" but is neither a prefix nor a suffix of it;
+        // the removal loops used the *unanchored* `Regex::matches`.
+        assert_eq!(
+            pattern_from_str("b").remove_shortest_suffix(ShString::from("abc")),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("b").remove_largest_suffix(ShString::from("abc")),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("b").remove_shortest_prefix(ShString::from("abc")),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("b").remove_largest_prefix(ShString::from("abc")),
+            "abc"
+        );
+        // ... while a genuine one-character affix is removed.
+        assert_eq!(
+            pattern_from_str("c").remove_shortest_suffix(ShString::from("abc")),
+            "ab"
+        );
+        assert_eq!(
+            pattern_from_str("a").remove_shortest_prefix(ShString::from("abc")),
+            "bc"
+        );
+    }
+
+    #[test]
+    fn remove_affix_can_consume_the_whole_subject() {
+        // The loops ran `1..len - 1`, so a pattern matching the entire value
+        // was never tested and never removed.
+        assert_eq!(
+            pattern_from_str("abc").remove_shortest_prefix(ShString::from("abc")),
+            ""
+        );
+        assert_eq!(
+            pattern_from_str("abc").remove_largest_prefix(ShString::from("abc")),
+            ""
+        );
+        assert_eq!(
+            pattern_from_str("abc").remove_shortest_suffix(ShString::from("abc")),
+            ""
+        );
+        assert_eq!(
+            pattern_from_str("abc").remove_largest_suffix(ShString::from("abc")),
+            ""
+        );
+    }
+
+    #[test]
+    fn remove_affix_with_asterisk_spans_empty_and_whole() {
+        // `*` matches the empty affix (shortest) and the whole value (largest).
+        assert_eq!(
+            pattern_from_str("*").remove_shortest_prefix(ShString::from("abc")),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("*").remove_largest_prefix(ShString::from("abc")),
+            ""
+        );
+        assert_eq!(
+            pattern_from_str("*").remove_shortest_suffix(ShString::from("abc")),
+            "abc"
+        );
+        assert_eq!(
+            pattern_from_str("*").remove_largest_suffix(ShString::from("abc")),
+            ""
+        );
+    }
+
+    #[test]
+    fn remove_affix_does_not_split_a_multibyte_character() {
+        // The two "shortest" variants walked *byte* indices and sliced at them,
+        // so a multi-byte character could be cut in half and the trailing
+        // `String::from_utf8(..).expect(..)` aborted the process.
+        assert_eq!(
+            pattern_from_str("z").remove_shortest_suffix(ShString::from("héllo")),
+            "héllo"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_shortest_prefix(ShString::from("héllo")),
+            "héllo"
+        );
+        assert_eq!(
+            pattern_from_str("?").remove_shortest_prefix(ShString::from("héllo")),
+            "éllo"
+        );
+        assert_eq!(
+            pattern_from_str("o").remove_shortest_suffix(ShString::from("héllo")),
+            "héll"
+        );
+    }
+
+    #[test]
+    fn remove_affix_with_interior_nul_does_not_panic() {
+        // The two "largest" variants used `CString::new(s).expect(..)`.
+        assert_eq!(
+            pattern_from_str("z").remove_largest_prefix(ShString::from("a\0b")),
+            "a\0b"
+        );
+        assert_eq!(
+            pattern_from_str("z").remove_largest_suffix(ShString::from("a\0b")),
+            "a\0b"
+        );
+    }
+
+    #[test]
+    fn filename_pattern_matches_all_accepts_an_empty_component() {
+        // `matches_all` indexed `s.to_bytes()[0]` with no emptiness guard.
+        let pattern = filename_pattern_from_str("*");
+        assert!(pattern.matches_all(1, b""));
     }
 }

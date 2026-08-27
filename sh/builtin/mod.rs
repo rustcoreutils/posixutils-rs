@@ -23,12 +23,15 @@ use crate::builtin::getopts::GetOpts;
 use crate::builtin::hash::Hash;
 use crate::builtin::jobs::Jobs;
 use crate::builtin::kill::Kill;
+use crate::builtin::pwd::Pwd;
 use crate::builtin::read::BuiltinRead;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::shift::Shift;
+use crate::builtin::test_::Test;
 use crate::builtin::times::Times;
 use crate::builtin::trap::Trap;
+use crate::builtin::true_false::{False, True};
 use crate::builtin::type_::Type_;
 use crate::builtin::ulimit::Ulimit;
 use crate::builtin::umask::Umask;
@@ -40,6 +43,7 @@ use crate::os::{OsError, Pid};
 use crate::shell::environment::CannotModifyReadonly;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::shstr::ShString;
 use std::fmt::{Display, Formatter};
 
 pub mod alias;
@@ -58,12 +62,15 @@ mod getopts;
 mod hash;
 mod jobs;
 mod kill;
+mod pwd;
 mod read;
 mod readonly;
 pub mod set;
 mod shift;
+mod test_;
 mod times;
 pub mod trap;
+mod true_false;
 mod type_;
 mod ulimit;
 mod umask;
@@ -121,7 +128,7 @@ pub type BuiltinResult = Result<i32, BuiltinError>;
 pub trait SpecialBuiltinUtility {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult;
@@ -130,7 +137,7 @@ pub trait SpecialBuiltinUtility {
 struct BuiltinNull;
 
 impl SpecialBuiltinUtility for BuiltinNull {
-    fn exec(&self, _: &[String], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, _: &[ShString], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         Ok(0)
     }
 }
@@ -159,7 +166,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtil
 pub trait BuiltinUtility {
     fn exec(
         &self,
-        args: &[String],
+        args: &[ShString],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult;
@@ -183,12 +190,52 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "jobs" => Some(&Jobs),
         "type" => Some(&Type_),
         "unalias" => Some(&Unalias),
+        // POSIX XCU lists these as utilities; building them in is what every
+        // shell does, and `pwd` in particular *must* be built in because `cd`
+        // is (a forked /bin/pwd reports the process directory, not the shell's).
+        "pwd" => Some(&Pwd),
+        "true" => Some(&True),
+        "false" => Some(&False),
+        // A conditional is the most frequently executed command in a script;
+        // forking one per `[ ... ]` makes every loop pay for a process.
+        "test" => Some(&Test {
+            requires_closing_bracket: false,
+        }),
+        "[" => Some(&Test {
+            requires_closing_bracket: true,
+        }),
         _ => None,
     }
 }
 
-fn skip_option_terminator(args: &[String]) -> &[String] {
-    if args.first().is_some_and(|arg| arg == "--") {
+/// Reinterprets arguments as text, for the utilities whose operands are only
+/// ever option letters, signal names, numbers or variable names. A byte string
+/// that is not valid text cannot be any of those, so it is reported rather than
+/// silently mangled. Utilities that carry *values* — `export`, `read`, `cd`,
+/// `test` — take the bytes instead.
+/// A lossy text view for *option scanning only*. An option letter is ASCII, so
+/// an argument that is not text cannot be one and will simply not match any
+/// option; the operand itself is still taken from the byte `args`. Never use
+/// this where the value matters.
+fn args_for_option_scan(args: &[ShString]) -> Vec<String> {
+    args.iter().map(|a| a.display().to_string()).collect()
+}
+
+fn args_as_str<'a>(utility: &str, args: &'a [ShString]) -> Result<Vec<&'a str>, BuiltinError> {
+    args.iter()
+        .map(|arg| {
+            arg.to_str().ok_or_else(|| {
+                BuiltinError::CustomError(format!(
+                    "{utility}: '{}' is not valid text",
+                    arg.display()
+                ))
+            })
+        })
+        .collect()
+}
+
+fn skip_option_terminator<S: AsRef<[u8]>>(args: &[S]) -> &[S] {
+    if args.first().is_some_and(|arg| arg.as_ref() == b"--") {
         &args[1..]
     } else {
         args

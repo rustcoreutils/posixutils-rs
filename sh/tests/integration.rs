@@ -9,7 +9,8 @@
 
 mod pty;
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{run_test, run_test_u8, run_test_with_checker, TestPlan, TestPlanU8};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2181,16 +2182,38 @@ mod audit_regressions {
     }
 
     #[test]
-    fn non_script_command_file_exits_126() {
-        // A command_file that is not valid text is ENOEXEC-like: 126, not 127.
-        // Build it here rather than naming a system path, which differs across
-        // platforms (`/bin/true` does not exist on macOS).
+    fn a_command_file_that_is_not_a_script_fails() {
+        // A script is read as bytes and need not be text, so a binary is parsed
+        // like anything else and fails on its contents. The three reference
+        // shells disagree on the status -- dash reports 127 (the garbage names
+        // no command), bash sniffs the ELF magic and reports 126 -- so this
+        // pins only that it fails, and that nothing is executed.
         set_env_vars();
         let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
         std::fs::create_dir_all(dir).unwrap();
         let binary = dir.join("not_a_script.bin");
         std::fs::write(&binary, [0x7f, b'E', b'L', b'F', 0xff, 0xfe]).unwrap();
-        expect_cli_exit_code(vec![binary.to_string_lossy().into_owned()], "", 126);
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec![binary.to_string_lossy().into_owned()],
+                stdin_data: String::new(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                assert!(
+                    !output.status.success(),
+                    "a binary should not run as a script"
+                );
+                assert_ne!(output.status.code(), Some(101), "shell panicked");
+                assert!(
+                    output.stdout.is_empty(),
+                    "nothing should have been executed"
+                );
+            },
+        );
     }
 
     #[test]
@@ -2233,6 +2256,67 @@ mod audit_regressions {
     fn wait_removes_the_job_it_reaped() {
         run_successfully_and("sleep 0.05 & p=$!; wait $p; echo \"[$(jobs)]\"\n", |out| {
             assert_eq!(out, "[]\n")
+        });
+    }
+
+    #[test]
+    fn read_carries_bytes_that_are_not_text() {
+        // `read` decoded each line and failed the whole built-in with
+        // "read: invalid UTF-8", so a shell loop could not carry a line that
+        // every other part of the shell had already been taught to carry.
+        expect_stdout_bytes(
+            b"printf 'a\\377b\\n' | { IFS= read -r l; printf '[%s]' \"$l\"; }\n",
+            b"[a\xffb]",
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_login_name_leaves_the_tilde_prefix_alone() {
+        // The login name was decoded with `unwrap_or("")`, so a tilde-prefix
+        // that is not text expanded to HOME instead; and a name the system does
+        // not know aborted the whole expansion. POSIX leaves both undefined and
+        // dash and bash both leave the tilde-prefix as written.
+        test_script(
+            "echo ~nosuchuser_xyz/x\nV=~nosuchuser_xyz/x\necho \"$V\"\n",
+            "~nosuchuser_xyz/x\n~nosuchuser_xyz/x\n",
+        );
+        expect_stdout_bytes(b"echo ~$(printf '\\377')/x\n", b"~\xff/x\n");
+    }
+
+    #[test]
+    fn a_quoted_tilde_prefix_is_not_a_tilde_prefix() {
+        // > If any of the characters in the tilde-prefix are quoted, none of
+        // > the characters in the tilde-prefix shall be treated as a
+        // > tilde-prefix.  -- POSIX XCU 2.6.1
+        // The prefix ends at the first *unquoted* slash, so `~root"/x"` is not
+        // one either. Only the leading unquoted literal was examined.
+        test_script("echo ~\"root\"\n", "~root\n");
+        test_script("u=root\necho ~$u\n", "~root\n");
+        test_script("echo ~root\"/x\"\n", "~root/x\n");
+        test_script("V=~\"root\"\necho \"$V\"\n", "~root\n");
+        // A prefix that does end at an unquoted slash still expands.
+        run_successfully_and("echo ~/\"x\" = $HOME/x\n", |out| {
+            let (got, want) = out.trim().split_once(" = ").expect("no marker");
+            assert_eq!(got, want);
+        });
+    }
+
+    #[test]
+    fn wait_keeps_reporting_the_status_of_a_job_it_collected() {
+        // The status of a collected job outlives the job itself: dash and bash
+        // both answer a repeated `wait` on the same pid, and reserve 127 for a
+        // pid that was never a child of this shell.
+        run_successfully_and(
+            "false & p=$!; wait $p; echo a=$?; wait $p; echo b=$?\n",
+            |out| assert_eq!(out, "a=1\nb=1\n"),
+        );
+        // The same, after the periodic sweep has had time to reap the child, so
+        // `waitpid` is guaranteed to fail with ECHILD.
+        run_successfully_and("false & p=$!; sleep 0.3; wait $p; echo $?\n", |out| {
+            assert_eq!(out, "1\n")
+        });
+        run_successfully_and("wait 2>/dev/null 99999; echo $?\n", |out| {
+            assert_eq!(out, "127\n")
         });
     }
 
@@ -2406,12 +2490,14 @@ mod audit_regressions {
         set_env_vars();
         // `hash name` remembers a location, `hash` lists it, and assigning to
         // PATH clears the table.
+        // `cat` rather than `true`: only an *external* utility is hashed, and
+        // `true` is a builtin.
         run_successfully_and(
-            "saved=$PATH\nhash true\nbefore=$(hash)\nPATH=/nonexistent\nafter=$(hash)\n\
+            "saved=$PATH\nhash cat\nbefore=$(hash)\nPATH=/nonexistent\nafter=$(hash)\n\
              PATH=$saved\necho \"[$before][$after]\"\n",
             |out| {
                 assert!(
-                    out.contains("true"),
+                    out.contains("cat"),
                     "expected a remembered location: {out:?}"
                 );
                 assert!(out.ends_with("[]\n"), "expected an empty table: {out:?}");
@@ -2579,38 +2665,26 @@ mod audit_regressions {
     fn pipelines_do_not_leak_descriptors_to_their_commands() {
         // A pipeline member must see exactly what a plain command sees. That
         // is not a fixed set: a shell passes the descriptors it inherited on
-        // to its children, and the test harness may hold some open. So the
-        // single-command case is the baseline, and the question is only
-        // whether the pipeline machinery adds anything of its own.
-        if !Path::new("/proc/self/fd").exists() {
-            return;
-        }
-        let open_fds = |script: &str| {
-            let fds = std::cell::RefCell::new(Vec::new());
-            run_successfully_and(script, |out| {
-                let mut listed: Vec<u32> = out
-                    .split_whitespace()
-                    .filter_map(|fd| fd.parse().ok())
-                    .collect();
-                listed.sort_unstable();
-                *fds.borrow_mut() = listed;
-            });
-            fds.into_inner()
-        };
-        let baseline = open_fds("ls /proc/self/fd\n");
-        for script in [
-            "true | ls /proc/self/fd\n",
-            "ls /proc/self/fd | cat\n",
-            "true | true | ls /proc/self/fd\n",
-        ] {
-            let fds = open_fds(script);
-            assert_eq!(
-                fds.len(),
-                baseline.len(),
-                "`{}` leaked descriptors: {fds:?} vs baseline {baseline:?}",
-                script.trim_end()
-            );
-        }
+        // to its children, and the test harness may hold some open. So a plain
+        // command is the baseline, and the question is only whether the
+        // pipeline machinery adds anything of its own.
+        //
+        // Baseline and pipelines run in the *same* shell, so that what the
+        // harness has open cannot differ between them, and the comparison is
+        // by which descriptors are extra rather than by how many there are.
+        run_successfully_and(
+            "cd \"$TEST_WRITE_DIR\"\n\
+             if ls /proc/self/fd >/dev/null 2>&1; then\n\
+             \x20 ls /proc/self/fd > fd_base 2>/dev/null\n\
+             \x20 true | ls /proc/self/fd > fd_a 2>/dev/null\n\
+             \x20 ls /proc/self/fd | cat > fd_b 2>/dev/null\n\
+             \x20 true | true | ls /proc/self/fd > fd_c 2>/dev/null\n\
+             \x20 for f in fd_a fd_b fd_c; do comm -13 fd_base $f; done\n\
+             \x20 rm -f fd_base fd_a fd_b fd_c\n\
+             fi\n\
+             echo done\n",
+            |out| assert_eq!(out, "done\n", "a pipeline leaked a descriptor"),
+        );
     }
 
     #[test]
@@ -2699,6 +2773,805 @@ mod audit_regressions {
                 dir.display()
             ),
             |out| assert_eq!(out, format!("[{}/gone]\n", dir.display())),
+        );
+    }
+
+    // ---- Phase 1: panics that abort the shell -------------------------------
+    // Each of these aborted the process (exit 101) or killed a non-interactive
+    // shell outright. Expected values verified against dash 0.5.12.
+
+    #[test]
+    fn trailing_backslash_at_end_of_input_is_literal() {
+        // `WordToken::Backslash` is emitted even when `\` ends the word, so the
+        // unquoted arm's `next_char().unwrap()` saw `None` and panicked.
+        test_script("echo a\\", "a\\\n");
+    }
+
+    #[test]
+    fn unterminated_command_substitution_is_a_syntax_error_not_a_panic() {
+        // Three `.expect("invalid word")` sites in the word lexer discarded a
+        // real ParserError.
+        expect_clean_failure("echo $((1`))\n");
+        expect_clean_failure("echo `\n");
+        expect_clean_failure("echo $(\n");
+    }
+
+    #[test]
+    fn an_incomplete_construct_at_end_of_input_is_a_syntax_error() {
+        // Reading commands from stdin, a construct still awaiting more input
+        // was silently abandoned at EOF and the shell exited 0. There is no
+        // more input at EOF, so it is a syntax error; dash exits 2.
+        for script in [
+            "if true\n",
+            "while true; do\n",
+            "case x in\n",
+            "echo 'unterminated\n",
+            "echo $(\n",
+        ] {
+            expect_exit_code(script, 2);
+        }
+        // A complete script is unaffected.
+        expect_exit_code("echo ok\n", 0);
+    }
+
+    /// `set -x` output goes to stderr, so assert on stderr rather than stdout.
+    fn expect_stderr(script: &str, expected_stderr: &str) {
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-s".to_string()],
+                stdin_data: script.to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                assert_eq!(String::from_utf8_lossy(&output.stderr), expected_stderr);
+                assert!(output.status.success());
+            },
+        );
+    }
+
+    #[test]
+    fn xtrace_of_an_assignment_only_command_does_not_panic() {
+        // `trace()` sliced `..len - 1` and was called before the is_empty guard.
+        expect_stderr("set -x\na=1\n", "+ a=1\n");
+    }
+
+    #[test]
+    fn xtrace_reports_the_command_and_its_expanded_words() {
+        // Redirections are not traced, matching dash.
+        expect_stderr("set -x\ntrue > /dev/null\n", "+ true\n");
+        expect_stderr("x=ab\nset -x\ntrue $x\n", "+ true ab\n");
+    }
+
+    #[test]
+    fn assignments_of_a_simple_command_are_applied_left_to_right() {
+        // POSIX processes a simple command's assignments in order, and an
+        // earlier one is visible to a later one. Expanding them all up front
+        // would silently break this.
+        test_script("a=1 b=$a\necho \"[$b]\"\n", "[1]\n");
+        expect_stderr("set -x\na=1 b=$a\n", "+ a=1 b=1\n");
+        // A prefix assignment on a command is confined to that command.
+        test_script("a=1 b=$a true\necho \"[$b]\"\n", "[]\n");
+    }
+
+    #[test]
+    fn trap_with_an_empty_action_ignores_the_signal() {
+        // `is_unsigned_int("")` is vacuously true, so the empty action was
+        // parsed as a signal number and `trap` — a special builtin — exited.
+        test_script("trap '' INT\necho after\n", "after\n");
+        test_script("trap '' INT\ntrap -p INT\n", "trap -- '' INT\n");
+    }
+
+    #[test]
+    fn set_accepts_the_option_terminator_after_other_options() {
+        // `"--" if i == 0` only recognized `--` in first position, so the
+        // universal `set -f -- "$@"` idiom killed the script.
+        test_script("set -f -- a b c\necho $#\n", "3\n");
+        test_script("set -- x y\nset -f -- \"$@\"\necho $1 $2\n", "x y\n");
+    }
+
+    // ---- Phase 2: reserved words are recognized only in command position ----
+
+    #[test]
+    fn a_reserved_word_used_as_an_argument_is_an_ordinary_word() {
+        // The lexer classified reserved words unconditionally, and
+        // `parse_simple_command` stopped at whichever one it had been handed as
+        // the terminator, so `echo done` inside a loop body ate the `done` and
+        // the loop never terminated.
+        test_script("while true; do echo done; break; done\n", "done\n");
+        test_script("for i in 1; do echo done; done\n", "done\n");
+        test_script(
+            "for i in do done esac in; do echo $i; done\n",
+            "do\ndone\nesac\nin\n",
+        );
+        test_script(
+            "echo then; echo if fi done esac\n",
+            "then\nif fi done esac\n",
+        );
+        test_script("until false; do echo u; break; done\n", "u\n");
+    }
+
+    #[test]
+    fn in_is_recognized_as_the_third_word_of_case_and_for() {
+        // POSIX 2.4 excludes `in` from the "first word after a reserved word"
+        // rule, so the word before it carries no signal and the parser has to
+        // accept an ordinary word spelled `in`.
+        test_script("case in in in) echo M;; esac\n", "M\n");
+        test_script("for in in in; do echo $in; done\n", "in\n");
+        test_script("case case in case) echo C;; esac\n", "C\n");
+    }
+
+    #[test]
+    fn a_case_item_may_have_an_empty_body() {
+        // POSIX 2.9.4 permits `x) ;;`, which the AST could not represent.
+        test_script("case x in x) ;; esac\necho rc=$?\n", "rc=0\n");
+        test_script("case x in x) ;; *) echo NO;; esac\n", "");
+        test_script("case y in x) ;; *) echo STAR;; esac\n", "STAR\n");
+        test_script("case word in esac\necho done\n", "done\n");
+    }
+
+    #[test]
+    fn command_substitution_containing_a_case_is_scanned_to_its_end() {
+        // The scanner counted parentheses, but a `case` pattern's `)` has no
+        // opener, so it cut the substitution short at the first pattern — and
+        // then executed the truncated text anyway.
+        test_script("x=$(case a in a) echo A;; esac)\necho \"[$x]\"\n", "[A]\n");
+        test_script(
+            "x=$(case a in a) case b in b) echo X;; esac;; esac)\necho \"[$x]\"\n",
+            "[X]\n",
+        );
+        test_script("echo \"$(case q in *) echo deep;; esac)\"\n", "deep\n");
+        // `case`/`esac` outside command position must not be counted.
+        test_script("x=$(echo case)\necho \"[$x]\"\n", "[case]\n");
+        test_script(
+            "x=$(case a in a) echo esac;; esac)\necho \"[$x]\"\n",
+            "[esac]\n",
+        );
+    }
+
+    #[test]
+    fn an_alias_may_expand_to_a_compound_command() {
+        // `alias_substitution` returned Ok(None) when the expansion did not
+        // start with a plain word, and the caller then advanced past it.
+        test_script("alias f=\"if true; then echo t; fi\"\nf\n", "t\n");
+        test_script("alias g=\"while true; do echo L; break; done\"\ng\n", "L\n");
+    }
+
+    #[test]
+    fn a_closing_brace_needs_a_preceding_separator() {
+        // `}` is a reserved word, so it is only recognized in command position;
+        // `{ word }` is a syntax error in dash and bash alike.
+        test_script("{ echo hi; }\n", "hi\n");
+        expect_exit_code("{ echo hi }\n", 2);
+    }
+
+    // ---- Phase 3: control flow, errexit, traps, -n --------------------------
+
+    #[test]
+    fn and_or_list_skips_every_element_the_operator_excludes() {
+        // The short-circuit advanced by a single extra element, so only the
+        // *next* pipeline was skipped and `false && a && b` still ran b.
+        test_script("false && echo A && echo B\necho rc=$?\n", "rc=1\n");
+        test_script("true || echo A || echo B\necho rc=$?\n", "rc=0\n");
+        test_script("false || echo A || echo B\necho rc=$?\n", "A\nrc=0\n");
+        test_script("true && echo A && echo B\necho rc=$?\n", "A\nB\nrc=0\n");
+        test_script("false && echo A || echo C\necho rc=$?\n", "C\nrc=0\n");
+    }
+
+    #[test]
+    fn errexit_exempts_every_element_of_an_and_or_list_but_the_last() {
+        // The predicate was inverted, so `set -e; false || echo recovered`
+        // exited 1 without running the recovery.
+        test_script(
+            "set -e\nfalse || echo recovered\necho done\n",
+            "recovered\ndone\n",
+        );
+        test_script("set -e\nfalse && echo A\necho done\n", "done\n");
+        // The last element is still subject to errexit.
+        expect_exit_code("set -e\ntrue && false\necho notreached\n", 1);
+    }
+
+    #[test]
+    fn a_loop_reports_the_status_of_its_body() {
+        // `interpret_loop_clause` bound `status` to 0 and never reassigned it.
+        test_script(
+            "i=0\nwhile [ $i -lt 1 ]; do i=1; false; done\necho $?\n",
+            "1\n",
+        );
+        test_script(
+            "i=0\nuntil [ $i -ge 1 ]; do i=1; true; done\necho $?\n",
+            "0\n",
+        );
+        // A body that never runs leaves the status at zero.
+        test_script("while false; do echo x; done\necho $?\n", "0\n");
+    }
+
+    #[test]
+    fn a_subshell_starts_with_the_exit_trap_reset() {
+        // POSIX 2.12: traps the parent caught are reset to their default in a
+        // subshell. `become_subshell` reset the signal traps but left
+        // `exit_action`, so `trap 'rm -rf "$tmpdir"' EXIT` fired in every
+        // subshell, and `fork_and_exec`'s child never reset anything at all.
+        test_script("trap 'echo TRAP' EXIT\n(true)\necho done\n", "done\nTRAP\n");
+        test_script(
+            "trap 'echo TRAP' EXIT\nx=$(true)\necho done\n",
+            "done\nTRAP\n",
+        );
+        test_script("trap 'echo T' EXIT\ntrue | true\necho done\n", "done\nT\n");
+    }
+
+    #[test]
+    fn a_failed_prefix_assignment_does_not_leak_into_the_environment() {
+        // `push_scope` was followed by a `?`-return that skipped `pop_scope`,
+        // and `Environment::exported` exports every local scope, so the
+        // variable persisted *and* reached every later child.
+        run_successfully_and(
+            "FOO=bar cat </nonexistent 2>/dev/null\nenv | grep -c '^FOO=' || true\n",
+            |out| assert_eq!(out, "0\n"),
+        );
+        run_successfully_and("FOO=bar true\nenv | grep -c '^FOO=' || true\n", |out| {
+            assert_eq!(out, "0\n")
+        });
+    }
+
+    #[test]
+    fn a_functions_redirections_are_applied_once() {
+        // `exec_function` redirected into its own copy and then
+        // `interpret_compound_command` redirected again, opening every
+        // redirection twice.
+        // BSD `wc -l` pads its count, so compare the trimmed text.
+        run_successfully_and(
+            "f() { echo x; }\nf >> $TEST_WRITE_DIR/once.txt\nf >> $TEST_WRITE_DIR/once.txt\nwc -l < $TEST_WRITE_DIR/once.txt\nrm -f $TEST_WRITE_DIR/once.txt\n",
+            |out| assert_eq!(out.trim(), "2"),
+        );
+    }
+
+    #[test]
+    fn noexec_parses_the_whole_input() {
+        // The guard returned after the first command, so `sh -n` reported
+        // success for a script whose later commands do not parse.
+        expect_cli_exit_code(vec!["-n".to_string(), "-s".to_string()], "true\n)))\n", 2);
+        expect_cli_exit_code(
+            vec!["-n".to_string(), "-s".to_string()],
+            "true\necho ok\n",
+            0,
+        );
+        // -n must not execute anything.
+        run_successfully_and("true\n", |out| assert_eq!(out, ""));
+    }
+
+    // ---- Phase 4: field splitting, POSIX XCU 2.6.5 --------------------------
+
+    /// Runs `script` and compares stdout, for cases where the interesting
+    /// answer is a field count reported by a child shell.
+    fn expect_stdout(script: &str, expected: &str) {
+        run_successfully_and(script, |out| assert_eq!(out, expected));
+    }
+
+    #[test]
+    fn a_run_of_ifs_whitespace_is_one_delimiter() {
+        // The splitter consumed a delimiter and then skipped IFS whitespace,
+        // leaving a following non-whitespace IFS character to be processed as a
+        // second delimiter and emit a spurious empty field.
+        expect_stdout(
+            "IFS=' :'\nx='  a : b  '\nprintf '[%s]' $x\necho\n",
+            "[a][b]\n",
+        );
+        expect_stdout(
+            "IFS=' :'\nx='a:  :b'\nprintf '[%s]' $x\necho\n",
+            "[a][][b]\n",
+        );
+        // A non-whitespace IFS character still delimits on its own.
+        expect_stdout("IFS=:\nx='a::b'\nprintf '[%s]' $x\necho\n", "[a][][b]\n");
+        expect_stdout(
+            "IFS=:\nx='a:b:c::'\nprintf '[%s]' $x\necho\n",
+            "[a][b][c][]\n",
+        );
+        expect_stdout("IFS=:\nx=':a'\nprintf '[%s]' $x\necho\n", "[][a]\n");
+        expect_stdout("IFS=:\nx='a:'\nprintf '[%s]' $x\necho\n", "[a]\n");
+    }
+
+    #[test]
+    fn quoted_dollar_at_with_no_parameters_generates_zero_fields() {
+        // POSIX 2.5.2. The surrounding quotes contribute an empty literal, so
+        // the shell produced one empty field and `exec prog "$@"` invoked
+        // `prog ""`.
+        expect_stdout("set --\n/bin/sh -c 'echo $#' x \"$@\"\n", "0\n");
+        expect_stdout("set -- a b\n/bin/sh -c 'echo $#' x \"$@\"\n", "2\n");
+    }
+
+    #[test]
+    fn a_null_ifs_does_not_merge_the_parameters_of_quoted_dollar_at() {
+        // `split_fields` early-returned when IFS was null, discarding the field
+        // boundaries `"$@"` had planted — but IFS has no say over those.
+        // `IFS=` is *the* idiom for disabling splitting.
+        expect_stdout(
+            "set -- a b c\nIFS=\nfor i in \"$@\"; do echo \"<$i>\"; done\n",
+            "<a>\n<b>\n<c>\n",
+        );
+    }
+
+    #[test]
+    fn unquoted_dollar_at_discards_null_parameters() {
+        // A `FieldEnd` was planted between parameters regardless of quoting, so
+        // an unquoted `$@` kept null parameters as empty fields.
+        expect_stdout("set -- a '' b\n/bin/sh -c 'echo $#' x $@\n", "2\n");
+        expect_stdout("set -- '' ''\n/bin/sh -c 'echo $#' x $@\n", "0\n");
+        // Quoted, they are kept.
+        expect_stdout("set -- a '' b\n/bin/sh -c 'echo $#' x \"$@\"\n", "3\n");
+        // Parameters stay separate whatever IFS says; only their contents split.
+        expect_stdout("set -- 'a b' c\nIFS=:\n/bin/sh -c 'echo $#' x $@\n", "2\n");
+        // A parameter that is entirely IFS white space contributes no field.
+        expect_stdout("set -- ' ' x\n/bin/sh -c 'echo $#' p $@\n", "1\n");
+    }
+
+    #[test]
+    fn dollar_star_and_dollar_at_are_null_rather_than_unset() {
+        // Every special parameter reported itself as Set, so `${*:-word}` never
+        // substituted. They are always set, but null when they expand to
+        // nothing, so `:-` substitutes and `-` does not.
+        expect_stdout("set --\necho \"${*:-D}\"\n", "D\n");
+        expect_stdout("set --\necho \"${@:-D}\"\n", "D\n");
+        expect_stdout("set -- ''\necho \"${*:-D}\"\n", "D\n");
+        expect_stdout("set --\necho \"[${*-D}]\"\n", "[]\n");
+        expect_stdout("set -- a\necho \"${*:-D}\"\n", "a\n");
+        expect_stdout("set --\necho \"[${*:+S}]\"\n", "[]\n");
+        expect_stdout("set -- a\necho \"${*:+S}\"\n", "S\n");
+    }
+
+    #[test]
+    fn braced_hash_is_the_positional_parameter_count() {
+        // `${#}` was parsed as a length operator with its operand missing.
+        expect_stdout("set -- a b\necho \"${#}\"\n", "2\n");
+        expect_stdout("set --\necho \"${#}\"\n", "0\n");
+        expect_stdout("x=abc\necho \"${#x}\"\n", "3\n");
+    }
+
+    // ---- Phase 5: redirections, file descriptors, umask ---------------------
+
+    #[test]
+    fn redirections_may_permute_file_descriptors() {
+        // The child's setup iterated a HashMap and dup2'd in arbitrary order
+        // with no collision analysis, so a source that was also another
+        // redirection's destination got clobbered before it was read. Every
+        // source is now moved above the highest destination first.
+        // The outer redirections put stdout and stderr on files; the inner
+        // `3>&1 1>&2 2>&3` then swaps the two, so each stream lands in the
+        // other's file.
+        test_script(
+            "{ { echo OUT; echo ERR >&2; } 3>&1 1>&2 2>&3; } >$TEST_WRITE_DIR/swap_o 2>$TEST_WRITE_DIR/swap_e\ncat $TEST_WRITE_DIR/swap_o $TEST_WRITE_DIR/swap_e\nrm -f $TEST_WRITE_DIR/swap_o $TEST_WRITE_DIR/swap_e\n",
+            "ERR\nOUT\n",
+        );
+    }
+
+    #[test]
+    fn closing_a_file_descriptor_actually_closes_it() {
+        // `2>&-` only removed the entry from the table, and an absent
+        // descriptor is inherited from the shell rather than closed. Assert the
+        // write fails rather than a particular status, which differs by system.
+        test_script(
+            "if ( echo x >&2 ) 2>&-; then echo open; else echo closed; fi\n",
+            "closed\n",
+        );
+        // The same probe with the descriptor left open, so the test cannot pass
+        // by the write failing for some unrelated reason.
+        test_script(
+            "if ( echo x >&2 ) 2>/dev/null; then echo open; else echo closed; fi\n",
+            "open\n",
+        );
+    }
+
+    #[test]
+    fn a_closed_descriptor_does_not_take_a_later_redirection_with_it() {
+        // Closing fd 5 for `5<&-` frees it, so a later `<file` in the same
+        // command may be handed fd 5 by the kernel. Closing during the
+        // placement pass took that descriptor with it, in whichever order the
+        // map happened to yield -- the same script gave 4 lines or 1.
+        // BSD `wc -l` pads its count, so compare the trimmed text.
+        for _ in 0..8 {
+            run_successfully_and(
+                "cd $TEST_READ_DIR\ncat 5<file1.txt 5<&- <file1.txt | wc -l\n",
+                |out| assert_eq!(out.trim(), "4"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirection_creates_a_file_with_mode_0666_less_the_umask() {
+        // `.mode()` was passed `shell.umask`, which holds the *complement* of
+        // the mask, so `> f` produced a mode 755 executable and the mask was
+        // applied twice.
+        test_script(
+            "umask 022\n> $TEST_WRITE_DIR/mode1\nls -l $TEST_WRITE_DIR/mode1 | cut -c1-10\nrm -f $TEST_WRITE_DIR/mode1\n",
+            "-rw-r--r--\n",
+        );
+        test_script(
+            "umask 077\n> $TEST_WRITE_DIR/mode2\nls -l $TEST_WRITE_DIR/mode2 | cut -c1-10\nrm -f $TEST_WRITE_DIR/mode2\n",
+            "-rw-------\n",
+        );
+    }
+
+    #[test]
+    fn umask_reaches_the_commands_the_shell_runs() {
+        // Nothing called libc::umask, so the builtin changed only the shell's
+        // own bookkeeping and every utility it ran used the inherited mask.
+        test_script(
+            "umask 077\ntouch $TEST_WRITE_DIR/child_mode\nls -l $TEST_WRITE_DIR/child_mode | cut -c1-10\nrm -f $TEST_WRITE_DIR/child_mode\n",
+            "-rw-------\n",
+        );
+    }
+
+    // ---- Phase 6: wait instead of polling ----------------------------------
+
+    #[test]
+    fn background_jobs_are_reaped_without_job_control() {
+        // Terminated background jobs were only collected when `monitor` was
+        // set, so a non-interactive `cmd &` loop left one zombie per iteration.
+        // Counting them needs `ps`, so assert the count rather than a timing.
+        run_successfully_and(
+            "i=0\nwhile [ $i -lt 20 ]; do /bin/true & i=$((i+1)); done\nsleep 1\nps -o stat= --ppid $$ 2>/dev/null | grep -c Z || true\n",
+            |out| assert_eq!(out.trim(), "0", "background jobs left zombies"),
+        );
+    }
+
+    #[test]
+    fn waiting_for_a_job_already_reaped_is_not_an_error() {
+        // Reaping unconditionally meant `update_jobs` could hit ECHILD for a
+        // job `wait` had already collected, and it reported that as an error.
+        test_script(
+            "for i in 1 2 3; do true & done\nwait\necho done\n",
+            "done\n",
+        );
+        test_script("true &\nwait $!\necho $?\n", "0\n");
+        test_script("false &\nwait $!\necho $?\n", "1\n");
+    }
+
+    // ---- Phase 7: patterns match bytes directly ----------------------------
+
+    #[test]
+    fn a_pattern_ending_in_a_slash_names_directories_only() {
+        // `FilenamePattern::new` split on '/' and filtered out empty
+        // components, which discarded the trailing slash entirely: `*/` matched
+        // plain files and reported them without the slash.
+        test_script(
+            "cd $TEST_WRITE_DIR\nrm -rf slashdir\nmkdir -p slashdir/sub slashdir/sub2\n: > slashdir/afile\ncd slashdir\nprintf '[%s]' */\necho\ncd ..\nrm -rf slashdir\n",
+            "[sub/][sub2/]\n",
+        );
+        test_script("echo /etc/\n", "/etc/\n");
+    }
+
+    #[test]
+    fn shell_patterns_have_no_regex_metacharacters() {
+        // Patterns used to be translated to a BRE, so every regex
+        // metacharacter needed escaping and a missed one changed the meaning.
+        test_script("case '.' in .) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case 'a' in .) echo NO;; *) echo M;; esac\n", "M\n");
+        test_script("case '^' in [.*^]) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case 'x+y' in 'x+y') echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("case 'a$b' in 'a$b') echo M;; *) echo NO;; esac\n", "M\n");
+    }
+
+    #[test]
+    fn a_pattern_with_many_asterisks_terminates() {
+        // A backtracking matcher goes exponential on this shape; the state-set
+        // simulation does not. A regression would hang rather than fail.
+        test_script(
+            "x=$(printf 'a%.0s' $(seq 200))\ncase $x in a*a*a*a*a*b) echo NO;; *) echo M;; esac\n",
+            "M\n",
+        );
+    }
+
+    #[test]
+    fn question_mark_matches_a_character_not_a_byte() {
+        test_script("case 'é' in ?) echo M;; *) echo NO;; esac\n", "M\n");
+        test_script("x=héllo\necho \"${x#?}\"\n", "éllo\n");
+    }
+
+    // ---- Phase 8: the byte core --------------------------------------------
+
+    #[test]
+    fn dollar_star_joins_on_the_first_character_of_ifs() {
+        // The separator was `&v[..1]`, a *byte* slice of IFS, so a multi-byte
+        // first character split mid-character and panicked.
+        test_script("IFS=é\nset -- a b\necho \"$*\"\n", "aéb\n");
+        test_script("IFS=éx\nset -- a b c\necho \"$*\"\n", "aébéc\n");
+        test_script("IFS=:\nset -- a b\necho \"$*\"\n", "a:b\n");
+        test_script("IFS=\nset -- a b\necho \"$*\"\n", "ab\n");
+        test_script("set -- a b\necho \"$*\"\n", "a b\n");
+    }
+
+    #[test]
+    fn parameter_length_counts_characters() {
+        test_script("x=héllo\necho \"${#x}\"\n", "5\n");
+        test_script("x=abc\necho \"${#x}\"\n", "3\n");
+    }
+
+    // ---- Phase 9: missing builtins and interactive output -------------------
+
+    #[test]
+    fn pwd_true_and_false_are_builtins() {
+        // POSIX XCU lists all three as utilities. `pwd` in particular *must* be
+        // built in, because `cd` is: a forked /bin/pwd reports the process
+        // working directory, which differs from the shell's logical one after
+        // `cd` through a symbolic link.
+        test_script("true\necho $?\n", "0\n");
+        test_script("false\necho $?\n", "1\n");
+        test_script("true && echo yes\n", "yes\n");
+        test_script(
+            "type pwd true false\n",
+            "pwd is a shell builtin\ntrue is a shell builtin\nfalse is a shell builtin\n",
+        );
+    }
+
+    #[test]
+    fn pwd_reports_the_logical_directory_after_following_a_link() {
+        // The whole reason `pwd` has to be a builtin.
+        test_script(
+            "cd $TEST_WRITE_DIR\nrm -rf pwdlink\nmkdir -p pwdlink_real\nln -sfn pwdlink_real pwdlink\ncd pwdlink\ntest \"$(pwd)\" != \"$(pwd -P)\" && echo differ\ncase $(pwd) in */pwdlink) echo logical;; esac\ncase $(pwd -P) in */pwdlink_real) echo physical;; esac\ncd ..\nrm -rf pwdlink pwdlink_real\n",
+            "differ\nlogical\nphysical\n",
+        );
+    }
+
+    // ---- Phase 10: test and [ are builtins ---------------------------------
+
+    #[test]
+    fn test_and_bracket_are_builtins() {
+        test_script(
+            "type test [\n",
+            "test is a shell builtin\n[ is a shell builtin\n",
+        );
+        test_script("[ 1 -eq 1 ] && echo yes\n", "yes\n");
+        test_script("[ 1 -eq 2 ] || echo no\n", "no\n");
+        test_script("test -n abc && echo nonempty\n", "nonempty\n");
+        test_script("[ -z '' ] && echo empty\n", "empty\n");
+        test_script("[ -e /etc/passwd ] && echo exists\n", "exists\n");
+        test_script("[ ! -e /nonexistent_xyz ] && echo absent\n", "absent\n");
+        test_script(
+            "i=0\nwhile [ $i -lt 3 ]; do echo $i; i=$((i+1)); done\n",
+            "0\n1\n2\n",
+        );
+    }
+
+    #[test]
+    fn a_test_usage_error_exits_greater_than_one() {
+        // POSIX distinguishes a usage error from an expression that is merely
+        // false: false is 1, a usage error is greater than 1.
+        expect_exit_code("[ 1 -eq 1 ]\n", 0);
+        expect_exit_code("[ 1 -eq 2 ]\n", 1);
+        expect_exit_code("[ 1 -eq 1\n", 2);
+        expect_exit_code("[ -q x ]\n", 2);
+    }
+
+    // ---- Phase 8: values are byte strings ----------------------------------
+
+    /// Byte-exact: the shapes below cannot be written as a `.sh`/`.out` fixture
+    /// pair, which is `include_str!`-based UTF-8.
+    /// Whether the filesystem under test can hold a filename that is not valid
+    /// text. APFS cannot, so on macOS the byte-name probes below are measuring
+    /// the filesystem rather than the shell. Probed rather than assumed, so
+    /// they still run wherever the names are accepted.
+    fn filesystem_keeps_byte_names() -> bool {
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(&dir).expect("the target temporary directory is unusable");
+        let path = dir.join(std::ffi::OsStr::from_bytes(b"byte-name-probe\xff"));
+        let _ = std::fs::remove_file(&path);
+        let accepted = std::fs::write(&path, b"").is_ok();
+        let _ = std::fs::remove_file(&path);
+        if !accepted {
+            eprintln!("this filesystem rejects a filename that is not valid text");
+        }
+        accepted
+    }
+
+    fn expect_stdout_bytes(script: &[u8], expected: &[u8]) {
+        set_env_vars();
+        run_test_u8(TestPlanU8 {
+            cmd: "sh".to_string(),
+            args: vec!["-s".to_string()],
+            stdin_data: script.to_vec(),
+            expected_out: expected.to_vec(),
+            expected_err: Vec::new(),
+            expected_exit_code: 0,
+        });
+    }
+
+    #[test]
+    fn a_command_substitution_keeps_bytes_that_are_not_text() {
+        // The result used to go through String::from_utf8_lossy, so every byte
+        // that was not part of a character became U+FFFD.
+        expect_stdout_bytes(b"V=$(printf 'a\\377b')\necho \"$V\"\n", b"a\xffb\n");
+    }
+
+    #[test]
+    fn a_variable_holds_bytes_that_are_not_text() {
+        expect_stdout_bytes(
+            b"V=$(printf 'a\\377b')\nW=\"$V$V\"\necho \"$W\"\n",
+            b"a\xffba\xffb\n",
+        );
+    }
+
+    #[test]
+    fn export_p_output_round_trips_bytes() {
+        // `export -p` is meant to be read back by the shell, so a value that is
+        // not text has to survive it rather than being flattened.
+        // Selected with the shell rather than `grep`, whose text-vs-binary
+        // decision depends on the locale, and which would also match the CI
+        // runner's own VCPKG_INSTALLATION_ROOT if anchored on the name alone.
+        expect_stdout_bytes(
+            b"V=$(printf 'a\\377b')\nexport V\nexport -p | while IFS= read -r line; do\n  case $line in \"export V=\"*) printf '%s\\n' \"$line\" ;; esac\ndone\n",
+            b"export V='a\xffb'\n",
+        );
+    }
+
+    #[test]
+    fn dollar_star_joins_on_a_byte_that_is_not_a_character() {
+        // The separator is the first *element* of IFS, which may be a byte that
+        // does not form a character.
+        expect_stdout_bytes(
+            b"V=$(printf 'a\\377b')\nset -- x y\nIFS=$V\necho \"$*\"\n",
+            b"xay\n",
+        );
+    }
+
+    #[test]
+    fn the_length_of_a_value_counts_characters_and_stray_bytes_alike() {
+        expect_stdout_bytes(b"V=$(printf 'a\\377b')\necho ${#V}\n", b"3\n");
+        expect_stdout_bytes(b"V=h\xc3\xa9llo\necho ${#V}\n", b"5\n");
+    }
+
+    #[test]
+    fn script_text_may_contain_bytes_that_are_not_characters() {
+        // The lexer used to work on `&str`, so a script containing one Latin-1
+        // byte was refused outright with exit 126 -- dash runs it.
+        expect_stdout_bytes(b"echo hi\n# caf\xe9 comment\necho done\n", b"hi\ndone\n");
+    }
+
+    #[test]
+    fn a_word_may_contain_bytes_that_are_not_characters() {
+        // Every syntactically significant character is ASCII, so a byte >= 0x80
+        // is an ordinary word character and reaches the value unchanged.
+        expect_stdout_bytes(b"echo 'a\xffb'\n", b"a\xffb\n");
+        expect_stdout_bytes(b"V=a\xffb\necho \"$V\"\n", b"a\xffb\n");
+        expect_stdout_bytes(b"echo \xff\n", b"\xff\n");
+        expect_stdout_bytes(b"echo \"a\xffb\"\n", b"a\xffb\n");
+    }
+
+    #[test]
+    fn eval_reparses_bytes_that_are_not_characters() {
+        expect_stdout_bytes(
+            b"V=$(printf 'a\\377b')\neval \"echo \\\"$V\\\"\"\n",
+            b"a\xffb\n",
+        );
+    }
+
+    // ---- Review follow-up: byte-safety gaps in the converted builtins ------
+
+    #[test]
+    fn set_and_cd_keep_the_bytes_of_their_operands() {
+        // Both scanned their options through a *fallible* text conversion, so
+        // any non-text argument was rejected outright -- `set -- "$@"` is the
+        // most common idiom in the shell. Options are ASCII, so they can be
+        // scanned lossily while the operand keeps its bytes.
+        expect_stdout_bytes(
+            b"set -- \"$(printf 'a\\377b')\"\necho \"$1\"\n",
+            b"a\xffb\n",
+        );
+        if !filesystem_keeps_byte_names() {
+            return;
+        }
+        expect_stdout_bytes(
+            b"cd \"$TEST_WRITE_DIR\"\nd=$(printf 'd\\377')\nrm -rf \"$d\"\nmkdir \"$d\"\ncd \"$d\" && echo in\ncd ..\nrm -rf \"$d\"\n",
+            b"in\n",
+        );
+    }
+
+    #[test]
+    fn test_probes_the_path_it_was_given() {
+        // The builtin converted every operand lossily, so a file test probed a
+        // path with U+FFFD in it and two distinct byte strings compared equal.
+        expect_stdout_bytes(
+            b"a=$(printf 'x\\377')\nb=$(printf 'x\\376')\n[ \"$a\" = \"$b\" ] && echo same || echo different\n",
+            b"different\n",
+        );
+        if !filesystem_keeps_byte_names() {
+            return;
+        }
+        expect_stdout_bytes(
+            b"cd \"$TEST_WRITE_DIR\"\nf=$(printf 'tf\\377')\nrm -f \"$f\"\n: > \"$f\"\n[ -e \"$f\" ] && echo present\nrm -f \"$f\"\n",
+            b"present\n",
+        );
+    }
+
+    #[test]
+    fn a_redirection_target_keeps_its_bytes() {
+        // The target was converted lossily on the way to `open`, so the file
+        // created had U+FFFD in its name rather than the byte asked for.
+        if !filesystem_keeps_byte_names() {
+            return;
+        }
+        expect_stdout_bytes(
+            b"cd \"$TEST_WRITE_DIR\"\nf=$(printf 'rt\\377')\nrm -f \"$f\"\necho hi > \"$f\"\ncat \"$f\"\nrm -f \"$f\"\n",
+            b"hi\n",
+        );
+    }
+
+    #[test]
+    fn getopts_does_not_panic_on_a_non_text_parameter() {
+        // Option letters were scanned through a lossy view but the offset of an
+        // inline option-argument indexed the raw bytes, so an invalid byte
+        // (1 raw byte, 3 lossy) ran the slice past the end.
+        expect_exit_code(
+            "set -- \"$(printf -- '-\\377aX')\"\ngetopts 'a:' o\ngetopts 'a:' o\n",
+            0,
+        );
+        // The ordinary forms still work.
+        test_script(
+            "set -- -aVAL\ngetopts a: o\necho \"$o=$OPTARG\"\n",
+            "a=VAL\n",
+        );
+        test_script(
+            "set -- -ab\ngetopts ab o; echo $o\ngetopts ab o; echo $o\n",
+            "a\nb\n",
+        );
+    }
+
+    #[test]
+    fn read_strips_ifs_whitespace_from_the_ends() {
+        // The field splitter stops creating fields once `max_fields` is reached,
+        // which for `read var` is immediately -- but that must not stop it
+        // recognizing the IFS white space at the *ends* of the remainder.
+        test_script("read a <<EOF\n  hello  \nEOF\necho \"[$a]\"\n", "[hello]\n");
+        test_script("read a b <<EOF\nx y z \nEOF\necho \"[$b]\"\n", "[y z]\n");
+        // A non-white-space IFS character is *not* stripped.
+        test_script(
+            "IFS=:\nread a b <<EOF\nx:y:z\nEOF\necho \"[$b]\"\n",
+            "[y:z]\n",
+        );
+    }
+
+    #[test]
+    fn a_here_document_leaves_no_stray_descriptor() {
+        // The temporary the here-document is written to was duplicated into
+        // place but never closed, so the exec'd process inherited it.
+        // Counting the descriptors cannot work: the shell inherits whatever the
+        // test harness has open. Compare the same command with and without the
+        // here-document instead, so the inherited ones cancel out -- and do
+        // nothing at all where there is no /proc to ask.
+        run_successfully_and(
+            "cd \"$TEST_WRITE_DIR\"\nif ls /proc/self/fd >/dev/null 2>&1; then\n  ls /proc/self/fd > hd_base 2>/dev/null\n  ls /proc/self/fd <<EOF > hd_here 2>/dev/null\nx\nEOF\n  comm -13 hd_base hd_here\n  rm -f hd_base hd_here\nfi\necho done\n",
+            |out| assert_eq!(out, "done\n", "a here-document leaked a descriptor"),
+        );
+    }
+
+    #[test]
+    fn dollar_star_is_null_only_when_it_joins_to_nothing() {
+        // Nullness follows the *joined* value, separators included: two empty
+        // parameters join to a single space and so are not null, unless IFS is
+        // itself empty. And when the default is used the parameter's own
+        // expansion must not be appended after it.
+        test_script("set -- ''\necho \"[${*:-X}]\"\n", "[X]\n");
+        test_script("set -- '' ''\necho \"[${*:-X}]\"\n", "[ ]\n");
+        test_script("IFS=\nset -- '' ''\necho \"[${*:-X}]\"\n", "[X]\n");
+        test_script("set --\necho \"[${*:-X}]\"\n", "[X]\n");
+        test_script("set -- '' a\necho \"[${*:-X}]\"\n", "[ a]\n");
+        test_script("set -- ''\necho \"[${*-X}]\"\n", "[]\n");
+    }
+
+    #[test]
+    fn a_bracket_expression_matches_a_byte_that_is_not_a_character() {
+        // The member was recorded as the Latin-1 *character*, but the subject
+        // step for such a byte decodes to nothing, so it could never match --
+        // while the same byte outside a bracket matched correctly.
+        expect_stdout_bytes(
+            b"case $(printf '\\377') in [\xff]) echo match;; *) echo no;; esac\n",
+            b"match\n",
+        );
+        expect_stdout_bytes(
+            b"case a in [!\xff]) echo match;; *) echo no;; esac\n",
+            b"match\n",
         );
     }
 }

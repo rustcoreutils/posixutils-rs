@@ -142,6 +142,9 @@ impl Rule {
         target: &Target,
         up_to_date: bool,
         newer: &[String],
+        // Maps a prerequisite name to where it was actually found, so `$<`
+        // names the file the recipe will read when `VPATH` supplied it.
+        resolve: &dyn Fn(&str) -> String,
     ) -> Result<(), ErrorCode> {
         // For an inference rule applied to a specific target, compute the
         // input/output pair from the target name and the rule's suffixes.
@@ -149,12 +152,12 @@ impl Rule {
             let target_name = target.as_ref();
             if to.is_empty() {
                 // Single-suffix rule (`.s2:`): build `target` from `target.s2`.
-                let input = PathBuf::from(format!("{}.{}", target_name, from));
+                let input = PathBuf::from(resolve(&format!("{target_name}.{from}")));
                 vec![(input, PathBuf::from(target_name))]
             } else {
                 let expected_suffix = format!(".{}", to);
                 if let Some(stem) = target_name.strip_suffix(&expected_suffix) {
-                    let input = PathBuf::from(format!("{}.{}", stem, from));
+                    let input = PathBuf::from(resolve(&format!("{stem}.{from}")));
                     let output = PathBuf::from(target_name);
                     vec![(input, output)]
                 } else {
@@ -288,10 +291,15 @@ impl Rule {
                 let is_recursive = raw.contains("$(MAKE)") || raw.contains("${MAKE}");
                 let always_run = force_run || is_recursive;
 
+                // Expand `$@`, `$<`, `$*`, `$^`, `$+` and `$?` before the
+                // recipe is either shown or run, so the line printed under -n
+                // (or when not silent) is the line that executes.
+                let expanded = self.substitute_internal_macros(target, recipe, &inout, newer);
+
                 if !always_run {
                     // -n flag
                     if dry_run {
-                        println!("{}", recipe);
+                        println!("{}", expanded);
                         continue;
                     }
 
@@ -311,7 +319,7 @@ impl Rule {
 
                 // -s flag
                 if !silent {
-                    println!("{}", recipe);
+                    println!("{}", expanded);
                 }
 
                 // POSIX: the recipe shell comes from the `SHELL` macro
@@ -325,7 +333,7 @@ impl Rule {
                 let mut command = Command::new(shell);
 
                 self.init_env(env_macros, &mut command, macros);
-                let recipe = self.substitute_internal_macros(target, recipe, &inout, newer);
+                let recipe = expanded;
                 // POSIX: when errors are not being ignored, the shell -e option
                 // shall also be in effect, so the recipe aborts on the first
                 // failing command.

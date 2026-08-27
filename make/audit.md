@@ -101,12 +101,10 @@ wrong build.
   `a_dollar_in_a_comment_does_not_abort`.
   _Residual: comment text is still expanded rather than skipped. It is now
   harmless, but `$(shell ...)` in a comment would still run. Recorded as **#51**._
-- [ ] **#51 — Comment text is expanded rather than skipped.** Substitution runs
-  over the whole line before the parser strips comments, so a macro reference
-  inside a `#` comment is still expanded. Harmless today (an undefined name is
-  empty), but once `$(shell ...)` exists a commented-out command would run.
-  Needs expansion to move behind comment stripping.
-
+- [x] **#51 — Comment text is expanded rather than skipped.** ✓ fixed 2026-08-27
+  (P7). The comment is stripped before expansion, so a reference inside one is
+  never evaluated — a commented-out `$(shell rm -rf ...)` does not run. Command
+  lines are exempt: they reach the shell verbatim, where `#` is meaningful.
 - [x] **#35 — Include processing is handed an empty macro table.** ✓ fixed
   2026-08-27 (P1 step 1). `expand_includes` threads the real macro table through
   `process_include_lines`, which was being handed `&HashMap::new()`, so
@@ -175,22 +173,46 @@ wrong build.
   _Known residual: `main.rs` appends command-line macros to the makefile text,
   so they are indistinguishable from makefile macros and are also not exported.
   POSIX 105866 requires that they be. Recorded as **#50**._
-- [ ] **#50 — Command-line `macro=value` operands are not exported to recipes.**
-  POSIX 105866: command-line macro definitions (except `MAKEFLAGS` and `SHELL`)
-  "shall be added to the environment of make". `main.rs` appends them as trailing
-  makefile text, so by the time they reach `Make::macros` nothing distinguishes
-  them from a definition written in the file, and #49's filter excludes both.
-  Needs macro *source* tracking (POSIX sources 1-4), which is P3 work.
-
+- [x] **#50 — Command-line `macro=value` operands are not exported to recipes.**
+  ✓ fixed 2026-08-27 (P7). POSIX 105866 requires them in make's environment;
+  putting them there is also what makes them visible to recipes, since #49's
+  filter exports a macro only if make already inherited its name. `MAKEFLAGS`
+  and `SHELL` are excluded as the spec requires.
 - [ ] **#52 — `$(eval ...)` is unimplemented.** 53 occurrences in the sample
   corpus. It expands its argument and then reads the result back as makefile
   source, which means re-entering the reader mid-expansion — the reader owns the
   macro table and the output buffer, and `substitute` has no handle on it.
   Refused loudly rather than expanded to nothing, so a makefile using it fails
   instead of silently losing whatever it was defining. Needs its own phase.
-- [ ] **#53 — `VPATH`/`vpath` are unimplemented.** Prerequisite search paths.
-  Two occurrences in the sample corpus, so low priority, but a project that uses
-  it will not build.
+- [x] **#53 — `VPATH`/`vpath` are unimplemented.** ✓ partially fixed 2026-08-27
+  (P7). The `VPATH` macro is honoured: a prerequisite that does not exist as
+  written is looked up in each listed directory, for both staleness checks and
+  inference-rule matching, and `$<` names where the file was actually found —
+  byte-identical to GNU on the probe. _Residual: the `vpath` **directive** with
+  its per-pattern search paths is still unimplemented; recorded as **#55**._
+- [ ] **#55 — The `vpath` directive is unimplemented.** `vpath %.c src` sets a
+  search path for a pattern rather than globally. The `VPATH` macro (#53) covers
+  the common case; this is the finer-grained form.
+- [x] **#54 — The built-in inference rules are display strings, not rules.**
+  ✓ fixed 2026-08-27 (P7). POSIX's default rules (`.c.o`, `.c`, `.sh`, `.y.o`,
+  `.l.o`, `.y.c`, `.l.c`, `.c.a`) and the macros they use (`CC`, `CFLAGS`, `AR`,
+  `ARFLAGS`, `YACC`, `LEX` …) existed only inside the `-p` dump table, so
+  `make f.o` with an `f.c` present reported `no target 'f.o'`. Nearly every real
+  makefile leans on the built-in `.c.o`. They are now real rules, seeded from
+  makefile text so they go through the same reader, appended after the
+  makefile's own so a user rule of the same name wins, and suppressed by `-r`.
+  Found by the P7 corpus run, not by the audit. Tests
+  `builtin_c_to_o_rule_applies`, `dash_r_suppresses_the_builtin_rules`.
+- [x] **#56 — A `<tab>`-indented line outside any rule is a parse error.**
+  ✓ fixed 2026-08-27 (P7). A tab-indented line is a command line only inside a
+  rule; outside one it is ordinary text. Real makefiles indent continuation and
+  comment lines with tabs — Lua's makefile does — so `\t# note` between two macro
+  definitions must not be `command line before any target`. Found by the corpus.
+- [x] **#57 — The echoed recipe is not the recipe that runs.** ✓ fixed 2026-08-27
+  (P7). Internal macros were expanded *after* the line was printed, so `-n` and
+  the non-silent echo showed `cc -c -o $@ $<` while executing the right command.
+  Since telling the user what will run is exactly what `-n` is for, the
+  expansion now happens first. Found by the corpus.
 
 ## Minor
 
@@ -211,13 +233,10 @@ wrong build.
   served. An inference rule applied to a real target goes through
   `run_for_target`, which knows the stem; scanning for every file with the source
   suffix was both dead structure and the mechanism behind #38's silent no-op.
-- [ ] **#48 — Backslash-newline folding leaves two spaces where POSIX and GNU
-  leave one.** `parser/preprocessor.rs` `fold_continuations`. Old #7 claimed the
-  continuation "and leading white space of the next line collapse to a single
-  space"; the space *before* the backslash is also retained, so
-  `SRC = one \` + `      two` yields `one  two` where GNU yields `one two`.
-  Visible to any recipe that passes the macro to something whitespace-sensitive.
-
+- [x] **#48 — Backslash-newline folding leaves two spaces where POSIX and GNU
+  leave one.** ✓ fixed 2026-08-27 (P7). Any blank already sitting before the
+  backslash is dropped, so the continuation collapses to exactly one space.
+  `SRC = one \` + `      two` now gives `one two`, matching GNU Make 4.3.
 ## Design note
 
 The crate has no dependency graph: `Make` holds a `Vec<Rule>` and answers every

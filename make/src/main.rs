@@ -348,6 +348,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // POSIX 105866: "all of the make utility command line macro definitions
+    // (except the MAKEFLAGS macro or the SHELL macro) shall be added to the
+    // environment of make". Putting them there is also what makes them visible
+    // to recipes, since a macro is exported only if make already inherited its
+    // name -- the rule that keeps *makefile* macros from leaking (audit #50).
+    for definition in &cmdline_macros {
+        let Some((name, value)) = definition.split_once('=') else {
+            continue;
+        };
+        let name = name.trim_end_matches([':', '?', '+', '!']).trim();
+        if name.is_empty() || name == "MAKEFLAGS" || name == "SHELL" {
+            continue;
+        }
+        env::set_var(name, value);
+    }
+
     let parsed = match parse_makefile(&makefile, &cmdline_macros) {
         Ok(parsed) => parsed,
         Err(err) => {

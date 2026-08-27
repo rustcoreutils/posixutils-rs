@@ -175,12 +175,21 @@ impl Builder {
         }
     }
 
+    /// Add a command line to the rule under construction.
+    ///
+    /// A `<tab>`-indented line is a command line only inside a rule. Outside
+    /// one it is ordinary text -- real makefiles indent continuation and
+    /// comment lines with tabs, so `\t# note` between two macro definitions
+    /// must not be an error. It is re-classified without its indentation.
     fn push_command(&mut self, body: &str, lineno: usize) {
-        match self.current.as_mut() {
-            Some(rule) => rule.recipes.push(body.to_string()),
-            None => self
-                .errors
-                .push(format!("{lineno}: command line before any target")),
+        if self.current.is_some() {
+            if let Some(rule) = self.current.as_mut() {
+                rule.recipes.push(body.to_string());
+            }
+            return;
+        }
+        if let Line::Entry(code) = classify(body) {
+            self.open(code, lineno);
         }
     }
 

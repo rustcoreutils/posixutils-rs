@@ -95,6 +95,12 @@ fn fold_one_line(lines: &[&str], i: &mut usize) -> (String, usize) {
         if is_recipe {
             current.push_str(next.strip_prefix('\t').unwrap_or(next));
         } else {
+            // The continuation, the newline, and the next line's leading white
+            // space collapse to a *single* space -- so any blank already
+            // sitting before the backslash goes too (audit #48).
+            while current.ends_with([' ', '\t']) {
+                current.pop();
+            }
             current.push(' ');
             current.push_str(next.trim_start());
         }
@@ -713,9 +719,14 @@ impl Reader {
     /// the end of the makefile text.
     fn keep(&mut self, line: &str) -> Result<()> {
         if line.starts_with('\t') {
+            // A command line reaches the shell verbatim, `#` included.
             self.out.push_str(line);
         } else {
-            let expanded = substitute_to_fixpoint(line, self.table.values())?;
+            // Strip the comment *before* expanding, so a reference inside one
+            // is never evaluated -- a commented-out `$(shell rm -rf ...)`
+            // must not run (audit #51).
+            let code = super::scan::strip_comment(line);
+            let expanded = substitute_to_fixpoint(code, self.table.values())?;
             self.out.push_str(&expanded);
         }
         self.out.push('\n');

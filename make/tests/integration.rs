@@ -1512,3 +1512,78 @@ mod execution {
         assert!(stdout.contains("MAKEFLAGS=[]"), "stdout: {stdout}");
     }
 }
+
+// VPATH search, and the built-in inference rules POSIX requires.
+mod builtins {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #53: VPATH names directories to search for a prerequisite that is
+    // not where the rule says. `$<` must name where it was actually found.
+    #[test]
+    fn vpath_finds_a_prerequisite_and_names_it() {
+        let _ = fs::create_dir_all("vpath_src");
+        let _ = fs::write("vpath_src/vp_probe.c", "");
+        let (stdout, code) = run(&["-f", "tests/makefiles/vpath/vpath.mk", "all"]);
+        assert!(
+            stdout.contains("IN=vpath_src/vp_probe.c"),
+            "stdout: {stdout}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_file("vp_probe.o");
+        let _ = fs::remove_dir_all("vpath_src");
+    }
+
+    // Audit #54: the default rules existed only as display strings in the -p
+    // table, so `make f.o` with an f.c present reported "no target" -- every
+    // makefile relying on the built-in .c.o rule, which is most of them.
+    #[test]
+    fn builtin_c_to_o_rule_applies() {
+        let _ = fs::write("builtin_probe.c", "int probe(void){return 0;}\n");
+        // CFLAGS defaults to POSIX's `-O 1` (spec line 106049), which c17 takes as
+        // two arguments and cc does not, so it is cleared alongside CC.
+        let (_, code) = run(&[
+            "-f",
+            "tests/makefiles/vpath/builtin.mk",
+            "CC=cc",
+            "CFLAGS=",
+            "all",
+        ]);
+        assert_eq!(code, Some(0), "built-in .c.o rule did not apply");
+        assert!(std::path::Path::new("builtin_probe.o").exists());
+        let _ = fs::remove_file("builtin_probe.o");
+        let _ = fs::remove_file("builtin_probe.c");
+    }
+
+    // -r suppresses them, as POSIX requires. Its own fixture and source file,
+    // so it cannot race the test above under parallel execution.
+    #[test]
+    fn dash_r_suppresses_the_builtin_rules() {
+        let _ = fs::write("builtin_r_probe.c", "int probe(void){return 0;}\n");
+        let (_, code) = run(&[
+            "-r",
+            "-f",
+            "tests/makefiles/vpath/builtin_r.mk",
+            "CC=cc",
+            "CFLAGS=",
+            "all",
+        ]);
+        assert_ne!(code, Some(0), "-r must suppress the built-in rules");
+        let _ = fs::remove_file("builtin_r_probe.o");
+        let _ = fs::remove_file("builtin_r_probe.c");
+    }
+}

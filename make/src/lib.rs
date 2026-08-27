@@ -119,6 +119,41 @@ impl Make {
             .find(|rule| rule.targets().any(|t| t.as_ref() == target.as_ref()))
     }
 
+    /// Directories named by the `VPATH` macro, in search order.
+    ///
+    /// POSIX has no `VPATH`, but it is the conventional way to keep sources in
+    /// one tree and build in another. Both the `:`-separated and
+    /// blank-separated spellings are accepted, as GNU does.
+    fn vpath_dirs(&self) -> Vec<&str> {
+        self.macros
+            .iter()
+            .find(|(name, _)| name == "VPATH")
+            .map(|(_, value)| {
+                value
+                    .split([':', ' ', '\t'])
+                    .filter(|d| !d.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Resolve a prerequisite through `VPATH`.
+    ///
+    /// A name that exists as written, or that no `VPATH` directory supplies, is
+    /// returned unchanged, so this is transparent when `VPATH` is unset.
+    pub fn resolve_vpath(&self, name: &str) -> String {
+        if name.contains('/') || std::path::Path::new(name).exists() {
+            return name.to_string();
+        }
+        for dir in self.vpath_dirs() {
+            let candidate = format!("{dir}/{name}");
+            if std::path::Path::new(&candidate).exists() {
+                return candidate;
+            }
+        }
+        name.to_string()
+    }
+
     /// Find a `%` pattern rule matching `name` and instantiate it for that
     /// target. The first matching pattern in file order wins, as GNU does.
     ///
@@ -181,7 +216,7 @@ impl Make {
                                 && from == from_name)
                 });
                 if let Some(rule) = hit {
-                    let prereq_path = format!("{stem}{source_suffix}");
+                    let prereq_path = self.resolve_vpath(&format!("{stem}{source_suffix}"));
                     if std::path::Path::new(&prereq_path).exists() {
                         return Some(rule);
                     }
@@ -199,7 +234,7 @@ impl Make {
                         if to.is_empty() && from == from_name)
             });
             if let Some(rule) = hit {
-                let prereq_path = format!("{name}{source_suffix}");
+                let prereq_path = self.resolve_vpath(&format!("{name}{source_suffix}"));
                 if std::path::Path::new(&prereq_path).exists() {
                     return Some(rule);
                 }
@@ -240,20 +275,10 @@ impl Make {
             {
                 Some(rule) => rule,
                 None => {
-                    // No target rule named `name`: try to infer one (single- or
-                    // double-suffix) from an existing prerequisite file.
-                    if let Some(inference_rule) = self.find_inference_rule(name.as_ref()) {
-                        let target = Target::new(name.as_ref());
-                        inference_rule.run_for_target(
-                            &self.config,
-                            &self.macros,
-                            &target,
-                            false,
-                            &[],
-                        )?;
-                        return Ok(true);
-                    }
                     // A `%.o: %.c` pattern rule, instantiated for this target.
+                    // Pattern rules are tried before suffix inference: a
+                    // makefile that writes `%.o: %.c` means it, and must not
+                    // lose to the built-in `.c.o`. GNU orders them the same way.
                     if let Some(rule) = self.find_pattern_rule(name.as_ref()) {
                         let target = Target::new(name.as_ref());
                         for prerequisite in rule.prerequisites() {
@@ -264,6 +289,20 @@ impl Make {
                             .map(|p| p.as_ref().to_string())
                             .collect();
                         rule.run_for_pattern(&self.config, &self.macros, &target, false, &newer)?;
+                        return Ok(true);
+                    }
+                    // No target rule named `name`: try to infer one (single- or
+                    // double-suffix) from an existing prerequisite file.
+                    if let Some(inference_rule) = self.find_inference_rule(name.as_ref()) {
+                        let target = Target::new(name.as_ref());
+                        inference_rule.run_for_target(
+                            &self.config,
+                            &self.macros,
+                            &target,
+                            false,
+                            &[],
+                            &|name| self.resolve_vpath(name),
+                        )?;
                         return Ok(true);
                     }
                     // Per POSIX: "If a target exists and there is neither a target rule
@@ -332,6 +371,7 @@ impl Make {
                     target,
                     up_to_date,
                     &newer,
+                    &|name| self.resolve_vpath(name),
                 )?;
                 return Ok(true);
             }
@@ -444,7 +484,8 @@ impl Make {
         if let Some(target_modified) = target_modified {
             prerequisites
                 .filter(|prerequisite| {
-                    let Some(pre_modified) = get_modified_time(prerequisite) else {
+                    let resolved = self.resolve_vpath(prerequisite.as_ref());
+                    let Some(pre_modified) = get_modified_time(&resolved) else {
                         return true;
                     };
 
@@ -457,6 +498,57 @@ impl Make {
         }
     }
 }
+
+/// The default macros and inference rules POSIX requires make to start with.
+///
+/// These existed only as display strings in the `-p` dump table, so `make f.o`
+/// with an `f.c` present reported "no target" -- every makefile that leans on
+/// the built-in `.c.o` rule, which is most of them, could not build.
+///
+/// Written as makefile text so it goes through the same reader as anything
+/// else. `-r` (`config.clear`) suppresses it, as POSIX requires.
+const BUILTIN_RULES: &str = r#"
+.c:
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+.sh:
+	cp $< $@
+	chmod a+x $@
+.c.o:
+	$(CC) $(CFLAGS) -c $<
+.y.o:
+	$(YACC) $(YFLAGS) $<
+	$(CC) $(CFLAGS) -c y.tab.c
+	rm -f y.tab.c
+	mv y.tab.o $@
+.l.o:
+	$(LEX) $(LFLAGS) $<
+	$(CC) $(CFLAGS) -c lex.yy.c
+	rm -f lex.yy.c
+	mv lex.yy.o $@
+.y.c:
+	$(YACC) $(YFLAGS) $<
+	mv y.tab.c $@
+.l.c:
+	$(LEX) $(LFLAGS) $<
+	mv lex.yy.c $@
+.c.a:
+	$(CC) -c $(CFLAGS) $<
+	$(AR) $(ARFLAGS) $@ $*.o
+	rm -f $*.o
+"#;
+
+/// The macros those rules refer to. A makefile definition overrides them, so
+/// they are seeded first and only kept where the makefile is silent.
+const BUILTIN_MACROS: [(&str, &str); 8] = [
+    ("CC", "c17"),
+    ("CFLAGS", "-O 1"),
+    ("AR", "ar"),
+    ("ARFLAGS", "-rv"),
+    ("YACC", "yacc"),
+    ("YFLAGS", ""),
+    ("LEX", "lex"),
+    ("LFLAGS", ""),
+];
 
 impl TryFrom<(Makefile, Config)> for Make {
     type Error = ErrorCode;
@@ -499,6 +591,16 @@ impl TryFrom<(Makefile, Config)> for Make {
             config,
         };
 
+        // Seed the built-in macros the default rules refer to, without
+        // overriding anything the makefile defined.
+        if !make.config.clear {
+            for (name, value) in BUILTIN_MACROS {
+                if !make.macros.iter().any(|(n, _)| n == name) {
+                    make.macros.push((name.to_string(), value.to_string()));
+                }
+            }
+        }
+
         for rule in suffixes_rules {
             special_target::process(rule, &mut make)?;
         }
@@ -534,6 +636,38 @@ impl TryFrom<(Makefile, Config)> for Make {
 
         for rule in special_rules {
             special_target::process(rule, &mut make)?;
+        }
+
+        // Built-in inference rules come last, so a rule of the same name in
+        // the makefile is found first.
+        if !make.config.clear {
+            // The built-in recipes reference $(CC), $(CFLAGS) and friends, so
+            // they must be expanded against the macros the makefile defined
+            // plus the defaults it did not. Emitting those as immediate
+            // definitions ahead of the rules runs the whole thing through the
+            // ordinary reader.
+            let mut builtin = String::new();
+            for (name, value) in &make.macros {
+                builtin.push_str(&format!("{name} ::= {value}\n"));
+            }
+            builtin.push_str(&BUILTIN_RULES.replace("\\t", "\t"));
+            if let Ok(parsed) = builtin.parse::<Makefile>() {
+                let (rules, _) = parsed.into_parts();
+                for parsed_rule in rules {
+                    let rule = Rule::from(parsed_rule);
+                    let Some(target) = rule.targets().next() else {
+                        continue;
+                    };
+                    let name = target.to_string();
+                    let already = make
+                        .inference_rules
+                        .iter()
+                        .any(|r| r.targets().any(|t| t.as_ref() == name));
+                    if !already {
+                        make.inference_rules.push(rule);
+                    }
+                }
+            }
         }
 
         Ok(make)

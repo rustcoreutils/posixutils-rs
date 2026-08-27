@@ -7,6 +7,7 @@
 //
 
 mod directive;
+mod func;
 pub mod parse;
 pub mod preprocessor;
 mod scan;

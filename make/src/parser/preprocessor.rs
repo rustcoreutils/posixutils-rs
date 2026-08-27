@@ -8,6 +8,7 @@
 //
 
 use super::directive::{parse_directive, split_condition_args, Directive};
+use super::func;
 use crate::Macro;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -37,6 +38,8 @@ pub enum PreprocError {
     UnmatchedConditional(String),
     /// A macro whose expansion re-introduces its own reference.
     RecursiveMacro,
+    /// A function reported an error, or does not exist.
+    FunctionFailed(String),
 }
 
 impl Display for PreprocError {
@@ -59,6 +62,7 @@ impl Display for PreprocError {
                     "macro expansion does not terminate (recursive definition?)"
                 )
             }
+            PreprocError::FunctionFailed(msg) => writeln!(f, "{msg}"),
             other => writeln!(f, "{:?}", other),
         }
     }
@@ -218,6 +222,54 @@ fn get_ident(letters: &mut Peekable<impl Iterator<Item = char>>) -> Result<Strin
     } else {
         Ok(ident)
     }
+}
+
+/// Read a `$(...)` name. Function names may contain a hyphen (`filter-out`);
+/// macro names conventionally may not, but accepting one here only makes an
+/// otherwise-malformed reference resolve to the empty string instead of an
+/// error.
+fn get_reference_name(letters: &mut Peekable<impl Iterator<Item = char>>) -> Result<String> {
+    let mut ident = String::new();
+    while let Some(&c) = letters.peek() {
+        if !(suitable_ident(&c) || c == '-') {
+            break;
+        }
+        ident.push(c);
+        letters.next();
+    }
+    if ident.is_empty() {
+        Err(PreprocError::EmptyIdent)
+    } else {
+        Ok(ident)
+    }
+}
+
+/// Consume a function's argument text up to the delimiter that closes it,
+/// honouring nested `$(...)`/`${...}`.
+fn read_balanced(
+    letters: &mut Peekable<impl Iterator<Item = char>>,
+    open: char,
+    close: char,
+) -> Result<String> {
+    let mut raw = String::new();
+    let mut depth = 0usize;
+    for c in letters.by_ref() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            if depth == 0 {
+                return Ok(raw);
+            }
+            depth -= 1;
+        }
+        raw.push(c);
+    }
+    Err(PreprocError::UnexpectedEOF)
+}
+
+/// Expand text on a function's behalf.
+fn expand_for_function(text: &str, ctx: &func::Ctx) -> std::result::Result<String, String> {
+    expand_to_fixpoint(text, ctx.table).map_err(|e| e.to_string())
 }
 
 fn take_till_eol(letters: &mut Peekable<impl Iterator<Item = char>>) -> String {
@@ -502,9 +554,24 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                 }
 
                 skip_blank(&mut letters);
-                let Ok(macro_name) = get_ident(&mut letters) else {
+                let Ok(macro_name) = get_reference_name(&mut letters) else {
                     Err(PreprocError::BadMacroName)?
                 };
+
+                // `$(fn args...)` -- a function call, not a macro reference.
+                if func::is_function(&macro_name) {
+                    skip_blank(&mut letters);
+                    let raw = read_balanced(&mut letters, open, close)?;
+                    let ctx = func::Ctx {
+                        table,
+                        env_wins: env_macros,
+                    };
+                    let out = func::call(&macro_name, &raw, &ctx, &expand_for_function)
+                        .map_err(PreprocError::FunctionFailed)?;
+                    result.push_str(&out);
+                    substitutions += 1;
+                    continue;
+                }
 
                 // `$(name:subst1=subst2)` substitution form.
                 if letters.peek() == Some(&':') {

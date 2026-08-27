@@ -173,6 +173,16 @@ wrong build.
   them from a definition written in the file, and #49's filter excludes both.
   Needs macro *source* tracking (POSIX sources 1-4), which is P3 work.
 
+- [ ] **#52 — `$(eval ...)` is unimplemented.** 53 occurrences in the sample
+  corpus. It expands its argument and then reads the result back as makefile
+  source, which means re-entering the reader mid-expansion — the reader owns the
+  macro table and the output buffer, and `substitute` has no handle on it.
+  Refused loudly rather than expanded to nothing, so a makefile using it fails
+  instead of silently losing whatever it was defining. Needs its own phase.
+- [ ] **#53 — `VPATH`/`vpath` are unimplemented.** Prerequisite search paths.
+  Two occurrences in the sample corpus, so low priority, but a project that uses
+  it will not build.
+
 ## Minor
 
 - [ ] **#43 — `-p` prints a `Debug` dump of the built-in table, never the

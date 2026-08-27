@@ -523,3 +523,118 @@ mod conditionals {
         assert!(preprocess("# price is $5\nall:\n\techo ok\n").is_ok());
     }
 }
+
+// Macro functions. Not POSIX; the set was chosen by counting occurrences
+// across real Makefiles rather than by mirroring GNU's roster.
+mod functions {
+    use posixutils_make::parser::preprocessor::preprocess;
+
+    fn echoed(body: &str) -> String {
+        let src = format!("all:\n\t@echo [{body}]\n");
+        let out = preprocess(&src).expect("must preprocess").0;
+        let start = out.find('[').expect("marker");
+        let end = out.rfind(']').expect("marker");
+        out[start + 1..end].to_string()
+    }
+
+    #[test]
+    fn text_functions() {
+        assert_eq!(echoed("$(subst ee,EE,feet street)"), "fEEt strEEt");
+        assert_eq!(echoed("$(patsubst %.c,%.o,a.c b.c)"), "a.o b.o");
+        assert_eq!(echoed("$(strip   a   b  )"), "a b");
+        assert_eq!(echoed("$(sort b a c a)"), "a b c");
+        assert_eq!(echoed("$(filter %.c,a.c b.o)"), "a.c");
+        assert_eq!(echoed("$(filter-out %.c,a.c b.o)"), "b.o");
+        assert_eq!(echoed("$(findstring a,a b)"), "a");
+    }
+
+    #[test]
+    fn path_functions() {
+        assert_eq!(echoed("$(dir src/foo.c)"), "src/");
+        assert_eq!(echoed("$(notdir src/foo.c)"), "foo.c");
+        assert_eq!(echoed("$(basename src/foo.c)"), "src/foo");
+        assert_eq!(echoed("$(suffix src/foo.c)"), ".c");
+        assert_eq!(echoed("$(addprefix obj/,a.o b.o)"), "obj/a.o obj/b.o");
+        assert_eq!(echoed("$(addsuffix .o,a b)"), "a.o b.o");
+    }
+
+    #[test]
+    fn word_functions() {
+        assert_eq!(echoed("$(words a b c)"), "3");
+        assert_eq!(echoed("$(word 2,a b c)"), "b");
+        assert_eq!(echoed("$(wordlist 2,3,a b c d)"), "b c");
+        assert_eq!(echoed("$(firstword a b)"), "a");
+        assert_eq!(echoed("$(lastword a b)"), "b");
+    }
+
+    #[test]
+    fn shell_function() {
+        assert_eq!(echoed("$(shell echo hello)"), "hello");
+    }
+
+    #[test]
+    fn conditional_functions() {
+        assert_eq!(echoed("$(if ,yes,no)"), "no");
+        assert_eq!(echoed("$(if x,yes,no)"), "yes");
+        assert_eq!(echoed("$(or ,,third)"), "third");
+        assert_eq!(echoed("$(and a,b)"), "b");
+        assert_eq!(echoed("$(and a,,c)"), "");
+    }
+
+    #[test]
+    fn foreach_binds_its_variable() {
+        assert_eq!(echoed("$(foreach v,1 2 3,[$(v)])"), "[1] [2] [3]");
+    }
+
+    #[test]
+    fn call_binds_positional_arguments() {
+        let src = "greet = hi $(1) and $(2)\nall:\n\t@echo [$(call greet,a,b)]\n";
+        let out = preprocess(src).expect("must preprocess").0;
+        assert!(out.contains("[hi a and b]"), "got: {out:?}");
+    }
+
+    #[test]
+    fn functions_nest() {
+        assert_eq!(echoed("$(sort $(patsubst %.c,%.o,b.c a.c))"), "a.o b.o");
+    }
+
+    // A comma inside a nested reference must not split the argument list.
+    #[test]
+    fn nested_commas_do_not_split_arguments() {
+        assert_eq!(echoed("$(words $(subst a,b,a a a))"), "3");
+    }
+
+    #[test]
+    fn wildcard_lists_matching_files() {
+        let dir = std::env::temp_dir().join("make_wildcard_probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("one.c"), "").unwrap();
+        std::fs::write(dir.join("two.c"), "").unwrap();
+        std::fs::write(dir.join("skip.h"), "").unwrap();
+        let src = format!("all:\n\t@echo [$(wildcard {}/*.c)]\n", dir.display());
+        let out = preprocess(&src).expect("must preprocess").0;
+        assert!(out.contains("one.c"), "got: {out:?}");
+        assert!(out.contains("two.c"), "got: {out:?}");
+        assert!(!out.contains("skip.h"), "got: {out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn error_function_stops_the_parse() {
+        assert!(preprocess("all:\n\t@echo $(error boom)\n").is_err());
+    }
+
+    // $(eval) needs the reader re-entered mid-expansion; refusing loudly beats
+    // silently expanding to nothing.
+    #[test]
+    fn eval_is_refused_not_ignored() {
+        assert!(preprocess("all:\n\t@echo $(eval X = 1)\n").is_err());
+    }
+
+    // An unimplemented function is refused rather than silently expanding to
+    // nothing, so a makefile using one fails loudly instead of building wrong.
+    #[test]
+    fn an_unknown_function_name_is_refused() {
+        assert!(preprocess("all:\n\t@echo $(nosuchthing foo)\n").is_err());
+    }
+}

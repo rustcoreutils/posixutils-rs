@@ -405,7 +405,8 @@ impl ViEditor {
                 if let Some(word_range) = current_bigword(current_line, self.cursor.position) {
                     let word =
                         into_expansion_word(&current_line[word_range.start..word_range.end])?;
-                    let parsed_word = parse_word(&word, 0, false).map_err(|_| CommandError)?;
+                    let parsed_word =
+                        parse_word(word.as_bytes(), 0, false).map_err(|_| CommandError)?;
                     let expansions =
                         expand_word(&parsed_word, false, shell).map_err(|_| CommandError)?;
                     if expansions.is_empty() {

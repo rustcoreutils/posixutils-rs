@@ -10,6 +10,7 @@
 use crate::parse::command_parser::is_valid_name;
 use crate::parse::word::{Word, WordPart};
 use crate::shell::environment::Environment;
+use crate::shstr::ShString;
 use std::ffi::{c_char, CStr, CString};
 
 fn is_portable_filename_character(c: char) -> bool {
@@ -64,21 +65,23 @@ fn expand_home(
 /// Expands `~` at the start of `value` and after each unquoted `:` in it, as
 /// required for the value of an assignment.
 fn expand_assignment_value(
-    value: &str,
+    value: &[u8],
     env: &Environment,
     user_home: &dyn UsersHomeDirs,
-) -> Result<String, String> {
-    let mut result = String::with_capacity(value.len());
-    for (i, sub) in value.split(':').enumerate() {
+) -> Result<ShString, String> {
+    let mut result = ShString::new();
+    for (i, sub) in value.split(|&b| b == b':').enumerate() {
         if i > 0 {
-            result.push(':');
+            result.push_bytes(b":");
         }
-        if let Some(rest) = sub.strip_prefix('~') {
-            let prefix_end = rest.find('/').unwrap_or(rest.len());
-            result += &expand_home(&rest[..prefix_end], env, user_home)?;
-            result += &rest[prefix_end..];
+        if let Some(rest) = sub.strip_prefix(b"~") {
+            let prefix_end = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
+            // A login name is text; one that is not cannot name a user.
+            let name = std::str::from_utf8(&rest[..prefix_end]).unwrap_or("");
+            result.push_bytes(expand_home(name, env, user_home)?);
+            result.push_bytes(&rest[prefix_end..]);
         } else {
-            result += sub;
+            result.push_bytes(sub);
         }
     }
     Ok(result)
@@ -87,13 +90,14 @@ fn expand_assignment_value(
 /// Expands a leading `~`, as required for an ordinary word. Assumes `word`
 /// starts with `~`.
 fn expand_word_tilde(
-    word: &str,
+    word: &[u8],
     env: &Environment,
     user_home: &dyn UsersHomeDirs,
-) -> Result<String, String> {
-    let prefix_end = word.find('/').unwrap_or(word.len());
-    let mut result = expand_home(&word[1..prefix_end], env, user_home)?;
-    result += &word[prefix_end..];
+) -> Result<ShString, String> {
+    let prefix_end = word.iter().position(|&b| b == b'/').unwrap_or(word.len());
+    let name = std::str::from_utf8(&word[1..prefix_end]).unwrap_or("");
+    let mut result = ShString::from(expand_home(name, env, user_home)?);
+    result.push_bytes(&word[prefix_end..]);
     Ok(result)
 }
 
@@ -123,7 +127,7 @@ fn expand_tilde_with_custom_users_home_dirs(
     };
 
     if mode == TildeMode::Word {
-        if !unquoted_start.starts_with('~') {
+        if !unquoted_start.starts_with(b"~") {
             return Ok(());
         }
         // > The pathname resulting from tilde expansion shall be treated as if
@@ -135,27 +139,30 @@ fn expand_tilde_with_custom_users_home_dirs(
 
     // The part of the first literal that is an assignment value, and whatever
     // precedes it (the `name=` of a declaration utility operand).
-    let (prefix, value) = if mode == TildeMode::DeclarationOperand {
-        match unquoted_start.split_once('=') {
-            Some((name, value)) if is_valid_name(name) => {
-                (&unquoted_start[..name.len() + 1], value)
+    let (prefix, value): (&[u8], &[u8]) = if mode == TildeMode::DeclarationOperand {
+        match unquoted_start.iter().position(|&b| b == b'=') {
+            Some(pos) if std::str::from_utf8(&unquoted_start[..pos]).is_ok_and(is_valid_name) => {
+                (&unquoted_start[..pos + 1], &unquoted_start[pos + 1..])
             }
             // not `name=value` after all, so nothing here is an assignment
             _ => return Ok(()),
         }
     } else {
-        ("", unquoted_start.as_str())
+        (b"", unquoted_start.as_bytes())
     };
     let expanded = expand_assignment_value(value, env, user_home)?;
-    if expanded != value {
-        word.parts[0] = WordPart::QuotedLiteral(format!("{prefix}{expanded}"));
+    if expanded.as_bytes() != value {
+        let mut replacement = ShString::from(prefix);
+        replacement.push_bytes(&expanded);
+        word.parts[0] = WordPart::QuotedLiteral(replacement);
     }
     for i in 1..word.parts.len() {
         if let WordPart::UnquotedLiteral(lit) = &word.parts[i] {
-            if let Some(prefix_start) = lit.find(":~") {
+            if let Some(prefix_start) = lit.windows(2).position(|w| w == b":~") {
                 let expanded = expand_assignment_value(&lit[prefix_start + 1..], env, user_home)?;
-                word.parts[i] =
-                    WordPart::QuotedLiteral(format!("{}{}", &lit[..=prefix_start], expanded));
+                let mut replacement = ShString::from(&lit[..=prefix_start]);
+                replacement.push_bytes(&expanded);
+                word.parts[i] = WordPart::QuotedLiteral(replacement);
             }
         }
     }

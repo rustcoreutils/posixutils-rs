@@ -20,6 +20,7 @@ use crate::parse::word::{
 };
 use crate::parse::word_parser::parse_word_pair;
 use crate::parse::{AliasTable, ParseResult, ParserError};
+use crate::shstr::ShString;
 use std::borrow::Cow;
 use std::rc::Rc;
 
@@ -28,17 +29,23 @@ pub fn is_valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn try_into_assignment(word: &str, line_no: u32) -> ParseResult<Result<Assignment, &str>> {
-    if !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+fn try_into_assignment(word: &[u8], line_no: u32) -> ParseResult<Result<Assignment, &[u8]>> {
+    // A name is restricted to the portable character set, so this scan never
+    // needs to decode; the first byte that is not part of a name decides.
+    if !word
+        .first()
+        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+    {
         return Ok(Err(word));
     }
-    if let Some((pos, c)) = word
-        .char_indices()
-        .find(|(_, c)| !c.is_ascii_alphanumeric() && *c != '_')
+    if let Some(pos) = word
+        .iter()
+        .position(|c| !c.is_ascii_alphanumeric() && *c != b'_')
     {
-        if c == '=' {
+        if word[pos] == b'=' {
             let (name, value) = word.split_at(pos);
-            let name = Rc::from(name);
+            // Safe: every byte of `name` passed the ASCII test above.
+            let name = Rc::from(std::str::from_utf8(name).expect("a name is ASCII"));
             parse_word_pair(&value[1..], line_no, false).map(|value| Ok(Assignment { name, value }))
         } else {
             Ok(Err(word))
@@ -132,7 +139,7 @@ impl<'src> CommandParser<'src> {
         self.lookahead == token
             || matches!(
                 (&self.lookahead, token.as_word_str()),
-                (CommandToken::Word(word), Some(text)) if word.as_ref() == text
+                (CommandToken::Word(word), Some(text)) if word.as_ref() == text.as_bytes()
             )
     }
 
@@ -174,9 +181,11 @@ impl<'src> CommandParser<'src> {
     fn match_name(&mut self) -> ParseResult<Name> {
         let line_no = self.lookahead_lineno;
         match self.lookahead.as_word_str() {
-            Some(word) if is_valid_name(word) => self
-                .advance()
-                .map(|word| word.into_word_cow().unwrap().into_owned().into()),
+            Some(word) if is_valid_name(word) => self.advance().map(|word| {
+                // A name is ASCII; `is_valid_name` above guarantees it.
+                let bytes = word.into_word_cow().unwrap().into_owned();
+                Rc::from(String::from_utf8(bytes).expect("a name is ASCII").as_str())
+            }),
             _ => Err(ParserError::new(
                 line_no,
                 format!("expected name, got {}", self.lookahead),
@@ -188,7 +197,7 @@ impl<'src> CommandParser<'src> {
     fn parse_word_pair(&mut self) -> ParseResult<WordPair> {
         let line_no = self.lookahead_lineno;
         let token = self.advance()?;
-        if let Some(word) = token.as_word_str() {
+        if let Some(word) = token.as_word_bytes() {
             parse_word_pair(word, line_no, false)
         } else {
             Err(ParserError::new(
@@ -228,7 +237,7 @@ impl<'src> CommandParser<'src> {
                 contents,
             } => {
                 let contents = parse_word_pair(contents.as_ref(), self.lookahead_lineno, true)?;
-                let delimiter = delimiter.to_string();
+                let delimiter = ShString::from(delimiter.to_vec());
                 self.advance()?;
                 return Ok(Some(RedirectionKind::HereDocument {
                     delimiter,
@@ -243,9 +252,9 @@ impl<'src> CommandParser<'src> {
                 } = self.advance()?
                 {
                     return Ok(Some(RedirectionKind::QuotedHereDocument {
-                        start_delimiter: start_delimiter.into_owned(),
-                        end_delimiter: end_delimiter.into_owned(),
-                        contents: contents.into_owned(),
+                        start_delimiter: ShString::from(start_delimiter.into_owned()),
+                        end_delimiter: ShString::from(end_delimiter.into_owned()),
+                        contents: ShString::from(contents.into_owned()),
                     }));
                 } else {
                     unreachable!()
@@ -309,22 +318,26 @@ impl<'src> CommandParser<'src> {
 
     fn alias_substitution(
         &mut self,
-        word: Cow<'src, str>,
+        word: Cow<'src, [u8]>,
         apply_alias_substitution_to_next_word: &mut bool,
         alias_table: &AliasTable,
     ) -> ParseResult<Option<WordPair>> {
         let mut next_substitution = word;
         let mut performed_one_substitution = false;
         loop {
-            if self.is_currently_processing_substitution(next_substitution.as_ref()) {
+            // An alias name is text; a word that is not cannot name one.
+            let Some(name) = std::str::from_utf8(next_substitution.as_ref()).ok() else {
+                return parse_word_pair(&next_substitution, self.lookahead_lineno, false).map(Some);
+            };
+            if self.is_currently_processing_substitution(name) {
                 return parse_word_pair(&next_substitution, self.lookahead_lineno, false).map(Some);
             }
-            if let Some(alias) = alias_table.get(next_substitution.as_ref()) {
-                *apply_alias_substitution_to_next_word = alias.ends_with(is_blank);
-                self.lexer.insert_text_at_current_position(
-                    alias.to_string().into(),
-                    next_substitution.as_ref(),
-                );
+            if let Some(alias) = alias_table.get(name) {
+                *apply_alias_substitution_to_next_word =
+                    alias.as_bytes().last().copied().is_some_and(is_blank);
+                let name = name.to_string();
+                self.lexer
+                    .insert_text_at_current_position(alias.clone().into_bytes().into(), &name);
                 performed_one_substitution = true;
                 // The replacement text takes the command word's place, so its
                 // first token is in command position and a reserved word there
@@ -359,14 +372,14 @@ impl<'src> CommandParser<'src> {
             if self.lookahead.is_reserved_word() {
                 return Ok(command.none_if_empty());
             }
-            match self.lookahead.as_word_str() {
+            match self.lookahead.as_word_bytes() {
                 Some(word) => {
                     match try_into_assignment(word, self.lookahead_lineno)? {
                         Ok(assignment) => command.assignments.push(assignment),
                         Err(word) => {
                             if continue_to_apply_alias_substitution {
                                 let next_word = self.alias_substitution(
-                                    word.to_string().into(),
+                                    word.to_vec().into(),
                                     &mut continue_to_apply_alias_substitution,
                                     alias_table,
                                 )?;
@@ -400,11 +413,11 @@ impl<'src> CommandParser<'src> {
             if self.lookahead.is_reserved_word() {
                 return Ok(command.none_if_empty());
             }
-            match self.lookahead.as_word_str() {
+            match self.lookahead.as_word_bytes() {
                 Some(word) => {
                     if continue_to_apply_alias_substitution {
                         let next_word = self.alias_substitution(
-                            word.to_string().into(),
+                            word.to_vec().into(),
                             &mut continue_to_apply_alias_substitution,
                             alias_table,
                         )?;
@@ -505,7 +518,7 @@ impl<'src> CommandParser<'src> {
         self.skip_linebreak()?;
         let mut words = Vec::new();
         if self.match_reserved_word(CommandToken::In)? {
-            while self.lookahead.as_word_str().is_some() {
+            while self.lookahead.as_word_bytes().is_some() {
                 let word = self.advance()?.into_word_cow().unwrap();
                 words.push(parse_word_pair(&word, self.lookahead_lineno, false)?);
             }
@@ -728,12 +741,18 @@ impl<'src> CommandParser<'src> {
             )))
         } else {
             let command_type = match &self.lookahead {
-                CommandToken::Word(word) if is_valid_name(word) => {
+                CommandToken::Word(word) if std::str::from_utf8(word).is_ok_and(is_valid_name) => {
                     if self.lexer.is_next_lparen() {
                         let word = self.advance()?.into_word_cow().unwrap();
                         assert_eq!(self.lookahead, CommandToken::LParen);
+                        // A function name is ASCII: `is_valid_name` above.
+                        let name: Name = Rc::from(
+                            String::from_utf8(word.into_owned())
+                                .expect("a name is ASCII")
+                                .as_str(),
+                        );
                         Some(
-                            self.parse_function_definition(word.into_owned().into(), alias_table)
+                            self.parse_function_definition(name, alias_table)
                                 .map(CommandType::FunctionDefinition)?,
                         )
                     } else {
@@ -866,7 +885,7 @@ impl<'src> CommandParser<'src> {
         Ok(Some(command))
     }
 
-    pub fn new(source: &'src str, start_lineno: u32) -> ParseResult<Self> {
+    pub fn new(source: &'src [u8], start_lineno: u32) -> ParseResult<Self> {
         let mut lexer = CommandLexer::new(source);
         // The very first token of the input begins a command.
         let (lookahead, lookahead_lineno) = lexer.next_token(true)?;
@@ -890,12 +909,13 @@ mod tests {
         quoted_literal, special_parameter, unquoted_literal, unquoted_literal_pair,
     };
     use crate::parse::word::SpecialParameter;
+    use crate::shstr::ShString;
 
     fn parse_complete_command(
         text: &str,
         alias_table: AliasTable,
     ) -> ParseResult<Option<CompleteCommand>> {
-        let mut parser = CommandParser::new(text, 1)?;
+        let mut parser = CommandParser::new(text.as_bytes(), 1)?;
         parser.parse_next_command(&alias_table)
     }
 
@@ -1254,10 +1274,10 @@ mod tests {
             Redirection {
                 file_descriptor: None,
                 kind: RedirectionKind::HereDocument {
-                    delimiter: "end".to_string(),
+                    delimiter: ShString::from("end"),
                     contents: WordPair {
                         word: quoted_literal("this\nis\n\ta\ntest\n"),
-                        as_string: "this\nis\n\ta\ntest\n".to_string()
+                        as_string: ShString::from("this\nis\n\ta\ntest\n")
                     }
                 }
             }
@@ -1271,10 +1291,10 @@ mod tests {
             Redirection {
                 file_descriptor: None,
                 kind: RedirectionKind::HereDocument {
-                    delimiter: "end".to_string(),
+                    delimiter: ShString::from("end"),
                     contents: WordPair {
                         word: quoted_literal("this\nis\na\ntest\n"),
-                        as_string: "this\nis\na\ntest\n".to_string()
+                        as_string: ShString::from("this\nis\na\ntest\n")
                     }
                 }
             }

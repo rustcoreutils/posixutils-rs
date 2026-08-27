@@ -152,7 +152,7 @@ pub fn execute_file_as_script(shell: &mut Shell, path: &Path) -> Result<i32, Scr
 
     let lineno = shell.last_lineno;
     shell.last_lineno = 0;
-    let execution_result = shell.execute_program(&source);
+    let execution_result = shell.execute_program(source.as_bytes());
     shell.last_lineno = lineno;
     execution_result.map_err(ScriptExecutionError::ParsingError)
 }
@@ -256,9 +256,13 @@ impl DeclarationUtility {
 
 /// True for a word of the form `name=…`, whose value a declaration utility
 /// expands as if it were an assignment.
-fn is_assignment_shaped(word: &str) -> bool {
-    word.split_once('=')
-        .is_some_and(|(name, _)| is_valid_name(name))
+fn is_assignment_shaped(word: &[u8]) -> bool {
+    // A name is restricted to the portable character set, so the bytes before
+    // the first `=` must be valid text to be one at all.
+    match word.iter().position(|&b| b == b'=') {
+        Some(pos) => std::str::from_utf8(&word[..pos]).is_ok_and(is_valid_name),
+        None => false,
+    }
 }
 
 impl Shell {
@@ -370,7 +374,7 @@ impl Shell {
     pub fn execute_action(&mut self, action: TrapAction) {
         if let TrapAction::Commands(commands) = action {
             let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
-            if let Err(err) = self.execute_program(&commands) {
+            if let Err(err) = self.execute_program(commands.as_bytes()) {
                 eprintln!("sh: error parsing action: {}", err.message);
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
@@ -677,7 +681,7 @@ impl Shell {
         for (index, word_pair) in simple_command.words.iter().enumerate() {
             if declaration_utility == DeclarationUtility::Yes
                 && index > 0
-                && is_assignment_shaped(&word_pair.as_string)
+                && is_assignment_shaped(word_pair.as_string.as_bytes())
             {
                 expanded_words.push(expand_declaration_operand(&word_pair.word, self)?);
                 continue;
@@ -1218,7 +1222,7 @@ impl Shell {
         status
     }
 
-    pub fn execute_in_subshell(&mut self, program: &str) -> CommandExecutionResult<ShString> {
+    pub fn execute_in_subshell(&mut self, program: &[u8]) -> CommandExecutionResult<ShString> {
         let (read_pipe, write_pipe) = pipe()?;
         match fork()? {
             ForkResult::Child => {
@@ -1265,9 +1269,9 @@ impl Shell {
         }
     }
 
-    pub fn execute_program(&mut self, program: &str) -> Result<i32, ParserError> {
+    pub fn execute_program(&mut self, program: &[u8]) -> Result<i32, ParserError> {
         if self.set_options.verbose {
-            self.eprint(program)
+            self.eprint(&String::from_utf8_lossy(program))
         }
         if let Err(err) = self.background_jobs.update_jobs() {
             self.eprint(&format!("sh: error updating background jobs ({err})"));
@@ -1421,7 +1425,7 @@ impl Shell {
     pub fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
         // PS1/PS2/PS4 are written to the terminal, so a lossy view is right.
         let var = self.environment.get_str_value(var).unwrap_or_default();
-        match parse_word(var, 0, false) {
+        match parse_word(var.as_bytes(), 0, false) {
             Ok(word) => match expand_word_to_string(&word, false, self) {
                 Ok(str) => str.display().to_string(),
                 Err(err) => {

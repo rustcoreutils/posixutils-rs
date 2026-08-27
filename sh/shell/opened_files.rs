@@ -219,7 +219,9 @@ impl OpenedFiles {
                 RedirectionKind::QuotedHereDocument { contents, .. } => {
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
-                        OpenedFile::HereDocument(Rc::new(RefCell::new(contents.clone()))),
+                        OpenedFile::HereDocument(Rc::new(RefCell::new(
+                            contents.display().to_string(),
+                        ))),
                     );
                 }
             }

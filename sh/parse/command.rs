@@ -9,6 +9,7 @@
 
 use crate::nonempty::NonEmpty;
 use crate::parse::word::WordPair;
+use crate::shstr::ShString;
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::rc::Rc;
 
@@ -53,13 +54,13 @@ pub enum RedirectionKind {
         file: WordPair,
     },
     HereDocument {
-        delimiter: String,
+        delimiter: ShString,
         contents: WordPair,
     },
     QuotedHereDocument {
-        start_delimiter: String,
-        end_delimiter: String,
-        contents: String,
+        start_delimiter: ShString,
+        end_delimiter: ShString,
+        contents: ShString,
     },
 }
 
@@ -67,20 +68,32 @@ impl Display for RedirectionKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             RedirectionKind::IORedirection { kind, file } => {
-                write!(f, "{}{}", kind, file.as_string)
+                write!(f, "{}{}", kind, file.as_string.display())
             }
             RedirectionKind::HereDocument {
                 delimiter,
                 contents,
             } => {
-                write!(f, "<<{}\n{}{}", delimiter, contents.as_string, delimiter)
+                write!(
+                    f,
+                    "<<{}\n{}{}",
+                    delimiter.display(),
+                    contents.as_string.display(),
+                    delimiter.display()
+                )
             }
             RedirectionKind::QuotedHereDocument {
                 start_delimiter,
                 end_delimiter,
                 contents,
             } => {
-                write!(f, "<<{}\n{}{}", start_delimiter, contents, end_delimiter)
+                write!(
+                    f,
+                    "<<{}\n{}{}",
+                    start_delimiter.display(),
+                    contents.display(),
+                    end_delimiter.display()
+                )
             }
         }
     }
@@ -109,7 +122,7 @@ pub struct Assignment {
 
 impl Display for Assignment {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}={}", self.name, self.value.as_string)
+        write!(f, "{}={}", self.name, self.value.as_string.display())
     }
 }
 
@@ -176,9 +189,9 @@ pub struct CaseItem {
 
 impl Display for CaseItem {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({}", self.pattern.first().as_string)?;
+        write!(f, "({}", self.pattern.first().as_string.display())?;
         for pattern in self.pattern.tail() {
-            write!(f, " | {}", pattern.as_string)?;
+            write!(f, " | {}", pattern.as_string.display())?;
         }
         write!(f, ")")?;
         if let Some(body) = &self.body {
@@ -239,14 +252,14 @@ impl Display for CompoundCommand {
             } => {
                 write!(f, "for {} in", iter_var)?;
                 for word in words {
-                    write!(f, " {}", word.as_string)?;
+                    write!(f, " {}", word.as_string.display())?;
                 }
                 write!(f, "; do ")?;
                 body.format_into(f, true)?;
                 write!(f, " done")
             }
             CompoundCommand::CaseClause { arg, cases } => {
-                write!(f, "case {} in", arg.as_string)?;
+                write!(f, "case {} in", arg.as_string.display())?;
                 for case in cases {
                     write!(f, " {}", case)?;
                 }

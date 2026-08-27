@@ -2181,16 +2181,38 @@ mod audit_regressions {
     }
 
     #[test]
-    fn non_script_command_file_exits_126() {
-        // A command_file that is not valid text is ENOEXEC-like: 126, not 127.
-        // Build it here rather than naming a system path, which differs across
-        // platforms (`/bin/true` does not exist on macOS).
+    fn a_command_file_that_is_not_a_script_fails() {
+        // A script is read as bytes and need not be text, so a binary is parsed
+        // like anything else and fails on its contents. The three reference
+        // shells disagree on the status -- dash reports 127 (the garbage names
+        // no command), bash sniffs the ELF magic and reports 126 -- so this
+        // pins only that it fails, and that nothing is executed.
         set_env_vars();
         let dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
         std::fs::create_dir_all(dir).unwrap();
         let binary = dir.join("not_a_script.bin");
         std::fs::write(&binary, [0x7f, b'E', b'L', b'F', 0xff, 0xfe]).unwrap();
-        expect_cli_exit_code(vec![binary.to_string_lossy().into_owned()], "", 126);
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec![binary.to_string_lossy().into_owned()],
+                stdin_data: String::new(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                assert!(
+                    !output.status.success(),
+                    "a binary should not run as a script"
+                );
+                assert_ne!(output.status.code(), Some(101), "shell panicked");
+                assert!(
+                    output.stdout.is_empty(),
+                    "nothing should have been executed"
+                );
+            },
+        );
     }
 
     #[test]
@@ -3319,5 +3341,30 @@ mod audit_regressions {
     fn the_length_of_a_value_counts_characters_and_stray_bytes_alike() {
         expect_stdout_bytes(b"V=$(printf 'a\\377b')\necho ${#V}\n", b"3\n");
         expect_stdout_bytes(b"V=h\xc3\xa9llo\necho ${#V}\n", b"5\n");
+    }
+
+    #[test]
+    fn script_text_may_contain_bytes_that_are_not_characters() {
+        // The lexer used to work on `&str`, so a script containing one Latin-1
+        // byte was refused outright with exit 126 -- dash runs it.
+        expect_stdout_bytes(b"echo hi\n# caf\xe9 comment\necho done\n", b"hi\ndone\n");
+    }
+
+    #[test]
+    fn a_word_may_contain_bytes_that_are_not_characters() {
+        // Every syntactically significant character is ASCII, so a byte >= 0x80
+        // is an ordinary word character and reaches the value unchanged.
+        expect_stdout_bytes(b"echo 'a\xffb'\n", b"a\xffb\n");
+        expect_stdout_bytes(b"V=a\xffb\necho \"$V\"\n", b"a\xffb\n");
+        expect_stdout_bytes(b"echo \xff\n", b"\xff\n");
+        expect_stdout_bytes(b"echo \"a\xffb\"\n", b"a\xffb\n");
+    }
+
+    #[test]
+    fn eval_reparses_bytes_that_are_not_characters() {
+        expect_stdout_bytes(
+            b"V=$(printf 'a\\377b')\neval \"echo \\\"$V\\\"\"\n",
+            b"a\xffb\n",
+        );
     }
 }

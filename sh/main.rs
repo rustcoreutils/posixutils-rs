@@ -23,7 +23,7 @@ use os::signals::{
 use std::error::Error;
 use std::fs::File;
 use std::io;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 
 mod builtin;
@@ -44,7 +44,7 @@ mod wordexp;
 /// was found but cannot serve as a script, and 128 only for an unrecoverable
 /// read error. The distinction is which step failed, not which errno came
 /// back, so the open and the read are done separately.
-fn read_command_file(path: &ShStr) -> Result<String, (io::Error, i32)> {
+fn read_command_file(path: &ShStr) -> Result<Vec<u8>, (io::Error, i32)> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -61,16 +61,17 @@ fn read_command_file(path: &ShStr) -> Result<String, (io::Error, i32)> {
     if file.metadata().is_ok_and(|metadata| metadata.is_dir()) {
         return Err((io::Error::other(gettext("Is a directory")), 126));
     }
-    let mut contents = String::new();
-    match file.read_to_string(&mut contents) {
+    // Read as bytes: a script is not required to be text, and refusing one
+    // that contains a byte which is not part of a character would make the
+    // shell unable to run scripts other shells run.
+    let mut contents = Vec::new();
+    match file.read_to_end(&mut contents) {
         Ok(_) => Ok(contents),
-        // Not text at all: an [ENOEXEC] error, which POSIX maps to 126.
-        Err(err) if err.kind() == io::ErrorKind::InvalidData => Err((err, 126)),
         Err(err) => Err((err, 128)),
     }
 }
 
-fn execute_string(string: &str, shell: &mut Shell) {
+fn execute_string(string: &[u8], shell: &mut Shell) {
     match shell.execute_program(string) {
         Ok(_) => {}
         Err(syntax_err) => {
@@ -152,7 +153,7 @@ fn standard_repl(shell: &mut Shell) {
                     };
                     let _ = writeln!(io::stderr());
                     shell.terminal.reset();
-                    match shell.execute_program(program_string) {
+                    match shell.execute_program(program_string.as_bytes()) {
                         Ok(_) => {
                             program_buffer.clear();
                             print_ps2 = false;
@@ -225,7 +226,7 @@ fn vi_repl(shell: &mut Shell) {
                     };
                     let _ = writeln!(io::stderr());
                     shell.terminal.reset();
-                    match shell.execute_program(program_string) {
+                    match shell.execute_program(program_string.as_bytes()) {
                         Ok(_) => {
                             program_buffer.clear();
                             print_ps2 = false;
@@ -297,7 +298,7 @@ fn non_terminal_repl(shell: &mut Shell) -> ! {
             Err(_) => shell.exit(128),
         }
         program_buffer.push_str(&line);
-        match shell.execute_program(&program_buffer) {
+        match shell.execute_program(program_buffer.as_bytes()) {
             Ok(_) => program_buffer.clear(),
             Err(syntax_err) => {
                 if !syntax_err.could_be_resolved_with_more_input {
@@ -337,7 +338,7 @@ fn interactive_shell(shell: &mut Shell) {
             unsafe { libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() };
         if ids_match {
             if let Ok(contents) = std::fs::read_to_string(&env_file) {
-                if let Err(err) = shell.execute_program(&contents) {
+                if let Err(err) = shell.execute_program(contents.as_bytes()) {
                     eprintln!("sh: {env_file}: {}", err.message);
                 }
             }
@@ -382,12 +383,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     match args.execution_mode {
         ExecutionMode::Interactive => interactive_shell(&mut shell),
         ExecutionMode::ReadCommandsFromStdin => {
-            let mut buffer = String::new();
+            // Read as bytes: `read_line` needs valid UTF-8 and silently ends
+            // the loop on a script that is not text.
+            let mut buffer: Vec<u8> = Vec::new();
             // A construct that is merely incomplete is not an error while more
             // input may still arrive, but it becomes one at end of input.
             let mut incomplete: Option<ParserError> = None;
-            while io::stdin().read_line(&mut buffer).is_ok_and(|n| n > 0) {
-                if buffer.ends_with("\\\n") {
+            while io::stdin()
+                .lock()
+                .read_until(b'\n', &mut buffer)
+                .is_ok_and(|n| n > 0)
+            {
+                if buffer.ends_with(b"\\\n") {
                     continue;
                 }
                 match shell.execute_program(&buffer) {
@@ -417,15 +424,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         other => match other {
             ExecutionMode::ReadCommandsFromString(command_string) => {
-                // The lexer works on text; carrying arbitrary bytes through the
-                // grammar is the remaining stage of the byte conversion.
-                match command_string.to_str() {
-                    Some(text) => execute_string(text, &mut shell),
-                    None => {
-                        eprintln!("sh: command string is not valid text");
-                        std::process::exit(2);
-                    }
-                }
+                execute_string(command_string.as_bytes(), &mut shell);
             }
             ExecutionMode::ReadFromFile(file) => match read_command_file(&file) {
                 Ok(file_contents) => execute_string(&file_contents, &mut shell),

@@ -166,7 +166,7 @@ fn execute_history(
     keep_in_history: bool,
 ) -> Result<i32, BuiltinError> {
     std::mem::swap(opened_files, &mut shell.opened_files);
-    let result = shell.execute_program(history);
+    let result = shell.execute_program(history.as_bytes());
     std::mem::swap(opened_files, &mut shell.opened_files);
     if !keep_in_history {
         shell.history.remove_last_entry();

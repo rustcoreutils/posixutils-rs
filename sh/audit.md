@@ -743,15 +743,53 @@ The scaffold is gone and the conversion now reaches every path that carries a
 - [x] **`$*` fell back to a space when IFS was not valid text.** The separator
   is the first *element* of IFS, which may be a byte that is not a character.
 
-**Stage 3, still to do: the lexer and script text.** `execute_program` takes
-`&str`, so a script — or a `-c` string, or `eval`/`.` input — must still be
-valid UTF-8, and `sh script-with-a-latin1-byte` is refused with a diagnostic
-rather than run. The insight that makes it tractable is that every
-syntactically significant character in the shell grammar is ASCII, so
-`Lexer::lookahead` becomes a byte and any byte >= 0x80 is by definition an
-ordinary word character. `cli/vi/` stays on `String` deliberately: terminal
-line editing is character-and-column oriented, and converting it would break
-cursor movement for no gain.
+### Phase 8 — the byte core (stage 3 of 3: the lexer and script text)
+
+The conversion is complete. What made it tractable is that **every
+syntactically significant character in the shell grammar is ASCII**, so the
+lexer never has to decode: `Lexer::lookahead` yields a `u8`, and a byte
+`>= 0x80` is by definition an ordinary word character that cannot be mistaken
+for an operator, a quote or a reserved word. The byte cursor that replaces
+`CharIndices` is *simpler* than what it replaced, since no `len_utf8`
+bookkeeping is needed.
+
+- `Lexer`, `CommandLexer`, `WordLexer` and their token payloads
+  (`Cow<'src, [u8]>`) work on bytes; `WordPart`, `WordPair::as_string` and the
+  here-document payloads hold `ShString`.
+- `execute_program` takes `&[u8]`, so a script file, a `-c` string, `eval` and
+  `.` all carry bytes. `read_command_file` reads with `read_to_end`, and the
+  stdin loop uses `read_until` — `read_line` needs valid UTF-8 and was silently
+  ending the loop on a script that is not text.
+- [x] **A script containing one Latin-1 byte was refused with exit 126.** It
+  now runs, as it does under dash.
+- [x] **A word could not contain a byte that is not part of a character.**
+  `CommandToken::as_word_str` returned `None` for such a word, so the parser did
+  not see it as a word at all and reported a syntax error. `as_word_bytes` is
+  used wherever any word is allowed; `as_word_str` remains only for comparing
+  against fixed spellings.
+- `$'\xNN'` now emits the **byte** NN rather than encoding U+00NN as two bytes
+  — a latent defect the conversion exposed.
+
+Names stay text throughout: a variable, function or alias name is restricted to
+the portable character set, so the few places that need one (`try_into_assignment`,
+function definitions, `is_valid_name`) assert ASCII rather than carrying bytes.
+
+Six lossy conversions remain, all deliberate and all diagnostics or ASCII
+scanning: four `WordToken` `Display` arms, `getopts` scanning option letters
+(the byte offsets still index the original bytes), and `set -v` echoing the
+program. `cli/vi/` stays on `String` deliberately: terminal line editing is
+character-and-column oriented, and converting it would break cursor movement for
+no gain.
+
+The safety net did its job — the lexer conversion touched 4945 lines and 186
+character literals, and all 92 inline parser/lexer tests plus the 198 fixtures
+passed unchanged, without a single expectation being edited to fit.
+
+One committed test had to change, and only because the behaviour it pinned was
+an artifact: `non_script_command_file_exits_126` asserted 126 for a binary
+command file, which followed from the UTF-8 refusal being removed here. The
+three reference shells disagree (dash 127, bash sniffs ELF magic and gives 126),
+so the test now pins only that it fails and executes nothing.
 
 ### Phase 9 — missing builtins and interactive output
 

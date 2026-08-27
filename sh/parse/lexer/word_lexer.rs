@@ -11,7 +11,6 @@ use crate::parse::lexer::Lexer;
 use crate::parse::ParseResult;
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
-use std::str::CharIndices;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WordToken<'src> {
@@ -22,14 +21,16 @@ pub enum WordToken<'src> {
     // this needs to be a standalone token, otherwise we would get
     // `Backslash` and then we would try to lex `BacktickCommandSubstitution`
     QuotedBacktick,
-    CommandSubstitution(&'src str),
-    BacktickCommandSubstitution(&'src str),
-    ArithmeticExpansion(&'src str),
+    CommandSubstitution(&'src [u8]),
+    BacktickCommandSubstitution(&'src [u8]),
+    ArithmeticExpansion(&'src [u8]),
     /// `$'...'` dollar-single-quote (POSIX.1-2024 §2.2.4); holds the raw,
     /// not-yet-unescaped content between the quotes.
-    DollarSingleQuote(&'src str),
+    DollarSingleQuote(&'src [u8]),
 
-    Char(char),
+    /// One byte of ordinary word text. Bytes >= 0x80 arrive here individually
+    /// and are reassembled by the word parser, which never inspects them.
+    Char(u8),
 
     Eof,
 }
@@ -37,85 +38,86 @@ pub enum WordToken<'src> {
 /// A character that, immediately after `$`, can introduce a parameter
 /// expansion or special parameter. If `$` is followed by anything else (a
 /// blank, `]`, `"`, EOF, ...) it is an ordinary literal `$`.
-fn is_parameter_start(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '{' | '@' | '*' | '#' | '?' | '-' | '!' | '$')
+fn is_parameter_start(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            b'_' | b'{' | b'@' | b'*' | b'#' | b'?' | b'-' | b'!' | b'$'
+        )
 }
 
 /// Processes the backslash escape sequences of a `$'...'` string per
 /// POSIX.1-2024 §2.2.4 into the literal characters they denote.
-pub fn unescape_dollar_single_quote(raw: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
+pub fn unescape_dollar_single_quote(raw: &[u8]) -> Vec<u8> {
+    let mut result: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut bytes = raw.iter().copied().peekable();
+    while let Some(c) = bytes.next() {
+        if c != b'\\' {
             result.push(c);
             continue;
         }
-        match chars.next() {
-            Some('n') => result.push('\n'),
-            Some('t') => result.push('\t'),
-            Some('r') => result.push('\r'),
-            Some('a') => result.push('\u{07}'),
-            Some('b') => result.push('\u{08}'),
-            Some('e') | Some('E') => result.push('\u{1b}'),
-            Some('f') => result.push('\u{0c}'),
-            Some('v') => result.push('\u{0b}'),
-            Some('\\') => result.push('\\'),
-            Some('\'') => result.push('\''),
-            Some('"') => result.push('"'),
-            Some('?') => result.push('?'),
-            Some('x') => {
+        match bytes.next() {
+            Some(b'n') => result.push(b'\n'),
+            Some(b't') => result.push(b'\t'),
+            Some(b'r') => result.push(b'\r'),
+            Some(b'a') => result.push(0x07),
+            Some(b'b') => result.push(0x08),
+            Some(b'e') | Some(b'E') => result.push(0x1b),
+            Some(b'f') => result.push(0x0c),
+            Some(b'v') => result.push(0x0b),
+            Some(b'\\') => result.push(b'\\'),
+            Some(b'\'') => result.push(b'\''),
+            Some(b'"') => result.push(b'"'),
+            Some(b'?') => result.push(b'?'),
+            Some(b'x') => {
+                // `\xNN` names a *byte*, so it is emitted as one rather than
+                // being encoded as the character with that code point.
                 let mut value: u32 = 0;
                 let mut count = 0;
                 while count < 2 {
-                    match chars.peek().and_then(|c| c.to_digit(16)) {
+                    match bytes.peek().and_then(|c| (*c as char).to_digit(16)) {
                         Some(d) => {
                             value = value * 16 + d;
-                            chars.next();
+                            bytes.next();
                             count += 1;
                         }
                         None => break,
                     }
                 }
                 if count == 0 {
-                    result.push('\\');
-                    result.push('x');
-                } else if let Some(ch) = char::from_u32(value) {
-                    result.push(ch);
+                    result.push(b'\\');
+                    result.push(b'x');
+                } else {
+                    result.push(value as u8);
                 }
             }
-            Some('c') => {
-                if let Some(ctrl) = chars.next() {
+            Some(b'c') => {
+                if let Some(ctrl) = bytes.next() {
                     // control character: \cX -> the byte X & 0x1f
-                    let upper = ctrl.to_ascii_uppercase() as u32;
-                    if let Some(ch) = char::from_u32(upper ^ 0x40) {
-                        result.push(ch);
-                    }
+                    result.push(ctrl.to_ascii_uppercase() ^ 0x40);
                 }
             }
-            Some(d @ '0'..='7') => {
-                let mut value = d.to_digit(8).unwrap();
+            Some(d @ b'0'..=b'7') => {
+                let mut value = u32::from(d - b'0');
                 let mut count = 1;
                 while count < 3 {
-                    match chars.peek().and_then(|c| c.to_digit(8)) {
+                    match bytes.peek().and_then(|c| (*c as char).to_digit(8)) {
                         Some(o) => {
                             value = value * 8 + o;
-                            chars.next();
+                            bytes.next();
                             count += 1;
                         }
                         None => break,
                     }
                 }
-                if let Some(ch) = char::from_u32(value) {
-                    result.push(ch);
-                }
+                result.push(value as u8);
             }
             Some(other) => {
                 // unrecognized escape: keep the backslash and the character
-                result.push('\\');
+                result.push(b'\\');
                 result.push(other);
             }
-            None => result.push('\\'),
+            None => result.push(b'\\'),
         }
     }
     result
@@ -129,11 +131,17 @@ impl Display for WordToken<'_> {
             WordToken::Dollar => write!(f, "'$'"),
             WordToken::Backslash => write!(f, "'\\'"),
             WordToken::QuotedBacktick => write!(f, "'\\`'"),
-            WordToken::CommandSubstitution(str) => write!(f, "'$({str})'"),
-            WordToken::BacktickCommandSubstitution(str) => write!(f, "`{str}`"),
-            WordToken::ArithmeticExpansion(str) => write!(f, "'$(({str}))'"),
-            WordToken::DollarSingleQuote(str) => write!(f, "$'{str}'"),
-            WordToken::Char(c) => write!(f, "'{}'", c),
+            WordToken::CommandSubstitution(str) => {
+                write!(f, "'$({})'", String::from_utf8_lossy(str))
+            }
+            WordToken::BacktickCommandSubstitution(str) => {
+                write!(f, "`{}`", String::from_utf8_lossy(str))
+            }
+            WordToken::ArithmeticExpansion(str) => {
+                write!(f, "'$(({}))'", String::from_utf8_lossy(str))
+            }
+            WordToken::DollarSingleQuote(str) => write!(f, "$'{}'", String::from_utf8_lossy(str)),
+            WordToken::Char(c) => write!(f, "'{}'", *c as char),
             WordToken::Eof => write!(f, "'EOF'"),
         }
     }
@@ -145,21 +153,25 @@ fn advance_and_return<'a>(lex: &mut WordLexer, token: WordToken<'a>) -> WordToke
 }
 
 pub struct WordLexer<'src> {
-    source: &'src str,
-    iter: CharIndices<'src>,
-    lookahead: char,
+    source: &'src [u8],
+    /// Byte cursor. Every character the grammar cares about is ASCII, so the
+    /// lexer never needs to decode: a byte >= 0x80 is an ordinary word
+    /// character.
     position: usize,
+    lookahead: u8,
     reached_eof: bool,
 }
 
 impl Lexer for WordLexer<'_> {
     fn advance(&mut self) {
-        if let Some((pos, char)) = self.iter.next() {
-            self.position = pos;
-            self.lookahead = char;
+        // `position` names the lookahead byte, so it stops at the last byte
+        // once the source is exhausted; `next_line` compensates.
+        if self.position + 1 < self.source.len() {
+            self.position += 1;
+            self.lookahead = self.source[self.position];
         } else {
             self.reached_eof = true;
-            self.lookahead = '\0';
+            self.lookahead = b'\0';
         }
     }
 
@@ -167,7 +179,7 @@ impl Lexer for WordLexer<'_> {
         self.reached_eof
     }
 
-    fn lookahead(&mut self) -> char {
+    fn lookahead(&mut self) -> u8 {
         self.lookahead
     }
 
@@ -175,9 +187,9 @@ impl Lexer for WordLexer<'_> {
         0
     }
 
-    fn next_line(&mut self) -> Cow<'_, str> {
+    fn next_line(&mut self) -> Cow<'_, [u8]> {
         let start = self.position;
-        while !self.reached_eof && self.lookahead != '\n' {
+        while !self.reached_eof && self.lookahead != b'\n' {
             self.advance()
         }
         // `position` is the index of the lookahead character, and it stops
@@ -197,7 +209,7 @@ impl Lexer for WordLexer<'_> {
         line.into()
     }
 
-    fn next_word(&mut self) -> ParseResult<Cow<'_, str>> {
+    fn next_word(&mut self) -> ParseResult<Cow<'_, [u8]>> {
         let start = self.position;
         self.skip_word_token(None, false)?;
         Ok(Cow::from(&self.source[start..self.position]))
@@ -210,9 +222,9 @@ impl<'src> WordLexer<'src> {
             return Ok(WordToken::Eof);
         }
         let result = match self.lookahead {
-            '"' => advance_and_return(self, WordToken::DoubleQuote),
-            '\'' => advance_and_return(self, WordToken::SingleQuote),
-            '`' => {
+            b'"' => advance_and_return(self, WordToken::DoubleQuote),
+            b'\'' => advance_and_return(self, WordToken::SingleQuote),
+            b'`' => {
                 self.advance();
                 let start = self.position;
                 self.skip_backquoted_command_substitution()?;
@@ -220,22 +232,22 @@ impl<'src> WordLexer<'src> {
                 self.advance();
                 WordToken::BacktickCommandSubstitution(&self.source[start..end])
             }
-            '\\' => {
+            b'\\' => {
                 self.advance();
                 match self.lookahead {
-                    '`' => advance_and_return(self, WordToken::QuotedBacktick),
-                    '\n' => {
+                    b'`' => advance_and_return(self, WordToken::QuotedBacktick),
+                    b'\n' => {
                         self.advance();
                         return self.next_token();
                     }
                     _ => WordToken::Backslash,
                 }
             }
-            '$' => {
+            b'$' => {
                 self.advance();
-                if self.lookahead == '(' {
+                if self.lookahead == b'(' {
                     self.advance();
-                    if self.lookahead == '(' {
+                    if self.lookahead == b'(' {
                         self.advance();
                         let start = self.position;
                         self.skip_arithmetic_expansion()?;
@@ -247,14 +259,14 @@ impl<'src> WordLexer<'src> {
                         self.advance();
                         WordToken::CommandSubstitution(&self.source[start..end])
                     }
-                } else if self.lookahead == '\'' {
+                } else if self.lookahead == b'\'' {
                     // $'...' dollar-single-quote: capture the raw content, with
                     // a backslash escaping the following character (so \' does
                     // not terminate the string).
                     self.advance();
                     let start = self.position;
-                    while !self.reached_eof && self.lookahead != '\'' {
-                        if self.lookahead == '\\' {
+                    while !self.reached_eof && self.lookahead != b'\'' {
+                        if self.lookahead == b'\\' {
                             self.advance();
                             if self.reached_eof {
                                 break;
@@ -269,7 +281,7 @@ impl<'src> WordLexer<'src> {
                     WordToken::Dollar
                 } else {
                     // a '$' not introducing an expansion is an ordinary character
-                    WordToken::Char('$')
+                    WordToken::Char(b'$')
                 }
             }
             other => advance_and_return(self, WordToken::Char(other)),
@@ -277,7 +289,7 @@ impl<'src> WordLexer<'src> {
         Ok(result)
     }
 
-    pub fn next_char(&mut self) -> Option<char> {
+    pub fn next_char(&mut self) -> Option<u8> {
         if self.reached_eof {
             None
         } else {
@@ -287,22 +299,19 @@ impl<'src> WordLexer<'src> {
         }
     }
 
-    pub fn new(source: &'src str) -> Self {
-        let mut lexer = Self {
+    pub fn new(source: &'src [u8]) -> Self {
+        Self {
             source,
-            iter: source.char_indices(),
-            lookahead: '\0',
             position: 0,
-            reached_eof: false,
-        };
-        lexer.advance();
-        lexer
+            lookahead: source.first().copied().unwrap_or(b'\0'),
+            reached_eof: source.is_empty(),
+        }
     }
 }
 
-pub fn remove_quotes(word: &str) -> ParseResult<(bool, String)> {
+pub fn remove_quotes(word: &[u8]) -> ParseResult<(bool, Vec<u8>)> {
     let mut lex = WordLexer::new(word);
-    let mut result = String::with_capacity(word.len());
+    let mut result: Vec<u8> = Vec::with_capacity(word.len());
     let mut is_quoted = false;
     let mut inside_double_quotes = false;
     let mut next = lex.next_token()?;
@@ -315,10 +324,10 @@ pub fn remove_quotes(word: &str) -> ParseResult<(bool, String)> {
             WordToken::SingleQuote => {
                 is_quoted = true;
                 if inside_double_quotes {
-                    result.push('\'')
+                    result.push(b'\'')
                 } else {
                     while let Some(c) = lex.next_char() {
-                        if c == '\'' {
+                        if c == b'\'' {
                             break;
                         } else {
                             result.push(c);
@@ -326,45 +335,45 @@ pub fn remove_quotes(word: &str) -> ParseResult<(bool, String)> {
                     }
                 }
             }
-            WordToken::Dollar => result.push('$'),
+            WordToken::Dollar => result.push(b'$'),
             WordToken::Backslash => {
                 is_quoted = true;
                 if inside_double_quotes {
                     match lex.next_token()? {
                         WordToken::Dollar => {
-                            result.push('$');
+                            result.push(b'$');
                         }
                         WordToken::DoubleQuote => {
-                            result.push('"');
+                            result.push(b'"');
                         }
                         WordToken::Backslash => {
-                            result.push('\\');
+                            result.push(b'\\');
                         }
-                        _ => result.push('\\'),
+                        _ => result.push(b'\\'),
                     }
                 } else if let Some(c) = lex.next_char() {
                     result.push(c)
                 }
             }
-            WordToken::QuotedBacktick => result.push('`'),
+            WordToken::QuotedBacktick => result.push(b'`'),
             WordToken::CommandSubstitution(commands) => {
-                result.push_str("$(");
-                result.push_str(commands);
-                result.push(')');
+                result.extend_from_slice(b"$(");
+                result.extend_from_slice(commands);
+                result.push(b')');
             }
             WordToken::BacktickCommandSubstitution(commands) => {
-                result.push('`');
-                result.push_str(commands);
-                result.push('`');
+                result.push(b'`');
+                result.extend_from_slice(commands);
+                result.push(b'`');
             }
             WordToken::ArithmeticExpansion(expr) => {
-                result.push_str("$((");
-                result.push_str(expr);
-                result.push_str("))");
+                result.extend_from_slice(b"$((");
+                result.extend_from_slice(expr);
+                result.extend_from_slice(b"))");
             }
             WordToken::DollarSingleQuote(content) => {
                 is_quoted = true;
-                result.push_str(&unescape_dollar_single_quote(content));
+                result.extend_from_slice(&unescape_dollar_single_quote(content));
             }
             WordToken::Char(c) => result.push(c),
             WordToken::Eof => break,
@@ -379,7 +388,7 @@ mod tests {
     use super::*;
 
     fn lex_token(s: &str) -> WordToken<'_> {
-        let mut lex = WordLexer::new(s);
+        let mut lex = WordLexer::new(s.as_bytes());
         let token = lex.next_token().expect("failed to lex token");
         assert_eq!(
             lex.next_token().expect("failed to lex token"),
@@ -390,61 +399,61 @@ mod tests {
 
     #[test]
     fn lex_command_substitution() {
-        assert_eq!(lex_token("$()"), WordToken::CommandSubstitution(""));
-        assert_eq!(lex_token("$(cmd)"), WordToken::CommandSubstitution("cmd"));
+        assert_eq!(lex_token("$()"), WordToken::CommandSubstitution(b""));
+        assert_eq!(lex_token("$(cmd)"), WordToken::CommandSubstitution(b"cmd"));
         assert_eq!(
             lex_token("$(cmd arg1 arg2)"),
-            WordToken::CommandSubstitution("cmd arg1 arg2")
+            WordToken::CommandSubstitution(b"cmd arg1 arg2")
         );
         assert_eq!(
             lex_token("$(\ncmd1\ncmd2\ncmd3\n)"),
-            WordToken::CommandSubstitution("\ncmd1\ncmd2\ncmd3\n")
+            WordToken::CommandSubstitution(b"\ncmd1\ncmd2\ncmd3\n")
         );
         assert_eq!(
             lex_token("$(#comment\ncmd)"),
-            WordToken::CommandSubstitution("#comment\ncmd")
+            WordToken::CommandSubstitution(b"#comment\ncmd")
         );
         assert_eq!(
             lex_token("$(cmd $(cmd2))"),
-            WordToken::CommandSubstitution("cmd $(cmd2)")
+            WordToken::CommandSubstitution(b"cmd $(cmd2)")
         );
     }
 
     #[test]
     fn lex_backtick_command_substitution() {
-        assert_eq!(lex_token("``"), WordToken::BacktickCommandSubstitution(""));
+        assert_eq!(lex_token("``"), WordToken::BacktickCommandSubstitution(b""));
         assert_eq!(
             lex_token("`cmd`"),
-            WordToken::BacktickCommandSubstitution("cmd")
+            WordToken::BacktickCommandSubstitution(b"cmd")
         );
         assert_eq!(
             lex_token("`cmd arg1 arg2`"),
-            WordToken::BacktickCommandSubstitution("cmd arg1 arg2")
+            WordToken::BacktickCommandSubstitution(b"cmd arg1 arg2")
         );
         assert_eq!(
             lex_token("`\ncmd1\ncmd2\ncmd3\n`"),
-            WordToken::BacktickCommandSubstitution("\ncmd1\ncmd2\ncmd3\n")
+            WordToken::BacktickCommandSubstitution(b"\ncmd1\ncmd2\ncmd3\n")
         );
         assert_eq!(
             lex_token("`#comment\ncmd`"),
-            WordToken::BacktickCommandSubstitution("#comment\ncmd")
+            WordToken::BacktickCommandSubstitution(b"#comment\ncmd")
         );
         assert_eq!(
             lex_token("`cmd $(cmd2)`"),
-            WordToken::BacktickCommandSubstitution("cmd $(cmd2)")
+            WordToken::BacktickCommandSubstitution(b"cmd $(cmd2)")
         );
     }
 
     #[test]
     fn lex_arithmetic_expansion() {
-        assert_eq!(lex_token("$((1))"), WordToken::ArithmeticExpansion("1"));
+        assert_eq!(lex_token("$((1))"), WordToken::ArithmeticExpansion(b"1"));
         assert_eq!(
             lex_token("$((1 + 1))"),
-            WordToken::ArithmeticExpansion("1 + 1")
+            WordToken::ArithmeticExpansion(b"1 + 1")
         );
         assert_eq!(
             lex_token("$(((1) + (1)))"),
-            WordToken::ArithmeticExpansion("(1) + (1)")
+            WordToken::ArithmeticExpansion(b"(1) + (1)")
         );
     }
 }

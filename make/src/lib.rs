@@ -416,12 +416,14 @@ impl TryFrom<(Makefile, Config)> for Make {
         // are available when determining whether a rule like `.txt.out:` is an
         // inference rule.
 
+        let (parsed_rules, macros) = makefile.into_parts();
+
         let mut suffixes_rules = vec![];
         let mut remaining_parsed_rules = vec![];
 
         // Pass 1: Separate .SUFFIXES rules from everything else and process
         // them immediately so config.rules[".SUFFIXES"] is populated.
-        for parsed_rule in makefile.rules() {
+        for parsed_rule in parsed_rules {
             let rule = Rule::from(parsed_rule);
             let Some(target) = rule.targets().next() else {
                 return Err(NoTarget { target: None });
@@ -439,15 +441,7 @@ impl TryFrom<(Makefile, Config)> for Make {
         let mut make = Self {
             rules: vec![],
             inference_rules: vec![],
-            macros: makefile
-                .variable_definitions()
-                .map(|v| {
-                    (
-                        v.name().unwrap_or_default(),
-                        v.raw_value().unwrap_or_default(),
-                    )
-                })
-                .collect(),
+            macros,
             default_rule: None,
             pool,
             config,

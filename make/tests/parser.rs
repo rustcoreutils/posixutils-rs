@@ -210,417 +210,158 @@ all:
     }
 }
 
-mod lex {
-    use posixutils_make::parser::{lex::lex, SyntaxKind::*};
-
-    #[test]
-    fn test_empty() {
-        assert_eq!(lex(""), vec![]);
-    }
-
-    #[test]
-    fn test_simple() {
-        assert_eq!(
-            lex(r#"VARIABLE = value
-
-rule: prerequisite
-	recipe
-"#)
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
-            vec![
-                (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
-                (EQUALS, "="),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "value"),
-                (NEWLINE, "\n"),
-                (NEWLINE, "\n"),
-                (IDENTIFIER, "rule"),
-                (COLON, ":"),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "prerequisite"),
-                (NEWLINE, "\n"),
-                (INDENT, "\t"),
-                (TEXT, "recipe"),
-                (NEWLINE, "\n"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_bare_export() {
-        assert_eq!(
-            lex(r#"export
-"#)
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
-            vec![(EXPORT, "export"), (NEWLINE, "\n"),]
-        );
-    }
-
-    #[test]
-    fn test_export() {
-        assert_eq!(
-            lex(r#"export VARIABLE
-"#)
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
-            vec![
-                (EXPORT, "export"),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "VARIABLE"),
-                (NEWLINE, "\n"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_export_assignment() {
-        assert_eq!(
-            lex(r#"export VARIABLE := value
-"#)
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
-            vec![
-                (EXPORT, "export"),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
-                (COLON, ":"),
-                (EQUALS, "="),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "value"),
-                (NEWLINE, "\n"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_include() {
-        assert_eq!(
-            lex(r#"include FILENAME
-"#)
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
-            [
-                (INCLUDE, "include"),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "FILENAME"),
-                (NEWLINE, "\n")
-            ]
-        );
-    }
-
-    #[test]
-    fn test_multiple_prerequisites() {
-        assert_eq!(
-            lex(r#"rule: prerequisite1 prerequisite2
-	recipe
-
-"#)
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
-            vec![
-                (IDENTIFIER, "rule"),
-                (COLON, ":"),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "prerequisite1"),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "prerequisite2"),
-                (NEWLINE, "\n"),
-                (INDENT, "\t"),
-                (TEXT, "recipe"),
-                (NEWLINE, "\n"),
-                (NEWLINE, "\n"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_variable_question() {
-        assert_eq!(
-            lex("VARIABLE ?= value\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
-                (QUESTION, "?"),
-                (EQUALS, "="),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "value"),
-                (NEWLINE, "\n"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_conditional() {
-        assert_eq!(
-            lex(r#"ifneq (a, b)
-endif
-"#)
-            .iter()
-            .map(|(kind, text)| (*kind, text.as_str()))
-            .collect::<Vec<_>>(),
-            vec![
-                (IDENTIFIER, "ifneq"),
-                (WHITESPACE, " "),
-                (LPAREN, "("),
-                (IDENTIFIER, "a"),
-                (COMMA, ","),
-                (WHITESPACE, " "),
-                (IDENTIFIER, "b"),
-                (RPAREN, ")"),
-                (NEWLINE, "\n"),
-                (IDENTIFIER, "endif"),
-                (NEWLINE, "\n"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_variable_paren() {
-        assert_eq!(
-            lex("VARIABLE = $(value)\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
-                (EQUALS, "="),
-                (WHITESPACE, " "),
-                (DOLLAR, "$"),
-                (LPAREN, "("),
-                (IDENTIFIER, "value"),
-                (RPAREN, ")"),
-                (NEWLINE, "\n"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_variable_paren2() {
-        assert_eq!(
-            lex("VARIABLE = $(value)$(value2)\n")
-                .iter()
-                .map(|(kind, text)| (*kind, text.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
-                (EQUALS, "="),
-                (WHITESPACE, " "),
-                (DOLLAR, "$"),
-                (LPAREN, "("),
-                (IDENTIFIER, "value"),
-                (RPAREN, ")"),
-                (DOLLAR, "$"),
-                (LPAREN, "("),
-                (IDENTIFIER, "value2"),
-                (RPAREN, ")"),
-                (NEWLINE, "\n"),
-            ]
-        );
-    }
-}
+// `mod lex` used to assert token streams for the hand-written lexer. That
+// lexer is gone: the scanner replaced it, and its lexical helpers are unit
+// tested inside `src/parser/scan.rs`, where they can stay private.
 
 mod parse {
-    use posixutils_make::parser::preprocessor::preprocess;
-    use posixutils_make::parser::{parse::parse, Makefile};
-    use rowan::ast::AstNode;
+    use posixutils_make::parser::parse::parse;
+    use posixutils_make::parser::Makefile;
+    use std::str::FromStr;
+
+    fn parsed(source: &str) -> Makefile {
+        Makefile::from_str(source).expect("must parse")
+    }
+
+    fn only_rule(source: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mk = parsed(source);
+        let rule = mk.rules().next().expect("one rule").clone();
+        (
+            rule.targets().map(String::from).collect(),
+            rule.prerequisites().map(String::from).collect(),
+            rule.recipes().map(String::from).collect(),
+        )
+    }
 
     #[test]
     fn test_parse_simple() {
-        const SIMPLE: &str = r#"VARIABLE = command2
-
-rule: dependency
-	command
-	${VARIABLE}
-
-"#;
-        let Ok((processed, _macros)) = preprocess(SIMPLE) else {
-            panic!("Must be preprocessed without an error")
-        };
-        let parsed = parse(&processed);
-        println!("{:#?}", parsed.clone().unwrap().syntax());
-        assert_eq!(parsed.clone().err(), None);
-        let node = parsed.clone().unwrap().syntax();
-        assert_eq!(
-            format!("{:#?}", node),
-            r#"ROOT@0..39
-  NEWLINE@0..1 "\n"
-  NEWLINE@1..2 "\n"
-  RULE@2..39
-    IDENTIFIER@2..6 "rule"
-    COLON@6..7 ":"
-    WHITESPACE@7..8 " "
-    EXPR@8..18
-      IDENTIFIER@8..18 "dependency"
-    NEWLINE@18..19 "\n"
-    RECIPE@19..28
-      INDENT@19..20 "\t"
-      TEXT@20..27 "command"
-      NEWLINE@27..28 "\n"
-    RECIPE@28..38
-      INDENT@28..29 "\t"
-      TEXT@29..37 "command2"
-      NEWLINE@37..38 "\n"
-    NEWLINE@38..39 "\n"
-"#
-        );
-
-        let root = parsed.unwrap().root().clone_for_update();
-
-        let mut rules = root.rules().collect::<Vec<_>>();
-        assert_eq!(rules.len(), 1);
-        let rule = rules.pop().unwrap();
-        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-        assert_eq!(rule.prerequisites().collect::<Vec<_>>(), vec!["dependency"]);
-        assert_eq!(
-            rule.recipes().collect::<Vec<_>>(),
-            vec!["command", "command2"]
-        );
+        const SIMPLE: &str =
+            "VARIABLE = command2\n\nrule: dependency\n\tcommand\n\t${VARIABLE}\n\n";
+        let (targets, prerequisites, recipes) = only_rule(SIMPLE);
+        assert_eq!(targets, vec!["rule"]);
+        assert_eq!(prerequisites, vec!["dependency"]);
+        assert_eq!(recipes, vec!["command", "command2"]);
     }
-
-    #[test]
-    fn test_parse_export_assign() {
-        const EXPORT: &str = r#"export VARIABLE := value
-"#;
-        let Ok((processed, _macros)) = preprocess(EXPORT).map_err(|e| println!("{e:?}")) else {
-            panic!("Must be preprocessed without an error")
-        };
-        let parsed = parse(&processed);
-        assert!(parsed.clone().err().is_some());
-    }
-
-    // TODO: create `include` test with real files
-    //
-    //     #[test]
-    //     fn test_parse_include() {
-    //         const INCLUDE: &str = r#"include FILENAME
-    // "#;
-    //         let Ok(processed) = preprocess(INCLUDE) else { panic!("Could not preprocess") };
-    //         let parsed = parse(&processed);
-    //         assert_eq!(parsed.errors, Vec::<String>::new());
-    //         let node = parsed.syntax();
-    //
-    //         assert_eq!(
-    //             format!("{:#?}", node),
-    //             r#"ROOT@0..17
-    //   IDENTIFIER@0..7 "include"
-    //   WHITESPACE@7..8 " "
-    //   IDENTIFIER@8..16 "FILENAME"
-    //   NEWLINE@16..17 "\n"
-    // "#
-    //         );
-    //
-    //         let root = parsed.root().clone_for_update();
-    //
-    //         let variables = root.syntax();
-    //         dbg!(&variables);
-    //         // assert_eq!(variables.len(), 1);
-    //         // let variable = variables.pop().unwrap();
-    //         // assert_eq!(variable.name(), Some("VARIABLE".to_string()));
-    //         // assert_eq!(variable.raw_value(), Some("value".to_string()));
-    //     }
 
     #[test]
     fn test_parse_multiple_prerequisites() {
-        const MULTIPLE_PREREQUISITES: &str = r#"rule: dependency1 dependency2
-	command
+        let (targets, prerequisites, recipes) = only_rule("rule: a b c\n\techo hi\n");
+        assert_eq!(targets, vec!["rule"]);
+        assert_eq!(prerequisites, vec!["a", "b", "c"]);
+        assert_eq!(recipes, vec!["echo hi"]);
+    }
 
-"#;
-        let parsed = parse(MULTIPLE_PREREQUISITES);
-        assert_eq!(parsed.clone().err(), None);
-        let node = parsed.clone().unwrap().syntax();
-        assert_eq!(
-            format!("{:#?}", node),
-            r#"ROOT@0..40
-  RULE@0..40
-    IDENTIFIER@0..4 "rule"
-    COLON@4..5 ":"
-    WHITESPACE@5..6 " "
-    EXPR@6..29
-      IDENTIFIER@6..17 "dependency1"
-      WHITESPACE@17..18 " "
-      IDENTIFIER@18..29 "dependency2"
-    NEWLINE@29..30 "\n"
-    RECIPE@30..39
-      INDENT@30..31 "\t"
-      TEXT@31..38 "command"
-      NEWLINE@38..39 "\n"
-    NEWLINE@39..40 "\n"
-"#
-        );
-        let root = parsed.unwrap().root().clone_for_update();
+    // Audit #27: a rule may name more than one target. This was a hard parse
+    // error ("expected ':'") because the parser consumed exactly one.
+    #[test]
+    fn test_multiple_targets_per_rule() {
+        let (targets, prerequisites, _) = only_rule("a b: dep\n\techo hi\n");
+        assert_eq!(targets, vec!["a", "b"]);
+        assert_eq!(prerequisites, vec!["dep"]);
+    }
 
-        let rule = root.rules().next().unwrap();
-        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-        assert_eq!(
-            rule.prerequisites().collect::<Vec<_>>(),
-            vec!["dependency1", "dependency2"]
-        );
-        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+    // Audit #26: `/` is an ordinary name character. It used to lex as an ERROR
+    // token, and `prerequisites()` dropped everything that was not an
+    // IDENTIFIER, so `src/foo.c` silently became `src` and `foo.c`.
+    #[test]
+    fn test_slash_in_prerequisite() {
+        let (_, prerequisites, _) = only_rule("all: src/foo.c\n\techo hi\n");
+        assert_eq!(prerequisites, vec!["src/foo.c"]);
     }
 
     #[test]
-    fn test_add_rule() {
-        let mut makefile = Makefile::new();
-        let rule = makefile.add_rule("rule");
-        assert_eq!(rule.targets().collect::<Vec<_>>(), vec!["rule"]);
-        assert_eq!(
-            rule.prerequisites().collect::<Vec<_>>(),
-            Vec::<String>::new()
-        );
+    fn test_slash_in_target() {
+        let (targets, _, _) = only_rule("build/x.o: x.c\n\techo hi\n");
+        assert_eq!(targets, vec!["build/x.o"]);
+    }
 
-        assert_eq!(makefile.to_string(), "rule:\n");
+    // POSIX 105946: parentheses mean an archive member, and the name must
+    // survive whole for the archive-member mtime lookup.
+    #[test]
+    fn test_archive_member_target() {
+        let (targets, _, _) = only_rule("lib.a(mem.o): mem.c\n\techo hi\n");
+        assert_eq!(targets, vec!["lib.a(mem.o)"]);
+    }
+
+    // POSIX 105644: text after a <semicolon> is a command line.
+    #[test]
+    fn test_inline_command() {
+        let (_, prerequisites, recipes) = only_rule("rule: dep ; echo inline\n");
+        assert_eq!(prerequisites, vec!["dep"]);
+        assert_eq!(recipes, vec!["echo inline"]);
+    }
+
+    // POSIX 105911-105915: `target: ;` is the empty rule -- it has a command,
+    // and that command is empty. That distinction decides whether an inference
+    // rule is consulted for the target.
+    #[test]
+    fn test_empty_rule_has_a_command() {
+        let (_, _, recipes) = only_rule("rule: ;\n");
+        assert_eq!(recipes, vec![""]);
     }
 
     #[test]
-    fn test_push_command() {
-        let mut makefile = Makefile::new();
-        let rule = makefile.add_rule("rule");
-        rule.push_command("command");
-        assert_eq!(rule.recipes().collect::<Vec<_>>(), vec!["command"]);
+    fn test_comment_after_a_rule_header() {
+        let (targets, prerequisites, _) = only_rule("comment: # this is a comment\n\techo hi\n");
+        assert_eq!(targets, vec!["comment"]);
+        assert!(prerequisites.is_empty());
+    }
 
-        assert_eq!(makefile.to_string(), "rule:\n\tcommand\n");
+    // POSIX 105629: a command line reaches the shell verbatim, so `#` is not a
+    // comment there. This used to be a hard parse error.
+    #[test]
+    fn test_hash_survives_in_a_command() {
+        let (_, _, recipes) = only_rule("all:\n\t@echo \"#!/bin/sh\"\n");
+        assert_eq!(recipes, vec!["@echo \"#!/bin/sh\""]);
+    }
 
-        rule.push_command("command2");
-        assert_eq!(
-            rule.recipes().collect::<Vec<_>>(),
-            vec!["command", "command2"]
-        );
-
-        assert_eq!(makefile.to_string(), "rule:\n\tcommand\n\tcommand2\n");
+    // POSIX 105646: only a non-empty line that does not begin with <tab> or
+    // `#` begins a new entry, so a blank line inside a recipe does not end it.
+    #[test]
+    fn test_blank_line_does_not_end_a_recipe() {
+        let (_, _, recipes) = only_rule("all:\n\tcmd1\n\n\tcmd2\n");
+        assert_eq!(recipes, vec!["cmd1", "cmd2"]);
     }
 
     #[test]
-    fn test_replace_command() {
-        let mut makefile = Makefile::new();
-        let rule = makefile.add_rule("rule");
-        rule.push_command("command");
-        rule.push_command("command2");
-        assert_eq!(
-            rule.recipes().collect::<Vec<_>>(),
-            vec!["command", "command2"]
-        );
+    fn test_tab_only_line_is_ignored() {
+        let (_, _, recipes) = only_rule("all:\n\t\n\tcmd\n");
+        assert_eq!(recipes, vec!["cmd"]);
+    }
 
-        rule.replace_command(0, "new command");
+    // Audit #36: the macros the preprocessor consumed reach the caller.
+    #[test]
+    fn test_macros_reach_the_makefile() {
+        let mk = parsed("SHELL = /bin/bash\nall:\n\techo hi\n");
         assert_eq!(
-            rule.recipes().collect::<Vec<_>>(),
-            vec!["new command", "command2"]
+            mk.macros()
+                .iter()
+                .find(|(n, _)| n == "SHELL")
+                .map(|(_, v)| v.as_str()),
+            Some("/bin/bash")
         );
+    }
 
-        assert_eq!(makefile.to_string(), "rule:\n\tnew command\n\tcommand2\n");
+    // Replaces the old add_rule / push_command / replace_command tests, which
+    // existed only to exercise rowan tree mutation and had no in-crate caller.
+    #[test]
+    fn test_display_round_trip() {
+        let mk = parsed("a b: c\n\techo hi\n");
+        assert_eq!(mk.to_string(), "a b: c\n\techo hi\n");
+    }
+
+    #[test]
+    fn test_no_targets_is_an_error() {
+        assert!(Makefile::from_str("MACRO = value\n").is_err());
+    }
+
+    #[test]
+    fn test_semicolon_before_colon_is_an_error() {
+        assert!(parse("a;b: c\n").is_err());
+    }
+
+    #[test]
+    fn test_command_before_any_target_is_an_error() {
+        assert!(parse("\techo orphan\n").is_err());
     }
 }

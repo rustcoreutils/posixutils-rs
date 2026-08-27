@@ -36,16 +36,16 @@ the bottom of this file so the next reader does not have to redo them.
 Each of these blocks ordinary use, crashes, hangs, or silently produces the
 wrong build.
 
-- [ ] **#26 — The lexer omits `/` from `is_valid_identifier_char`, so no path
-  works.** `parser/lex.rs`. `all: src/foo.c` lexes as IDENTIFIER `src`, ERROR
-  `/`, IDENTIFIER `foo.c`; `Rule::prerequisites()` keeps only IDENTIFIERs, so
-  the list becomes `["src", "foo.c"]` → `make: no target 'foo.c'` (exit 6). A
-  slash in *target* position is a hard parse error. Nothing with subdirectories
-  builds.
-- [ ] **#27 — A rule may name only one target.** `parser/parse.rs`. `parse_rule`
-  does one `expect(IDENTIFIER)` then `self.tokens.pop()`, discarding whatever it
-  popped before reporting. `a b:` + `\techo hi` → `make: parse error: expected
-  ':'` (exit 4). Multiple targets per rule is core POSIX syntax.
+- [x] **#26 — The lexer omits `/`, so no path works.** ✓ fixed 2026-08-27 (P1).
+  The token lexer is gone; the scanner treats every character that is not a
+  `<blank>`, `:`, `;` or `#` as an ordinary name character, so `/`, `(`, `)`,
+  `~`, `%`, `"` and `=` all survive in both positions. Tests
+  `test_slash_in_prerequisite`, `test_slash_in_target`,
+  `test_archive_member_target`, `scan::accepts_slashes_in_names`.
+- [x] **#27 — A rule may name only one target.** ✓ fixed 2026-08-27 (P1).
+  `split_rule_line` splits every `<blank>`-separated word left of the first
+  `:` into a target. Tests `test_multiple_targets_per_rule`,
+  `scan::accepts_multiple_targets`.
 - [ ] **#28 — An indirect dependency cycle overflows the stack.** `lib.rs`.
   `_are_prerequisites_recursive` seeds `visited`/`stack` with the root and never
   inserts during the DFS, so only cycles returning to the root are caught.
@@ -151,11 +151,10 @@ wrong build.
   containing only the hardcoded built-ins — none of the makefile's own macros or
   targets — and its `.MACROS` entry carries a literal `"XSI GET=get"` key. The
   spec leaves the format unspecified, but not the content.
-- [ ] **#44 — `dbg!()` calls are shipped, and `parse_include` hardcodes
-  `"variables.mk"`.** `parser/parse.rs`. A bare `include` line dumps the whole
-  token vector to stderr and injects a literal `variables.mk` identifier into
-  the tree. The path is unreachable-by-luck scaffolding — the preprocessor
-  normally consumes `include` — and should be deleted rather than fixed.
+- [x] **#44 — `dbg!()` calls are shipped, and `parse_include` hardcodes
+  `"variables.mk"`.** ✓ fixed 2026-08-27 (P1). Both `dbg!()` calls and the
+  `parse_include` scaffolding were deleted with the old parser, as recommended
+  rather than repaired.
 - [ ] **#45 — `Target::new` calls `String::leak()` on every construction.**
   `rule/target.rs`. `build_target` constructs one per visit, so the leak scales
   with traversal count rather than with distinct targets — and #31 makes that

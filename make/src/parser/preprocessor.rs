@@ -575,6 +575,12 @@ fn process_include_lines(source: &str, table: &HashMap<String, String>) -> Resul
     Ok((result, counter))
 }
 
+/// True if `line` is an `include` / `-include` directive. The preprocessor has
+/// already spliced these, but `parse` may be handed text directly.
+pub(crate) fn is_include_line(line: &str) -> bool {
+    parse_include_directive(line).is_some()
+}
+
 /// Blank out macro-definition lines. `generate_macro_table` has already taken
 /// their content, and the rule parser must not see them. Blanking rather than
 /// deleting keeps every later line at its original number.

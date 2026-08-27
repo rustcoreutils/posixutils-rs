@@ -8,7 +8,6 @@
 //
 
 use core::fmt;
-use std::collections::BTreeSet;
 
 use crate::{
     error_code::ErrorCode,
@@ -333,19 +332,9 @@ impl Processor<'_> {
         Ok(())
     }
     fn process_phony(mut self) -> Result<(), Error> {
-        // POSIX: subsequent occurrences add to the list, so extend rather than
-        // replace the stored set.
-        let names = self
-            .rule
-            .prerequisites()
-            .map(|suffix| suffix.as_ref().to_string());
-        self.make
-            .config
-            .rules
-            .entry(Phony.as_ref().to_string())
-            .or_default()
-            .extend(names);
-
+        // POSIX: subsequent occurrences add to the list. That is inherent here
+        // -- each occurrence sets the flag on the rules it names, and nothing
+        // resets it.
         let what_to_do = |rule: &mut Rule| rule.config.phony = true;
         self.additive(what_to_do);
         self.global(what_to_do);
@@ -370,14 +359,6 @@ impl Processor<'_> {
 
         self.additive(what_to_do);
         self.global(what_to_do);
-
-        // POSIX: subsequent occurrences add to the list.
-        self.make
-            .config
-            .rules
-            .entry(Precious.as_ref().to_string())
-            .or_default()
-            .extend(precious_names);
         Ok(())
     }
     /// `.WAIT` as a target has no effect; it must have no prerequisites or
@@ -397,19 +378,14 @@ impl Processor<'_> {
         Ok(())
     }
 
+    /// `.SCCS_GET` names the recipe for retrieving a source file from SCCS.
+    ///
+    /// Accepted and validated, but inert: this make performs no SCCS retrieval,
+    /// so there is nothing to run the recipe from. Recorded as audit #61 rather
+    /// than left looking implemented — its recipe used to be stored in the `-p`
+    /// mirror table and read by nothing, which made the gap invisible.
     fn process_sccs_get(self) -> Result<(), Error> {
         self.without_prerequisites()?;
-
-        let sccs_set = self
-            .rule
-            .recipes()
-            .map(|val| val.as_ref().to_string())
-            .collect::<BTreeSet<String>>();
-
-        self.make
-            .config
-            .rules
-            .insert(SccsGet.as_ref().to_string(), sccs_set);
 
         Ok(())
     }

@@ -121,6 +121,75 @@ impl Make {
             .find(|rule| rule.targets().any(|t| t.as_ref() == target.as_ref()))
     }
 
+    /// Every macro definition in force, in first-definition order.
+    pub fn macros(&self) -> &[Macro] {
+        &self.macros
+    }
+
+    /// The complete set of macro definitions and target descriptions, in
+    /// makefile syntax (POSIX 105395 mandates the content and leaves the format
+    /// unspecified).
+    ///
+    /// Rendering it as makefile text rather than a bespoke format means the
+    /// dump round-trips: `make -p` output is itself a makefile.
+    pub fn database(&self) -> String {
+        let mut out = String::new();
+        self.write_macros(&mut out);
+        self.write_section(&mut out, "rules", self.rules.iter());
+        self.write_section(&mut out, "inference rules", self.inference_rules.iter());
+        self.write_section(&mut out, "default rule", self.default_rule.iter());
+        self.write_vpaths(&mut out);
+        out
+    }
+
+    fn write_macros(&self, out: &mut String) {
+        if self.macros.is_empty() {
+            return;
+        }
+        out.push_str("# macros\n");
+        for (name, value) in &self.macros {
+            // No trailing blank on an empty value, so the dump stays clean to
+            // read back.
+            match value.is_empty() {
+                true => out.push_str(&format!("{name} =\n")),
+                false => out.push_str(&format!("{name} = {value}\n")),
+            }
+        }
+        out.push('\n');
+    }
+
+    fn write_section<'a>(
+        &self,
+        out: &mut String,
+        title: &str,
+        rules: impl Iterator<Item = &'a Rule>,
+    ) {
+        let rendered: Vec<String> = rules.map(|rule| rule.to_string()).collect();
+        if rendered.is_empty() {
+            return;
+        }
+        out.push_str(&format!("# {title}\n"));
+        for rule in rendered {
+            out.push_str(&rule);
+        }
+        out.push('\n');
+    }
+
+    fn write_vpaths(&self, out: &mut String) {
+        if self.vpaths.is_empty() {
+            return;
+        }
+        out.push_str("# search paths\n");
+        for entry in &self.vpaths {
+            out.push_str(&format!(
+                "vpath {} {}\n",
+                entry.pattern,
+                entry.dirs.join(" ")
+            ));
+        }
+        out.push('\n');
+    }
+
     /// Directories named by the `VPATH` macro, in search order.
     ///
     /// POSIX has no `VPATH`, but it is the conventional way to keep sources in

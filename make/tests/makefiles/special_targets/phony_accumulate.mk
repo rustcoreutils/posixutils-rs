@@ -1,4 +1,8 @@
 .PHONY: a
 .PHONY: b
-all:
+a:
+	@echo PHONY-a
+b:
+	@echo PHONY-b
+all: a b
 	@echo x

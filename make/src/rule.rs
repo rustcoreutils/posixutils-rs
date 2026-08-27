@@ -19,6 +19,7 @@ use crate::{
     signal_handler, Macro, DEFAULT_SHELL, DEFAULT_SHELL_VAR,
 };
 use config::Config;
+use core::fmt;
 use gettextrs::gettext;
 use prerequisite::Prerequisite;
 use recipe::config::Config as RecipeConfig;
@@ -226,7 +227,6 @@ impl Rule {
             jobs: _,
             not_parallel: _,
             suffixes: _,
-            rules: _,
         } = *global_config;
         let Config {
             ignore: rule_ignore,
@@ -527,6 +527,23 @@ fn exported_macros(env_macros: bool, variables: &[Macro]) -> HashMap<String, Str
         .filter(|(name, _)| name != DEFAULT_SHELL_VAR && inherited.contains_key(name))
         .cloned()
         .collect()
+}
+
+impl fmt::Display for Rule {
+    /// Render in makefile syntax, so a `-p` dump round-trips.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let targets: Vec<&str> = self.targets.iter().map(|t| t.as_ref()).collect();
+        let prerequisites: Vec<&str> = self.prerequisites.iter().map(|p| p.as_ref()).collect();
+        write!(f, "{}:", targets.join(" "))?;
+        if !prerequisites.is_empty() {
+            write!(f, " {}", prerequisites.join(" "))?;
+        }
+        writeln!(f)?;
+        for recipe in &self.recipes {
+            writeln!(f, "\t{recipe}")?;
+        }
+        Ok(())
+    }
 }
 
 impl From<ParsedRule> for Rule {

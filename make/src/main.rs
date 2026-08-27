@@ -8,7 +8,6 @@
 //
 
 use core::str::FromStr;
-use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -139,8 +138,10 @@ struct Args {
     targets: Vec<OsString>,
 }
 
-fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
-    print!("{:?}", rules);
+/// Write the database `-p` asks for: POSIX 105395, "the complete set of macro
+/// definitions and target descriptions".
+fn print_database(make: &Make) {
+    print!("{}", make.database());
 }
 
 /// The `-k` "target could not be remade" diagnostic, routed through `gettext`
@@ -321,7 +322,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if clear {
-        config.rules.clear();
         config.suffixes.clear();
     }
 
@@ -367,10 +367,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = match parse_makefile(&makefile, &cmdline_macros) {
         Ok(parsed) => parsed,
         Err(err) => {
-            // -p flag
+            // -p with no usable makefile still has a database to show: the
+            // built-in macros and inference rules. POSIX's own example is
+            // `make -p -f /dev/null`, which has no targets and so does not
+            // parse. Build an empty makefile to get the built-ins seeded.
             if print {
-                // If makefile is not provided or parsing failed, print the default rules
-                print_rules(&config.rules);
+                let empty = Make::try_from((Makefile::default(), config)).map_err(|err| {
+                    eprintln!("make: {err}");
+                    err
+                })?;
+                print_database(&empty);
                 return Ok(());
             } else {
                 eprintln!("make: {}", err);
@@ -384,10 +390,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(err.into());
     });
 
-    // -p flag
+    // -p: POSIX does not say this suppresses the build, unlike -q, so the
+    // dump is written and the targets are still made.
     if print {
-        // Call print for  global config rules
-        print_rules(&make.config.rules);
+        print_database(&make);
     }
 
     if targets.is_empty() {

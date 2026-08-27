@@ -266,13 +266,36 @@ wrong build.
   which is what `run_for_pattern` already did — so that near-duplicate collapses
   into it. Found while checking #52 against GNU.
 
+- [ ] **#61 — `.SCCS_GET` is accepted but inert.** The special target is parsed
+  and validated, but this make performs no SCCS retrieval, so nothing ever runs
+  its recipe. Until now the recipe was stored in the `-p` mirror table and read
+  by nothing, which made the gap look like a feature; deleting that table for
+  #43 exposed it. Either implement SCCS retrieval or reject the target, but do
+  not keep accepting it silently.
+
 ## Minor
 
-- [ ] **#43 — `-p` prints a `Debug` dump of the built-in table, never the
-  makefile.** `main.rs` emits `{:?}` of a `BTreeMap` with no trailing newline,
-  containing only the hardcoded built-ins — none of the makefile's own macros or
-  targets — and its `.MACROS` entry carries a literal `"XSI GET=get"` key. The
-  spec leaves the format unspecified, but not the content.
+- [x] **#43 — `-p` prints a `Debug` dump of the built-in table, never the
+  makefile.** ✓ fixed 2026-08-27. `-p` now writes the real database in makefile
+  syntax: the makefile's own macros alongside the built-ins, its rules with
+  their recipes, the inference rules, `.DEFAULT`, and any `vpath` search paths.
+  POSIX 105395 mandates "the complete set of macro definitions and target
+  descriptions" and leaves the format unspecified; makefile syntax was chosen so
+  the dump round-trips — `make -p` output re-parses as a makefile and its rules
+  still fire. The trailing newline is there, and `-p` no longer suppresses the
+  build (POSIX says that only of `-q`).
+
+  POSIX Example 8, `make -p -f /dev/null 2>/dev/null`, keeps working — but
+  deliberately now. It used to succeed only because an empty makefile is a
+  *parse error* and the error path happened to print the defaults; that branch
+  now builds an empty makefile so the built-ins are seeded and dumped on purpose.
+
+  `Config.rules`, the `BTreeMap` mirror whose own doc comment said it existed
+  "for the `-p` dump", is deleted along with the four sites that maintained it
+  and the malformed `"XSI GET=get"` entry, which was never `NAME=value` syntax
+  and never a real macro. Tests `dash_p`, `dash_p_reports_the_parsed_makefile`,
+  `dash_p_output_is_a_makefile`.
+
 - [x] **#44 — `dbg!()` calls are shipped, and `parse_include` hardcodes
   `"variables.mk"`.** ✓ fixed 2026-08-27 (P1). Both `dbg!()` calls and the
   `parse_include` scaffolding were deleted with the old parser, as recommended

@@ -365,3 +365,161 @@ mod parse {
         assert!(parse("\techo orphan\n").is_err());
     }
 }
+
+// Conditionals and multi-line macro definitions. Not POSIX -- the standard has
+// no conditionals -- but 357 occurrences across a seven-Makefile sample of real
+// projects, far and away the most common construct a POSIX-only make cannot
+// read.
+mod conditionals {
+    use posixutils_make::parser::preprocessor::preprocess;
+
+    fn text(source: &str) -> String {
+        preprocess(source).expect("must preprocess").0
+    }
+
+    fn value(source: &str, name: &str) -> String {
+        preprocess(source)
+            .expect("must preprocess")
+            .1
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn ifeq_selects_the_matching_arm() {
+        let src =
+            "OS = Linux\nifeq ($(OS),Linux)\nCC = gcc\nelse\nCC = clang\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "CC"), "gcc");
+    }
+
+    #[test]
+    fn ifeq_takes_the_else_arm_when_it_does_not_match() {
+        let src =
+            "OS = Darwin\nifeq ($(OS),Linux)\nCC = gcc\nelse\nCC = clang\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "CC"), "clang");
+    }
+
+    #[test]
+    fn ifneq_inverts_the_test() {
+        let src = "A = x\nifneq ($(A),y)\nR = ok\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "R"), "ok");
+    }
+
+    // The canonical "is it set?" idiom. It needs an undefined macro to expand
+    // to the empty string rather than error (POSIX 105833).
+    #[test]
+    fn comparing_an_undefined_macro_to_empty_works() {
+        let src = "ifeq ($(UNSET),)\nR = empty\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "R"), "empty");
+    }
+
+    #[test]
+    fn ifdef_and_ifndef() {
+        let src = "A = 1\nifdef A\nR = yes\nendif\nifndef B\nS = alsoyes\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "R"), "yes");
+        assert_eq!(value(src, "S"), "alsoyes");
+    }
+
+    #[test]
+    fn else_if_chains() {
+        let src = "V = 2\nifeq ($(V),1)\nR = one\nelse ifeq ($(V),2)\nR = two\nelse\nR = other\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "R"), "two");
+    }
+
+    #[test]
+    fn conditionals_nest_and_may_be_space_indented() {
+        let src =
+            "V = 2\nifeq ($(V),2)\n  ifdef V\n  N = nested\n  endif\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "N"), "nested");
+    }
+
+    #[test]
+    fn quoted_argument_form_is_accepted() {
+        let src = "A = x\nifeq \"$(A)\" \"x\"\nQ = ok\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "Q"), "ok");
+    }
+
+    // A condition inside a dead branch must not be evaluated -- it may name
+    // macros only the live arm defines.
+    #[test]
+    fn an_inactive_branch_hides_its_contents() {
+        let src = "ifeq (a,b)\nR = taken\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "R"), "");
+    }
+
+    // A guarded include must not be read when its branch is dead.
+    #[test]
+    fn an_inactive_branch_does_not_read_an_include() {
+        let src = "ifeq (a,b)\ninclude /nonexistent_guarded_xyz.mk\nendif\nall:\n\techo hi\n";
+        assert!(preprocess(src).is_ok(), "guarded include must not be read");
+    }
+
+    #[test]
+    fn unmatched_endif_is_an_error() {
+        assert!(preprocess("all:\n\techo hi\nendif\n").is_err());
+    }
+
+    #[test]
+    fn unterminated_conditional_is_an_error() {
+        assert!(preprocess("ifeq (a,a)\nall:\n\techo hi\n").is_err());
+    }
+
+    #[test]
+    fn define_captures_a_multi_line_body() {
+        let src = "define B\none\ntwo\nendef\nall:\n\techo hi\n";
+        assert_eq!(value(src, "B"), "one\ntwo");
+    }
+
+    // A multi-line value used in a recipe must stay a recipe: every embedded
+    // newline gets the command line's <tab>.
+    #[test]
+    fn define_used_in_a_recipe_stays_indented() {
+        let src = "define B\n@echo one\n@echo two\nendef\nall:\n\t$(B)\n";
+        let out = text(src);
+        assert!(out.contains("\t@echo one\n\t@echo two"), "got: {out:?}");
+    }
+
+    // Audit #32: a self-including file used to loop forever.
+    #[test]
+    fn include_recursion_is_capped() {
+        let dir = std::env::temp_dir().join("make_include_cycle_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("self.mk");
+        std::fs::write(&f, format!("include {}\n", f.display())).unwrap();
+        let src = format!("include {}\nall:\n\techo hi\n", f.display());
+        assert!(preprocess(&src).is_err(), "self-include must not loop");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Audit #32: `A = $(A)x` used to grow the text forever.
+    #[test]
+    fn recursive_macro_is_capped() {
+        assert!(preprocess("A = $(A)x\nall:\n\techo $(A)\n").is_err());
+    }
+
+    // Audit #34: an undefined macro is the empty string, not a fatal error.
+    #[test]
+    fn undefined_macro_expands_to_empty() {
+        let out = text("all:\n\t@echo [$(UNSET)]\n");
+        assert!(out.contains("@echo []"), "got: {out:?}");
+    }
+
+    // Audit #34: the environment is macro source 3 unconditionally; `-e` only
+    // changes which source wins.
+    #[test]
+    fn environment_is_a_macro_source_without_dash_e() {
+        std::env::set_var("MAKE_PARSER_ENV_PROBE", "fromenv");
+        let out = text("all:\n\t@echo [$(MAKE_PARSER_ENV_PROBE)]\n");
+        std::env::remove_var("MAKE_PARSER_ENV_PROBE");
+        assert!(out.contains("@echo [fromenv]"), "got: {out:?}");
+    }
+
+    // Audit #34: substitution used to run over comment text, so a bare `$`
+    // in a comment aborted the whole parse.
+    #[test]
+    fn a_dollar_in_a_comment_does_not_abort() {
+        assert!(preprocess("# price is $5\nall:\n\techo ok\n").is_ok());
+    }
+}

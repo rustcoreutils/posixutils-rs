@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod directive;
 pub mod parse;
 pub mod preprocessor;
 mod scan;

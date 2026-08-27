@@ -65,11 +65,13 @@ wrong build.
   23-node diamond chain (`n{i}: n{i+1} n{i+1}`) does not finish in 30 s where
   GNU make is instantaneous. With #29, any makefile with shared headers is
   unusable.
-- [ ] **#32 — Both preprocessor fixpoint loops are unbounded and hang.**
-  `parser/preprocessor.rs`. Neither the include-expansion loop nor the
-  macro-substitution loop has an iteration cap or self-reference detection. A
-  file that includes itself loops forever appending content; `A = $(A)x` never
-  terminates.
+- [x] **#32 — Both preprocessor fixpoint loops are unbounded and hang.** ✓ fixed
+  2026-08-27 (P2). Include splicing is capped at 64 levels (POSIX 105611 requires
+  at least 16), so a self-including file reports a cycle instead of looping;
+  macro expansion is capped at 256 rounds, so `A = $(A)x` reports
+  `macro expansion does not terminate` instead of growing the text forever.
+  Tests `include_recursion_is_capped`, `recursive_macro_is_capped`.
+
 - [ ] **#33 — Under `-k`, a target whose prerequisite failed still runs its
   recipe.** `rule.rs`. The failed prerequisite `break`s out with `Ok`, so the
   dependent builds from inputs that were never produced. `all: a b` with
@@ -79,13 +81,23 @@ wrong build.
 
 ## Major
 
-- [ ] **#34 — An undefined macro is fatal, environment variables are not macros,
-  and comments are expanded.** `parser/preprocessor.rs`. POSIX requires an
-  undefined macro to expand to the empty string and makes environment variables
-  macros unconditionally. `echo $(UNDEF)` → `parse error:
-  UndefinedMacro("UNDEF")`; `echo $(HOME)` fails identically without `-e`; and
-  because substitution runs over comment text, `# price is $5` aborts the whole
-  parse with `UndefinedMacro("5")`.
+- [x] **#34 — An undefined macro is fatal, environment variables are not macros,
+  and comments are expanded.** ✓ fixed 2026-08-27 (P2). `lookup_macro` returns
+  the empty string for an unknown name (POSIX 105833) and consults the
+  environment unconditionally as macro source 3 (105845) -- `-e` now only
+  decides which source wins, rather than whether the environment is read at all.
+  A bare `$` in a comment no longer aborts the parse, since the reference simply
+  expands to nothing. Tests `undefined_macro_expands_to_empty`,
+  `environment_is_a_macro_source_without_dash_e`,
+  `a_dollar_in_a_comment_does_not_abort`.
+  _Residual: comment text is still expanded rather than skipped. It is now
+  harmless, but `$(shell ...)` in a comment would still run. Recorded as **#51**._
+- [ ] **#51 — Comment text is expanded rather than skipped.** Substitution runs
+  over the whole line before the parser strips comments, so a macro reference
+  inside a `#` comment is still expanded. Harmless today (an undefined name is
+  empty), but once `$(shell ...)` exists a commented-out command would run.
+  Needs expansion to move behind comment stripping.
+
 - [x] **#35 — Include processing is handed an empty macro table.** ✓ fixed
   2026-08-27 (P1 step 1). `expand_includes` threads the real macro table through
   `process_include_lines`, which was being handed `&HashMap::new()`, so

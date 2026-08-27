@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use super::directive::{parse_directive, split_condition_args, Directive};
 use crate::Macro;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -26,7 +27,16 @@ pub enum PreprocError {
     CommandFailed,
     UndefinedMacro(String),
     BadMacroName,
-    IncludeFailed { path: String, reason: String },
+    IncludeFailed {
+        path: String,
+        reason: String,
+    },
+    /// A conditional whose arguments could not be split.
+    BadConditional(String),
+    /// `else`/`endif` without a matching `if`, or an unterminated `if`.
+    UnmatchedConditional(String),
+    /// A macro whose expansion re-introduces its own reference.
+    RecursiveMacro,
 }
 
 impl Display for PreprocError {
@@ -36,6 +46,18 @@ impl Display for PreprocError {
             // it a readable message rather than the debug representation.
             PreprocError::IncludeFailed { path, reason } => {
                 writeln!(f, "cannot open include file '{path}': {reason}")
+            }
+            PreprocError::BadConditional(args) => {
+                writeln!(f, "malformed conditional: {args}")
+            }
+            PreprocError::UnmatchedConditional(word) => {
+                writeln!(f, "unmatched '{word}'")
+            }
+            PreprocError::RecursiveMacro => {
+                writeln!(
+                    f,
+                    "macro expansion does not terminate (recursive definition?)"
+                )
             }
             other => writeln!(f, "{:?}", other),
         }
@@ -311,15 +333,33 @@ fn parse_operator(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<Ope
 }
 
 /// Expand `body` against `table` until it stops changing.
+/// How many expansion rounds before we call a macro self-referential. A value
+/// that re-introduces its own reference (`A = $(A)x`) never converges.
+const MAX_EXPANSION_ROUNDS: usize = 256;
+
 fn expand_to_fixpoint(body: &str, table: &HashMap<String, String>) -> Result<String> {
     let mut body = body.to_string();
-    loop {
+    for _ in 0..MAX_EXPANSION_ROUNDS {
         let (result, substitutions) = substitute(&body, table)?;
         if substitutions == 0 {
             return Ok(body);
         }
         body = result;
     }
+    Err(PreprocError::RecursiveMacro)
+}
+
+/// Expand every macro reference in `source` until it stops changing.
+fn substitute_to_fixpoint(source: &str, table: &HashMap<String, String>) -> Result<String> {
+    let mut source = source.to_string();
+    for _ in 0..MAX_EXPANSION_ROUNDS {
+        let (result, substitutions) = substitute(&source, table)?;
+        if substitutions == 0 {
+            return Ok(result);
+        }
+        source = result;
+    }
+    Err(PreprocError::RecursiveMacro)
 }
 
 /// POSIX 105746-105748: strip leading white space, drop a single trailing
@@ -373,26 +413,40 @@ fn parse_macro_name(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<S
     Ok(name)
 }
 
-/// Searches for all the lines in makefile that resemble macro definition
-/// and creates a name→body table from them, in first-definition order.
-fn generate_macro_table(source: &str) -> Result<MacroTable> {
-    let mut macro_table = MacroTable::default();
-
-    for def in source.lines().filter(|line| is_macro_definition(line)) {
-        let mut text = def.chars().peekable();
-        let macro_name = parse_macro_name(&mut text)?;
-        skip_blank(&mut text);
-        let operator = parse_operator(&mut text)?;
-        skip_blank(&mut text);
-        let body = take_till_eol(&mut text);
-        let body = apply_operator(operator, &macro_name, body, &macro_table)?;
-        macro_table.set(macro_name, body);
-    }
-
-    Ok(macro_table)
+/// Parse one macro-definition line into the name and the value its operator
+/// assigns, resolving against what is already defined.
+fn parse_macro_definition(line: &str, table: &MacroTable) -> Result<(String, String)> {
+    let mut text = line.chars().peekable();
+    // A definition may be indented with spaces, which is common inside a
+    // conditional. (A <tab> would make it a command line, handled elsewhere.)
+    skip_blank(&mut text);
+    let name = parse_macro_name(&mut text)?;
+    skip_blank(&mut text);
+    let operator = parse_operator(&mut text)?;
+    skip_blank(&mut text);
+    let body = take_till_eol(&mut text);
+    let body = apply_operator(operator, &name, body, table)?;
+    Ok((name, body))
 }
 
 pub static ENV_MACROS: AtomicBool = AtomicBool::new(false);
+
+/// Resolve a macro reference to its value.
+///
+/// POSIX 105845 makes the environment macro source 3, unconditionally -- `-e`
+/// changes which source *wins*, not whether the environment is consulted at
+/// all. POSIX 105833: "if the macro named by string1 does not exist, the final
+/// result shall be an empty string", so an undefined name is not an error.
+fn lookup_macro(name: &str, table: &HashMap<String, String>, env_wins: bool) -> String {
+    let from_env = std::env::var(name).ok();
+    let from_table = table.get(name).cloned();
+    let resolved = if env_wins {
+        from_env.or(from_table)
+    } else {
+        from_table.or(from_env)
+    };
+    resolved.unwrap_or_default()
+}
 
 fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, u32)> {
     let env_macros = ENV_MACROS.load(Acquire);
@@ -421,15 +475,7 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                 continue;
             }
             c if suitable_ident(&c) => {
-                let env_macro = if env_macros {
-                    std::env::var(c.to_string()).ok()
-                } else {
-                    None
-                };
-                let table_macro = table.get(&c.to_string()).cloned();
-                let Some(macro_body) = env_macro.or(table_macro) else {
-                    Err(PreprocError::UndefinedMacro(c.to_string()))?
-                };
+                let macro_body = lookup_macro(&c.to_string(), table, env_macros);
                 result.push_str(&macro_body);
                 substitutions += 1;
                 continue;
@@ -460,13 +506,6 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                     Err(PreprocError::BadMacroName)?
                 };
 
-                let env_macro = if env_macros {
-                    std::env::var(&macro_name).ok()
-                } else {
-                    None
-                };
-                let table_macro = table.get(&macro_name).cloned();
-
                 // `$(name:subst1=subst2)` substitution form.
                 if letters.peek() == Some(&':') {
                     letters.next();
@@ -484,9 +523,7 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                     if !closed {
                         Err(PreprocError::UnexpectedEOF)?
                     }
-                    let Some(macro_body) = env_macro.or(table_macro) else {
-                        Err(PreprocError::UndefinedMacro(macro_name.to_string()))?
-                    };
+                    let macro_body = lookup_macro(&macro_name, table, env_macros);
                     result.push_str(&apply_substitution(&macro_body, &spec));
                     substitutions += 1;
                     continue;
@@ -500,19 +537,18 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                     Err(PreprocError::UnexpectedSymbol(finilizer))?
                 }
 
-                let Some(macro_body) = env_macro.or(table_macro) else {
-                    // The special `MAKE` macro, when not otherwise defined, is
-                    // passed through to the rule stage (it expands to the make
-                    // program and marks the recipe for recursive execution).
-                    if macro_name == "MAKE" {
-                        result.push('$');
-                        result.push(open);
-                        result.push_str("MAKE");
-                        result.push(close);
-                        continue;
-                    }
-                    Err(PreprocError::UndefinedMacro(macro_name.to_string()))?
-                };
+                // The special `MAKE` macro, when not otherwise defined, is
+                // passed through to the rule stage (it expands to the make
+                // program and marks the recipe for recursive execution).
+                let defined = table.contains_key(&macro_name) || std::env::var(&macro_name).is_ok();
+                if !defined && macro_name == "MAKE" {
+                    result.push('$');
+                    result.push(open);
+                    result.push_str("MAKE");
+                    result.push(close);
+                    continue;
+                }
+                let macro_body = lookup_macro(&macro_name, table, env_macros);
                 result.push_str(&macro_body);
                 substitutions += 1;
 
@@ -543,93 +579,319 @@ fn parse_include_directive(line: &str) -> Option<(&str, bool)> {
     }
 }
 
-/// Copy-pastes included makefiles into single one recursively.
-/// Pretty much the same as C preprocessor and `#include` directive
-fn process_include_lines(source: &str, table: &HashMap<String, String>) -> Result<(String, usize)> {
-    let mut counter = 0;
-    let mut result = String::new();
-    for line in source.lines() {
-        let expanded = if let Some((path_spec, ignore_missing)) = parse_include_directive(line) {
-            counter += 1;
-            // Propagate a substitution error (e.g. an undefined macro in the
-            // path) rather than defaulting to an empty, misleading path.
-            let (path, _) = substitute(path_spec, table)?;
-            match fs::read_to_string(Path::new(&path)) {
-                Ok(contents) => contents,
-                // `-include` silently ignores a missing/unreadable file;
-                // plain `include` is a hard error.
-                Err(_) if ignore_missing => String::new(),
-                Err(err) => {
-                    return Err(PreprocError::IncludeFailed {
-                        path,
-                        reason: err.to_string(),
-                    })
-                }
-            }
-        } else {
-            line.to_string()
-        };
-        result.push_str(&expanded);
-        result.push('\n');
-    }
-    Ok((result, counter))
-}
-
-/// True if `line` is an `include` / `-include` directive. The preprocessor has
-/// already spliced these, but `parse` may be handed text directly.
-pub(crate) fn is_include_line(line: &str) -> bool {
+/// True if `line` is an `include` / `-include` directive.
+fn is_include_directive(line: &str) -> bool {
     parse_include_directive(line).is_some()
 }
 
-/// Blank out macro-definition lines. `generate_macro_table` has already taken
-/// their content, and the rule parser must not see them. Blanking rather than
-/// deleting keeps every later line at its original number.
-fn blank_macro_lines(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    for line in source.lines() {
-        if !is_macro_definition(line) {
+/// True if `line` is an `include` / `-include` directive. The reader has
+/// already spliced these, but `parse` may be handed text directly.
+pub(crate) fn is_include_line(line: &str) -> bool {
+    is_include_directive(line)
+}
+
+/// One level of `if.../else/endif` nesting.
+struct Branch {
+    /// Whether this level's currently selected arm is live.
+    active: bool,
+    /// Whether any arm at this level has already been taken, so a later
+    /// `else` must not fire.
+    taken: bool,
+    /// Whether a bare `else` has been seen, so a second one is an error.
+    closed: bool,
+}
+
+/// How deep `include` may nest before we call it a cycle. POSIX 105611 requires
+/// at least 16; the cap exists so a self-including file terminates.
+const MAX_INCLUDE_DEPTH: usize = 64;
+
+/// Walks makefile text once, evaluating directives in order.
+///
+/// Macro definitions, conditionals and includes are interleaved because they
+/// depend on each other: a conditional's outcome can decide which macros exist,
+/// and a macro can name the file an `include` reads. Every consumed line is
+/// replaced by an empty one so later lines keep their original numbers.
+struct Reader {
+    table: MacroTable,
+    branches: Vec<Branch>,
+    out: String,
+    depth: usize,
+}
+
+impl Reader {
+    fn new() -> Self {
+        Reader {
+            table: MacroTable::default(),
+            branches: Vec::new(),
+            out: String::new(),
+            depth: 0,
+        }
+    }
+
+    /// Whether lines are currently being kept.
+    fn active(&self) -> bool {
+        self.branches.iter().all(|b| b.active)
+    }
+
+    /// Emit a line.
+    ///
+    /// A rule header is expanded here, against what is defined at that point.
+    /// A command line is left raw and expanded once the whole file has been
+    /// read, because a macro may be defined after the recipe that uses it --
+    /// notably a command-line `macro=value` operand, which `main` appends to
+    /// the end of the makefile text.
+    fn keep(&mut self, line: &str) -> Result<()> {
+        if line.starts_with('\t') {
+            self.out.push_str(line);
+        } else {
+            let expanded = substitute_to_fixpoint(line, self.table.values())?;
+            self.out.push_str(&expanded);
+        }
+        self.out.push('\n');
+        Ok(())
+    }
+
+    /// Consume a line without emitting it, preserving line numbering.
+    fn drop_line(&mut self) {
+        self.out.push('\n');
+    }
+
+    /// Expand macro references in a directive's condition, using what is
+    /// defined so far.
+    fn expand(&self, text: &str) -> Result<String> {
+        expand_to_fixpoint(text, self.table.values())
+    }
+
+    fn eval_compare(&self, equal: bool, args: &str) -> Result<bool> {
+        let expanded = self.expand(args)?;
+        let Some((lhs, rhs)) = split_condition_args(&expanded) else {
+            return Err(PreprocError::BadConditional(args.to_string()));
+        };
+        Ok((lhs == rhs) == equal)
+    }
+
+    fn eval_defined(&self, defined: bool, name: &str) -> Result<bool> {
+        let name = self.expand(name)?;
+        let name = name.trim();
+        // An empty value counts as undefined, matching GNU.
+        let has = self
+            .table
+            .get(name)
+            .map(|v| !v.is_empty())
+            .unwrap_or_else(|| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false));
+        Ok(has == defined)
+    }
+
+    fn eval_condition(&self, directive: &Directive) -> Result<bool> {
+        match directive {
+            Directive::IfCompare { equal, args } => self.eval_compare(*equal, args),
+            Directive::IfDefined { defined, name } => self.eval_defined(*defined, name),
+            other => Err(PreprocError::BadConditional(format!("{other:?}"))),
+        }
+    }
+
+    /// Open a new conditional level. A condition inside an inactive branch is
+    /// not evaluated -- it may reference macros that only the live arm defines.
+    fn push_branch(&mut self, directive: &Directive) -> Result<()> {
+        let live = self.active();
+        let taken = if live {
+            self.eval_condition(directive)?
+        } else {
+            false
+        };
+        self.branches.push(Branch {
+            active: taken,
+            taken,
+            closed: false,
+        });
+        Ok(())
+    }
+
+    fn handle_else(&mut self, chained: Option<&Directive>) -> Result<()> {
+        let Some(branch) = self.branches.pop() else {
+            return Err(PreprocError::UnmatchedConditional("else".to_string()));
+        };
+        if branch.closed {
+            return Err(PreprocError::UnmatchedConditional("else".to_string()));
+        }
+        let outer_live = self.active();
+        let (active, closed) = match chained {
+            // `else ifeq (...)`: eligible only if no arm has been taken yet.
+            Some(cond) => {
+                let eligible = outer_live && !branch.taken;
+                let hit = eligible && {
+                    self.branches.push(Branch {
+                        active: true,
+                        taken: branch.taken,
+                        closed: false,
+                    });
+                    let r = self.eval_condition(cond);
+                    self.branches.pop();
+                    r?
+                };
+                (hit, false)
+            }
+            None => (outer_live && !branch.taken, true),
+        };
+        self.branches.push(Branch {
+            active,
+            taken: branch.taken || active,
+            closed,
+        });
+        Ok(())
+    }
+
+    fn handle_endif(&mut self) -> Result<()> {
+        self.branches
+            .pop()
+            .map(|_| ())
+            .ok_or_else(|| PreprocError::UnmatchedConditional("endif".to_string()))
+    }
+
+    /// Capture a `define ... endef` body, returning the lines consumed.
+    fn capture_define(&mut self, name: &str, lines: &[&str], start: usize) -> usize {
+        let mut body: Vec<&str> = Vec::new();
+        let mut i = start + 1;
+        while i < lines.len() {
+            if matches!(parse_directive(lines[i]), Some(Directive::EndDef)) {
+                break;
+            }
+            body.push(lines[i]);
+            i += 1;
+        }
+        if self.active() {
+            self.table.set(name.to_string(), body.join("\n"));
+        }
+        // Blank out the whole construct, header and terminator included.
+        for _ in start..=i.min(lines.len() - 1) {
+            self.drop_line();
+        }
+        i
+    }
+
+    fn splice_include(&mut self, line: &str) -> Result<()> {
+        let Some((path_spec, ignore_missing)) = parse_include_directive(line) else {
+            return Ok(());
+        };
+        let path = self.expand(path_spec)?;
+        let path = path.trim();
+        self.drop_line();
+
+        if self.depth >= MAX_INCLUDE_DEPTH {
+            return Err(PreprocError::IncludeFailed {
+                path: path.to_string(),
+                reason: format!("include nested more than {MAX_INCLUDE_DEPTH} deep (cycle?)"),
+            });
+        }
+
+        let contents = match fs::read_to_string(Path::new(path)) {
+            Ok(contents) => contents,
+            Err(_) if ignore_missing => return Ok(()),
+            Err(err) => {
+                return Err(PreprocError::IncludeFailed {
+                    path: path.to_string(),
+                    reason: err.to_string(),
+                })
+            }
+        };
+
+        self.depth += 1;
+        let folded = fold_continuations(&contents);
+        self.read(&folded)?;
+        self.depth -= 1;
+        Ok(())
+    }
+
+    /// Handle one line; returns the index of the last line it consumed.
+    fn handle(&mut self, lines: &[&str], i: usize) -> Result<usize> {
+        let line = lines[i];
+
+        if let Some(directive) = parse_directive(line) {
+            match directive {
+                Directive::Define(name) => return Ok(self.capture_define(&name, lines, i)),
+                Directive::EndDef => self.drop_line(),
+                Directive::Else(chained) => {
+                    self.handle_else(chained.as_deref())?;
+                    self.drop_line();
+                }
+                Directive::EndIf => {
+                    self.handle_endif()?;
+                    self.drop_line();
+                }
+                other => {
+                    self.push_branch(&other)?;
+                    self.drop_line();
+                }
+            }
+            return Ok(i);
+        }
+
+        if !self.active() {
+            self.drop_line();
+            return Ok(i);
+        }
+
+        if is_include_directive(line) {
+            self.splice_include(line)?;
+        } else if is_macro_definition(line) {
+            self.define_macro(line)?;
+            self.drop_line();
+        } else {
+            self.keep(line)?;
+        }
+        Ok(i)
+    }
+
+    fn define_macro(&mut self, line: &str) -> Result<()> {
+        let (name, body) = parse_macro_definition(line, &self.table)?;
+        self.table.set(name, body);
+        Ok(())
+    }
+
+    fn read(&mut self, text: &str) -> Result<()> {
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        // Text ending in a newline splits with a trailing empty element; it is
+        // the terminator of the last line, not a line of its own.
+        if lines.last() == Some(&"") {
+            lines.pop();
+        }
+        let mut i = 0;
+        while i < lines.len() {
+            i = self.handle(&lines, i)? + 1;
+        }
+        Ok(())
+    }
+}
+
+/// Expand the command lines held back during the read, now that every macro is
+/// known.
+///
+/// A multi-line value landing in a recipe gets each of its newlines followed by
+/// the recipe's <tab>, so every line stays a command line rather than becoming
+/// a bogus rule.
+fn expand_command_lines(text: &str, table: &HashMap<String, String>) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if line.starts_with('\t') {
+            let expanded = substitute_to_fixpoint(line, table)?;
+            out.push_str(&expanded.replace('\n', "\n\t"));
+        } else {
             out.push_str(line);
         }
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
-/// Splice `include` lines until none remain, returning the macro table of the
-/// fully-spliced text.
-fn expand_includes(source: &mut String) -> Result<MacroTable> {
-    let mut table = generate_macro_table(source)?;
-    loop {
-        // The real table, not an empty one: a path spec may reference macros,
-        // e.g. `include $(TOP)/config.mk`.
-        let (spliced, found) = process_include_lines(source, table.values())?;
-        *source = spliced;
-        table = generate_macro_table(source)?;
-        if found == 0 {
-            return Ok(table);
-        }
-    }
-}
-
-/// Expand every macro reference in `source` until it stops changing.
-fn substitute_to_fixpoint(source: &str, table: &HashMap<String, String>) -> Result<String> {
-    let mut source = source.to_string();
-    loop {
-        let (result, substitutions) = substitute(&source, table)?;
-        if substitutions == 0 {
-            return Ok(result);
-        }
-        source = result;
-    }
-}
-
-/// Resolve `include`s and macros, returning the text the rule parser sees and
-/// the macro definitions it must not (they are consumed here, but `Make` needs
-/// them for `SHELL` and for the recipe environment).
+/// Resolve directives, includes and macros, returning the text the rule parser
+/// sees and the macro definitions it must not (they are consumed here, but
+/// `Make` needs them for `SHELL` and for the recipe environment).
 pub fn preprocess(source: &str) -> Result<(String, Vec<Macro>)> {
-    let mut source = fold_continuations(source);
-    let table = expand_includes(&mut source)?;
-    let source = blank_macro_lines(&source);
-    let text = substitute_to_fixpoint(&source, table.values())?;
-    Ok((text, table.into_macros()))
+    let mut reader = Reader::new();
+    reader.read(&fold_continuations(source))?;
+    if !reader.branches.is_empty() {
+        return Err(PreprocError::UnmatchedConditional("endif".to_string()));
+    }
+    let text = expand_command_lines(&reader.out, reader.table.values())?;
+    Ok((text, reader.table.into_macros()))
 }

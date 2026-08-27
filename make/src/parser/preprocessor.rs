@@ -590,7 +590,11 @@ fn substitute(source: &str, table: &HashMap<String, String>) -> Result<(String, 
                     if !closed {
                         Err(PreprocError::UnexpectedEOF)?
                     }
+                    // Expand the body before substituting: a delayed macro
+                    // holds unexpanded text, and `$(SRC:.c=.o)` has to see the
+                    // words, not `$(wildcard *.c)`.
                     let macro_body = lookup_macro(&macro_name, table, env_macros);
+                    let macro_body = expand_to_fixpoint(&macro_body, table)?;
                     result.push_str(&apply_substitution(&macro_body, &spec));
                     substitutions += 1;
                     continue;

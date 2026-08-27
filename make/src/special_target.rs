@@ -154,23 +154,33 @@ impl TryFrom<Target> for SpecialTarget {
 impl TryFrom<(Target, Config)> for InferenceTarget {
     type Error = ParseError;
 
+    /// A dot-target is an inference rule only if it *parses* as `.s1` or
+    /// `.s1.s2` and its suffixes are known.
+    ///
+    /// The previous version asked whether the name merely started with a known
+    /// suffix, which filed `.config:` as an inference rule for `.c` and made a
+    /// bare `make` build the wrong target (audit #38). It also computed `from`
+    /// and `to` from the same expression, so both were the same string.
     fn try_from((target, config): (Target, Config)) -> Result<Self, Self::Error> {
-        let suffixes = &config.suffixes;
-        let source = target.to_string();
-
-        let from = suffixes
-            .iter()
-            .filter_map(|x| source.strip_prefix(x.as_str()))
-            .next()
-            .ok_or(ParseError)?
-            .to_string();
-        let to = suffixes
-            .iter()
-            .filter_map(|x| source.strip_prefix(x.as_str()))
-            .next()
-            .map(|x| x.to_string());
-
-        Ok(Self { from, to })
+        let Target::Inference { from, to, .. } = Target::new(target.to_string()) else {
+            return Err(ParseError);
+        };
+        let known = |suffix: &str| {
+            config
+                .suffixes
+                .iter()
+                .any(|s| s.trim_start_matches('.') == suffix)
+        };
+        if !known(&from) {
+            return Err(ParseError);
+        }
+        if to.is_empty() {
+            return Ok(Self { from, to: None });
+        }
+        if !known(&to) {
+            return Err(ParseError);
+        }
+        Ok(Self { from, to: Some(to) })
     }
 }
 

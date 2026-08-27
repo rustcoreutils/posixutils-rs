@@ -1031,6 +1031,13 @@ mod special_targets {
             &[
                 "-f",
                 "tests/makefiles/special_targets/suffixes/suffixes_basic.mk",
+                // The fixture defines only an inference rule, so it has no
+                // default target and the target must be named. `make` with no
+                // operand used to fall back to the first inference rule and
+                // scan the working directory for anything matching; POSIX
+                // 105428 makes the default the first target that is not
+                // special or an inference rule, and GNU agrees.
+                "suffixes_test.xfo",
             ],
             "Converting suffixes_test.sfx to suffixes_test.xfo\n",
             "",
@@ -1323,6 +1330,99 @@ mod build_graph {
     fn a_shared_prerequisite_builds_once_under_dash_j() {
         let (stdout, code) = run(&["-f", "tests/makefiles/graph/diamond.mk", "-j4", "all"]);
         assert_eq!(stdout.matches("SHARED").count(), 1, "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+}
+
+// Inference rules, `%` pattern rules, and default-target selection.
+mod inference {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    fn with_files(files: &[&str], body: impl FnOnce()) {
+        for f in files {
+            let _ = File::create(f);
+        }
+        body();
+        for f in files {
+            let _ = fs::remove_file(f);
+        }
+    }
+
+    // `%.o: %.c` -- not POSIX, but how real makefiles express inference.
+    #[test]
+    fn pattern_rule_builds_with_stem_and_input() {
+        with_files(&["pat_probe.c"], || {
+            let (stdout, code) = run(&["-f", "tests/makefiles/inference/pattern.mk", "all"]);
+            assert!(
+                stdout.contains("target=pat_probe.o input=pat_probe.c stem=pat_probe"),
+                "stdout: {stdout}"
+            );
+            assert_eq!(code, Some(0));
+        });
+        let _ = fs::remove_file("pat_probe.o");
+    }
+
+    // Audit #37: `$*` is the target with its suffix removed, not the target.
+    #[test]
+    fn star_is_the_stem() {
+        with_files(&["star_probe.c"], || {
+            let (stdout, _) = run(&["-f", "tests/makefiles/inference/star.mk", "all"]);
+            assert!(stdout.contains("STAR=[star_probe]"), "stdout: {stdout}");
+            assert!(stdout.contains("AT=[star_probe.o]"), "stdout: {stdout}");
+        });
+        let _ = fs::remove_file("star_probe.o");
+    }
+
+    // Audit #47: POSIX 105920 -- ".SUFFIXES" order picks the rule, not the
+    // order the rules happen to appear in the makefile. Both orderings must
+    // agree, and both must pick .sh because it is listed first.
+    #[test]
+    fn suffixes_order_decides_not_rule_order() {
+        with_files(&["ord_probe.c", "ord_probe.sh"], || {
+            for fixture in [
+                "tests/makefiles/inference/suffix_order_c_first.mk",
+                "tests/makefiles/inference/suffix_order_sh_first.mk",
+            ] {
+                let _ = fs::remove_file("ord_probe");
+                let (stdout, _) = run(&["-f", fixture, "ord_probe"]);
+                assert!(stdout.contains("VIA-SH"), "{fixture} gave: {stdout}");
+            }
+        });
+        let _ = fs::remove_file("ord_probe");
+    }
+
+    // Audit #38: `.config` is not an inference rule just because it starts
+    // with a dot. It used to be classified as one, find no files to scan, and
+    // silently run nothing -- while also displacing the real default target.
+    #[test]
+    fn a_dot_target_is_not_an_inference_rule() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/inference/dot_target.mk", ".config"]);
+        assert!(stdout.contains("BUILT-DOTCONFIG"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+
+    // POSIX 105428: the default is the first target that is not special or an
+    // inference rule, so a leading dot-target is skipped. GNU agrees.
+    #[test]
+    fn default_target_skips_a_dot_target() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/inference/dot_target.mk"]);
+        assert!(stdout.contains("BUILT-REAL"), "stdout: {stdout}");
+        assert!(!stdout.contains("DOTCONFIG"), "stdout: {stdout}");
         assert_eq!(code, Some(0));
     }
 }

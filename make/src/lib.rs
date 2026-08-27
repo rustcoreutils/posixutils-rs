@@ -115,20 +115,40 @@ impl Make {
     fn rule_by_target_name(&self, target: impl AsRef<str>) -> Option<&Rule> {
         self.rules
             .iter()
+            .filter(|rule| !rule.is_pattern())
             .find(|rule| rule.targets().any(|t| t.as_ref() == target.as_ref()))
     }
 
+    /// Find a `%` pattern rule matching `name` and instantiate it for that
+    /// target. The first matching pattern in file order wins, as GNU does.
+    ///
+    /// Pattern rules are not POSIX -- the standard has only suffix inference
+    /// rules -- but they are how real makefiles express the same thing.
+    fn find_pattern_rule(&self, name: &str) -> Option<Rule> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.is_pattern())
+            .find_map(|rule| rule.instantiate_pattern(name))
+    }
+
     pub fn first_target(&self) -> Result<&Target, ErrorCode> {
-        // Per POSIX: "the first target that make encounters that is not a special
-        // target or an inference rule shall be used."
-        // If there are no non-special, non-inference targets, fall back to the
-        // first inference rule (which will scan CWD for matching files).
-        let rule = self
-            .rules
-            .first()
-            .or_else(|| self.inference_rules.first())
-            .ok_or(NoTarget { target: None })?;
-        rule.targets().next().ok_or(NoTarget { target: None })
+        // POSIX 105428: "the first target that make encounters that is not a
+        // special target or an inference rule shall be used."
+        //
+        // A dot-target such as `.config` is neither a usable default nor an
+        // inference rule, and a pattern rule is a template rather than a
+        // target, so both are skipped -- matching GNU, which builds the first
+        // ordinary target. Falling back to an inference rule (audit #N6) would
+        // send a bare `make` scanning the working directory instead.
+        self.rules
+            .iter()
+            .filter(|rule| !rule.is_pattern())
+            .filter_map(|rule| rule.targets().next())
+            .find(|target| {
+                let name = target.as_ref();
+                !name.starts_with('.') || name.contains('/')
+            })
+            .ok_or(NoTarget { target: None })
     }
 
     /// Finds a matching inference rule for the given target name.
@@ -147,27 +167,41 @@ impl Make {
             .max_by_key(|s| s.len())
         {
             let stem = &name[..name.len() - target_suffix.len()];
-            for rule in &self.inference_rules {
-                if let Some(Target::Inference { from, to, .. }) = rule.targets().next() {
-                    if !to.is_empty() && format!(".{}", to) == *target_suffix {
-                        let prereq_path = format!("{}.{}", stem, from);
-                        if std::path::Path::new(&prereq_path).exists() {
-                            return Some(rule);
-                        }
+            // POSIX 105920/105930: "The order in which the suffixes are
+            // specified defines the order in which the inference rules ... are
+            // used", so the search iterates `.SUFFIXES`, not the order the
+            // rules happen to appear in the makefile (audit #47).
+            for source_suffix in suffixes {
+                let from_name = source_suffix.trim_start_matches('.');
+                let hit = self.inference_rules.iter().find(|rule| {
+                    matches!(rule.targets().next(),
+                        Some(Target::Inference { from, to, .. })
+                            if !to.is_empty()
+                                && format!(".{to}") == *target_suffix
+                                && from == from_name)
+                });
+                if let Some(rule) = hit {
+                    let prereq_path = format!("{stem}{source_suffix}");
+                    if std::path::Path::new(&prereq_path).exists() {
+                        return Some(rule);
                     }
                 }
             }
         }
 
         // Single-suffix: the target has no suffix; find a `.s2` (single-suffix)
-        // rule whose prerequisite `<name>.s2` exists.
-        for rule in &self.inference_rules {
-            if let Some(Target::Inference { from, to, .. }) = rule.targets().next() {
-                if to.is_empty() {
-                    let prereq_path = format!("{}.{}", name, from);
-                    if std::path::Path::new(&prereq_path).exists() {
-                        return Some(rule);
-                    }
+        // rule whose prerequisite `<name>.s2` exists. Same ordering rule.
+        for source_suffix in suffixes {
+            let from_name = source_suffix.trim_start_matches('.');
+            let hit = self.inference_rules.iter().find(|rule| {
+                matches!(rule.targets().next(),
+                    Some(Target::Inference { from, to, .. })
+                        if to.is_empty() && from == from_name)
+            });
+            if let Some(rule) = hit {
+                let prereq_path = format!("{name}{source_suffix}");
+                if std::path::Path::new(&prereq_path).exists() {
+                    return Some(rule);
                 }
             }
         }
@@ -217,6 +251,19 @@ impl Make {
                             false,
                             &[],
                         )?;
+                        return Ok(true);
+                    }
+                    // A `%.o: %.c` pattern rule, instantiated for this target.
+                    if let Some(rule) = self.find_pattern_rule(name.as_ref()) {
+                        let target = Target::new(name.as_ref());
+                        for prerequisite in rule.prerequisites() {
+                            self.build_target(prerequisite.as_ref())?;
+                        }
+                        let newer: Vec<String> = rule
+                            .prerequisites()
+                            .map(|p| p.as_ref().to_string())
+                            .collect();
+                        rule.run_for_pattern(&self.config, &self.macros, &target, false, &newer)?;
                         return Ok(true);
                     }
                     // Per POSIX: "If a target exists and there is neither a target rule

@@ -120,18 +120,18 @@ wrong build.
   `fakesh`, matching GNU. Test `shell_macro_selects_the_recipe_shell`.
   _Landing this exposed **#49**, which had to be fixed alongside it._
 
-- [ ] **#37 — `$*` expands to the whole target name, not the stem.** `rule.rs`.
-  POSIX: the target with the suffix deleted. A `.c.o:` rule on `f.o` yields
-  `STAR=[f.o]`, should be `f`. This also breaks the crate's own built-in `.c.a`
-  rule in `config.rs`, whose `$(AR) $(ARFLAGS) $@ $*.o` archives the wrong
-  object.
-- [ ] **#38 — The inference-rule classifier misfires on any dot-target beginning
-  with a known suffix.** `special_target.rs`. Classification is "starts with a
-  suffix in `.SUFFIXES`", so `.config:` is filed as an inference rule: with it
-  first in the file, a bare `make` builds `real` instead. `.cargo/…` and any
-  `.o`- or `.a`-prefixed dot-target are affected. `InferenceTarget::from` and
-  `to` also compute the identical expression (both `strip_prefix`), so for
-  `.c.o` both return `.o` and both accessors are dead.
+- [x] **#37 — `$*` expands to the whole target name, not the stem.** ✓ fixed
+  2026-08-27 (P5). `$*` is now the target with its suffix removed, keeping any
+  directory part. `.c.o` applied to `f.o` gives `f`. Test `star_is_the_stem`.
+- [x] **#38 — The inference-rule classifier misfires on any dot-target beginning
+  with a known suffix.** ✓ fixed 2026-08-27 (P5). Classification now requires the
+  name to *parse* as `.s1` or `.s1.s2` **and** its suffixes to be in
+  `.SUFFIXES`, instead of asking whether the name merely starts with one, so
+  `.config:` is an ordinary rule. `InferenceTarget::from`/`to` no longer compute
+  the same expression. The second half was in `Rule::run`, whose inference branch
+  scanned the working directory: a dot-target that only looked like an inference
+  rule found no files and silently ran no recipe. Tests
+  `a_dot_target_is_not_an_inference_rule`, `default_target_skips_a_dot_target`.
 - [ ] **#39 — A non-UTF-8 target operand panics.** `main.rs` calls
   `target.into_string().unwrap()`. `make $'\xff'` → `panicked at … called
   Result::unwrap() on an Err value: "\xFF"`, exit 101. Targets are filenames and
@@ -151,16 +151,13 @@ wrong build.
   creates a file named `clean`, after which every `make clean` reports it up to
   date and never runs the recipe.
 
-- [ ] **#47 — `.SUFFIXES` order does not drive inference-rule selection; the
-  order the rules appear in the file does.** `special_target.rs` / `config.rs`.
-  Old #16 claimed an "authoritative insertion-ordered `Config.suffixes`" was
-  added. Membership works and the clear form works — with `.SUFFIXES: .c` only,
-  a `.sh:` rule is correctly not applied, matching GNU. But with
-  `.SUFFIXES: .sh .c` and both `bar.c` and `bar.sh` present, the winner tracks
-  which of `.c:` / `.sh:` appears first in the makefile: rules in the order
-  `.c` then `.sh` give `VIA-C`, and reversing just the two rules gives
-  `VIA-SH`. GNU gives `VIA-SH` in both cases, following `.SUFFIXES`.
-
+- [x] **#47 — `.SUFFIXES` order does not drive inference-rule selection.**
+  ✓ fixed 2026-08-27 (P5). `find_inference_rule` iterates `Config::suffixes` and
+  looks up the rule for each, rather than iterating the rules in file order.
+  POSIX 105920: "The order in which the suffixes are specified defines the order
+  in which the inference rules ... are used." With `.SUFFIXES: .sh .c` both rule
+  orderings now pick `.sh`, matching GNU Make 4.3. Test
+  `suffixes_order_decides_not_rule_order`.
 - [x] **#49 — Makefile macros leak into every recipe's environment.** ✓ fixed
   2026-08-27 (P1), in the commit that closed #36. `init_env` did
   `command.envs(macros)` unconditionally — inert only while `Make::macros` was
@@ -206,10 +203,11 @@ wrong build.
 - [x] **#45 — `Target::new` calls `String::leak()` on every construction.**
   ✓ fixed 2026-08-27 (P4). `Target` owns `String`s and `name()`/`AsRef<str>`
   borrow from `&self`, so nothing leaks per visit. No test changed.
-- [ ] **#46 — `find_files_with_extension` builds a walk queue it never pushes
-  to.** `rule.rs`. The `VecDeque` is initialized and drained but never appended
-  to, so the loop always runs exactly once. The structure implies a recursive
-  directory walk that does not happen.
+- [x] **#46 — `find_files_with_extension` builds a walk queue it never pushes
+  to.** ✓ fixed 2026-08-27 (P5). Deleted with the working-directory scan it
+  served. An inference rule applied to a real target goes through
+  `run_for_target`, which knows the stem; scanning for every file with the source
+  suffix was both dead structure and the mechanism behind #38's silent no-op.
 - [ ] **#48 — Backslash-newline folding leaves two spaces where POSIX and GNU
   leave one.** `parser/preprocessor.rs` `fold_continuations`. Old #7 claimed the
   continuation "and leading white space of the next line collapse to a single

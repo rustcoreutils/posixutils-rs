@@ -23,8 +23,6 @@ use gettextrs::gettext;
 use prerequisite::Prerequisite;
 use recipe::config::Config as RecipeConfig;
 use recipe::Recipe;
-use std::collections::VecDeque;
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::{
     collections::HashMap,
@@ -81,6 +79,32 @@ impl Rule {
 
     pub fn recipes(&self) -> impl Iterator<Item = &Recipe> {
         self.recipes.iter()
+    }
+
+    /// True if this rule's target is a `%` pattern.
+    pub fn is_pattern(&self) -> bool {
+        self.targets.iter().any(|t| t.as_ref().contains('%'))
+    }
+
+    /// Instantiate a pattern rule for a concrete target, substituting the stem
+    /// into the target and every prerequisite.
+    ///
+    /// `%.o: %.c` applied to `src/foo.o` yields the rule
+    /// `src/foo.o: src/foo.c`. Recipes are left alone; their `$@`/`$<` are
+    /// expanded later against the instantiated names.
+    pub fn instantiate_pattern(&self, target: &str) -> Option<Rule> {
+        let pattern = self.targets.first()?.as_ref().to_string();
+        let stem = pattern_stem(&pattern, target)?;
+        Some(Rule {
+            targets: vec![Target::new(target)],
+            prerequisites: self
+                .prerequisites
+                .iter()
+                .map(|p| Prerequisite::new(pattern_expand(p.as_ref(), stem)))
+                .collect(),
+            recipes: self.recipes.clone(),
+            config: self.config.clone(),
+        })
     }
 
     /// Fold another rule for the same target into this one.
@@ -150,6 +174,25 @@ impl Rule {
         self.run_with_files(global_config, macros, target, up_to_date, files, newer)
     }
 
+    /// Runs an instantiated pattern rule, with the matched prerequisite as the
+    /// input file so `$<` and `$*` resolve.
+    pub fn run_for_pattern(
+        &self,
+        global_config: &GlobalConfig,
+        macros: &[Macro],
+        target: &Target,
+        up_to_date: bool,
+        newer: &[String],
+    ) -> Result<(), ErrorCode> {
+        let input = self
+            .prerequisites()
+            .next()
+            .map(|p| PathBuf::from(p.as_ref()))
+            .unwrap_or_default();
+        let files = vec![(input, PathBuf::from(target.as_ref()))];
+        self.run_with_files(global_config, macros, target, up_to_date, files, newer)
+    }
+
     /// Runs the rule with the global config and macros passed in.
     ///
     /// Returns `Ok` on success and `Err` on any errors while running the rule.
@@ -161,20 +204,14 @@ impl Rule {
         up_to_date: bool,
         newer: &[String],
     ) -> Result<(), ErrorCode> {
-        let files = match target {
-            Target::Inference { from, to, .. } => find_files_with_extension(from)?
-                .into_iter()
-                .map(|input| {
-                    let mut output = input.clone();
-                    output.set_extension(to);
-                    (input, output)
-                })
-                .collect::<Vec<_>>(),
-            _ => {
-                vec![(PathBuf::from(""), PathBuf::from(""))]
-            }
-        };
-
+        // One pass, with no input/output pair: an inference rule applied to a
+        // real target goes through `run_for_target`, which knows the stem.
+        //
+        // This used to scan the working directory for every file with the
+        // rule's source suffix, which meant a dot-target that merely *looked*
+        // like an inference rule (`.config:`) found no files and silently ran
+        // no recipe at all (audit #38, #46).
+        let files = vec![(PathBuf::from(""), PathBuf::from(""))];
         self.run_with_files(global_config, macros, target, up_to_date, files, newer)
     }
 
@@ -391,7 +428,9 @@ impl Rule {
             }
             '+' => all_prereqs,
             '<' => vec![files.0.to_string_lossy().into_owned()],
-            '*' => vec![files.1.to_string_lossy().into_owned()],
+            // POSIX: `$*` is the target with the suffix deleted, i.e. the
+            // stem -- not the whole target name.
+            '*' => vec![stem_of(&files.1.to_string_lossy())],
             _ => return String::new(),
         };
 
@@ -523,34 +562,33 @@ impl From<(ParsedRule, Config)> for Rule {
     }
 }
 
-fn find_files_with_extension(ext: &str) -> Result<Vec<PathBuf>, ErrorCode> {
-    use std::{env, fs};
-
-    let mut result = vec![];
-    let Ok(current) = env::current_dir() else {
-        Err(IoError(ErrorKind::PermissionDenied))?
-    };
-    let mut dirs_to_walk = VecDeque::new();
-    dirs_to_walk.push_back(current);
-
-    while let Some(path) = dirs_to_walk.pop_front() {
-        let files = fs::read_dir(path)?;
-        for file in files.filter_map(Result::ok) {
-            let Ok(metadata) = file.metadata() else {
-                continue;
-            };
-
-            if metadata.is_file() {
-                if let Some(e) = file.path().extension() {
-                    if ext == e {
-                        result.push(file.path());
-                    }
-                }
-            }
-        }
+/// The target with its suffix removed, keeping any directory part.
+fn stem_of(name: &str) -> String {
+    let start = name.rfind('/').map(|i| i + 1).unwrap_or(0);
+    match name[start..].rfind('.') {
+        Some(i) => name[..start + i].to_string(),
+        None => name.to_string(),
     }
+}
 
-    Ok(result)
+/// Match `target` against a `%` pattern, returning the stem.
+pub fn pattern_stem<'a>(pattern: &str, target: &'a str) -> Option<&'a str> {
+    let (prefix, suffix) = pattern.split_once('%')?;
+    if target.len() < prefix.len() + suffix.len() {
+        return None;
+    }
+    if !target.starts_with(prefix) || !target.ends_with(suffix) {
+        return None;
+    }
+    Some(&target[prefix.len()..target.len() - suffix.len()])
+}
+
+/// Replace `%` in `text` with `stem`, or return it unchanged when it has none.
+fn pattern_expand(text: &str, stem: &str) -> String {
+    match text.split_once('%') {
+        Some((prefix, suffix)) => format!("{prefix}{stem}{suffix}"),
+        None => text.to_string(),
+    }
 }
 
 /// The make program to substitute for the `$(MAKE)` macro: this executable's

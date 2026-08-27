@@ -8,7 +8,8 @@
 //
 // POSIX.1-2024 conformance tests for cflow, ctags, and cxref.
 //
-// Each test names the audit item it covers (see cc/audit.md). These are
+// Each test names the audit item it covers; `git log --grep '#R6'` finds the
+// finding by number. These are
 // deliberately negative-path and format-exactness tests: the pre-existing
 // mega-tests in this directory prove that accepted input produces plausible
 // output, which is why none of them caught the defects recorded in the audit.

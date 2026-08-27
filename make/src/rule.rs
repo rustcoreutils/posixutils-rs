@@ -83,6 +83,35 @@ impl Rule {
         self.recipes.iter()
     }
 
+    /// Fold another rule for the same target into this one.
+    ///
+    /// POSIX 105653: "A target that has prerequisites, but does not have any
+    /// commands, can be used to add to the prerequisite list for that target.
+    /// Only one target rule for any given target can contain commands."
+    ///
+    /// Prerequisites accumulate, and are deliberately not deduplicated -- `$+`
+    /// is defined to keep duplicates, and `$^` removes them at expansion time.
+    /// The clause carries no "shall be an error", so a second commanded rule is
+    /// undefined rather than invalid: warn and let the later one win, as GNU
+    /// does, rather than refusing a makefile that other makes accept.
+    pub fn absorb(&mut self, other: Rule) {
+        self.prerequisites.extend(other.prerequisites);
+        if !other.recipes.is_empty() {
+            if !self.recipes.is_empty() {
+                let target = self
+                    .targets
+                    .first()
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "make: {}",
+                    gettext(format!("warning: overriding recipe for target '{target}'"))
+                );
+            }
+            self.recipes = other.recipes;
+        }
+    }
+
     /// Runs an inference rule for a specific target (not a CWD scan).
     ///
     /// This is used when POSIX requires applying an inference rule to a specific

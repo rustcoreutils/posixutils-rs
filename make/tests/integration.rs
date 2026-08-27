@@ -1269,3 +1269,60 @@ mod inference_rules {
         );
     }
 }
+
+// Build-graph state: cycles, rule merging, and single-build under -j.
+mod build_graph {
+    use super::*;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #28: a cycle that does not pass through the root used to recurse
+    // until the stack overflowed (exit 134). The visited/stack sets were seeded
+    // with the root and never inserted into during the walk.
+    #[test]
+    fn indirect_cycle_is_diagnosed_not_a_stack_overflow() {
+        let (_, code) = run(&["-f", "tests/makefiles/graph/indirect_cycle.mk", "a"]);
+        assert_eq!(code, Some(8), "expected a clean cycle diagnostic");
+    }
+
+    // Audit #30: POSIX 105653 lets several rules name one target, with
+    // prerequisites accumulating. Only the first was used, so `b` never built
+    // and the recipe never ran -- silently, with exit 0.
+    #[test]
+    fn prerequisites_accumulate_across_rules() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/graph/split_rules.mk", "all"]);
+        assert!(stdout.contains("BUILT-A"), "stdout: {stdout}");
+        assert!(stdout.contains("BUILT-B"), "stdout: {stdout}");
+        assert!(stdout.contains("done"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+
+    // Audit #31: a target reachable by two paths was built once per path.
+    #[test]
+    fn a_shared_prerequisite_builds_once() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/graph/diamond.mk", "all"]);
+        assert_eq!(stdout.matches("SHARED").count(), 1, "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+
+    // Audit #29: and under -j two shells ran that recipe *concurrently*, which
+    // is a data race on whatever the recipe writes.
+    #[test]
+    fn a_shared_prerequisite_builds_once_under_dash_j() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/graph/diamond.mk", "-j4", "all"]);
+        assert_eq!(stdout.matches("SHARED").count(), 1, "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+}

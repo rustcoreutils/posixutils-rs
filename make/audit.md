@@ -46,25 +46,34 @@ wrong build.
   `split_rule_line` splits every `<blank>`-separated word left of the first
   `:` into a target. Tests `test_multiple_targets_per_rule`,
   `scan::accepts_multiple_targets`.
-- [ ] **#28 — An indirect dependency cycle overflows the stack.** `lib.rs`.
-  `_are_prerequisites_recursive` seeds `visited`/`stack` with the root and never
-  inserts during the DFS, so only cycles returning to the root are caught.
-  `a: b` / `b: c` / `c: b` → `thread 'main' has overflowed its stack / fatal
-  runtime error`, exit 134. `RecursivePrerequisite` is unreachable otherwise.
-- [ ] **#29 — A shared prerequisite is built repeatedly, and concurrently under
-  `-j`.** `lib.rs`. There is no "already built" set. Diamond `all: x y`,
-  `x: shared`, `y: shared`: the `shared` recipe runs twice serially, and under
-  `-j4` two shells run it simultaneously. Two processes writing the same output
-  file corrupts the target.
-- [ ] **#30 — Only the first rule for a target is used; later ones are silently
-  dropped.** `lib.rs` `rule_by_target_name`. POSIX allows a target's
-  prerequisites to be split across rules. `all: a` then `all: b` + `echo done`
-  builds only `a`; `b` is never built and `echo done` never runs. Exit 0.
-- [ ] **#31 — `get_newer_prerequisites` has no memoization; DAG traversal is
-  exponential.** `lib.rs`. Each prerequisite re-walks the whole subgraph. A
-  23-node diamond chain (`n{i}: n{i+1} n{i+1}`) does not finish in 30 s where
-  GNU make is instantaneous. With #29, any makefile with shared headers is
-  unusable.
+- [x] **#28 — An indirect dependency cycle overflows the stack.** ✓ fixed
+  2026-08-27 (P4). `graph::find_cycle` is an iterative DFS with an explicit
+  stack that inserts into its on-stack and done sets as it walks, so a cycle
+  anywhere in the graph is reported rather than only one passing back through
+  the root. `a: b` / `b: c` / `c: b` now exits 8 with
+  `recursive prerequisite found trying to build 'b'`. Tests
+  `indirect_cycle_not_through_the_root_is_found`, `deep_chain_does_not_overflow`
+  (10,000 deep), `indirect_cycle_is_diagnosed_not_a_stack_overflow`.
+- [x] **#29 — A shared prerequisite is built repeatedly, and concurrently under
+  `-j`.** ✓ fixed 2026-08-27 (P4). `graph::Ledger` moves a target through
+  `Unvisited → Running → Finished` under one mutex, so only the thread that
+  observes it unclaimed runs the recipe; a second arrival either replays the
+  recorded outcome or waits on a condvar. The wait cannot deadlock because the
+  cycle check runs before any worker is spawned. Tests
+  `only_one_thread_builds_a_target`, `a_shared_prerequisite_builds_once`,
+  `a_shared_prerequisite_builds_once_under_dash_j`.
+- [x] **#30 — Only the first rule for a target is used; later ones are silently
+  dropped.** ✓ fixed 2026-08-27 (P4). Rules naming the same target are merged at
+  construction via `Rule::absorb`: prerequisites accumulate (not deduplicated —
+  `$+` keeps duplicates), and a second rule carrying commands warns and wins, as
+  GNU does. POSIX 105653 permits only one commanded rule but attaches no "shall
+  be an error", so refusing the makefile would reject input other makes accept.
+  Test `prerequisites_accumulate_across_rules`.
+- [x] **#31 — `get_newer_prerequisites` has no memoization; DAG traversal is
+  exponential.** ✓ fixed 2026-08-27 (P4). The ledger records each target's
+  outcome, so a second visit replays it instead of re-walking the subtree. The
+  23-node diamond chain that did not finish in 30 s now completes in 0.01 s,
+  matching GNU Make 4.3.
 - [x] **#32 — Both preprocessor fixpoint loops are unbounded and hang.** ✓ fixed
   2026-08-27 (P2). Include splicing is capped at 64 levels (POSIX 105611 requires
   at least 16), so a self-including file reports a cycle instead of looping;
@@ -194,10 +203,9 @@ wrong build.
   `"variables.mk"`.** ✓ fixed 2026-08-27 (P1). Both `dbg!()` calls and the
   `parse_include` scaffolding were deleted with the old parser, as recommended
   rather than repaired.
-- [ ] **#45 — `Target::new` calls `String::leak()` on every construction.**
-  `rule/target.rs`. `build_target` constructs one per visit, so the leak scales
-  with traversal count rather than with distinct targets — and #31 makes that
-  count exponential.
+- [x] **#45 — `Target::new` calls `String::leak()` on every construction.**
+  ✓ fixed 2026-08-27 (P4). `Target` owns `String`s and `name()`/`AsRef<str>`
+  borrow from `&self`, so nothing leaks per visit. No test changed.
 - [ ] **#46 — `find_files_with_extension` builds a walk queue it never pushes
   to.** `rule.rs`. The `VecDeque` is initialized and drained but never appended
   to, so the loop always runs exactly once. The structure implies a recursive

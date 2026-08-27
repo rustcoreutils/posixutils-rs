@@ -9,13 +9,13 @@
 
 pub mod config;
 pub mod error_code;
+pub mod graph;
 pub mod parser;
 pub mod rule;
 pub mod signal_handler;
 pub mod special_target;
 
 use std::{
-    collections::HashSet,
     fs::{self},
     time::{Duration, SystemTime},
 };
@@ -86,7 +86,23 @@ pub struct Make {
     /// Token pool bounding concurrent target updates under `-j` (maxjobs - 1
     /// tokens; the inline build needs no token).
     pool: TokenPool,
+    /// Which targets are built, building, or failed. Gives single-build under
+    /// `-j` and memoization across repeated visits.
+    ledger: graph::Ledger,
     pub config: Config,
+}
+
+impl graph::Edges for Make {
+    fn prerequisites_of(&self, target: &str) -> Vec<String> {
+        match self.rule_by_target_name(target) {
+            Some(rule) => rule
+                .prerequisites()
+                .map(|p| p.as_ref().to_string())
+                .filter(|p| p != WAIT_TARGET)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
 }
 
 impl Make {
@@ -160,11 +176,26 @@ impl Make {
 
     /// Builds the target with the given name.
     ///
+    /// The ledger makes this idempotent: a target reachable by several paths is
+    /// built once, its outcome replayed to every later visit, and under `-j` a
+    /// second thread arriving mid-build waits rather than running the recipe a
+    /// second time (audit #29, #31).
+    ///
     /// # Returns
     /// - Ok(true) if the target was built.
     /// - Ok(false) if the target was already up to date.
     /// - Err(_) if any errors occur.
     pub fn build_target(&self, name: impl AsRef<str>) -> Result<bool, ErrorCode> {
+        match self.ledger.claim(name.as_ref()) {
+            graph::Claim::Done(outcome) => return outcome.into_result(),
+            graph::Claim::Build => {}
+        }
+        let result = self.build_target_uncached(name.as_ref());
+        self.ledger.finish(name.as_ref(), &result);
+        result
+    }
+
+    fn build_target_uncached(&self, name: impl AsRef<str>) -> Result<bool, ErrorCode> {
         // Search both regular rules and inference rules
         let rule = match self.rule_by_target_name(&name) {
             Some(rule) => rule,
@@ -218,10 +249,8 @@ impl Make {
     /// - Ok(false) if the rule was already up to date.
     /// - Err(_) if any errors occur.
     fn run_rule_with_prerequisites(&self, rule: &Rule, target: &Target) -> Result<bool, ErrorCode> {
-        if self.are_prerequisites_recursive(target) {
-            return Err(RecursivePrerequisite {
-                origin: target.to_string(),
-            });
+        if let Some(origin) = graph::find_cycle(self, target.as_ref()) {
+            return Err(RecursivePrerequisite { origin });
         }
 
         let newer_prerequisites = self.get_newer_prerequisites(target);
@@ -369,42 +398,6 @@ impl Make {
             prerequisites.collect()
         }
     }
-
-    /// Checks if the target has recursive prerequisites.
-    /// Returns true if the target has recursive prerequisites.
-    fn are_prerequisites_recursive(&self, target: impl AsRef<str>) -> bool {
-        let mut visited = HashSet::from([target.as_ref()]);
-        let mut stack = HashSet::from([target.as_ref()]);
-
-        self._are_prerequisites_recursive(target.as_ref(), &mut visited, &mut stack)
-    }
-
-    /// A helper function to check if the target has recursive prerequisites.
-    /// Uses DFS to check for recursive prerequisites.
-    fn _are_prerequisites_recursive(
-        &self,
-        target: &str,
-        visited: &mut HashSet<&str>,
-        stack: &mut HashSet<&str>,
-    ) -> bool {
-        let Some(rule) = self.rule_by_target_name(target) else {
-            return false;
-        };
-
-        let prerequisites = rule.prerequisites();
-
-        for prerequisite in prerequisites {
-            if (!visited.contains(prerequisite.as_ref())
-                && self._are_prerequisites_recursive(prerequisite.as_ref(), visited, stack))
-                || stack.contains(prerequisite.as_ref())
-            {
-                return true;
-            }
-        }
-
-        stack.remove(target);
-        false
-    }
 }
 
 impl TryFrom<(Makefile, Config)> for Make {
@@ -444,6 +437,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             macros,
             default_rule: None,
             pool,
+            ledger: graph::Ledger::new(),
             config,
         };
 
@@ -465,7 +459,18 @@ impl TryFrom<(Makefile, Config)> for Make {
             } else if InferenceTarget::try_from((target.clone(), make.config.clone())).is_ok() {
                 make.inference_rules.push(rule);
             } else {
-                make.rules.push(rule);
+                // POSIX 105653: several rules may name the same target, with
+                // prerequisites accumulating. The old lookup returned the first
+                // match and silently dropped the rest (audit #30).
+                let name = target.to_string();
+                match make
+                    .rules
+                    .iter_mut()
+                    .find(|existing| existing.targets().any(|t| t.as_ref() == name))
+                {
+                    Some(existing) => existing.absorb(rule),
+                    None => make.rules.push(rule),
+                }
             }
         }
 

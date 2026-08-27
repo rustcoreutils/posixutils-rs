@@ -13,7 +13,7 @@
 //! is left is rule lines and command lines, which this walks one line at a
 //! time.
 
-use super::preprocessor::{is_include_line, is_macro_definition, preprocess};
+use super::preprocessor::{is_include_line, is_macro_definition, preprocess, VPathEntry};
 use super::scan::{self, RuleLine};
 use crate::Macro;
 use std::fmt::{self, Display, Formatter};
@@ -84,6 +84,8 @@ impl Display for Rule {
 pub struct Makefile {
     rules: Vec<Rule>,
     macros: Vec<Macro>,
+    /// `vpath` search paths, in declaration order.
+    vpaths: Vec<VPathEntry>,
 }
 
 impl Makefile {
@@ -95,9 +97,13 @@ impl Makefile {
         &self.macros
     }
 
-    /// Consume the makefile, yielding its rules and macros.
-    pub fn into_parts(self) -> (Vec<Rule>, Vec<Macro>) {
-        (self.rules, self.macros)
+    pub fn vpaths(&self) -> &[VPathEntry] {
+        &self.vpaths
+    }
+
+    /// Consume the makefile, yielding its rules, macros and search paths.
+    pub fn into_parts(self) -> (Vec<Rule>, Vec<Macro>, Vec<VPathEntry>) {
+        (self.rules, self.macros, self.vpaths)
     }
 }
 
@@ -201,7 +207,11 @@ impl Builder {
         }
     }
 
-    fn finish(mut self, macros: Vec<Macro>) -> Result<Makefile, ParseError> {
+    fn finish(
+        mut self,
+        macros: Vec<Macro>,
+        vpaths: Vec<VPathEntry>,
+    ) -> Result<Makefile, ParseError> {
         self.close();
         // A makefile that defines no rules at all cannot be built from.
         if self.errors.is_empty() && self.rules.is_empty() {
@@ -211,6 +221,7 @@ impl Builder {
             Ok(Makefile {
                 rules: self.rules,
                 macros,
+                vpaths,
             })
         } else {
             Err(ParseError(self.errors))
@@ -220,10 +231,14 @@ impl Builder {
 
 /// Parse preprocessed makefile text into rules.
 pub fn parse(text: &str) -> Result<Makefile, ParseError> {
-    parse_with_macros(text, Vec::new())
+    parse_scanned(text, Vec::new(), Vec::new())
 }
 
-fn parse_with_macros(text: &str, macros: Vec<Macro>) -> Result<Makefile, ParseError> {
+fn parse_scanned(
+    text: &str,
+    macros: Vec<Macro>,
+    vpaths: Vec<VPathEntry>,
+) -> Result<Makefile, ParseError> {
     let mut builder = Builder::default();
 
     for (idx, raw) in text.split('\n').enumerate() {
@@ -236,14 +251,14 @@ fn parse_with_macros(text: &str, macros: Vec<Macro>) -> Result<Makefile, ParseEr
         }
     }
 
-    builder.finish(macros)
+    builder.finish(macros, vpaths)
 }
 
 impl FromStr for Makefile {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (processed, macros) = preprocess(s).map_err(|e| ParseError(vec![e.to_string()]))?;
-        parse_with_macros(&processed, macros)
+        let scanned = preprocess(s).map_err(|e| ParseError(vec![e.to_string()]))?;
+        parse_scanned(&scanned.text, scanned.macros, scanned.vpaths)
     }
 }

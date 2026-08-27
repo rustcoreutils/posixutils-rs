@@ -29,10 +29,10 @@ all:
 all:
 	var ok var ok ok
 "#;
-        let Ok((result, _macros)) = preprocess(MACROS) else {
+        let Ok(scanned) = preprocess(MACROS) else {
             panic!("Test must be preprocessed without an error")
         };
-        assert_eq!(result, EXPECTED);
+        assert_eq!(scanned.text, EXPECTED);
     }
 
     // Audit #6: `$(VAR:subst1=subst2)` suffix substitution.
@@ -40,7 +40,7 @@ all:
     fn test_subst_suffix() {
         let result = preprocess("SRC = a.c b.c foo.c\nall:\n\t@echo $(SRC:.c=.o)\n")
             .unwrap()
-            .0;
+            .text;
         assert!(result.contains("@echo a.o b.o foo.o"), "got: {result:?}");
     }
 
@@ -49,7 +49,7 @@ all:
     fn test_subst_pattern() {
         let result = preprocess("O = a.o b.o\nall:\n\t@echo $(O:%.o=%.x)\n")
             .unwrap()
-            .0;
+            .text;
         assert!(result.contains("@echo a.x b.x"), "got: {result:?}");
     }
 
@@ -59,7 +59,7 @@ all:
     fn test_continuation_macro() {
         let result = preprocess("FOO = a\\\nb\nall:\n\t@echo $(FOO)\n")
             .unwrap()
-            .0;
+            .text;
         assert!(result.contains("@echo a b"), "got: {result:?}");
     }
 
@@ -67,7 +67,7 @@ all:
     // (the leading tab of the continuation is removed).
     #[test]
     fn test_continuation_recipe() {
-        let result = preprocess("all:\n\t@echo one \\\n\ttwo\n").unwrap().0;
+        let result = preprocess("all:\n\t@echo one \\\n\ttwo\n").unwrap().text;
         assert!(result.contains("@echo one two"), "got: {result:?}");
     }
 
@@ -77,7 +77,7 @@ all:
     fn test_internal_macros_passthrough() {
         let result = preprocess("all: a b\n\t@echo $^ $+ $(@D) $(@F) ${?F}\n")
             .unwrap()
-            .0;
+            .text;
         assert!(
             result.contains("@echo $^ $+ $(@D) $(@F) ${?F}"),
             "got: {result:?}"
@@ -90,7 +90,7 @@ all:
     fn test_dash_include_missing_ignored() {
         let result = preprocess("-include /nonexistent_xyz.mk\nall:\n\t@echo ok\n");
         assert!(result.is_ok(), "got: {result:?}");
-        assert!(result.unwrap().0.contains("@echo ok"));
+        assert!(result.unwrap().text.contains("@echo ok"));
     }
 
     #[test]
@@ -105,7 +105,7 @@ all:
     fn test_includedir_not_mistaken_for_include() {
         let result = preprocess("includedir = /usr\nall:\n\t@echo $(includedir)\n")
             .unwrap()
-            .0;
+            .text;
         assert!(result.contains("@echo /usr"), "got: {result:?}");
     }
 
@@ -126,7 +126,7 @@ all:
     }
 
     fn macros_of(source: &str) -> Vec<(String, String)> {
-        preprocess(source).expect("must preprocess").1
+        preprocess(source).expect("must preprocess").macros
     }
 
     fn value_of(source: &str, name: &str) -> String {
@@ -203,7 +203,7 @@ all:
         let source = format!("TOP = {}\ninclude $(TOP)/inc.mk\n", dir.display());
         let text = preprocess(&source)
             .expect("include with a macro in its path")
-            .0;
+            .text;
         assert!(text.contains("from-include"), "got: {text:?}");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -374,13 +374,13 @@ mod conditionals {
     use posixutils_make::parser::preprocessor::preprocess;
 
     fn text(source: &str) -> String {
-        preprocess(source).expect("must preprocess").0
+        preprocess(source).expect("must preprocess").text
     }
 
     fn value(source: &str, name: &str) -> String {
         preprocess(source)
             .expect("must preprocess")
-            .1
+            .macros
             .into_iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v)
@@ -531,7 +531,7 @@ mod functions {
 
     fn echoed(body: &str) -> String {
         let src = format!("all:\n\t@echo [{body}]\n");
-        let out = preprocess(&src).expect("must preprocess").0;
+        let out = preprocess(&src).expect("must preprocess").text;
         let start = out.find('[').expect("marker");
         let end = out.rfind(']').expect("marker");
         out[start + 1..end].to_string()
@@ -589,7 +589,7 @@ mod functions {
     #[test]
     fn call_binds_positional_arguments() {
         let src = "greet = hi $(1) and $(2)\nall:\n\t@echo [$(call greet,a,b)]\n";
-        let out = preprocess(src).expect("must preprocess").0;
+        let out = preprocess(src).expect("must preprocess").text;
         assert!(out.contains("[hi a and b]"), "got: {out:?}");
     }
 
@@ -612,7 +612,7 @@ mod functions {
         std::fs::write(dir.join("two.c"), "").unwrap();
         std::fs::write(dir.join("skip.h"), "").unwrap();
         let src = format!("all:\n\t@echo [$(wildcard {}/*.c)]\n", dir.display());
-        let out = preprocess(&src).expect("must preprocess").0;
+        let out = preprocess(&src).expect("must preprocess").text;
         assert!(out.contains("one.c"), "got: {out:?}");
         assert!(out.contains("two.c"), "got: {out:?}");
         assert!(!out.contains("skip.h"), "got: {out:?}");
@@ -636,5 +636,86 @@ mod functions {
     #[test]
     fn an_unknown_function_name_is_refused() {
         assert!(preprocess("all:\n\t@echo $(nosuchthing foo)\n").is_err());
+    }
+}
+
+// The `vpath` directive: per-pattern prerequisite search paths.
+mod vpath {
+    use posixutils_make::parser::preprocessor::preprocess;
+
+    fn entries(source: &str) -> Vec<(String, Vec<String>)> {
+        preprocess(source)
+            .expect("must preprocess")
+            .vpaths
+            .into_iter()
+            .map(|e| (e.pattern, e.dirs))
+            .collect()
+    }
+
+    #[test]
+    fn add_records_a_pattern_and_its_directories() {
+        let got = entries("vpath %.c src:lib\nall:\n\techo hi\n");
+        assert_eq!(
+            got,
+            vec![(
+                "%.c".to_string(),
+                vec!["src".to_string(), "lib".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn blank_separated_directories_are_accepted_too() {
+        let got = entries("vpath %.c src lib\nall:\n\techo hi\n");
+        assert_eq!(got[0].1, vec!["src".to_string(), "lib".to_string()]);
+    }
+
+    // Repeating the directive for a pattern appends, as GNU does.
+    #[test]
+    fn repeating_a_pattern_appends() {
+        let got = entries("vpath %.c src\nvpath %.c lib\nall:\n\techo hi\n");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, vec!["src".to_string(), "lib".to_string()]);
+    }
+
+    #[test]
+    fn several_patterns_are_kept_in_order() {
+        let got = entries("vpath %.c src\nvpath %.h hdr\nall:\n\techo hi\n");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "%.c");
+        assert_eq!(got[1].0, "%.h");
+    }
+
+    #[test]
+    fn pattern_alone_clears_that_pattern() {
+        let got = entries("vpath %.c src\nvpath %.h hdr\nvpath %.c\nall:\n\techo hi\n");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "%.h");
+    }
+
+    #[test]
+    fn bare_vpath_clears_everything() {
+        let got = entries("vpath %.c src\nvpath %.h hdr\nvpath\nall:\n\techo hi\n");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn the_argument_is_macro_expanded() {
+        let got = entries("D = src\nvpath %.c $(D)\nall:\n\techo hi\n");
+        assert_eq!(got[0].1, vec!["src".to_string()]);
+    }
+
+    // A dead conditional branch must not record its vpath.
+    #[test]
+    fn an_inactive_branch_records_nothing() {
+        let got = entries("ifeq (a,b)\nvpath %.c src\nendif\nall:\n\techo hi\n");
+        assert!(got.is_empty());
+    }
+
+    // `vpathological:` is a target, not the directive.
+    #[test]
+    fn a_longer_word_is_not_the_directive() {
+        let got = entries("vpathological: dep\n\techo hi\n");
+        assert!(got.is_empty());
     }
 }

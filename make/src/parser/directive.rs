@@ -36,6 +36,9 @@ pub(crate) enum Directive {
     Define(String),
     /// `endef` — ends one.
     EndDef,
+    /// `vpath` with its raw argument text: a pattern and its directories, a
+    /// pattern alone (clear that pattern), or nothing (clear every pattern).
+    VPath(String),
 }
 
 /// Split a directive line into its keyword and the rest.
@@ -86,6 +89,7 @@ pub(crate) fn parse_directive(line: &str) -> Option<Directive> {
         "endif" => Some(Directive::EndIf),
         "define" => Some(Directive::Define(define_name(rest))),
         "endef" => Some(Directive::EndDef),
+        "vpath" => Some(Directive::VPath(rest.to_string())),
         _ => None,
     }
 }
@@ -210,6 +214,24 @@ mod tests {
             Some(Directive::Define("BODY".to_string()))
         );
         assert_eq!(parse_directive("endef"), Some(Directive::EndDef));
+    }
+
+    #[test]
+    fn recognizes_vpath_forms() {
+        assert_eq!(
+            parse_directive("vpath %.c src:lib"),
+            Some(Directive::VPath("%.c src:lib".to_string()))
+        );
+        assert_eq!(
+            parse_directive("vpath %.c"),
+            Some(Directive::VPath("%.c".to_string()))
+        );
+        assert_eq!(
+            parse_directive("vpath"),
+            Some(Directive::VPath(String::new()))
+        );
+        // `vpathological` is not the directive.
+        assert_eq!(parse_directive("vpathological: dep"), None);
     }
 
     #[test]

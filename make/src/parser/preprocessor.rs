@@ -667,6 +667,25 @@ pub(crate) fn is_include_line(line: &str) -> bool {
     is_include_directive(line)
 }
 
+/// One `vpath` entry: a `%` pattern and the directories searched for it.
+///
+/// Not POSIX -- the standard has only the blanket `VPATH` macro -- but the
+/// per-pattern form is how a makefile says "sources here, headers there".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VPathEntry {
+    pub pattern: String,
+    pub dirs: Vec<String>,
+}
+
+/// What the reader produced: the text the rule parser sees, plus the state it
+/// consumed on the way.
+#[derive(Debug, Default)]
+pub struct Preprocessed {
+    pub text: String,
+    pub macros: Vec<Macro>,
+    pub vpaths: Vec<VPathEntry>,
+}
+
 /// One level of `if.../else/endif` nesting.
 struct Branch {
     /// Whether this level's currently selected arm is live.
@@ -693,6 +712,7 @@ struct Reader {
     branches: Vec<Branch>,
     out: String,
     depth: usize,
+    vpaths: Vec<VPathEntry>,
 }
 
 impl Reader {
@@ -702,6 +722,7 @@ impl Reader {
             branches: Vec::new(),
             out: String::new(),
             depth: 0,
+            vpaths: Vec::new(),
         }
     }
 
@@ -830,6 +851,50 @@ impl Reader {
             .ok_or_else(|| PreprocError::UnmatchedConditional("endif".to_string()))
     }
 
+    /// `vpath` with no arguments: forget every search path.
+    fn clear_all_vpaths(&mut self) {
+        self.vpaths.clear();
+    }
+
+    /// `vpath PATTERN`: forget the search path for one pattern.
+    fn clear_vpath(&mut self, pattern: &str) {
+        self.vpaths.retain(|entry| entry.pattern != pattern);
+    }
+
+    /// `vpath PATTERN DIRS`: add directories for a pattern, appending to any
+    /// already recorded for it. Directories are `:`- or blank-separated.
+    fn add_vpath(&mut self, pattern: &str, dirs: &str) {
+        let dirs: Vec<String> = dirs
+            .split([':', ' ', '\t'])
+            .filter(|d| !d.is_empty())
+            .map(String::from)
+            .collect();
+        if dirs.is_empty() {
+            return;
+        }
+        match self.vpaths.iter_mut().find(|e| e.pattern == pattern) {
+            Some(entry) => entry.dirs.extend(dirs),
+            None => self.vpaths.push(VPathEntry {
+                pattern: pattern.to_string(),
+                dirs,
+            }),
+        }
+    }
+
+    /// Dispatch a `vpath` directive to one of its three forms.
+    fn handle_vpath(&mut self, args: &str) -> Result<()> {
+        let expanded = self.expand(args)?;
+        let trimmed = expanded.trim();
+        match trimmed.split_once([' ', '\t']) {
+            // `vpath PATTERN DIRS`
+            Some((pattern, dirs)) => self.add_vpath(pattern, dirs),
+            // `vpath PATTERN` / bare `vpath`
+            None if trimmed.is_empty() => self.clear_all_vpaths(),
+            None => self.clear_vpath(trimmed),
+        }
+        Ok(())
+    }
+
     /// Capture a `define ... endef` body, returning the lines consumed.
     fn capture_define(&mut self, name: &str, lines: &[&str], start: usize) -> usize {
         let mut body: Vec<&str> = Vec::new();
@@ -900,6 +965,12 @@ impl Reader {
                     self.handle_endif()?;
                     self.drop_line();
                 }
+                Directive::VPath(args) => {
+                    if self.active() {
+                        self.handle_vpath(&args)?;
+                    }
+                    self.drop_line();
+                }
                 other => {
                     self.push_branch(&other)?;
                     self.drop_line();
@@ -968,12 +1039,16 @@ fn expand_command_lines(text: &str, table: &HashMap<String, String>) -> Result<S
 /// Resolve directives, includes and macros, returning the text the rule parser
 /// sees and the macro definitions it must not (they are consumed here, but
 /// `Make` needs them for `SHELL` and for the recipe environment).
-pub fn preprocess(source: &str) -> Result<(String, Vec<Macro>)> {
+pub fn preprocess(source: &str) -> Result<Preprocessed> {
     let mut reader = Reader::new();
     reader.read(&fold_continuations(source))?;
     if !reader.branches.is_empty() {
         return Err(PreprocError::UnmatchedConditional("endif".to_string()));
     }
     let text = expand_command_lines(&reader.out, reader.table.values())?;
-    Ok((text, reader.table.into_macros()))
+    Ok(Preprocessed {
+        text,
+        macros: reader.table.into_macros(),
+        vpaths: reader.vpaths,
+    })
 }

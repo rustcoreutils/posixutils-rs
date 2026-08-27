@@ -190,9 +190,17 @@ wrong build.
   inference-rule matching, and `$<` names where the file was actually found —
   byte-identical to GNU on the probe. _Residual: the `vpath` **directive** with
   its per-pattern search paths is still unimplemented; recorded as **#55**._
-- [ ] **#55 — The `vpath` directive is unimplemented.** `vpath %.c src` sets a
-  search path for a pattern rather than globally. The `VPATH` macro (#53) covers
-  the common case; this is the finer-grained form.
+- [x] **#55 — The `vpath` directive is unimplemented.** ✓ fixed 2026-08-27.
+  All three GNU forms: `vpath PATTERN DIRS` appends directories for a pattern,
+  `vpath PATTERN` clears that pattern, and a bare `vpath` clears every pattern.
+  Entries are recorded by the reader in declaration order and carried through to
+  `Make`; `resolve_vpath` consults them before the blanket `VPATH` macro, first
+  matching pattern winning. Verified against GNU Make 4.3 on all three forms.
+  Tests: nine in `parser.rs` `mod vpath`, plus
+  `vpath_directive_finds_a_prerequisite`.
+  _Note: `vpath` was previously not recognized at all — it fell through to being
+  treated as an ordinary line, so a makefile using it was silently mis-parsed._
+
 - [x] **#54 — The built-in inference rules are display strings, not rules.**
   ✓ fixed 2026-08-27 (P7). POSIX's default rules (`.c.o`, `.c`, `.sh`, `.y.o`,
   `.l.o`, `.y.c`, `.l.c`, `.c.a`) and the macros they use (`CC`, `CFLAGS`, `AR`,

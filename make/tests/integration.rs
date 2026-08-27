@@ -1548,6 +1548,22 @@ mod builtins {
         let _ = fs::remove_dir_all("vpath_src");
     }
 
+    // Audit #55: the `vpath` directive gives a search path per pattern, unlike
+    // the blanket VPATH macro. `$<` must name where the file was found.
+    #[test]
+    fn vpath_directive_finds_a_prerequisite() {
+        let _ = fs::create_dir_all("vpath_dir_probe");
+        let _ = fs::write("vpath_dir_probe/vpd_probe.c", "");
+        let (stdout, code) = run(&["-f", "tests/makefiles/vpath/directive.mk", "all"]);
+        assert!(
+            stdout.contains("IN=vpath_dir_probe/vpd_probe.c"),
+            "stdout: {stdout}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_file("vpd_probe.o");
+        let _ = fs::remove_dir_all("vpath_dir_probe");
+    }
+
     // Audit #54: the default rules existed only as display strings in the -p
     // table, so `make f.o` with an f.c present reported "no target" -- every
     // makefile relying on the built-in .c.o rule, which is most of them.

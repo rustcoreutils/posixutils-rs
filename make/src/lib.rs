@@ -20,7 +20,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use parser::Makefile;
+use parser::{Makefile, VPathEntry};
 
 /// An owned macro definition `(name, value)`. Owning the data (rather than
 /// holding a rowan AST node) keeps `Make` `Send`/`Sync` for parallel builds.
@@ -89,6 +89,8 @@ pub struct Make {
     /// Which targets are built, building, or failed. Gives single-build under
     /// `-j` and memoization across repeated visits.
     ledger: graph::Ledger,
+    /// `vpath` search paths, in declaration order.
+    vpaths: Vec<VPathEntry>,
     pub config: Config,
 }
 
@@ -145,13 +147,27 @@ impl Make {
         if name.contains('/') || std::path::Path::new(name).exists() {
             return name.to_string();
         }
-        for dir in self.vpath_dirs() {
-            let candidate = format!("{dir}/{name}");
-            if std::path::Path::new(&candidate).exists() {
-                return candidate;
+        // A `vpath` pattern is more specific than the blanket `VPATH` macro, so
+        // it is consulted first; the first matching pattern wins, as GNU does.
+        if let Some(found) = self.search_vpath_patterns(name) {
+            return found;
+        }
+        search_dirs(&self.vpath_dirs(), name).unwrap_or_else(|| name.to_string())
+    }
+
+    /// Look `name` up in the directories of the first `vpath` pattern it
+    /// matches.
+    fn search_vpath_patterns(&self, name: &str) -> Option<String> {
+        for entry in &self.vpaths {
+            if rule::pattern_stem(&entry.pattern, name).is_none() {
+                continue;
+            }
+            let dirs: Vec<&str> = entry.dirs.iter().map(String::as_str).collect();
+            if let Some(found) = search_dirs(&dirs, name) {
+                return Some(found);
             }
         }
-        name.to_string()
+        None
     }
 
     /// Find a `%` pattern rule matching `name` and instantiate it for that
@@ -499,6 +515,13 @@ impl Make {
     }
 }
 
+/// Return `name` found under one of `dirs`, if any.
+fn search_dirs(dirs: &[&str], name: &str) -> Option<String> {
+    dirs.iter()
+        .map(|dir| format!("{dir}/{name}"))
+        .find(|candidate| std::path::Path::new(candidate).exists())
+}
+
 /// The default macros and inference rules POSIX requires make to start with.
 ///
 /// These existed only as display strings in the `-p` dump table, so `make f.o`
@@ -559,7 +582,7 @@ impl TryFrom<(Makefile, Config)> for Make {
         // are available when determining whether a rule like `.txt.out:` is an
         // inference rule.
 
-        let (parsed_rules, macros) = makefile.into_parts();
+        let (parsed_rules, macros, vpaths) = makefile.into_parts();
 
         let mut suffixes_rules = vec![];
         let mut remaining_parsed_rules = vec![];
@@ -588,6 +611,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             default_rule: None,
             pool,
             ledger: graph::Ledger::new(),
+            vpaths,
             config,
         };
 
@@ -652,7 +676,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             }
             builtin.push_str(&BUILTIN_RULES.replace("\\t", "\t"));
             if let Ok(parsed) = builtin.parse::<Makefile>() {
-                let (rules, _) = parsed.into_parts();
+                let (rules, _, _) = parsed.into_parts();
                 for parsed_rule in rules {
                     let rule = Rule::from(parsed_rule);
                     let Some(target) = rule.targets().next() else {

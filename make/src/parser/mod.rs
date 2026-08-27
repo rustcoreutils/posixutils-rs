@@ -13,3 +13,4 @@ pub mod preprocessor;
 pub(crate) mod scan;
 
 pub use parse::{Makefile, Rule};
+pub use preprocessor::VPathEntry;

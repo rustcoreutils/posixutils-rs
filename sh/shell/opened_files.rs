@@ -25,6 +25,11 @@ pub const STDERR_FILENO: u32 = libc::STDERR_FILENO as u32;
 
 pub type RedirectionResult = Result<(), CommandExecutionError>;
 
+/// POSIX: a redirection that creates a file requests mode 0666; the process
+/// umask, applied by the kernel, is what narrows it. Passing the shell's own
+/// mask here instead would both use the wrong bits and apply the mask twice.
+const FILE_CREATION_MODE: u32 = 0o666;
+
 #[derive(Clone)]
 pub enum OpenedFile {
     Stdin,
@@ -33,6 +38,10 @@ pub enum OpenedFile {
     ReadFile(Rc<File>),
     WriteFile(Rc<File>),
     ReadWriteFile(Rc<File>),
+    /// `n>&-` / `n<&-`: the descriptor is closed for the command. Removing the
+    /// entry from the table is not enough — an absent descriptor is simply
+    /// inherited from the shell.
+    Closed,
     /// A here-document. The remaining text is shared between clones of
     /// `OpenedFiles`, the way a real descriptor shares its file offset, so
     /// that `read` in a loop consumes successive lines.
@@ -69,7 +78,7 @@ impl OpenedFiles {
                     // Atomically create the file with O_CREAT|O_EXCL so the
                     // existence check and creation cannot race.
                     match File::options()
-                        .mode(shell.umask)
+                        .mode(FILE_CREATION_MODE)
                         .write(true)
                         .create_new(true)
                         .open(target)
@@ -87,7 +96,7 @@ impl OpenedFiles {
                                 )));
                             }
                             File::options()
-                                .mode(shell.umask)
+                                .mode(FILE_CREATION_MODE)
                                 .write(true)
                                 .create(true)
                                 .open(target)
@@ -97,7 +106,7 @@ impl OpenedFiles {
                     }
                 } else {
                     File::options()
-                        .mode(shell.umask)
+                        .mode(FILE_CREATION_MODE)
                         .write(true)
                         .truncate(!append)
                         .append(append)
@@ -117,7 +126,7 @@ impl OpenedFiles {
                     file_descriptor.unwrap_or(STDIN_FILENO)
                 };
                 if target == "-" {
-                    self.opened_files.remove(&dest_fd);
+                    self.opened_files.insert(dest_fd, OpenedFile::Closed);
                 } else {
                     let duplicate_input = *kind == IORedirectionKind::DuplicateInput;
                     let source_fd = target.parse::<u32>().map_err(|_| {
@@ -157,7 +166,7 @@ impl OpenedFiles {
             }
             IORedirectionKind::RedirectInput => {
                 let file = File::options()
-                    .mode(shell.umask)
+                    .mode(FILE_CREATION_MODE)
                     .read(true)
                     .open(target)
                     .map_err(io_err_to_redirection_err)?;
@@ -167,7 +176,7 @@ impl OpenedFiles {
             }
             IORedirectionKind::OpenRW => {
                 let file = File::options()
-                    .mode(shell.umask)
+                    .mode(FILE_CREATION_MODE)
                     .read(true)
                     .write(true)
                     .create(true)
@@ -221,9 +230,10 @@ impl OpenedFiles {
             }
             // The descriptor was closed, or redirected to something that
             // cannot be written to (a read-only file, a here-document).
-            Some(OpenedFile::ReadFile(_)) | Some(OpenedFile::HereDocument(_)) | None => {
-                Err(std::io::Error::from_raw_os_error(libc::EBADF))
-            }
+            Some(OpenedFile::ReadFile(_))
+            | Some(OpenedFile::HereDocument(_))
+            | Some(OpenedFile::Closed)
+            | None => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
             // `exec 1<&0`: writing goes to the shell's stdin descriptor, which
             // succeeds when it is open for writing too (a terminal).
             Some(OpenedFile::Stdin) => write(libc::STDIN_FILENO, contents.as_bytes())

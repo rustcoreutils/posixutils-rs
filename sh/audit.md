@@ -545,3 +545,39 @@ Two unit tests asserted an internal representation that changed: an empty field
 now carries no parts rather than one part holding the empty string (nothing
 downstream distinguishes them), and unquoted `$@` plants `SoftFieldEnd`.
 `${#*}`/`${#@}` remain an error; POSIX leaves the length of `*`/`@` unspecified.
+
+### Phase 5 — redirections, file descriptors, umask
+
+- [x] **Chained redirections could clobber a source before reading it.** The
+  child's descriptor setup iterated a `HashMap` and `dup2`'d in arbitrary order
+  with no collision analysis, so in `3>&1 1>&2 2>&3` — where each source is
+  another redirection's destination — the result depended on map order. Every
+  source is now duplicated above the highest destination first, then placed.
+- [x] **`2>&-` did not close anything.** The arm removed the entry from the
+  table, but an *absent* descriptor is simply inherited from the shell, so
+  `ls /nosuch 2>&-` still wrote to fd 2. There is now an explicit
+  `OpenedFile::Closed`.
+  Closing it has to happen **after** every other redirection is placed: `5<&-`
+  frees fd 5, so a later `<file` in the same command may be handed fd 5 by the
+  kernel, and closing during the placement pass took that descriptor with it.
+  That made `cat 5<file1.txt 5<&- <file1.txt` print its file or nothing
+  depending on map order — a nondeterministic result that the fixture caught
+  only intermittently.
+- [x] **A redirection created files with the execute bit set.** All five
+  `File::options()` sites passed `.mode(shell.umask)`, but `shell.umask` holds
+  the *complement* of the mask (the allowed permission bits, 0o755 by default),
+  so `> f` produced mode 755 and the mask was then applied a second time by the
+  kernel. POSIX asks for mode 0666 and lets the umask narrow it: `> f` under
+  `umask 022` now gives 644, matching dash.
+- [x] **`umask` never reached the commands the shell ran.** Nothing in the crate
+  called `libc::umask`, so the builtin updated only the shell's own bookkeeping
+  while every utility it started used the inherited mask —
+  `umask 077; touch f` gave 664. The builtin now sets the process mask, and the
+  shell seeds its own value from the inherited one instead of assuming 022.
+
+Deliberately **not** changed: a redirection error exits 1 here and in
+`bash --posix`, where dash exits 2. POSIX requires only a non-zero status.
+
+The `umask` fixture was corrected on both counts: it asserted the inherited mask
+was 022 (it varies by environment, so the script now sets one first) and it
+asserted the mode-755 behavior this phase fixes.

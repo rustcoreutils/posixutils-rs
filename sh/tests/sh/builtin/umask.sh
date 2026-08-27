@@ -1,3 +1,5 @@
+# Start from a known mask: the inherited one varies between environments.
+umask 022
 umask
 echo $?
 umask -S

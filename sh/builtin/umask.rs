@@ -121,9 +121,13 @@ impl BuiltinUtility for Umask {
                     return Err(format!("umask: invalid mask '{mask_arg}'").into());
                 }
                 shell.umask = !new_umask & 0o777;
+                // The mask must reach the process itself, or it has no effect
+                // on files created by the utilities the shell runs.
+                crate::os::umask(new_umask);
             } else {
                 // symbolic mode operates on the allowed-permission bits
                 shell.umask = apply_symbolic(shell.umask, mask_arg)?;
+                crate::os::umask(!shell.umask & 0o777);
             }
         } else {
             return Err(gettext("umask: too many arguments").into());

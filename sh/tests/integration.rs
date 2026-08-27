@@ -3054,4 +3054,70 @@ mod audit_regressions {
         expect_stdout("set --\necho \"${#}\"\n", "0\n");
         expect_stdout("x=abc\necho \"${#x}\"\n", "3\n");
     }
+
+    // ---- Phase 5: redirections, file descriptors, umask ---------------------
+
+    #[test]
+    fn redirections_may_permute_file_descriptors() {
+        // The child's setup iterated a HashMap and dup2'd in arbitrary order
+        // with no collision analysis, so a source that was also another
+        // redirection's destination got clobbered before it was read. Every
+        // source is now moved above the highest destination first.
+        // The outer redirections put stdout and stderr on files; the inner
+        // `3>&1 1>&2 2>&3` then swaps the two, so each stream lands in the
+        // other's file.
+        test_script(
+            "{ { echo OUT; echo ERR >&2; } 3>&1 1>&2 2>&3; } >$TEST_WRITE_DIR/swap_o 2>$TEST_WRITE_DIR/swap_e\ncat $TEST_WRITE_DIR/swap_o $TEST_WRITE_DIR/swap_e\nrm -f $TEST_WRITE_DIR/swap_o $TEST_WRITE_DIR/swap_e\n",
+            "ERR\nOUT\n",
+        );
+    }
+
+    #[test]
+    fn closing_a_file_descriptor_actually_closes_it() {
+        // `2>&-` only removed the entry from the table, and an absent
+        // descriptor is inherited from the shell rather than closed.
+        expect_exit_code("ls /nonexistent_xyz 2>&-\n", 2);
+        run_successfully_and("ls /nonexistent_xyz 2>&- 2>/dev/null || true\n", |out| {
+            assert_eq!(out, "")
+        });
+    }
+
+    #[test]
+    fn a_closed_descriptor_does_not_take_a_later_redirection_with_it() {
+        // Closing fd 5 for `5<&-` frees it, so a later `<file` in the same
+        // command may be handed fd 5 by the kernel. Closing during the
+        // placement pass took that descriptor with it, in whichever order the
+        // map happened to yield -- the same script gave 4 lines or 1.
+        for _ in 0..8 {
+            test_script(
+                "cd $TEST_READ_DIR\ncat 5<file1.txt 5<&- <file1.txt | wc -l\n",
+                "4\n",
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirection_creates_a_file_with_mode_0666_less_the_umask() {
+        // `.mode()` was passed `shell.umask`, which holds the *complement* of
+        // the mask, so `> f` produced a mode 755 executable and the mask was
+        // applied twice.
+        test_script(
+            "umask 022\n> $TEST_WRITE_DIR/mode1\nls -l $TEST_WRITE_DIR/mode1 | cut -c1-10\nrm -f $TEST_WRITE_DIR/mode1\n",
+            "-rw-r--r--\n",
+        );
+        test_script(
+            "umask 077\n> $TEST_WRITE_DIR/mode2\nls -l $TEST_WRITE_DIR/mode2 | cut -c1-10\nrm -f $TEST_WRITE_DIR/mode2\n",
+            "-rw-------\n",
+        );
+    }
+
+    #[test]
+    fn umask_reaches_the_commands_the_shell_runs() {
+        // Nothing called libc::umask, so the builtin changed only the shell's
+        // own bookkeeping and every utility it ran used the inherited mask.
+        test_script(
+            "umask 077\ntouch $TEST_WRITE_DIR/child_mode\nls -l $TEST_WRITE_DIR/child_mode | cut -c1-10\nrm -f $TEST_WRITE_DIR/child_mode\n",
+            "-rw-------\n",
+        );
+    }
 }

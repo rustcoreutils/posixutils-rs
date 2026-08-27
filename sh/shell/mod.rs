@@ -1447,7 +1447,9 @@ impl Default for Shell {
             signal_manager: SignalManager::new(false),
             background_jobs: JobManager::default(),
             history: History::new(32767),
-            umask: !0o022 & 0o777,
+            // Stored as the complement: the permission bits a new file may
+            // keep. Seeded from the inherited process mask rather than assumed.
+            umask: !crate::os::get_umask() & 0o777,
             saved_command_locations: HashMap::with_capacity(DEFAULT_COMMAND_CACHE_CAPACITY),
             is_subshell: false,
             last_pipeline_command: String::new(),

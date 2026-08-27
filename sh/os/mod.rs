@@ -101,6 +101,20 @@ pub enum ForkResult {
 }
 
 #[allow(clippy::comparison_chain)]
+/// Sets the process file-mode creation mask and returns the previous one.
+/// `umask(2)` cannot fail.
+pub fn umask(mask: u32) -> u32 {
+    unsafe { libc::umask(mask as libc::mode_t) as u32 }
+}
+
+/// Reads the process file-mode creation mask without changing it. There is no
+/// query form of `umask(2)`, so it has to be set and put back.
+pub fn get_umask() -> u32 {
+    let previous = umask(0o022);
+    umask(previous);
+    previous
+}
+
 pub fn fork() -> OsResult<ForkResult> {
     // fork in general is not safe for multithreaded programs, but all code in this module is single
     // threaded, so this is safe
@@ -234,12 +248,38 @@ impl From<OsError> for ExecError {
     }
 }
 
+/// Duplicates `fd` onto a descriptor strictly greater than `floor`, so that it
+/// cannot collide with any redirection destination.
+fn dup_above(fd: RawFd, floor: RawFd) -> OsResult<RawFd> {
+    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor + 1) };
+    if new_fd < 0 {
+        return Err(OsError {
+            command: "fcntl",
+            errno: get_current_errno_value(),
+        });
+    }
+    Ok(new_fd)
+}
+
 pub fn exec(
     command: OsString,
     args: &[String],
     opened_files: &OpenedFiles,
     env: &Environment,
 ) -> Result<Infallible, ExecError> {
+    // A source descriptor may itself be another redirection's destination
+    // (`3>&1 1>&2 2>&3`), and the map is iterated in an arbitrary order, so
+    // placing them one at a time can clobber a source before it is read. Move
+    // every source out of the way first, above every destination, then put them
+    // where they belong.
+    let highest_dest = opened_files
+        .opened_files
+        .keys()
+        .map(|id| *id as i32)
+        .max()
+        .unwrap_or(libc::STDERR_FILENO);
+    let mut staged: Vec<(RawFd, RawFd)> = Vec::with_capacity(opened_files.opened_files.len());
+    let mut to_close: Vec<RawFd> = Vec::new();
     for (id, file) in &opened_files.opened_files {
         let dest = *id as i32;
         let src = match file {
@@ -250,18 +290,27 @@ pub fn exec(
             | OpenedFile::WriteFile(file)
             | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
             OpenedFile::HereDocument(contents) => {
-                let here_document = here_document_fd(contents.borrow().as_bytes())?.into_raw_fd();
-                // mkstemp may well hand back the descriptor the redirection
-                // targets (e.g. `exec 3<<EOF` with fd 3 free), and closing it
-                // after a no-op dup2 would leave the target closed.
-                if here_document != dest {
-                    dup2(here_document, dest)?;
-                    close(here_document)?;
-                }
+                here_document_fd(contents.borrow().as_bytes())?.into_raw_fd()
+            }
+            OpenedFile::Closed => {
+                // `2>&-`: the descriptor must actually be closed, not merely
+                // dropped from the table and inherited. Deferred until every
+                // other redirection is in place: closing fd 5 for `5<&-` frees
+                // it, so a later `<file` in the same command may well have been
+                // handed fd 5 by the kernel, and closing it here would take
+                // that descriptor with it.
+                to_close.push(dest);
                 continue;
             }
         };
+        staged.push((dup_above(src, highest_dest)?, dest));
+    }
+    for (src, dest) in staged {
         dup2(src, dest)?;
+        close(src)?;
+    }
+    for fd in to_close {
+        let _ = close(fd);
     }
     let command = CString::new(command.into_vec()).unwrap();
     let args = args

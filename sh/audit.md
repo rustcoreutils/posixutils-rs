@@ -953,3 +953,16 @@ matched the CI runner's `VCPKG_INSTALLATION_ROOT`, and two assertions compared
 missing file, which is a GNU-ism; it now asserts that writing to the closed
 descriptor fails, with the same probe run against an *open* descriptor so it
 cannot pass for an unrelated reason.
+
+Two more decodes of the same class as the byte-conversion follow-up, both found
+while making the `export -p` test independent of `grep`:
+
+- [x] **`read` rejected a line that is not text**, failing the whole built-in
+  with "read: invalid UTF-8". The decode was pure loss: `ExpandedWord::append`
+  already takes anything that is `Into<ShString>`, so the bytes were being
+  decoded only to be re-encoded. A shell loop could not carry a line every other
+  part of the shell had already been taught to carry.
+- [x] **The interactive REPL rejected a typed line that is not text**, with
+  "sh: invalid utf-8 sequence". The same pure round-trip: the decoded string was
+  handed straight to `execute_program` as `.as_bytes()`, and the lexer has taken
+  bytes since the conversion.

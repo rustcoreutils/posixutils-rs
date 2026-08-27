@@ -143,17 +143,12 @@ fn standard_repl(shell: &mut Shell) {
                     if program_buffer.ends_with(b"\\\n") {
                         continue;
                     }
-                    let program_string = match std::str::from_utf8(&program_buffer) {
-                        Ok(buf) => buf,
-                        Err(_) => {
-                            eprintln!("sh: invalid utf-8 sequence");
-                            program_buffer.clear();
-                            continue;
-                        }
-                    };
                     let _ = writeln!(io::stderr());
                     shell.terminal.reset();
-                    match shell.execute_program(program_string.as_bytes()) {
+                    // The line goes to the shell as the bytes that were typed:
+                    // the lexer takes bytes, so decoding it here would only
+                    // reject a line the shell can otherwise run.
+                    match shell.execute_program(&program_buffer) {
                         Ok(_) => {
                             program_buffer.clear();
                             print_ps2 = false;
@@ -216,17 +211,12 @@ fn vi_repl(shell: &mut Shell) {
                     if program_buffer.ends_with(b"\\\n") {
                         continue;
                     }
-                    let program_string = match std::str::from_utf8(&program_buffer) {
-                        Ok(buf) => buf,
-                        Err(_) => {
-                            eprintln!("sh: invalid utf-8 sequence");
-                            program_buffer.clear();
-                            continue;
-                        }
-                    };
                     let _ = writeln!(io::stderr());
                     shell.terminal.reset();
-                    match shell.execute_program(program_string.as_bytes()) {
+                    // The line goes to the shell as the bytes that were typed:
+                    // the lexer takes bytes, so decoding it here would only
+                    // reject a line the shell can otherwise run.
+                    match shell.execute_program(&program_buffer) {
                         Ok(_) => {
                             program_buffer.clear();
                             print_ps2 = false;

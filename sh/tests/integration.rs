@@ -2259,6 +2259,17 @@ mod audit_regressions {
     }
 
     #[test]
+    fn read_carries_bytes_that_are_not_text() {
+        // `read` decoded each line and failed the whole built-in with
+        // "read: invalid UTF-8", so a shell loop could not carry a line that
+        // every other part of the shell had already been taught to carry.
+        expect_stdout_bytes(
+            b"printf 'a\\377b\\n' | { IFS= read -r l; printf '[%s]' \"$l\"; }\n",
+            b"[a\xffb]",
+        );
+    }
+
+    #[test]
     fn an_unrecognized_login_name_leaves_the_tilde_prefix_alone() {
         // The login name was decoded with `unwrap_or("")`, so a tilde-prefix
         // that is not text expanded to HOME instead; and a name the system does
@@ -3380,8 +3391,11 @@ mod audit_regressions {
     fn export_p_output_round_trips_bytes() {
         // `export -p` is meant to be read back by the shell, so a value that is
         // not text has to survive it rather than being flattened.
+        // Selected with the shell rather than `grep`, whose text-vs-binary
+        // decision depends on the locale, and which would also match the CI
+        // runner's own VCPKG_INSTALLATION_ROOT if anchored on the name alone.
         expect_stdout_bytes(
-            b"V=$(printf 'a\\377b')\nexport V\nexport -p | grep '^export V='\n",
+            b"V=$(printf 'a\\377b')\nexport V\nexport -p | while IFS= read -r line; do\n  case $line in \"export V=\"*) printf '%s\\n' \"$line\" ;; esac\ndone\n",
             b"export V='a\xffb'\n",
         );
     }

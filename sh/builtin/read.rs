@@ -20,10 +20,6 @@ use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
 
-fn bytes_to_string(bytes: Vec<u8>) -> Result<String, BuiltinError> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| gettext("read: invalid UTF-8").into())
-}
-
 fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     let mut buffer = [0u8; 1];
     match read(fd, &mut buffer) {
@@ -90,8 +86,8 @@ fn read_until_from_non_blocking_fd(
                 } else if next == b'\\' {
                     buffer.push(b'\\');
                 } else {
-                    result.append(bytes_to_string(std::mem::take(&mut buffer))?, false, true);
-                    result.append(bytes_to_string(vec![next])?, true, true);
+                    result.append(std::mem::take(&mut buffer), false, true);
+                    result.append(vec![next], true, true);
                 }
                 continue;
             }
@@ -111,7 +107,7 @@ fn read_until_from_non_blocking_fd(
         crate::os::wait_for_input(fd)?;
     }
     if !buffer.is_empty() {
-        result.append(bytes_to_string(buffer)?, false, true);
+        result.append(buffer, false, true);
     }
     Ok(ReadResult {
         contents: result,
@@ -143,8 +139,8 @@ fn read_until_from_file(
             } else if next == b'\\' {
                 buffer.push(b'\\');
             } else {
-                result.append(bytes_to_string(std::mem::take(&mut buffer))?, false, true);
-                result.append(bytes_to_string(vec![next])?, true, true);
+                result.append(std::mem::take(&mut buffer), false, true);
+                result.append(vec![next], true, true);
             }
             continue;
         }
@@ -160,7 +156,7 @@ fn read_until_from_file(
     }
 
     if !buffer.is_empty() {
-        result.append(bytes_to_string(buffer)?, false, true);
+        result.append(buffer, false, true);
     }
     Ok(ReadResult {
         contents: result,

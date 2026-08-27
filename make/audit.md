@@ -26,6 +26,11 @@ the same day found 21 defects, every one reproduced against a built
 
 New findings are numbered from #26 so the old numbers keep resolving in git.
 
+**All 23 remaining old findings were then re-probed (2026-08-27)** against the
+same binary, with GNU Make 4.3 as the reference wherever POSIX leaves room.
+Eighteen hold, three were refuted, two are partial. The results are recorded at
+the bottom of this file so the next reader does not have to redo them.
+
 ## Critical
 
 Each of these blocks ordinary use, crashes, hangs, or silently produces the
@@ -90,7 +95,15 @@ wrong build.
   environment are dead.** `parser/parse.rs`. `Makefile::variable_definitions()`
   always returns empty and `Make::macros` is always `[]`, which makes `Macro`,
   `Rule::init_env` and the `SHELL` lookup in `rule.rs` unreachable machinery.
-  `SHELL=/bin/echo` is silently ignored — the recipe still runs under `/bin/sh`.
+  Old #12 claimed this fixed ("the recipe shell is resolved from the `SHELL`
+  *macro*"); it is not. Probed with `SHELL = ./fakesh`: the recipe runs under
+  `/bin/sh` and prints `real-sh-ran`, where GNU runs `fakesh` and prints
+  `FAKESH-RAN args=[-c echo real-sh-ran]`. Note the macro *does* expand —
+  `$(SHELL)` yields `/bin/zzz` — because textual substitution happens in the
+  preprocessor. It is only the structured `Make::macros` lookup that is empty,
+  so a fix has to route the recipe-shell decision through the same path
+  expansion already uses. The env-var half of old #12 holds: `SHELL` in the
+  environment is correctly ignored.
 - [ ] **#37 — `$*` expands to the whole target name, not the stem.** `rule.rs`.
   POSIX: the target with the suffix deleted. A `.c.o:` rule on `f.o` yields
   `STAR=[f.o]`, should be `f`. This also breaks the crate's own built-in `.c.a`
@@ -115,10 +128,22 @@ wrong build.
   once per recipe.** `rule.rs` installs handlers unconditionally inside the
   per-recipe loop. POSIX requires a signal ignored on entry to stay ignored, so
   make invoked with SIGINT masked dies on a Ctrl-C the caller deliberately
-  suppressed.
+  suppressed. Probed: make run under `trap '' INT` with a `sleep` recipe still
+  dies on SIGINT. This refutes old #17, which claimed registration was correctly
+  gated.
 - [ ] **#42 — `-t` touches `.PHONY` targets.** `rule.rs`. `make -t clean`
   creates a file named `clean`, after which every `make clean` reports it up to
   date and never runs the recipe.
+
+- [ ] **#47 — `.SUFFIXES` order does not drive inference-rule selection; the
+  order the rules appear in the file does.** `special_target.rs` / `config.rs`.
+  Old #16 claimed an "authoritative insertion-ordered `Config.suffixes`" was
+  added. Membership works and the clear form works — with `.SUFFIXES: .c` only,
+  a `.sh:` rule is correctly not applied, matching GNU. But with
+  `.SUFFIXES: .sh .c` and both `bar.c` and `bar.sh` present, the winner tracks
+  which of `.c:` / `.sh:` appears first in the makefile: rules in the order
+  `.c` then `.sh` give `VIA-C`, and reversing just the two rules gives
+  `VIA-SH`. GNU gives `VIA-SH` in both cases, following `.SUFFIXES`.
 
 ## Minor
 
@@ -140,6 +165,12 @@ wrong build.
   to.** `rule.rs`. The `VecDeque` is initialized and drained but never appended
   to, so the loop always runs exactly once. The structure implies a recursive
   directory walk that does not happen.
+- [ ] **#48 — Backslash-newline folding leaves two spaces where POSIX and GNU
+  leave one.** `parser/preprocessor.rs` `fold_continuations`. Old #7 claimed the
+  continuation "and leading white space of the next line collapse to a single
+  space"; the space *before* the backslash is also retained, so
+  `SRC = one \` + `      two` yields `one  two` where GNU yields `one two`.
+  Visible to any recipe that passes the macro to something whitespace-sensitive.
 
 ## Design note
 
@@ -155,3 +186,45 @@ built on it cannot express two targets on a line (#27), a slash in a filename
 scoped per rule rather than a whole-file textual fixpoint (#32, #34, #35), and
 target names should be `OsStr`/`PathBuf` rather than `String` + `leak()`
 (#39, #45).
+
+## Re-probe of the 2026-06-12 findings (2026-08-27)
+
+All 25 old findings were ticked. #13 and #24 were refuted by the crate review
+(they are #40 and #43 above). The remaining 23 were re-probed against
+`target/release/make`, with GNU Make 4.3 as the reference wherever POSIX leaves
+room. **Eighteen hold, three are refuted, two are partial.**
+
+Recorded so the next reader does not repeat the work. A row here is a claim
+about the binary as of 2026-08-27, not about the source.
+
+| Old | Claim | Result |
+|---|---|---|
+| #1 | recipe line with `=` no longer aborts the parse | holds — `echo VAR=1` and `[ x = y ]` both run |
+| #2 | `.POSIX` accepted | holds |
+| #3 | missing `include` errors instead of panicking | holds — `cannot open include file …`, exit 4 |
+| #4 | `-k` exits 0 when everything succeeds | holds |
+| #5 | command-line `macro=value`, taking precedence | holds — overrides the makefile's own value |
+| #6 | `$(SRC:.c=.o)` substitution | holds — `a.c b.c` → `a.o b.o` |
+| #7 | continuation folds to a single space | **refuted** — folds to two; see #48 |
+| #8 | single-suffix inference rules | holds — `.c:` applied to `foo` |
+| #9 | `-j`, `.WAIT`, `.NOTPARALLEL` | holds — and `.WAIT` genuinely orders under `-j4` |
+| #10 | multiple `-f`, concatenated in order | holds |
+| #11 | shell `-e` for non-ignored recipes | holds — `false; echo …` does not leak; `-` prefix still ignores |
+| #12 | recipe shell from the `SHELL` macro | **refuted** — runs under `/bin/sh`; see #36 |
+| #14 | `$?` is newer-only | holds — one of two prerequisites listed |
+| #15 | `$^`, `$+`, `$(@D)`, `$(@F)` | holds — byte-identical to GNU |
+| #16 | `.SUFFIXES` order authoritative | **partial** — membership and clear work, order does not; see #47 |
+| #17 | signal registration correctly gated | **refuted** — overrides an inherited `SIG_IGN`; see #41 |
+| #18 | bare `.PRECIOUS` protects every target | holds — verified against a control where a plain target *is* deleted |
+| #19 | `-include` implemented; `includedir=` not mistaken for it | holds |
+| #20 | handler resets to `SIG_DFL` and re-raises | holds — `WIFSIGNALED`, signal 2, not `exit(130)` |
+| #21 | cleanup honors `.PHONY` | holds — same control as #18 |
+| #22 | special targets additive across occurrences | holds — two `.PHONY:` lines both take effect |
+| #23 | diagnostics internationalized | **partial, as its own text admits** — 34 `gettext` sites, 10 raw `eprintln!` remain, mostly `main.rs` error paths |
+| #25 | every error path exits >1 | holds — 2 / 4 / 6 for recipe / parse / no-target, and `-q` correctly exits 1 |
+
+Three probes were confounded on the first pass and needed a second: #15 failed
+only because of #26 (the slash in `sub/out`); #18 and #21 both "passed" until a
+plain-target control proved the cleanup path runs at all; and #20 needed
+`waitpid` to tell death-by-signal from `exit(128+n)`, which a shell's `$?`
+cannot distinguish.

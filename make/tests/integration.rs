@@ -1418,6 +1418,21 @@ mod build_graph {
         assert_eq!(stdout.matches("SHARED").count(), 1, "stdout: {stdout}");
         assert_eq!(code, Some(0));
     }
+
+    // Audit #80: `.c.o:` and `.o.c:` make each of `foo.o` and `foo.c` the
+    // other's source. `Edges::prerequisites_of` reported only named and
+    // pattern edges, so the cycle check saw nothing and the ledger blocked the
+    // one thread forever on a target it was itself building. Single-threaded:
+    // this is not a `-j` race.
+    #[test]
+    fn mutually_recursive_inference_rules_are_a_cycle_not_a_hang() {
+        let _ = std::fs::write("infcyc.c", "");
+        let _ = std::fs::write("infcyc.o", "");
+        let (_, code) = run(&["-f", "tests/makefiles/graph/inference_cycle.mk", "infcyc.o"]);
+        assert_eq!(code, Some(8), "expected a cycle diagnostic, not a hang");
+        let _ = std::fs::remove_file("infcyc.c");
+        let _ = std::fs::remove_file("infcyc.o");
+    }
 }
 
 // Inference rules, `%` pattern rules, and default-target selection.

@@ -107,21 +107,39 @@ impl graph::Edges for Make {
     /// The prerequisites the cycle check must see.
     ///
     /// A named rule is not the only way a target acquires prerequisites: a `%`
-    /// pattern rule contributes them once instantiated for a concrete name.
-    /// Looking only at named rules made `%.a: %.a` invisible to `find_cycle`,
-    /// so the self-edge went undetected and the build deadlocked on it
-    /// (audit #65).
+    /// pattern rule contributes them once instantiated for a concrete name,
+    /// and an inference rule contributes the source it derives from its
+    /// suffixes. Looking only at named rules made `%.a: %.a` invisible to
+    /// `find_cycle`, so the self-edge went undetected and the build deadlocked
+    /// on it (audit #65); the same hole let `.c.o:` plus `.o.c:` build `foo.o`
+    /// from `foo.c` from `foo.o`, where the ledger blocked the one thread on a
+    /// target it was itself in the middle of building (audit #80).
+    ///
+    /// The order below mirrors `build_target_uncached`, so the edges reported
+    /// are the edges that will actually be walked.
     fn prerequisites_of(&self, target: &str) -> Vec<String> {
-        let named = self
-            .rule_by_target_name(target)
-            .map(|rule| edge_names(rule.prerequisites()));
-        if let Some(edges) = named {
+        let named = self.rule_by_target_name(target);
+        let mut edges = match named {
+            Some(rule) => edge_names(rule.prerequisites()),
+            None => match self.find_pattern_rule(target) {
+                Some(rule) => return edge_names(rule.prerequisites()),
+                None => Vec::new(),
+            },
+        };
+        // A rule carrying commands is the one that runs; only a commandless
+        // one (or none at all) falls through to inference.
+        if named.is_some_and(|rule| rule.recipes().count() > 0) {
             return edges;
         }
-        match self.find_pattern_rule(target) {
-            Some(rule) => edge_names(rule.prerequisites()),
-            None => Vec::new(),
+        let source = self
+            .find_inference_rule(target)
+            .and_then(|rule| inference_source(rule, &Target::new(target)));
+        if let Some(source) = source {
+            if !edges.contains(&source) {
+                edges.push(source);
+            }
         }
+        edges
     }
 }
 

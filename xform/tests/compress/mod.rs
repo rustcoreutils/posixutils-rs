@@ -1110,7 +1110,7 @@ fn test_compress_binary_repeating_pattern() {
 }
 
 // =============================================================================
-// POSIX audit regression tests (xform/audit.md)
+// POSIX audit regression tests (see the xform/ audit in git history)
 // =============================================================================
 
 #[test]

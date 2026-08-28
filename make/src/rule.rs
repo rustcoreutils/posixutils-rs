@@ -7,29 +7,28 @@
 // SPDX-License-Identifier: MIT
 //
 
-pub mod config;
 pub mod prerequisite;
 pub mod recipe;
 pub mod target;
 
+use crate::attributes::{Attributes, Flags};
+use crate::parser::preprocessor;
 use crate::{
     config::Config as GlobalConfig,
     error_code::ErrorCode::{self, *},
     parser::Rule as ParsedRule,
     signal_handler, Macro, DEFAULT_SHELL, DEFAULT_SHELL_VAR,
 };
-use config::Config;
+use core::fmt;
 use gettextrs::gettext;
 use prerequisite::Prerequisite;
 use recipe::config::Config as RecipeConfig;
 use recipe::Recipe;
-use std::collections::VecDeque;
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::{
     collections::HashMap,
     fs::{File, FileTimes},
-    process::{self, Command},
+    process::Command,
     sync::{Arc, LazyLock, Mutex},
     time::SystemTime,
 };
@@ -49,14 +48,59 @@ pub struct InterruptInfo {
     pub original_mtime: Option<SystemTime>,
 }
 
-pub static INTERRUPT_FLAG: LazyArcMutex<Option<InterruptInfo>> =
-    LazyLock::new(|| Arc::new(Mutex::new(None)));
+/// Every target whose recipe is running right now.
+///
+/// A list, not a single slot: under `-j` several recipes are in flight at once
+/// and each has its own target to clean up. It used to be one global written
+/// before every recipe line and never cleared, so concurrent workers
+/// overwrote each other and a signal arriving after the last recipe consulted
+/// a stale entry (audit #75).
+pub static IN_FLIGHT: LazyArcMutex<Vec<InterruptInfo>> =
+    LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
 
-/// Set when a non-ignored recipe error is swallowed under `-k` (keep going) so
-/// that `make` can report the failure and exit nonzero even though the build
-/// loop continued with the remaining, independent targets.
-pub static KEEP_GOING_ERROR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Registers a target as in flight for as long as this value lives.
+///
+/// A guard rather than a matching pair of calls: a recipe can leave
+/// `run_with_files` by any of half a dozen `return`s, and every one of them
+/// must drop the entry.
+struct InFlight {
+    target: String,
+}
+
+impl InFlight {
+    fn enter(info: InterruptInfo) -> Self {
+        let target = info.target.clone();
+        IN_FLIGHT.lock().unwrap().push(info);
+        Self { target }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = IN_FLIGHT.lock() {
+            if let Some(at) = in_flight.iter().position(|i| i.target == self.target) {
+                in_flight.remove(at);
+            }
+        }
+    }
+}
+
+/// Everything a recipe needs that does not vary from one rule to the next.
+///
+/// The three run entry points all carry the same invariants -- the global
+/// options, the macro table, the export list, and the `VPATH` resolver -- and
+/// threading them one by one had pushed each signature past seven parameters.
+pub struct Env<'a> {
+    pub config: &'a GlobalConfig,
+    pub macros: &'a [Macro],
+    /// Names an `export` directive made visible to recipes.
+    pub exports: &'a [String],
+    /// Maps a prerequisite name to where it was actually found, so `$<` names
+    /// the file the recipe will read when `VPATH` supplied it.
+    pub resolve: &'a dyn Fn(&str) -> String,
+    /// What `.IGNORE`, `.SILENT`, `.PRECIOUS` and `.PHONY` say about a target.
+    pub attributes: &'a Attributes,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rule {
@@ -66,8 +110,6 @@ pub struct Rule {
     prerequisites: Vec<Prerequisite>,
     /// The recipe of the rule
     recipes: Vec<Recipe>,
-
-    pub config: Config,
 }
 
 impl Rule {
@@ -83,6 +125,87 @@ impl Rule {
         self.recipes.iter()
     }
 
+    /// True if this rule's target is a `%` pattern.
+    pub fn is_pattern(&self) -> bool {
+        self.targets.iter().any(|t| t.as_ref().contains('%'))
+    }
+
+    /// Instantiate a pattern rule for a concrete target, substituting the stem
+    /// into the target and every prerequisite.
+    ///
+    /// `%.o: %.c` applied to `src/foo.o` yields the rule
+    /// `src/foo.o: src/foo.c`. Recipes are left alone; their `$@`/`$<` are
+    /// expanded later against the instantiated names.
+    pub fn instantiate_pattern(&self, target: &str) -> Option<Rule> {
+        let pattern = self.targets.first()?.as_ref().to_string();
+        let stem = pattern_stem(&pattern, target)?;
+        Some(Rule {
+            targets: vec![Target::new(target)],
+            prerequisites: self
+                .prerequisites
+                .iter()
+                .map(|p| Prerequisite::new(pattern_expand(p.as_ref(), stem)))
+                .collect(),
+            recipes: self.recipes.clone(),
+        })
+    }
+
+    /// One rule per target.
+    ///
+    /// POSIX 105643 makes the target side a `<blank>`-separated list of
+    /// targets, each one a target in its own right: `a b: c` is `a: c` and
+    /// `b: c`. The targets share the prerequisites and the commands, they do
+    /// not share a rule — GNU reads it the same way. Keeping them
+    /// in one made every later rule for *any* of them add prerequisites to all
+    /// the others, the same leak attributes had before they were keyed by
+    /// target (audit #84).
+    ///
+    /// A `%` pattern rule is left whole: it is a template matched by name
+    /// rather than a target, and splitting it would only give the pattern
+    /// lookup duplicates to walk.
+    pub fn split_targets(self) -> Vec<Rule> {
+        if self.targets.len() < 2 || self.is_pattern() {
+            return vec![self];
+        }
+        self.targets
+            .iter()
+            .map(|target| Rule {
+                targets: vec![target.clone()],
+                prerequisites: self.prerequisites.clone(),
+                recipes: self.recipes.clone(),
+            })
+            .collect()
+    }
+
+    /// Fold another rule for the same target into this one.
+    ///
+    /// POSIX 105653: "A target that has prerequisites, but does not have any
+    /// commands, can be used to add to the prerequisite list for that target.
+    /// Only one target rule for any given target can contain commands."
+    ///
+    /// Prerequisites accumulate, and are deliberately not deduplicated -- `$+`
+    /// is defined to keep duplicates, and `$^` removes them at expansion time.
+    /// The clause carries no "shall be an error", so a second commanded rule is
+    /// undefined rather than invalid: warn and let the later one win, as GNU
+    /// does, rather than refusing a makefile that other makes accept.
+    pub fn absorb(&mut self, other: Rule) {
+        self.prerequisites.extend(other.prerequisites);
+        if !other.recipes.is_empty() {
+            if !self.recipes.is_empty() {
+                let target = self
+                    .targets
+                    .first()
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "make: {}",
+                    gettext(format!("warning: overriding recipe for target '{target}'"))
+                );
+            }
+            self.recipes = other.recipes;
+        }
+    }
+
     /// Runs an inference rule for a specific target (not a CWD scan).
     ///
     /// This is used when POSIX requires applying an inference rule to a specific
@@ -90,24 +213,24 @@ impl Rule {
     /// are substituted based on the target name and the inference rule's suffixes.
     pub fn run_for_target(
         &self,
-        global_config: &GlobalConfig,
-        macros: &[Macro],
+        env: &Env<'_>,
         target: &Target,
         up_to_date: bool,
         newer: &[String],
     ) -> Result<(), ErrorCode> {
+        let resolve = env.resolve;
         // For an inference rule applied to a specific target, compute the
         // input/output pair from the target name and the rule's suffixes.
         let files = if let Some(Target::Inference { from, to, .. }) = self.targets().next() {
             let target_name = target.as_ref();
             if to.is_empty() {
                 // Single-suffix rule (`.s2:`): build `target` from `target.s2`.
-                let input = PathBuf::from(format!("{}.{}", target_name, from));
+                let input = PathBuf::from(resolve(&format!("{target_name}.{from}")));
                 vec![(input, PathBuf::from(target_name))]
             } else {
                 let expected_suffix = format!(".{}", to);
                 if let Some(stem) = target_name.strip_suffix(&expected_suffix) {
-                    let input = PathBuf::from(format!("{}.{}", stem, from));
+                    let input = PathBuf::from(resolve(&format!("{stem}.{from}")));
                     let output = PathBuf::from(target_name);
                     vec![(input, output)]
                 } else {
@@ -118,7 +241,7 @@ impl Rule {
             vec![(PathBuf::from(""), PathBuf::from(""))]
         };
 
-        self.run_with_files(global_config, macros, target, up_to_date, files, newer)
+        self.run_with_files(env, target, up_to_date, files, newer)
     }
 
     /// Runs the rule with the global config and macros passed in.
@@ -126,39 +249,46 @@ impl Rule {
     /// Returns `Ok` on success and `Err` on any errors while running the rule.
     pub fn run(
         &self,
-        global_config: &GlobalConfig,
-        macros: &[Macro],
+        env: &Env<'_>,
         target: &Target,
         up_to_date: bool,
         newer: &[String],
     ) -> Result<(), ErrorCode> {
-        let files = match target {
-            Target::Inference { from, to, .. } => find_files_with_extension(from)?
-                .into_iter()
-                .map(|input| {
-                    let mut output = input.clone();
-                    output.set_extension(to);
-                    (input, output)
-                })
-                .collect::<Vec<_>>(),
-            _ => {
-                vec![(PathBuf::from(""), PathBuf::from(""))]
-            }
-        };
-
-        self.run_with_files(global_config, macros, target, up_to_date, files, newer)
+        // One pass. The first prerequisite is the input file, so `$<` names it
+        // in an ordinary rule as well as an inferred one -- POSIX defines `$<`
+        // only for inference rules, but GNU sets it here too and generated
+        // rules (`$(eval $(call tpl,...))`) lean on it heavily.
+        //
+        // An inference rule applied to a real target goes through
+        // `run_for_target` instead, which knows the stem. This used to scan the
+        // working directory for every file with the rule's source suffix, which
+        // meant a dot-target that merely *looked* like an inference rule
+        // (`.config:`) found no files and silently ran no recipe (audit #38, #46).
+        let input = self
+            .prerequisites()
+            .next()
+            .map(|p| PathBuf::from((env.resolve)(p.as_ref())))
+            .unwrap_or_default();
+        let files = vec![(input, PathBuf::from(target.as_ref()))];
+        self.run_with_files(env, target, up_to_date, files, newer)
     }
 
     /// Internal helper: runs the rule's recipes for the given input/output file pairs.
     fn run_with_files(
         &self,
-        global_config: &GlobalConfig,
-        macros: &[Macro],
+        env: &Env<'_>,
         target: &Target,
         up_to_date: bool,
         files: Vec<(PathBuf, PathBuf)>,
         newer: &[String],
     ) -> Result<(), ErrorCode> {
+        let Env {
+            config: global_config,
+            macros,
+            exports,
+            resolve: _,
+            attributes,
+        } = *env;
         let GlobalConfig {
             ignore: global_ignore,
             dry_run: global_dry_run,
@@ -168,20 +298,21 @@ impl Rule {
             quit: global_quit,
             clear: _,
             print: global_print,
-            keep_going: global_keep_going,
-            terminate: global_terminate,
+            keep_going: _,
+            terminate: _,
             precious: global_precious,
             jobs: _,
             not_parallel: _,
             suffixes: _,
-            rules: _,
         } = *global_config;
-        let Config {
-            ignore: rule_ignore,
-            silent: rule_silent,
-            precious: rule_precious,
-            phony: rule_phony,
-        } = self.config;
+        // Attributes belong to the target, not to the rule: one rule may name
+        // several targets and `.IGNORE: a` must not reach `b` (audit #78).
+        let Flags {
+            ignore: target_ignore,
+            silent: target_silent,
+            precious: target_precious,
+            phony: target_phony,
+        } = attributes.of(target.as_ref());
 
         // Capture the target's modification time once, before any recipe line
         // runs, so the signal handler can tell whether an interrupted recipe
@@ -189,6 +320,27 @@ impl Rule {
         let original_mtime = std::fs::metadata(target.as_ref())
             .ok()
             .and_then(|m| m.modified().ok());
+
+        let dry_run = global_dry_run;
+        let touch = global_touch;
+        let env_macros = global_env_macros;
+        let quit = global_quit;
+        let print = global_print;
+        let precious = global_precious || target_precious;
+
+        // POSIX: make catches signals unless -n, -p, or -q is set (those take
+        // the default action). -i is not an exemption.
+        if !dry_run && !print && !quit {
+            signal_handler::register_signals();
+        }
+
+        // Dropped on the way out, however this returns.
+        let _in_flight = InFlight::enter(InterruptInfo {
+            target: target.as_ref().to_string(),
+            precious,
+            phony: target_phony,
+            original_mtime,
+        });
 
         for inout in files {
             for recipe in self.recipes() {
@@ -198,30 +350,9 @@ impl Rule {
                     force_run: recipe_force_run,
                 } = recipe.config;
 
-                let ignore = global_ignore || rule_ignore || recipe_ignore;
-                let dry_run = global_dry_run;
-                let silent = global_silent || rule_silent || recipe_silent;
+                let ignore = global_ignore || target_ignore || recipe_ignore;
+                let silent = global_silent || target_silent || recipe_silent;
                 let force_run = recipe_force_run;
-                let touch = global_touch;
-                let env_macros = global_env_macros;
-                let quit = global_quit;
-                let print = global_print;
-                let precious = global_precious || rule_precious;
-                let keep_going = global_keep_going;
-                let terminate = global_terminate;
-
-                *INTERRUPT_FLAG.lock().unwrap() = Some(InterruptInfo {
-                    target: target.as_ref().to_string(),
-                    precious,
-                    phony: rule_phony,
-                    original_mtime,
-                });
-
-                // POSIX: make catches signals unless -n, -p, or -q is set (those
-                // take the default action). -i is not an exemption.
-                if !dry_run && !print && !quit {
-                    signal_handler::register_signals();
-                }
 
                 // POSIX: a recipe line prefixed with `+`, or one containing the
                 // `$(MAKE)`/`${MAKE}` macro, is executed even under -n, -t, or
@@ -230,10 +361,16 @@ impl Rule {
                 let is_recursive = raw.contains("$(MAKE)") || raw.contains("${MAKE}");
                 let always_run = force_run || is_recursive;
 
+                // Expand `$@`, `$<`, `$*`, `$^`, `$+` and `$?` before the
+                // recipe is either shown or run, so the line printed under -n
+                // (or when not silent) is the line that executes.
+                let expanded =
+                    self.substitute_internal_macros(env, target, recipe, &inout, newer)?;
+
                 if !always_run {
                     // -n flag
                     if dry_run {
-                        println!("{}", recipe);
+                        println!("{}", expanded);
                         continue;
                     }
 
@@ -241,19 +378,25 @@ impl Rule {
                     if touch {
                         continue;
                     }
-                    // -q flag
+                    // -q asks a question; it never runs anything. Reaching a
+                    // recipe means the answer is "not up to date", which is
+                    // reported to `main` as a status. It used to be answered
+                    // with `process::exit` from right here -- under `-j` that
+                    // is a worker thread inside `thread::scope`, abandoning
+                    // its siblings mid-build (audit #76).
                     if quit {
                         if up_to_date {
-                            process::exit(0);
-                        } else {
-                            process::exit(1);
+                            continue;
                         }
+                        return Err(NotUpToDateError {
+                            target: target.as_ref().to_string(),
+                        });
                     }
                 }
 
                 // -s flag
                 if !silent {
-                    println!("{}", recipe);
+                    println!("{}", expanded);
                 }
 
                 // POSIX: the recipe shell comes from the `SHELL` macro
@@ -266,8 +409,8 @@ impl Rule {
                     .unwrap_or_else(|| DEFAULT_SHELL.to_string());
                 let mut command = Command::new(shell);
 
-                self.init_env(env_macros, &mut command, macros);
-                let recipe = self.substitute_internal_macros(target, recipe, &inout, newer);
+                self.init_env(env_macros, &mut command, macros, exports);
+                let recipe = expanded;
                 // POSIX: when errors are not being ignored, the shell -e option
                 // shall also be in effect, so the recipe aborts on the first
                 // failing command.
@@ -287,34 +430,41 @@ impl Rule {
                         }
                     }
                 };
+                // A failed recipe fails its target, whatever -k says. `-k`
+                // means keep building the *other* targets, not build this
+                // one's dependents anyway: returning Ok here let every
+                // dependent run against inputs that were never produced
+                // (audit #33). Whether siblings continue is decided by the
+                // traversal, and the diagnostic is printed by the caller.
                 if !status.success() && !ignore {
-                    // -S and -k flags
-                    if !terminate && keep_going {
-                        eprintln!(
-                            "make: {}",
-                            ExecutionError {
-                                exit_code: status.code(),
-                            }
-                        );
-                        KEEP_GOING_ERROR.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    } else {
-                        return Err(ExecutionError {
-                            exit_code: status.code(),
-                        });
-                    }
+                    return Err(ExecutionError {
+                        target: target.as_ref().to_string(),
+                        exit_code: status.code(),
+                    });
                 }
             }
 
-            let silent = global_silent || rule_silent;
-            let touch = global_touch;
+            let silent = global_silent || target_silent;
 
-            // -t flag
+            // -t flag. A .PHONY target names no file, so touching it would
+            // create one and make every later `make <target>` report it up to
+            // date forever (audit #42).
             if touch {
+                if target_phony {
+                    return Ok(());
+                }
                 if !silent {
                     println!("{} {target}", gettext("touch"));
                 }
-                let file = File::create(target.as_ref())?;
+                // Opened without `O_TRUNC`: `-t` marks a target up to date,
+                // it does not empty it. `File::create` truncates, so `make -t`
+                // destroyed the contents of every target it touched
+                // (audit #82).
+                let file = File::options()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(target.as_ref())?;
                 file.set_times(FileTimes::new().set_modified(SystemTime::now()))?;
                 return Ok(());
             }
@@ -328,6 +478,7 @@ impl Rule {
     /// (`F`) part of each element.
     fn expand_internal_macro(
         &self,
+        env: &Env<'_>,
         sigil: char,
         modifier: Option<char>,
         target: &Target,
@@ -343,15 +494,18 @@ impl Rule {
             .map(|(_, m)| m.strip_suffix(')').unwrap_or(m))
             .unwrap_or("");
 
-        let all_prereqs: Vec<String> = self
-            .prerequisites()
-            .map(|p| p.as_ref().to_string())
-            .collect();
+        // Every prerequisite name is resolved through `VPATH`, exactly as `$<`
+        // is. A recipe reads the file make found, so `$^` and `$?` have to
+        // name it; leaving them raw handed the recipe a path that does not
+        // exist whenever a search directory supplied the prerequisite
+        // (audit #85).
+        let resolve = env.resolve;
+        let all_prereqs: Vec<String> = self.prerequisites().map(|p| resolve(p.as_ref())).collect();
 
         let base: Vec<String> = match sigil {
             '@' => vec![archive_name.to_string()],
             '%' => vec![member.to_string()],
-            '?' => newer.to_vec(),
+            '?' => newer.iter().map(|n| resolve(n)).collect(),
             '^' => {
                 // All prerequisites, duplicates removed, order preserved.
                 let mut seen = std::collections::HashSet::new();
@@ -362,7 +516,9 @@ impl Rule {
             }
             '+' => all_prereqs,
             '<' => vec![files.0.to_string_lossy().into_owned()],
-            '*' => vec![files.1.to_string_lossy().into_owned()],
+            // POSIX: `$*` is the target with the suffix deleted, i.e. the
+            // stem -- not the whole target name.
+            '*' => vec![stem_of(&files.1.to_string_lossy())],
             _ => return String::new(),
         };
 
@@ -374,14 +530,23 @@ impl Rule {
         parts.join(" ")
     }
 
+    /// Expand `$@`, `$<`, `$*`, `$^`, `$+` and `$?` in a recipe line, and
+    /// evaluate the deferred function calls that read them.
+    ///
+    /// Fails rather than pass the line on: a call reaching this stage can still
+    /// report an error — `$(error bad $@)` mentions an automatic variable, so
+    /// it is deferred to here — and re-emitting the unevaluated call handed
+    /// `error` to the shell as a command instead (audit #90).
     fn substitute_internal_macros(
         &self,
+        env: &Env<'_>,
         target: &Target,
         recipe: &Recipe,
         files: &(PathBuf, PathBuf),
         newer: &[String],
-    ) -> Recipe {
+    ) -> Result<Recipe, ErrorCode> {
         const SIGILS: [char; 7] = ['@', '%', '?', '<', '*', '^', '+'];
+        let macros = env.macros;
         let recipe = recipe.inner();
         let mut stream = recipe.chars().peekable();
         let mut result = String::new();
@@ -400,37 +565,66 @@ impl Rule {
                 // Two-character form, e.g. `$@`, `$^`, `$?`.
                 Some(c) if SIGILS.contains(&c) => {
                     stream.next();
-                    result.push_str(&self.expand_internal_macro(c, None, target, files, newer));
+                    result
+                        .push_str(&self.expand_internal_macro(env, c, None, target, files, newer));
                 }
                 // Bracketed form, e.g. `$(@)`, `$(@D)`, `$(?F)`.
                 Some(open @ ('(' | '{')) => {
                     let close = if open == '(' { ')' } else { '}' };
-                    let mut inner = String::new();
                     stream.next();
-                    while let Some(&c) = stream.peek() {
-                        if c == close {
-                            stream.next();
-                            break;
+                    // Read to the *matching* close, not the first one. A
+                    // deferred call nests -- `$(addprefix o/,$(notdir $^))` --
+                    // and stopping at the inner `)` both evaluated a truncated
+                    // call and left the real `)` in the command (audit #79).
+                    let mut inner = String::new();
+                    let mut depth = 0usize;
+                    for c in stream.by_ref() {
+                        if c == open {
+                            depth += 1;
+                        } else if c == close {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
                         }
                         inner.push(c);
-                        stream.next();
                     }
                     let mut chars = inner.chars();
                     match chars.next() {
                         Some(sigil) if SIGILS.contains(&sigil) => {
                             let modifier = chars.next().filter(|m| matches!(m, 'D' | 'F'));
                             result.push_str(
-                                &self.expand_internal_macro(sigil, modifier, target, files, newer),
+                                &self.expand_internal_macro(
+                                    env, sigil, modifier, target, files, newer,
+                                ),
                             );
                         }
                         // The special `MAKE` macro expands to the make program.
                         _ if inner == "MAKE" => result.push_str(&make_program()),
-                        // Not an internal macro: re-emit verbatim.
+                        // Not an internal macro -- a deferred function call
+                        // such as `$(notdir $^)`. Re-emit it, but substitute
+                        // inside first: the automatic variables it reads are
+                        // exactly what this pass exists to supply, and leaving
+                        // them raw is what made `$(notdir $^)` operate on the
+                        // two characters `$^` (audit #62).
                         _ => {
-                            result.push('$');
-                            result.push(open);
-                            result.push_str(&inner);
-                            result.push(close);
+                            let inner = self.substitute_internal_macros(
+                                env,
+                                target,
+                                &Recipe::new(inner),
+                                files,
+                                newer,
+                            )?;
+                            let call = format!("${open}{}{close}", inner.inner());
+                            // Evaluate just this call, not the whole line: a
+                            // line-wide pass would also eat a shell `$VAR`.
+                            let text =
+                                preprocessor::expand_recipe(&call, macros).map_err(|message| {
+                                    ParserError {
+                                        constraint: crate::parser::ParseError(vec![message]),
+                                    }
+                                })?;
+                            result.push_str(&text);
                         }
                     }
                 }
@@ -439,75 +633,111 @@ impl Rule {
             }
         }
 
-        Recipe::new(result)
+        Ok(Recipe::new(result))
     }
 
     /// A helper function to initialize env vars for shell commands.
-    fn init_env(&self, env_macros: bool, command: &mut Command, variables: &[Macro]) {
-        let mut macros: HashMap<String, String> = variables.iter().cloned().collect();
+    fn init_env(
+        &self,
+        env_macros: bool,
+        command: &mut Command,
+        variables: &[Macro],
+        exports: &[String],
+    ) {
+        command.envs(exported_macros(env_macros, variables, exports));
+    }
+}
 
-        // POSIX: the `SHELL` macro shall not modify the `SHELL` environment
-        // variable seen by recipes, so never export it. The child still
-        // inherits the real `SHELL` from this process's environment.
-        macros.remove(DEFAULT_SHELL_VAR);
+/// The makefile macros a recipe's environment should carry.
+///
+/// POSIX 105869: macros defined in a makefile "shall not be added to the
+/// environment of make if they are not already in its environment", so a macro
+/// whose name make did not inherit is never exported. Whether an
+/// already-present variable is *updated* is unspecified (105871); we update it,
+/// matching GNU make -- except under `-e`, where the environment wins.
+///
+/// `SHELL` is excluded outright: it selects the recipe shell and must not be
+/// handed to the child as an environment variable.
+///
+/// The child inherits make's own environment regardless; this only decides what
+/// is added on top.
+fn exported_macros(
+    env_macros: bool,
+    variables: &[Macro],
+    exports: &[String],
+) -> HashMap<String, String> {
+    if env_macros {
+        return HashMap::new();
+    }
+    let inherited: HashMap<String, String> = std::env::vars().collect();
+    // `export` with no names means all of them (GNU), recorded as `*`.
+    let export_all = exports.iter().any(|e| e == "*");
+    variables
+        .iter()
+        .filter(|(name, _)| name != DEFAULT_SHELL_VAR)
+        .filter(|(name, _)| {
+            // Inherited names keep their POSIX 105869 treatment; an explicit
+            // `export` adds a name make did not inherit (audit #74).
+            inherited.contains_key(name) || export_all || exports.iter().any(|e| e == name)
+        })
+        .cloned()
+        .collect()
+}
 
-        if env_macros {
-            let env_vars: HashMap<String, String> = std::env::vars().collect();
-            macros.extend(env_vars);
+impl fmt::Display for Rule {
+    /// Render in makefile syntax, so a `-p` dump round-trips.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let targets: Vec<&str> = self.targets.iter().map(|t| t.as_ref()).collect();
+        let prerequisites: Vec<&str> = self.prerequisites.iter().map(|p| p.as_ref()).collect();
+        write!(f, "{}:", targets.join(" "))?;
+        if !prerequisites.is_empty() {
+            write!(f, " {}", prerequisites.join(" "))?;
         }
-        command.envs(macros);
+        writeln!(f)?;
+        for recipe in &self.recipes {
+            writeln!(f, "\t{recipe}")?;
+        }
+        Ok(())
     }
 }
 
 impl From<ParsedRule> for Rule {
     fn from(parsed: ParsedRule) -> Self {
-        let config = Config::default();
-        Self::from((parsed, config))
-    }
-}
-
-impl From<(ParsedRule, Config)> for Rule {
-    fn from((parsed, config): (ParsedRule, Config)) -> Self {
-        let targets = parsed.targets().map(Target::new).collect();
-        let prerequisites = parsed.prerequisites().map(Prerequisite::new).collect();
-        let recipes = parsed.recipes().map(Recipe::new).collect();
         Rule {
-            targets,
-            prerequisites,
-            recipes,
-            config,
+            targets: parsed.targets().map(Target::new).collect(),
+            prerequisites: parsed.prerequisites().map(Prerequisite::new).collect(),
+            recipes: parsed.recipes().map(Recipe::new).collect(),
         }
     }
 }
 
-fn find_files_with_extension(ext: &str) -> Result<Vec<PathBuf>, ErrorCode> {
-    use std::{env, fs};
-
-    let mut result = vec![];
-    let Ok(current) = env::current_dir() else {
-        Err(IoError(ErrorKind::PermissionDenied))?
-    };
-    let mut dirs_to_walk = VecDeque::new();
-    dirs_to_walk.push_back(current);
-
-    while let Some(path) = dirs_to_walk.pop_front() {
-        let files = fs::read_dir(path)?;
-        for file in files.filter_map(Result::ok) {
-            let Ok(metadata) = file.metadata() else {
-                continue;
-            };
-
-            if metadata.is_file() {
-                if let Some(e) = file.path().extension() {
-                    if ext == e {
-                        result.push(file.path());
-                    }
-                }
-            }
-        }
+/// The target with its suffix removed, keeping any directory part.
+fn stem_of(name: &str) -> String {
+    let start = name.rfind('/').map(|i| i + 1).unwrap_or(0);
+    match name[start..].rfind('.') {
+        Some(i) => name[..start + i].to_string(),
+        None => name.to_string(),
     }
+}
 
-    Ok(result)
+/// Match `target` against a `%` pattern, returning the stem.
+pub fn pattern_stem<'a>(pattern: &str, target: &'a str) -> Option<&'a str> {
+    let (prefix, suffix) = pattern.split_once('%')?;
+    if target.len() < prefix.len() + suffix.len() {
+        return None;
+    }
+    if !target.starts_with(prefix) || !target.ends_with(suffix) {
+        return None;
+    }
+    Some(&target[prefix.len()..target.len() - suffix.len()])
+}
+
+/// Replace `%` in `text` with `stem`, or return it unchanged when it has none.
+fn pattern_expand(text: &str, stem: &str) -> String {
+    match text.split_once('%') {
+        Some((prefix, suffix)) => format!("{prefix}{stem}{suffix}"),
+        None => text.to_string(),
+    }
 }
 
 /// The make program to substitute for the `$(MAKE)` macro: this executable's

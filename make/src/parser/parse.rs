@@ -1,4 +1,4 @@
-// Copyright (c) 2024-2025 Hemi Labs, Inc.
+// Copyright (c) 2024-2026 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -6,40 +6,24 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parser::lex::lex;
-use rowan::ast::AstNode;
+//! The makefile scanner.
+//!
+//! By the time `parse` runs, the preprocessor has folded continuations,
+//! spliced includes, expanded macros and blanked macro-definition lines. What
+//! is left is rule lines and command lines, which this walks one line at a
+//! time.
+
+use super::preprocessor::{is_include_line, is_macro_definition, preprocess_with, VPathEntry};
+use super::scan::{self, RuleLine};
+use crate::Macro;
+use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
-
-use super::SyntaxKind::*;
-
-#[derive(Debug)]
-pub enum Error {
-    Io(std::io::Error),
-    Parse(ParseError),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match &self {
-            Error::Io(e) => write!(f, "IO error: {}", e),
-            Error::Parse(e) => write!(f, "Parse error: {}", e),
-        }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParseError(pub Vec<String>);
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl Display for ParseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for err in &self.0 {
             writeln!(f, "{}", err)?;
         }
@@ -49,487 +33,255 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-impl From<ParseError> for Error {
-    fn from(e: ParseError) -> Self {
-        Error::Parse(e)
-    }
-}
-
-/// Second, implementing the `Language` trait teaches rowan to convert between
-/// these two SyntaxKind types, allowing for a nicer SyntaxNode API where
-/// "kinds" are values from our `enum SyntaxKind`, instead of plain u16 values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Lang {}
-impl rowan::Language for Lang {
-    type Kind = SyntaxKind;
-    fn kind_from_raw(raw: rowan::SyntaxKind) -> Self::Kind {
-        unsafe { std::mem::transmute::<u16, SyntaxKind>(raw.0) }
-    }
-    fn kind_to_raw(kind: Self::Kind) -> rowan::SyntaxKind {
-        kind.into()
-    }
-}
-
-/// GreenNode is an immutable tree, which is cheap to change,
-/// but doesn't contain offsets and parent pointers.
-use rowan::GreenNode;
-
-use super::SyntaxKind;
-use crate::parser::preprocessor::preprocess;
-/// You can construct GreenNodes by hand, but a builder
-/// is helpful for top-down parsers: it maintains a stack
-/// of currently in-progress nodes
-use rowan::GreenNodeBuilder;
-
-/// The parse results are stored as a "green tree".
-/// We'll discuss working with the results later
-#[derive(Debug)]
-pub struct Parse {
-    green_node: GreenNode,
-    #[allow(unused)]
-    pub errors: Vec<String>,
-}
-
-#[derive(Clone)]
-pub struct Parsed(GreenNode);
-
-impl Parsed {
-    pub fn syntax(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.0.clone())
-    }
-
-    pub fn root(&self) -> Makefile {
-        Makefile::cast(self.syntax()).unwrap()
-    }
-}
-
-pub fn parse(text: &str) -> Result<Parsed, ParseError> {
-    struct Parser {
-        /// input tokens, including whitespace,
-        /// in *reverse* order.
-        tokens: Vec<(SyntaxKind, String)>,
-        /// the in-progress tree.
-        builder: GreenNodeBuilder<'static>,
-        /// the list of syntax errors we've accumulated
-        /// so far.
-        errors: Vec<String>,
-    }
-
-    impl Parser {
-        fn error(&mut self, msg: String) {
-            self.builder.start_node(ERROR.into());
-            if self.current().is_some() {
-                self.bump();
-            }
-            self.errors.push(msg);
-            self.builder.finish_node();
-        }
-
-        fn parse_expr(&mut self) {
-            self.builder.start_node(EXPR.into());
-            loop {
-                match self.current() {
-                    Some(NEWLINE) | None => {
-                        break;
-                    }
-                    Some(_t) => {
-                        self.bump();
-                    }
-                }
-            }
-            self.builder.finish_node();
-        }
-
-        fn parse_recipe_line(&mut self) {
-            self.builder.start_node(RECIPE.into());
-            self.expect(INDENT);
-            self.expect(TEXT);
-            self.expect(NEWLINE);
-            self.builder.finish_node();
-        }
-
-        fn parse_include(&mut self) {
-            self.builder.start_node(RULE.into());
-            self.expect(IDENTIFIER);
-            self.skip_ws();
-            if self.tokens.last() == Some(&(IDENTIFIER, "include".to_string())) {
-                self.expect(IDENTIFIER);
-                self.skip_ws();
-            }
-            self.expect(NEWLINE);
-            self.builder.token(IDENTIFIER.into(), "variables.mk");
-            dbg!(&self.builder);
-            self.builder.finish_node();
-        }
-
-        fn parse_rule(&mut self) {
-            self.builder.start_node(RULE.into());
-            self.skip_ws();
-            self.try_expect(EXPORT);
-            self.skip_ws();
-            self.expect(IDENTIFIER);
-            self.skip_ws();
-            if self.tokens.pop() == Some((COLON, ":".to_string())) {
-                self.builder.token(COLON.into(), ":");
-            } else {
-                self.error("expected ':'".into());
-            }
-            self.skip_ws();
-            self.parse_expr();
-            self.expect(NEWLINE);
-            loop {
-                match self.current() {
-                    Some(INDENT) => {
-                        self.parse_recipe_line();
-                    }
-                    Some(NEWLINE) => {
-                        self.bump();
-                        break;
-                    }
-                    _ => {
-                        break;
-                    }
-                }
-            }
-            self.builder.finish_node();
-        }
-
-        fn parse(mut self) -> Parse {
-            self.builder.start_node(ROOT.into());
-            loop {
-                match self.find(|&&(k, _)| k == COLON || k == NEWLINE || k == INCLUDE) {
-                    Some((COLON, ":")) => {
-                        self.parse_rule();
-                    }
-                    Some((INCLUDE, "include")) => {
-                        dbg!(&self.tokens);
-                        self.parse_include();
-                    }
-                    Some((NEWLINE, _)) => {
-                        self.bump();
-                    }
-                    Some(_) | None => {
-                        self.error(" *** No targets. Stop.".to_string());
-                        if self.current().is_some() {
-                            self.bump();
-                        }
-                    }
-                }
-
-                if self.current().is_none() {
-                    break;
-                }
-            }
-            // Close the root node.
-            self.builder.finish_node();
-
-            // Turn the builder into a GreenNode
-            Parse {
-                green_node: self.builder.finish(),
-                errors: self.errors,
-            }
-        }
-        /// Advance one token, adding it to the current branch of the tree builder.
-        fn bump(&mut self) {
-            let (kind, text) = self.tokens.pop().unwrap();
-            self.builder.token(kind.into(), text.as_str());
-        }
-        /// Peek at the first unprocessed token
-        fn current(&self) -> Option<SyntaxKind> {
-            self.tokens.last().map(|(kind, _)| *kind)
-        }
-
-        fn find(
-            &self,
-            finder: impl FnMut(&&(SyntaxKind, String)) -> bool,
-        ) -> Option<(SyntaxKind, &str)> {
-            self.tokens
-                .iter()
-                .rev()
-                .find(finder)
-                .map(|(kind, text)| (*kind, text.as_str()))
-        }
-
-        fn expect(&mut self, expected: SyntaxKind) {
-            if self.current() != Some(expected) {
-                self.error(format!("expected {:?}, got {:?}", expected, self.current()));
-            } else {
-                self.bump();
-            }
-        }
-
-        fn try_expect(&mut self, expected: SyntaxKind) -> bool {
-            if self.current() != Some(expected) {
-                false
-            } else {
-                self.bump();
-                true
-            }
-        }
-
-        fn skip_ws(&mut self) {
-            while self.current() == Some(WHITESPACE) {
-                self.bump()
-            }
-        }
-    }
-
-    let mut tokens = lex(text);
-
-    tokens.reverse();
-    let result = Parser {
-        tokens,
-        builder: GreenNodeBuilder::new(),
-        errors: Vec::new(),
-    }
-    .parse();
-
-    if !result.errors.is_empty() {
-        Err(ParseError(result.errors))
-    } else {
-        Ok(Parsed(result.green_node))
-    }
-}
-
-/// To work with the parse results we need a view into the
-/// green tree - the Syntax tree.
-/// It is also immutable, like a GreenNode,
-/// but it contains parent pointers, offsets, and
-/// has identity semantics.
-type SyntaxNode = rowan::SyntaxNode<Lang>;
-#[allow(unused)]
-type SyntaxToken = rowan::SyntaxToken<Lang>;
-#[allow(unused)]
-type SyntaxElement = rowan::NodeOrToken<SyntaxNode, SyntaxToken>;
-
-impl Parse {
-    pub fn syntax(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green_node.clone())
-    }
-
-    pub fn root(&self) -> Makefile {
-        Makefile::cast(self.syntax()).unwrap()
-    }
-}
-
-macro_rules! ast_node {
-    ($ast:ident, $kind:ident) => {
-        #[derive(PartialEq, Eq, Hash)]
-        #[repr(transparent)]
-        pub struct $ast(SyntaxNode);
-
-        impl AstNode for $ast {
-            type Language = Lang;
-
-            fn can_cast(kind: SyntaxKind) -> bool {
-                kind == $kind
-            }
-
-            fn cast(syntax: SyntaxNode) -> Option<Self> {
-                if Self::can_cast(syntax.kind()) {
-                    Some(Self(syntax))
-                } else {
-                    None
-                }
-            }
-
-            fn syntax(&self) -> &SyntaxNode {
-                &self.0
-            }
-        }
-
-        impl core::fmt::Display for $ast {
-            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
-                write!(f, "{}", self.0.text())
-            }
-        }
-    };
-}
-
-ast_node!(Makefile, ROOT);
-ast_node!(Rule, RULE);
-ast_node!(Identifier, IDENTIFIER);
-ast_node!(VariableDefinition, VARIABLE);
-
-impl VariableDefinition {
-    pub fn name(&self) -> Option<String> {
-        self.syntax().children_with_tokens().find_map(|it| {
-            it.as_token().and_then(|it| {
-                if it.kind() == IDENTIFIER && it.text() != "export" {
-                    Some(it.text().to_string())
-                } else {
-                    None
-                }
-            })
-        })
-    }
-
-    pub fn raw_value(&self) -> Option<String> {
-        self.syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
-            .map(|it| it.text().to_string())
-    }
-}
-
-impl Makefile {
-    pub fn new() -> Makefile {
-        let mut builder = GreenNodeBuilder::new();
-
-        builder.start_node(ROOT.into());
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root(builder.finish());
-        Makefile(syntax.clone_for_update())
-    }
-
-    /// Read a changelog file from a reader
-    pub fn read<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
-        let mut buf = String::new();
-        r.read_to_string(&mut buf)?;
-        Ok(buf.parse()?)
-    }
-
-    pub fn read_relaxed<R: std::io::Read>(mut r: R) -> Result<Makefile, Error> {
-        let mut buf = String::new();
-        r.read_to_string(&mut buf)?;
-
-        let parsed = parse(&buf)?;
-        Ok(parsed.root())
-    }
-
-    pub fn rules(&self) -> impl Iterator<Item = Rule> {
-        self.syntax().children().filter_map(Rule::cast)
-    }
-
-    pub fn rules_by_target<'a>(&'a self, target: &'a str) -> impl Iterator<Item = Rule> + 'a {
-        self.rules()
-            .filter(move |rule| rule.targets().any(|t| t == target))
-    }
-
-    pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
-        self.syntax()
-            .children()
-            .filter_map(VariableDefinition::cast)
-    }
-
-    pub fn add_rule(&mut self, target: &str) -> Rule {
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RULE.into());
-        builder.token(IDENTIFIER.into(), target);
-        builder.token(COLON.into(), ":");
-        builder.token(NEWLINE.into(), "\n");
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
-        let pos = self.0.children_with_tokens().count();
-        self.0
-            .splice_children(pos..pos, vec![syntax.clone().into()]);
-        Rule(syntax)
-    }
+/// One target rule: its targets, its prerequisites, and its command lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Rule {
+    targets: Vec<String>,
+    prerequisites: Vec<String>,
+    /// Command lines with their leading `<tab>` removed. Prefix characters
+    /// (`@`, `-`, `+`) are still attached; `rule::Recipe` strips those.
+    recipes: Vec<String>,
+    /// 1-based line in the preprocessed text, for diagnostics.
+    line: usize,
 }
 
 impl Rule {
-    pub fn targets(&self) -> impl Iterator<Item = String> {
-        self.syntax()
-            .children_with_tokens()
-            .take_while(|it| it.as_token().is_none_or(|t| t.kind() != COLON))
-            .filter_map(|it| it.as_token().map(|t| t.text().to_string()))
+    pub fn targets(&self) -> impl Iterator<Item = &str> {
+        self.targets.iter().map(String::as_str)
     }
 
-    pub fn prerequisites(&self) -> impl Iterator<Item = String> {
-        self.syntax()
-            .children()
-            .find(|it| it.kind() == EXPR)
-            .into_iter()
-            .flat_map(|it| {
-                it.children_with_tokens().filter_map(|it| {
-                    it.as_token().and_then(|t| {
-                        if t.kind() == IDENTIFIER {
-                            Some(t.text().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                })
-            })
+    pub fn prerequisites(&self) -> impl Iterator<Item = &str> {
+        self.prerequisites.iter().map(String::as_str)
     }
 
-    pub fn recipes(&self) -> impl Iterator<Item = String> {
-        self.syntax()
-            .children()
-            .filter(|it| it.kind() == RECIPE)
-            .flat_map(|it| {
-                it.children_with_tokens().filter_map(|it| {
-                    it.as_token().and_then(|t| {
-                        if t.kind() == TEXT {
-                            Some(t.text().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                })
-            })
+    pub fn recipes(&self) -> impl Iterator<Item = &str> {
+        self.recipes.iter().map(String::as_str)
     }
 
-    pub fn replace_command(&self, i: usize, line: &str) {
-        // Find the RECIPE with index i, then replace the line in it
-        let index = self
-            .syntax()
-            .children()
-            .filter(|it| it.kind() == RECIPE)
-            .nth(i)
-            .expect("index out of bounds")
-            .index();
-
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RECIPE.into());
-        builder.token(INDENT.into(), "\t");
-        builder.token(TEXT.into(), line);
-        builder.token(NEWLINE.into(), "\n");
-        builder.finish_node();
-
-        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
-        self.0
-            .splice_children(index..index + 1, vec![syntax.into()]);
-    }
-
-    pub fn push_command(&self, line: &str) {
-        // Find the latest RECIPE entry, then append the new line after it.
-        let index = self
-            .0
-            .children_with_tokens()
-            .filter(|it| it.kind() == RECIPE)
-            .last();
-
-        let index = index.map_or_else(
-            || self.0.children_with_tokens().count(),
-            |it| it.index() + 1,
-        );
-
-        let mut builder = GreenNodeBuilder::new();
-        builder.start_node(RECIPE.into());
-        builder.token(INDENT.into(), "\t");
-        builder.token(TEXT.into(), line);
-        builder.token(NEWLINE.into(), "\n");
-        builder.finish_node();
-        let syntax = SyntaxNode::new_root(builder.finish()).clone_for_update();
-
-        self.0.splice_children(index..index, vec![syntax.into()]);
+    /// Line in the preprocessed text where this rule's header appeared.
+    pub fn line(&self) -> usize {
+        self.line
     }
 }
 
-impl Default for Makefile {
-    fn default() -> Self {
-        Self::new()
+impl Display for Rule {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "{}: {}",
+            self.targets.join(" "),
+            self.prerequisites.join(" ")
+        )?;
+        for recipe in &self.recipes {
+            writeln!(f, "\t{recipe}")?;
+        }
+        Ok(())
     }
+}
+
+/// A parsed makefile: its rules, and the macros the preprocessor consumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Makefile {
+    rules: Vec<Rule>,
+    macros: Vec<Macro>,
+    /// `vpath` search paths, in declaration order.
+    vpaths: Vec<VPathEntry>,
+    /// Macros an `export` directive named.
+    exports: Vec<String>,
+}
+
+impl Makefile {
+    pub fn rules(&self) -> impl Iterator<Item = &Rule> {
+        self.rules.iter()
+    }
+
+    pub fn macros(&self) -> &[Macro] {
+        &self.macros
+    }
+
+    pub fn vpaths(&self) -> &[VPathEntry] {
+        &self.vpaths
+    }
+
+    pub fn exports(&self) -> &[String] {
+        &self.exports
+    }
+
+    /// Consume the makefile, yielding its rules, macros, search paths and
+    /// exported macro names.
+    pub fn into_parts(self) -> (Vec<Rule>, Vec<Macro>, Vec<VPathEntry>, Vec<String>) {
+        (self.rules, self.macros, self.vpaths, self.exports)
+    }
+}
+
+impl Display for Makefile {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for rule in &self.rules {
+            write!(f, "{rule}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What one physical line of a preprocessed makefile is.
+enum Line<'a> {
+    /// A `<tab>`-indented command line, tab already removed.
+    Command(&'a str),
+    /// Blank, or a comment; neither opens nor closes an entry (POSIX 105646).
+    Ignorable,
+    /// A macro definition or include line, already handled upstream.
+    Consumed,
+    /// Any other non-empty line, which begins a new entry.
+    Entry(&'a str),
+}
+
+/// Classify one physical line.
+fn classify(line: &str) -> Line<'_> {
+    // POSIX 105645: all lines beginning with <tab> are command lines. Checked
+    // first, and never comment-stripped -- the shell sees them verbatim, where
+    // `#` is meaningful.
+    if let Some(body) = line.strip_prefix('\t') {
+        if body.trim().is_empty() {
+            return Line::Ignorable;
+        }
+        return Line::Command(body);
+    }
+
+    let code = scan::strip_comment(line);
+    if code.trim().is_empty() {
+        return Line::Ignorable;
+    }
+    if is_macro_definition(code) || is_include_line(code) {
+        return Line::Consumed;
+    }
+    Line::Entry(code)
+}
+
+/// Start a rule from a parsed rule line, seeding its inline command if present.
+fn rule_from(header: RuleLine, line: usize) -> Rule {
+    let RuleLine {
+        targets,
+        prerequisites,
+        inline,
+    } = header;
+    Rule {
+        targets,
+        prerequisites,
+        recipes: inline.into_iter().collect(),
+        line,
+    }
+}
+
+/// Accumulates rules while walking the file.
+#[derive(Default)]
+struct Builder {
+    rules: Vec<Rule>,
+    errors: Vec<String>,
+    current: Option<Rule>,
+}
+
+impl Builder {
+    /// Close the rule under construction, if any.
+    fn close(&mut self) {
+        if let Some(rule) = self.current.take() {
+            self.rules.push(rule);
+        }
+    }
+
+    /// Add a command line to the rule under construction.
+    ///
+    /// A `<tab>`-indented line is a command line only inside a rule. Outside
+    /// one it is ordinary text -- real makefiles indent continuation and
+    /// comment lines with tabs, so `\t# note` between two macro definitions
+    /// must not be an error. It is re-classified without its indentation.
+    fn push_command(&mut self, body: &str, lineno: usize) {
+        if self.current.is_some() {
+            if let Some(rule) = self.current.as_mut() {
+                rule.recipes.push(body.to_string());
+            }
+            return;
+        }
+        if let Line::Entry(code) = classify(body) {
+            self.open(code, lineno);
+        }
+    }
+
+    fn open(&mut self, code: &str, lineno: usize) {
+        self.close();
+        match scan::split_rule_line(code) {
+            Ok(header) => self.current = Some(rule_from(header, lineno)),
+            Err(msg) => self.errors.push(format!("{lineno}: {msg}")),
+        }
+    }
+
+    fn finish(
+        mut self,
+        macros: Vec<Macro>,
+        vpaths: Vec<VPathEntry>,
+        exports: Vec<String>,
+    ) -> Result<Makefile, ParseError> {
+        self.close();
+        // A makefile that defines no rules at all cannot be built from.
+        if self.errors.is_empty() && self.rules.is_empty() {
+            self.errors.push(" *** No targets. Stop.".to_string());
+        }
+        if self.errors.is_empty() {
+            Ok(Makefile {
+                rules: self.rules,
+                macros,
+                vpaths,
+                exports,
+            })
+        } else {
+            Err(ParseError(self.errors))
+        }
+    }
+}
+
+/// Parse preprocessed makefile text into rules.
+pub fn parse(text: &str) -> Result<Makefile, ParseError> {
+    parse_scanned(text, Vec::new(), Vec::new(), Vec::new())
+}
+
+fn parse_scanned(
+    text: &str,
+    macros: Vec<Macro>,
+    vpaths: Vec<VPathEntry>,
+    exports: Vec<String>,
+) -> Result<Makefile, ParseError> {
+    let mut builder = Builder::default();
+
+    for (idx, raw) in text.split('\n').enumerate() {
+        let lineno = idx + 1;
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        match classify(line) {
+            Line::Command(body) => builder.push_command(body, lineno),
+            Line::Ignorable | Line::Consumed => {}
+            Line::Entry(code) => builder.open(code, lineno),
+        }
+    }
+
+    builder.finish(macros, vpaths, exports)
 }
 
 impl FromStr for Makefile {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let processed = preprocess(s).map_err(|e| ParseError(vec![e.to_string()]))?;
-        parse(&processed).map(|node| node.root())
+        Makefile::parse_with_macros(s, &[])
+    }
+}
+
+impl Makefile {
+    /// Parse `text` with command-line macros already in force.
+    pub fn parse_with_macros(text: &str, cmdline: &[Macro]) -> Result<Makefile, ParseError> {
+        let scanned =
+            preprocess_with(text, cmdline).map_err(|e| ParseError(vec![e.to_string()]))?;
+        parse_scanned(
+            &scanned.text,
+            scanned.macros,
+            scanned.vpaths,
+            scanned.exports,
+        )
     }
 }

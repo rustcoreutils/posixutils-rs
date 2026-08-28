@@ -358,7 +358,7 @@ impl DiagLevel {
     /// are where translation buys the most for the least fragmentation. The
     /// message bodies are built with `format!` at their call sites, which
     /// makes them unusable as msgids without restructuring every one — see
-    /// #U7 in cc/audit.md.
+    /// #U7 in the cc audit (`git log --grep '#U7'`).
     fn prefix(&self) -> String {
         match self {
             DiagLevel::Warning => format!("{}: ", gettext("warning")),

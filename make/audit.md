@@ -1,183 +1,655 @@
 # POSIX.1-2024 Conformance Audit — `make`
 
-**Implementation:** `make/src/` (16 files, ~3,074 lines: `main.rs`, `lib.rs`, `config.rs`, `error_code.rs`, `special_target.rs`, `signal_handler.rs`, `parser/{mod,lex,parse,preprocessor}.rs`, `rule.rs` + `rule/{target,prerequisite,recipe,config}.rs`)
-**Tests:** `make/tests/` (fixture makefiles + `mod.rs` harness, ~1,511 lines)
+Open items only. The 2026-06-12 audit and its 25 numbered findings are in git
+history — `git show 49de59d3^:make/audit.md` recovers the file as it stood
+before it was deleted on 2026-08-27, and `git log --follow -- make/audit.md`
+walks its whole history.
+
+**Implementation:** `make/src/` (~6,589 lines across 19 files)
+**Tests:** `make/tests/` (fixture makefiles + two harnesses, ~3,811 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3 `make`, pp. 3130–3146.
-**Reference:** No sliced spec tree was available; the spec was extracted from the mega-PDF `~/tmp/POSIX.2024.pdf` (pp. 3130–3146) to `~/tmp/make-spec.txt`. Mirrors the `m4` audit's PDF-based method.
-**Date:** 2026-06-12
-**Verification:** Critical and most Major findings were **behaviorally verified** against the built `target/release/make` binary (no source changes), cross-checked with GNU `make` where a control was useful. Items not behaviorally verified are tagged **(static)**. Several agent-proposed findings were **refuted** by behavioral testing and are recorded at the bottom rather than silently dropped.
+No sliced spec tree covers `make`; the section was extracted from the mega-PDF.
 
-## TL;DR
+## Why this file came back
 
-> **Status (2026-06-12): all findings below have been remediated** across nine
-> commits on the `make-audit` branch (Phases 1–9). The original assessment is
-> retained for context; each item is now ticked with the fix, the phase, and its
-> regression test. Two genuinely out-of-scope items are documented rather than
-> implemented: full XSI SCCS auto-retrieval (`.SCCS_GET`/`PROJECTDIR`) and a
-> parser-level `lib(member):` / slash-in-target-name syntax (the `ar` member
-> *timestamp* lookup the audit named is implemented). The `-p` debug-dump format
-> is kept deliberately (the spec leaves it unspecified).
+It was deleted on 2026-08-27 as a crate with nothing open. A crate-wide review
+the same day found 21 defects, every one reproduced against a built
+`target/release/make`. Two of them were already in the old file and ticked:
 
-The implementation handles the easy golden path (a simple `target: prereq` rule with a tab-indented recipe, basic `$(VAR)` macros, `-n`/`-s`/`-i`/`-q`, `.PHONY`, `.DEFAULT`, single internal macros) but falls over on a startling amount of *ordinary* makefile content. The macro preprocessor treats **every line containing `=` as a macro definition — including tab-indented recipe lines** — so any recipe with an `=` (`./configure --prefix=/usr`, `[ x = y ]`, `VAR=1 cmd`, `cc --opt=val`) is rejected with a hard `parse error: EmptyIdent`. The special target `.POSIX` — which the spec says a *portable* makefile **shall** include — is rejected as "not supported". A missing `include` file panics. `make -k` reports failure and exits 2 even when every target builds. Command-line `macro=value` operands, multiple `-f`, the `-j` parallel-execution machinery (`-j`/token pool/`.WAIT`/`.NOTPARALLEL`), the `$(VAR:a=b)` substitution form, single-suffix inference rules, backslash-newline continuation, `MAKEFLAGS`, and the shell `-e` requirement are all absent or broken. This is an early-stage implementation: many headline POSIX requirements are unmet, and several are crashes/aborts on common input.
+- **Slash in a target or prerequisite** (now #26) was dispositioned
+  "genuinely out-of-scope — parser-level `lib(member):` / slash-in-target-name
+  syntax." That framing reads as an XSI archive-member corner. It is not: it
+  means no makefile with subdirectories can be built.
+- **`MAKEFLAGS`** (old #13, now #40) was ticked ✓ fixed with a trailing note
+  that "full synthesis of command-line flags *into* `MAKEFLAGS` for children is
+  not done." That note *is* the finding.
 
-## Priority issues
+New findings are numbered from #26 so the old numbers keep resolving in git.
+
+**All 23 remaining old findings were then re-probed (2026-08-27)** against the
+same binary, with GNU Make 4.3 as the reference wherever POSIX leaves room.
+Eighteen hold, three were refuted, two are partial. The results are recorded at
+the bottom of this file so the next reader does not have to redo them.
+
+## Critical
+
+Each of these blocks ordinary use, crashes, hangs, or silently produces the
+wrong build.
+
+- [x] **#26 — The lexer omits `/`, so no path works.** ✓ fixed 2026-08-27 (P1).
+  The token lexer is gone; the scanner treats every character that is not a
+  `<blank>`, `:`, `;` or `#` as an ordinary name character, so `/`, `(`, `)`,
+  `~`, `%`, `"` and `=` all survive in both positions. Tests
+  `test_slash_in_prerequisite`, `test_slash_in_target`,
+  `test_archive_member_target`, `scan::accepts_slashes_in_names`.
+- [x] **#27 — A rule may name only one target.** ✓ fixed 2026-08-27 (P1).
+  `split_rule_line` splits every `<blank>`-separated word left of the first
+  `:` into a target. Tests `test_multiple_targets_per_rule`,
+  `scan::accepts_multiple_targets`.
+- [x] **#28 — An indirect dependency cycle overflows the stack.** ✓ fixed
+  2026-08-27 (P4). `graph::find_cycle` is an iterative DFS with an explicit
+  stack that inserts into its on-stack and done sets as it walks, so a cycle
+  anywhere in the graph is reported rather than only one passing back through
+  the root. `a: b` / `b: c` / `c: b` now exits 8 with
+  `recursive prerequisite found trying to build 'b'`. Tests
+  `indirect_cycle_not_through_the_root_is_found`, `deep_chain_does_not_overflow`
+  (10,000 deep), `indirect_cycle_is_diagnosed_not_a_stack_overflow`.
+- [x] **#29 — A shared prerequisite is built repeatedly, and concurrently under
+  `-j`.** ✓ fixed 2026-08-27 (P4). `graph::Ledger` moves a target through
+  `Unvisited → Running → Finished` under one mutex, so only the thread that
+  observes it unclaimed runs the recipe; a second arrival either replays the
+  recorded outcome or waits on a condvar. The wait cannot deadlock because the
+  cycle check runs before any worker is spawned. Tests
+  `only_one_thread_builds_a_target`, `a_shared_prerequisite_builds_once`,
+  `a_shared_prerequisite_builds_once_under_dash_j`.
+- [x] **#30 — Only the first rule for a target is used; later ones are silently
+  dropped.** ✓ fixed 2026-08-27 (P4). Rules naming the same target are merged at
+  construction via `Rule::absorb`: prerequisites accumulate (not deduplicated —
+  `$+` keeps duplicates), and a second rule carrying commands warns and wins, as
+  GNU does. POSIX 105653 permits only one commanded rule but attaches no "shall
+  be an error", so refusing the makefile would reject input other makes accept.
+  Test `prerequisites_accumulate_across_rules`.
+- [x] **#31 — `get_newer_prerequisites` has no memoization; DAG traversal is
+  exponential.** ✓ fixed 2026-08-27 (P4). The ledger records each target's
+  outcome, so a second visit replays it instead of re-walking the subtree. The
+  23-node diamond chain that did not finish in 30 s now completes in 0.01 s,
+  matching GNU Make 4.3.
+- [x] **#32 — Both preprocessor fixpoint loops are unbounded and hang.** ✓ fixed
+  2026-08-27 (P2). Include splicing is capped at 64 levels (POSIX 105611 requires
+  at least 16), so a self-including file reports a cycle instead of looping;
+  macro expansion is capped at 256 rounds, so `A = $(A)x` reports
+  `macro expansion does not terminate` instead of growing the text forever.
+  Tests `include_recursion_is_capped`, `recursive_macro_is_capped`.
+
+- [x] **#33 — Under `-k`, a target whose prerequisite failed still runs its
+  recipe.** ✓ fixed 2026-08-27 (P6). A failed recipe now fails its target
+  whatever `-k` says; `-k` means keep building the *other* targets, which the
+  traversal decides. `KEEP_GOING_ERROR`, the process-global flag that could not
+  say which target failed under `-j`, is deleted. Test
+  `keep_going_skips_a_target_whose_prerequisite_failed`, which also pins that an
+  independent sibling still builds.
+## Major
+
+- [x] **#34 — An undefined macro is fatal, environment variables are not macros,
+  and comments are expanded.** ✓ fixed 2026-08-27 (P2). `lookup_macro` returns
+  the empty string for an unknown name (POSIX 105833) and consults the
+  environment unconditionally as macro source 3 (105845) -- `-e` now only
+  decides which source wins, rather than whether the environment is read at all.
+  A bare `$` in a comment no longer aborts the parse, since the reference simply
+  expands to nothing. Tests `undefined_macro_expands_to_empty`,
+  `environment_is_a_macro_source_without_dash_e`,
+  `a_dollar_in_a_comment_does_not_abort`.
+  _Residual: comment text is still expanded rather than skipped. It is now
+  harmless, but `$(shell ...)` in a comment would still run. Recorded as **#51**._
+- [x] **#51 — Comment text is expanded rather than skipped.** ✓ fixed 2026-08-27
+  (P7). The comment is stripped before expansion, so a reference inside one is
+  never evaluated — a commented-out `$(shell rm -rf ...)` does not run. Command
+  lines are exempt: they reach the shell verbatim, where `#` is meaningful.
+- [x] **#35 — Include processing is handed an empty macro table.** ✓ fixed
+  2026-08-27 (P1 step 1). `expand_includes` threads the real macro table through
+  `process_include_lines`, which was being handed `&HashMap::new()`, so
+  `include $(TOP)/inc.mk` now resolves. Test `test_include_path_may_use_a_macro`.
+- [x] **#36 — No `VARIABLE` node is ever built, so `SHELL` and the recipe
+  environment are dead.** ✓ fixed 2026-08-27 (P1). Macros never reached the
+  tree: the preprocessor consumed them textually and blanked their lines before
+  lexing, so `variable_definitions()` was always empty and `Make::macros` always
+  `[]`. `preprocess` now returns the macro table and `Make` takes it directly —
+  no node kind was needed. Probed with `SHELL = ./fakesh`: the recipe runs under
+  `fakesh`, matching GNU. Test `shell_macro_selects_the_recipe_shell`.
+  _Landing this exposed **#49**, which had to be fixed alongside it._
+
+- [x] **#37 — `$*` expands to the whole target name, not the stem.** ✓ fixed
+  2026-08-27 (P5). `$*` is now the target with its suffix removed, keeping any
+  directory part. `.c.o` applied to `f.o` gives `f`. Test `star_is_the_stem`.
+- [x] **#38 — The inference-rule classifier misfires on any dot-target beginning
+  with a known suffix.** ✓ fixed 2026-08-27 (P5). Classification now requires the
+  name to *parse* as `.s1` or `.s1.s2` **and** its suffixes to be in
+  `.SUFFIXES`, instead of asking whether the name merely starts with one, so
+  `.config:` is an ordinary rule. `InferenceTarget::from`/`to` no longer compute
+  the same expression. The second half was in `Rule::run`, whose inference branch
+  scanned the working directory: a dot-target that only looked like an inference
+  rule found no files and silently ran no recipe. Tests
+  `a_dot_target_is_not_an_inference_rule`, `default_target_skips_a_dot_target`.
+- [x] **#39 — A non-UTF-8 target operand panics.** ✓ fixed 2026-08-27 (P6).
+  Diagnosed and skipped rather than unwrapped, so `make $'\xff'` exits 2 instead
+  of 101. The crate is `String`-based throughout, so such a target still cannot
+  be *built*; it can now at least be reported. Test
+  `a_non_utf8_target_is_diagnosed_not_a_panic`.
+- [x] **#40 — `MAKEFLAGS` is never synthesized, so it does not reach
+  sub-makes.** ✓ fixed 2026-08-27 (P6). `makeflags_for_children` builds the
+  letters-only form POSIX 105866 describes — and that `args_with_makeflags`
+  already parses back — from the inheritable options. `-f`, `-C` and the target
+  operands are excluded as specific to the invocation. Verified end to end: a
+  sub-make invoked through `$(MAKE)` sees `MAKEFLAGS=[k]`. Tests
+  `makeflags_carries_options_to_children`,
+  `makeflags_is_empty_when_no_options_are_given`.
+- [x] **#41 — `register_signals()` overrides an inherited `SIG_IGN`, and runs
+  once per recipe.** ✓ fixed 2026-08-27 (P6). `sigaction` replaces `signal`, the
+  existing disposition is read first and left alone when it is `SIG_IGN`, and
+  registration happens once via `Once` rather than per recipe line. Probed: make
+  run under `trap '' INT` survives a SIGINT that used to kill it.
+- [x] **#42 — `-t` touches `.PHONY` targets.** ✓ fixed 2026-08-27 (P6). A phony
+  target names no file, so `-t` skips it instead of creating one that made every
+  later `make <target>` report it up to date forever. Test
+  `touch_does_not_materialize_a_phony_target`.
+- [x] **#47 — `.SUFFIXES` order does not drive inference-rule selection.**
+  ✓ fixed 2026-08-27 (P5). `find_inference_rule` iterates `Config::suffixes` and
+  looks up the rule for each, rather than iterating the rules in file order.
+  POSIX 105920: "The order in which the suffixes are specified defines the order
+  in which the inference rules ... are used." With `.SUFFIXES: .sh .c` both rule
+  orderings now pick `.sh`, matching GNU Make 4.3. Test
+  `suffixes_order_decides_not_rule_order`.
+- [x] **#49 — Makefile macros leak into every recipe's environment.** ✓ fixed
+  2026-08-27 (P1), in the commit that closed #36. `init_env` did
+  `command.envs(macros)` unconditionally — inert only while `Make::macros` was
+  empty, and a live leak the moment #36 wired it up. POSIX 105869: macros
+  defined in a makefile "shall not be added to the environment of make if they
+  are not already in its environment". `exported_macros` now filters to names
+  make already inherited, and `SHELL` is excluded outright. Whether an
+  already-present variable is *updated* is unspecified (105871); we update it,
+  matching GNU, except under `-e` where the environment wins. Tests
+  `makefile_macro_absent_from_env_is_not_exported`,
+  `makefile_macro_present_in_env_is_updated`, `dash_e_lets_the_environment_win`.
+  _The residual noted here — command-line macros appended to the makefile text,
+  and so indistinguishable from makefile macros — is gone as of #71: they are
+  seeded into the reader's table before the read and locked against a later
+  assignment._
+- [x] **#50 — Command-line `macro=value` operands are not exported to recipes.**
+  ✓ fixed 2026-08-27 (P7). POSIX 105866 requires them in make's environment;
+  putting them there is also what makes them visible to recipes, since #49's
+  filter exports a macro only if make already inherited its name. `MAKEFLAGS`
+  and `SHELL` are excluded as the spec requires.
+- [x] **#52 — `$(eval ...)` is unimplemented.** ✓ fixed 2026-08-27. It expands
+  its argument and hands the text to the reader to be read back as makefile
+  source, so it can define macros, rules and conditionals.
+
+  A function cannot reach the reader — the reader owns the macro table and the
+  output buffer, and expansion runs inside a `&mut self` call on it — so eval
+  leaves text in a queue on the shared `func::Expansion` and the reader drains
+  it, re-entering `read` the way `include` already does. Four things this design
+  had to get right, each now a test:
+  * **Ordering.** The drain runs *before* the producing line is emitted. A rule
+    header emitted after it would close the enclosing rule and steal its recipe.
+  * **`$$`.** One `$` level is consumed, matching GNU. `substitute` passes `$$`
+    through untouched, so a template's `$$(CC)` would otherwise keep both
+    dollars and reach the shell as a command substitution — a silent wrong
+    build, not an error.
+  * **Isolation.** Eval'd text gets its own conditional stack; sharing let an
+    eval'd `endif` close a conditional belonging to the enclosing file.
+  * **Laziness.** eval takes one argument, so its text is never split on commas.
+
+  Verified byte-identical to GNU Make 4.3 on the generated-rules idiom
+  `$(foreach p,foo bar,$(eval $(call tpl,$(p))))`. Thirteen tests in
+  `parser.rs` `mod eval`.
+  _Recipe lines are expanded after the reader has finished, so `$(eval ...)`
+  there is refused rather than silently dropped._
+
+- [x] **#53 — `VPATH`/`vpath` are unimplemented.** ✓ partially fixed 2026-08-27
+  (P7). The `VPATH` macro is honoured: a prerequisite that does not exist as
+  written is looked up in each listed directory, for both staleness checks and
+  inference-rule matching, and `$<` names where the file was actually found —
+  byte-identical to GNU on the probe. _Residual: the `vpath` **directive** with
+  its per-pattern search paths is still unimplemented; recorded as **#55**._
+- [x] **#55 — The `vpath` directive is unimplemented.** ✓ fixed 2026-08-27.
+  All three GNU forms: `vpath PATTERN DIRS` appends directories for a pattern,
+  `vpath PATTERN` clears that pattern, and a bare `vpath` clears every pattern.
+  Entries are recorded by the reader in declaration order and carried through to
+  `Make`; `resolve_vpath` consults them before the blanket `VPATH` macro, first
+  matching pattern winning. Verified against GNU Make 4.3 on all three forms.
+  Tests: nine in `parser.rs` `mod vpath`, plus
+  `vpath_directive_finds_a_prerequisite`.
+  _Note: `vpath` was previously not recognized at all — it fell through to being
+  treated as an ordinary line, so a makefile using it was silently mis-parsed._
+
+- [x] **#54 — The built-in inference rules are display strings, not rules.**
+  ✓ fixed 2026-08-27 (P7). POSIX's default rules (`.c.o`, `.c`, `.sh`, `.y.o`,
+  `.l.o`, `.y.c`, `.l.c`, `.c.a`) and the macros they use (`CC`, `CFLAGS`, `AR`,
+  `ARFLAGS`, `YACC`, `LEX` …) existed only inside the `-p` dump table, so
+  `make f.o` with an `f.c` present reported `no target 'f.o'`. Nearly every real
+  makefile leans on the built-in `.c.o`. They are now real rules, seeded from
+  makefile text so they go through the same reader, appended after the
+  makefile's own so a user rule of the same name wins, and suppressed by `-r`.
+  Found by the P7 corpus run, not by the audit. Tests
+  `builtin_c_to_o_rule_applies`, `dash_r_suppresses_the_builtin_rules`.
+- [x] **#56 — A `<tab>`-indented line outside any rule is a parse error.**
+  ✓ fixed 2026-08-27 (P7). A tab-indented line is a command line only inside a
+  rule; outside one it is ordinary text. Real makefiles indent continuation and
+  comment lines with tabs — Lua's makefile does — so `\t# note` between two macro
+  definitions must not be `command line before any target`. Found by the corpus.
+- [x] **#57 — The echoed recipe is not the recipe that runs.** ✓ fixed 2026-08-27
+  (P7). Internal macros were expanded *after* the line was printed, so `-n` and
+  the non-silent echo showed `cc -c -o $@ $<` while executing the right command.
+  Since telling the user what will run is exactly what `-n` is for, the
+  expansion now happens first. Found by the corpus.
+
+- [x] **#58 — A self-referential `$(call ...)` exhausts the stack.** ✓ fixed
+  2026-08-27. `A = $(call A)` aborted with `fatal runtime error: stack overflow`
+  and dumped core. `MAX_EXPANSION_ROUNDS` bounds the rounds *within* one
+  expansion frame, but `substitute → func::call → expand → substitute` is a real
+  recursion and had no depth bound at all. A shared `func::Expansion` carries a
+  depth counter through every nested `Ctx`, capped at 200, and reports a
+  recursive definition instead. Found while designing #52, which multiplies the
+  ways to reach it. Tests `self_referential_call_is_capped_not_a_crash`,
+  `mutually_recursive_calls_are_capped`, `recursion_through_foreach_is_capped`,
+  `finite_nesting_still_expands`.
+- [x] **#59 — A function error grows a newline per nesting level.** ✓ fixed
+  2026-08-27. The error crosses the `Result<String, String>` boundary between
+  `func` and the preprocessor once per level, and `FunctionFailed`'s `Display`
+  used `writeln!`, so each `to_string()` appended another newline — a 200-deep
+  recursion printed its one-line message followed by 202 blank lines. Test
+  `a_depth_error_is_reported_once`.
+
+- [x] **#60 — `$<` is empty in an ordinary rule.** ✓ fixed 2026-08-27. POSIX
+  defines `$<` only for inference rules, but GNU sets it to the first
+  prerequisite in an explicit rule too, and generated rules lean on it: a
+  template emitting `$(1).o: $(1).c` with `$<` in its recipe is the common
+  shape. `Rule::run` now supplies the first prerequisite as the input file,
+  which is what `run_for_pattern` already did — so that near-duplicate collapses
+  into it. Found while checking #52 against GNU.
+
+- [x] **#61 — `.SCCS_GET` is accepted but inert.** ✓ fixed 2026-08-28.
+  Retrieval is implemented. A target with no rule of its own and an
+  `SCCS/s.<name>` beside it is fetched by running the `.SCCS_GET` recipe:
+  POSIX 105699 compares the two timestamps and retrieves when the target is
+  missing or older, and POSIX 105704 leaves a target alone if anyone may write
+  it — a checked-out file belongs to whoever checked it out. The makefile's own
+  `.SCCS_GET` replaces the built-in default (`sccs $(SCCSFLAGS) get
+  $(SCCSGETFLAGS) $@`, POSIX 106038), which `-r` suppresses along with the rest
+  of the built-ins; `GET`, `GFLAGS`, `SCCSFLAGS` and `SCCSGETFLAGS` join the
+  default macros. `sccs` is taken from `PATH`, which is what the spec's own
+  default rule names. Tests `a_missing_source_is_retrieved_from_sccs`,
+  `a_writable_target_is_not_retrieved`, `an_up_to_date_source_is_not_retrieved`,
+  `the_default_recipe_is_seeded_unless_dash_r`.
+  _Not implemented: the XSI `~` suffix rules (`.c~.o` and friends), which are a
+  separate mechanism for building directly from an SCCS file._
+
+- [x] **#62 — A function applied to an automatic variable sees its literal text.**
+  ✓ fixed 2026-08-28. A call whose argument mentions `$@`/`$<`/`$^`/… is now left
+  verbatim while reading — only the rule stage can supply one — and evaluated
+  there, after the automatic variables have values. `substitute_internal_macros`
+  also had to stop re-emitting a bracketed non-internal form *verbatim*: it was
+  skipping the `$^` nested inside `$(notdir $^)`, which is the whole point of
+  that pass. Byte-identical to GNU on `notdir`, `dir` and `basename` over `$^`.
+  Tests `functions_see_automatic_variables`, `a_shell_variable_in_a_recipe_survives`.
+  _Only the deferred call is evaluated at rule time, not the whole line: a
+  line-wide pass turned a shell `$MAKEFLAGS` into `$M` followed by `AKEFLAGS`._
+
+## Minor
+
+- [x] **#43 — `-p` prints a `Debug` dump of the built-in table, never the
+  makefile.** ✓ fixed 2026-08-27. `-p` now writes the real database in makefile
+  syntax: the makefile's own macros alongside the built-ins, its rules with
+  their recipes, the inference rules, `.DEFAULT`, and any `vpath` search paths.
+  POSIX 105395 mandates "the complete set of macro definitions and target
+  descriptions" and leaves the format unspecified; makefile syntax was chosen so
+  the dump round-trips — `make -p` output re-parses as a makefile and its rules
+  still fire. The trailing newline is there, and `-p` no longer suppresses the
+  build (POSIX says that only of `-q`).
+
+  POSIX Example 8, `make -p -f /dev/null 2>/dev/null`, keeps working — but
+  deliberately now. It used to succeed only because an empty makefile is a
+  *parse error* and the error path happened to print the defaults; that branch
+  now builds an empty makefile so the built-ins are seeded and dumped on purpose.
+
+  `Config.rules`, the `BTreeMap` mirror whose own doc comment said it existed
+  "for the `-p` dump", is deleted along with the four sites that maintained it
+  and the malformed `"XSI GET=get"` entry, which was never `NAME=value` syntax
+  and never a real macro. Tests `dash_p`, `dash_p_reports_the_parsed_makefile`,
+  `dash_p_output_is_a_makefile`.
+
+- [x] **#44 — `dbg!()` calls are shipped, and `parse_include` hardcodes
+  `"variables.mk"`.** ✓ fixed 2026-08-27 (P1). Both `dbg!()` calls and the
+  `parse_include` scaffolding were deleted with the old parser, as recommended
+  rather than repaired.
+- [x] **#45 — `Target::new` calls `String::leak()` on every construction.**
+  ✓ fixed 2026-08-27 (P4). `Target` owns `String`s and `name()`/`AsRef<str>`
+  borrow from `&self`, so nothing leaks per visit. No test changed.
+- [x] **#46 — `find_files_with_extension` builds a walk queue it never pushes
+  to.** ✓ fixed 2026-08-27 (P5). Deleted with the working-directory scan it
+  served. An inference rule applied to a real target goes through
+  `run_for_target`, which knows the stem; scanning for every file with the source
+  suffix was both dead structure and the mechanism behind #38's silent no-op.
+- [x] **#48 — Backslash-newline folding leaves two spaces where POSIX and GNU
+  leave one.** ✓ fixed 2026-08-27 (P7). Any blank already sitting before the
+  backslash is dropped, so the continuation collapses to exactly one space.
+  `SRC = one \` + `      two` now gives `one two`, matching GNU Make 4.3.
+## Design note
+
+The crate has no dependency graph: `Make` holds a `Vec<Rule>` and answers every
+question by linear scan and re-traversal, which is what produces #28, #29, #30
+and #31 together. An explicit `HashMap<TargetId, Node>` DAG built once, with
+`Unvisited`/`InProgress`/`Done` colouring, gives cycle detection, memoization
+and `-j` double-build safety from the same state.
+
+The `rowan` CST is the wrong tool for a line-oriented format, and the parser
+built on it cannot express two targets on a line (#27), a slash in a filename
+(#26), or a variable definition (#36). Macro expansion should be lazy and
+scoped per rule rather than a whole-file textual fixpoint (#32, #34, #35), and
+target names should be `OsStr`/`PathBuf` rather than `String` + `leak()`
+(#39, #45).
+
+## From the 2026-08-27 branch review
+
+Thirteen defects found by review, three more found while verifying them. All
+reproduce against the built binary and were diffed against GNU Make 4.3.
+
+**#75-#78 were planned and dropped.** The design pass named them N2-N5 and the
+plan listed them for its execution phase; that phase shipped the numbered
+findings and reported complete without them. They are unchanged since.
 
 ### Critical
 
-- [x] **#1 — A recipe line containing `=` aborts the whole parse with `EmptyIdent`.** ✓ fixed (Phase 1): added `is_macro_definition()` so neither `generate_macro_table` nor `remove_variables` misclassifies tab-indented recipe lines; regression tests `recipe_line_with_equals`. `parser/preprocessor.rs:79–82` (`generate_macro_table` does `source.lines().filter(|line| line.contains('='))`, never skipping tab-indented recipe lines) → `get_ident` fails → `preprocessor.rs:56–57`. Verified: `@echo ./configure --prefix=/usr`, `@test x = x`, `@FOO=1 cmd`, `@echo tar --file=a.tar` all yield `make: parse error: EmptyIdent` (exit 4); GNU make runs them fine. This breaks a large fraction of real recipes. Fix: in `generate_macro_table`, skip lines that begin with a `<tab>` (recipe lines), and only treat a line as a macro definition when the text *before* the first `=`/`:` is a valid macro name.
+- [x] **#63 — Inference rules never compare timestamps.** ✓ fixed 2026-08-28.
+  The inference branch now goes through `run_rule_with_prerequisites` like every
+  other path. That needed the staleness check to stop re-deriving the rule by
+  name — `rule_by_target_name` excludes pattern rules and never sees
+  `inference_rules`, so it reported no prerequisites for exactly these targets,
+  and routing alone would have flipped "always rebuilds" into "never rebuilds".
+  Prerequisites now come from the resolved rule, with an inference rule's
+  implicit source derived from its suffixes. Test
+  `an_inference_rule_is_not_rerun_when_current`.
+- [x] **#64 — Pattern rules never compare timestamps, and `$?` is wrong.**
+  ✓ fixed 2026-08-28. Same routing. `$?` is now the prerequisites newer than the
+  target rather than all of them, and prerequisites are brought up to date before
+  staleness is judged so a rebuilt one counts whatever the timestamps say. Tests
+  `a_pattern_rule_is_not_rerun_when_current`,
+  `question_mark_lists_only_newer_prerequisites`.
+- [x] **#65 — A self-referential pattern rule deadlocks.** ✓ fixed 2026-08-28.
+  Two halves: the pattern branch never called `find_cycle`, and
+  `Edges::prerequisites_of` went through `rule_by_target_name`, which filters out
+  pattern rules — so even calling the check would have seen no edge. The edge
+  source now falls back to instantiating a matching pattern, and the branch runs
+  the check. `%.a: %.a` reports a recursive prerequisite instead of blocking on
+  the ledger forever. Test `self_referential_pattern_is_a_cycle_not_a_hang`.
+  _Divergence noted: GNU drops a circular dependency with a warning and
+  continues; we error, consistent with how named-rule cycles already behave._
 
-- [x] **#2 — `.POSIX` special target is rejected as unsupported.** ✓ fixed (Phase 2): added a `Posix` arm + `process_posix()` that validates no prerequisites/commands and accepts it; removed the now-unreachable `NotSupported` catch-all. Test `special_targets::posix`. `special_target.rs:178–187` — the `process()` match has no `Posix` arm, so the recognized `Posix` variant (`special_target.rs:23`, `:38`) falls into `unsupported => Err(Error::NotSupported)`. Verified: `.POSIX:` → `make: '.POSIX' special target constraint is not fulfilled: the special target is not supported: '.POSIX'` (exit 9). The spec DESCRIPTION (p. 3130) says a portable makefile **shall** include `.POSIX`; this rejects every conformant portable makefile. Fix: add `Posix => this.process_posix()` that enforces no prerequisites / no commands and returns `Ok(())` (optionally enabling strict mode).
+- [x] **#67 — A multi-line macro deletes every built-in rule.** ✓ fixed
+  2026-08-28. The round-trip through generated makefile text is gone: the rule
+  text is a constant, so only its recipe lines need the makefile's macros, and
+  those are expanded directly. Nothing carries a macro value back through a
+  parser, which was the whole failure mode — a `define` body has a newline in
+  it, so the generated text stopped parsing and `if let Ok` threw the error
+  away. Any expansion failure is now reported. Tests
+  `a_multi_line_macro_does_not_delete_the_builtin_rules`,
+  `a_broken_builtin_expansion_is_reported`.
+- [x] **#68 — `$(if)`/`$(or)`/`$(and)` recurse unbounded into a crash.** ✓ fixed
+  2026-08-28. All three now take the depth guard the other lazy functions had.
+  #58 added it to `eval`, `foreach` and `call` and stopped there, so half the
+  class stayed open. Tests `recursion_through_if_is_capped`,
+  `recursion_through_or_and_is_capped`.
+- [x] **#69 — `$(wordlist)` panics on an inverted range.** ✓ fixed 2026-08-28.
+  An inverted span is an empty list, as GNU. Test
+  `wordlist_with_an_inverted_range_is_empty`, which also pins the single-word
+  and past-the-end cases.
+### Major
 
-- [x] **#3 — `include` of a missing/unreadable file panics.** ✓ fixed (Phase 1): `process_include_lines` now returns a `PreprocError::IncludeFailed` with a readable message instead of `unwrap()`-panicking; regression test `missing_include_is_graceful_error`. `parser/preprocessor.rs:279` — `fs::read_to_string(path).unwrap()`. Verified: `include /nonexistent.mk` → `thread 'main' panicked … Result::unwrap() on an Err` (exit 101). The spec (Include Lines, p. 3135) requires a diagnostic and error exit for a non-prefixed `include`, not a panic. Fix: replace `unwrap()` with a graceful `ErrorCode::IoError`; for the `-include` (hyphen-prefixed) form, ignore a missing file per spec.
+- [x] **#66 — `VPATH` is skipped for a prerequisite with no rule of its own.**
+  ✓ fixed 2026-08-28. The up-to-date probe and the staleness comparison both
+  resolve through `resolve_vpath`, and `Rule::run` takes the same resolver
+  `run_for_target` already had, so `$<` names where the file was found.
+  Byte-identical to GNU on the probe. Test
+  `vpath_supplies_a_prerequisite_with_no_rule`.
+- [x] **#70 — A nested reference in a `$(x:a=b)` replacement is rejected.**
+  ✓ fixed 2026-08-28. The spec is read with `read_balanced`, the same reader the
+  function path uses, so `$(SRC:%.c=$(D)/%.o)` yields `obj/a.o obj/b.o`. Test
+  `test_subst_replacement_may_nest_a_reference`.
+- [x] **#71 — Command-line macros do not override macros used in rule headers.**
+  ✓ fixed 2026-08-28. They are now seeded into the reader's macro table before
+  the read, so a header earlier in the file sees them. Seeding alone would have
+  been the same bug in the other direction — a later `OBJ = a.o` in the makefile
+  would clobber the command line — so the table carries a `locked` set that an
+  ordinary assignment cannot write through, with GNU's `override` directive as
+  the documented way past it. `Makefile::parse_with_macros` is the entry point.
+  Tests `a_command_line_macro_overrides_a_rule_header`,
+  `a_later_assignment_does_not_clobber_a_command_line_macro`,
+  `override_defeats_a_command_line_macro`.
+- [x] **#72 — A lone `$` rejects the whole makefile.** ✓ fixed 2026-08-28. `$X`
+  for any single character is a reference to a macro named `X`, matching GNU;
+  an unknown one expands to nothing rather than erroring. `@echo "cost 5 $ each"`
+  now prints. Test `test_a_lone_dollar_is_a_single_char_reference`.
+- [x] **#73 — `?=` and `+=` ignore the environment.** ✓ fixed 2026-08-28. Both
+  operators now resolve their existing value through the macro table *then* the
+  environment, so `CC ?= gcc` with `CC=clang` inherited yields `clang` and
+  `CC += -Wall` yields `clang -Wall`, matching GNU. Test
+  `conditional_and_append_see_the_environment`.
+- [x] **#74 — A bare `export NAME` fails to parse.** ✓ fixed 2026-08-28.
+  `export`/`unexport` are directives now, like `vpath`, and the names they carry
+  are threaded through `Preprocessed` to `Rule::run` so the directive actually
+  adds to the recipe environment rather than merely parsing. Bare `export` marks
+  every macro. Tests `export_directive_puts_a_macro_in_the_environment`,
+  `a_macro_is_not_exported_without_the_directive`.
+- [x] **#75 — `INTERRUPT_FLAG` is never cleared and is shared under `-j`.**
+  ✓ fixed 2026-08-28. It is a list of in-flight targets now, entered once per
+  target by an RAII guard so every exit path from the recipe loop clears it,
+  and the handler cleans up all of them. Probed old against new: a SIGINT
+  during a two-worker build left one partial file on disk before, none now.
+  Test `an_interrupt_cleans_up_every_target_in_flight`.
+- [x] **#76 — `-q` calls `process::exit` from a worker thread.** ✓ fixed
+  2026-08-28. The recipe loop reports "not up to date" and `main` chooses the
+  status. _Correction to the finding: the abandoned-siblings scenario is not
+  reachable — `build_prerequisites` already excludes `-q` from its parallel
+  predicate, so a `-q` build is serial whatever `-j` says, and a probe of old
+  against new shows no behavioural difference. What is fixed is the structure:
+  the exit status is decided where the other exit statuses are decided._
+  Test `dash_q_answers_with_a_status_and_no_output`.
+- [x] **#77 — A bare `.PHONY:` marks every rule phony.** ✓ fixed 2026-08-28.
+  It named no targets, so it fell through to the global modifier and marked
+  every rule; POSIX 105677 says such a target shall be ignored, and it is.
+  Tests `a_bare_phony_is_ignored`, `a_named_phony_is_always_out_of_date`.
+- [x] **#78 — `.IGNORE`/`.SILENT`/`.PRECIOUS` apply per rule, not per target.**
+  ✓ fixed 2026-08-28. The four attribute flags moved off `Rule` into an
+  `Attributes` map keyed by target name, which is what POSIX describes
+  ("prerequisites of this special target are targets themselves"). A rule
+  naming several targets can no longer spread one target's attribute across
+  the others. The whole-makefile forms set the corresponding global option
+  instead of marking every rule, again as specified — `.IGNORE` with no
+  prerequisites means "as if -i". `rule::config` had no members left and is
+  deleted. Tests `ignore_applies_to_the_named_target_only`,
+  `silent_applies_to_the_named_target_only`, plus unit tests on `Attributes`.
 
-- [x] **#4 — `make -k` reports failure and exits 2 even when all targets succeed.** ✓ fixed (Phase 3): the unconditional `if keep_going` block in `main.rs` was the only failure signal, because under `-k` `rule.rs` swallows a failed recipe (prints the error, `break`s, returns `Ok`) so the error never reached `main`. Added a `KEEP_GOING_ERROR` atomic (`rule.rs`) set when a non-ignored recipe error is swallowed; `main` resets it before each command-line target and reports `Target … not remade because of errors` (and sets `had_error`) only when it fired — so an all-success `-k` build now exits 0 with no diagnostic. Tests `arguments::dash_k_success` (success ⇒ exit 0, silent) plus the preserved `arguments::dash_k` (failure ⇒ message + exit 2). Behaviorally verified: independent command-line targets still build after one fails. `main.rs:266–283` — after a *successful* `build_target`, the `if keep_going { eprintln!("…Target … not remade because of errors"); had_error = true; }` block fired unconditionally, and `had_error` forced `status_code = 2`.
+## From the 2026-08-28 branch review
 
-- [x] **#5 — Command-line `macro=value` operands are unsupported.** ✓ fixed (Phase 2): `main()` partitions operands with `is_macro_definition()`; macro operands are appended after the makefile(s) so they take precedence. Tests `cmdline_macro_overrides_file`, `cmdline_macro_defines`. `main.rs:108–110` — all positional args go into `targets: Vec<OsString>`; nothing splits out `name=value`. Verified: `make FOO=bar all` → `make: parse error: UndefinedMacro("FOO")` (exit 4). The SYNOPSIS mandates `[macro[::[:]]=value...]` operands, and the spec gives them the highest macro precedence. Fix: before queueing targets, peel off args matching the macro-assignment forms and inject them as a top-precedence macro layer (the `ENV_MACROS` atomic in `preprocessor.rs` is a usable precedent).
+Ten defects found by review of the `updates` branch, two more found while
+verifying them. All reproduce against the built binary and were diffed against
+GNU Make 4.3; each fix carries a regression test.
+
+### Critical
+
+- [x] **#79 — A function call nested around an automatic variable is
+  truncated.** ✓ fixed 2026-08-28. `substitute_internal_macros` read `$(...)`
+  to the *first* `)` with no nesting count, and then evaluated that truncated
+  call, so `$(addprefix o/,$(notdir $^))` printed `[o/x.c)]` — the inner call's
+  result plus the outer call's stray paren. It reads to the matching close now,
+  the way the preprocessor's `read_balanced` already did. A regression against
+  `main`, which re-emitted the bracketed form verbatim and stayed correct. Test
+  `nested_functions_read_to_the_matching_paren`.
+- [x] **#80 — Two inference rules that derive each other's source hang.**
+  ✓ fixed 2026-08-28. `Edges::prerequisites_of` reported named and `%`-pattern
+  edges only, so an inference rule's implicit source was invisible to
+  `find_cycle`; `Ledger::claim` then blocked the *one* thread on a target it
+  was itself in the middle of building. With `.c.o:` and `.o.c:` both defined,
+  `make foo.o` never returned and printed nothing. `prerequisites_of` now
+  mirrors the dispatch order in `build_target_uncached` — named rule, else
+  pattern rule, else the inferred source — so the cycle is reported. Not a `-j`
+  race: it deadlocked single-threaded. Test
+  `mutually_recursive_inference_rules_are_a_cycle_not_a_hang`.
+- [x] **#81 — A trailing comment reaches the directive.** ✓ fixed 2026-08-28.
+  `handle_line` recognized directives on the raw line, before `strip_comment`,
+  so the comment became part of the condition: `ifeq ($(X),1)   # why` failed
+  the whole makefile with `malformed conditional`, and `ifdef X  # why`
+  silently evaluated false and took the `else` arm. Every line but a
+  `<tab>`-indented command line now loses its comment first, which is where
+  POSIX 105629 draws the line too. Test
+  `a_trailing_comment_does_not_reach_the_condition`.
+- [x] **#82 — `-t` empties the target.** ✓ fixed 2026-08-28. The touch path
+  opened the target with `File::create`, which is `O_TRUNC`, so `make -t`
+  destroyed the contents of every out-of-date target it marked. Opened without
+  truncation now: `-t` records a time, it does not write the file. Test
+  `touch_preserves_the_target_contents`.
+- [x] **#83 — An explicit prerequisite list hides the inferred source.**
+  ✓ fixed 2026-08-28. Staleness was judged from `effective_prerequisites`,
+  which for an explicit dispatch is only the named rule's list, and the
+  up-to-date early return came *before* the "no commands → check inference
+  rules" branch. The standard `foo.o: foo.h` plus `.c.o:` idiom therefore never
+  saw `foo.c`, and a changed source never recompiled — make reported the target
+  up to date. The inference rule is resolved once, before the comparison, and
+  its source joins the prerequisite list. Test
+  `an_inference_rule_sees_a_changed_source_through_an_explicit_rule`.
+- [x] **#84 — A later rule leaks prerequisites to sibling targets.** ✓ fixed
+  2026-08-28. `Rule::absorb` merged into a rule that may name several targets,
+  so `a b:` followed by `a: extra` gave `extra` to `b` as well — the same leak
+  #78 fixed for attributes, unfixed for prerequisites. POSIX 105643 makes the
+  target side a `<blank>`-separated list of targets, each a target in its own
+  right — `a b: c` is `a: c` and `b: c` — so `Rule::split_targets` expands a
+  multi-target rule into one rule per target at construction and absorption
+  only ever merges rules for the same single target. A `%` pattern rule is left
+  whole: it is a template matched by name, not a target. Test
+  `a_later_rule_does_not_leak_prerequisites_to_siblings`.
 
 ### Major
 
-- [x] **#6 — `$(string:subst1=subst2)` substitution form is unimplemented and hard-errors.** ✓ fixed (Phase 4): the `(`/`{` branch of `substitute` now detects `:` after the macro name and applies `apply_substitution`, which handles both the suffix form and the `[op]%[os]=[np][%][ns]` pattern form word-wise. Tests `preprocess::test_subst_suffix`, `test_subst_pattern`; verified `$(SRC:.c=.o)`→`a.o b.o foo.o`, `$(O:%.o=%.x)`→`a.x b.x`. `parser/preprocessor.rs` `substitute`.
-
-- [x] **#7 — Backslash-newline line continuation is not folded.** ✓ fixed (Phase 4): `preprocess` now runs `fold_continuations` first. Outside recipe lines, `\<newline>` + leading white space of the next line collapse to a single space; in a recipe (tab-indented) line the continuation is spliced (one leading tab of the next line removed) so the whole command reaches the shell. An escaped trailing backslash (`\\`) is not treated as a splice. Tests `preprocess::test_continuation_macro`, `test_continuation_recipe`; verified `FOO = a \`<newline>`b` → `a b`.
-
-- [x] **#8 — Single-suffix inference rules (`.c:`, `.sh:`) are never applied.** ✓ fixed (Phase 5): `try_parse_inference` now accepts a single-suffix target as `Inference { from: <suffix>, to: "" }`; `find_inference_rule` searches single-suffix rules (where the suffixless target's `<name>.<from>` exists) after double-suffix, and `build_target`'s no-rule branch invokes inference before falling through to `.DEFAULT`/`NoTarget`; `run_for_target` computes the `<target>.<from>` input for `to==""`. Test `inference_rules::single_suffix_rule`; verified `make bar` with `bar.c` + `.c:` → `built bar from bar.c`.
-
-- [x] **#9 — Parallel execution machinery is entirely absent: `-j`, token pool, `.WAIT`, `.NOTPARALLEL`.** ✓ fixed (Phase 7): added `-j maxjobs` (last value wins via `overrides_with`; non-positive ⇒ 1). `Make` was made `Send`/`Sync` (macros now owned `(String,String)`), and a non-blocking `TokenPool` of `maxjobs-1` tokens bounds concurrency. `build_prerequisites` splits a target's prerequisites on `.WAIT` barriers (build left-of-`.WAIT` before right-of-`.WAIT`) and, under `-j>1`, builds each segment with `std::thread::scope`: each prerequisite that obtains a token runs in a worker thread, the rest build inline (so the recursion is deadlock-free). `.WAIT`/`.NOTPARALLEL` are now real `SpecialTarget` variants — `.WAIT` as a target is a no-op and as a prerequisite is a barrier (no longer "no target '.WAIT'"); `.NOTPARALLEL` forces sequential builds. Tests `parallel::{dash_j_builds_all_targets,dash_j_last_value_wins,notparallel_recognized,wait_barrier_is_not_built}`; behaviorally verified `-j2` halves wall-clock for two independent sleeps, `.WAIT`/`.NOTPARALLEL` serialize, and a diamond build does not deadlock.
-
-- [x] **#10 — Multiple `-f makefile` options are rejected.** ✓ fixed (Phase 2): `makefile` is now `Vec<PathBuf>`; `parse_makefile` concatenates the operands in order (with `-` = stdin). Test `multiple_dash_f`. `main.rs:50–51` — `makefile: Option<PathBuf>`. Verified: `make -f A.mk -f B.mk …` → `error: the argument '--makefile <MAKEFILE>' cannot be used multiple times` (exit 2). Spec: multiple `-f` shall be processed in order. Fix: make it `Vec<PathBuf>` and concatenate the makefiles in order.
-
-- [x] **#11 — The shell `-e` option is not in effect for non-ignored recipes.** ✓ fixed (Phase 6): the recipe command is now run with `-e -c` when the recipe's errors are not ignored, and plain `-c` when they are (`-`/`.IGNORE`/`-i`). Test `recipe_execution::shell_e_aborts_on_first_failure`; verified `false; echo REACHED` now aborts (exit 2, no `REACHED`) and `-false; echo REACHED` still reaches it.
-
-- [x] **#12 — Recipes are run with the `SHELL` *environment variable*, which the spec forbids.** ✓ fixed (Phase 6): the recipe shell is resolved from the `SHELL` *macro* (default `/bin/sh`); the `SHELL` env var is no longer consulted for shell selection, and `init_env` no longer exports the `SHELL` macro to recipe sub-processes (so the macro cannot modify the child's `SHELL`). Verified: a `SHELL` macro selects the shell while a bogus `SHELL` env var is ignored.
-
-- [x] **#13 — `MAKEFLAGS` is ignored.** ✓ fixed (Phase 4): `args_with_makeflags()` seeds options from the env var ahead of the real command line. The letters-only first word (`kn`) becomes a combined short option (`-kn`); `-`-prefixed and `macro=value` words pass through. `MAKEFLAGS` is inherited by recipe sub-processes via the environment (sub-make propagation). Tests `internal_macros::makeflags_letters_form`; verified `MAKEFLAGS=n`, `MAKEFLAGS=-n`, and `MAKEFLAGS='V=hello'`. Note: full synthesis of command-line flags *into* `MAKEFLAGS` for children is not done (only env-provided flags propagate).
-
-- [x] **#14 — `$?` expands to *all* prerequisites, not those newer than the target.** ✓ fixed (Phase 4): `run_rule_with_prerequisites` now threads the `get_newer_prerequisites` slice through `run`/`run_for_target`/`run_with_files` into `substitute_internal_macros`, where `$?` uses the newer-only list (space-separated; the old code concatenated with no separator). `$^`/`$+` keep the full list. Behaviorally verified: with `prog: a.o b.o a.o` and only `b.o` newer, `$?`→`b.o`.
-
-- [x] **#15 — `$^`, `$+`, and the `$(@D)`/`$(@F)` (dir/file) macro variants are missing.** ✓ fixed (Phase 4): `substitute_internal_macros` was rewritten around `expand_internal_macro`, which supports sigils `@ % ? < * ^ +` in both the two-char (`$^`) and bracketed (`$(@D)`, `${?F}`) forms. `$^` dedups (order preserved); `$+` keeps duplicates; the `D`/`F` modifiers take `dir_part`/`file_part` of each element. The preprocessor passes internal-macro references through verbatim (added `^`/`+` to the two-char passthrough and a `$(`-internal passthrough) so they reach the rule stage. Tests `internal_macros::caret_and_plus`, unit tests `rule::tests::dir_and_file_parts`; verified `$(@D)`/`$(@F)`/`${@F}`. Note: targets containing `/` still do not parse (separate pre-existing lexer limitation, not in this audit), so `$(@D)` is `.` for ordinary targets.
-
-- [x] **#16 — `.SUFFIXES` is stored in a `BTreeSet`, destroying search order; additive/clear semantics are also broken.** ✓ fixed (Phase 5): added an authoritative insertion-ordered `Config.suffixes: Vec<String>` (consumed by `find_inference_rule` and `InferenceTarget`); the sorted `rules[".SUFFIXES"]` `BTreeSet` is kept only as a mirror for the `-p` dump. `process_suffixes` now clears on empty prerequisites (`clear_suffixes`) and appends otherwise (`add_suffix`, order-preserving, dedup) instead of replacing. `-r` clears the Vec too. Test `inference_rules::suffixes_clear_then_readd`; verified append keeps built-ins, empty `.SUFFIXES:` clears them, and a later `.SUFFIXES: .c .o` re-enables inference.
-
-- [x] **#17 — Signal registration is gated on the wrong condition.** ✓ fixed (Phase 8): registration is now `if !dry_run && !print && !quit` — make catches signals unless `-n`/`-p`/`-q` is set (those take the default action), and `-i` is no longer an exemption. Test `target_behavior::async_events_registered_under_dash_i` confirms an interrupt under `-i` still cleans up and re-raises.
-
-- [x] **#18 — `.PRECIOUS` with no prerequisites does not protect targets on signal.** ✓ fixed (Phase 8): `process_precious` now sets `make.config.precious = true` when `.PRECIOUS` has no prerequisites, so the global-precious flag the signal handler consults protects every in-progress target.
-
-- [x] **#19 — `-include` is not actually implemented (line passed through).** ✓ fixed (Phase 5): `parse_include_directive` recognizes both `include` and the `-include` form, requires the trailing blank (so `includedir=…` is no longer mis-parsed as an include), and inlines the file; a missing/unreadable file is silently ignored for `-include` and a hard error for `include`. Tests `preprocess::test_dash_include_missing_ignored`, `test_include_missing_errors`, `test_includedir_not_mistaken_for_include`. Note: full immediate/delayed re-making of include files is not implemented (the file is simply inlined), which matches the existing `include` behavior.
+- [x] **#85 — `VPATH` resolves only `$<`.** ✓ fixed 2026-08-28.
+  `expand_internal_macro` passed `files.0` through the resolver and took `$^`,
+  `$+` and `$?` straight from the raw prerequisite names, so a recipe using
+  them named a file that does not exist in the working directory. Every
+  prerequisite-derived macro is resolved now. Test
+  `vpath_resolves_every_prerequisite_macro`.
+- [x] **#86 — A double-colon rule parses as a prerequisite named `:`.**
+  ✓ fixed 2026-08-28. `split_rule_line` took the first `:`, so `all:: a` became
+  target `all` with prerequisites `[":", "a"]` and the build failed with
+  `no target ':'` — a diagnostic about the wrong thing entirely. GNU's
+  double-colon rule is not POSIX and is not implemented; it is now named and
+  rejected rather than misread. Tests `scan::rejects_a_double_colon_rule`,
+  `scan::accepts_a_colon_in_a_prerequisite`, `double_colon_rule_is_diagnosed`.
+- [x] **#87 — A trailing `$` fails the makefile.** ✓ fixed 2026-08-28. A `$` as
+  the last character of a line raised `UnexpectedEOF` from `substitute`, which
+  aborts the entire read, so a recipe as ordinary as `@echo end$` was rejected.
+  It is emitted literally, as the rule stage already did for the same input.
+  Test `a_trailing_dollar_is_literal`.
+- [x] **#88 — A computed macro name fails the makefile.** ✓ fixed 2026-08-28.
+  `$($(X))` made `get_reference_name` return empty and the whole makefile was
+  rejected with `BadMacroName`, where POSIX 105833 makes even an unresolvable
+  reference the empty string. The inner reference is resolved and its result
+  looked up; an inner reference that expands to nothing yields the empty
+  string. Test `a_computed_macro_name_resolves`.
+- [x] **#90 — A deferred function's error is swallowed.** ✓ fixed 2026-08-28.
+  A call that mentions an automatic variable is deferred to the rule stage, and
+  the fallback there was `Err(_) => push_str(&call)`: the unevaluated call went
+  to the shell, which reported `error: not found` and the build exited 0. So
+  `$(error bad $@)` — deferred precisely because it names `$@` — did nothing.
+  `substitute_internal_macros` returns a `Result` and the error propagates.
+  Test `a_deferred_function_error_is_reported`.
 
 ### Minor
 
-- [x] **#20 — Signal handler calls `process::exit(128+sig)` instead of resetting to default and re-raising.** ✓ fixed (Phase 8): the handler now does `signal(sig, SIG_DFL); raise(sig)`, so make dies *from* the signal and the parent observes a signal death (verified: `status.code()` is `None`, `status.signal()` is `SIGINT`). Tests updated accordingly.
+- [x] **#89 — The failure diagnostic does not name the target.** ✓ fixed
+  2026-08-28. `make: execution error: 1` left the reader to guess which target
+  it belonged to, which under `-k` is the whole question. `ExecutionError`
+  carries the target and the message reads `make: [xd] execution error: 1`.
+  Covered by the updated `dash_k` and `dash_cap_s` expectations.
 
-- [x] **#21 — Signal cleanup ignores `.PHONY` membership and the mtime-change condition.** ✓ fixed (Phase 8): `INTERRUPT_FLAG` now carries an `InterruptInfo { target, precious, phony, original_mtime }`. The target's mtime is captured once before its recipe sequence; on interrupt the handler deletes only when the target is not precious, not phony, and its mtime changed (i.e. the recipe had begun writing the file). Verified by `target_behavior::async_events` (a freshly created `text.txt` is deleted) and `special_targets::precious` (a precious target is kept).
+## Still open
 
-- [x] **#22 — `.IGNORE`/`.SILENT`/`.PHONY`/`.PRECIOUS` "subsequent occurrences add to the list" and per-target forms are order-dependent.** ✓ fixed (Phase 9): order-dependence does not occur in practice because special targets are processed only after *all* rules are classified (`Make::try_from` pass 2), so `additive()`/`global()` see every rule and the per-rule flags accumulate. The remaining literal gap — `process_phony`/`process_precious` `insert` (replacing) the stored set — is fixed to `entry().or_default().extend(...)`, so multiple `.PHONY`/`.PRECIOUS` lines now accumulate (visible in `-p`). `.SCCS_GET` keeps last-wins (it is a single command redefinition, not a list). Test `special_targets::phony_accumulates`.
+- **Full POSIX macro source-1..4 precedence.** No macro records where its value
+  came from. Precedence is emergent: built-in defaults are seeded only where
+  the makefile is silent, the environment is consulted as a fallback (or wins
+  under `-e`), and command-line macros are locked. That answers every case
+  probed against GNU Make 4.3, and #71/#73 closed the two that were wrong, but
+  it is not the four-source model the spec describes, and a case that needs to
+  ask "which source set this?" cannot be answered today.
+- **GNU double-colon rules** (`target:: prerequisites`), where several rules
+  for one target each carry their own commands and all of them run. POSIX has
+  no such construct. As of #86 the form is recognized and rejected by name
+  rather than misparsed, so a makefile using it fails with a diagnostic that
+  says what is unsupported.
+- **XSI `~` suffix rules** (`.c~.o`, `.sh~` and friends), which build directly
+  from an SCCS history file. Separate machinery from `.SCCS_GET` retrieval
+  (#61), which is implemented.
 
-- [x] **#23 — Runtime diagnostics are largely un-internationalized.** ✓ improved (Phase 9): the substantive error messages already route through `gettext` (`error_code.rs` `Display`). The remaining raw build-loop diagnostics in `main.rs` (the `-k` "Target … not remade because of errors" and the "is up to date." messages) are now routed through `gettext` too (English msgids reproduce the exact prior wording, so output is unchanged when untranslated). Comprehensive coverage of every string remains incremental, but `LC_MESSAGES` now governs the user-facing diagnostics.
+## Acceptance gate
 
-- [x] **#24 — `-p` output format is a Rust `{:?}` debug dump.** ✓ reviewed (Phase 9): the spec explicitly leaves the `-p` format unspecified, so the debug dump conforms. It is intentionally kept as-is: it is the documented contract of three exact-match `-p` regression tests, and a reformatting would be pure churn with no conformance gain. No code change.
+`/tmp/makecorpus.sh` (rebuilt per session, per the project's convention for gate
+scripts). Three checks per corpus project:
 
-- [x] **#25 — Internal error exit codes use values 3–9.** ✓ reviewed (Phase 3): `error_code.rs` maps distinct internal errors to 3–9; only `-q`'s not-up-to-date maps to 1 and success to 0. All error paths are `>1`, so this satisfies the spec's 0/1/>1 exit-status contract. The granular codes are non-standard but conforming, so they are kept (changing them risks breaking the existing exit-code tests for no conformance gain). No code change.
+| check | what it does | catches |
+|---|---|---|
+| build | make succeeds, artifact exists, artifact runs | outright breakage |
+| noop | `make -n` straight after a build prints nothing | always-rebuild |
+| diff | `make -n` on a clean tree matches `gmake -n` | silent divergence |
 
-## Detailed conformance matrix
+Two things the earlier single-check gate got wrong, both worth keeping:
 
-### Options (SYNOPSIS `make [-einpqrst] [-f makefile]... [-j maxjobs] [-k|-S] [macro=value...] [target...]`)
-- [x] `-e` CONFORMS — environment overrides macros; `main.rs:56–61`, plumbed via `ENV_MACROS` (`preprocessor.rs`).
-- [x] `-i` CONFORMS — global ignore; `main.rs:53`, `config.rs:44`, `rule.rs:165`.
-- [x] `-n` CONFORMS — prints without executing; verified (`echo …` printed, not run). `rule.rs:183–188`.
-- [x] `-p` CONFORMS (format unspecified) — `main.rs:112–114` debug dump. See #24.
-- [x] `-q` CONFORMS — exit 1 when not up to date, recipe not run; verified. `rule.rs:194–201`.
-- [x] `-r` CONFORMS — clears suffixes / built-ins; `main.rs:207–209`.
-- [x] `-s` CONFORMS — suppresses echo; verified. `rule.rs:204–207`.
-- [x] `-t` CONFORMS — touches targets; `rule.rs:252–260`.
-- [x] `-k` CONFORMS (Critical #4 fixed) — all-success build exits 0 silently; a failed target is reported while independent targets continue, exit 2.
-- [x] `-S` present as `--terminate` (`main.rs`) and is the default; the `-k` interaction (#4) is fixed (when both are set, `-S`/terminate wins so make stops). Known minor: strict POSIX "last of `-k`/`-S` on the command line wins" ordering is not modeled (the flags are independent booleans); documented, not a numbered finding.
-- [x] `-f` (multiple) processed in order (Major #10 fixed, Phase 2).
-- [x] `-j maxjobs` implemented with a token pool (Major #9 fixed).
-- [x] `macro=value` operands supported with top precedence (Critical #5 fixed, Phase 2).
-- Extensions present (non-POSIX, no conflict — informational): `-C/--directory` (verified working), long-option aliases (`--ignore`, `--silent`, …). Per audit scope these are noted, not flagged.
+- **The corpus needs a phony target directly over an inferred one.** Both original
+  projects put a real-file intermediate between the phony root and the pattern
+  rule, so the traversal short-circuits on a rerun and an always-rebuild bug
+  stays invisible. The `phony` project exists to expose exactly that.
+- **The differential is opt-in per project.** A project relying on the *built-in*
+  `.c.o` legitimately differs from GNU: POSIX specifies
+  `$(CC) $(CFLAGS) -c $<`, GNU's is `-c -o $@ $<`. Lua is exempted for that
+  reason, with the reason recorded in the run output rather than silently.
 
-### Macros
-- [x] `$(NAME)` / `${NAME}` CONFORMS — verified (`CC=echo` expands in recipe; refutes an agent "verbatim to shell" claim). `preprocessor.rs` `substitute`.
-- [x] Single internal macros `$@ $% $? $< $*` CONFORMS *in isolation* — `rule.rs:284–301`; `$@` verified equal to GNU. But see #14 (`$?` semantics) and #1 (a same-line `=` still aborts the parse).
-- [x] `$$` → `$` CONFORMS — verified (`echo price is $$5` → `price is `). Refutes an agent DIVERGES claim.
-- [x] `$(VAR:a=b)` / `%`-pattern CONFORMS (Major #6 fixed).
-- [x] `$^` / `$+` / `$(@D)` / `$(@F)` CONFORMS (Major #15 fixed).
-- [x] Command-line macro precedence (Critical #5 done) and `MAKEFLAGS` (Major #13 fixed).
-- [x] Backslash-newline in macro bodies folded (Major #7 fixed).
-- [x] `?=`, `+=`, `!=` — `?=` verified correct (kept existing value; fell back when unset — refutes an agent "inverted" claim). `+=`/`!=` not behaviorally re-verified here; flavor (immediate vs deferred) is not tracked (`preprocessor.rs`) — **(static, low priority)**.
+A gate is only worth having if it can fail. On the tree of 2026-08-28 this one
+fails on two real defects (`phony`/noop, `synthetic`/diff) and exits nonzero.
 
-### Operands / STDIN / Include
-- [x] `-` operand to `-f` reads stdin — `main.rs:140–141`.
-- [x] First non-special target as default — `lib.rs:65–76`; verified via `.DEFAULT` and normal targets.
-- [x] `include existing.mk` CONFORMS — verified.
-- [x] `include missing.mk` graceful error (Critical #3 done); `-include` implemented with missing-file-ignore (Major #19 fixed).
+## Re-probe of the 2026-06-12 findings (2026-08-27)
 
-### Environment variables
-- [x] `LANG`/`LC_*` — `setlocale(LcAll, "")` at `main.rs:165` (CONFORMS for locale init; message coverage is #23).
-- [x] `MAKEFLAGS` honored (Major #13 fixed).
-- [x] `SHELL` macro (not env var) used for recipe shell (Major #12 fixed).
-- [x] `PROJECTDIR` (XSI) — reviewed: an optional XSI SCCS search-path feature, intentionally out of scope alongside `.SCCS_GET` runtime retrieval. Documented as a known limitation, not a base-spec conformance failure.
+All 25 old findings were ticked. #13 and #24 were refuted by the crate review
+(they are #40 and #43 above). The remaining 23 were re-probed against
+`target/release/make`, with GNU Make 4.3 as the reference wherever POSIX leaves
+room. **Eighteen hold, three are refuted, two are partial.**
 
-### Asynchronous events
-- [x] SIGHUP/SIGINT/SIGQUIT/SIGTERM handlers installed — `signal_handler.rs:40–43`.
-- [x] Non-precious in-progress target removed on signal — `signal_handler.rs:19–32`.
-- [x] Registration gated correctly (Major #17 fixed); `.PRECIOUS` global honored (Major #18 fixed); reset-and-re-raise (Minor #20 fixed); mtime/`.PHONY` cleanup check (Minor #21 fixed).
+Recorded so the next reader does not repeat the work. A row here is a claim
+about the binary as of 2026-08-27, not about the source.
 
-### STDOUT / STDERR / Exit status
-- [x] Recipe echo to stdout; diagnostics to stderr — `rule.rs`, `main.rs`.
-- [x] Recipe command failure → exit 2 — verified (`false` → `execution error: 1`, exit 2). `error_code.rs`.
-- [x] Up-to-date message — `main.rs:257–258`.
-- [x] `-k` exit handling (Critical #4 fixed); granular internal codes conform (Minor #25, kept).
+| Old | Claim | Result |
+|---|---|---|
+| #1 | recipe line with `=` no longer aborts the parse | holds — `echo VAR=1` and `[ x = y ]` both run |
+| #2 | `.POSIX` accepted | holds |
+| #3 | missing `include` errors instead of panicking | holds — `cannot open include file …`, exit 4 |
+| #4 | `-k` exits 0 when everything succeeds | holds |
+| #5 | command-line `macro=value`, taking precedence | holds — overrides the makefile's own value |
+| #6 | `$(SRC:.c=.o)` substitution | holds — `a.c b.c` → `a.o b.o` |
+| #7 | continuation folds to a single space | **refuted** — folds to two; see #48 |
+| #8 | single-suffix inference rules | holds — `.c:` applied to `foo` |
+| #9 | `-j`, `.WAIT`, `.NOTPARALLEL` | holds — and `.WAIT` genuinely orders under `-j4` |
+| #10 | multiple `-f`, concatenated in order | holds |
+| #11 | shell `-e` for non-ignored recipes | holds — `false; echo …` does not leak; `-` prefix still ignores |
+| #12 | recipe shell from the `SHELL` macro | **refuted** — runs under `/bin/sh`; see #36 |
+| #14 | `$?` is newer-only | holds — one of two prerequisites listed |
+| #15 | `$^`, `$+`, `$(@D)`, `$(@F)` | holds — byte-identical to GNU |
+| #16 | `.SUFFIXES` order authoritative | **partial** — membership and clear work, order does not; see #47 |
+| #17 | signal registration correctly gated | **refuted** — overrides an inherited `SIG_IGN`; see #41 |
+| #18 | bare `.PRECIOUS` protects every target | holds — verified against a control where a plain target *is* deleted |
+| #19 | `-include` implemented; `includedir=` not mistaken for it | holds |
+| #20 | handler resets to `SIG_DFL` and re-raises | holds — `WIFSIGNALED`, signal 2, not `exit(130)` |
+| #21 | cleanup honors `.PHONY` | holds — same control as #18 |
+| #22 | special targets additive across occurrences | holds — two `.PHONY:` lines both take effect |
+| #23 | diagnostics internationalized | **partial, as its own text admits** — 34 `gettext` sites, 10 raw `eprintln!` remain, mostly `main.rs` error paths |
+| #25 | every error path exits >1 | holds — 2 / 4 / 6 for recipe / parse / no-target, and `-q` correctly exits 1 |
 
-### Special targets
-- [x] `.DEFAULT` CONFORMS — verified (fires for missing target). `special_target.rs` / `lib.rs:136–143`. Now also enforces the "specified with commands" requirement (Phase 9): an empty `.DEFAULT:` is a constraint violation. Test `special_targets::validations::default_without_recipes`.
-- [x] `.PHONY` CONFORMS — verified (forces rebuild twice). `lib.rs:167–169`.
-- [x] `.SILENT` (global) CONFORMS — verified. `special_target.rs:259–267`.
-- [x] `.IGNORE` PARTIAL — global form works; ordering caveat #22.
-- [x] `.SCCS_GET` (XSI) PARTIAL — recognized/stored; no runtime SCCS retrieval. Reviewed (Phase 9): full SCCS auto-retrieval is an optional XSI feature requiring SCCS tooling and is intentionally out of scope; the special target is parsed, validated (no prerequisites), and its command is stored/overridable. Documented as a known limitation rather than a conformance failure of the base spec.
-- [x] `.POSIX` accepted (Critical #2 fixed, Phase 2).
-- [x] `.SUFFIXES` insertion-ordered with clear/append (Major #16 fixed).
-- [x] `.PRECIOUS` global protection honored (Major #18 fixed).
-- [x] `.WAIT` / `.NOTPARALLEL` recognized and honored (Major #9 fixed).
-- [x] Subsequent-occurrence accumulation (Minor #22 fixed) — sets now extend.
-
-### Extended description / rendering
-- [x] One shell per recipe line CONFORMS — `rule.rs:209–219`.
-- [x] `@` (silent) / `-` (ignore) / `+` (force) prefixes recognized — `rule/recipe.rs`; `+` forces under `-n`/`-t` (verified indirectly).
-- [x] Shell `-e` in effect (Major #11 fixed); `+`/`$(MAKE)` lines now run under `-n`/`-t`/`-q` (`$(MAKE)` is passed through preprocessing, detected in `run_with_files`, and expanded to the make program). Tests `recipe_execution::*`.
-- [x] **Archive/library `lib(member.o)` member mtime — PARTIAL→implemented for the timestamp:** `get_modified_time` now reads a member's stored mtime from the `ar` archive (`archive_member_mtime`/`parse_archive_target`, unit-tested), so an `archive(member)` *string* compares correctly. REMAINING (separate pre-existing parser gap, not the audited mtime issue): the rule parser cannot lex a `lib(member):` target header (`(` is a distinct token), so such a rule cannot yet be *declared* in a makefile.
-
-## Test coverage signal
-
-Existing tests are fixture-driven (`make/tests/makefiles/**`) and cover parsing of includes, recipe prefixes, and several special targets. Not covered (each is a "write a test" item):
-- [x] Recipe lines containing `=` (#1) — `recipe_line_with_equals` (Phase 1).
-- [x] `.POSIX:` as the first line (#2) — `special_targets::posix` (Phase 2).
-- [x] Missing `include` file → graceful error, and `-include` → ignore (#3, #19) — `preprocess::test_*include*`.
-- [x] `make -k` exit status on success and on partial failure (#4) — `arguments::dash_k_success` + `arguments::dash_k`.
-- [x] Command-line `macro=value` operands and precedence (#5) — `macros::cmdline_macro_*` (Phase 2).
-- [x] `$(VAR:.c=.o)` substitution (#6) and backslash-newline continuation (#7) — `preprocess::test_subst_*`, `test_continuation_*`.
-- [x] Single-suffix inference rules (#8) — `inference_rules::single_suffix_rule`.
-- [x] `-j`, `.WAIT`, `.NOTPARALLEL` (#9) — `parallel::*`; multiple `-f` (#10).
-- [x] Shell `-e` abort on first failing command (#11) — `recipe_execution::shell_e_aborts_on_first_failure`; `SHELL` macro vs env var (#12, behaviorally verified).
-- [x] `MAKEFLAGS` seeding options (#13); `$?` newer-only and `$^`/`$+`/`$(@D)` (#14, #15) — `internal_macros::*`, `rule::tests::dir_and_file_parts`.
-- [x] `.SUFFIXES` ordering + clear/append (#16) — `inference_rules::suffixes_clear_then_readd`.
-- [x] Signal-driven cleanup, `.PRECIOUS` global, re-raise (#17, #18, #20, #21) — `target_behavior::async_events*`, `special_targets::precious`.
-
-## Suggested PR groupings
-
-- **PR A — "Don't choke on ordinary makefiles" (Critical #1, #3):** make `generate_macro_table` skip recipe lines and validate the pre-`=` name; replace the `include` `unwrap()` with a diagnostic. Biggest correctness win.
-- **PR B — "Portability basics" (Critical #2, #5; Major #10):** accept `.POSIX`; parse command-line `macro=value` operands with correct precedence; accept multiple `-f`.
-- **PR C — "`-k`/exit-status correctness" (Critical #4; Minor #25):** per-target error tracking; stop flagging success as failure.
-- **PR D — "Macro completeness" (Major #6, #7, #13, #14, #15):** `:subst=`/`%` forms, backslash-newline folding, `MAKEFLAGS`, `$?` newer-only, `$^`/`$+`/`$(@D)`/`$(@F)`.
-- **PR E — "Inference & suffixes" (Major #8, #16; #19):** single-suffix rules, insertion-ordered `.SUFFIXES` with clear/append, real `-include`.
-- **PR F — "Recipe execution fidelity" (Major #11, #12):** shell `-e` when not ignoring; use the `SHELL` macro, not the env var.
-- **PR G — "Parallelism" (Major #9):** `-j maxjobs` + token pool + `.WAIT`/`.NOTPARALLEL` (larger, can be staged last).
-- **PR H — "Signals" (Major #17, #18; Minor #20, #21):** correct registration gating, `.PRECIOUS` global flag, reset-and-re-raise, mtime/`.PHONY` checks.
-
-## Appendix — agent findings refuted by behavioral testing
-
-Per the playbook, claims that did not survive verification are recorded, not deleted:
-- **`$(VAR)` in recipes reaches the shell verbatim** — REFUTED. `CC=echo` expands to `echo …` and runs; user macros are expanded at preprocess time.
-- **`$$` passes through as `$$`** — REFUTED. `$$` collapses to `$` (verified `echo price is $$5` → `price is `).
-- **`?=` logic is inverted** — REFUTED. Keeps an existing value and falls back when unset (both verified).
-- **`-include` of a missing file panics** — REFUTED. It does not panic (the line is passed through; the real gap is that `-include` is not implemented, #19). The *non*-prefixed `include` is what panics (#3).
+Three probes were confounded on the first pass and needed a second: #15 failed
+only because of #26 (the slash in `sub/out`); #18 and #21 both "passed" until a
+plain-target control proved the cleanup path runs at all; and #20 needed
+`waitpid` to tell death-by-signal from `exit(128+n)`, which a shell's `$?`
+cannot distinguish.

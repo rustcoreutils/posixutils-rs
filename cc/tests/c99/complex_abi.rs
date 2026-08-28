@@ -145,7 +145,7 @@ fn c99_complex_long_double_argument_passing() {
 /// Each literal is built at its own precision. Writing `6.0L + 7.0L*I` would
 /// instead exercise a *cross-precision* complex conversion, because `I` is a
 /// `double _Complex` — that path is separately broken and is recorded as #C4
-/// in cc/audit.md rather than tested here.
+/// in the cc audit (`git log --grep '#C4'`) rather than tested here.
 #[test]
 fn c99_complex_arithmetic_compiles_and_works() {
     let src = r#"

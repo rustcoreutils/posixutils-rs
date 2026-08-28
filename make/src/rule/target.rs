@@ -14,12 +14,12 @@ use core::fmt;
 /// A target for a rule.
 pub enum Target {
     Simple {
-        name: &'static str,
+        name: String,
     },
     Inference {
-        name: &'static str,
-        from: &'static str,
-        to: &'static str,
+        name: String,
+        from: String,
+        to: String,
     },
     Special(SpecialTarget),
 }
@@ -37,10 +37,10 @@ impl Target {
             return t;
         }
 
-        Target::Simple { name: name.leak() }
+        Target::Simple { name }
     }
 
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Target::Simple { name } => name,
             Target::Inference { name, .. } => name,
@@ -92,9 +92,9 @@ impl Target {
         }
         if !matches!(source.peek(), Some('.')) {
             return Some(Self::Inference {
-                name: format!(".{from}").leak(),
-                from: from.leak(),
-                to: "",
+                name: format!(".{from}"),
+                from,
+                to: String::new(),
             });
         }
 
@@ -109,21 +109,21 @@ impl Target {
         }
 
         Some(Self::Inference {
-            name: format!(".{from}.{to}").leak(),
-            from: from.leak(),
-            to: to.leak(),
+            name: format!(".{from}.{to}"),
+            from,
+            to,
         })
     }
 }
 
 impl AsRef<str> for Target {
-    fn as_ref(&self) -> &'static str {
+    fn as_ref(&self) -> &str {
         self.name()
     }
 }
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.clone().name())
+        write!(f, "{}", self.name())
     }
 }

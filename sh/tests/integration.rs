@@ -1395,8 +1395,9 @@ mod builtin {
     }
 }
 
-/// Regression tests for the findings in `sh/audit.md`. Each test cites its
-/// audit issue number. Tests are grouped by remediation phase.
+/// Regression tests for the `sh` audit findings. Each test cites its audit
+/// issue number; `git log --grep '#57'` finds the finding by number. Tests are
+/// grouped by remediation phase.
 mod audit_regressions {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

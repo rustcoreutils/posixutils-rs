@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::{BTreeMap, BTreeSet};
-
 /// Represents the configuration of the make utility
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -41,11 +39,8 @@ pub struct Config {
 
     /// The `.SUFFIXES` list, kept in declaration (insertion) order, which
     /// defines the inference-rule search order (POSIX). This is the
-    /// authoritative store; the `.SUFFIXES` entry in `rules` is a sorted mirror
-    /// retained for the `-p` dump.
+    /// authoritative store.
     pub suffixes: Vec<String>,
-
-    pub rules: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Default for Config {
@@ -64,91 +59,27 @@ impl Default for Config {
             jobs: 1,
             not_parallel: false,
             terminate: true,
-            suffixes: [".o", ".c", ".y", ".l", ".a", ".sh", ".c~", ".y~", ".l~", ".sh~"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            rules: BTreeMap::from([
-                (
-                    ".SUFFIXES".to_string(),
-                    vec![
-                        ".o", ".c", ".y", ".l", ".a", ".sh", ".c~", ".y~", ".l~", ".sh~",
-                    ]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-                ),
-                (
-                    ".SCCS_GET".to_string(),
-                    BTreeSet::from([String::from("sccs $(SCCSFLAGS) get $(SCCSGETFLAGS) $@")]),
-                ),
-                (
-                    ".MACROS".to_string(),
-                    vec![
-                        "AR=ar",
-                        "ARFLAGS=-rv",
-                        "YACC=yacc",
-                        "YFLAGS=",
-                        "LEX=lex",
-                        "LFLAGS=",
-                        "LDFLAGS=",
-                        "CC=c17",
-                        "CFLAGS=-O 1",
-                        "XSI GET=get",
-                        "GFLAGS=",
-                        "SCCSFLAGS=",
-                        "SCCSGETFLAGS=-s",
-                    ]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-                ),
-                (
-                    "SUFFIX RULES".to_string(),
-                    [
-                        // Single-Suffix Rules
-                        ".c: $(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<",
-                        ".sh: cp $< $@",
-                        ".sh: chmod a+x $@",
-
-                        // Double-Suffix Rules
-                        ".c.o: $(CC) $(CFLAGS) -c $<",
-                        ".y.o: $(YACC) $(YFLAGS) $<; $(CC) $(CFLAGS) -c y.tab.c; rm -f y.tab.c; mv y.tab.o $@",
-                        ".l.o: $(LEX) $(LFLAGS) $<; $(CC) $(CFLAGS) -c lex.yy.c; rm -f lex.yy.c; mv lex.yy.o $@",
-                        ".y.c: $(YACC) $(YFLAGS) $<; mv y.tab.c $@",
-                        ".l.c: $(LEX) $(LFLAGS) $<; mv lex.yy.c $@",
-                        "XSI .c~.o: $(GET) $(GFLAGS) -p $< > $*.c; $(CC) $(CFLAGS) -c $*.c",
-                        ".y~.o: $(GET) $(GFLAGS) -p $< > $*.y; $(YACC) $(YFLAGS) $*.y; $(CC) $(CFLAGS) -c y.tab.c; rm -f y.tab.c; mv y.tab.o $@",
-                        ".l~.o: $(GET) $(GFLAGS) -p $< > $*.l; $(LEX) $(LFLAGS) $*.l; $(CC) $(CFLAGS) -c lex.yy.c; rm -f lex.yy.c; mv lex.yy.o $@",
-                        ".y~.c: $(GET) $(GFLAGS) -p $< > $*.y; $(YACC) $(YFLAGS) $*.y; mv y.tab.c $@",
-                        ".l~.c: $(GET) $(GFLAGS) -p $< > $*.l; $(LEX) $(LFLAGS) $*.l; mv lex.yy.c $@",
-                        ".c.a: $(CC) -c $(CFLAGS) $<; $(AR) $(ARFLAGS) $@ $*.o; rm -f $*.o",
-                    ]
-                    .into_iter()
-                    .map(String::from)
-                    .collect::<BTreeSet<String>>(),
-            )
-            ]),
+            suffixes: [
+                ".o", ".c", ".y", ".l", ".a", ".sh", ".c~", ".y~", ".l~", ".sh~",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
         }
     }
 }
 
 impl Config {
     /// Adds a new suffix to the `.SUFFIXES` list, preserving insertion order and
-    /// avoiding duplicates. The sorted `rules` mirror is kept in sync.
+    /// avoiding duplicates.
     pub fn add_suffix(&mut self, new_suffix: &str) {
         if !self.suffixes.iter().any(|s| s == new_suffix) {
             self.suffixes.push(new_suffix.to_string());
         }
-        self.rules
-            .entry(".SUFFIXES".to_string())
-            .or_default()
-            .insert(new_suffix.to_string());
     }
 
     /// Clears the `.SUFFIXES` list (an empty `.SUFFIXES:` special target).
     pub fn clear_suffixes(&mut self) {
         self.suffixes.clear();
-        self.rules.insert(".SUFFIXES".to_string(), BTreeSet::new());
     }
 }

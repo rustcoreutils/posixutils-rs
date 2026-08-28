@@ -11,8 +11,9 @@ specifies.
 
 It does not record our choices in the areas POSIX leaves unspecified or
 implementation-defined, nor unimplemented corners of the standard.  Those are
-tracked per utility in the `audit.md` file of each crate (`text/audit.md`,
-`tree/audit.md`, and so on).
+tracked per utility in the `audit.md` file of each crate — see the list in
+`audits.md`.  A crate carries one only while it still has an open item; the
+closed findings are in git history.
 
 ## Utilities beyond POSIX
 

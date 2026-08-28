@@ -7,20 +7,22 @@
 // SPDX-License-Identifier: MIT
 //
 
+pub mod attributes;
 pub mod config;
 pub mod error_code;
+pub mod graph;
 pub mod parser;
 pub mod rule;
 pub mod signal_handler;
 pub mod special_target;
 
+use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::HashSet,
     fs::{self},
     time::{Duration, SystemTime},
 };
 
-use parser::Makefile;
+use parser::{preprocessor, Makefile, VPathEntry};
 
 /// An owned macro definition `(name, value)`. Owning the data (rather than
 /// holding a rowan AST node) keeps `Make` `Send`/`Sync` for parallel builds.
@@ -83,10 +85,70 @@ pub struct Make {
     /// Inference rules (e.g. `.c.o:`, `.txt.out:`).
     inference_rules: Vec<Rule>,
     default_rule: Option<Rule>, // .DEFAULT
+    /// The recipe that retrieves a source file from SCCS. Built-in unless the
+    /// makefile supplies its own `.SCCS_GET`.
+    sccs_get: Option<Rule>,
     /// Token pool bounding concurrent target updates under `-j` (maxjobs - 1
     /// tokens; the inline build needs no token).
     pool: TokenPool,
+    /// Which targets are built, building, or failed. Gives single-build under
+    /// `-j` and memoization across repeated visits.
+    ledger: graph::Ledger,
+    /// `vpath` search paths, in declaration order.
+    vpaths: Vec<VPathEntry>,
+    /// Macros an `export` directive put in the recipe environment.
+    exports: Vec<String>,
+    /// What the attribute special targets say about each target.
+    attributes: attributes::Attributes,
     pub config: Config,
+}
+
+impl graph::Edges for Make {
+    /// The prerequisites the cycle check must see.
+    ///
+    /// A named rule is not the only way a target acquires prerequisites: a `%`
+    /// pattern rule contributes them once instantiated for a concrete name,
+    /// and an inference rule contributes the source it derives from its
+    /// suffixes. Looking only at named rules made `%.a: %.a` invisible to
+    /// `find_cycle`, so the self-edge went undetected and the build deadlocked
+    /// on it (audit #65); the same hole let `.c.o:` plus `.o.c:` build `foo.o`
+    /// from `foo.c` from `foo.o`, where the ledger blocked the one thread on a
+    /// target it was itself in the middle of building (audit #80).
+    ///
+    /// The order below mirrors `build_target_uncached`, so the edges reported
+    /// are the edges that will actually be walked.
+    fn prerequisites_of(&self, target: &str) -> Vec<String> {
+        let named = self.rule_by_target_name(target);
+        let mut edges = match named {
+            Some(rule) => edge_names(rule.prerequisites()),
+            None => match self.find_pattern_rule(target) {
+                Some(rule) => return edge_names(rule.prerequisites()),
+                None => Vec::new(),
+            },
+        };
+        // A rule carrying commands is the one that runs; only a commandless
+        // one (or none at all) falls through to inference.
+        if named.is_some_and(|rule| rule.recipes().count() > 0) {
+            return edges;
+        }
+        let source = self
+            .find_inference_rule(target)
+            .and_then(|rule| inference_source(rule, &Target::new(target)));
+        if let Some(source) = source {
+            if !edges.contains(&source) {
+                edges.push(source);
+            }
+        }
+        edges
+    }
+}
+
+/// Prerequisite names as graph edges. `.WAIT` is a barrier marker, not a target.
+fn edge_names<'a>(prerequisites: impl Iterator<Item = &'a Prerequisite>) -> Vec<String> {
+    prerequisites
+        .map(|p| p.as_ref().to_string())
+        .filter(|p| p != WAIT_TARGET)
+        .collect()
 }
 
 impl Make {
@@ -99,20 +161,159 @@ impl Make {
     fn rule_by_target_name(&self, target: impl AsRef<str>) -> Option<&Rule> {
         self.rules
             .iter()
+            .filter(|rule| !rule.is_pattern())
             .find(|rule| rule.targets().any(|t| t.as_ref() == target.as_ref()))
     }
 
+    /// Every macro definition in force, in first-definition order.
+    pub fn macros(&self) -> &[Macro] {
+        &self.macros
+    }
+
+    /// The complete set of macro definitions and target descriptions, in
+    /// makefile syntax (POSIX 105395 mandates the content and leaves the format
+    /// unspecified).
+    ///
+    /// Rendering it as makefile text rather than a bespoke format means the
+    /// dump round-trips: `make -p` output is itself a makefile.
+    pub fn database(&self) -> String {
+        let mut out = String::new();
+        self.write_macros(&mut out);
+        self.write_section(&mut out, "rules", self.rules.iter());
+        self.write_section(&mut out, "inference rules", self.inference_rules.iter());
+        self.write_section(&mut out, "default rule", self.default_rule.iter());
+        self.write_section(&mut out, "sccs get", self.sccs_get.iter());
+        self.write_vpaths(&mut out);
+        out
+    }
+
+    fn write_macros(&self, out: &mut String) {
+        if self.macros.is_empty() {
+            return;
+        }
+        out.push_str("# macros\n");
+        for (name, value) in &self.macros {
+            // No trailing blank on an empty value, so the dump stays clean to
+            // read back.
+            match value.is_empty() {
+                true => out.push_str(&format!("{name} =\n")),
+                false => out.push_str(&format!("{name} = {value}\n")),
+            }
+        }
+        out.push('\n');
+    }
+
+    fn write_section<'a>(
+        &self,
+        out: &mut String,
+        title: &str,
+        rules: impl Iterator<Item = &'a Rule>,
+    ) {
+        let rendered: Vec<String> = rules.map(|rule| rule.to_string()).collect();
+        if rendered.is_empty() {
+            return;
+        }
+        out.push_str(&format!("# {title}\n"));
+        for rule in rendered {
+            out.push_str(&rule);
+        }
+        out.push('\n');
+    }
+
+    fn write_vpaths(&self, out: &mut String) {
+        if self.vpaths.is_empty() {
+            return;
+        }
+        out.push_str("# search paths\n");
+        for entry in &self.vpaths {
+            out.push_str(&format!(
+                "vpath {} {}\n",
+                entry.pattern,
+                entry.dirs.join(" ")
+            ));
+        }
+        out.push('\n');
+    }
+
+    /// Directories named by the `VPATH` macro, in search order.
+    ///
+    /// POSIX has no `VPATH`, but it is the conventional way to keep sources in
+    /// one tree and build in another. Both the `:`-separated and
+    /// blank-separated spellings are accepted, as GNU does.
+    fn vpath_dirs(&self) -> Vec<&str> {
+        self.macros
+            .iter()
+            .find(|(name, _)| name == "VPATH")
+            .map(|(_, value)| {
+                value
+                    .split([':', ' ', '\t'])
+                    .filter(|d| !d.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Resolve a prerequisite through `VPATH`.
+    ///
+    /// A name that exists as written, or that no `VPATH` directory supplies, is
+    /// returned unchanged, so this is transparent when `VPATH` is unset.
+    pub fn resolve_vpath(&self, name: &str) -> String {
+        if name.contains('/') || std::path::Path::new(name).exists() {
+            return name.to_string();
+        }
+        // A `vpath` pattern is more specific than the blanket `VPATH` macro, so
+        // it is consulted first; the first matching pattern wins, as GNU does.
+        if let Some(found) = self.search_vpath_patterns(name) {
+            return found;
+        }
+        search_dirs(&self.vpath_dirs(), name).unwrap_or_else(|| name.to_string())
+    }
+
+    /// Look `name` up in the directories of the first `vpath` pattern it
+    /// matches.
+    fn search_vpath_patterns(&self, name: &str) -> Option<String> {
+        for entry in &self.vpaths {
+            if rule::pattern_stem(&entry.pattern, name).is_none() {
+                continue;
+            }
+            let dirs: Vec<&str> = entry.dirs.iter().map(String::as_str).collect();
+            if let Some(found) = search_dirs(&dirs, name) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Find a `%` pattern rule matching `name` and instantiate it for that
+    /// target. The first matching pattern in file order wins, as GNU does.
+    ///
+    /// Pattern rules are not POSIX -- the standard has only suffix inference
+    /// rules -- but they are how real makefiles express the same thing.
+    fn find_pattern_rule(&self, name: &str) -> Option<Rule> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.is_pattern())
+            .find_map(|rule| rule.instantiate_pattern(name))
+    }
+
     pub fn first_target(&self) -> Result<&Target, ErrorCode> {
-        // Per POSIX: "the first target that make encounters that is not a special
-        // target or an inference rule shall be used."
-        // If there are no non-special, non-inference targets, fall back to the
-        // first inference rule (which will scan CWD for matching files).
-        let rule = self
-            .rules
-            .first()
-            .or_else(|| self.inference_rules.first())
-            .ok_or(NoTarget { target: None })?;
-        rule.targets().next().ok_or(NoTarget { target: None })
+        // POSIX 105428: "the first target that make encounters that is not a
+        // special target or an inference rule shall be used."
+        //
+        // A dot-target such as `.config` is neither a usable default nor an
+        // inference rule, and a pattern rule is a template rather than a
+        // target, so both are skipped -- matching GNU, which builds the first
+        // ordinary target. Falling back to an inference rule (audit #N6) would
+        // send a bare `make` scanning the working directory instead.
+        self.rules
+            .iter()
+            .filter(|rule| !rule.is_pattern())
+            .filter_map(|rule| rule.targets().next())
+            .find(|target| {
+                let name = target.as_ref();
+                !name.starts_with('.') || name.contains('/')
+            })
+            .ok_or(NoTarget { target: None })
     }
 
     /// Finds a matching inference rule for the given target name.
@@ -131,27 +332,41 @@ impl Make {
             .max_by_key(|s| s.len())
         {
             let stem = &name[..name.len() - target_suffix.len()];
-            for rule in &self.inference_rules {
-                if let Some(Target::Inference { from, to, .. }) = rule.targets().next() {
-                    if !to.is_empty() && format!(".{}", to) == *target_suffix {
-                        let prereq_path = format!("{}.{}", stem, from);
-                        if std::path::Path::new(&prereq_path).exists() {
-                            return Some(rule);
-                        }
+            // POSIX 105920/105930: "The order in which the suffixes are
+            // specified defines the order in which the inference rules ... are
+            // used", so the search iterates `.SUFFIXES`, not the order the
+            // rules happen to appear in the makefile (audit #47).
+            for source_suffix in suffixes {
+                let from_name = source_suffix.trim_start_matches('.');
+                let hit = self.inference_rules.iter().find(|rule| {
+                    matches!(rule.targets().next(),
+                        Some(Target::Inference { from, to, .. })
+                            if !to.is_empty()
+                                && format!(".{to}") == *target_suffix
+                                && from == from_name)
+                });
+                if let Some(rule) = hit {
+                    let prereq_path = self.resolve_vpath(&format!("{stem}{source_suffix}"));
+                    if std::path::Path::new(&prereq_path).exists() {
+                        return Some(rule);
                     }
                 }
             }
         }
 
         // Single-suffix: the target has no suffix; find a `.s2` (single-suffix)
-        // rule whose prerequisite `<name>.s2` exists.
-        for rule in &self.inference_rules {
-            if let Some(Target::Inference { from, to, .. }) = rule.targets().next() {
-                if to.is_empty() {
-                    let prereq_path = format!("{}.{}", name, from);
-                    if std::path::Path::new(&prereq_path).exists() {
-                        return Some(rule);
-                    }
+        // rule whose prerequisite `<name>.s2` exists. Same ordering rule.
+        for source_suffix in suffixes {
+            let from_name = source_suffix.trim_start_matches('.');
+            let hit = self.inference_rules.iter().find(|rule| {
+                matches!(rule.targets().next(),
+                    Some(Target::Inference { from, to, .. })
+                        if to.is_empty() && from == from_name)
+            });
+            if let Some(rule) = hit {
+                let prereq_path = self.resolve_vpath(&format!("{name}{source_suffix}"));
+                if std::path::Path::new(&prereq_path).exists() {
+                    return Some(rule);
                 }
             }
         }
@@ -160,11 +375,26 @@ impl Make {
 
     /// Builds the target with the given name.
     ///
+    /// The ledger makes this idempotent: a target reachable by several paths is
+    /// built once, its outcome replayed to every later visit, and under `-j` a
+    /// second thread arriving mid-build waits rather than running the recipe a
+    /// second time (audit #29, #31).
+    ///
     /// # Returns
     /// - Ok(true) if the target was built.
     /// - Ok(false) if the target was already up to date.
     /// - Err(_) if any errors occur.
     pub fn build_target(&self, name: impl AsRef<str>) -> Result<bool, ErrorCode> {
+        match self.ledger.claim(name.as_ref()) {
+            graph::Claim::Done(outcome) => return outcome.into_result(),
+            graph::Claim::Build => {}
+        }
+        let result = self.build_target_uncached(name.as_ref());
+        self.ledger.finish(name.as_ref(), &result);
+        result
+    }
+
+    fn build_target_uncached(&self, name: impl AsRef<str>) -> Result<bool, ErrorCode> {
         // Search both regular rules and inference rules
         let rule = match self.rule_by_target_name(&name) {
             Some(rule) => rule,
@@ -175,23 +405,46 @@ impl Make {
             {
                 Some(rule) => rule,
                 None => {
+                    // A `%.o: %.c` pattern rule, instantiated for this target.
+                    // Pattern rules are tried before suffix inference: a
+                    // makefile that writes `%.o: %.c` means it, and must not
+                    // lose to the built-in `.c.o`. GNU orders them the same way.
+                    //
+                    // Both this and the inference case below go through
+                    // `run_rule_with_prerequisites` rather than calling the
+                    // runner directly. Calling it directly skipped the staleness
+                    // check, so every build recompiled (audit #63, #64); skipped
+                    // the cycle check (#65); and reported every prerequisite in
+                    // `$?` rather than the newer ones.
+                    if let Some(rule) = self.find_pattern_rule(name.as_ref()) {
+                        let target = Target::new(name.as_ref());
+                        return self.run_rule_with_prerequisites(
+                            &rule,
+                            &target,
+                            Dispatch::Explicit,
+                        );
+                    }
                     // No target rule named `name`: try to infer one (single- or
                     // double-suffix) from an existing prerequisite file.
                     if let Some(inference_rule) = self.find_inference_rule(name.as_ref()) {
                         let target = Target::new(name.as_ref());
-                        inference_rule.run_for_target(
-                            &self.config,
-                            &self.macros,
+                        return self.run_rule_with_prerequisites(
+                            inference_rule,
                             &target,
-                            false,
-                            &[],
-                        )?;
+                            Dispatch::Inference,
+                        );
+                    }
+                    // XSI: a source file with an SCCS history is retrieved
+                    // rather than declared missing, and a stale one is
+                    // refreshed before it is called up to date (audit #61).
+                    if self.retrieve_from_sccs(name.as_ref())? {
                         return Ok(true);
                     }
                     // Per POSIX: "If a target exists and there is neither a target rule
                     // nor an inference rule for the target, the target shall be considered
-                    // up-to-date."
-                    if get_modified_time(&name).is_some() {
+                    // up-to-date."  Resolved through VPATH: a file supplied by a
+                    // search directory exists (audit #66).
+                    if get_modified_time(self.resolve_vpath(name.as_ref())).is_some() {
                         return Ok(false);
                     }
                     // No rule and file doesn't exist - try .DEFAULT or fail
@@ -208,61 +461,201 @@ impl Make {
         };
         let target = Target::new(name.as_ref());
 
-        self.run_rule_with_prerequisites(rule, &target)
+        self.run_rule_with_prerequisites(rule, &target, Dispatch::Explicit)
     }
 
-    /// Runs the given rule.
+    /// The prerequisites that decide whether `target` is out of date.
+    ///
+    /// A named rule lists them, and an instantiated pattern rule has already had
+    /// the stem substituted in. An inference rule lists none: its input is
+    /// derived from its suffixes and the concrete target name, which is why
+    /// nothing could compare timestamps for it before (audit #63).
+    fn effective_prerequisites(
+        &self,
+        rule: &Rule,
+        target: &Target,
+        dispatch: Dispatch,
+    ) -> Vec<String> {
+        let listed: Vec<String> = rule
+            .prerequisites()
+            .map(|p| p.as_ref().to_string())
+            .collect();
+        if dispatch == Dispatch::Explicit {
+            return listed;
+        }
+        match inference_source(rule, target) {
+            Some(source) => {
+                let mut all = vec![source];
+                all.extend(listed);
+                all
+            }
+            None => listed,
+        }
+    }
+
+    /// Which of `prerequisites` are newer than `target`, or do not exist yet.
+    ///
+    /// Names are resolved through `VPATH` first: a prerequisite supplied by a
+    /// search directory exists, and treating it as missing is what made
+    /// `VPATH` useless for a prerequisite with no rule of its own (audit #66).
+    fn newer_prerequisites(&self, target: &str, prerequisites: &[String]) -> Vec<String> {
+        let Some(target_modified) = get_modified_time(self.resolve_vpath(target)) else {
+            // The target does not exist, so everything it needs counts.
+            return prerequisites.to_vec();
+        };
+        prerequisites
+            .iter()
+            .filter(|name| *name != WAIT_TARGET)
+            .filter(|name| match get_modified_time(self.resolve_vpath(name)) {
+                Some(modified) => modified > target_modified,
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Runs a rule after bringing its prerequisites up to date.
     ///
     /// # Returns
     /// - Ok(true) if the rule was run.
     /// - Ok(false) if the rule was already up to date.
     /// - Err(_) if any errors occur.
-    fn run_rule_with_prerequisites(&self, rule: &Rule, target: &Target) -> Result<bool, ErrorCode> {
-        if self.are_prerequisites_recursive(target) {
-            return Err(RecursivePrerequisite {
-                origin: target.to_string(),
-            });
+    fn run_rule_with_prerequisites(
+        &self,
+        rule: &Rule,
+        target: &Target,
+        dispatch: Dispatch,
+    ) -> Result<bool, ErrorCode> {
+        if let Some(origin) = graph::find_cycle(self, target.as_ref()) {
+            return Err(RecursivePrerequisite { origin });
         }
 
-        let newer_prerequisites = self.get_newer_prerequisites(target);
-        let mut up_to_date = newer_prerequisites.is_empty() && get_modified_time(target).is_some();
-        if rule.config.phony {
-            up_to_date = false;
+        let mut prerequisites = self.effective_prerequisites(rule, target, dispatch);
+
+        // POSIX 105929: "When no target rule with commands is found to update a
+        // target, the inference rules shall be checked." The rule that will
+        // actually run is the one that decides staleness, so its source joins
+        // the prerequisite list here, before the comparison. Looking it up only
+        // *after* the up-to-date test meant the standard `foo.o: foo.h` plus
+        // `.c.o:` idiom never saw `foo.c` at all, and a changed source never
+        // recompiled (audit #83).
+        let inferred = match rule.recipes().count() {
+            0 => self.find_inference_rule(target.as_ref()),
+            _ => None,
+        };
+        if let Some(source) = inferred.and_then(|rule| inference_source(rule, target)) {
+            if !prerequisites.contains(&source) {
+                prerequisites.insert(0, source);
+            }
         }
+
+        // Bring every prerequisite up to date before judging staleness. One that
+        // was actually rebuilt makes this target stale whatever the timestamps
+        // say, and one that is merely older must still be visited -- it may be
+        // phony, or stale against its own sources.
+        let rebuilt = self.build_prerequisites(&prerequisites)?;
+
+        // `$?` is the prerequisites newer than the target.
+        let newer = self.newer_prerequisites(target.as_ref(), &prerequisites);
+        let exists = get_modified_time(self.resolve_vpath(target.as_ref())).is_some();
+        let phony = self.attributes.is_phony(target.as_ref());
+        let up_to_date = !rebuilt && newer.is_empty() && exists && !phony;
 
         if up_to_date {
             return Ok(false);
         }
 
-        self.build_prerequisites(&newer_prerequisites)?;
-
-        // `$?` expands to the prerequisites newer than the target (the `.WAIT`
-        // barrier markers are not real prerequisites).
-        let newer: Vec<String> = newer_prerequisites
-            .iter()
-            .map(|p| p.as_ref().to_string())
-            .filter(|p| p != WAIT_TARGET)
-            .collect();
-
-        // Per POSIX: "When no target rule with commands is found to update a
-        // target, the inference rules shall be checked."  If the matched target
-        // rule has no recipes, look for a matching inference rule and run it
-        // for this specific target instead.
-        if rule.recipes().count() == 0 {
-            if let Some(inference_rule) = self.find_inference_rule(target.as_ref()) {
-                inference_rule.run_for_target(
-                    &self.config,
-                    &self.macros,
-                    target,
-                    up_to_date,
-                    &newer,
-                )?;
-                return Ok(true);
-            }
+        if let Some(inference_rule) = inferred {
+            return self.run_inference(inference_rule, target, up_to_date, &newer);
         }
 
-        rule.run(&self.config, &self.macros, target, up_to_date, &newer)?;
+        // An inference rule derives `$<` from its suffixes rather than from a
+        // prerequisite list, so it must go through `run_for_target`; handing it
+        // to `run` would leave `$<` empty.
+        if dispatch == Dispatch::Inference {
+            return self.run_inference(rule, target, up_to_date, &newer);
+        }
 
+        self.with_env(|env| rule.run(env, target, up_to_date, &newer))?;
+        Ok(true)
+    }
+
+    /// Register the built-in inference rules, expanded against the macros in
+    /// force, skipping any the makefile already defines.
+    fn seed_builtin_rules(&mut self) -> Result<(), ErrorCode> {
+        let text = expand_rules(BUILTIN_RULES, &self.macros)?;
+        let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
+        for parsed_rule in parsed.rules() {
+            let rule = Rule::from(parsed_rule.clone());
+            let Some(name) = rule.targets().next().map(Target::to_string) else {
+                continue;
+            };
+            let already = self
+                .inference_rules
+                .iter()
+                .any(|r| r.targets().any(|t| t.as_ref() == name));
+            if !already {
+                self.inference_rules.push(rule);
+            }
+        }
+        Ok(())
+    }
+
+    /// Retrieve `name` from SCCS if it has a history file and needs one.
+    ///
+    /// POSIX 105699: an `SCCS/s.name` beside a target makes make compare the
+    /// two timestamps and run the `.SCCS_GET` commands when the target is
+    /// missing or older. Returns whether anything was retrieved.
+    fn retrieve_from_sccs(&self, name: &str) -> Result<bool, ErrorCode> {
+        let Some(rule) = self.sccs_get.as_ref() else {
+            return Ok(false);
+        };
+        let Some(history) = sccs_history(name) else {
+            return Ok(false);
+        };
+        if !needs_sccs_get(name, &history) {
+            return Ok(false);
+        }
+        let target = Target::new(name);
+        self.with_env(|env| rule.run(env, &target, false, &[]))?;
+        Ok(true)
+    }
+
+    /// Register the built-in `.SCCS_GET` recipe, unless the makefile gave one.
+    fn seed_sccs_get(&mut self) -> Result<(), ErrorCode> {
+        if self.sccs_get.is_some() {
+            return Ok(());
+        }
+        let text = expand_rules(SCCS_GET_RULE, &self.macros)?;
+        let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
+        self.sccs_get = parsed.rules().next().map(|r| Rule::from(r.clone()));
+        Ok(())
+    }
+
+    /// Assemble the invariants a recipe runs against, and hand them to `f`.
+    ///
+    /// The `VPATH` resolver borrows `self`, so it cannot outlive the call; a
+    /// callback keeps that borrow local instead of asking every caller to
+    /// spell the closure out.
+    fn with_env<R>(&self, f: impl FnOnce(&rule::Env<'_>) -> R) -> R {
+        let resolve = |name: &str| self.resolve_vpath(name);
+        f(&rule::Env {
+            config: &self.config,
+            macros: &self.macros,
+            exports: &self.exports,
+            resolve: &resolve,
+            attributes: &self.attributes,
+        })
+    }
+
+    fn run_inference(
+        &self,
+        rule: &Rule,
+        target: &Target,
+        up_to_date: bool,
+        newer: &[String],
+    ) -> Result<bool, ErrorCode> {
+        self.with_env(|env| rule.run_for_target(env, target, up_to_date, newer))?;
         Ok(true)
     }
 
@@ -272,38 +665,56 @@ impl Make {
     /// `.WAIT` prerequisites split the list into segments that must be built in
     /// order: every prerequisite to the left of a `.WAIT` is brought up to date
     /// before any to its right. Within a segment, prerequisites are independent.
-    fn build_prerequisites(&self, prerequisites: &[&Prerequisite]) -> Result<(), ErrorCode> {
+    fn build_prerequisites(&self, prerequisites: &[String]) -> Result<bool, ErrorCode> {
         let parallel = self.config.jobs > 1
             && !self.config.not_parallel
             && !self.config.dry_run
             && !self.config.quit
             && !self.config.touch;
 
+        let mut updated = false;
         let mut segment: Vec<&str> = Vec::new();
         for prerequisite in prerequisites {
-            let name = prerequisite.as_ref();
+            let name = prerequisite.as_str();
             if name == WAIT_TARGET {
                 // Barrier: finish the current segment before continuing.
-                self.build_segment(&segment, parallel)?;
+                updated |= self.build_segment(&segment, parallel)?;
                 segment.clear();
             } else {
                 segment.push(name);
             }
         }
-        self.build_segment(&segment, parallel)
+        updated |= self.build_segment(&segment, parallel)?;
+        Ok(updated)
     }
 
     /// Builds one segment of independent prerequisites, in parallel when `-j`
     /// allows it. Parallelism is bounded by the token pool; a prerequisite that
     /// cannot obtain a token is built inline so the build always progresses.
-    fn build_segment(&self, names: &[&str], parallel: bool) -> Result<(), ErrorCode> {
+    fn build_segment(&self, names: &[&str], parallel: bool) -> Result<bool, ErrorCode> {
         if !parallel || names.len() <= 1 {
+            // Under -k a failed prerequisite must not stop its *siblings*; the
+            // first error is still returned, so the dependent target is skipped.
+            let mut first_error = None;
+            let mut updated = false;
             for name in names {
-                self.build_target(name)?;
+                match self.build_target(name) {
+                    Ok(built) => updated |= built,
+                    Err(err) => {
+                        if !self.config.keep_going || self.config.terminate {
+                            return Err(err);
+                        }
+                        first_error.get_or_insert(err);
+                    }
+                }
             }
-            return Ok(());
+            return match first_error {
+                Some(err) => Err(err),
+                None => Ok(updated),
+            };
         }
 
+        let updated = std::sync::atomic::AtomicBool::new(false);
         let errors: std::sync::Mutex<Vec<ErrorCode>> = std::sync::Mutex::new(Vec::new());
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
@@ -314,11 +725,14 @@ impl Make {
             for &name in names {
                 if self.pool.try_acquire() {
                     let errors = &errors;
+                    let updated = &updated;
                     handles.push(scope.spawn(move || {
                         let result = self.build_target(name);
                         self.pool.release();
-                        if let Err(err) = result {
-                            errors.lock().unwrap().push(err);
+                        match result {
+                            Ok(true) => updated.store(true, std::sync::atomic::Ordering::Relaxed),
+                            Ok(false) => {}
+                            Err(err) => errors.lock().unwrap().push(err),
                         }
                     }));
                 } else {
@@ -326,8 +740,10 @@ impl Make {
                 }
             }
             for name in inline {
-                if let Err(err) = self.build_target(name) {
-                    errors.lock().unwrap().push(err);
+                match self.build_target(name) {
+                    Ok(true) => updated.store(true, std::sync::atomic::Ordering::Relaxed),
+                    Ok(false) => {}
+                    Err(err) => errors.lock().unwrap().push(err),
                 }
             }
             for handle in handles {
@@ -335,77 +751,109 @@ impl Make {
             }
         });
 
-        // Report the first error (if any); recipe-level `-k` handling already
-        // happens inside the recipe runner via the KEEP_GOING_ERROR flag.
+        // Report the first error (if any).
         match errors.into_inner().unwrap().into_iter().next() {
             Some(err) => Err(err),
-            None => Ok(()),
+            None => Ok(updated.into_inner()),
         }
-    }
-
-    /// Retrieves the prerequisites of the target that are newer than the target.
-    /// Recursively checks the prerequisites of the prerequisites.
-    /// Returns an empty vector if the target does not exist (or it's a file).
-    fn get_newer_prerequisites(&self, target: impl AsRef<str>) -> Vec<&Prerequisite> {
-        let Some(target_rule) = self.rule_by_target_name(&target) else {
-            return vec![];
-        };
-        let target_modified = get_modified_time(target);
-
-        let prerequisites = target_rule.prerequisites();
-
-        if let Some(target_modified) = target_modified {
-            prerequisites
-                .filter(|prerequisite| {
-                    let Some(pre_modified) = get_modified_time(prerequisite) else {
-                        return true;
-                    };
-
-                    !self.get_newer_prerequisites(prerequisite).is_empty()
-                        || pre_modified > target_modified
-                })
-                .collect()
-        } else {
-            prerequisites.collect()
-        }
-    }
-
-    /// Checks if the target has recursive prerequisites.
-    /// Returns true if the target has recursive prerequisites.
-    fn are_prerequisites_recursive(&self, target: impl AsRef<str>) -> bool {
-        let mut visited = HashSet::from([target.as_ref()]);
-        let mut stack = HashSet::from([target.as_ref()]);
-
-        self._are_prerequisites_recursive(target.as_ref(), &mut visited, &mut stack)
-    }
-
-    /// A helper function to check if the target has recursive prerequisites.
-    /// Uses DFS to check for recursive prerequisites.
-    fn _are_prerequisites_recursive(
-        &self,
-        target: &str,
-        visited: &mut HashSet<&str>,
-        stack: &mut HashSet<&str>,
-    ) -> bool {
-        let Some(rule) = self.rule_by_target_name(target) else {
-            return false;
-        };
-
-        let prerequisites = rule.prerequisites();
-
-        for prerequisite in prerequisites {
-            if (!visited.contains(prerequisite.as_ref())
-                && self._are_prerequisites_recursive(prerequisite.as_ref(), visited, stack))
-                || stack.contains(prerequisite.as_ref())
-            {
-                return true;
-            }
-        }
-
-        stack.remove(target);
-        false
     }
 }
+
+/// How the rule about to run was selected.
+///
+/// This cannot be read off the rule: `.config:` parses as `Target::Inference`
+/// syntactically while being an ordinary target rule (audit #38). Only the
+/// classification done at construction knows, so the caller says.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dispatch {
+    /// A named rule, an instantiated pattern rule, or `.DEFAULT`.
+    Explicit,
+    /// A suffix inference rule, whose input comes from its suffixes.
+    Inference,
+}
+
+/// The file an inference rule reads to make `target`.
+///
+/// `.c.o` applied to `foo.o` reads `foo.c`; a single-suffix `.c` applied to
+/// `foo` reads `foo.c`.
+fn inference_source(rule: &Rule, target: &Target) -> Option<String> {
+    let Some(Target::Inference { from, to, .. }) = rule.targets().next() else {
+        return None;
+    };
+    let name = target.as_ref();
+    if to.is_empty() {
+        return Some(format!("{name}.{from}"));
+    }
+    let stem = name.strip_suffix(&format!(".{to}"))?;
+    Some(format!("{stem}.{from}"))
+}
+
+/// Return `name` found under one of `dirs`, if any.
+fn search_dirs(dirs: &[&str], name: &str) -> Option<String> {
+    dirs.iter()
+        .map(|dir| format!("{dir}/{name}"))
+        .find(|candidate| std::path::Path::new(candidate).exists())
+}
+
+/// The default macros and inference rules POSIX requires make to start with.
+///
+/// These existed only as display strings in the `-p` dump table, so `make f.o`
+/// with an `f.c` present reported "no target" -- every makefile that leans on
+/// the built-in `.c.o` rule, which is most of them, could not build.
+///
+/// Written as makefile text so it goes through the same reader as anything
+/// else. `-r` (`config.clear`) suppresses it, as POSIX requires.
+const BUILTIN_RULES: &str = r#"
+.c:
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+.sh:
+	cp $< $@
+	chmod a+x $@
+.c.o:
+	$(CC) $(CFLAGS) -c $<
+.y.o:
+	$(YACC) $(YFLAGS) $<
+	$(CC) $(CFLAGS) -c y.tab.c
+	rm -f y.tab.c
+	mv y.tab.o $@
+.l.o:
+	$(LEX) $(LFLAGS) $<
+	$(CC) $(CFLAGS) -c lex.yy.c
+	rm -f lex.yy.c
+	mv lex.yy.o $@
+.y.c:
+	$(YACC) $(YFLAGS) $<
+	mv y.tab.c $@
+.l.c:
+	$(LEX) $(LFLAGS) $<
+	mv lex.yy.c $@
+.c.a:
+	$(CC) -c $(CFLAGS) $<
+	$(AR) $(ARFLAGS) $@ $*.o
+	rm -f $*.o
+"#;
+
+/// The default `.SCCS_GET` recipe (POSIX 106038). `sccs` is taken from `PATH`,
+/// which is what the spec's own default rule names; this repo's `sccs/` build
+/// serves if it is installed there.
+const SCCS_GET_RULE: &str = ".SCCS_GET:\n\tsccs $(SCCSFLAGS) get $(SCCSGETFLAGS) $@\n";
+
+/// The macros those rules refer to. A makefile definition overrides them, so
+/// they are seeded first and only kept where the makefile is silent.
+const BUILTIN_MACROS: [(&str, &str); 12] = [
+    ("CC", "c17"),
+    ("CFLAGS", "-O 1"),
+    ("AR", "ar"),
+    ("ARFLAGS", "-rv"),
+    ("YACC", "yacc"),
+    ("YFLAGS", ""),
+    ("LEX", "lex"),
+    ("LFLAGS", ""),
+    ("GET", "get"),
+    ("GFLAGS", ""),
+    ("SCCSFLAGS", ""),
+    ("SCCSGETFLAGS", "-s"),
+];
 
 impl TryFrom<(Makefile, Config)> for Make {
     type Error = ErrorCode;
@@ -416,12 +864,14 @@ impl TryFrom<(Makefile, Config)> for Make {
         // are available when determining whether a rule like `.txt.out:` is an
         // inference rule.
 
+        let (parsed_rules, macros, vpaths, exports) = makefile.into_parts();
+
         let mut suffixes_rules = vec![];
         let mut remaining_parsed_rules = vec![];
 
         // Pass 1: Separate .SUFFIXES rules from everything else and process
         // them immediately so config.rules[".SUFFIXES"] is populated.
-        for parsed_rule in makefile.rules() {
+        for parsed_rule in parsed_rules {
             let rule = Rule::from(parsed_rule);
             let Some(target) = rule.targets().next() else {
                 return Err(NoTarget { target: None });
@@ -439,19 +889,26 @@ impl TryFrom<(Makefile, Config)> for Make {
         let mut make = Self {
             rules: vec![],
             inference_rules: vec![],
-            macros: makefile
-                .variable_definitions()
-                .map(|v| {
-                    (
-                        v.name().unwrap_or_default(),
-                        v.raw_value().unwrap_or_default(),
-                    )
-                })
-                .collect(),
+            macros,
             default_rule: None,
+            sccs_get: None,
             pool,
+            ledger: graph::Ledger::new(),
+            vpaths,
+            exports,
+            attributes: attributes::Attributes::default(),
             config,
         };
+
+        // Seed the built-in macros the default rules refer to, without
+        // overriding anything the makefile defined.
+        if !make.config.clear {
+            for (name, value) in BUILTIN_MACROS {
+                if !make.macros.iter().any(|(n, _)| n == name) {
+                    make.macros.push((name.to_string(), value.to_string()));
+                }
+            }
+        }
 
         for rule in suffixes_rules {
             special_target::process(rule, &mut make)?;
@@ -471,7 +928,30 @@ impl TryFrom<(Makefile, Config)> for Make {
             } else if InferenceTarget::try_from((target.clone(), make.config.clone())).is_ok() {
                 make.inference_rules.push(rule);
             } else {
-                make.rules.push(rule);
+                // POSIX 105653: several rules may name the same target, with
+                // prerequisites accumulating. The old lookup returned the first
+                // match and silently dropped the rest (audit #30).
+                //
+                // Each target of a multi-target rule is folded in separately.
+                // POSIX 105643 makes the target side a `<blank>`-separated
+                // list of targets, each a target in its own right, so `a b: c`
+                // is `a: c` and `b: c`. Absorbing a later `a: extra` into the
+                // rule the two shared handed
+                // `extra` to `b` as well -- the same leak `.IGNORE: a` had
+                // before attributes were keyed by target (audit #84).
+                for rule in rule.split_targets() {
+                    let Some(name) = rule.targets().next().map(|t| t.to_string()) else {
+                        continue;
+                    };
+                    match make
+                        .rules
+                        .iter_mut()
+                        .find(|existing| existing.targets().any(|t| t.as_ref() == name))
+                    {
+                        Some(existing) => existing.absorb(rule),
+                        None => make.rules.push(rule),
+                    }
+                }
             }
         }
 
@@ -479,7 +959,76 @@ impl TryFrom<(Makefile, Config)> for Make {
             special_target::process(rule, &mut make)?;
         }
 
+        // Built-in inference rules come last, so a rule of the same name in
+        // the makefile is found first.
+        if !make.config.clear {
+            make.seed_builtin_rules()?;
+            make.seed_sccs_get()?;
+        }
+
         Ok(make)
+    }
+}
+
+/// Expand the built-in recipes against the macros actually in force.
+///
+/// The rule text is a constant, so it always parses; only the recipe lines
+/// need the makefile's macros. The previous arrangement pasted every macro
+/// back into that text as `NAME ::= value` and re-parsed the lot, so any value
+/// containing a newline -- every `define` body -- made the whole thing fail to
+/// parse, and an `if let Ok` swallowed the error. Every built-in rule
+/// disappeared without a word (audit #67).
+fn expand_rules(text: &str, macros: &[Macro]) -> Result<String, ErrorCode> {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        match line.strip_prefix('\t') {
+            Some(body) => {
+                out.push('\t');
+                out.push_str(&expand_builtin_recipe(body, macros)?);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Expand one built-in recipe line. `$@`, `$<` and `$*` are left for the rule
+/// stage, which is the only place that knows the target.
+fn expand_builtin_recipe(line: &str, macros: &[Macro]) -> Result<String, ErrorCode> {
+    preprocessor::expand_recipe(line, macros).map_err(|message| ParserError {
+        constraint: parser::ParseError(vec![message]),
+    })
+}
+
+/// The SCCS history file for `name`, if there is one.
+///
+/// POSIX names it `SCCS/s.source_file`, beside the target rather than beside
+/// the makefile, so a target with a directory part looks in that directory.
+fn sccs_history(name: &str) -> Option<String> {
+    let (dir, file) = match name.rfind('/') {
+        Some(at) => (&name[..=at], &name[at + 1..]),
+        None => ("", name),
+    };
+    let path = format!("{dir}SCCS/s.{file}");
+    fs::metadata(&path).is_ok().then_some(path)
+}
+
+/// Whether `target` should be retrieved from its SCCS history.
+///
+/// POSIX 105701: retrieve when the target is missing or the history is newer.
+/// POSIX 105704: "if the target is writable by anyone, make shall not retrieve
+/// a new version" -- a checked-out, editable file is left as it is.
+fn needs_sccs_get(target: &str, history: &str) -> bool {
+    let Ok(metadata) = fs::metadata(target) else {
+        return true;
+    };
+    if metadata.permissions().mode() & 0o222 != 0 {
+        return false;
+    }
+    match (get_modified_time(history), get_modified_time(target)) {
+        (Some(history), Some(target)) => history > target,
+        _ => true,
     }
 }
 

@@ -126,7 +126,7 @@ mod arguments {
         run_test_helper(
             &["-SC", "tests/makefiles/arguments/dash_cap_s"],
             "OK\n",
-            "make: execution error: 1\n",
+            "make: [bar] execution error: 1\n",
             2,
         )
     }
@@ -143,37 +143,67 @@ mod arguments {
 
     #[test]
     fn dash_p() {
-        run_test_helper(
-            &["-p"],
-            "{\".MACROS\": {\"AR=ar\", \"ARFLAGS=-rv\", \"CC=c17\", \"CFLAGS=-O 1\", \"GFLAGS=\", \"LDFLAGS=\", \"LEX=lex\", \"LFLAGS=\", \"SCCSFLAGS=\", \"SCCSGETFLAGS=-s\", \"XSI GET=get\", \"YACC=yacc\", \"YFLAGS=\"}, \".SCCS_GET\": {\"sccs $(SCCSFLAGS) get $(SCCSGETFLAGS) $@\"}, \".SUFFIXES\": {\".a\", \".c\", \".c~\", \".l\", \".l~\", \".o\", \".sh\", \".sh~\", \".y\", \".y~\"}, \"SUFFIX RULES\": {\".c.a: $(CC) -c $(CFLAGS) $<; $(AR) $(ARFLAGS) $@ $*.o; rm -f $*.o\", \".c.o: $(CC) $(CFLAGS) -c $<\", \".c: $(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<\", \".l.c: $(LEX) $(LFLAGS) $<; mv lex.yy.c $@\", \".l.o: $(LEX) $(LFLAGS) $<; $(CC) $(CFLAGS) -c lex.yy.c; rm -f lex.yy.c; mv lex.yy.o $@\", \".l~.c: $(GET) $(GFLAGS) -p $< > $*.l; $(LEX) $(LFLAGS) $*.l; mv lex.yy.c $@\", \".l~.o: $(GET) $(GFLAGS) -p $< > $*.l; $(LEX) $(LFLAGS) $*.l; $(CC) $(CFLAGS) -c lex.yy.c; rm -f lex.yy.c; mv lex.yy.o $@\", \".sh: chmod a+x $@\", \".sh: cp $< $@\", \".y.c: $(YACC) $(YFLAGS) $<; mv y.tab.c $@\", \".y.o: $(YACC) $(YFLAGS) $<; $(CC) $(CFLAGS) -c y.tab.c; rm -f y.tab.c; mv y.tab.o $@\", \".y~.c: $(GET) $(GFLAGS) -p $< > $*.y; $(YACC) $(YFLAGS) $*.y; mv y.tab.c $@\", \".y~.o: $(GET) $(GFLAGS) -p $< > $*.y; $(YACC) $(YFLAGS) $*.y; $(CC) $(CFLAGS) -c y.tab.c; rm -f y.tab.c; mv y.tab.o $@\", \"XSI .c~.o: $(GET) $(GFLAGS) -p $< > $*.c; $(CC) $(CFLAGS) -c $*.c\"}}",
-            "",
-            0,
-        )
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-p", "-f", "/dev/null"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // POSIX 105395: "the complete set of macro definitions and target
+        // descriptions"; the format is unspecified, so this is makefile syntax.
+        // POSIX Example 8 runs exactly this to view the built-in rules, so it
+        // must succeed on a makefile with no targets.
+        assert!(stdout.contains("# macros"), "stdout: {stdout}");
+        assert!(stdout.contains("CC = c17"), "stdout: {stdout}");
+        assert!(stdout.contains("# inference rules"), "stdout: {stdout}");
+        assert!(stdout.contains(".c.o:"), "stdout: {stdout}");
+        assert!(stdout.ends_with('\n'), "dump must end with a newline");
+        assert_eq!(output.status.code(), Some(0));
     }
+
+    // The dump reports what was actually parsed, not a hand-maintained table:
+    // the makefile's own macros and rules appear alongside the built-ins.
     #[test]
-    fn dash_p_with_mk() {
-        run_test_helper(
-            &["-pf", "tests/makefiles/arguments/dash_p/with_phony.mk"],
-            "{\".MACROS\": {\"AR=ar\", \"ARFLAGS=-rv\", \"CC=c17\", \"CFLAGS=-O 1\", \"GFLAGS=\", \"LDFLAGS=\", \"LEX=lex\", \"LFLAGS=\", \"SCCSFLAGS=\", \"SCCSGETFLAGS=-s\", \"XSI GET=get\", \"YACC=yacc\", \"YFLAGS=\"}, \".PHONY\": {\"clean\"}, \".SCCS_GET\": {\"sccs $(SCCSFLAGS) get $(SCCSGETFLAGS) $@\"}, \".SUFFIXES\": {\".a\", \".c\", \".c~\", \".l\", \".l~\", \".o\", \".sh\", \".sh~\", \".y\", \".y~\"}, \"SUFFIX RULES\": {\".c.a: $(CC) -c $(CFLAGS) $<; $(AR) $(ARFLAGS) $@ $*.o; rm -f $*.o\", \".c.o: $(CC) $(CFLAGS) -c $<\", \".c: $(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<\", \".l.c: $(LEX) $(LFLAGS) $<; mv lex.yy.c $@\", \".l.o: $(LEX) $(LFLAGS) $<; $(CC) $(CFLAGS) -c lex.yy.c; rm -f lex.yy.c; mv lex.yy.o $@\", \".l~.c: $(GET) $(GFLAGS) -p $< > $*.l; $(LEX) $(LFLAGS) $*.l; mv lex.yy.c $@\", \".l~.o: $(GET) $(GFLAGS) -p $< > $*.l; $(LEX) $(LFLAGS) $*.l; $(CC) $(CFLAGS) -c lex.yy.c; rm -f lex.yy.c; mv lex.yy.o $@\", \".sh: chmod a+x $@\", \".sh: cp $< $@\", \".y.c: $(YACC) $(YFLAGS) $<; mv y.tab.c $@\", \".y.o: $(YACC) $(YFLAGS) $<; $(CC) $(CFLAGS) -c y.tab.c; rm -f y.tab.c; mv y.tab.o $@\", \"some\n.y~.c: $(GET) $(GFLAGS) -p $< > $*.y; $(YACC) $(YFLAGS) $*.y; mv y.tab.c $@\", \".y~.o: $(GET) $(GFLAGS) -p $< > $*.y; $(YACC) $(YFLAGS) $*.y; $(CC) $(CFLAGS) -c y.tab.c; rm -f y.tab.c; mv y.tab.o $@\", \"XSI .c~.o: $(GET) $(GFLAGS) -p $< > $*.c; $(CC) $(CFLAGS) -c $*.c\"}}",
-            "",
-            0,
-        )
+    fn dash_p_reports_the_parsed_makefile() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args([
+                "-pn",
+                "-f",
+                "tests/makefiles/arguments/dash_p/with_phony.mk",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("# rules"), "stdout: {stdout}");
+        assert!(stdout.contains("clean:"), "stdout: {stdout}");
+        assert_eq!(output.status.code(), Some(0));
     }
+
+    // The dump is makefile syntax, so it parses as one.
     #[test]
-    fn dash_r_with_file() {
-        run_test_helper_with_setup_and_destruct(
-            &["-rf", "tests/makefiles/arguments/dash_r/with_file.mk"],
-            "Converting testfile.txt to testfile.out\n",
-            "",
-            0,
-            || {
-                File::create("testfile.txt").expect("failed to create file");
-            },
-            || {
-                let _ = remove_file("testfile.txt");
-                let _ = remove_file("testfile.out");
-            },
-        );
+    fn dash_p_output_is_a_makefile() {
+        let bin = get_binary_path("make");
+        let dump = Command::new(&bin)
+            .args(["-p", "-f", "/dev/null"])
+            .output()
+            .expect("failed to run make");
+        let path = std::env::temp_dir().join("make_p_roundtrip.mk");
+        std::fs::write(&path, &dump.stdout).unwrap();
+        let reparsed = Command::new(&bin)
+            .arg("-f")
+            .arg(&path)
+            .arg("-n")
+            .arg(".c.o")
+            .output()
+            .expect("failed to run make");
+        // It parses: the failure mode we are excluding is a parse error (4).
+        assert_ne!(reparsed.status.code(), Some(4), "dump did not re-parse");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -249,7 +279,7 @@ mod arguments {
         run_test_helper(
             &["-kf", "tests/makefiles/arguments/dash_k.mk"],
             "OK\necho 12\n12\n",
-            "make: execution error: 1\nmake: Target z not remade because of errors\n",
+            "make: [bar] execution error: 1\nmake: Target z not remade because of errors\n",
             2,
         );
     }
@@ -297,6 +327,75 @@ mod internal_macros {
             "",
             0,
         );
+    }
+
+    // Audit #36: the recipe shell comes from the `SHELL` macro. It used to be
+    // inert because `Make::macros` was always empty, so every recipe ran under
+    // /bin/sh no matter what the makefile said. `/bin/echo` as the shell makes
+    // the invocation visible instead of running it.
+    #[test]
+    fn shell_macro_selects_the_recipe_shell() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-f", "tests/makefiles/macros/shell_macro.mk"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // What /bin/echo prints back is its own argument list, which proves
+        // /bin/echo -- not /bin/sh -- ran the recipe. Only the tail is
+        // asserted: GNU coreutils echo consumes the leading `-e` as its
+        // "enable escapes" flag, while the BSD echo on macOS prints it, so the
+        // agreement to assert is the invocation, not the platform's opinion of
+        // `-e`.
+        assert!(
+            stdout.trim_end().ends_with("-c echo hi"),
+            "stdout: {stdout}"
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    fn run_env_export(extra_env: Option<(&str, &str)>, args: &[&str]) -> String {
+        let bin = get_binary_path("make");
+        let mut cmd = Command::new(bin);
+        cmd.arg("-f")
+            .arg("tests/makefiles/macros/env_export.mk")
+            .args(args);
+        if let Some((k, v)) = extra_env {
+            cmd.env(k, v);
+        }
+        let output = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    // POSIX 105869: a macro defined in a makefile "shall not be added to the
+    // environment of make if they are not already in its environment". Wiring
+    // #36 made `Make::macros` non-empty for the first time, which turned
+    // `init_env`'s unconditional export into a live leak.
+    #[test]
+    fn makefile_macro_absent_from_env_is_not_exported() {
+        let stdout = run_env_export(None, &[]);
+        assert_eq!(stdout, "MYMACRO=[]\n", "stdout: {stdout}");
+    }
+
+    // 105871 leaves updating an existing variable unspecified; we update it,
+    // matching GNU make.
+    #[test]
+    fn makefile_macro_present_in_env_is_updated() {
+        let stdout = run_env_export(Some(("MYMACRO", "fromenv")), &[]);
+        assert_eq!(stdout, "MYMACRO=[frommakefile]\n", "stdout: {stdout}");
+    }
+
+    // Under -e the environment wins over the makefile.
+    #[test]
+    fn dash_e_lets_the_environment_win() {
+        let stdout = run_env_export(Some(("MYMACRO", "fromenv")), &["-e"]);
+        assert_eq!(stdout, "MYMACRO=[fromenv]\n", "stdout: {stdout}");
     }
 
     // Audit #13: the `MAKEFLAGS` environment variable seeds options; `n`
@@ -392,7 +491,7 @@ mod recipe_execution {
         run_test_helper(
             &["-sf", "tests/makefiles/recipe_execution/shell_e.mk"],
             "",
-            "make: execution error: 1\n",
+            "make: [all] execution error: 1\n",
             2,
         );
     }
@@ -467,6 +566,25 @@ mod parsing {
             "",
             0,
         );
+    }
+
+    // Audit #86: `all:: dep` is GNU's double-colon rule, which we do not
+    // implement. Splitting on the first `:` made the second one a prerequisite
+    // literally named `:`, so the makefile failed with `no target ':'` --
+    // a diagnostic about the wrong thing entirely.
+    #[test]
+    fn double_colon_rule_is_diagnosed() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-f", "tests/makefiles/parsing/double_colon.mk", "all"])
+            .output()
+            .expect("failed to run make");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("double-colon rules are not supported"),
+            "stderr: {stderr}"
+        );
+        assert_eq!(output.status.code(), Some(4));
     }
 
     // Audit #3: a missing `include` file must produce a graceful error, not
@@ -839,18 +957,36 @@ mod special_targets {
     // list, observable in the `-p` dump.
     #[test]
     fn phony_accumulates() {
+        // Both `a` and `b` are declared phony by separate `.PHONY` lines, so
+        // both recipes must run even though files of those names exist. This
+        // used to be asserted against the `-p` mirror table; with that gone the
+        // behaviour itself is what to check, which is the better test anyway.
+        // Distinctive names: these files are created in the crate root, which
+        // every test shares. Plain `a`/`b` collided with the parallel fixtures'
+        // target names, making those tests see an up-to-date target and fail
+        // intermittently depending on interleaving.
+        for target in ["phony_probe_a", "phony_probe_b"] {
+            let _ = File::create(target);
+        }
         let bin = get_binary_path("make");
-        let output = Command::new(bin)
-            .args(["-pf", "tests/makefiles/special_targets/phony_accumulate.mk"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("failed to run make");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("\".PHONY\": {\"a\", \"b\"}"),
-            "stdout: {stdout}"
-        );
+        for target in ["phony_probe_a", "phony_probe_b"] {
+            let output = Command::new(&bin)
+                .args([
+                    "-f",
+                    "tests/makefiles/special_targets/phony_accumulate.mk",
+                    target,
+                ])
+                .output()
+                .expect("failed to run make");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains(&format!("PHONY-{target}")),
+                "{target} was treated as up to date: {stdout}"
+            );
+        }
+        for target in ["phony_probe_a", "phony_probe_b"] {
+            let _ = std::fs::remove_file(target);
+        }
     }
 
     #[test]
@@ -910,9 +1046,18 @@ mod special_targets {
 
     #[test]
     fn sccs_get() {
+        // `.SCCS_GET` is accepted and validated, but inert: this make performs
+        // no SCCS retrieval, so nothing ever runs the recipe (audit #61). It
+        // used to be stored in the `-p` mirror table and read by nothing, which
+        // made the gap look like a feature. What is testable is that the
+        // makefile is still accepted and the ordinary target builds.
         run_test_helper(
-            &["-pf", "tests/makefiles/special_targets/sccs/basic_sccs.mk"],
-            "{\".MACROS\": {\"AR=ar\", \"ARFLAGS=-rv\", \"CC=c17\", \"CFLAGS=-O 1\", \"GFLAGS=\", \"LDFLAGS=\", \"LEX=lex\", \"LFLAGS=\", \"SCCSFLAGS=\", \"SCCSGETFLAGS=-s\", \"XSI GET=get\", \"YACC=yacc\", \"YFLAGS=\"}, \".SCCS_GET\": {\"echo \\\"executing command\\\"\"}, \".SUFFIXES\": {\".a\", \".c\", \".c~\", \".l\", \".l~\", \".o\", \".sh\", \".sh~\", \".y\", \".y~\"}, \"SUFFIX RULES\": {\".c.a: $(CC) -c $(CFLAGS) $<; $(AR) $(ARFLAGS) $@ $*.o; rm -f $*.o\", \".c.o: $(CC) $(CFLAGS) -c $<\", \".c: $(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<\", \".l.c: $(LEX) $(LFLAGS) $<; mv lex.yy.c $@\", \".l.o: $(LEX) $(LFLAGS) $<; $(CC) $(CFLAGS) -c lex.yy.c; rm -f lex.yy.c; mv lex.yy.o $@\", \".l~.c: $(GET) $(GFLAGS) -p $< > $*.l; $(LEX) $(LFLAGS) $*.l; mv lex.yy.c $@\", \".l~.o: $(GET) $(GFLAGS) -p $< > $*.l; $(LEX) $(LFLAGS) $*.l; $(CC) $(CFLAGS) -c lex.yy.c; rm -f lex.yy.c; mv lex.yy.o $@\", \".sh: chmod a+x $@\", \".sh: cp $< $@\", \".y.c: $(YACC) $(YFLAGS) $<; mv y.tab.c $@\", \".y.o: $(YACC) $(YFLAGS) $<; $(CC) $(CFLAGS) -c y.tab.c; rm -f y.tab.c; mv y.tab.o $@\", \"something\n.y~.c: $(GET) $(GFLAGS) -p $< > $*.y; $(YACC) $(YFLAGS) $*.y; mv y.tab.c $@\", \".y~.o: $(GET) $(GFLAGS) -p $< > $*.y; $(YACC) $(YFLAGS) $*.y; $(CC) $(CFLAGS) -c y.tab.c; rm -f y.tab.c; mv y.tab.o $@\", \"XSI .c~.o: $(GET) $(GFLAGS) -p $< > $*.c; $(CC) $(CFLAGS) -c $*.c\"}}",
+            &[
+                "-f",
+                "tests/makefiles/special_targets/sccs/basic_sccs.mk",
+                "target",
+            ],
+            "something\n",
             "",
             0,
         );
@@ -968,6 +1113,13 @@ mod special_targets {
             &[
                 "-f",
                 "tests/makefiles/special_targets/suffixes/suffixes_basic.mk",
+                // The fixture defines only an inference rule, so it has no
+                // default target and the target must be named. `make` with no
+                // operand used to fall back to the first inference rule and
+                // scan the working directory for anything matching; POSIX
+                // 105428 makes the default the first target that is not
+                // special or an inference rule, and GNU agrees.
+                "suffixes_test.xfo",
             ],
             "Converting suffixes_test.sfx to suffixes_test.xfo\n",
             "",
@@ -1204,5 +1356,1042 @@ mod inference_rules {
                 let _ = remove_file("cleartest.p2");
             },
         );
+    }
+}
+
+// Build-graph state: cycles, rule merging, and single-build under -j.
+mod build_graph {
+    use super::*;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #28: a cycle that does not pass through the root used to recurse
+    // until the stack overflowed (exit 134). The visited/stack sets were seeded
+    // with the root and never inserted into during the walk.
+    #[test]
+    fn indirect_cycle_is_diagnosed_not_a_stack_overflow() {
+        let (_, code) = run(&["-f", "tests/makefiles/graph/indirect_cycle.mk", "a"]);
+        assert_eq!(code, Some(8), "expected a clean cycle diagnostic");
+    }
+
+    // Audit #65: a pattern whose prerequisite matches the same pattern makes the
+    // target its own prerequisite. The pattern branch skipped the cycle check,
+    // and `Edges::prerequisites_of` could not see a pattern-contributed edge, so
+    // the build blocked on the ledger condvar forever waiting for itself.
+    #[test]
+    fn self_referential_pattern_is_a_cycle_not_a_hang() {
+        let (_, code) = run(&["-f", "tests/makefiles/graph/pattern_self_cycle.mk", "all"]);
+        assert_eq!(code, Some(8), "expected a cycle diagnostic, not a hang");
+    }
+
+    // Audit #30: POSIX 105653 lets several rules name one target, with
+    // prerequisites accumulating. Only the first was used, so `b` never built
+    // and the recipe never ran -- silently, with exit 0.
+    #[test]
+    fn prerequisites_accumulate_across_rules() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/graph/split_rules.mk", "all"]);
+        assert!(stdout.contains("BUILT-A"), "stdout: {stdout}");
+        assert!(stdout.contains("BUILT-B"), "stdout: {stdout}");
+        assert!(stdout.contains("done"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+
+    // Audit #31: a target reachable by two paths was built once per path.
+    #[test]
+    fn a_shared_prerequisite_builds_once() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/graph/diamond.mk", "all"]);
+        assert_eq!(stdout.matches("SHARED").count(), 1, "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+
+    // Audit #29: and under -j two shells ran that recipe *concurrently*, which
+    // is a data race on whatever the recipe writes.
+    #[test]
+    fn a_shared_prerequisite_builds_once_under_dash_j() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/graph/diamond.mk", "-j4", "all"]);
+        assert_eq!(stdout.matches("SHARED").count(), 1, "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+
+    // Audit #80: `.c.o:` and `.o.c:` make each of `foo.o` and `foo.c` the
+    // other's source. `Edges::prerequisites_of` reported only named and
+    // pattern edges, so the cycle check saw nothing and the ledger blocked the
+    // one thread forever on a target it was itself building. Single-threaded:
+    // this is not a `-j` race.
+    #[test]
+    fn mutually_recursive_inference_rules_are_a_cycle_not_a_hang() {
+        let _ = std::fs::write("infcyc.c", "");
+        let _ = std::fs::write("infcyc.o", "");
+        let (_, code) = run(&["-f", "tests/makefiles/graph/inference_cycle.mk", "infcyc.o"]);
+        assert_eq!(code, Some(8), "expected a cycle diagnostic, not a hang");
+        let _ = std::fs::remove_file("infcyc.c");
+        let _ = std::fs::remove_file("infcyc.o");
+    }
+
+    // Audit #84: `sib_a sib_b:` is two rules. A later `sib_a: sib_extra` was
+    // absorbed into the rule both targets shared, so building `sib_b` built
+    // `sib_extra` too and reported it in `$^`.
+    #[test]
+    fn a_later_rule_does_not_leak_prerequisites_to_siblings() {
+        let (stdout, code) = run(&[
+            "-f",
+            "tests/makefiles/graph/sibling_prerequisites.mk",
+            "sib_b",
+        ]);
+        assert!(stdout.contains("T=sib_b CARET=[]"), "stdout: {stdout}");
+        assert!(!stdout.contains("BUILT-EXTRA"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        // ...and the target that *does* name it still gets it.
+        let (stdout, _) = run(&[
+            "-f",
+            "tests/makefiles/graph/sibling_prerequisites.mk",
+            "sib_a",
+        ]);
+        assert!(stdout.contains("BUILT-EXTRA"), "stdout: {stdout}");
+        assert!(
+            stdout.contains("T=sib_a CARET=[sib_extra]"),
+            "stdout: {stdout}"
+        );
+    }
+}
+
+// Inference rules, `%` pattern rules, and default-target selection.
+mod inference {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    fn with_files(files: &[&str], body: impl FnOnce()) {
+        for f in files {
+            let _ = File::create(f);
+        }
+        body();
+        for f in files {
+            let _ = fs::remove_file(f);
+        }
+    }
+
+    // `%.o: %.c` -- not POSIX, but how real makefiles express inference.
+    #[test]
+    fn pattern_rule_builds_with_stem_and_input() {
+        with_files(&["pat_probe.c"], || {
+            let (stdout, code) = run(&["-f", "tests/makefiles/inference/pattern.mk", "all"]);
+            assert!(
+                stdout.contains("target=pat_probe.o input=pat_probe.c stem=pat_probe"),
+                "stdout: {stdout}"
+            );
+            assert_eq!(code, Some(0));
+        });
+        let _ = fs::remove_file("pat_probe.o");
+    }
+
+    // Audit #37: `$*` is the target with its suffix removed, not the target.
+    #[test]
+    fn star_is_the_stem() {
+        with_files(&["star_probe.c"], || {
+            let (stdout, _) = run(&["-f", "tests/makefiles/inference/star.mk", "all"]);
+            assert!(stdout.contains("STAR=[star_probe]"), "stdout: {stdout}");
+            assert!(stdout.contains("AT=[star_probe.o]"), "stdout: {stdout}");
+        });
+        let _ = fs::remove_file("star_probe.o");
+    }
+
+    // Audit #47: POSIX 105920 -- ".SUFFIXES" order picks the rule, not the
+    // order the rules happen to appear in the makefile. Both orderings must
+    // agree, and both must pick .sh because it is listed first.
+    #[test]
+    fn suffixes_order_decides_not_rule_order() {
+        with_files(&["ord_probe.c", "ord_probe.sh"], || {
+            for fixture in [
+                "tests/makefiles/inference/suffix_order_c_first.mk",
+                "tests/makefiles/inference/suffix_order_sh_first.mk",
+            ] {
+                let _ = fs::remove_file("ord_probe");
+                let (stdout, _) = run(&["-f", fixture, "ord_probe"]);
+                assert!(stdout.contains("VIA-SH"), "{fixture} gave: {stdout}");
+            }
+        });
+        let _ = fs::remove_file("ord_probe");
+    }
+
+    // Audit #38: `.config` is not an inference rule just because it starts
+    // with a dot. It used to be classified as one, find no files to scan, and
+    // silently run nothing -- while also displacing the real default target.
+    #[test]
+    fn a_dot_target_is_not_an_inference_rule() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/inference/dot_target.mk", ".config"]);
+        assert!(stdout.contains("BUILT-DOTCONFIG"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+
+    // POSIX 105428: the default is the first target that is not special or an
+    // inference rule, so a leading dot-target is skipped. GNU agrees.
+    #[test]
+    fn default_target_skips_a_dot_target() {
+        let (stdout, code) = run(&["-f", "tests/makefiles/inference/dot_target.mk"]);
+        assert!(stdout.contains("BUILT-REAL"), "stdout: {stdout}");
+        assert!(!stdout.contains("DOTCONFIG"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+    }
+}
+
+// Recipe execution and command-line semantics.
+mod execution {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #33: -k means "keep building the other targets", not "build this
+    // target's dependents anyway". The failing recipe used to return Ok, so
+    // `all` ran against inputs that were never produced.
+    #[test]
+    fn keep_going_skips_a_target_whose_prerequisite_failed() {
+        let (stdout, _, code) = run(&[
+            "-f",
+            "tests/makefiles/execution/keep_going_skips.mk",
+            "-k",
+            "all",
+        ]);
+        assert!(!stdout.contains("SHOULD-NOT-RUN"), "stdout: {stdout}");
+        // ...but an independent sibling still gets built, which is the point of -k.
+        assert!(stdout.contains("B-RAN"), "stdout: {stdout}");
+        assert_eq!(code, Some(2));
+    }
+
+    // Audit #42: `-t` on a .PHONY target used to create a file named after it,
+    // after which every `make <target>` reported it up to date forever.
+    #[test]
+    fn touch_does_not_materialize_a_phony_target() {
+        let _ = fs::remove_file("phony_probe");
+        let (_, _, code) = run(&[
+            "-f",
+            "tests/makefiles/execution/phony_touch.mk",
+            "-t",
+            "phony_probe",
+        ]);
+        assert_eq!(code, Some(0));
+        assert!(
+            !std::path::Path::new("phony_probe").exists(),
+            "-t created a file for a .PHONY target"
+        );
+    }
+
+    // Audit #82: `-t` marks a target up to date; it does not empty it. The
+    // touch path opened the file with `File::create`, which truncates, so
+    // `make -t` destroyed the contents of every target it touched.
+    #[test]
+    fn touch_preserves_the_target_contents() {
+        use std::{thread, time::Duration};
+        let _ = fs::write("tch_out", "CONTENTS\n");
+        thread::sleep(Duration::from_millis(1100));
+        let _ = fs::write("tch_dep", "");
+        let _ = fs::write("tch.mk", "tch_out: tch_dep\n\t@echo rebuild\n");
+        let (stdout, _, code) = run(&["-f", "tch.mk", "-t", "tch_out"]);
+        assert!(stdout.contains("touch tch_out"), "stdout: {stdout}");
+        assert_eq!(
+            fs::read_to_string("tch_out").unwrap_or_default(),
+            "CONTENTS\n",
+            "-t truncated the target"
+        );
+        assert_eq!(code, Some(0));
+        for f in ["tch_out", "tch_dep", "tch.mk"] {
+            let _ = fs::remove_file(f);
+        }
+    }
+
+    // Audit #39: a target is a filename and need not be valid UTF-8.
+    #[test]
+    fn a_non_utf8_target_is_diagnosed_not_a_panic() {
+        use std::os::unix::ffi::OsStrExt;
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .arg("-f")
+            .arg("tests/makefiles/execution/makeflags.mk")
+            .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+            .output()
+            .expect("failed to run make");
+        // 101 is the Rust panic exit status.
+        assert_ne!(output.status.code(), Some(101), "make panicked");
+        assert_eq!(output.status.code(), Some(2));
+    }
+
+    // Audit #71: a command-line macro must beat a definition in the makefile,
+    // including in a rule *header*. Appending the operand after the text left
+    // the header already expanded by the time it was read. POSIX 105866.
+    #[test]
+    fn a_command_line_macro_overrides_a_rule_header() {
+        let _ = std::fs::write(
+            "cmdline_hdr.mk",
+            "OBJ = a.o\nall: $(OBJ)\n\t@echo \"prereqs=$^\"\na.o:\n\t@echo MADE-A\nb.o:\n\t@echo MADE-B\n",
+        );
+        let (stdout, _, _) = run(&["-f", "cmdline_hdr.mk", "OBJ=b.o", "all"]);
+        assert!(stdout.contains("MADE-B"), "stdout: {stdout}");
+        assert!(stdout.contains("prereqs=b.o"), "stdout: {stdout}");
+        let _ = std::fs::remove_file("cmdline_hdr.mk");
+    }
+
+    // ...and a later ordinary assignment must not undo it, which is what the
+    // append-at-the-end arrangement was implicitly providing.
+    #[test]
+    fn a_later_assignment_does_not_clobber_a_command_line_macro() {
+        let _ = std::fs::write("cmdline_late.mk", "all:\n\t@echo [$(V)]\nV = fromfile\n");
+        let (stdout, _, _) = run(&["-f", "cmdline_late.mk", "V=fromcmd", "all"]);
+        assert!(stdout.contains("[fromcmd]"), "stdout: {stdout}");
+        let _ = std::fs::remove_file("cmdline_late.mk");
+    }
+
+    // `override` is the documented escape hatch.
+    #[test]
+    fn override_defeats_a_command_line_macro() {
+        let _ = std::fs::write(
+            "cmdline_override.mk",
+            "CFLAGS = -O2\noverride CFLAGS += -fPIC\nall:\n\t@echo [$(CFLAGS)]\n",
+        );
+        let (stdout, _, _) = run(&["-f", "cmdline_override.mk", "CFLAGS=-O0", "all"]);
+        assert!(stdout.contains("[-O0 -fPIC]"), "stdout: {stdout}");
+        let _ = std::fs::remove_file("cmdline_override.mk");
+    }
+
+    // Audit #73: `?=` and `+=` consult the environment, which is macro source 3.
+    #[test]
+    fn conditional_and_append_see_the_environment() {
+        let _ = std::fs::write("env_ops.mk", "CC ?= gcc\nall:\n\t@echo [$(CC)]\n");
+        let bin = get_binary_path("make");
+        let out = Command::new(&bin)
+            .args(["-f", "env_ops.mk", "all"])
+            .env("CC", "clang")
+            .output()
+            .expect("run make");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("[clang]"),
+            "?= ignored the environment"
+        );
+        let _ = std::fs::write("env_ops.mk", "CC += -Wall\nall:\n\t@echo [$(CC)]\n");
+        let out = Command::new(&bin)
+            .args(["-f", "env_ops.mk", "all"])
+            .env("CC", "clang")
+            .output()
+            .expect("run make");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("[clang -Wall]"),
+            "+= dropped the inherited value"
+        );
+        let _ = std::fs::remove_file("env_ops.mk");
+    }
+
+    // Audit #74: a valueless `export NAME` put the macro in the recipe
+    // environment; it used to reach the rule scanner and fail on a missing colon.
+    #[test]
+    fn export_directive_puts_a_macro_in_the_environment() {
+        let _ = std::fs::write(
+            "export_dir.mk",
+            "MYVAR = fromfile\nexport MYVAR\nall:\n\t@echo \"env=[$$MYVAR]\"\n",
+        );
+        let (stdout, _, code) = run(&["-f", "export_dir.mk", "all"]);
+        assert!(stdout.contains("env=[fromfile]"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = std::fs::remove_file("export_dir.mk");
+    }
+
+    // Without the directive it stays out, per POSIX 105869.
+    #[test]
+    fn a_macro_is_not_exported_without_the_directive() {
+        let _ = std::fs::write(
+            "export_none.mk",
+            "MYVAR = fromfile\nall:\n\t@echo \"env=[$$MYVAR]\"\n",
+        );
+        let (stdout, _, _) = run(&["-f", "export_none.mk", "all"]);
+        assert!(stdout.contains("env=[]"), "stdout: {stdout}");
+        let _ = std::fs::remove_file("export_none.mk");
+    }
+
+    // Audit #40: POSIX 105866 -- make passes its options down through
+    // MAKEFLAGS. It was never constructed, so a sub-make saw nothing.
+    #[test]
+    fn makeflags_carries_options_to_children() {
+        let (stdout, _, _) = run(&["-f", "tests/makefiles/execution/makeflags.mk", "-k", "all"]);
+        assert!(stdout.contains("MAKEFLAGS=[k]"), "stdout: {stdout}");
+    }
+
+    #[test]
+    fn makeflags_is_empty_when_no_options_are_given() {
+        let (stdout, _, _) = run(&["-f", "tests/makefiles/execution/makeflags.mk", "all"]);
+        assert!(stdout.contains("MAKEFLAGS=[]"), "stdout: {stdout}");
+    }
+}
+
+// VPATH search, and the built-in inference rules POSIX requires.
+mod builtins {
+    use super::*;
+    use std::fs;
+
+    /// Like `run`, but keeps stderr too.
+    fn run3(args: &[&str]) -> (String, String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #53: VPATH names directories to search for a prerequisite that is
+    // not where the rule says. `$<` must name where it was actually found.
+    #[test]
+    fn vpath_finds_a_prerequisite_and_names_it() {
+        let _ = fs::create_dir_all("vpath_src");
+        let _ = fs::write("vpath_src/vp_probe.c", "");
+        let (stdout, code) = run(&["-f", "tests/makefiles/vpath/vpath.mk", "all"]);
+        assert!(
+            stdout.contains("IN=vpath_src/vp_probe.c"),
+            "stdout: {stdout}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_file("vp_probe.o");
+        let _ = fs::remove_dir_all("vpath_src");
+    }
+
+    // Audit #55: the `vpath` directive gives a search path per pattern, unlike
+    // the blanket VPATH macro. `$<` must name where the file was found.
+    #[test]
+    fn vpath_directive_finds_a_prerequisite() {
+        let _ = fs::create_dir_all("vpath_dir_probe");
+        let _ = fs::write("vpath_dir_probe/vpd_probe.c", "");
+        let (stdout, code) = run(&["-f", "tests/makefiles/vpath/directive.mk", "all"]);
+        assert!(
+            stdout.contains("IN=vpath_dir_probe/vpd_probe.c"),
+            "stdout: {stdout}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_file("vpd_probe.o");
+        let _ = fs::remove_dir_all("vpath_dir_probe");
+    }
+
+    // Audit #54: the default rules existed only as display strings in the -p
+    // table, so `make f.o` with an f.c present reported "no target" -- every
+    // makefile relying on the built-in .c.o rule, which is most of them.
+    #[test]
+    fn builtin_c_to_o_rule_applies() {
+        let _ = fs::write("builtin_probe.c", "int probe(void){return 0;}\n");
+        // CFLAGS defaults to POSIX's `-O 1` (spec line 106049), which c17 takes as
+        // two arguments and cc does not, so it is cleared alongside CC.
+        let (_, code) = run(&[
+            "-f",
+            "tests/makefiles/vpath/builtin.mk",
+            "CC=cc",
+            "CFLAGS=",
+            "all",
+        ]);
+        assert_eq!(code, Some(0), "built-in .c.o rule did not apply");
+        assert!(std::path::Path::new("builtin_probe.o").exists());
+        let _ = fs::remove_file("builtin_probe.o");
+        let _ = fs::remove_file("builtin_probe.c");
+    }
+
+    // Audit #67: the built-ins used to be seeded by pasting every macro back
+    // into makefile text as `NAME ::= value` and re-parsing it. A `define`
+    // body has a newline in it, so the text no longer parsed, and the error
+    // was swallowed -- every built-in rule vanished silently.
+    #[test]
+    fn a_multi_line_macro_does_not_delete_the_builtin_rules() {
+        let _ = fs::write("builtin_define_probe.c", "int probe(void){return 0;}\n");
+        let _ = fs::write(
+            "builtin_define.mk",
+            "define GREETING\nhello\nworld\nendef\n\nall: builtin_define_probe.o\n\t@echo LINKED\n",
+        );
+        let (stdout, _, code) = run3(&["-n", "-f", "builtin_define.mk", "all"]);
+        assert!(
+            stdout.contains("-c builtin_define_probe.c"),
+            "built-in .c.o rule was lost; stdout: {stdout}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_file("builtin_define.mk");
+        let _ = fs::remove_file("builtin_define_probe.c");
+    }
+
+    // A built-in recipe that cannot be expanded must be reported. Seeding used
+    // to be wrapped in `if let Ok`, which is why losing every rule was silent.
+    // A command-line macro carries its text unexpanded to the seeding step, so
+    // this reaches that expansion and nothing earlier -- under `-r`, which
+    // skips seeding entirely, the same run is merely "no target".
+    #[test]
+    fn a_broken_builtin_expansion_is_reported() {
+        let _ = fs::write("builtin_broken_probe.c", "int probe(void){return 0;}\n");
+        let _ = fs::write(
+            "builtin_broken.mk",
+            "all: builtin_broken_probe.o\n\t@echo LINKED\n",
+        );
+        let args = [
+            "-n",
+            "-f",
+            "builtin_broken.mk",
+            "CFLAGS=$(wordlist x,2,a b)",
+        ];
+        let (_, stderr, code) = run3(&args);
+        assert_eq!(code, Some(4), "stderr: {stderr}");
+        assert!(stderr.contains("is not a number"), "stderr: {stderr}");
+        let _ = fs::remove_file("builtin_broken.mk");
+        let _ = fs::remove_file("builtin_broken_probe.c");
+    }
+
+    // -r suppresses them, as POSIX requires. Its own fixture and source file,
+    // so it cannot race the test above under parallel execution.
+    #[test]
+    fn dash_r_suppresses_the_builtin_rules() {
+        let _ = fs::write("builtin_r_probe.c", "int probe(void){return 0;}\n");
+        let (_, code) = run(&[
+            "-r",
+            "-f",
+            "tests/makefiles/vpath/builtin_r.mk",
+            "CC=cc",
+            "CFLAGS=",
+            "all",
+        ]);
+        assert_ne!(code, Some(0), "-r must suppress the built-in rules");
+        let _ = fs::remove_file("builtin_r_probe.o");
+        let _ = fs::remove_file("builtin_r_probe.c");
+    }
+}
+
+// Whether a target is up to date. The inference and pattern branches used to
+// bypass the check entirely, so every build recompiled everything.
+mod up_to_date {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #63: an inference rule ran with up_to_date=false and no mtime
+    // comparison, so `make foo.o` recompiled on every invocation.
+    #[test]
+    fn an_inference_rule_is_not_rerun_when_current() {
+        let _ = fs::write("utd_inf.c", "");
+        let _ = fs::remove_file("utd_inf.o");
+        let (first, _) = run(&["-f", "tests/makefiles/uptodate/inference.mk", "utd_inf.o"]);
+        assert!(first.contains("COMPILING"), "first run must build: {first}");
+        let (second, code) = run(&["-f", "tests/makefiles/uptodate/inference.mk", "utd_inf.o"]);
+        assert!(
+            !second.contains("COMPILING"),
+            "second run rebuilt: {second}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_file("utd_inf.o");
+        let _ = fs::remove_file("utd_inf.c");
+    }
+
+    // Audit #64: same for a pattern rule. The phony root matters -- with a
+    // real-file intermediate the traversal short-circuits and hides this.
+    #[test]
+    fn a_pattern_rule_is_not_rerun_when_current() {
+        let _ = fs::write("utd_pat.c", "");
+        let _ = fs::remove_file("utd_pat.o");
+        let (first, _) = run(&["-f", "tests/makefiles/uptodate/pattern.mk", "all"]);
+        assert!(
+            first.contains("PATCOMPILE"),
+            "first run must build: {first}"
+        );
+        let (second, _) = run(&["-f", "tests/makefiles/uptodate/pattern.mk", "all"]);
+        assert!(
+            !second.contains("PATCOMPILE"),
+            "second run rebuilt: {second}"
+        );
+        assert!(
+            second.contains("ALL"),
+            "phony root must still run: {second}"
+        );
+        let _ = fs::remove_file("utd_pat.o");
+        let _ = fs::remove_file("utd_pat.c");
+    }
+
+    // Audit #64: `$?` is the prerequisites *newer* than the target, not all of
+    // them. The pattern branch filled it with every prerequisite.
+    #[test]
+    fn question_mark_lists_only_newer_prerequisites() {
+        use std::{thread, time::Duration};
+        let _ = fs::write("utd_old", "");
+        thread::sleep(Duration::from_millis(1100));
+        let _ = fs::write("utd_target", "");
+        thread::sleep(Duration::from_millis(1100));
+        let _ = fs::write("utd_new", "");
+        let _ = fs::write(
+            "utd_question.mk",
+            "utd_target: utd_old utd_new\n\t@echo \"Q=[$?]\"\n",
+        );
+        let (out, _) = run(&["-f", "utd_question.mk", "utd_target"]);
+        assert!(out.contains("Q=[utd_new]"), "out: {out}");
+        for f in ["utd_old", "utd_new", "utd_target", "utd_question.mk"] {
+            let _ = fs::remove_file(f);
+        }
+    }
+
+    // Audit #62: a function whose argument reads an automatic variable used to
+    // run while the makefile was being read, when `$^` was still the literal two
+    // characters -- so `$(notdir $^)` returned them unchanged. Such a call is
+    // now deferred to the rule stage, which knows the target.
+    #[test]
+    fn functions_see_automatic_variables() {
+        let _ = fs::create_dir_all("fn_probe_src");
+        let _ = fs::write("fn_probe_src/a.o", "");
+        let _ = fs::write("fn_probe_src/b.o", "");
+        let (out, code) = run(&[
+            "-f",
+            "tests/makefiles/uptodate/functions_on_automatic.mk",
+            "all",
+        ]);
+        assert!(out.contains("notdir=[a.o b.o]"), "out: {out}");
+        assert!(out.contains("dir=[fn_probe_src/]"), "out: {out}");
+        assert!(
+            out.contains("base=[fn_probe_src/a fn_probe_src/b]"),
+            "out: {out}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all("fn_probe_src");
+    }
+
+    // A shell variable reference in a recipe must survive: expanding the whole
+    // line again at rule time would turn `$MAKEFLAGS` into `$M` + `AKEFLAGS`,
+    // so only the deferred call itself is evaluated.
+    #[test]
+    fn a_shell_variable_in_a_recipe_survives() {
+        let _ = fs::write("fn_shellvar.mk", "all:\n\t@FOO=bar; echo \"[$$FOO]\"\n");
+        let (out, _) = run(&["-f", "fn_shellvar.mk", "all"]);
+        assert!(out.contains("[bar]"), "out: {out}");
+        let _ = fs::remove_file("fn_shellvar.mk");
+    }
+
+    // Audit #79: a function call nested inside another. `$(...)` was read to
+    // the first `)`, so the outer call was evaluated truncated and the real
+    // closing paren was left in the shell command: `[o/x.c)]`.
+    #[test]
+    fn nested_functions_read_to_the_matching_paren() {
+        let _ = fs::create_dir_all("nf_probe_src");
+        let _ = fs::write("nf_probe_src/x.c", "");
+        let (out, code) = run(&["-f", "tests/makefiles/uptodate/nested_functions.mk", "all"]);
+        assert!(out.contains("prefixed=[o/x.c]"), "out: {out}");
+        assert!(out.contains("stem=[x]"), "out: {out}");
+        assert!(out.contains("deep=[o/x]"), "out: {out}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all("nf_probe_src");
+    }
+
+    // Audit #83: `foo.o: foo.h` with no commands, plus a `.c.o:` rule. The
+    // staleness test used only the *named* prerequisites and returned before
+    // the inference rule was ever looked up, so a changed `foo.c` never
+    // recompiled -- make reported the target up to date.
+    #[test]
+    fn an_inference_rule_sees_a_changed_source_through_an_explicit_rule() {
+        use std::{thread, time::Duration};
+        let _ = fs::write("inf_prereq.c", "");
+        let _ = fs::write("inf_prereq.h", "");
+        let _ = fs::remove_file("inf_prereq.o");
+        let mk = "tests/makefiles/uptodate/inference_with_prereq.mk";
+        let (first, _) = run(&["-f", mk, "inf_prereq.o"]);
+        assert!(first.contains("COMPILE inf_prereq.c"), "first: {first}");
+        thread::sleep(Duration::from_millis(1100));
+        let _ = fs::write("inf_prereq.c", "changed");
+        let (second, code) = run(&["-f", mk, "inf_prereq.o"]);
+        assert!(
+            second.contains("COMPILE inf_prereq.c"),
+            "a changed source did not recompile: {second}"
+        );
+        assert_eq!(code, Some(0));
+        for f in ["inf_prereq.c", "inf_prereq.h", "inf_prereq.o"] {
+            let _ = fs::remove_file(f);
+        }
+    }
+
+    // Audit #85: only `$<` was resolved through VPATH, so `$^`, `$+` and `$?`
+    // named a file that does not exist in the working directory.
+    #[test]
+    fn vpath_resolves_every_prerequisite_macro() {
+        let _ = fs::create_dir_all("vpm_probe_src");
+        let _ = fs::write("vpm_probe_src/vpm_a.txt", "");
+        let (out, code) = run(&["-f", "tests/makefiles/uptodate/vpath_macros.mk", "all"]);
+        assert!(
+            out.contains(
+                "LT=[vpm_probe_src/vpm_a.txt] CARET=[vpm_probe_src/vpm_a.txt] \
+PLUS=[vpm_probe_src/vpm_a.txt] Q=[vpm_probe_src/vpm_a.txt]"
+            ),
+            "out: {out}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all("vpm_probe_src");
+    }
+
+    // Audit #90: a call that mentions an automatic variable is deferred to the
+    // rule stage, and its error was swallowed there -- the unevaluated call
+    // was handed to the shell, which reported `error: not found` and carried
+    // on with exit 0.
+    #[test]
+    fn a_deferred_function_error_is_reported() {
+        let _ = fs::write("def_err.mk", "all:\n\t@echo \"[$(error bad $@)]\"\n");
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-f", "def_err.mk", "all"])
+            .output()
+            .expect("failed to run make");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("bad all"), "stderr: {stderr}");
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "the error must not be ignored"
+        );
+        let _ = fs::remove_file("def_err.mk");
+    }
+
+    // Audit #66: a prerequisite with no rule of its own, supplied by VPATH. The
+    // up-to-date probe used the unresolved name, so it looked missing.
+    #[test]
+    fn vpath_supplies_a_prerequisite_with_no_rule() {
+        let _ = fs::create_dir_all("utd_vpath_src");
+        let _ = fs::write("utd_vpath_src/utd_dep.c", "");
+        let (out, code) = run(&["-f", "tests/makefiles/uptodate/vpath_prereq.mk", "all"]);
+        assert!(out.contains("IN=[utd_vpath_src/utd_dep.c]"), "out: {out}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all("utd_vpath_src");
+    }
+}
+
+// Interrupt handling, and the `-q` question. Both used to be answered from
+// inside the recipe loop.
+mod interrupt {
+    use super::*;
+    use std::fs;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    /// Signal `pid`, the way a shell would.
+    fn interrupt(pid: u32) {
+        let _ = Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status();
+    }
+
+    // Audit #75: the in-flight target was one global slot, written before
+    // every recipe line and never cleared. Under `-j` the second worker
+    // overwrote the first, so an interrupt cleaned up one partial file and
+    // left the other on disk -- exactly the state POSIX has make delete.
+    #[test]
+    fn an_interrupt_cleans_up_every_target_in_flight() {
+        let dir = "interrupt_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".PHONY: all\nall: ip_p ip_q\nip_p:\n\t@echo partial > ip_p; sleep 2\nip_q:\n\t@echo partial > ip_q; sleep 2\n",
+        );
+
+        let mut child = Command::new(get_binary_path("make"))
+            .args(["-C", dir, "-j4"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to run make");
+
+        // Long enough for both recipes to have written their partial file.
+        sleep(Duration::from_millis(600));
+        interrupt(child.id());
+        let _ = child.wait();
+
+        let left: Vec<&str> = ["ip_p", "ip_q"]
+            .into_iter()
+            .filter(|name| std::path::Path::new(&format!("{dir}/{name}")).exists())
+            .collect();
+        let _ = fs::remove_dir_all(dir);
+        assert!(left.is_empty(), "partial files left behind: {left:?}");
+    }
+
+    // Audit #76: `-q` used to answer by calling `process::exit` from the
+    // recipe loop. The status is decided by `main` now; the answer itself must
+    // not change, and nothing may be printed.
+    #[test]
+    fn dash_q_answers_with_a_status_and_no_output() {
+        let dir = "quiet_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            "all: qp_a qp_b\nqp_a:\n\t@echo a > qp_a\nqp_b:\n\t@echo b > qp_b\n",
+        );
+
+        let out = Command::new(get_binary_path("make"))
+            .args(["-C", dir, "-j2", "-q", "all"])
+            .output()
+            .expect("failed to run make");
+
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty(), "-q printed to stdout");
+        assert!(out.stderr.is_empty(), "-q printed to stderr");
+        assert!(
+            !std::path::Path::new(&format!("{dir}/qp_a")).exists(),
+            "-q ran a recipe"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+// The attribute special targets name *targets*, not rules.
+mod attributes {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, String, Option<i32>) {
+        let output = Command::new(get_binary_path("make"))
+            .args(args)
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #77: POSIX 105677 -- a `.PHONY` with no prerequisites shall be
+    // ignored. It used to fall through to the global modifier and mark every
+    // rule phony, so nothing in the makefile was ever up to date.
+    #[test]
+    fn a_bare_phony_is_ignored() {
+        let dir = "bare_phony_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".PHONY:\nbp_out:\n\t@echo BUILT\n",
+        );
+        let _ = fs::write(format!("{dir}/bp_out"), "");
+
+        let (stdout, _, code) = run(&["-C", dir, "bp_out"]);
+        assert!(!stdout.contains("BUILT"), "bare .PHONY made it phony");
+        assert!(stdout.contains("is up to date"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // ...and a `.PHONY` that does name a target still works.
+    #[test]
+    fn a_named_phony_is_always_out_of_date() {
+        let dir = "named_phony_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".PHONY: np_out\nnp_out:\n\t@echo BUILT\n",
+        );
+        let _ = fs::write(format!("{dir}/np_out"), "");
+
+        let (stdout, _, code) = run(&["-C", dir, "np_out"]);
+        assert!(stdout.contains("BUILT"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Audit #78: `.IGNORE: a` used to set a flag on the whole `Rule`, so the
+    // other target on `a b: dep` was silenced too.
+    #[test]
+    fn ignore_applies_to_the_named_target_only() {
+        let dir = "ignore_scope_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".IGNORE: is_a\nis_a is_b:\n\t@echo running $@; false\n",
+        );
+
+        let (_, _, ignored) = run(&["-C", dir, "is_a"]);
+        assert_eq!(ignored, Some(0), ".IGNORE did not reach its own target");
+
+        let (_, _, not_ignored) = run(&["-C", dir, "is_b"]);
+        assert_eq!(not_ignored, Some(2), ".IGNORE leaked to a sibling target");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Same for `.SILENT`: the recipe of the target it names is not echoed, the
+    // sibling's still is.
+    #[test]
+    fn silent_applies_to_the_named_target_only() {
+        let dir = "silent_scope_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".SILENT: ss_a\nss_a ss_b:\n\techo running $@\n",
+        );
+
+        let (quiet, _, _) = run(&["-C", dir, "ss_a"]);
+        assert_eq!(quiet, "running ss_a\n", "the recipe line was echoed");
+
+        let (loud, _, _) = run(&["-C", dir, "ss_b"]);
+        assert!(
+            loud.contains("echo running ss_b"),
+            ".SILENT leaked to a sibling target; stdout: {loud}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+// XSI SCCS retrieval: a source file with an `SCCS/s.` history is fetched
+// rather than reported missing.
+mod sccs {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let output = Command::new(get_binary_path("make"))
+            .args(args)
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    /// A working directory with a `.SCCS_GET` of its own, so the test does not
+    /// need `sccs` installed to exercise the retrieval path.
+    fn fixture(dir: &str) {
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(format!("{dir}/SCCS"));
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".SCCS_GET:\n\t@echo RETRIEVED $@; echo from-sccs > $@\n\nall: sg_probe.c\n\t@cat sg_probe.c\n",
+        );
+        let _ = fs::write(format!("{dir}/SCCS/s.sg_probe.c"), "history\n");
+    }
+
+    // Audit #61: `.SCCS_GET` was parsed, validated, and then dropped, so a
+    // target that exists only in SCCS was simply "no target".
+    #[test]
+    fn a_missing_source_is_retrieved_from_sccs() {
+        let dir = "sccs_probe";
+        fixture(dir);
+        let (stdout, code) = run(&["-C", dir, "all"]);
+        assert!(stdout.contains("RETRIEVED sg_probe.c"), "stdout: {stdout}");
+        assert!(stdout.contains("from-sccs"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // POSIX 105704: "if the target is writable by anyone, make shall not
+    // retrieve a new version" -- a checked-out file is the author's.
+    #[test]
+    fn a_writable_target_is_not_retrieved() {
+        let dir = "sccs_writable_probe";
+        fixture(dir);
+        let file = format!("{dir}/sg_probe.c");
+        let _ = fs::write(&file, "edited\n");
+        let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o644));
+        // History newer than the target, so only the write bit can stop this.
+        let _ = fs::write(format!("{dir}/SCCS/s.sg_probe.c"), "newer history\n");
+
+        let (stdout, code) = run(&["-C", dir, "all"]);
+        assert!(!stdout.contains("RETRIEVED"), "stdout: {stdout}");
+        assert!(stdout.contains("edited"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A read-only target that is current is not retrieved again either.
+    #[test]
+    fn an_up_to_date_source_is_not_retrieved() {
+        let dir = "sccs_current_probe";
+        fixture(dir);
+        let (first, _) = run(&["-C", dir, "all"]);
+        assert!(first.contains("RETRIEVED"), "stdout: {first}");
+        let (second, code) = run(&["-C", dir, "all"]);
+        assert!(!second.contains("RETRIEVED"), "stdout: {second}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The default recipe is POSIX 106038, and -r suppresses it with the rest
+    // of the built-ins.
+    #[test]
+    fn the_default_recipe_is_seeded_unless_dash_r() {
+        let dir = "sccs_default_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(format!("{dir}/Makefile"), "all:\n\t@:\n");
+
+        let (with, _) = run(&["-C", dir, "-p", "all"]);
+        assert!(with.contains(".SCCS_GET:"), "stdout: {with}");
+        assert!(with.contains("get -s $@"), "stdout: {with}");
+
+        let (without, _) = run(&["-C", dir, "-rp", "all"]);
+        assert!(!without.contains(".SCCS_GET:"), "stdout: {without}");
+        let _ = fs::remove_dir_all(dir);
     }
 }

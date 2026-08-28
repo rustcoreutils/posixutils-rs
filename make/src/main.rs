@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use core::str::FromStr;
-use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -22,7 +20,6 @@ use posixutils_make::{
     config::Config,
     error_code::ErrorCode::{self, *},
     parser::{preprocessor::ENV_MACROS, Makefile},
-    rule::KEEP_GOING_ERROR,
     Make,
 };
 
@@ -140,8 +137,10 @@ struct Args {
     targets: Vec<OsString>,
 }
 
-fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
-    print!("{:?}", rules);
+/// Write the database `-p` asks for: POSIX 105395, "the complete set of macro
+/// definitions and target descriptions".
+fn print_database(make: &Make) {
+    print!("{}", make.database());
 }
 
 /// The `-k` "target could not be remade" diagnostic, routed through `gettext`
@@ -163,6 +162,32 @@ fn target_not_remade(target: &str) -> String {
 /// words containing `=` are macro operands; words already starting with `-` are
 /// passed verbatim. `MAKEFLAGS` is inherited by recipe sub-processes via the
 /// environment, so it propagates to sub-makes.
+/// Build the `MAKEFLAGS` value a sub-make should inherit.
+///
+/// POSIX 105866 requires make to pass its options down through `MAKEFLAGS`.
+/// Only options that make sense to inherit are forwarded; `-f`, `-C` and the
+/// target operands are specific to this invocation. The letters-only first word
+/// is the form POSIX describes and the form `args_with_makeflags` parses back.
+fn makeflags_for_children(config: &Config) -> String {
+    let mut letters = String::new();
+    for (flag, ch) in [
+        (config.ignore, 'i'),
+        (config.dry_run, 'n'),
+        (config.silent, 's'),
+        (config.quit, 'q'),
+        (config.keep_going, 'k'),
+        (config.terminate, 'S'),
+        (config.env_macros, 'e'),
+        (config.touch, 't'),
+        (config.clear, 'r'),
+    ] {
+        if flag {
+            letters.push(ch);
+        }
+    }
+    letters
+}
+
 fn args_with_makeflags() -> Vec<OsString> {
     let mut args: Vec<OsString> = env::args_os().collect();
     let Ok(flags) = env::var("MAKEFLAGS") else {
@@ -229,11 +254,20 @@ fn parse_makefile(paths: &[PathBuf], cmdline_macros: &[String]) -> Result<Makefi
         }
     }
 
-    for macro_def in cmdline_macros {
-        append_part(&mut contents, macro_def);
-    }
+    // Command-line macros are *seeded*, not appended: a rule header is expanded
+    // where it appears, so appending left `all: $(OBJ)` already expanded by the
+    // time the operand was read (audit #71).
+    let seeded: Vec<(String, String)> = cmdline_macros
+        .iter()
+        .filter_map(|def| def.split_once('='))
+        .map(|(name, value)| {
+            let name = name.trim_end_matches([':', '?', '+', '!']).trim();
+            (name.to_string(), value.to_string())
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
 
-    match Makefile::from_str(&contents) {
+    match Makefile::parse_with_macros(&contents, &seeded) {
         Ok(makefile) => Ok(makefile),
         Err(err) => Err(ErrorCode::ParserError { constraint: err }),
     }
@@ -296,11 +330,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if clear {
-        config.rules.clear();
         config.suffixes.clear();
     }
 
     ENV_MACROS.store(env_macros, Relaxed);
+
+    // POSIX 105866: make passes its options to sub-makes through MAKEFLAGS.
+    // Only the flags worth inheriting go in; -f, -C and the target operands
+    // belong to this invocation (audit #40).
+    let inherited = makeflags_for_children(&config);
+    if !inherited.is_empty() {
+        env::set_var("MAKEFLAGS", inherited);
+    }
 
     // Separate command-line `macro=value` operands from target operands
     // (POSIX SYNOPSIS allows them to be intermixed).
@@ -315,13 +356,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // POSIX 105866: "all of the make utility command line macro definitions
+    // (except the MAKEFLAGS macro or the SHELL macro) shall be added to the
+    // environment of make". Putting them there is also what makes them visible
+    // to recipes, since a macro is exported only if make already inherited its
+    // name -- the rule that keeps *makefile* macros from leaking (audit #50).
+    for definition in &cmdline_macros {
+        let Some((name, value)) = definition.split_once('=') else {
+            continue;
+        };
+        let name = name.trim_end_matches([':', '?', '+', '!']).trim();
+        if name.is_empty() || name == "MAKEFLAGS" || name == "SHELL" {
+            continue;
+        }
+        env::set_var(name, value);
+    }
+
     let parsed = match parse_makefile(&makefile, &cmdline_macros) {
         Ok(parsed) => parsed,
         Err(err) => {
-            // -p flag
+            // -p with no usable makefile still has a database to show: the
+            // built-in macros and inference rules. POSIX's own example is
+            // `make -p -f /dev/null`, which has no targets and so does not
+            // parse. Build an empty makefile to get the built-ins seeded.
             if print {
-                // If makefile is not provided or parsing failed, print the default rules
-                print_rules(&config.rules);
+                let empty = Make::try_from((Makefile::default(), config)).map_err(|err| {
+                    eprintln!("make: {err}");
+                    err
+                })?;
+                print_database(&empty);
                 return Ok(());
             } else {
                 eprintln!("make: {}", err);
@@ -335,10 +398,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(err.into());
     });
 
-    // -p flag
+    // -p: POSIX does not say this suppresses the build, unlike -q, so the
+    // dump is written and the targets are still made.
     if print {
-        // Call print for  global config rules
-        print_rules(&make.config.rules);
+        print_database(&make);
     }
 
     if targets.is_empty() {
@@ -356,17 +419,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut had_error = false;
     for target in targets {
-        let target = target.into_string().unwrap();
-        KEEP_GOING_ERROR.store(false, Relaxed);
+        // A target is a filename, so it need not be valid UTF-8. Diagnose it
+        // rather than panicking (audit #39); the rest of the crate is
+        // String-based, so a non-UTF-8 operand cannot be built, but it can at
+        // least be reported.
+        let target = match target.into_string() {
+            Ok(target) => target,
+            Err(raw) => {
+                eprintln!(
+                    "make: {}: {}",
+                    raw.to_string_lossy(),
+                    gettext("target name is not valid text")
+                );
+                had_error = true;
+                continue;
+            }
+        };
         match make.build_target(&target) {
+            // -q asks a question and prints nothing: the answer is the exit
+            // status. The build reports "not up to date" rather than calling
+            // `process::exit` from a worker thread (audit #76), so the choice
+            // of status lands here instead.
+            Err(NotUpToDateError { .. }) if quit => {
+                status_code = 1;
+                break;
+            }
+            Ok(_) if quit => {}
             Ok(updated) => {
-                // Under `-k` a failed recipe is reported and swallowed so the
-                // build can continue; the flag tells us this target could not
-                // actually be remade.
-                if KEEP_GOING_ERROR.load(Relaxed) {
-                    eprintln!("{}", target_not_remade(&target));
-                    had_error = true;
-                } else if !updated {
+                if !updated {
                     println!(
                         "{}: `{}` {}",
                         gettext("make"),

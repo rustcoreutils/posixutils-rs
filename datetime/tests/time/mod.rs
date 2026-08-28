@@ -169,7 +169,7 @@ fn reports_126_when_the_utility_cannot_be_invoked() {
 // its trailing operand list with `trailing_var_arg` but without
 // `allow_hyphen_values`, so clap tried to parse the utility's first hyphenated
 // argument as one of time's own and rejected it: `time ls -l` and
-// `time sh -c '...'` both failed. See `#C4` in `process/audit.md` — env, nice
+// `time sh -c '...'` both failed. See `#C4` in the process/ audit — env, nice
 // and timeout had the identical defect.
 #[test]
 fn utility_arguments_may_start_with_a_hyphen() {

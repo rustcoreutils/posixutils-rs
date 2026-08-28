@@ -18,17 +18,36 @@ use gettextrs::gettext;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     // Transparent
-    ExecutionError { exit_code: Option<i32> },
+    /// A recipe failed. The target is carried so the diagnostic can name
+    /// what did not build; `make: execution error: 1` alone left the user to
+    /// guess which of a `-k` build's targets it belonged to (audit #89).
+    ExecutionError {
+        target: String,
+        exit_code: Option<i32>,
+    },
     IoError(io::ErrorKind),
-    ParserError { constraint: ParseError },
+    ParserError {
+        constraint: ParseError,
+    },
 
     // Specific
     NoMakefile,
-    NotUpToDateError { target: String },
-    NoTarget { target: Option<String> },
-    NoRule { rule: String },
-    RecursivePrerequisite { origin: String },
-    SpecialTargetConstraintNotFulfilled { target: String, constraint: Error },
+    NotUpToDateError {
+        target: String,
+    },
+    NoTarget {
+        target: Option<String>,
+    },
+    NoRule {
+        rule: String,
+    },
+    RecursivePrerequisite {
+        origin: String,
+    },
+    SpecialTargetConstraintNotFulfilled {
+        target: String,
+        constraint: Error,
+    },
 }
 
 impl From<ErrorCode> for i32 {
@@ -64,18 +83,21 @@ impl fmt::Display for ErrorCode {
             NotUpToDateError { target } => {
                 write!(f, "{}: {}", target, gettext("target is not up to date"))
             }
-            ExecutionError { exit_code } => match exit_code {
-                Some(exit_code) => {
-                    write!(f, "{}: {}", gettext("execution error"), exit_code)
-                }
-                None => {
-                    write!(
-                        f,
-                        "{}: {}",
-                        gettext("execution error"),
-                        gettext("terminated by signal"),
-                    )
-                }
+            ExecutionError { target, exit_code } => match exit_code {
+                Some(exit_code) => write!(
+                    f,
+                    "[{}] {}: {}",
+                    target,
+                    gettext("execution error"),
+                    exit_code
+                ),
+                None => write!(
+                    f,
+                    "[{}] {}: {}",
+                    target,
+                    gettext("execution error"),
+                    gettext("terminated by signal"),
+                ),
             },
             IoError(err) => write!(f, "{}: {}", gettext("io error"), err),
             NoMakefile => write!(f, "{}", gettext("no makefile")),

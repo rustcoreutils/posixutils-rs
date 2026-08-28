@@ -8,9 +8,9 @@
 //
 
 use core::fmt;
-use std::collections::BTreeSet;
 
 use crate::{
+    attributes::Flags,
     error_code::ErrorCode,
     rule::{target::Target, Rule},
     Make,
@@ -154,23 +154,33 @@ impl TryFrom<Target> for SpecialTarget {
 impl TryFrom<(Target, Config)> for InferenceTarget {
     type Error = ParseError;
 
+    /// A dot-target is an inference rule only if it *parses* as `.s1` or
+    /// `.s1.s2` and its suffixes are known.
+    ///
+    /// The previous version asked whether the name merely started with a known
+    /// suffix, which filed `.config:` as an inference rule for `.c` and made a
+    /// bare `make` build the wrong target (audit #38). It also computed `from`
+    /// and `to` from the same expression, so both were the same string.
     fn try_from((target, config): (Target, Config)) -> Result<Self, Self::Error> {
-        let suffixes = &config.suffixes;
-        let source = target.to_string();
-
-        let from = suffixes
-            .iter()
-            .filter_map(|x| source.strip_prefix(x.as_str()))
-            .next()
-            .ok_or(ParseError)?
-            .to_string();
-        let to = suffixes
-            .iter()
-            .filter_map(|x| source.strip_prefix(x.as_str()))
-            .next()
-            .map(|x| x.to_string());
-
-        Ok(Self { from, to })
+        let Target::Inference { from, to, .. } = Target::new(target.to_string()) else {
+            return Err(ParseError);
+        };
+        let known = |suffix: &str| {
+            config
+                .suffixes
+                .iter()
+                .any(|s| s.trim_start_matches('.') == suffix)
+        };
+        if !known(&from) {
+            return Err(ParseError);
+        }
+        if to.is_empty() {
+            return Ok(Self { from, to: None });
+        }
+        if !known(&to) {
+            return Err(ParseError);
+        }
+        Ok(Self { from, to: Some(to) })
     }
 }
 
@@ -211,28 +221,25 @@ pub fn process(rule: Rule, make: &mut Make) -> Result<(), ErrorCode> {
 
 /// This impl block contains modifiers for special targets
 impl Processor<'_> {
-    /// - Additive: multiple special targets can be specified in the same makefile and the effects are
-    ///   cumulative.
-    fn additive(&mut self, f: impl FnMut(&mut Rule) + Clone) {
-        for prerequisite in self.rule.prerequisites() {
-            self.make
-                .rules
-                .iter_mut()
-                .chain(self.make.inference_rules.iter_mut())
-                .filter(|r| r.targets().any(|t| t.as_ref() == prerequisite.as_ref()))
-                .for_each(f.clone());
-        }
+    /// The targets this special target names.
+    ///
+    /// POSIX: "prerequisites of this special target are targets themselves".
+    fn named_targets(&self) -> Vec<String> {
+        self.rule
+            .prerequisites()
+            .map(|p| p.as_ref().to_string())
+            .collect()
     }
 
-    /// - Global: the special target applies to all rules in the makefile if no prerequisites are
-    ///   specified.
-    fn global(&mut self, f: impl FnMut(&mut Rule) + Clone) {
-        if self.rule.prerequisites().count() == 0 {
-            self.make
-                .rules
-                .iter_mut()
-                .chain(self.make.inference_rules.iter_mut())
-                .for_each(f);
+    /// Set an attribute on each named target.
+    ///
+    /// Per target, never per rule: one rule may name several targets, and
+    /// `.IGNORE: a` on `a b: dep` must leave `b` alone (audit #78). Marking a
+    /// name that has no rule at all is harmless -- an inference rule may
+    /// supply it later.
+    fn mark_each(&mut self, set: impl Fn(&mut Flags)) {
+        for target in self.named_targets() {
+            self.make.attributes.mark(&target, &set);
         }
     }
 }
@@ -283,22 +290,30 @@ impl Processor<'_> {
         Ok(())
     }
 
+    /// POSIX 105663: with no prerequisites, "make shall behave as if the -i
+    /// option had been specified" -- a global option, not an attribute on
+    /// every target.
     fn process_ignore(mut self) -> Result<(), Error> {
         self.without_recipes()?;
 
-        let what_to_do = |rule: &mut Rule| rule.config.ignore = true;
-        self.additive(what_to_do);
-        self.global(what_to_do);
+        if self.named_targets().is_empty() {
+            self.make.config.ignore = true;
+            return Ok(());
+        }
+        self.mark_each(|flags| flags.ignore = true);
 
         Ok(())
     }
 
+    /// Likewise `-s` for a `.SILENT` with no prerequisites.
     fn process_silent(mut self) -> Result<(), Error> {
         self.without_recipes()?;
 
-        let what_to_do = |rule: &mut Rule| rule.config.silent = true;
-        self.additive(what_to_do);
-        self.global(what_to_do);
+        if self.named_targets().is_empty() {
+            self.make.config.silent = true;
+            return Ok(());
+        }
+        self.mark_each(|flags| flags.silent = true);
 
         Ok(())
     }
@@ -322,52 +337,27 @@ impl Processor<'_> {
 
         Ok(())
     }
+    /// POSIX 105677: "a `.PHONY` special target with no prerequisites shall be
+    /// ignored". It used to fall through to the global modifier and mark every
+    /// rule phony, so nothing in the makefile was ever up to date (audit #77).
+    ///
+    /// Subsequent occurrences add to the list, which is inherent: each marks
+    /// the targets it names and nothing clears a flag.
     fn process_phony(mut self) -> Result<(), Error> {
-        // POSIX: subsequent occurrences add to the list, so extend rather than
-        // replace the stored set.
-        let names = self
-            .rule
-            .prerequisites()
-            .map(|suffix| suffix.as_ref().to_string());
-        self.make
-            .config
-            .rules
-            .entry(Phony.as_ref().to_string())
-            .or_default()
-            .extend(names);
-
-        let what_to_do = |rule: &mut Rule| rule.config.phony = true;
-        self.additive(what_to_do);
-        self.global(what_to_do);
+        self.mark_each(|flags| flags.phony = true);
 
         Ok(())
     }
 
+    /// POSIX 105689: with no prerequisites, "all targets in the makefile shall
+    /// be treated as if specified with `.PRECIOUS`", which is a global flag.
     fn process_precious(mut self) -> Result<(), Error> {
-        let precious_names: Vec<String> = self
-            .rule
-            .prerequisites()
-            .map(|val| val.as_ref().to_string())
-            .collect();
-
-        // POSIX: with no prerequisites, `.PRECIOUS` protects *all* targets, so
-        // set the global flag the signal handler consults.
-        if precious_names.is_empty() {
+        if self.named_targets().is_empty() {
             self.make.config.precious = true;
+            return Ok(());
         }
+        self.mark_each(|flags| flags.precious = true);
 
-        let what_to_do = |rule: &mut Rule| rule.config.precious = true;
-
-        self.additive(what_to_do);
-        self.global(what_to_do);
-
-        // POSIX: subsequent occurrences add to the list.
-        self.make
-            .config
-            .rules
-            .entry(Precious.as_ref().to_string())
-            .or_default()
-            .extend(precious_names);
         Ok(())
     }
     /// `.WAIT` as a target has no effect; it must have no prerequisites or
@@ -387,19 +377,16 @@ impl Processor<'_> {
         Ok(())
     }
 
+    /// `.SCCS_GET` names the recipe for retrieving a source file from SCCS.
+    ///
+    /// POSIX 106037 gives a default; a makefile's own commands replace it. The
+    /// recipe used to be accepted, validated and then dropped, so retrieval
+    /// never happened either way (audit #61).
     fn process_sccs_get(self) -> Result<(), Error> {
         self.without_prerequisites()?;
+        self.with_recipes()?;
 
-        let sccs_set = self
-            .rule
-            .recipes()
-            .map(|val| val.as_ref().to_string())
-            .collect::<BTreeSet<String>>();
-
-        self.make
-            .config
-            .rules
-            .insert(SccsGet.as_ref().to_string(), sccs_set);
+        self.make.sccs_get.replace(self.rule);
 
         Ok(())
     }

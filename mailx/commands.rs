@@ -19,6 +19,7 @@ use crate::mailbox::Mailbox;
 use crate::message::{author_filename, Disposition, ReadState};
 use crate::msglist::{msglist_or_current, parse_message, parse_msglist};
 use crate::send::{compose_reply, send_message, ComposedMessage};
+use crate::util::expand_local_prefixes;
 use crate::variables::{parse_set_arg, split_args, Variables};
 
 /// Result of executing a command
@@ -755,7 +756,7 @@ fn cmd_copy_author(
 
     if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
         let filename = author_filename(first_msg.from())?;
-        let filename = expand_filename(filename, vars);
+        let filename = expand_author_filename(filename, vars);
 
         mb.save_messages(&msg_nums, &filename, true)?;
 
@@ -888,11 +889,15 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     // Remember the folder we are leaving for a later `#`.
     let leaving = mb.path.clone();
 
-    // Open the new mailbox before flushing the old one. Flushing first left the
-    // session pointing at a mailbox that had already been written out whenever
-    // the new folder turned out to be unreadable.
-    let mut new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
+    // Check the new folder can be opened *before* flushing the old one, so a
+    // bad path does not leave the session pointing at a mailbox already written
+    // out. The load itself has to happen after the flush: reading it first
+    // would record a byte length taken before `quit` rewrote the file, and if
+    // the two are the same mailbox everything `quit` appended would then look
+    // like newly delivered mail and be copied through a second time.
+    fs::File::open(&path).map_err(|e| format!("{}: {}", path, e))?;
     mb.quit(vars)?;
+    let mut new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
     new_mb.prev_path = Some(leaving);
 
     *mb = new_mb;
@@ -929,7 +934,7 @@ fn cmd_followup(
 
     // Record to file named after first recipient
     let record_file = author_filename(original.from())?;
-    let record_file = expand_filename(record_file, vars);
+    let record_file = expand_author_filename(record_file, vars);
 
     // Enter input mode
     compose_body(&mut composed, Some(mb), vars)?;
@@ -1257,8 +1262,9 @@ pub(crate) fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult,
     }
 
     for arg in split_args(args) {
-        if let Some(name) = boolean_being_cleared(&arg) {
-            vars.unset(name);
+        if let Some(name) = variable_being_cleared(&arg, vars) {
+            let name = name.to_string();
+            vars.unset(&name);
             continue;
         }
         let (name, value) = parse_set_arg(&arg);
@@ -1276,17 +1282,20 @@ pub(crate) fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult,
     Ok(CommandResult::Continue)
 }
 
-/// The variable `arg` clears, if it is a `noname` form.
+/// The variable `arg` clears, if it is a `noname` form (spec 104963-104966).
 ///
-/// Only a `no` prefix on a name mailx actually knows as a boolean clears
-/// anything. Stripping `no` from every name that merely began with those two
-/// letters turned `set notify` into `unset tify`.
-fn boolean_being_cleared(arg: &str) -> Option<&str> {
+/// `no` is stripped when what follows names a variable that is currently set,
+/// or one of the internal booleans mailx knows about even when unset. Stripping
+/// it from any name merely beginning with those two letters turned `set notify`
+/// into `unset tify`; requiring the remainder to be a *known* boolean was the
+/// opposite mistake, and stopped `set nocrt` and every user-defined variable
+/// from being cleared at all.
+fn variable_being_cleared<'a>(arg: &'a str, vars: &Variables) -> Option<&'a str> {
     if arg.contains('=') {
         return None;
     }
     let rest = arg.strip_prefix("no")?;
-    BOOLEAN_VARIABLES.contains(&rest).then_some(rest)
+    (BOOLEAN_VARIABLES.contains(&rest) || vars.is_set(rest)).then_some(rest)
 }
 
 /// The internal variables that hold a boolean value (spec 104568-104681).
@@ -1573,33 +1582,19 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
 /// `my file.txt` silently became `myfile.txt`; a name the shell could not parse
 /// fell back to itself with no diagnostic.
 fn expand_filename(name: &str, vars: &Variables) -> String {
-    let name = name.trim();
-
-    let expanded = match name {
-        "%" => crate::util::spool_path(&crate::user_login_or_unknown()),
-        "&" => crate::util::mbox_path(vars),
-        _ => {
-            if let Some(user) = name.strip_prefix('%') {
-                crate::util::spool_path(user)
-            } else if let Some(rest) = name.strip_prefix('+') {
-                match vars.get("folder") {
-                    Some(folder) => {
-                        let folder = if folder.starts_with('/') {
-                            folder.to_string()
-                        } else {
-                            format!("{}/{}", crate::util::home(), folder)
-                        };
-                        format!("{}/{}", folder, rest)
-                    }
-                    None => name.to_string(),
-                }
-            } else {
-                name.to_string()
-            }
-        }
-    };
-
+    let expanded = expand_local_prefixes(name, vars);
     shell_expand(&expanded, vars).unwrap_or(expanded)
+}
+
+/// Resolve a filename derived from message content, without the shell.
+///
+/// `Save`, `Copy`, `followup`, and `Followup` name their file after the
+/// message author. That name is attacker-controlled, so it gets the `+folder`
+/// and `%`/`&` notations that are mailx's own, and stops there -- the shell
+/// word expansion POSIX applies to a *typed* filename (spec 104709) would make
+/// a `From:` header a command line.
+fn expand_author_filename(name: &str, vars: &Variables) -> String {
+    expand_local_prefixes(name, vars)
 }
 
 /// Apply shell word expansion to a filename, requiring a single result.
@@ -1608,6 +1603,10 @@ fn expand_filename(name: &str, vars: &Variables) -> String {
 /// expands to several pathnames can be recognized rather than silently
 /// concatenated. Returns `None` when the name is left as typed.
 fn shell_expand(name: &str, vars: &Variables) -> Option<String> {
+    // The word is interpolated into a shell command, so this must only ever be
+    // reached for a name the user typed. A filename derived from message
+    // content goes through `expand_author_filename`, which stops short of the
+    // shell.
     // Nothing to expand: no shell metacharacter, no `~`, no variable.
     if !name.contains(['~', '$', '*', '?', '[', '`', '"', '\'', '\\']) {
         return None;

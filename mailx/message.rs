@@ -321,17 +321,21 @@ pub fn extract_login(addr: &str) -> &str {
 
 /// The login name of a message's author, usable as a filename component.
 ///
-/// `Save`, `Copy`, `followup`, and `Followup` name a file after the author, and
-/// the value comes straight out of a header an attacker controls. Anything that
-/// would escape the intended directory is rejected rather than sanitized, since
-/// a silently rewritten name is a file the user did not ask for either.
+/// `Save`, `Copy`, `followup`, and `Followup` name a file after the author
+/// (spec 104958-104960), and the value comes straight out of a header the
+/// sender controls. It is checked against a conservative allow-list rather
+/// than a list of things to reject: a login is a login, and anything else --
+/// a path separator, a shell metacharacter, a leading `-` that would read as
+/// an option -- means the header is not naming one. Rejecting beats
+/// sanitizing, since a silently rewritten name is also a file the user did
+/// not ask for.
 pub fn author_filename(from: &str) -> Result<&str, String> {
     let login = extract_login(from).trim();
+    let acceptable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+');
     if login.is_empty()
-        || login.contains('/')
-        || login.contains('\0')
-        || login == "."
-        || login == ".."
+        || login.starts_with('-')
+        || login.starts_with('.')
+        || !login.chars().all(acceptable)
     {
         return Err(format!("{}: invalid author name", from));
     }

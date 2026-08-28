@@ -186,7 +186,14 @@ pub fn send_message(
         // The envelope is what the delivery software is handed; the headers are
         // what the recipients see. Blind recipients appear in the first and not
         // the second, so the two are reported separately.
-        eprintln!("Envelope: {}", msg.all_recipients().join(", "));
+        eprintln!(
+            "Envelope: {}",
+            msg.all_recipients()
+                .into_iter()
+                .map(crate::message::extract_address)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         eprintln!("To: {}", msg.to.join(", "));
         if !msg.cc.is_empty() {
             eprintln!("Cc: {}", msg.cc.join(", "));
@@ -217,7 +224,16 @@ pub fn send_message(
     // `Bcc:` header, so under `-t` the blind recipients were simply never
     // delivered to; naming them here also means a blind address cannot leak
     // into the delivered message however the mail system is configured.
-    let recipients = msg.all_recipients();
+    // Envelope operands are bare addresses. `compose_reply` fills the recipient
+    // lists from header values, so they carry display names -- and a display
+    // name containing a comma or a quote is not something to hand an MTA as a
+    // recipient.
+    let recipients: Vec<&str> = msg
+        .all_recipients()
+        .into_iter()
+        .map(crate::message::extract_address)
+        .filter(|a| !a.is_empty())
+        .collect();
     if recipients.is_empty() {
         return Err("No recipients specified".to_string());
     }

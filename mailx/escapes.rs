@@ -9,7 +9,6 @@
 
 //! Tilde escape handling for mailx input mode
 
-use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
@@ -370,22 +369,7 @@ fn expand_escapes(s: &str) -> String {
 /// `~w my file.txt` wrote to `myfile.txt`, `~w $(cmd)out` executed `cmd`, and a
 /// name the shell could not parse silently fell back to itself.
 fn expand_filename(name: &str, vars: &Variables) -> String {
-    let name = name.trim();
-
-    // Handle + prefix (folder variable) - this is mailx-specific, not shell
-    if let Some(rest) = name.strip_prefix('+') {
-        if let Some(folder) = vars.get("folder") {
-            let folder = if folder.starts_with('/') {
-                folder.to_string()
-            } else {
-                let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                format!("{}/{}", home, folder)
-            };
-            return format!("{}/{}", folder, rest);
-        }
-    }
-
-    name.to_string()
+    crate::util::expand_local_prefixes(name, vars)
 }
 
 fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<(), String> {

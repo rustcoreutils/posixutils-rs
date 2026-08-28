@@ -161,3 +161,43 @@ pub fn prompt_field(label: &str, current: &str) -> Result<Option<String>, String
 pub fn addresses(list: &str) -> impl Iterator<Item = &str> {
     list.split(',').map(str::trim).filter(|a| !a.is_empty())
 }
+
+/// Resolve the filename notations that are mailx's own, not the shell's.
+///
+/// `+folder` becomes the `folder` variable and a slash (spec 104705-104708);
+/// `%` is the system mailbox, `%user` that user's, `&` the secondary mbox; a
+/// leading `~` is the home directory. None of this involves the shell, so it is
+/// safe for a name that came from message content rather than from the user.
+/// `#` needs the previously opened folder and is resolved by `file`.
+pub fn expand_local_prefixes(name: &str, vars: &Variables) -> String {
+    let name = name.trim();
+
+    match name {
+        "%" => return spool_path(&crate::user_login_or_unknown()),
+        "&" => return mbox_path(vars),
+        _ => {}
+    }
+
+    if let Some(user) = name.strip_prefix('%') {
+        return spool_path(user);
+    }
+    if let Some(rest) = name.strip_prefix('+') {
+        if let Some(folder) = vars.get("folder") {
+            let folder = if folder.starts_with('/') {
+                folder.to_string()
+            } else {
+                format!("{}/{}", home(), folder)
+            };
+            return format!("{}/{}", folder, rest);
+        }
+        return name.to_string();
+    }
+    if name == "~" {
+        return home();
+    }
+    if let Some(rest) = name.strip_prefix("~/") {
+        return format!("{}/{}", home(), rest);
+    }
+
+    name.to_string()
+}

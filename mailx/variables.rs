@@ -114,6 +114,12 @@ impl Variables {
         self.booleans.get(name).copied().unwrap_or(false)
     }
 
+    /// Whether `name` currently has a value or a boolean setting.
+    pub fn is_set(&self, name: &str) -> bool {
+        let name = if name == "ask" { "asksub" } else { name };
+        self.values.contains_key(name) || self.booleans.contains_key(name)
+    }
+
     /// Unset a variable
     pub fn unset(&mut self, name: &str) {
         let name = if name == "ask" { "asksub" } else { name };

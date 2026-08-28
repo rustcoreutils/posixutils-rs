@@ -102,8 +102,12 @@ impl Mailbox {
                         // End of headers
                         in_headers = false;
                     } else if line.starts_with(' ') || line.starts_with('\t') {
-                        // Header continuation
-                        if header_continuation && !last_header_key.is_empty() {
+                        // Header continuation. Skipped entirely when the header
+                        // it continues was not retained.
+                        if !header_continuation {
+                            continue;
+                        }
+                        if !last_header_key.is_empty() {
                             if let Some(val) = msg.headers.get_mut(&last_header_key) {
                                 val.push(' ');
                                 val.push_str(line.trim());
@@ -131,7 +135,12 @@ impl Mailbox {
                             // Not retained in `header_lines`: the writer
                             // regenerates it from `read`, and keeping the loaded
                             // copy would emit a stale one beside the fresh one.
+                            // Its continuation lines go with it -- leaving the
+                            // previous header current would append them to
+                            // whatever came before `Status:`.
                             msg.headers.insert(key, value);
+                            last_header_key.clear();
+                            header_continuation = false;
                             continue;
                         }
 
@@ -169,7 +178,11 @@ impl Mailbox {
         // separator on write would then have doubled it, growing the mailbox by
         // a blank line every session.
         for msg in &mut mailbox.messages {
-            if msg.body.ends_with("\n\n") {
+            if msg.body == "\n" {
+                // A message with no body at all: the one line present is the
+                // framing blank, not content.
+                msg.body.clear();
+            } else if msg.body.ends_with("\n\n") {
                 msg.body.pop();
             }
         }
@@ -572,19 +585,31 @@ fn migrate_to_mbox(path: &str, messages: &[Message], append: bool) -> io::Result
 
 /// Append messages to a file named by `save`, `copy`, or the mbox default.
 ///
-/// The target may itself be a mailbox someone else is delivering to, so the
-/// append is taken under the same exclusive lock as a rewrite.
+/// The target is whatever the user named. It may be another mailbox someone is
+/// delivering to, so the append takes the same exclusive lock as a rewrite --
+/// but it may equally be `/dev/null`, a fifo, or a file open only for writing,
+/// none of which can be opened for reading, seeked, or synced. Those are not
+/// errors in the save; the durability the lock and the sync buy applies to the
+/// regular files where it means something.
 fn append_messages_to_file(
     path: &str,
     messages: &[Message],
     include_from_line: bool,
 ) -> io::Result<()> {
-    let mut file = open_locked(path)?;
-    file.seek(io::SeekFrom::End(0))?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    // Best effort: flock fails on some filesystems and object types.
+    // SAFETY: the fd is valid for the lifetime of `file`.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+
     {
         let mut w = io::BufWriter::new(&mut file);
         write_messages(&mut w, messages, include_from_line)?;
         w.flush()?;
     }
-    commit(file)
+    file.flush()?;
+    if file.metadata().is_ok_and(|m| m.is_file()) {
+        file.sync_all()?;
+    }
+    Ok(())
 }

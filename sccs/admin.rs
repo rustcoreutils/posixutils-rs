@@ -215,9 +215,19 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
         mr_numbers,
     } = params;
 
-    // Determine initial SID
+    // Determine initial SID. "The level number is optional, and defaults to 1"
+    // (POSIX 84017-84019): `-r2` names release 2, not the level-0 SID `2.0`,
+    // which is not a valid delta number at all and would poison every later
+    // get and delta on the file.
     let sid = match initial_sid {
-        Some(s) => parse_sid(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+        Some(s) => {
+            let mut sid =
+                parse_sid(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            if sid.lev == 0 {
+                sid.lev = 1;
+            }
+            sid
+        }
         None => Sid::trunk(1, 1),
     };
 

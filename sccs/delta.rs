@@ -22,7 +22,7 @@ use plib::sccsfile::{
     paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, PfileEntry, SccsDateTime, SccsFile,
     SccsFlag, Sid,
 };
-use posixutils_sccs::{diag, mrlist, operands, pfile, sfio, zlock};
+use posixutils_sccs::{diag, mrlist, operands, pfile, protect, sfio, zlock};
 
 /// True if standard input is a terminal.
 fn stdin_is_tty() -> bool {
@@ -580,6 +580,16 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // Parse SCCS file
     let mut sccs = SccsFile::from_path(sfile_path)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // The user list can be narrowed while an edit is outstanding, so the
+    // p-file lock taken by an earlier `get -e` is no evidence of present
+    // permission. Re-check before anything is written.
+    if let Err(refusal) =
+        protect::check_edit(&sccs, pfile_entry.new_sid.rel, &posixutils_sccs::username())
+    {
+        diag::error_path("delta", sfile_path, refusal.message());
+        return Ok(false);
+    }
 
     // Find the base delta
     let base_delta = sccs

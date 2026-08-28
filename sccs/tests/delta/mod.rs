@@ -1069,3 +1069,45 @@ fn delta_honors_and_records_the_pfile_include_list() {
         "the new delta must record the included serial"
     );
 }
+
+/// The authorized-user list is checked again when the delta is committed, not
+/// only when the edit starts.
+///
+/// The window is real: `admin -a` can narrow the list while an edit is
+/// outstanding, and the p-file lock taken earlier is no evidence of present
+/// permission. CSSC refuses here too, with the same message.
+#[test]
+fn delta_refuses_a_user_removed_from_the_authorized_list_mid_edit() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "revoked", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    // Start the edit while still permitted...
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+
+    // ...then hand the file to somebody else.
+    let out = super::common::run_in("admin", &["-asomeoneelse", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "admin -a: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("delta", &["-ynope", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "delta must re-check the user list; stdout {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not authorized"),
+        "got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Nothing was recorded: the trunk head is still 1.1.
+    let out = super::common::run_in("prs", &["-d:I:", "-r", &sfile_s], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1.1");
+}

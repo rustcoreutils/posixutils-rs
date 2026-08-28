@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid};
-use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, sfio, zlock};
+use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, protect, sfio, zlock};
 
 /// get - get a version of an SCCS file
 #[derive(Parser)]
@@ -564,13 +564,19 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     let sccs = SccsFile::from_path(sfile_path)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
+    // The `d` flag names "the default delta number (SID) to be used by a get
+    // command" (POSIX 84036), so it stands in for -r when -r is absent. An
+    // explicit -r still outranks it.
+    let default_sid = sccs.default_sid().map(|s| s.to_string());
+    let requested_sid: Option<&str> = args.sid.as_deref().or(default_sid.as_deref());
+
     // Find target delta. With -t, access the most recently created (top)
     // delta in the requested release (or overall when no -r is given).
     let target = if args.top {
-        find_top_delta(&sccs, args.sid.as_deref())
+        find_top_delta(&sccs, requested_sid)
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?
     } else {
-        find_target_delta(&sccs, args.sid.as_deref())
+        find_target_delta(&sccs, requested_sid)
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?
     };
 
@@ -585,6 +591,17 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // early-return (encoded) path below and is removed on every return.
     let _zlock;
     let new_sid = if args.edit {
+        // Ceiling, floor, locked releases and the authorized-user list are
+        // enforced here and not for a plain retrieval: POSIX 99077-99078
+        // attaches them to -e. Checked before the lock is taken so a refusal
+        // leaves no z-file and no p-file entry behind.
+        if let Err(refusal) =
+            protect::check_edit(&sccs, target_sid.rel, &posixutils_sccs::username())
+        {
+            diag::error_path("get", sfile_path, refusal.message());
+            return Ok(false);
+        }
+
         _zlock = match zlock::acquire(sfile_path) {
             Ok(z) => z,
             Err(e) if zlock::is_held(&e) => {
@@ -594,7 +611,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             Err(e) => return Err(e),
         };
 
-        let requested: Option<Sid> = args.sid.as_deref().and_then(|s| s.parse().ok());
+        let requested: Option<Sid> = requested_sid.and_then(|s| s.parse().ok());
         let new_sid = compute_new_sid(&sccs, target, args.branch, requested.as_ref());
 
         // Check for existing edit lock (unless joint edit is allowed)

@@ -28,6 +28,7 @@ pub mod idkw;
 pub mod mrlist;
 pub mod operands;
 pub mod pfile;
+pub mod protect;
 pub mod sfio;
 pub mod zlock;
 

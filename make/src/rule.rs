@@ -428,7 +428,15 @@ impl Rule {
                 if !silent {
                     println!("{} {target}", gettext("touch"));
                 }
-                let file = File::create(target.as_ref())?;
+                // Opened without `O_TRUNC`: `-t` marks a target up to date,
+                // it does not empty it. `File::create` truncates, so `make -t`
+                // destroyed the contents of every target it touched
+                // (audit #82).
+                let file = File::options()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(target.as_ref())?;
                 file.set_times(FileTimes::new().set_modified(SystemTime::now()))?;
                 return Ok(());
             }

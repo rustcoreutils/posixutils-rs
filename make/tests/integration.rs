@@ -1568,6 +1568,29 @@ mod execution {
         );
     }
 
+    // Audit #82: `-t` marks a target up to date; it does not empty it. The
+    // touch path opened the file with `File::create`, which truncates, so
+    // `make -t` destroyed the contents of every target it touched.
+    #[test]
+    fn touch_preserves_the_target_contents() {
+        use std::{thread, time::Duration};
+        let _ = fs::write("tch_out", "CONTENTS\n");
+        thread::sleep(Duration::from_millis(1100));
+        let _ = fs::write("tch_dep", "");
+        let _ = fs::write("tch.mk", "tch_out: tch_dep\n\t@echo rebuild\n");
+        let (stdout, _, code) = run(&["-f", "tch.mk", "-t", "tch_out"]);
+        assert!(stdout.contains("touch tch_out"), "stdout: {stdout}");
+        assert_eq!(
+            fs::read_to_string("tch_out").unwrap_or_default(),
+            "CONTENTS\n",
+            "-t truncated the target"
+        );
+        assert_eq!(code, Some(0));
+        for f in ["tch_out", "tch_dep", "tch.mk"] {
+            let _ = fs::remove_file(f);
+        }
+    }
+
     // Audit #39: a target is a filename and need not be valid UTF-8.
     #[test]
     fn a_non_utf8_target_is_diagnosed_not_a_panic() {

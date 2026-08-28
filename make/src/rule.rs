@@ -12,6 +12,7 @@ pub mod prerequisite;
 pub mod recipe;
 pub mod target;
 
+use crate::parser::preprocessor;
 use crate::{
     config::Config as GlobalConfig,
     error_code::ErrorCode::{self, *},
@@ -286,7 +287,8 @@ impl Rule {
                 // Expand `$@`, `$<`, `$*`, `$^`, `$+` and `$?` before the
                 // recipe is either shown or run, so the line printed under -n
                 // (or when not silent) is the line that executes.
-                let expanded = self.substitute_internal_macros(target, recipe, &inout, newer);
+                let expanded =
+                    self.substitute_internal_macros(target, recipe, &inout, newer, macros);
 
                 if !always_run {
                     // -n flag
@@ -439,6 +441,7 @@ impl Rule {
         recipe: &Recipe,
         files: &(PathBuf, PathBuf),
         newer: &[String],
+        macros: &[Macro],
     ) -> Recipe {
         const SIGILS: [char; 7] = ['@', '%', '?', '<', '*', '^', '+'];
         let recipe = recipe.inner();
@@ -484,12 +487,27 @@ impl Rule {
                         }
                         // The special `MAKE` macro expands to the make program.
                         _ if inner == "MAKE" => result.push_str(&make_program()),
-                        // Not an internal macro: re-emit verbatim.
+                        // Not an internal macro -- a deferred function call
+                        // such as `$(notdir $^)`. Re-emit it, but substitute
+                        // inside first: the automatic variables it reads are
+                        // exactly what this pass exists to supply, and leaving
+                        // them raw is what made `$(notdir $^)` operate on the
+                        // two characters `$^` (audit #62).
                         _ => {
-                            result.push('$');
-                            result.push(open);
-                            result.push_str(&inner);
-                            result.push(close);
+                            let inner = self.substitute_internal_macros(
+                                target,
+                                &Recipe::new(inner),
+                                files,
+                                newer,
+                                macros,
+                            );
+                            let call = format!("${open}{}{close}", inner.inner());
+                            // Evaluate just this call, not the whole line: a
+                            // line-wide pass would also eat a shell `$VAR`.
+                            match preprocessor::expand_recipe(&call, macros) {
+                                Ok(text) => result.push_str(&text),
+                                Err(_) => result.push_str(&call),
+                            }
                         }
                     }
                 }

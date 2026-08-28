@@ -282,6 +282,37 @@ fn read_balanced(
     Err(PreprocError::UnexpectedEOF)
 }
 
+/// The automatic variables, which only the rule stage can resolve.
+const AUTOMATIC: [char; 7] = ['@', '%', '?', '<', '*', '^', '+'];
+
+/// True if `text` mentions an automatic variable.
+///
+/// A function whose argument does cannot be evaluated while reading: `$^` is
+/// still literal here, so `$(notdir $^)` would apply `notdir` to the two
+/// characters `$^` and return them unchanged (audit #62). Such a call is left
+/// verbatim for the rule stage, which knows the target.
+fn mentions_automatic(text: &str) -> bool {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            continue;
+        }
+        match chars.peek() {
+            Some(&next) if AUTOMATIC.contains(&next) => return true,
+            // `$(@D)`, `${?F}` and friends.
+            Some(&('(' | '{')) => {
+                let mut rest = chars.clone();
+                rest.next();
+                if matches!(rest.peek(), Some(n) if AUTOMATIC.contains(n)) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Expand text on a function's behalf.
 fn expand_for_function(text: &str, ctx: &func::Ctx) -> std::result::Result<String, String> {
     expand_to_fixpoint(text, ctx.table, ctx.state).map_err(|e| e.to_string())
@@ -594,6 +625,17 @@ fn substitute(
                 if func::is_function(&macro_name) {
                     skip_blank(&mut letters);
                     let raw = read_balanced(&mut letters, open, close)?;
+                    // Defer the call if it reads an automatic variable; only
+                    // the rule stage can supply one (audit #62).
+                    if mentions_automatic(&raw) {
+                        result.push('$');
+                        result.push(open);
+                        result.push_str(&macro_name);
+                        result.push(' ');
+                        result.push_str(&raw);
+                        result.push(close);
+                        continue;
+                    }
                     let ctx = func::Ctx {
                         table,
                         env_wins: env_macros,
@@ -1144,6 +1186,14 @@ fn expand_command_lines(text: &str, table: &HashMap<String, String>) -> Result<S
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Expand a recipe line once the rule stage has substituted its automatic
+/// variables, so a function deferred by `mentions_automatic` finally runs.
+pub fn expand_recipe(text: &str, macros: &[Macro]) -> std::result::Result<String, String> {
+    let table: HashMap<String, String> = macros.iter().cloned().collect();
+    let state = func::Expansion::without_eval();
+    substitute_to_fixpoint(text, &table, &state).map_err(|e| e.to_string())
 }
 
 /// Resolve directives, includes and macros, returning the text the rule parser

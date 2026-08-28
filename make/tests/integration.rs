@@ -1754,6 +1754,41 @@ mod up_to_date {
         }
     }
 
+    // Audit #62: a function whose argument reads an automatic variable used to
+    // run while the makefile was being read, when `$^` was still the literal two
+    // characters -- so `$(notdir $^)` returned them unchanged. Such a call is
+    // now deferred to the rule stage, which knows the target.
+    #[test]
+    fn functions_see_automatic_variables() {
+        let _ = fs::create_dir_all("fn_probe_src");
+        let _ = fs::write("fn_probe_src/a.o", "");
+        let _ = fs::write("fn_probe_src/b.o", "");
+        let (out, code) = run(&[
+            "-f",
+            "tests/makefiles/uptodate/functions_on_automatic.mk",
+            "all",
+        ]);
+        assert!(out.contains("notdir=[a.o b.o]"), "out: {out}");
+        assert!(out.contains("dir=[fn_probe_src/]"), "out: {out}");
+        assert!(
+            out.contains("base=[fn_probe_src/a fn_probe_src/b]"),
+            "out: {out}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all("fn_probe_src");
+    }
+
+    // A shell variable reference in a recipe must survive: expanding the whole
+    // line again at rule time would turn `$MAKEFLAGS` into `$M` + `AKEFLAGS`,
+    // so only the deferred call itself is evaluated.
+    #[test]
+    fn a_shell_variable_in_a_recipe_survives() {
+        let _ = fs::write("fn_shellvar.mk", "all:\n\t@FOO=bar; echo \"[$$FOO]\"\n");
+        let (out, _) = run(&["-f", "fn_shellvar.mk", "all"]);
+        assert!(out.contains("[bar]"), "out: {out}");
+        let _ = fs::remove_file("fn_shellvar.mk");
+    }
+
     // Audit #66: a prerequisite with no rule of its own, supplied by VPATH. The
     // up-to-date probe used the unresolved name, so it looked missing.
     #[test]

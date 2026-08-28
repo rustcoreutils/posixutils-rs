@@ -273,15 +273,16 @@ wrong build.
   #43 exposed it. Either implement SCCS retrieval or reject the target, but do
   not keep accepting it silently.
 
-- [ ] **#62 — A function applied to an automatic variable sees its literal text.**
-  `$(notdir $^)` yields `src/a.o src/b.o` where GNU yields `a.o b.o`; `$(dir $^)`
-  yields `./`; `$(basename $<)` is a no-op. Recipe macro/function expansion runs
-  at read time (`expand_command_lines`), but automatic variables are substituted
-  at run time (`substitute_internal_macros`) — so a function only ever sees the
-  literal `$^`. The two phases cannot compose in that order. Fixing it means
-  expanding automatic variables *first* and running function expansion against
-  the result at run time, which needs the macro table available there.
-  Found by the corpus differential, not by the review.
+- [x] **#62 — A function applied to an automatic variable sees its literal text.**
+  ✓ fixed 2026-08-28. A call whose argument mentions `$@`/`$<`/`$^`/… is now left
+  verbatim while reading — only the rule stage can supply one — and evaluated
+  there, after the automatic variables have values. `substitute_internal_macros`
+  also had to stop re-emitting a bracketed non-internal form *verbatim*: it was
+  skipping the `$^` nested inside `$(notdir $^)`, which is the whole point of
+  that pass. Byte-identical to GNU on `notdir`, `dir` and `basename` over `$^`.
+  Tests `functions_see_automatic_variables`, `a_shell_variable_in_a_recipe_survives`.
+  _Only the deferred call is evaluated at rule time, not the whole line: a
+  line-wide pass turned a shell `$MAKEFLAGS` into `$M` followed by `AKEFLAGS`._
 
 ## Minor
 

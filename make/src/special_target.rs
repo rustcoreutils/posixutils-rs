@@ -379,12 +379,14 @@ impl Processor<'_> {
 
     /// `.SCCS_GET` names the recipe for retrieving a source file from SCCS.
     ///
-    /// Accepted and validated, but inert: this make performs no SCCS retrieval,
-    /// so there is nothing to run the recipe from. Recorded as audit #61 rather
-    /// than left looking implemented — its recipe used to be stored in the `-p`
-    /// mirror table and read by nothing, which made the gap invisible.
+    /// POSIX 106037 gives a default; a makefile's own commands replace it. The
+    /// recipe used to be accepted, validated and then dropped, so retrieval
+    /// never happened either way (audit #61).
     fn process_sccs_get(self) -> Result<(), Error> {
         self.without_prerequisites()?;
+        self.with_recipes()?;
+
+        self.make.sccs_get.replace(self.rule);
 
         Ok(())
     }

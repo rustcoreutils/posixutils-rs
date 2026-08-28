@@ -2131,3 +2131,97 @@ mod attributes {
         let _ = fs::remove_dir_all(dir);
     }
 }
+
+// XSI SCCS retrieval: a source file with an `SCCS/s.` history is fetched
+// rather than reported missing.
+mod sccs {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let output = Command::new(get_binary_path("make"))
+            .args(args)
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    /// A working directory with a `.SCCS_GET` of its own, so the test does not
+    /// need `sccs` installed to exercise the retrieval path.
+    fn fixture(dir: &str) {
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(format!("{dir}/SCCS"));
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".SCCS_GET:\n\t@echo RETRIEVED $@; echo from-sccs > $@\n\nall: sg_probe.c\n\t@cat sg_probe.c\n",
+        );
+        let _ = fs::write(format!("{dir}/SCCS/s.sg_probe.c"), "history\n");
+    }
+
+    // Audit #61: `.SCCS_GET` was parsed, validated, and then dropped, so a
+    // target that exists only in SCCS was simply "no target".
+    #[test]
+    fn a_missing_source_is_retrieved_from_sccs() {
+        let dir = "sccs_probe";
+        fixture(dir);
+        let (stdout, code) = run(&["-C", dir, "all"]);
+        assert!(stdout.contains("RETRIEVED sg_probe.c"), "stdout: {stdout}");
+        assert!(stdout.contains("from-sccs"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // POSIX 105704: "if the target is writable by anyone, make shall not
+    // retrieve a new version" -- a checked-out file is the author's.
+    #[test]
+    fn a_writable_target_is_not_retrieved() {
+        let dir = "sccs_writable_probe";
+        fixture(dir);
+        let file = format!("{dir}/sg_probe.c");
+        let _ = fs::write(&file, "edited\n");
+        let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o644));
+        // History newer than the target, so only the write bit can stop this.
+        let _ = fs::write(format!("{dir}/SCCS/s.sg_probe.c"), "newer history\n");
+
+        let (stdout, code) = run(&["-C", dir, "all"]);
+        assert!(!stdout.contains("RETRIEVED"), "stdout: {stdout}");
+        assert!(stdout.contains("edited"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A read-only target that is current is not retrieved again either.
+    #[test]
+    fn an_up_to_date_source_is_not_retrieved() {
+        let dir = "sccs_current_probe";
+        fixture(dir);
+        let (first, _) = run(&["-C", dir, "all"]);
+        assert!(first.contains("RETRIEVED"), "stdout: {first}");
+        let (second, code) = run(&["-C", dir, "all"]);
+        assert!(!second.contains("RETRIEVED"), "stdout: {second}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The default recipe is POSIX 106038, and -r suppresses it with the rest
+    // of the built-ins.
+    #[test]
+    fn the_default_recipe_is_seeded_unless_dash_r() {
+        let dir = "sccs_default_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(format!("{dir}/Makefile"), "all:\n\t@:\n");
+
+        let (with, _) = run(&["-C", dir, "-p", "all"]);
+        assert!(with.contains(".SCCS_GET:"), "stdout: {with}");
+        assert!(with.contains("get -s $@"), "stdout: {with}");
+
+        let (without, _) = run(&["-C", dir, "-rp", "all"]);
+        assert!(!without.contains(".SCCS_GET:"), "stdout: {without}");
+        let _ = fs::remove_dir_all(dir);
+    }
+}

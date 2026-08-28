@@ -266,12 +266,21 @@ wrong build.
   which is what `run_for_pattern` already did — so that near-duplicate collapses
   into it. Found while checking #52 against GNU.
 
-- [ ] **#61 — `.SCCS_GET` is accepted but inert.** The special target is parsed
-  and validated, but this make performs no SCCS retrieval, so nothing ever runs
-  its recipe. Until now the recipe was stored in the `-p` mirror table and read
-  by nothing, which made the gap look like a feature; deleting that table for
-  #43 exposed it. Either implement SCCS retrieval or reject the target, but do
-  not keep accepting it silently.
+- [x] **#61 — `.SCCS_GET` is accepted but inert.** ✓ fixed 2026-08-28.
+  Retrieval is implemented. A target with no rule of its own and an
+  `SCCS/s.<name>` beside it is fetched by running the `.SCCS_GET` recipe:
+  POSIX 105699 compares the two timestamps and retrieves when the target is
+  missing or older, and POSIX 105704 leaves a target alone if anyone may write
+  it — a checked-out file belongs to whoever checked it out. The makefile's own
+  `.SCCS_GET` replaces the built-in default (`sccs $(SCCSFLAGS) get
+  $(SCCSGETFLAGS) $@`, POSIX 106038), which `-r` suppresses along with the rest
+  of the built-ins; `GET`, `GFLAGS`, `SCCSFLAGS` and `SCCSGETFLAGS` join the
+  default macros. `sccs` is taken from `PATH`, which is what the spec's own
+  default rule names. Tests `a_missing_source_is_retrieved_from_sccs`,
+  `a_writable_target_is_not_retrieved`, `an_up_to_date_source_is_not_retrieved`,
+  `the_default_recipe_is_seeded_unless_dash_r`.
+  _Not implemented: the XSI `~` suffix rules (`.c~.o` and friends), which are a
+  separate mechanism for building directly from an SCCS file._
 
 - [x] **#62 — A function applied to an automatic variable sees its literal text.**
   ✓ fixed 2026-08-28. A call whose argument mentions `$@`/`$<`/`$^`/… is now left

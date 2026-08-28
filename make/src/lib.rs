@@ -16,6 +16,7 @@ pub mod rule;
 pub mod signal_handler;
 pub mod special_target;
 
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::{self},
     time::{Duration, SystemTime},
@@ -84,6 +85,9 @@ pub struct Make {
     /// Inference rules (e.g. `.c.o:`, `.txt.out:`).
     inference_rules: Vec<Rule>,
     default_rule: Option<Rule>, // .DEFAULT
+    /// The recipe that retrieves a source file from SCCS. Built-in unless the
+    /// makefile supplies its own `.SCCS_GET`.
+    sccs_get: Option<Rule>,
     /// Token pool bounding concurrent target updates under `-j` (maxjobs - 1
     /// tokens; the inline build needs no token).
     pool: TokenPool,
@@ -160,6 +164,7 @@ impl Make {
         self.write_section(&mut out, "rules", self.rules.iter());
         self.write_section(&mut out, "inference rules", self.inference_rules.iter());
         self.write_section(&mut out, "default rule", self.default_rule.iter());
+        self.write_section(&mut out, "sccs get", self.sccs_get.iter());
         self.write_vpaths(&mut out);
         out
     }
@@ -411,6 +416,12 @@ impl Make {
                             Dispatch::Inference,
                         );
                     }
+                    // XSI: a source file with an SCCS history is retrieved
+                    // rather than declared missing, and a stale one is
+                    // refreshed before it is called up to date (audit #61).
+                    if self.retrieve_from_sccs(name.as_ref())? {
+                        return Ok(true);
+                    }
                     // Per POSIX: "If a target exists and there is neither a target rule
                     // nor an inference rule for the target, the target shall be considered
                     // up-to-date."  Resolved through VPATH: a file supplied by a
@@ -541,7 +552,7 @@ impl Make {
     /// Register the built-in inference rules, expanded against the macros in
     /// force, skipping any the makefile already defines.
     fn seed_builtin_rules(&mut self) -> Result<(), ErrorCode> {
-        let text = expand_builtin_rules(&self.macros)?;
+        let text = expand_rules(BUILTIN_RULES, &self.macros)?;
         let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
         for parsed_rule in parsed.rules() {
             let rule = Rule::from(parsed_rule.clone());
@@ -556,6 +567,37 @@ impl Make {
                 self.inference_rules.push(rule);
             }
         }
+        Ok(())
+    }
+
+    /// Retrieve `name` from SCCS if it has a history file and needs one.
+    ///
+    /// POSIX 105699: an `SCCS/s.name` beside a target makes make compare the
+    /// two timestamps and run the `.SCCS_GET` commands when the target is
+    /// missing or older. Returns whether anything was retrieved.
+    fn retrieve_from_sccs(&self, name: &str) -> Result<bool, ErrorCode> {
+        let Some(rule) = self.sccs_get.as_ref() else {
+            return Ok(false);
+        };
+        let Some(history) = sccs_history(name) else {
+            return Ok(false);
+        };
+        if !needs_sccs_get(name, &history) {
+            return Ok(false);
+        }
+        let target = Target::new(name);
+        self.with_env(|env| rule.run(env, &target, false, &[]))?;
+        Ok(true)
+    }
+
+    /// Register the built-in `.SCCS_GET` recipe, unless the makefile gave one.
+    fn seed_sccs_get(&mut self) -> Result<(), ErrorCode> {
+        if self.sccs_get.is_some() {
+            return Ok(());
+        }
+        let text = expand_rules(SCCS_GET_RULE, &self.macros)?;
+        let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
+        self.sccs_get = parsed.rules().next().map(|r| Rule::from(r.clone()));
         Ok(())
     }
 
@@ -760,9 +802,14 @@ const BUILTIN_RULES: &str = r#"
 	rm -f $*.o
 "#;
 
+/// The default `.SCCS_GET` recipe (POSIX 106038). `sccs` is taken from `PATH`,
+/// which is what the spec's own default rule names; this repo's `sccs/` build
+/// serves if it is installed there.
+const SCCS_GET_RULE: &str = ".SCCS_GET:\n\tsccs $(SCCSFLAGS) get $(SCCSGETFLAGS) $@\n";
+
 /// The macros those rules refer to. A makefile definition overrides them, so
 /// they are seeded first and only kept where the makefile is silent.
-const BUILTIN_MACROS: [(&str, &str); 8] = [
+const BUILTIN_MACROS: [(&str, &str); 12] = [
     ("CC", "c17"),
     ("CFLAGS", "-O 1"),
     ("AR", "ar"),
@@ -771,6 +818,10 @@ const BUILTIN_MACROS: [(&str, &str); 8] = [
     ("YFLAGS", ""),
     ("LEX", "lex"),
     ("LFLAGS", ""),
+    ("GET", "get"),
+    ("GFLAGS", ""),
+    ("SCCSFLAGS", ""),
+    ("SCCSGETFLAGS", "-s"),
 ];
 
 impl TryFrom<(Makefile, Config)> for Make {
@@ -809,6 +860,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             inference_rules: vec![],
             macros,
             default_rule: None,
+            sccs_get: None,
             pool,
             ledger: graph::Ledger::new(),
             vpaths,
@@ -868,6 +920,7 @@ impl TryFrom<(Makefile, Config)> for Make {
         // the makefile is found first.
         if !make.config.clear {
             make.seed_builtin_rules()?;
+            make.seed_sccs_get()?;
         }
 
         Ok(make)
@@ -882,9 +935,9 @@ impl TryFrom<(Makefile, Config)> for Make {
 /// containing a newline -- every `define` body -- made the whole thing fail to
 /// parse, and an `if let Ok` swallowed the error. Every built-in rule
 /// disappeared without a word (audit #67).
-fn expand_builtin_rules(macros: &[Macro]) -> Result<String, ErrorCode> {
-    let mut out = String::with_capacity(BUILTIN_RULES.len());
-    for line in BUILTIN_RULES.lines() {
+fn expand_rules(text: &str, macros: &[Macro]) -> Result<String, ErrorCode> {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
         match line.strip_prefix('\t') {
             Some(body) => {
                 out.push('\t');
@@ -903,6 +956,37 @@ fn expand_builtin_recipe(line: &str, macros: &[Macro]) -> Result<String, ErrorCo
     preprocessor::expand_recipe(line, macros).map_err(|message| ParserError {
         constraint: parser::ParseError(vec![message]),
     })
+}
+
+/// The SCCS history file for `name`, if there is one.
+///
+/// POSIX names it `SCCS/s.source_file`, beside the target rather than beside
+/// the makefile, so a target with a directory part looks in that directory.
+fn sccs_history(name: &str) -> Option<String> {
+    let (dir, file) = match name.rfind('/') {
+        Some(at) => (&name[..=at], &name[at + 1..]),
+        None => ("", name),
+    };
+    let path = format!("{dir}SCCS/s.{file}");
+    fs::metadata(&path).is_ok().then_some(path)
+}
+
+/// Whether `target` should be retrieved from its SCCS history.
+///
+/// POSIX 105701: retrieve when the target is missing or the history is newer.
+/// POSIX 105704: "if the target is writable by anyone, make shall not retrieve
+/// a new version" -- a checked-out, editable file is left as it is.
+fn needs_sccs_get(target: &str, history: &str) -> bool {
+    let Ok(metadata) = fs::metadata(target) else {
+        return true;
+    };
+    if metadata.permissions().mode() & 0o222 != 0 {
+        return false;
+    }
+    match (get_modified_time(history), get_modified_time(target)) {
+        (Some(history), Some(target)) => history > target,
+        _ => true,
+    }
 }
 
 /// Retrieves the modified time of the file at the given path.

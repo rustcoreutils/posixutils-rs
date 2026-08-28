@@ -265,12 +265,16 @@ pub fn send_message(
     // Debug mode - don't actually send, just print diagnostics
     if vars.get_bool("debug") {
         eprintln!("--- Debug mode: message not sent ---");
+        // The envelope is what the delivery software is handed; the headers are
+        // what the recipients see. Blind recipients appear in the first and not
+        // the second, so the two are reported separately.
+        eprintln!("Envelope: {}", msg.all_recipients().join(", "));
         eprintln!("To: {}", msg.to.join(", "));
         if !msg.cc.is_empty() {
             eprintln!("Cc: {}", msg.cc.join(", "));
         }
         if !msg.bcc.is_empty() {
-            eprintln!("Bcc: {}", msg.bcc.join(", "));
+            eprintln!("Bcc(envelope only): {}", msg.bcc.join(", "));
         }
         eprintln!("Subject: {}", msg.subject);
         eprintln!("Body: {} bytes", msg.body.len());
@@ -290,9 +294,20 @@ pub fn send_message(
         .find(|p| std::path::Path::new(p).exists())
         .ok_or("Cannot find sendmail")?;
 
+    // Name the recipients on the command line rather than asking sendmail to
+    // read them from the headers with `-t`. `format()` deliberately emits no
+    // `Bcc:` header, so under `-t` the blind recipients were simply never
+    // delivered to; naming them here also means a blind address cannot leak
+    // into the delivered message however the mail system is configured.
+    let recipients = msg.all_recipients();
+    if recipients.is_empty() {
+        return Err("No recipients specified".to_string());
+    }
+
     let mut cmd = Command::new(sendmail);
-    cmd.arg("-t") // Read recipients from headers
-        .arg("-oi") // Don't treat . as end of message
+    cmd.arg("-oi") // Don't treat . as end of message
+        .arg("--")
+        .args(&recipients)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -415,9 +430,8 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
             msg.add_to(original.from());
         }
 
-        // Add all To: recipients
-        // If metoo is not set, exclude ourselves and our alternates
-        let user = env::var("USER").unwrap_or_default();
+        // Add all To: recipients.  Unless metoo is set, the user's own login
+        // and any declared alternates come out of the list (spec 104926-104928).
         let include_self = vars.get_bool("metoo");
 
         for addr in original.to().split(',') {
@@ -425,10 +439,7 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
             if addr.is_empty() {
                 continue;
             }
-            // Skip self unless metoo is set
-            if !include_self
-                && (addr.to_lowercase().contains(&user.to_lowercase()) || vars.is_alternate(addr))
-            {
+            if !include_self && vars.is_me(addr) {
                 continue;
             }
             msg.add_to(addr);
@@ -441,11 +452,7 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
                 if addr.is_empty() {
                     continue;
                 }
-                // Skip self unless metoo is set
-                if !include_self
-                    && (addr.to_lowercase().contains(&user.to_lowercase())
-                        || vars.is_alternate(addr))
-                {
+                if !include_self && vars.is_me(addr) {
                     continue;
                 }
                 msg.add_cc(addr);

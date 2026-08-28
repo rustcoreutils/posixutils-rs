@@ -246,7 +246,6 @@ impl Mailbox {
     pub fn print_headers(&self, msg_nums: Option<&[usize]>, vars: &Variables) {
         let screen = vars.screen_lines().get();
         let show_to = vars.get_bool("showto");
-        let user = std::env::var("USER").unwrap_or_default();
 
         let nums: Vec<usize> = msg_nums
             .map(|n| n.to_vec())
@@ -258,7 +257,7 @@ impl Mailbox {
                 let state_char = msg.status_char();
 
                 // Decide whether to show To or From
-                let address_field = if show_to && msg.from().contains(&user) {
+                let address_field = if show_to && vars.is_me(msg.from()) {
                     format!("To {}", truncate_display(msg.to(), 18))
                 } else {
                     msg.short_from()

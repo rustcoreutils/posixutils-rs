@@ -385,7 +385,29 @@ fn get_mbox_path() -> String {
 }
 
 fn get_user() -> String {
-    env::var("USER")
-        .or_else(|_| env::var("LOGNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    user_login_or("unknown")
+}
+
+/// The login name of the user running mailx, or an empty string if unknown.
+///
+/// `USER` may be present but empty, which is not a login name; treat it the
+/// same as absent rather than letting "" stand in for the user's identity.
+pub fn user_login() -> String {
+    user_login_or("")
+}
+
+/// The login name, or `unknown` when the environment does not say.
+pub fn user_login_or_unknown() -> String {
+    user_login_or("unknown")
+}
+
+fn user_login_or(fallback: &str) -> String {
+    for var in ["USER", "LOGNAME"] {
+        if let Ok(v) = env::var(var) {
+            if !v.trim().is_empty() {
+                return v;
+            }
+        }
+    }
+    fallback.to_string()
 }

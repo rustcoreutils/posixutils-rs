@@ -3582,3 +3582,426 @@ fn author_derived_filename_rejects_path_traversal() {
     );
     let _ = std::fs::remove_file(probe);
 }
+
+// =============================================================================
+// Send path, filename handling, and argument quoting
+// =============================================================================
+
+/// Bcc recipients must actually be handed to the mail delivery software, and
+/// must not appear as a header in the delivered message.
+#[test]
+fn bcc_reaches_the_envelope_but_not_the_message() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from(
+                "set debug\nmail to@example.com\n~b blind@example.com\n~s subj\nbody\n.\nexit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let envelope = err
+                .lines()
+                .find(|l| l.starts_with("Envelope:"))
+                .unwrap_or_else(|| panic!("debug output has no envelope line: {}", err));
+            assert!(
+                envelope.contains("blind@example.com"),
+                "bcc recipient never reached the envelope: {}",
+                envelope
+            );
+            assert!(
+                !err.contains("\nBcc: "),
+                "the blind recipient leaked into the message headers: {}",
+                err
+            );
+        },
+    );
+}
+
+/// An empty `$USER` must not drop every recipient of a reply.
+///
+/// The self-exclusion compared with `contains`, so an empty login matched every
+/// address and `reply` silently addressed nobody but the sender.
+#[test]
+fn reply_with_empty_user_keeps_recipients() {
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         To: me@example.com, carol@example.com\n\
+         Cc: dave@example.com\n\
+         Subject: group thread\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set debug\nreply 1\nbody\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", ""), ("LOGNAME", "")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            for who in ["carol@example.com", "dave@example.com"] {
+                assert!(
+                    err.contains(who),
+                    "an empty $USER dropped {} from the reply: {}",
+                    who,
+                    err
+                );
+            }
+        },
+    );
+}
+
+/// A short login must not remove recipients merely because it is a substring.
+#[test]
+fn reply_self_exclusion_is_not_a_substring_match() {
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         To: ed@example.com, edward@example.com, ted@example.com\n\
+         Subject: group thread\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set debug\nreply 1\nbody\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", "ed"), ("LOGNAME", "ed")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            for who in ["edward@example.com", "ted@example.com"] {
+                assert!(
+                    err.contains(who),
+                    "login `ed` over-matched and dropped {}: {}",
+                    who,
+                    err
+                );
+            }
+        },
+    );
+}
+
+/// A hyphen inside an address is not a message range (spec 104533).
+#[test]
+fn hyphenated_address_is_not_a_range() {
+    let mbox = create_temp_mbox(
+        "From alpha@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alpha@example.com\n\
+         Subject: first message\n\
+         \n\
+         body one\n\
+         \n\
+         From beta@example.org Fri Nov 29 11:00:00 2024\n\
+         From: beta@example.org\n\
+         Subject: second message\n\
+         \n\
+         body two\n\
+         \n\
+         From alpha-zeta@example.net Fri Nov 29 12:00:00 2024\n\
+         From: alpha-zeta@example.net\n\
+         Subject: third message\n\
+         \n\
+         body three\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("from alpha-zeta\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("third message"),
+                "the hyphenated address did not match its own message: {}",
+                out
+            );
+            assert!(
+                !out.contains("first message") && !out.contains("second message"),
+                "`alpha-zeta` was parsed as the range alpha..zeta: {}",
+                out
+            );
+        },
+    );
+}
+
+/// `~|` must not deadlock when the filter writes more than a pipe buffer.
+///
+/// The body was written to the child's stdin in full before its output was
+/// read, so a filter producing more than one pipe buffer blocked writing while
+/// mailx blocked writing. This test runs mailx under its own watchdog rather
+/// than the shared harness, which has no timeout: a regression here hangs
+/// forever instead of failing.
+#[test]
+fn tilde_pipe_survives_large_output() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    // A body far larger than the 64 KiB pipe buffer, read from a file so it
+    // does not have to travel through stdin a kilobyte at a time.
+    let big = NamedTempFile::new().expect("big body file");
+    let big_path = big.path().to_str().unwrap().to_string();
+    let line = "the quick brown fox jumps over the lazy dog\n";
+    std::fs::write(&big_path, line.repeat(6000)).expect("write big body");
+
+    let mut child = Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-n", "-N", "-f", &mbox_path])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mailx");
+
+    let script = format!(
+        "set debug\nmail to@example.com\n~r {}\n~| cat\n~x\nexit\n",
+        big_path
+    );
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write script");
+
+    let (tx, rx) = mpsc::channel();
+    let handle = child.id();
+    std::thread::spawn(move || {
+        let status = child.wait_with_output();
+        let _ = tx.send(status);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Ok(output)) => {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "`~| cat` on a large body failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(Err(e)) => panic!("waiting for mailx failed: {}", e),
+        Err(_) => {
+            // SAFETY: `handle` is this child's pid; the process is still running
+            // because the wait has not completed, so the pid has not been reused.
+            unsafe { libc::kill(handle as libc::pid_t, libc::SIGKILL) };
+            panic!("`~| cat` deadlocked on a body larger than one pipe buffer");
+        }
+    }
+}
+
+/// `~w` names a pathname (spec 105094); it is not a shell word.
+#[test]
+fn tilde_w_does_not_run_the_shell() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let target = dir.path().join("my file.txt");
+    let probe = dir.path().join("PWNED");
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!(
+                "mail to@example.com\nbody text\n~w {}\n~w $(touch {})out.txt\n~x\nexit\n",
+                target.display(),
+                probe.display()
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            assert!(
+                target.exists(),
+                "~w did not write to the literal pathname, so the name was word-split"
+            );
+            assert!(
+                !probe.exists(),
+                "~w ran command substitution on the filename"
+            );
+        },
+    );
+}
+
+/// A `set` value may contain blanks when quoted (spec 104965, 104694-104699).
+#[test]
+fn set_value_may_contain_blanks() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set indentprefix=\"> \"\nset\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("indentprefix=\"> \""),
+                "a quoted set value lost its trailing blank: {}",
+                out
+            );
+            assert!(
+                !out.lines().any(|l| l.trim() == "\""),
+                "the set tokenizer produced a junk variable named `\"`: {}",
+                out
+            );
+        },
+    );
+}
+
+/// `set noX` unsets `X`, and must not strip `no` from an unrelated name.
+#[test]
+fn set_no_prefix_only_strips_a_known_boolean() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set notify\nset\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.lines().any(|l| l.trim() == "notify"),
+                "`set notify` was read as `set no tify`: {}",
+                out
+            );
+        },
+    );
+}
+
+/// Editor temporaries must live under `$TMPDIR` with a name nobody can predict.
+#[test]
+fn editor_temp_file_honors_tmpdir() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let log = dir.path().join("editor.log");
+    let editor = dir.path().join("fake-editor");
+    std::fs::write(
+        &editor,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\n", log.display()),
+    )
+    .expect("write fake editor");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake editor");
+    }
+
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+    let tmpdir = dir.path().to_str().unwrap().to_string();
+    let editor_path = editor.to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!("set EDITOR={}\nedit 1\nexit\n", editor_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("TMPDIR", &tmpdir)],
+        |_plan, _output| {
+            let logged = std::fs::read_to_string(&log).unwrap_or_default();
+            let path = logged.trim();
+            assert!(!path.is_empty(), "the editor was never invoked");
+            assert!(
+                path.starts_with(&tmpdir),
+                "the editor temporary ignored $TMPDIR: {}",
+                path
+            );
+            assert!(
+                !path.contains("mailx."),
+                "the editor temporary still uses a predictable name: {}",
+                path
+            );
+        },
+    );
+}

@@ -200,6 +200,33 @@ impl Variables {
             .iter()
             .any(|a| a.to_lowercase() == addr_lower)
     }
+
+    /// Whether `addr` names the user running mailx.
+    ///
+    /// This decides which recipients `reply` drops when `metoo` is unset, and
+    /// which messages `showto` displays by recipient. POSIX 104926 defines the
+    /// set as the user's login name plus the addresses declared with
+    /// `alternates`, compared case-insensitively (spec 104728).
+    ///
+    /// The comparison is on whole names, not substrings. It used to ask whether
+    /// the address *contained* the login, which made a short login like `ed`
+    /// match `edward@example.com` -- and made an empty `$USER` match every
+    /// address there is, so a reply-all silently addressed no one.
+    pub fn is_me(&self, addr: &str) -> bool {
+        let addr = crate::message::extract_address(addr).trim();
+        if addr.is_empty() {
+            return false;
+        }
+        if self.is_alternate(addr) {
+            return true;
+        }
+        let login = crate::user_login();
+        if login.is_empty() {
+            return false;
+        }
+        let local = addr.split('@').next().unwrap_or(addr);
+        addr.eq_ignore_ascii_case(&login) || local.eq_ignore_ascii_case(&login)
+    }
 }
 
 /// Parse a set command argument
@@ -207,10 +234,70 @@ pub fn parse_set_arg(arg: &str) -> (&str, Option<&str>) {
     if let Some(eq_pos) = arg.find('=') {
         let name = &arg[..eq_pos];
         let value = &arg[eq_pos + 1..];
-        // Remove quotes if present
-        let value = value.trim_matches('"').trim_matches('\'');
+        // Strip one balanced pair of surrounding quotes, not every quote at
+        // each end independently: `trim_matches` mangled `x=""quoted""` and
+        // `x='a"` alike.
+        let value = strip_one_quote_pair(value);
         (name, Some(value))
     } else {
         (arg, None)
     }
+}
+
+/// Remove one matched pair of surrounding quotes, if present.
+fn strip_one_quote_pair(s: &str) -> &str {
+    for q in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Split a command argument string into words, honoring POSIX quoting.
+///
+/// Per spec 104694-104703: an argument enclosed in a matched pair of double or
+/// single quotes keeps its whitespace and backslashes literally, each quote
+/// character is ordinary inside the other kind, and an unquoted backslash makes
+/// the next character literal. Splitting on bare whitespace instead meant no
+/// variable value could contain a blank -- `set prompt="mail > "` was simply
+/// unusable.
+pub fn split_args(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.push(c),
+            None if c == '\\' => {
+                started = true;
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            None if c == '"' || c == '\'' => {
+                started = true;
+                quote = Some(c);
+            }
+            None if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            None => {
+                started = true;
+                word.push(c);
+            }
+        }
+    }
+
+    if started {
+        words.push(word);
+    }
+    words
 }

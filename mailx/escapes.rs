@@ -426,6 +426,16 @@ fn expand_escapes(s: &str) -> String {
     s.replace("\\t", "\t").replace("\\n", "\n")
 }
 
+/// Resolve a filename named by a command escape.
+///
+/// A command escape names "the file named by the pathname file" (spec
+/// 105085, 105094) -- unlike a command-mode filename, which POSIX does put
+/// through shell word expansion (spec 104704-104711). The `+folder` prefix is
+/// still honored, since that is mailx's own notation rather than the shell's.
+///
+/// This used to run the name through `sh -c "printf '%s' <name>"` unquoted, so
+/// `~w my file.txt` wrote to `myfile.txt`, `~w $(cmd)out` executed `cmd`, and a
+/// name the shell could not parse silently fell back to itself.
 fn expand_filename(name: &str, vars: &Variables) -> String {
     let name = name.trim();
 
@@ -438,63 +448,30 @@ fn expand_filename(name: &str, vars: &Variables) -> String {
                 let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 format!("{}/{}", home, folder)
             };
-            let expanded_rest = shell_expand(rest, vars);
-            return format!("{}/{}", folder, expanded_rest);
+            return format!("{}/{}", folder, rest);
         }
     }
 
-    // Use shell for word expansion (POSIX wordexp semantics)
-    shell_expand(name, vars)
-}
-
-/// Perform shell word expansion on a string using /bin/sh
-/// This provides POSIX wordexp() semantics: tilde, parameter, command substitution, etc.
-fn shell_expand(s: &str, vars: &Variables) -> String {
-    if s.is_empty() {
-        return s.to_string();
-    }
-
-    // Shell out to get proper expansion
-    // Use printf %s to avoid issues with echo and backslashes
-    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
-
-    let output = Command::new(shell)
-        .arg("-c")
-        .arg("--")
-        .arg(format!("printf '%s' {}", s))
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
-        _ => {
-            // If shell expansion fails, return original string
-            s.to_string()
-        }
-    }
+    name.to_string()
 }
 
 fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<(), String> {
-    // Create temp file
-    let temp_path = format!("/tmp/mailx.{}", std::process::id());
+    // The temporary comes from `mkstemp` (`O_EXCL`, mode 0600, honoring
+    // `$TMPDIR`). The old `/tmp/mailx.<pid>` name was predictable and
+    // world-readable, and writing to it followed a symlink planted in advance.
+    let mut tmp = plib::tmp::NamedTempFile::new().map_err(|e| e.to_string())?;
+    tmp.as_file_mut()
+        .write_all(msg.format().as_bytes())
+        .map_err(|e| e.to_string())?;
+    tmp.as_file_mut().flush().map_err(|e| e.to_string())?;
 
-    // Write message to temp file
-    let content = msg.format();
-    fs::write(&temp_path, &content).map_err(|e| e.to_string())?;
-
-    // Run editor
     Command::new(editor)
-        .arg(&temp_path)
+        .arg(tmp.path())
         .status()
         .map_err(|e| e.to_string())?;
 
-    // Read back
-    let edited = fs::read_to_string(&temp_path).map_err(|e| e.to_string())?;
-
-    // Parse the edited content
+    let edited = fs::read_to_string(tmp.path()).map_err(|e| e.to_string())?;
     parse_edited_message(&edited, msg)?;
-
-    // Clean up
-    let _ = fs::remove_file(&temp_path);
 
     println!("(continue)");
     Ok(())
@@ -635,7 +612,7 @@ fn forward_messages(
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     for num in msg_nums {
@@ -663,7 +640,7 @@ fn insert_messages(
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     let indent = if with_indent {
@@ -706,16 +683,26 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
         .spawn()
         .map_err(|e| format!("Failed to execute command: {}", e))?;
 
-    {
-        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|e| format!("Failed to write to command: {}", e))?;
-    }
+    // Feed the body from a separate thread. Writing it all before reading the
+    // filter's output deadlocked as soon as that output exceeded one pipe
+    // buffer: the child blocked writing to a full stdout while we blocked
+    // writing to a full stdin.
+    let mut stdin = child.stdin.take().ok_or("Failed to open stdin")?;
+    let body = input.to_string();
+    let writer = std::thread::spawn(move || stdin.write_all(body.as_bytes()));
 
     let output = child
         .wait_with_output()
         .map_err(|e| format!("Failed to wait for command: {}", e))?;
+
+    match writer.join() {
+        Ok(Ok(())) => {}
+        // A filter that exits without reading its input (`~| head`) closes the
+        // pipe early; that is not an error in the message.
+        Ok(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {}
+        Ok(Err(e)) => return Err(format!("Failed to write to command: {}", e)),
+        Err(_) => return Err("Failed to write to command".to_string()),
+    }
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())

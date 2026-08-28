@@ -12,11 +12,19 @@
 
 use crate::mailbox::Mailbox;
 use crate::message::{extract_login, Disposition, ReadState};
+use crate::variables::Variables;
 
 /// Parse a message list specification and return matching message numbers
-/// If allnet is true, address matching compares only the login part (before @)
-pub fn parse_msglist(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec<usize>, String> {
-    parse_msglist_with_opts(spec, mb, for_undelete, false)
+///
+/// When the `allnet` variable is set, address matching compares only the login
+/// part before the `@` (spec 104575-104577).
+pub fn parse_msglist(
+    spec: &str,
+    mb: &Mailbox,
+    for_undelete: bool,
+    vars: &Variables,
+) -> Result<Vec<usize>, String> {
+    parse_msglist_with_opts(spec, mb, for_undelete, vars.get_bool("allnet"))
 }
 
 fn parse_msglist_with_opts(
@@ -70,12 +78,14 @@ fn parse_single_spec(
     for_undelete: bool,
     allnet: bool,
 ) -> Result<Vec<usize>, String> {
-    // Check for range (n-m)
+    // Check for range (n-m). A range is a pair of *message numbers*
+    // (spec 104533), so both halves must be numeric before the `-` is read as a
+    // separator. Treating any embedded hyphen as a range turned an ordinary
+    // address like `alpha-zeta@example.net` into the span between whatever its
+    // two halves happened to match.
     if let Some(dash_pos) = spec.find('-') {
-        if dash_pos > 0 && dash_pos < spec.len() - 1 {
-            let start_str = &spec[..dash_pos];
-            let end_str = &spec[dash_pos + 1..];
-
+        let (start_str, end_str) = (&spec[..dash_pos], &spec[dash_pos + 1..]);
+        if is_message_number(start_str) && is_message_number(end_str) {
             let start = parse_single_number(start_str, mb, for_undelete, allnet)?;
             let end = parse_single_number(end_str, mb, for_undelete, allnet)?;
 
@@ -83,7 +93,11 @@ fn parse_single_spec(
                 return Err("Invalid range".to_string());
             }
 
-            return Ok((start..=end).collect());
+            // Clamp to the mailbox. `for_undelete` skips the caller-side filter
+            // that would otherwise drop out-of-range numbers, so `undelete
+            // 1-9999` used to hand back 9999 entries.
+            let last = mb.message_count();
+            return Ok((start..=end.min(last)).collect());
         }
     }
 
@@ -248,6 +262,11 @@ fn parse_single_spec(
     }
 }
 
+/// Whether `s` can be one end of an `n-m` range.
+fn is_message_number(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
 fn parse_single_number(
     spec: &str,
     mb: &Mailbox,
@@ -261,8 +280,8 @@ fn parse_single_number(
 }
 
 /// Parse a message list and return just the first message
-pub fn parse_message(spec: &str, mb: &Mailbox) -> Result<usize, String> {
-    let list = parse_msglist(spec, mb, false)?;
+pub fn parse_message(spec: &str, mb: &Mailbox, vars: &Variables) -> Result<usize, String> {
+    let list = parse_msglist(spec, mb, false, vars)?;
     list.first()
         .copied()
         .ok_or_else(|| "No message".to_string())

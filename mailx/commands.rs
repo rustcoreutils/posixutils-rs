@@ -19,7 +19,7 @@ use crate::mailbox::Mailbox;
 use crate::message::{author_filename, Disposition, ReadState};
 use crate::msglist::{parse_message, parse_msglist};
 use crate::send::{compose_reply, send_message, ComposedMessage};
-use crate::variables::{parse_set_arg, Variables};
+use crate::variables::{parse_set_arg, split_args, Variables};
 
 /// Result of executing a command
 pub enum CommandResult {
@@ -163,8 +163,8 @@ pub fn execute_command(
         "hel" | "help" | "?" => cmd_help(),
 
         // Hold/Preserve
-        "ho" | "hol" | "hold" => cmd_hold(args, mb),
-        "pre" | "pres" | "prese" | "preser" | "preserv" | "preserve" => cmd_hold(args, mb),
+        "ho" | "hol" | "hold" => cmd_hold(args, mb, vars),
+        "pre" | "pres" | "prese" | "preser" | "preserv" | "preserve" => cmd_hold(args, mb, vars),
 
         // If/Else/Endif (for startup files)
         "i" | "if" => Ok(CommandResult::Continue), // Simplified - ignore conditionals
@@ -178,7 +178,7 @@ pub fn execute_command(
         "m" | "ma" | "mai" | "mail" => cmd_mail(args, mb, vars),
 
         // Mbox
-        "mb" | "mbo" | "mbox" => cmd_mbox(args, mb),
+        "mb" | "mbo" | "mbox" => cmd_mbox(args, mb, vars),
 
         // Next
         "n" | "ne" | "nex" | "next" => cmd_next(args, mb, vars),
@@ -229,7 +229,7 @@ pub fn execute_command(
         "sh" | "she" | "shel" | "shell" => cmd_shell_interactive(vars),
 
         // Size
-        "si" | "siz" | "size" => cmd_size(args, mb),
+        "si" | "siz" | "size" => cmd_size(args, mb, vars),
 
         // Source
         "so" | "sou" | "sour" | "sourc" | "source" => cmd_source(args, vars),
@@ -238,7 +238,7 @@ pub fn execute_command(
         "to" | "top" => cmd_top(args, mb, vars),
 
         // Touch
-        "tou" | "touc" | "touch" => cmd_touch(args, mb),
+        "tou" | "touc" | "touch" => cmd_touch(args, mb, vars),
 
         // Unalias
         "una" | "unal" | "unali" | "unalia" | "unalias" => cmd_unalias(args, vars),
@@ -434,7 +434,7 @@ fn cmd_copy(
     } else {
         let file = parts.last().unwrap();
         let msglist = parts[..parts.len() - 1].join(" ");
-        let nums = parse_msglist(&msglist, mb, false)?;
+        let nums = parse_msglist(&msglist, mb, false, vars)?;
         (nums, expand_filename(file, vars))
     };
 
@@ -471,7 +471,7 @@ fn cmd_copy_author(
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
@@ -500,7 +500,7 @@ fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandR
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     let max_deleted = msg_nums.iter().copied().max().unwrap_or(0);
@@ -581,22 +581,31 @@ fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     let editor = vars.get("EDITOR").unwrap_or("ed");
+    edit_messages(&msg_nums, mb, editor)
+}
 
-    for num in msg_nums {
+/// Run `editor` over each message in turn, on a private temporary copy.
+///
+/// The temporary comes from `mkstemp` (`O_EXCL`, mode 0600, honoring `$TMPDIR`)
+/// rather than a name built from the pid: `/tmp/mailx.<pid>.<n>` is predictable,
+/// world-readable, and `fs::write` follows a symlink planted there first.
+fn edit_messages(msg_nums: &[usize], mb: &Mailbox, editor: &str) -> Result<CommandResult, String> {
+    for &num in msg_nums {
         if let Some(msg) = mb.get(num) {
-            let temp_path = format!("/tmp/mailx.{}.{}", std::process::id(), num);
-            fs::write(&temp_path, msg.format_full()).map_err(|e| e.to_string())?;
+            let mut tmp = plib::tmp::NamedTempFile::new().map_err(|e| e.to_string())?;
+            tmp.as_file_mut()
+                .write_all(msg.format_full().as_bytes())
+                .map_err(|e| e.to_string())?;
+            tmp.as_file_mut().flush().map_err(|e| e.to_string())?;
 
             Command::new(editor)
-                .arg(&temp_path)
+                .arg(tmp.path())
                 .status()
                 .map_err(|e| e.to_string())?;
-
-            let _ = fs::remove_file(&temp_path);
         }
     }
 
@@ -663,7 +672,7 @@ fn cmd_followup(
     let msg_num = if args.is_empty() {
         mb.current
     } else {
-        parse_message(args, mb)?
+        parse_message(args, mb, vars)?
     };
 
     let original = mb.get(msg_num).ok_or("No message")?;
@@ -691,7 +700,7 @@ fn cmd_from(args: &str, mb: &Mailbox, vars: &Variables) -> Result<CommandResult,
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     mb.print_headers(Some(&msg_nums), vars);
@@ -700,7 +709,7 @@ fn cmd_from(args: &str, mb: &Mailbox, vars: &Variables) -> Result<CommandResult,
 
 fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
     if !args.is_empty() {
-        let msg_num = parse_message(args, mb)?;
+        let msg_num = parse_message(args, mb, vars)?;
         mb.current = msg_num;
     }
 
@@ -762,7 +771,7 @@ Commands:
     Ok(CommandResult::Continue)
 }
 
-fn cmd_hold(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+fn cmd_hold(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104831).
     if !mb.is_system_mailbox {
         return Err("hold: Allowed only in the system mailbox".to_string());
@@ -771,7 +780,7 @@ fn cmd_hold(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     for num in msg_nums {
@@ -828,7 +837,7 @@ fn cmd_mail(args: &str, mb: &Mailbox, vars: &mut Variables) -> Result<CommandRes
     Ok(CommandResult::Continue)
 }
 
-fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+fn cmd_mbox(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104853).
     if !mb.is_system_mailbox {
         return Err("mbox: Allowed only in the system mailbox".to_string());
@@ -837,7 +846,7 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     for num in msg_nums {
@@ -854,7 +863,7 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
 
 fn cmd_next(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
     if !args.is_empty() {
-        let msg_num = parse_message(args, mb)?;
+        let msg_num = parse_message(args, mb, vars)?;
         mb.current = msg_num;
     }
 
@@ -888,14 +897,14 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
 
         for i in 0..words.len() {
             let potential_msglist = words[..=i].join(" ");
-            if parse_msglist(&potential_msglist, mb, false).is_ok() {
+            if parse_msglist(&potential_msglist, mb, false, vars).is_ok() {
                 msglist_end = i + 1;
             }
         }
 
         if msglist_end == 0 || msglist_end >= words.len() {
             // All command or all msglist
-            if let Ok(nums) = parse_msglist(args, mb, false) {
+            if let Ok(nums) = parse_msglist(args, mb, false, vars) {
                 (
                     nums,
                     vars.get("cmd").ok_or("No command specified")?.to_string(),
@@ -906,7 +915,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
         } else {
             let msglist = words[..msglist_end].join(" ");
             let cmd = words[msglist_end..].join(" ");
-            let nums = parse_msglist(&msglist, mb, false)?;
+            let nums = parse_msglist(&msglist, mb, false, vars)?;
             (nums, cmd)
         }
     };
@@ -961,7 +970,7 @@ fn cmd_print(
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     let crt = vars.get_number("crt");
@@ -1028,7 +1037,7 @@ fn cmd_reply(
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     for &num in &msg_nums {
@@ -1094,7 +1103,7 @@ fn cmd_save(
         (vec![mb.current], mbox)
     } else if parts.len() == 1 {
         // Could be msglist or file
-        if let Ok(nums) = parse_msglist(parts[0], mb, false) {
+        if let Ok(nums) = parse_msglist(parts[0], mb, false, vars) {
             // It's a msglist, save to mbox
             let mbox = vars.get("MBOX").map(|s| s.to_string()).unwrap_or_else(|| {
                 let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -1108,7 +1117,7 @@ fn cmd_save(
     } else {
         let file = parts.last().unwrap();
         let msglist = parts[..parts.len() - 1].join(" ");
-        let nums = parse_msglist(&msglist, mb, false)?;
+        let nums = parse_msglist(&msglist, mb, false, vars)?;
         (nums, expand_filename(file, vars))
     };
 
@@ -1146,7 +1155,7 @@ fn cmd_save_author(
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
@@ -1184,32 +1193,75 @@ pub(crate) fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult,
         return Ok(CommandResult::Continue);
     }
 
-    for arg in args.split_whitespace() {
-        if arg.starts_with("no") && !arg.contains('=') {
-            vars.unset(&arg[2..]);
+    for arg in split_args(args) {
+        if let Some(name) = boolean_being_cleared(&arg) {
+            vars.unset(name);
+            continue;
+        }
+        let (name, value) = parse_set_arg(&arg);
+        // Reject onehop - we permanently operate in noonehop mode
+        if name == "onehop" {
+            return Err("onehop is not supported; operating in noonehop mode".to_string());
+        }
+        if let Some(val) = value {
+            vars.set(name, val);
         } else {
-            let (name, value) = parse_set_arg(arg);
-            // Reject onehop - we permanently operate in noonehop mode
-            if name == "onehop" {
-                return Err("onehop is not supported; operating in noonehop mode".to_string());
-            }
-            if let Some(val) = value {
-                vars.set(name, val);
-            } else {
-                vars.set_bool(name, true);
-            }
+            vars.set_bool(name, true);
         }
     }
 
     Ok(CommandResult::Continue)
 }
 
+/// The variable `arg` clears, if it is a `noname` form.
+///
+/// Only a `no` prefix on a name mailx actually knows as a boolean clears
+/// anything. Stripping `no` from every name that merely began with those two
+/// letters turned `set notify` into `unset tify`.
+fn boolean_being_cleared(arg: &str) -> Option<&str> {
+    if arg.contains('=') {
+        return None;
+    }
+    let rest = arg.strip_prefix("no")?;
+    BOOLEAN_VARIABLES.contains(&rest).then_some(rest)
+}
+
+/// The internal variables that hold a boolean value (spec 104568-104681).
+const BOOLEAN_VARIABLES: &[&str] = &[
+    "allnet",
+    "append",
+    "ask",
+    "askbcc",
+    "askcc",
+    "asksub",
+    "autoprint",
+    "bang",
+    "debug",
+    "dot",
+    "flipr",
+    "header",
+    "hold",
+    "ignore",
+    "ignoreeof",
+    "keep",
+    "keepsave",
+    "metoo",
+    "onehop",
+    "outfolder",
+    "page",
+    "quiet",
+    "save",
+    "sendwait",
+    "showto",
+    "verbose",
+];
+
 fn cmd_set_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for arg in args.split_whitespace() {
-        if arg.starts_with("no") && !arg.contains('=') {
-            vars.unset(&arg[2..]);
+    for arg in split_args(args) {
+        if let Some(name) = boolean_being_cleared(&arg) {
+            vars.unset(name);
         } else {
-            let (name, value) = parse_set_arg(arg);
+            let (name, value) = parse_set_arg(&arg);
             // Silently skip onehop - we permanently operate in noonehop mode
             if name == "onehop" {
                 continue;
@@ -1281,11 +1333,11 @@ fn cmd_shell_interactive(vars: &Variables) -> Result<CommandResult, String> {
     Ok(CommandResult::Continue)
 }
 
-fn cmd_size(args: &str, mb: &Mailbox) -> Result<CommandResult, String> {
+fn cmd_size(args: &str, mb: &Mailbox, vars: &Variables) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     for num in msg_nums {
@@ -1330,7 +1382,7 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResu
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     let toplines = vars.get_number("toplines").unwrap_or(5) as usize;
@@ -1366,7 +1418,7 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResu
     Ok(CommandResult::Continue)
 }
 
-fn cmd_touch(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+fn cmd_touch(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104853, touch grouping).
     if !mb.is_system_mailbox {
         return Err("touch: Allowed only in the system mailbox".to_string());
@@ -1375,7 +1427,7 @@ fn cmd_touch(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     for num in msg_nums {
@@ -1410,7 +1462,7 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<Comman
             return Err("No deleted messages".to_string());
         }
     } else {
-        parse_msglist(args, mb, true)?
+        parse_msglist(args, mb, true, vars)?
     };
 
     for num in &msg_nums {
@@ -1454,24 +1506,11 @@ fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandR
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
-        parse_msglist(args, mb, false)?
+        parse_msglist(args, mb, false, vars)?
     };
 
     let editor = vars.get("VISUAL").unwrap_or("vi");
-
-    for num in msg_nums {
-        if let Some(msg) = mb.get(num) {
-            let temp_path = format!("/tmp/mailx.{}.{}", std::process::id(), num);
-            fs::write(&temp_path, msg.format_full()).map_err(|e| e.to_string())?;
-
-            Command::new(editor)
-                .arg(&temp_path)
-                .status()
-                .map_err(|e| e.to_string())?;
-
-            let _ = fs::remove_file(&temp_path);
-        }
-    }
+    edit_messages(&msg_nums, mb, editor)?;
 
     Ok(CommandResult::Continue)
 }
@@ -1489,7 +1528,7 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRe
     } else {
         let file = parts.last().unwrap();
         let msglist = parts[..parts.len() - 1].join(" ");
-        let nums = parse_msglist(&msglist, mb, false)?;
+        let nums = parse_msglist(&msglist, mb, false, vars)?;
         (nums, expand_filename(file, vars))
     };
 

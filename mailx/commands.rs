@@ -623,11 +623,11 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     // Remember the folder we are leaving for a later `#`.
     let leaving = mb.path.clone();
 
-    // Save current mailbox first
-    mb.quit(vars)?;
-
-    // Open new mailbox
+    // Open the new mailbox before flushing the old one. Flushing first left the
+    // session pointing at a mailbox that had already been written out whenever
+    // the new folder turned out to be unreadable.
     let mut new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
+    mb.quit(vars)?;
     new_mb.prev_path = Some(leaving);
 
     *mb = new_mb;

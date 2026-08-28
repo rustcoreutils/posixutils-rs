@@ -112,7 +112,7 @@ pub fn handle_escape(
             // Execute mailx command
             // In input mode, only a subset of commands are valid
             if !args.is_empty() {
-                if let Err(e) = execute_input_mode_command(args, msg, mb, vars) {
+                if let Err(e) = execute_input_mode_command(args, vars) {
                     eprintln!("{}", e);
                 }
             }
@@ -736,47 +736,15 @@ fn pipe_output_through_pager(text: &str, pager: &str) {
 
 /// Execute a mailx command-level request from input mode (`~:` / `~_`).
 ///
-/// Per spec 105048-105049 this performs the command-level request; the valid
-/// subset here is the command-mode commands that do not require the message
-/// store. Commands are dispatched through the real interpreter functions so a
-/// `set` actually mutates `vars`.
-fn execute_input_mode_command(
-    line: &str,
-    _msg: &mut ComposedMessage,
-    _mb: Option<&Mailbox>,
-    vars: &mut Variables,
-) -> Result<(), String> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(());
-    }
-
-    // A leading `!` is a shell escape regardless of spacing.
-    if let Some(shell_cmd) = line.strip_prefix('!') {
-        run_shell_command(shell_cmd, vars)?;
-        println!("!");
-        return Ok(());
-    }
-
-    // Parse command and arguments
-    let (cmd, args) = if let Some(pos) = line.find(char::is_whitespace) {
-        (&line[..pos], line[pos..].trim())
-    } else {
-        (line, "")
-    };
-
-    match cmd.to_lowercase().as_str() {
-        "se" | "set" => crate::commands::cmd_set(args, vars).map(|_| ()),
-        "uns" | "unse" | "unset" => crate::commands::cmd_unset(args, vars).map(|_| ()),
-        "a" | "al" | "ali" | "alia" | "alias" | "g" | "gr" | "gro" | "grou" | "group" => {
-            crate::commands::cmd_alias(args, vars).map(|_| ())
-        }
-        "alt" | "alte" | "alter" | "altern" | "alterna" | "alternat" | "alternate"
-        | "alternates" => crate::commands::cmd_alternates(args, vars).map(|_| ()),
-        "ec" | "ech" | "echo" => {
-            println!("{}", args);
-            Ok(())
-        }
-        _ => Err(format!("{}: command not valid in input mode", cmd)),
-    }
+/// Per spec 105048-105049 this performs the command-level request. It goes
+/// through the one interpreter, which decides what is legal here from each
+/// command's context mask -- this used to be a third hand-written dispatcher
+/// with its own copy of the argument parser and its own `!` handling that,
+/// unlike the other two, did no bang expansion.
+fn execute_input_mode_command(line: &str, vars: &mut Variables) -> Result<(), String> {
+    // Input mode has no message store; commands needing one are excluded by
+    // their context mask, so this scratch mailbox is never read from.
+    let mut scratch = Mailbox::new(String::new());
+    crate::commands::execute_in(line, &mut scratch, vars, crate::commands::Context::Input)
+        .map(|_| ())
 }

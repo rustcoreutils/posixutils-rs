@@ -29,9 +29,15 @@ pub struct Variables {
     pub retained_headers: Vec<String>,
     /// Last shell command (for ! expansion with bang variable)
     pub last_shell_cmd: Option<String>,
-    /// Conditional (`if`/`else`/`endif`) nesting state for command mode:
+    /// Conditional (`if`/`else`/`endif`) nesting state:
     /// each entry is (this branch matches, currently in the else branch).
     pub cond_stack: Vec<(bool, bool)>,
+    /// Whether mailx was invoked in Send Mode.
+    ///
+    /// This is what `if s` and `if r` in a start-up file ask about. Receive
+    /// Mode is the only mode with a command loop, so the same rule serves both
+    /// the start-up files and the interactive interpreter.
+    pub send_mode: bool,
 }
 
 impl Variables {
@@ -45,6 +51,7 @@ impl Variables {
             retained_headers: Vec::new(),
             last_shell_cmd: None,
             cond_stack: Vec::new(),
+            send_mode: false,
         };
 
         // Set defaults per POSIX

@@ -28,309 +28,567 @@ pub enum CommandResult {
     Exit,
 }
 
+/// Where a command line came from, which decides what is legal there.
+///
+/// The three contexts used to be three separate interpreters -- command mode,
+/// start-up files, and `~:` from input mode -- each with its own abbreviation
+/// list, its own `!` handling, and its own idea of which commands existed. They
+/// drifted, so they are one interpreter and one table now, with the differences
+/// expressed as a mask on each command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Context {
+    /// The interactive command loop.
+    Command,
+    /// A start-up file or a file read by `source`.
+    Startup,
+    /// A `~:` or `~_` request from input mode.
+    Input,
+}
+
+impl Context {
+    fn bit(self) -> u8 {
+        match self {
+            Context::Command => CMD,
+            Context::Startup => RC,
+            Context::Input => INPUT,
+        }
+    }
+
+    fn where_invalid(self) -> &'static str {
+        match self {
+            Context::Command => "command not valid here",
+            Context::Startup => "command not valid in a start-up file",
+            Context::Input => "command not valid in input mode",
+        }
+    }
+}
+
+const CMD: u8 = 1 << 0;
+const RC: u8 = 1 << 1;
+const INPUT: u8 = 1 << 2;
+
+/// Legal everywhere: needs no message store and changes only settings.
+const ANY: u8 = CMD | RC | INPUT;
+/// Legal in command mode and start-up files, but not from input mode.
+const CMD_RC: u8 = CMD | RC;
+
+type Handler = fn(&str, &mut Mailbox, &mut Variables) -> Result<CommandResult, String>;
+
+/// One command: its full name, the shortest accepted abbreviation, where it is
+/// legal, and what runs it.
+struct Cmd {
+    /// The full command name, in the case POSIX spells it.
+    name: &'static str,
+    /// Length of the shortest accepted prefix (the part before `[` in the
+    /// POSIX synopsis).
+    min: usize,
+    /// Contexts this command may be used in.
+    ctx: u8,
+    run: Handler,
+}
+
+/// Every command, with the abbreviation rule POSIX states for it.
+///
+/// Matching is case-sensitive, which is the whole point: `Copy`, `Save`,
+/// `Print`, `Type`, `Reply`, and `Followup` are distinct commands from their
+/// lowercase forms (spec 104734-104742, 104949-104961, 104876, 104893-104902,
+/// 104803-104813). Dispatching on a lowercased command word made all six
+/// unreachable, and their handlers dead code.
+///
+/// The start-up exclusions are spec 104557-104559 exactly: `!`, `edit`, `hold`,
+/// `mail`, `preserve`, `reply`, `Reply`, `Save`, `shell`, `visual`, `Copy`,
+/// `followup`, and `Followup`. Note that lowercase `copy` and `save` are
+/// *legal* there; only the capitalized forms are not.
+const COMMANDS: &[Cmd] = &[
+    Cmd {
+        name: "alias",
+        min: 1,
+        ctx: ANY,
+        run: |a, _, v| cmd_alias(a, v),
+    },
+    Cmd {
+        name: "group",
+        min: 1,
+        ctx: ANY,
+        run: |a, _, v| cmd_alias(a, v),
+    },
+    Cmd {
+        name: "alternates",
+        min: 3,
+        ctx: ANY,
+        run: |a, _, v| cmd_alternates(a, v),
+    },
+    Cmd {
+        name: "echo",
+        min: 2,
+        ctx: ANY,
+        run: |a, _, _| {
+            println!("{}", a);
+            Ok(CommandResult::Continue)
+        },
+    },
+    Cmd {
+        name: "set",
+        min: 2,
+        ctx: ANY,
+        run: |a, _, v| cmd_set(a, v),
+    },
+    Cmd {
+        name: "unset",
+        min: 3,
+        ctx: ANY,
+        run: |a, _, v| cmd_unset(a, v),
+    },
+    Cmd {
+        name: "cd",
+        min: 2,
+        ctx: CMD_RC,
+        run: |a, _, _| cmd_cd(a),
+    },
+    Cmd {
+        name: "chdir",
+        min: 2,
+        ctx: CMD_RC,
+        run: |a, _, _| cmd_cd(a),
+    },
+    Cmd {
+        name: "copy",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_copy(a, m, v, false),
+    },
+    Cmd {
+        name: "Copy",
+        min: 1,
+        ctx: CMD,
+        run: |a, m, v| cmd_copy_author(a, m, v, false),
+    },
+    Cmd {
+        name: "delete",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_delete,
+    },
+    Cmd {
+        name: "discard",
+        min: 2,
+        ctx: CMD_RC,
+        run: |a, _, v| cmd_discard(a, v),
+    },
+    Cmd {
+        name: "ignore",
+        min: 2,
+        ctx: CMD_RC,
+        run: |a, _, v| cmd_discard(a, v),
+    },
+    Cmd {
+        name: "dp",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_dp,
+    },
+    Cmd {
+        name: "dt",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_dp,
+    },
+    Cmd {
+        name: "edit",
+        min: 1,
+        ctx: CMD,
+        run: cmd_edit,
+    },
+    Cmd {
+        name: "exit",
+        min: 2,
+        ctx: CMD_RC,
+        run: |_, _, _| Ok(CommandResult::Exit),
+    },
+    Cmd {
+        name: "xit",
+        min: 1,
+        ctx: CMD_RC,
+        run: |_, _, _| Ok(CommandResult::Exit),
+    },
+    Cmd {
+        name: "file",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_file,
+    },
+    Cmd {
+        name: "folder",
+        min: 4,
+        ctx: CMD_RC,
+        run: cmd_file,
+    },
+    Cmd {
+        name: "folders",
+        min: 7,
+        ctx: CMD_RC,
+        run: |_, _, v| cmd_folders(v),
+    },
+    Cmd {
+        name: "followup",
+        min: 2,
+        ctx: CMD,
+        run: |a, m, v| cmd_followup(a, m, v, false),
+    },
+    Cmd {
+        name: "Followup",
+        min: 2,
+        ctx: CMD,
+        run: |a, m, v| cmd_followup(a, m, v, true),
+    },
+    Cmd {
+        name: "from",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_from,
+    },
+    Cmd {
+        name: "headers",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_headers,
+    },
+    Cmd {
+        name: "help",
+        min: 3,
+        ctx: CMD_RC,
+        run: |_, _, _| cmd_help(),
+    },
+    Cmd {
+        name: "hold",
+        min: 2,
+        ctx: CMD,
+        run: cmd_hold,
+    },
+    Cmd {
+        name: "preserve",
+        min: 3,
+        ctx: CMD,
+        run: cmd_hold,
+    },
+    Cmd {
+        name: "list",
+        min: 1,
+        ctx: CMD_RC,
+        run: |_, _, _| cmd_list(),
+    },
+    Cmd {
+        name: "mail",
+        min: 1,
+        ctx: CMD,
+        run: cmd_mail,
+    },
+    Cmd {
+        name: "mbox",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_mbox,
+    },
+    Cmd {
+        name: "next",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_next,
+    },
+    Cmd {
+        name: "pipe",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_pipe,
+    },
+    Cmd {
+        name: "print",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_print(a, m, v, false),
+    },
+    Cmd {
+        name: "Print",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_print(a, m, v, true),
+    },
+    Cmd {
+        name: "type",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_print(a, m, v, false),
+    },
+    Cmd {
+        name: "Type",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_print(a, m, v, true),
+    },
+    Cmd {
+        name: "quit",
+        min: 1,
+        ctx: CMD_RC,
+        run: |_, _, _| Ok(CommandResult::Quit),
+    },
+    Cmd {
+        name: "reply",
+        min: 1,
+        ctx: CMD,
+        run: |a, m, v| cmd_reply_flipr(a, m, v, true),
+    },
+    Cmd {
+        name: "respond",
+        min: 3,
+        ctx: CMD,
+        run: |a, m, v| cmd_reply_flipr(a, m, v, true),
+    },
+    Cmd {
+        name: "Reply",
+        min: 1,
+        ctx: CMD,
+        run: |a, m, v| cmd_reply_flipr(a, m, v, false),
+    },
+    Cmd {
+        name: "Respond",
+        min: 3,
+        ctx: CMD,
+        run: |a, m, v| cmd_reply_flipr(a, m, v, false),
+    },
+    Cmd {
+        name: "retain",
+        min: 3,
+        ctx: CMD_RC,
+        run: |a, _, v| cmd_retain(a, v),
+    },
+    Cmd {
+        name: "save",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_save(a, m, v, true),
+    },
+    Cmd {
+        name: "Save",
+        min: 1,
+        ctx: CMD,
+        run: |a, m, v| cmd_copy_author(a, m, v, true),
+    },
+    Cmd {
+        name: "shell",
+        min: 2,
+        ctx: CMD,
+        run: |_, _, v| cmd_shell_interactive(v),
+    },
+    Cmd {
+        name: "size",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_size,
+    },
+    Cmd {
+        name: "source",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_source,
+    },
+    Cmd {
+        name: "top",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_top,
+    },
+    Cmd {
+        name: "touch",
+        min: 3,
+        ctx: CMD_RC,
+        run: cmd_touch,
+    },
+    Cmd {
+        name: "unalias",
+        min: 3,
+        ctx: CMD_RC,
+        run: |a, _, v| cmd_unalias(a, v),
+    },
+    Cmd {
+        name: "undelete",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_undelete,
+    },
+    Cmd {
+        name: "visual",
+        min: 1,
+        ctx: CMD,
+        run: cmd_visual,
+    },
+    Cmd {
+        name: "write",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_write,
+    },
+];
+
+/// Commands spelled with punctuation rather than a name.
+const PUNCTUATION: &[(&str, u8, Handler)] =
+    &[("?", CMD_RC, |_, _, _| cmd_help()), ("|", CMD_RC, cmd_pipe)];
+
+/// Find the command `word` names, if any.
+///
+/// A command may be entered as any prefix of its name at least `min` characters
+/// long (spec 104689-104693). The comparison is case-sensitive.
+fn lookup(word: &str, ctx: Context) -> Option<Result<&'static Cmd, String>> {
+    let cmd = COMMANDS
+        .iter()
+        .find(|c| word.len() >= c.min && c.name.len() >= word.len() && c.name.starts_with(word))?;
+    Some(if cmd.ctx & ctx.bit() == 0 {
+        Err(format!("{}: {}", word, ctx.where_invalid()))
+    } else {
+        Ok(cmd)
+    })
+}
+
+/// `reply`/`Reply` differ only in who the reply goes to, and `flipr` swaps
+/// which spelling means which (spec 104899-104902).
+fn cmd_reply_flipr(
+    args: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+    lowercase_form: bool,
+) -> Result<CommandResult, String> {
+    let reply_to_all = lowercase_form != vars.get_bool("flipr");
+    cmd_reply(args, mb, vars, reply_to_all)
+}
+
 /// Execute a command in Receive Mode
 pub fn execute_command(
     line: &str,
     mb: &mut Mailbox,
     vars: &mut Variables,
 ) -> Result<CommandResult, String> {
+    execute_in(line, mb, vars, Context::Command)
+}
+
+/// Execute one command line in `ctx`.
+///
+/// This is the single interpreter. `mb` is a scratch, empty mailbox in the
+/// start-up and input-mode contexts, where there is no message store; commands
+/// that need one are excluded by their context mask rather than by a separate
+/// dispatch table.
+pub fn execute_in(
+    line: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+    ctx: Context,
+) -> Result<CommandResult, String> {
     let line = line.trim();
 
-    // Check for blank line
-    if line.is_empty() {
+    if line.is_empty() || line.starts_with('#') {
         return Ok(CommandResult::Continue);
     }
 
-    // Check for comment
-    if line.starts_with('#') {
-        return Ok(CommandResult::Continue);
-    }
+    let (cmd, args) = parse_command_line(line);
 
-    // Conditional execution (if/else/endif) in command mode. execute_command is
-    // the Receive-Mode interpreter, so the `r` condition is true and `s` false.
-    {
-        let (cword, cargs) = parse_command_line(line);
-        match cword.to_lowercase().as_str() {
-            "i" | "if" => {
-                let matches = matches!(cargs.trim().to_lowercase().as_str(), "r");
-                vars.cond_stack.push((matches, false));
-                return Ok(CommandResult::Continue);
-            }
-            "el" | "els" | "else" => {
-                match vars.cond_stack.pop() {
-                    // A second else in the same if block is an error.
-                    Some((_, true)) | None => return Err("mailx: unexpected else".to_string()),
-                    Some((matches, false)) => vars.cond_stack.push((!matches, true)),
-                }
-                return Ok(CommandResult::Continue);
-            }
-            "en" | "end" | "endi" | "endif" => {
-                if vars.cond_stack.pop().is_none() {
-                    return Err("mailx: unexpected endif".to_string());
-                }
-                return Ok(CommandResult::Continue);
-            }
-            _ => {}
-        }
+    // Conditionals are handled before the context check, so an `if` guarding a
+    // command that is illegal here still suppresses it rather than diagnosing
+    // it.
+    if let Some(result) = conditional(cmd, args, vars) {
+        return result.map(|_| CommandResult::Continue);
     }
-
-    // Inside a non-matching conditional branch, skip the command.
     if !vars.cond_active() {
         return Ok(CommandResult::Continue);
     }
 
-    // Check for shell escape
-    if let Some(cmd) = line.strip_prefix('!') {
-        return cmd_shell(cmd, vars);
+    // Shell escape. Not valid in a start-up file (spec 104557-104559).
+    if let Some(rest) = line.strip_prefix('!') {
+        if ctx == Context::Startup {
+            return Err("!: command not valid in a start-up file".to_string());
+        }
+        return cmd_shell(rest, vars);
     }
 
-    // Check for = (current message number)
+    // Current message number.
     if line == "=" {
         println!("{}", mb.current);
         return Ok(CommandResult::Continue);
     }
 
-    // Parse command and arguments
-    let (cmd, args) = parse_command_line(line);
-
-    // Match command
-    match cmd.to_lowercase().as_str() {
-        // No command means "next"
-        "" => cmd_next(args, mb, vars),
-
-        // Aliases
-        "a" | "al" | "ali" | "alia" | "alias" => cmd_alias(args, vars),
-        "g" | "gr" | "gro" | "grou" | "group" => cmd_alias(args, vars),
-
-        // Alternates
-        "alt" | "alte" | "alter" | "altern" | "alterna" | "alternat" | "alternate"
-        | "alternates" => cmd_alternates(args, vars),
-
-        // Change directory
-        "cd" => cmd_cd(args),
-        "ch" | "chd" | "chdi" | "chdir" => cmd_cd(args),
-
-        // Copy
-        "c" | "co" | "cop" | "copy" => cmd_copy(args, mb, vars, false),
-        "C" | "Co" | "Cop" | "Copy" => cmd_copy_author(args, mb, vars),
-
-        // Delete
-        "d" | "de" | "del" | "dele" | "delet" | "delete" => cmd_delete(args, mb, vars),
-
-        // Discard/Ignore headers
-        "di" | "dis" | "disc" | "disca" | "discar" | "discard" => cmd_discard(args, vars),
-        "ig" | "ign" | "igno" | "ignor" | "ignore" => cmd_discard(args, vars),
-
-        // Delete and print
-        "dp" => cmd_dp(args, mb, vars),
-        "dt" => cmd_dp(args, mb, vars),
-
-        // Echo
-        "ec" | "ech" | "echo" => {
-            println!("{}", args);
-            Ok(CommandResult::Continue)
+    if let Some((_, bits, run)) = PUNCTUATION.iter().find(|(name, _, _)| *name == cmd) {
+        if bits & ctx.bit() == 0 {
+            return Err(format!("{}: {}", cmd, ctx.where_invalid()));
         }
+        return run(args, mb, vars);
+    }
 
-        // Edit
-        "e" | "ed" | "edi" | "edit" => cmd_edit(args, mb, vars),
-
-        // Exit
-        "ex" | "exi" | "exit" => Ok(CommandResult::Exit),
-        "x" | "xi" | "xit" => Ok(CommandResult::Exit),
-
-        // File/Folder
-        "fi" | "fil" | "file" => cmd_file(args, mb, vars),
-        "fold" | "folde" | "folder" => cmd_file(args, mb, vars),
-
-        // Folders
-        "folders" => cmd_folders(vars),
-
-        // Followup
-        "fo" | "fol" | "foll" | "follo" | "follow" | "followu" | "followup" => {
-            cmd_followup(args, mb, vars, false)
-        }
-        "F" | "Fo" | "Fol" | "Foll" | "Follo" | "Follow" | "Followu" | "Followup" => {
-            cmd_followup(args, mb, vars, true)
-        }
-
-        // From
-        "f" | "fr" | "fro" | "from" => cmd_from(args, mb, vars),
-
-        // Headers
-        "h" | "he" | "hea" | "head" | "heade" | "header" | "headers" => cmd_headers(args, mb, vars),
-
-        // Help
-        "hel" | "help" | "?" => cmd_help(),
-
-        // Hold/Preserve
-        "ho" | "hol" | "hold" => cmd_hold(args, mb, vars),
-        "pre" | "pres" | "prese" | "preser" | "preserv" | "preserve" => cmd_hold(args, mb, vars),
-
-        // If/Else/Endif (for startup files)
-        "i" | "if" => Ok(CommandResult::Continue), // Simplified - ignore conditionals
-        "el" | "els" | "else" => Ok(CommandResult::Continue),
-        "en" | "end" | "endi" | "endif" => Ok(CommandResult::Continue),
-
-        // List
-        "l" | "li" | "lis" | "list" => cmd_list(),
-
-        // Mail
-        "m" | "ma" | "mai" | "mail" => cmd_mail(args, mb, vars),
-
-        // Mbox
-        "mb" | "mbo" | "mbox" => cmd_mbox(args, mb, vars),
-
-        // Next
-        "n" | "ne" | "nex" | "next" => cmd_next(args, mb, vars),
-
-        // Pipe
-        "pi" | "pip" | "pipe" | "|" => cmd_pipe(args, mb, vars),
-
-        // Print/Type (with headers)
-        "P" | "Pr" | "Pri" | "Prin" | "Print" => cmd_print(args, mb, vars, true),
-        "T" | "Ty" | "Typ" | "Type" => cmd_print(args, mb, vars, true),
-
-        // Print/Type
-        "p" | "pr" | "pri" | "prin" | "print" => cmd_print(args, mb, vars, false),
-        "t" | "ty" | "typ" | "type" => cmd_print(args, mb, vars, false),
-
-        // Quit
-        "q" | "qu" | "qui" | "quit" => Ok(CommandResult::Quit),
-
-        // Reply (to sender only)
-        "R" | "Re" | "Rep" | "Repl" | "Reply" | "Res" | "Resp" | "Respo" | "Respon" | "Respond" => {
-            if vars.get_bool("flipr") {
-                cmd_reply(args, mb, vars, true)
-            } else {
-                cmd_reply(args, mb, vars, false)
+    // Scrolling: `z`, `z+`, `z-`.
+    if let Some(direction) = cmd.strip_prefix('z') {
+        if direction.is_empty() || direction == "+" || direction == "-" {
+            if ctx != Context::Command {
+                return Err(format!("{}: {}", cmd, ctx.where_invalid()));
             }
-        }
-
-        // Reply (to all)
-        "r" | "re" | "rep" | "repl" | "reply" | "res" | "resp" | "respo" | "respon" | "respond" => {
-            if vars.get_bool("flipr") {
-                cmd_reply(args, mb, vars, false)
-            } else {
-                cmd_reply(args, mb, vars, true)
-            }
-        }
-
-        // Retain headers
-        "ret" | "reta" | "retai" | "retain" => cmd_retain(args, vars),
-
-        // Save
-        "s" | "sa" | "sav" | "save" => cmd_save(args, mb, vars, true),
-        "S" | "Sa" | "Sav" | "Save" => cmd_save_author(args, mb, vars),
-
-        // Set
-        "se" | "set" => cmd_set(args, vars),
-
-        // Shell
-        "sh" | "she" | "shel" | "shell" => cmd_shell_interactive(vars),
-
-        // Size
-        "si" | "siz" | "size" => cmd_size(args, mb, vars),
-
-        // Source
-        "so" | "sou" | "sour" | "sourc" | "source" => cmd_source(args, vars),
-
-        // Top
-        "to" | "top" => cmd_top(args, mb, vars),
-
-        // Touch
-        "tou" | "touc" | "touch" => cmd_touch(args, mb, vars),
-
-        // Unalias
-        "una" | "unal" | "unali" | "unalia" | "unalias" => cmd_unalias(args, vars),
-
-        // Undelete
-        "u" | "un" | "und" | "unde" | "undel" | "undele" | "undelet" | "undelete" => {
-            cmd_undelete(args, mb, vars)
-        }
-
-        // Unset
-        "uns" | "unse" | "unset" => cmd_unset(args, vars),
-
-        // Visual
-        "v" | "vi" | "vis" | "visu" | "visua" | "visual" => cmd_visual(args, mb, vars),
-
-        // Write
-        "w" | "wr" | "wri" | "writ" | "write" => cmd_write(args, mb, vars),
-
-        // Scroll
-        "z" => cmd_scroll(args, mb, vars),
-        "z+" => cmd_scroll("+", mb, vars),
-        "z-" => cmd_scroll("-", mb, vars),
-
-        // Message number
-        _ => {
-            // Try to parse as a message number/list
-            if let Ok(num) = cmd.parse::<usize>() {
-                if num > 0 && num <= mb.message_count() {
-                    mb.current = num;
-                    cmd_print("", mb, vars, false)
-                } else {
-                    Err(format!("Invalid message number: {}", num))
-                }
-            } else {
-                Err(format!("Unknown command: {}", cmd))
-            }
+            return cmd_scroll(direction, mb, vars);
         }
     }
+
+    if let Some(found) = lookup(cmd, ctx) {
+        return (found?.run)(args, mb, vars);
+    }
+
+    // A bare message number selects and prints that message.
+    if let Ok(num) = cmd.parse::<usize>() {
+        if ctx != Context::Command {
+            return Err(format!("{}: {}", cmd, ctx.where_invalid()));
+        }
+        return if num > 0 && num <= mb.message_count() {
+            mb.current = num;
+            cmd_print("", mb, vars, false)
+        } else {
+            Err(format!("Invalid message number: {}", num))
+        };
+    }
+
+    Err(format!("Unknown command: {}", cmd))
 }
 
-/// Execute commands allowed in startup files
-pub fn execute_startup_command(line: &str, vars: &mut Variables) -> Result<(), String> {
-    let line = line.trim();
+/// Handle `if`/`else`/`endif`, returning `None` when `cmd` is none of them.
+///
+/// One engine for both contexts. There used to be two, disagreeing on whether a
+/// stray `else` was a warning or an error, and on whether `if s` was even
+/// recognized; a third copy in the start-up dispatcher matched the same words
+/// and did nothing with them.
+fn conditional(cmd: &str, args: &str, vars: &mut Variables) -> Option<Result<(), String>> {
+    let is = |name: &str, min: usize| {
+        cmd.len() >= min && name.len() >= cmd.len() && name.starts_with(cmd)
+    };
 
-    if line.is_empty() || line.starts_with('#') {
-        return Ok(());
+    if is("if", 1) {
+        // `s` is true while reading a start-up file for Send Mode, `r` for
+        // Receive Mode. The command loop is Receive Mode by definition.
+        let matches = match args.trim() {
+            "r" => !vars.send_mode,
+            "s" => vars.send_mode,
+            _ => false,
+        };
+        vars.cond_stack.push((matches, false));
+        return Some(Ok(()));
     }
-
-    // A shell escape (`!command`) is not valid in a start-up file (spec
-    // 104557-104559).
-    if line.starts_with('!') {
-        return Err("!: command not valid in a start-up file".to_string());
+    if is("else", 2) {
+        return Some(match vars.cond_stack.pop() {
+            Some((_, true)) | None => Err("unexpected else".to_string()),
+            Some((matches, false)) => {
+                vars.cond_stack.push((!matches, true));
+                Ok(())
+            }
+        });
     }
-
-    let (cmd, args) = parse_command_line(line);
-
-    match cmd.to_lowercase().as_str() {
-        "a" | "al" | "ali" | "alia" | "alias" | "g" | "gr" | "gro" | "grou" | "group" => {
-            cmd_alias_startup(args, vars)
-        }
-        "alt" | "alte" | "alter" | "altern" | "alterna" | "alternat" | "alternate"
-        | "alternates" => cmd_alternates_startup(args, vars),
-        "di" | "dis" | "disc" | "disca" | "discar" | "discard" | "ig" | "ign" | "igno"
-        | "ignor" | "ignore" => cmd_discard_startup(args, vars),
-        "ret" | "reta" | "retai" | "retain" => cmd_retain_startup(args, vars),
-        "se" | "set" => cmd_set_startup(args, vars),
-        "uns" | "unse" | "unset" => cmd_unset_startup(args, vars),
-        "so" | "sou" | "sour" | "sourc" | "source" => cmd_source_startup(args, vars),
-        "i" | "if" | "el" | "els" | "else" | "en" | "end" | "endi" | "endif" => Ok(()),
-
-        // Other legal start-up commands that do not require the message store.
-        "cd" | "ch" | "chd" | "chdi" | "chdir" => cmd_cd(args).map(|_| ()),
-        "ec" | "ech" | "echo" => {
-            println!("{}", args);
+    if is("endif", 2) {
+        return Some(if vars.cond_stack.pop().is_none() {
+            Err("unexpected endif".to_string())
+        } else {
             Ok(())
-        }
-
-        // Commands explicitly not valid in a start-up file (spec 104557-104559).
-        // The match is over the lowercased command, so copy/save/reply/followup
-        // also catch their Copy/Save/Reply/Followup forms.
-        "e" | "ed" | "edi" | "edit" | "ho" | "hol" | "hold" | "pre" | "pres" | "prese"
-        | "preser" | "preserv" | "preserve" | "m" | "ma" | "mai" | "mail" | "r" | "re" | "rep"
-        | "repl" | "reply" | "c" | "co" | "cop" | "copy" | "s" | "sa" | "sav" | "save" | "sh"
-        | "she" | "shel" | "shell" | "v" | "vi" | "vis" | "visu" | "visua" | "visual" | "fo"
-        | "fol" | "foll" | "follo" | "follow" | "followu" | "followup" => {
-            Err(format!("{}: command not valid in a start-up file", cmd))
-        }
-
-        // Other commands require the message store, which is not available
-        // during start-up; leave them as no-ops rather than diagnosing.
-        _ => Ok(()),
+        });
     }
+    None
 }
 
 fn parse_command_line(line: &str) -> (&str, &str) {
@@ -371,18 +629,6 @@ pub(crate) fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResul
     Ok(CommandResult::Continue)
 }
 
-fn cmd_alias_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    if !args.is_empty() {
-        let parts: Vec<&str> = args.split_whitespace().collect();
-        if parts.len() > 1 {
-            let name = parts[0].to_string();
-            let addrs: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-            vars.aliases.insert(name, addrs);
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
         println!("{}", vars.alternates.join(" "));
@@ -394,15 +640,6 @@ pub(crate) fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<Command
         }
     }
     Ok(CommandResult::Continue)
-}
-
-fn cmd_alternates_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for name in args.split_whitespace() {
-        if !vars.alternates.contains(&name.to_string()) {
-            vars.alternates.push(name.to_string());
-        }
-    }
-    Ok(())
 }
 
 fn cmd_cd(args: &str) -> Result<CommandResult, String> {
@@ -419,7 +656,7 @@ fn cmd_cd(args: &str) -> Result<CommandResult, String> {
 fn cmd_copy(
     args: &str,
     mb: &mut Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
     mark_saved: bool,
 ) -> Result<CommandResult, String> {
     // Parse arguments: [msglist] file
@@ -463,10 +700,17 @@ fn cmd_copy(
     Ok(CommandResult::Continue)
 }
 
+/// `Copy` and `Save`: file the messages under the author's name.
+///
+/// The two differ only in whether the messages are then marked saved
+/// (spec 104738-104742, 104958-104961), so they are one function. They were two
+/// near-identical copies, and -- because dispatch lowercased the command word
+/// before matching -- both were unreachable.
 fn cmd_copy_author(
     args: &str,
     mb: &mut Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
+    mark_saved: bool,
 ) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
@@ -479,6 +723,15 @@ fn cmd_copy_author(
         let filename = expand_filename(filename, vars);
 
         mb.save_messages(&msg_nums, &filename, true)?;
+
+        if mark_saved {
+            for num in &msg_nums {
+                if let Some(m) = mb.get_mut(*num) {
+                    m.disposition = Disposition::Saved;
+                }
+            }
+            mb.modified = true;
+        }
 
         let total_size: usize = msg_nums
             .iter()
@@ -496,7 +749,7 @@ fn cmd_copy_author(
     Ok(CommandResult::Continue)
 }
 
-fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -549,16 +802,7 @@ fn cmd_discard(args: &str, vars: &mut Variables) -> Result<CommandResult, String
     Ok(CommandResult::Continue)
 }
 
-fn cmd_discard_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for header in args.split_whitespace() {
-        if !vars.ignored_headers.contains(&header.to_string()) {
-            vars.ignored_headers.push(header.to_string());
-        }
-    }
-    Ok(())
-}
-
-fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Delete and print next
     cmd_delete(args, mb, vars)?;
 
@@ -577,7 +821,7 @@ fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResul
     Ok(CommandResult::Continue)
 }
 
-fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -645,7 +889,7 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     Ok(CommandResult::Continue)
 }
 
-fn cmd_folders(vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_folders(vars: &mut Variables) -> Result<CommandResult, String> {
     if let Some(folder) = vars.get("folder") {
         let folder = expand_filename(folder, vars);
         let lister = vars.get("LISTER").unwrap_or("ls");
@@ -698,7 +942,7 @@ fn cmd_followup(
     Ok(CommandResult::Continue)
 }
 
-fn cmd_from(args: &str, mb: &Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_from(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -709,7 +953,11 @@ fn cmd_from(args: &str, mb: &Mailbox, vars: &Variables) -> Result<CommandResult,
     Ok(CommandResult::Continue)
 }
 
-fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_headers(
+    args: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+) -> Result<CommandResult, String> {
     if !args.is_empty() {
         let msg_num = parse_message(args, mb, vars)?;
         mb.current = msg_num;
@@ -728,52 +976,28 @@ fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<Command
     Ok(CommandResult::Continue)
 }
 
+/// The command list, generated from the dispatch table.
+///
+/// `help` and `list` used to carry hand-written inventories. They had already
+/// drifted from what dispatch accepted: `list` advertised `Copy`, `Save`,
+/// `Print`, `Type`, `Reply`, and `Followup`, none of which could run.
+fn command_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = COMMANDS.iter().map(|c| c.name).collect();
+    names.extend(PUNCTUATION.iter().map(|(n, _, _)| *n));
+    names.push("z");
+    names
+}
+
 fn cmd_help() -> Result<CommandResult, String> {
-    println!(
-        r#"
-Commands:
-  ?           help
-  =           print current message number
-  alias       define/list aliases
-  alternates  define alternate addresses
-  cd          change directory
-  copy        copy messages to file
-  delete      delete messages
-  dp          delete and print next
-  edit        edit messages
-  exit        exit without saving
-  file        change mailbox
-  folders     list folder directory
-  from        print header summary
-  headers     print header page
-  hold        hold messages in mailbox
-  list        list available commands
-  mail        send mail
-  mbox        mark for moving to mbox
-  next        print next message
-  pipe        pipe messages to command
-  print       print messages
-  quit        quit, saving changes
-  reply       reply to message
-  retain      retain headers
-  save        save messages to file
-  set         set/print variables
-  shell       invoke shell
-  size        print message sizes
-  source      read commands from file
-  top         print top lines of messages
-  touch       mark messages for mbox
-  undelete    undelete messages
-  unset       unset variables
-  visual      edit with visual editor
-  write       write messages to file (no headers)
-  z           scroll header display
-"#
-    );
+    println!("Commands:");
+    for chunk in command_names().chunks(6) {
+        println!("  {}", chunk.join("  "));
+    }
+    println!("Any command may be abbreviated to its shortest unique prefix.");
     Ok(CommandResult::Continue)
 }
 
-fn cmd_hold(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_hold(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104831).
     if !mb.is_system_mailbox {
         return Err("hold: Allowed only in the system mailbox".to_string());
@@ -795,18 +1019,11 @@ fn cmd_hold(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
 }
 
 fn cmd_list() -> Result<CommandResult, String> {
-    println!(
-        "alias alternates cd chdir copy Copy delete discard dp dt \
-         echo edit exit file folder folders followup Followup from \
-         headers help hold if else endif ignore list mail mbox next \
-         pipe Print print quit Reply reply retain save Save set shell \
-         size source top touch Type type unalias undelete unset visual \
-         write z"
-    );
+    println!("{}", command_names().join(" "));
     Ok(CommandResult::Continue)
 }
 
-fn cmd_mail(args: &str, mb: &Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+fn cmd_mail(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let mut composed = ComposedMessage::new();
 
     for addr in args.split_whitespace() {
@@ -839,7 +1056,7 @@ fn cmd_mail(args: &str, mb: &Mailbox, vars: &mut Variables) -> Result<CommandRes
     Ok(CommandResult::Continue)
 }
 
-fn cmd_mbox(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_mbox(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104853).
     if !mb.is_system_mailbox {
         return Err("mbox: Allowed only in the system mailbox".to_string());
@@ -863,7 +1080,7 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
     Ok(CommandResult::Continue)
 }
 
-fn cmd_next(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_next(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     if !args.is_empty() {
         let msg_num = parse_message(args, mb, vars)?;
         mb.current = msg_num;
@@ -884,7 +1101,7 @@ fn cmd_next(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
     cmd_print("", mb, vars, false)
 }
 
-fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Parse: [msglist] command
     let (msg_nums, cmd) = if args.is_empty() {
         (
@@ -966,7 +1183,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
 fn cmd_print(
     args: &str,
     mb: &mut Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
     show_all_headers: bool,
 ) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
@@ -1078,19 +1295,10 @@ fn cmd_retain(args: &str, vars: &mut Variables) -> Result<CommandResult, String>
     Ok(CommandResult::Continue)
 }
 
-fn cmd_retain_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for header in args.split_whitespace() {
-        if !vars.retained_headers.contains(&header.to_string()) {
-            vars.retained_headers.push(header.to_string());
-        }
-    }
-    Ok(())
-}
-
 fn cmd_save(
     args: &str,
     mb: &mut Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
     mark_saved: bool,
 ) -> Result<CommandResult, String> {
     // Parse arguments: [msglist] [file]
@@ -1145,46 +1353,6 @@ fn cmd_save(
         msg_nums.len(),
         total_size
     );
-
-    Ok(CommandResult::Continue)
-}
-
-fn cmd_save_author(
-    args: &str,
-    mb: &mut Mailbox,
-    vars: &Variables,
-) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false, vars)?
-    };
-
-    if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
-        let filename = author_filename(first_msg.from())?;
-        let filename = expand_filename(filename, vars);
-
-        mb.save_messages(&msg_nums, &filename, true)?;
-
-        for num in &msg_nums {
-            if let Some(m) = mb.get_mut(*num) {
-                m.disposition = Disposition::Saved;
-            }
-        }
-        mb.modified = true;
-
-        let total_size: usize = msg_nums
-            .iter()
-            .filter_map(|&n| mb.get(n))
-            .map(|m| m.size())
-            .sum();
-        println!(
-            "\"{}\" {} messages {} bytes",
-            filename,
-            msg_nums.len(),
-            total_size
-        );
-    }
 
     Ok(CommandResult::Continue)
 }
@@ -1258,26 +1426,6 @@ const BOOLEAN_VARIABLES: &[&str] = &[
     "verbose",
 ];
 
-fn cmd_set_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for arg in split_args(args) {
-        if let Some(name) = boolean_being_cleared(&arg) {
-            vars.unset(name);
-        } else {
-            let (name, value) = parse_set_arg(&arg);
-            // Silently skip onehop - we permanently operate in noonehop mode
-            if name == "onehop" {
-                continue;
-            }
-            if let Some(val) = value {
-                vars.set(name, val);
-            } else {
-                vars.set_bool(name, true);
-            }
-        }
-    }
-    Ok(())
-}
-
 fn cmd_shell(cmd: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     // Expand ! to previous command if bang is set
     let cmd = if vars.get_bool("bang") {
@@ -1329,13 +1477,13 @@ fn expand_bang(cmd: &str, prev: Option<&str>) -> String {
     result
 }
 
-fn cmd_shell_interactive(vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_shell_interactive(vars: &mut Variables) -> Result<CommandResult, String> {
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     Command::new(shell).status().map_err(|e| e.to_string())?;
     Ok(CommandResult::Continue)
 }
 
-fn cmd_size(args: &str, mb: &Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_size(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -1351,36 +1499,39 @@ fn cmd_size(args: &str, mb: &Mailbox, vars: &Variables) -> Result<CommandResult,
     Ok(CommandResult::Continue)
 }
 
-fn cmd_source(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+/// `source`: read commands from a file and return to command mode.
+///
+/// The file goes through the same interpreter as a start-up file, so its
+/// `if`/`else`/`endif` work. `source` used to call the start-up dispatcher
+/// directly, which recognized those words and did nothing with them -- a
+/// conditional in a sourced file was silently ignored.
+fn cmd_source(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let path = expand_filename(args.trim(), vars);
     let content = fs::read_to_string(&path).map_err(|e| format!("{}: {}", path, e))?;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if !line.is_empty() && !line.starts_with('#') {
-            if let Err(e) = execute_startup_command(line, vars) {
-                eprintln!("{}: {}", path, e);
-            }
-        }
-    }
-
+    run_script(&content, &path, mb, vars);
     Ok(CommandResult::Continue)
 }
 
-fn cmd_source_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    let path = expand_filename(args.trim(), vars);
-    if let Ok(content) = fs::read_to_string(&path) {
-        for line in content.lines() {
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with('#') {
-                execute_startup_command(line, vars)?;
-            }
+/// Run every line of `content` as a start-up script.
+///
+/// Errors are reported and the script continues, which is one of the two
+/// behaviors spec 104559-104561 permits. An unterminated `if` is diagnosed at
+/// the end and the conditional stack is reset, so a malformed file cannot leave
+/// the rest of the session suppressed.
+pub fn run_script(content: &str, path: &str, mb: &mut Mailbox, vars: &mut Variables) {
+    let depth = vars.cond_stack.len();
+    for line in content.lines() {
+        if let Err(e) = execute_in(line, mb, vars, Context::Startup) {
+            eprintln!("mailx: {}: {}", path, e);
         }
     }
-    Ok(())
+    if vars.cond_stack.len() > depth {
+        eprintln!("mailx: {}: missing endif", path);
+        vars.cond_stack.truncate(depth);
+    }
 }
 
-fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_top(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -1420,7 +1571,7 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResu
     Ok(CommandResult::Continue)
 }
 
-fn cmd_touch(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_touch(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104853, touch grouping).
     if !mb.is_system_mailbox {
         return Err("touch: Allowed only in the system mailbox".to_string());
@@ -1453,7 +1604,11 @@ fn cmd_unalias(args: &str, vars: &mut Variables) -> Result<CommandResult, String
     Ok(CommandResult::Continue)
 }
 
-fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_undelete(
+    args: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         // Find deleted message
         if let Some(num) = mb.next_deleted(mb.current.saturating_sub(1)) {
@@ -1497,14 +1652,7 @@ pub(crate) fn cmd_unset(args: &str, vars: &mut Variables) -> Result<CommandResul
     Ok(CommandResult::Continue)
 }
 
-fn cmd_unset_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for name in args.split_whitespace() {
-        vars.unset(name);
-    }
-    Ok(())
-}
-
-fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         vec![mb.current]
     } else {
@@ -1517,7 +1665,7 @@ fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandR
     Ok(CommandResult::Continue)
 }
 
-fn cmd_write(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_write(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Parse arguments: [msglist] file
     let parts: Vec<&str> = args.split_whitespace().collect();
 
@@ -1567,7 +1715,7 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRe
     Ok(CommandResult::Continue)
 }
 
-fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let screen = vars.screen_lines().get();
     let direction = if args.starts_with('-') { -1i32 } else { 1 };
 

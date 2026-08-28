@@ -285,72 +285,13 @@ enum RcMode {
 }
 
 fn load_rc_content(content: &str, path: &str, vars: &mut Variables, mode: RcMode) {
-    // Stack to track conditional state: (condition_matches, in_else_branch)
-    let mut cond_stack: Vec<(bool, bool)> = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Parse the command
-        let (cmd, args) = if let Some(pos) = line.find(char::is_whitespace) {
-            (&line[..pos], line[pos..].trim())
-        } else {
-            (line, "")
-        };
-        let cmd_lower = cmd.to_lowercase();
-
-        // Handle if/else/endif
-        match cmd_lower.as_str() {
-            "i" | "if" => {
-                // `if s` for send mode, `if r` for receive mode
-                let arg = args.trim().to_lowercase();
-                let condition_matches = match arg.as_str() {
-                    "s" => mode == RcMode::Send,
-                    "r" => mode == RcMode::Receive,
-                    _ => false, // Unknown condition, treat as false
-                };
-                cond_stack.push((condition_matches, false));
-                continue;
-            }
-            "el" | "els" | "else" => {
-                if let Some((matches, in_else)) = cond_stack.pop() {
-                    // Toggle the condition for else branch
-                    cond_stack.push((!matches, true));
-                    if in_else {
-                        // Nested else without endif - error but continue
-                        eprintln!("mailx: {}: unexpected else", path);
-                    }
-                }
-                continue;
-            }
-            "en" | "end" | "endi" | "endif" => {
-                if cond_stack.pop().is_none() {
-                    eprintln!("mailx: {}: unexpected endif", path);
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        // Check if we should execute this command
-        let should_execute = cond_stack.iter().all(|(matches, _)| *matches);
-        if !should_execute {
-            continue;
-        }
-
-        // Execute command
-        if let Err(e) = commands::execute_startup_command(line, vars) {
-            eprintln!("mailx: {}: {}", path, e);
-        }
-    }
-
-    // Warn about unclosed conditionals
-    if !cond_stack.is_empty() {
-        eprintln!("mailx: {}: missing endif", path);
-    }
+    // `if s` / `if r` ask which mode mailx is running in; the interpreter reads
+    // it from here rather than from a parameter only this path could supply.
+    vars.send_mode = mode == RcMode::Send;
+    // Start-up files have no message store. Commands that need one are excluded
+    // by their context mask, so this scratch mailbox is never read from.
+    let mut scratch = Mailbox::new(String::new());
+    commands::run_script(content, path, &mut scratch, vars);
 }
 
 fn get_system_mailbox() -> String {

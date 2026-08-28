@@ -562,6 +562,25 @@ mod parsing {
         );
     }
 
+    // Audit #86: `all:: dep` is GNU's double-colon rule, which we do not
+    // implement. Splitting on the first `:` made the second one a prerequisite
+    // literally named `:`, so the makefile failed with `no target ':'` --
+    // a diagnostic about the wrong thing entirely.
+    #[test]
+    fn double_colon_rule_is_diagnosed() {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-f", "tests/makefiles/parsing/double_colon.mk", "all"])
+            .output()
+            .expect("failed to run make");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("double-colon rules are not supported"),
+            "stderr: {stderr}"
+        );
+        assert_eq!(output.status.code(), Some(4));
+    }
+
     // Audit #3: a missing `include` file must produce a graceful error, not
     // an uncontrolled panic (which exits 101).
     #[test]

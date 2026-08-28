@@ -61,6 +61,15 @@ pub(crate) fn split_rule_line(line: &str) -> Result<RuleLine, String> {
     let colon = line.find(':').ok_or("expected ':'")?;
     let (lhs, rhs) = (&line[..colon], &line[colon + 1..]);
 
+    // `target:: prerequisites` is the GNU double-colon rule: several rules for
+    // one target, each with its own commands, all of which run. POSIX has no
+    // such construct and we do not implement it. Say so: taking the first `:`
+    // made the second one a prerequisite literally named `:`, and the makefile
+    // failed with `no target ':'` (audit #86).
+    if rhs.starts_with(':') {
+        return Err("double-colon rules are not supported".to_string());
+    }
+
     // A semicolon left of the colon would otherwise yield a target literally
     // named `a;b`, silently.
     if lhs.contains(';') {
@@ -107,6 +116,21 @@ mod tests {
     #[test]
     fn accepts_multiple_targets() {
         assert_eq!(rule("a b: c").targets, vec!["a", "b"]);
+    }
+
+    // Audit #86: GNU's double-colon rule. Splitting on the first `:` made the
+    // second one a prerequisite literally named `:`, which failed later with
+    // `no target ':'` -- a diagnostic about the wrong thing entirely.
+    #[test]
+    fn rejects_a_double_colon_rule() {
+        let err = split_rule_line("all:: a").expect_err("must be rejected");
+        assert!(err.contains("double-colon"), "err: {err}");
+    }
+
+    // A `:` on the prerequisite side is not the double-colon form.
+    #[test]
+    fn accepts_a_colon_in_a_prerequisite() {
+        assert_eq!(rule("all: a:b").prerequisites, vec!["a:b"]);
     }
 
     // Audit #26: `/` is an ordinary name character, in both positions.

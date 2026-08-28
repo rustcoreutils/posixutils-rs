@@ -7,11 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-pub mod config;
 pub mod prerequisite;
 pub mod recipe;
 pub mod target;
 
+use crate::attributes::{Attributes, Flags};
 use crate::parser::preprocessor;
 use crate::{
     config::Config as GlobalConfig,
@@ -19,7 +19,6 @@ use crate::{
     parser::Rule as ParsedRule,
     signal_handler, Macro, DEFAULT_SHELL, DEFAULT_SHELL_VAR,
 };
-use config::Config;
 use core::fmt;
 use gettextrs::gettext;
 use prerequisite::Prerequisite;
@@ -99,6 +98,8 @@ pub struct Env<'a> {
     /// Maps a prerequisite name to where it was actually found, so `$<` names
     /// the file the recipe will read when `VPATH` supplied it.
     pub resolve: &'a dyn Fn(&str) -> String,
+    /// What `.IGNORE`, `.SILENT`, `.PRECIOUS` and `.PHONY` say about a target.
+    pub attributes: &'a Attributes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -109,8 +110,6 @@ pub struct Rule {
     prerequisites: Vec<Prerequisite>,
     /// The recipe of the rule
     recipes: Vec<Recipe>,
-
-    pub config: Config,
 }
 
 impl Rule {
@@ -148,7 +147,6 @@ impl Rule {
                 .map(|p| Prerequisite::new(pattern_expand(p.as_ref(), stem)))
                 .collect(),
             recipes: self.recipes.clone(),
-            config: self.config.clone(),
         })
     }
 
@@ -262,6 +260,7 @@ impl Rule {
             macros,
             exports,
             resolve: _,
+            attributes,
         } = *env;
         let GlobalConfig {
             ignore: global_ignore,
@@ -279,12 +278,14 @@ impl Rule {
             not_parallel: _,
             suffixes: _,
         } = *global_config;
-        let Config {
-            ignore: rule_ignore,
-            silent: rule_silent,
-            precious: rule_precious,
-            phony: rule_phony,
-        } = self.config;
+        // Attributes belong to the target, not to the rule: one rule may name
+        // several targets and `.IGNORE: a` must not reach `b` (audit #78).
+        let Flags {
+            ignore: target_ignore,
+            silent: target_silent,
+            precious: target_precious,
+            phony: target_phony,
+        } = attributes.of(target.as_ref());
 
         // Capture the target's modification time once, before any recipe line
         // runs, so the signal handler can tell whether an interrupted recipe
@@ -298,7 +299,7 @@ impl Rule {
         let env_macros = global_env_macros;
         let quit = global_quit;
         let print = global_print;
-        let precious = global_precious || rule_precious;
+        let precious = global_precious || target_precious;
 
         // POSIX: make catches signals unless -n, -p, or -q is set (those take
         // the default action). -i is not an exemption.
@@ -310,7 +311,7 @@ impl Rule {
         let _in_flight = InFlight::enter(InterruptInfo {
             target: target.as_ref().to_string(),
             precious,
-            phony: rule_phony,
+            phony: target_phony,
             original_mtime,
         });
 
@@ -322,8 +323,8 @@ impl Rule {
                     force_run: recipe_force_run,
                 } = recipe.config;
 
-                let ignore = global_ignore || rule_ignore || recipe_ignore;
-                let silent = global_silent || rule_silent || recipe_silent;
+                let ignore = global_ignore || target_ignore || recipe_ignore;
+                let silent = global_silent || target_silent || recipe_silent;
                 let force_run = recipe_force_run;
 
                 // POSIX: a recipe line prefixed with `+`, or one containing the
@@ -415,13 +416,13 @@ impl Rule {
                 }
             }
 
-            let silent = global_silent || rule_silent;
+            let silent = global_silent || target_silent;
 
             // -t flag. A .PHONY target names no file, so touching it would
             // create one and make every later `make <target>` report it up to
             // date forever (audit #42).
             if touch {
-                if rule_phony {
+                if target_phony {
                     return Ok(());
                 }
                 if !silent {
@@ -640,21 +641,10 @@ impl fmt::Display for Rule {
 
 impl From<ParsedRule> for Rule {
     fn from(parsed: ParsedRule) -> Self {
-        let config = Config::default();
-        Self::from((parsed, config))
-    }
-}
-
-impl From<(ParsedRule, Config)> for Rule {
-    fn from((parsed, config): (ParsedRule, Config)) -> Self {
-        let targets = parsed.targets().map(Target::new).collect();
-        let prerequisites = parsed.prerequisites().map(Prerequisite::new).collect();
-        let recipes = parsed.recipes().map(Recipe::new).collect();
         Rule {
-            targets,
-            prerequisites,
-            recipes,
-            config,
+            targets: parsed.targets().map(Target::new).collect(),
+            prerequisites: parsed.prerequisites().map(Prerequisite::new).collect(),
+            recipes: parsed.recipes().map(Recipe::new).collect(),
         }
     }
 }

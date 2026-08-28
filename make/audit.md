@@ -443,12 +443,20 @@ findings and reported complete without them. They are unchanged since.
   against new shows no behavioural difference. What is fixed is the structure:
   the exit status is decided where the other exit statuses are decided._
   Test `dash_q_answers_with_a_status_and_no_output`.
-- [ ] **#77 — A bare `.PHONY:` marks every rule phony.** POSIX 105677 says a
-  `.PHONY` with no prerequisites shall be ignored; instead nothing is ever
-  up to date. Planned as N4.
-- [ ] **#78 — `.IGNORE`/`.SILENT`/`.PRECIOUS` apply per rule, not per target.**
-  `a b: dep` with `.IGNORE: a` silences `b` too, because both targets live on one
-  rule. Planned as N5.
+- [x] **#77 — A bare `.PHONY:` marks every rule phony.** ✓ fixed 2026-08-28.
+  It named no targets, so it fell through to the global modifier and marked
+  every rule; POSIX 105677 says such a target shall be ignored, and it is.
+  Tests `a_bare_phony_is_ignored`, `a_named_phony_is_always_out_of_date`.
+- [x] **#78 — `.IGNORE`/`.SILENT`/`.PRECIOUS` apply per rule, not per target.**
+  ✓ fixed 2026-08-28. The four attribute flags moved off `Rule` into an
+  `Attributes` map keyed by target name, which is what POSIX describes
+  ("prerequisites of this special target are targets themselves"). A rule
+  naming several targets can no longer spread one target's attribute across
+  the others. The whole-makefile forms set the corresponding global option
+  instead of marking every rule, again as specified — `.IGNORE` with no
+  prerequisites means "as if -i". `rule::config` had no members left and is
+  deleted. Tests `ignore_applies_to_the_named_target_only`,
+  `silent_applies_to_the_named_target_only`, plus unit tests on `Attributes`.
 
 ## Acceptance gate
 

@@ -2031,3 +2031,103 @@ mod interrupt {
         let _ = fs::remove_dir_all(dir);
     }
 }
+
+// The attribute special targets name *targets*, not rules.
+mod attributes {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, String, Option<i32>) {
+        let output = Command::new(get_binary_path("make"))
+            .args(args)
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #77: POSIX 105677 -- a `.PHONY` with no prerequisites shall be
+    // ignored. It used to fall through to the global modifier and mark every
+    // rule phony, so nothing in the makefile was ever up to date.
+    #[test]
+    fn a_bare_phony_is_ignored() {
+        let dir = "bare_phony_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".PHONY:\nbp_out:\n\t@echo BUILT\n",
+        );
+        let _ = fs::write(format!("{dir}/bp_out"), "");
+
+        let (stdout, _, code) = run(&["-C", dir, "bp_out"]);
+        assert!(!stdout.contains("BUILT"), "bare .PHONY made it phony");
+        assert!(stdout.contains("is up to date"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // ...and a `.PHONY` that does name a target still works.
+    #[test]
+    fn a_named_phony_is_always_out_of_date() {
+        let dir = "named_phony_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".PHONY: np_out\nnp_out:\n\t@echo BUILT\n",
+        );
+        let _ = fs::write(format!("{dir}/np_out"), "");
+
+        let (stdout, _, code) = run(&["-C", dir, "np_out"]);
+        assert!(stdout.contains("BUILT"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Audit #78: `.IGNORE: a` used to set a flag on the whole `Rule`, so the
+    // other target on `a b: dep` was silenced too.
+    #[test]
+    fn ignore_applies_to_the_named_target_only() {
+        let dir = "ignore_scope_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".IGNORE: is_a\nis_a is_b:\n\t@echo running $@; false\n",
+        );
+
+        let (_, _, ignored) = run(&["-C", dir, "is_a"]);
+        assert_eq!(ignored, Some(0), ".IGNORE did not reach its own target");
+
+        let (_, _, not_ignored) = run(&["-C", dir, "is_b"]);
+        assert_eq!(not_ignored, Some(2), ".IGNORE leaked to a sibling target");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Same for `.SILENT`: the recipe of the target it names is not echoed, the
+    // sibling's still is.
+    #[test]
+    fn silent_applies_to_the_named_target_only() {
+        let dir = "silent_scope_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".SILENT: ss_a\nss_a ss_b:\n\techo running $@\n",
+        );
+
+        let (quiet, _, _) = run(&["-C", dir, "ss_a"]);
+        assert_eq!(quiet, "running ss_a\n", "the recipe line was echoed");
+
+        let (loud, _, _) = run(&["-C", dir, "ss_b"]);
+        assert!(
+            loud.contains("echo running ss_b"),
+            ".SILENT leaked to a sibling target; stdout: {loud}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}

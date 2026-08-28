@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+pub mod attributes;
 pub mod config;
 pub mod error_code;
 pub mod graph;
@@ -93,6 +94,8 @@ pub struct Make {
     vpaths: Vec<VPathEntry>,
     /// Macros an `export` directive put in the recipe environment.
     exports: Vec<String>,
+    /// What the attribute special targets say about each target.
+    attributes: attributes::Attributes,
     pub config: Config,
 }
 
@@ -509,7 +512,8 @@ impl Make {
         // `$?` is the prerequisites newer than the target.
         let newer = self.newer_prerequisites(target.as_ref(), &prerequisites);
         let exists = get_modified_time(self.resolve_vpath(target.as_ref())).is_some();
-        let up_to_date = !rebuilt && newer.is_empty() && exists && !rule.config.phony;
+        let phony = self.attributes.is_phony(target.as_ref());
+        let up_to_date = !rebuilt && newer.is_empty() && exists && !phony;
 
         if up_to_date {
             return Ok(false);
@@ -567,6 +571,7 @@ impl Make {
             macros: &self.macros,
             exports: &self.exports,
             resolve: &resolve,
+            attributes: &self.attributes,
         })
     }
 
@@ -808,6 +813,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             ledger: graph::Ledger::new(),
             vpaths,
             exports,
+            attributes: attributes::Attributes::default(),
             config,
         };
 

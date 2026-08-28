@@ -424,6 +424,19 @@ mod conditionals {
         assert_eq!(value(src, "CC"), "clang");
     }
 
+    // Audit #81: the directive was recognized on the raw line, before the
+    // comment was stripped, so the comment became part of the condition.
+    // `ifeq` failed the whole makefile; `ifdef` silently took the else arm.
+    #[test]
+    fn a_trailing_comment_does_not_reach_the_condition() {
+        let src = "X = 1\nifeq ($(X),1)   # why\nA = yes\nelse\nA = no\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "A"), "yes");
+        let src = "X = 1\nifdef X  # why\nB = yes\nelse\nB = no\nendif\nall:\n\techo hi\n";
+        assert_eq!(value(src, "B"), "yes");
+        let src = "ifeq (a,b)  # why\nC = no\nendif  # and here\nall:\n\techo hi\n";
+        assert_eq!(value(src, "C"), "");
+    }
+
     #[test]
     fn ifneq_inverts_the_test() {
         let src = "A = x\nifneq ($(A),y)\nR = ok\nendif\nall:\n\techo hi\n";

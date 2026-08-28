@@ -1162,7 +1162,17 @@ impl Reader {
 
     /// Handle one line; returns the index of the last line it consumed.
     fn handle_line(&mut self, lines: &[&str], i: usize) -> Result<usize> {
-        let line = lines[i];
+        // Every line but a command line loses its comment first. POSIX 105629
+        // hands a command line to the shell verbatim, where `#` is meaningful;
+        // everywhere else a `#` ends the line. Stripping here rather than at
+        // `keep` time is what lets `ifeq ($(X),1)  # why` be read as a
+        // conditional at all -- the comment used to reach `parse_directive`
+        // as part of the condition, so the makefile failed outright, and
+        // `ifdef X  # why` silently took the `else` arm (audit #81).
+        let line = match lines[i].starts_with('\t') {
+            true => lines[i],
+            false => super::scan::strip_comment(lines[i]),
+        };
 
         if let Some(directive) = parse_directive(line) {
             match directive {

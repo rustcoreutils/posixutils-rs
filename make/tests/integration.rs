@@ -1953,3 +1953,81 @@ mod up_to_date {
         let _ = fs::remove_dir_all("utd_vpath_src");
     }
 }
+
+// Interrupt handling, and the `-q` question. Both used to be answered from
+// inside the recipe loop.
+mod interrupt {
+    use super::*;
+    use std::fs;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    /// Signal `pid`, the way a shell would.
+    fn interrupt(pid: u32) {
+        let _ = Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status();
+    }
+
+    // Audit #75: the in-flight target was one global slot, written before
+    // every recipe line and never cleared. Under `-j` the second worker
+    // overwrote the first, so an interrupt cleaned up one partial file and
+    // left the other on disk -- exactly the state POSIX has make delete.
+    #[test]
+    fn an_interrupt_cleans_up_every_target_in_flight() {
+        let dir = "interrupt_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            ".PHONY: all\nall: ip_p ip_q\nip_p:\n\t@echo partial > ip_p; sleep 2\nip_q:\n\t@echo partial > ip_q; sleep 2\n",
+        );
+
+        let mut child = Command::new(get_binary_path("make"))
+            .args(["-C", dir, "-j4"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to run make");
+
+        // Long enough for both recipes to have written their partial file.
+        sleep(Duration::from_millis(600));
+        interrupt(child.id());
+        let _ = child.wait();
+
+        let left: Vec<&str> = ["ip_p", "ip_q"]
+            .into_iter()
+            .filter(|name| std::path::Path::new(&format!("{dir}/{name}")).exists())
+            .collect();
+        let _ = fs::remove_dir_all(dir);
+        assert!(left.is_empty(), "partial files left behind: {left:?}");
+    }
+
+    // Audit #76: `-q` used to answer by calling `process::exit` from the
+    // recipe loop. The status is decided by `main` now; the answer itself must
+    // not change, and nothing may be printed.
+    #[test]
+    fn dash_q_answers_with_a_status_and_no_output() {
+        let dir = "quiet_probe";
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            format!("{dir}/Makefile"),
+            "all: qp_a qp_b\nqp_a:\n\t@echo a > qp_a\nqp_b:\n\t@echo b > qp_b\n",
+        );
+
+        let out = Command::new(get_binary_path("make"))
+            .args(["-C", dir, "-j2", "-q", "all"])
+            .output()
+            .expect("failed to run make");
+
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty(), "-q printed to stdout");
+        assert!(out.stderr.is_empty(), "-q printed to stderr");
+        assert!(
+            !std::path::Path::new(&format!("{dir}/qp_a")).exists(),
+            "-q ran a recipe"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}

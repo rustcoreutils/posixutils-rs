@@ -436,6 +436,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         match make.build_target(&target) {
+            // -q asks a question and prints nothing: the answer is the exit
+            // status. The build reports "not up to date" rather than calling
+            // `process::exit` from a worker thread (audit #76), so the choice
+            // of status lands here instead.
+            Err(NotUpToDateError { .. }) if quit => {
+                status_code = 1;
+                break;
+            }
+            Ok(_) if quit => {}
             Ok(updated) => {
                 if !updated {
                     println!(

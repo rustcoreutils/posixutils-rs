@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::{
     collections::HashMap,
     fs::{File, FileTimes},
-    process::{self, Command},
+    process::Command,
     sync::{Arc, LazyLock, Mutex},
     time::SystemTime,
 };
@@ -49,8 +49,42 @@ pub struct InterruptInfo {
     pub original_mtime: Option<SystemTime>,
 }
 
-pub static INTERRUPT_FLAG: LazyArcMutex<Option<InterruptInfo>> =
-    LazyLock::new(|| Arc::new(Mutex::new(None)));
+/// Every target whose recipe is running right now.
+///
+/// A list, not a single slot: under `-j` several recipes are in flight at once
+/// and each has its own target to clean up. It used to be one global written
+/// before every recipe line and never cleared, so concurrent workers
+/// overwrote each other and a signal arriving after the last recipe consulted
+/// a stale entry (audit #75).
+pub static IN_FLIGHT: LazyArcMutex<Vec<InterruptInfo>> =
+    LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
+
+/// Registers a target as in flight for as long as this value lives.
+///
+/// A guard rather than a matching pair of calls: a recipe can leave
+/// `run_with_files` by any of half a dozen `return`s, and every one of them
+/// must drop the entry.
+struct InFlight {
+    target: String,
+}
+
+impl InFlight {
+    fn enter(info: InterruptInfo) -> Self {
+        let target = info.target.clone();
+        IN_FLIGHT.lock().unwrap().push(info);
+        Self { target }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = IN_FLIGHT.lock() {
+            if let Some(at) = in_flight.iter().position(|i| i.target == self.target) {
+                in_flight.remove(at);
+            }
+        }
+    }
+}
 
 /// Everything a recipe needs that does not vary from one rule to the next.
 ///
@@ -259,6 +293,27 @@ impl Rule {
             .ok()
             .and_then(|m| m.modified().ok());
 
+        let dry_run = global_dry_run;
+        let touch = global_touch;
+        let env_macros = global_env_macros;
+        let quit = global_quit;
+        let print = global_print;
+        let precious = global_precious || rule_precious;
+
+        // POSIX: make catches signals unless -n, -p, or -q is set (those take
+        // the default action). -i is not an exemption.
+        if !dry_run && !print && !quit {
+            signal_handler::register_signals();
+        }
+
+        // Dropped on the way out, however this returns.
+        let _in_flight = InFlight::enter(InterruptInfo {
+            target: target.as_ref().to_string(),
+            precious,
+            phony: rule_phony,
+            original_mtime,
+        });
+
         for inout in files {
             for recipe in self.recipes() {
                 let RecipeConfig {
@@ -268,27 +323,8 @@ impl Rule {
                 } = recipe.config;
 
                 let ignore = global_ignore || rule_ignore || recipe_ignore;
-                let dry_run = global_dry_run;
                 let silent = global_silent || rule_silent || recipe_silent;
                 let force_run = recipe_force_run;
-                let touch = global_touch;
-                let env_macros = global_env_macros;
-                let quit = global_quit;
-                let print = global_print;
-                let precious = global_precious || rule_precious;
-
-                *INTERRUPT_FLAG.lock().unwrap() = Some(InterruptInfo {
-                    target: target.as_ref().to_string(),
-                    precious,
-                    phony: rule_phony,
-                    original_mtime,
-                });
-
-                // POSIX: make catches signals unless -n, -p, or -q is set (those
-                // take the default action). -i is not an exemption.
-                if !dry_run && !print && !quit {
-                    signal_handler::register_signals();
-                }
 
                 // POSIX: a recipe line prefixed with `+`, or one containing the
                 // `$(MAKE)`/`${MAKE}` macro, is executed even under -n, -t, or
@@ -314,13 +350,19 @@ impl Rule {
                     if touch {
                         continue;
                     }
-                    // -q flag
+                    // -q asks a question; it never runs anything. Reaching a
+                    // recipe means the answer is "not up to date", which is
+                    // reported to `main` as a status. It used to be answered
+                    // with `process::exit` from right here -- under `-j` that
+                    // is a worker thread inside `thread::scope`, abandoning
+                    // its siblings mid-build (audit #76).
                     if quit {
                         if up_to_date {
-                            process::exit(0);
-                        } else {
-                            process::exit(1);
+                            continue;
                         }
+                        return Err(NotUpToDateError {
+                            target: target.as_ref().to_string(),
+                        });
                     }
                 }
 
@@ -374,7 +416,6 @@ impl Rule {
             }
 
             let silent = global_silent || rule_silent;
-            let touch = global_touch;
 
             // -t flag. A .PHONY target names no file, so touching it would
             // create one and make every later `make <target>` report it up to

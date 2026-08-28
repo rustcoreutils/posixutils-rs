@@ -429,12 +429,20 @@ findings and reported complete without them. They are unchanged since.
   adds to the recipe environment rather than merely parsing. Bare `export` marks
   every macro. Tests `export_directive_puts_a_macro_in_the_environment`,
   `a_macro_is_not_exported_without_the_directive`.
-- [ ] **#75 — `INTERRUPT_FLAG` is never cleared and is shared under `-j`.** Written
-  before every recipe line, never reset, one global for all workers. A SIGINT
-  after a build consults a stale target; concurrent recipes overwrite each other.
-  Planned as N3.
-- [ ] **#76 — `-q` calls `process::exit` from a worker thread.** Under `-j` that
-  exits mid `thread::scope`, abandoning siblings. Planned as N2.
+- [x] **#75 — `INTERRUPT_FLAG` is never cleared and is shared under `-j`.**
+  ✓ fixed 2026-08-28. It is a list of in-flight targets now, entered once per
+  target by an RAII guard so every exit path from the recipe loop clears it,
+  and the handler cleans up all of them. Probed old against new: a SIGINT
+  during a two-worker build left one partial file on disk before, none now.
+  Test `an_interrupt_cleans_up_every_target_in_flight`.
+- [x] **#76 — `-q` calls `process::exit` from a worker thread.** ✓ fixed
+  2026-08-28. The recipe loop reports "not up to date" and `main` chooses the
+  status. _Correction to the finding: the abandoned-siblings scenario is not
+  reachable — `build_prerequisites` already excludes `-q` from its parallel
+  predicate, so a `-q` build is serial whatever `-j` says, and a probe of old
+  against new shows no behavioural difference. What is fixed is the structure:
+  the exit status is decided where the other exit statuses are decided._
+  Test `dash_q_answers_with_a_status_and_no_output`.
 - [ ] **#77 — A bare `.PHONY:` marks every rule phony.** POSIX 105677 says a
   `.PHONY` with no prerequisites shall be ignored; instead nothing is ever
   up to date. Planned as N4.

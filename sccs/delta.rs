@@ -169,13 +169,44 @@ fn read_gfile_for(sccs: &SccsFile, sfile_path: &Path) -> io::Result<Vec<String>>
     Ok(plib::sccsfile::uuencode_sccs(&raw))
 }
 
-/// Reconstruct the base version (what was gotten with get -e)
-fn reconstruct_base(sccs: &SccsFile, base_serial: u16) -> io::Result<Vec<String>> {
-    let applied_set = sccs
-        .compute_applied_set(base_serial)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+/// The set of deltas that made up the version `get -e` handed the user.
+///
+/// The `-i`/`-x` lists recorded in the p-file are part of that: without them
+/// the base still holds an excluded delta's lines, and the diff charges their
+/// absence from the g-file to the user as deletions they never made. The same
+/// set has to drive the body rewrite, or the rewrite counts base lines the
+/// diff never saw and lands the edit at the wrong offset.
+fn base_applied_set(
+    sccs: &SccsFile,
+    base_serial: u16,
+    included: &[u16],
+    excluded: &[u16],
+) -> io::Result<HashSet<u16>> {
+    sccs.applied_set_with(base_serial, included, excluded)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
 
-    Ok(sccs.evaluate_body(&applied_set))
+/// Resolve one of the p-file's `-i`/`-x` option-arguments into delta serials.
+///
+/// The list was written by `get -e`, which already validated it, so an
+/// unresolvable token here means the s-file changed underneath the edit.
+fn resolve_pfile_list(
+    sccs: &SccsFile,
+    list: Option<&str>,
+    sfile_path: &Path,
+) -> Result<Vec<u16>, String> {
+    let Some(list) = list else {
+        return Ok(Vec::new());
+    };
+    let (serials, unresolved) = sccs.resolve_sid_list(list)?;
+    for tok in unresolved {
+        diag::error_path(
+            "delta",
+            sfile_path,
+            &format!("{}: {}", tok, gettext("no such delta")),
+        );
+    }
+    Ok(serials)
 }
 
 /// Diff the base version against the g-file.
@@ -288,13 +319,11 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]
 /// Apply diff operations to the SCCS body
 fn apply_diff_to_body(
     sccs: &SccsFile,
-    base_serial: u16,
+    applied_set: &HashSet<u16>,
     new_serial: u16,
     new_lines: &[String],
     diff_ops: &[LineOp],
 ) -> Vec<BodyRecord> {
-    let applied_set = sccs.compute_applied_set(base_serial).unwrap();
-
     // First, collect all lines that need to be deleted or kept
     let mut delete_set = HashSet::new();
     let mut insert_after: Vec<(usize, Vec<String>)> = Vec::new();
@@ -345,7 +374,7 @@ fn apply_diff_to_body(
                 new_body.push(record.clone());
             }
             BodyRecord::Text(_line) => {
-                let visible = plib::sccsfile::is_line_visible(&stack, &applied_set);
+                let visible = plib::sccsfile::is_line_visible(&stack, applied_set);
 
                 if visible {
                     // Check for inserts before this position
@@ -561,8 +590,26 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // Read g-file
     let new_lines = read_gfile_for(&sccs, sfile_path)?;
 
+    // The edit was made against the version `get -e` produced, which means the
+    // -i/-x lists it recorded in the p-file, not the plain base.
+    let forced_in = match resolve_pfile_list(&sccs, pfile_entry.included.as_deref(), sfile_path) {
+        Ok(v) => v,
+        Err(e) => {
+            diag::error_path("delta", sfile_path, &e);
+            return Ok(false);
+        }
+    };
+    let forced_out = match resolve_pfile_list(&sccs, pfile_entry.excluded.as_deref(), sfile_path) {
+        Ok(v) => v,
+        Err(e) => {
+            diag::error_path("delta", sfile_path, &e);
+            return Ok(false);
+        }
+    };
+
     // Reconstruct base version
-    let base_lines = reconstruct_base(&sccs, base_serial)?;
+    let applied_set = base_applied_set(&sccs, base_serial, &forced_in, &forced_out)?;
+    let base_lines = sccs.evaluate_body(&applied_set);
 
     // Compute diff
     let (stats, diff_ops) = compute_diff(&base_lines, &new_lines);
@@ -608,8 +655,11 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         serial: new_serial,
         pred_serial: base_serial,
         stats,
-        included: Vec::new(),
-        excluded: Vec::new(),
+        // The forced inclusions and exclusions belong to this delta's
+        // provenance: POSIX mandates prs :Dn:/:Dx: report them, and without
+        // them the exclusion reads as an ordinary edit forever after.
+        included: forced_in,
+        excluded: forced_out,
         ignored,
         mr_numbers: mrs,
         comments: if comment.is_empty() {
@@ -634,7 +684,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     }
 
     // Apply diff to body
-    let new_body = apply_diff_to_body(&sccs, base_serial, new_serial, &new_lines, &diff_ops);
+    let new_body = apply_diff_to_body(&sccs, &applied_set, new_serial, &new_lines, &diff_ops);
     sccs.body = new_body;
 
     // Add new delta to header (at the beginning - deltas are stored newest first)

@@ -948,3 +948,124 @@ fn delta_round_trips_a_binary_file() {
         "the re-gotten binary must match byte for byte"
     );
 }
+
+/// `get -e -x` records the exclusion in the p-file, and `delta` must both diff
+/// against the version the user actually edited and record the exclusion on
+/// the new delta.
+///
+/// It did neither: `reconstruct_base` called compute_applied_set on the base
+/// serial alone, so the base still contained the excluded delta's line and the
+/// diff charged its absence to the user as a deletion; and the new DeltaEntry
+/// hardcoded empty included/excluded lists, losing the provenance that POSIX
+/// requires prs :Dn:/:Dx: to report. CSSC reports 1 inserted / 0 deleted /
+/// 2 unchanged and records ^Ax 2.
+#[test]
+fn delta_honors_and_records_the_pfile_exclude_list() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "excl", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    // 1.2 adds b, 1.3 adds c.
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "two");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\nc\n").unwrap();
+    run_delta(&sfile, "three");
+
+    // Edit 1.3 with 1.2 forced out: the working file is "a\nc\n".
+    let out = super::common::run_in("get", &["-e", "-x1.2", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -x1.2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&gfile).unwrap(),
+        "a\nc\n",
+        "the g-file must omit the excluded delta's line"
+    );
+
+    // Append one line: exactly one insertion and nothing else.
+    fs::write(&gfile, "a\nc\nd\n").unwrap();
+    let out = super::common::run_in("delta", &["-yfour", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 inserted"), "got {stdout:?}");
+    assert!(
+        stdout.contains("0 deleted"),
+        "the exclusion must not be charged to the user as a deletion: {stdout:?}"
+    );
+    assert!(stdout.contains("2 unchanged"), "got {stdout:?}");
+
+    // The exclusion is recorded on the new delta, by serial.
+    let out = super::common::run_in("prs", &["-d:Dx:", "-r1.4", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "2",
+        "the new delta must record the excluded serial"
+    );
+
+    // And the retrieved 1.4 is what the user edited.
+    get_version_silent(&sfile, "a\nc\nd\n");
+}
+
+/// The include side of the same rule: `get -e -i` forces a delta in, and the
+/// new delta records it.
+#[test]
+fn delta_honors_and_records_the_pfile_include_list() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "incl", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    // 1.2 adds b, then a branch-free 1.3 removes it again.
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "two");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\n").unwrap();
+    run_delta(&sfile, "three");
+
+    // Retrieve 1.1 with 1.2 forced back in.
+    let out = super::common::run_in("get", &["-e", "-r1.1", "-i1.2", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -i1.2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&gfile).unwrap(),
+        "a\nb\n",
+        "the g-file must contain the forced-in delta's line"
+    );
+
+    fs::write(&gfile, "a\nb\nz\n").unwrap();
+    let out = super::common::run_in("delta", &["-yfour", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 inserted") && stdout.contains("0 deleted"),
+        "the inclusion must not be charged to the user as an edit: {stdout:?}"
+    );
+
+    let sid = stdout.lines().next().unwrap_or("").trim().to_string();
+    let out = super::common::run_in(
+        "prs",
+        &["-d:Dn:", &format!("-r{sid}"), &sfile_s],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "2",
+        "the new delta must record the included serial"
+    );
+}

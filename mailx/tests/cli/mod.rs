@@ -22,39 +22,12 @@
 //! Tests use static test data files for reproducible results.
 
 use plib::testing::{run_test, run_test_with_checker, run_test_with_checker_and_env, TestPlan};
-use plib::tmp::NamedTempFile;
-use std::io::Write;
-use std::path::PathBuf;
+
+use crate::common::{create_temp_mailrc, create_temp_mbox, test_data_path};
 
 // =============================================================================
 // Test Data Helpers
 // =============================================================================
-
-/// Get path to static test data file in tests/ directory
-fn test_data_path(filename: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests");
-    path.push(filename);
-    path
-}
-
-/// Helper to create a temporary mailrc file
-fn create_temp_mailrc(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mailrc");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mailrc");
-    file.flush().expect("failed to flush temp mailrc");
-    file
-}
-
-/// Helper to create a temporary mbox file
-fn create_temp_mbox(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mbox");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mbox");
-    file.flush().expect("failed to flush temp mbox");
-    file
-}
 
 // =============================================================================
 // -e Option: Check for Mail Presence

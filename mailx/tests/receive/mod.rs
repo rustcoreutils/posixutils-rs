@@ -19,33 +19,6 @@
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use plib::tmp::NamedTempFile;
 use std::io::Write;
-use std::path::PathBuf;
-
-/// Get path to static test data file in tests/ directory
-fn test_data_path(filename: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests");
-    path.push(filename);
-    path
-}
-
-/// Copy a static test data file to a temporary location
-/// Use this for tests that may modify the mailbox (quit saves changes)
-fn copy_test_data(filename: &str) -> NamedTempFile {
-    let src_path = test_data_path(filename);
-    let content = std::fs::read_to_string(&src_path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", src_path.display(), e));
-    create_temp_mbox(&content)
-}
-
-/// Helper to create a temporary mbox file (for tests needing custom content)
-fn create_temp_mbox(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mbox");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mbox");
-    file.flush().expect("failed to flush temp mbox");
-    file
-}
 
 /// Test headers display (-H option)
 /// Verifies:
@@ -1031,17 +1004,20 @@ fn cmd_print_uppercase() {
                 String::from("-f"),
                 String::from(mbox_path),
             ],
-            stdin_data: String::from("Print 1\nquit\n"),
+            // `discard` first: without it this asserts nothing, because the
+            // lowercase form prints Date: and From: too when no header is
+            // suppressed. That is how both of these passed while `Print` was
+            // unreachable and silently ran `print`.
+            stdin_data: String::from("discard Date\nPrint 1\nquit\n"),
             expected_out: String::new(),
             expected_err: String::new(),
             expected_exit_code: 0,
         },
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Print should show all headers including Date
             assert!(
                 stdout.contains("Date:") && stdout.contains("From:"),
-                "Print should show all headers: {}",
+                "Print must override discard and show all headers: {}",
                 stdout
             );
             assert!(output.status.success());
@@ -1064,7 +1040,8 @@ fn cmd_type_uppercase() {
                 String::from("-f"),
                 String::from(mbox_path),
             ],
-            stdin_data: String::from("Type 1\nquit\n"),
+            // `discard` first, for the same reason as cmd_print_uppercase.
+            stdin_data: String::from("discard Date\nType 1\nquit\n"),
             expected_out: String::new(),
             expected_err: String::new(),
             expected_exit_code: 0,
@@ -1073,7 +1050,7 @@ fn cmd_type_uppercase() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
                 stdout.contains("Date:") && stdout.contains("From:"),
-                "Type should work like Print: {}",
+                "Type must override discard, like Print: {}",
                 stdout
             );
             assert!(output.status.success());
@@ -2391,16 +2368,11 @@ fn conditional_commands_outside() {
     );
 }
 
-/// Helper to create a temporary mailrc file
-fn create_temp_mailrc(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mailrc");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mailrc");
-    file.flush().expect("failed to flush temp mailrc");
-    file
-}
-
 use plib::testing::run_test_with_checker_and_env;
+
+use crate::common::{
+    assert_no_panic, copy_test_data, create_temp_mailrc, create_temp_mbox, test_data_path,
+};
 
 // =============================================================================
 // `new` message state and the :n selector (audit #8)
@@ -3370,24 +3342,6 @@ fn append_places_migrated_messages_last() {
 // =============================================================================
 // Inputs that aborted the process
 // =============================================================================
-
-/// Assert a run completed without a Rust panic.
-fn assert_no_panic(output: &std::process::Output, what: &str) {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("panicked"),
-        "{} panicked: {}",
-        what,
-        stderr
-    );
-    assert_ne!(
-        output.status.code(),
-        Some(101),
-        "{} aborted: {}",
-        what,
-        stderr
-    );
-}
 
 /// A `From:` whose display name contains `>` before `<` must not abort.
 ///

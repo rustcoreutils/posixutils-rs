@@ -13,17 +13,8 @@
 //! variable or expect controlled failures when sendmail is unavailable.
 
 use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
-use plib::tmp::NamedTempFile;
-use std::io::Write;
 
-/// Helper to create a temporary mailrc file with given content
-fn create_temp_mailrc(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mailrc");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mailrc");
-    file.flush().expect("failed to flush temp mailrc");
-    file
-}
+use crate::common::create_temp_mailrc;
 
 /// Test basic send mode with single recipient
 /// Verifies:

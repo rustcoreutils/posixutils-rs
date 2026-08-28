@@ -27,47 +27,13 @@
 //! - testdata-5msg.mbox: 5 messages
 
 use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
-use plib::tmp::{NamedTempFile, TempDir};
-use std::io::Write;
-use std::path::PathBuf;
+use plib::tmp::TempDir;
+
+use crate::common::{copy_test_data, create_temp_mailrc};
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
-
-/// Get path to static test data file in tests/ directory
-fn test_data_path(filename: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests");
-    path.push(filename);
-    path
-}
-
-/// Copy a static test data file to a temporary location
-fn copy_test_data(filename: &str) -> NamedTempFile {
-    let src_path = test_data_path(filename);
-    let content = std::fs::read_to_string(&src_path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", src_path.display(), e));
-    create_temp_mbox(&content)
-}
-
-/// Helper to create a temporary mbox file
-fn create_temp_mbox(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mbox");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mbox");
-    file.flush().expect("failed to flush temp mbox");
-    file
-}
-
-/// Helper to create a temporary mailrc file
-fn create_temp_mailrc(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mailrc");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mailrc");
-    file.flush().expect("failed to flush temp mailrc");
-    file
-}
 
 // =============================================================================
 // Basic Set/Unset Operations

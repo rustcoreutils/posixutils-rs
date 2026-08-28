@@ -1087,7 +1087,6 @@ name = "posixutils-mailx"
 version = "0.8.0"
 dependencies = [
  "chrono",
- "filetime",
  "gettext-rs",
  "libc",
  "plib",

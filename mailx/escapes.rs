@@ -76,7 +76,10 @@ pub fn handle_escape(
     }
 
     let cmd_char = line.chars().next().unwrap();
-    let args = line[1..].trim();
+    // Slice past the command character by its UTF-8 length. Slicing at byte 1
+    // split a multibyte character (`~élan`) and panicked -- the callers already
+    // take care to advance by `len_utf8` past the escape character itself.
+    let args = line[cmd_char.len_utf8()..].trim();
 
     match cmd_char {
         '.' => {

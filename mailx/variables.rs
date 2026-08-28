@@ -10,6 +10,7 @@
 //! Internal variables for mailx
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 /// Mailx internal variables
 #[derive(Debug)]
@@ -78,6 +79,20 @@ impl Variables {
         self.get(name).and_then(|s| s.parse().ok())
     }
 
+    /// Header summaries per screenful, for the `headers` and `z` commands.
+    ///
+    /// The return type carries the non-zero guarantee rather than leaving each
+    /// caller to remember it: `screen` comes from the user, and every one of
+    /// the three sites that divides by it used to divide by zero on
+    /// `set screen=0`.
+    pub fn screen_lines(&self) -> NonZeroUsize {
+        const DEFAULT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
+        self.get_number("screen")
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(NonZeroUsize::new)
+            .unwrap_or(DEFAULT)
+    }
+
     /// Set a boolean variable
     pub fn set_bool(&mut self, name: &str, value: bool) {
         // Handle ask/asksub synonyms
@@ -132,27 +147,44 @@ impl Variables {
 
     /// Expand an alias
     pub fn expand_alias(&self, name: &str) -> Vec<String> {
-        if let Some(addrs) = self.aliases.get(name) {
-            let mut result = Vec::new();
-            for addr in addrs {
-                // A leading unquoted backslash prevents expansion of this group
-                // member (spec 104720-104721): strip it and take the rest as-is.
-                if let Some(literal) = addr.strip_prefix('\\') {
-                    result.push(literal.to_string());
-                    continue;
-                }
-                // Recursively expand
-                let expanded = self.expand_alias(addr);
-                if expanded.is_empty() {
-                    result.push(addr.clone());
-                } else {
-                    result.extend(expanded);
-                }
-            }
-            result
-        } else {
-            Vec::new()
+        let mut active = Vec::new();
+        self.expand_alias_inner(name, &mut active)
+    }
+
+    /// Expand `name`, with `active` naming the aliases already being expanded.
+    ///
+    /// An alias that refers back to one further up the chain is emitted
+    /// literally rather than followed. Without this, `alias a b` plus
+    /// `alias b a` -- or simply `alias a a` -- recursed until the stack died,
+    /// and a start-up file is a natural place for such a definition to appear.
+    fn expand_alias_inner(&self, name: &str, active: &mut Vec<String>) -> Vec<String> {
+        let Some(addrs) = self.aliases.get(name) else {
+            return Vec::new();
+        };
+        if active.iter().any(|a| a == name) {
+            return Vec::new();
         }
+        active.push(name.to_string());
+
+        let mut result = Vec::new();
+        for addr in addrs {
+            // A leading unquoted backslash prevents expansion of this group
+            // member (spec 104720-104721): strip it and take the rest as-is.
+            if let Some(literal) = addr.strip_prefix('\\') {
+                result.push(literal.to_string());
+                continue;
+            }
+            // Recursively expand
+            let expanded = self.expand_alias_inner(addr, active);
+            if expanded.is_empty() {
+                result.push(addr.clone());
+            } else {
+                result.extend(expanded);
+            }
+        }
+
+        active.pop();
+        result
     }
 
     /// Whether commands should currently execute given the conditional stack

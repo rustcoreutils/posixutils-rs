@@ -16,7 +16,7 @@ use std::process::Command;
 
 use crate::escapes::handle_escape;
 use crate::mailbox::Mailbox;
-use crate::message::{extract_login, Disposition, ReadState};
+use crate::message::{author_filename, Disposition, ReadState};
 use crate::msglist::{parse_message, parse_msglist};
 use crate::send::{compose_reply, send_message, ComposedMessage};
 use crate::variables::{parse_set_arg, Variables};
@@ -475,7 +475,7 @@ fn cmd_copy_author(
     };
 
     if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
-        let filename = extract_login(first_msg.from());
+        let filename = author_filename(first_msg.from())?;
         let filename = expand_filename(filename, vars);
 
         mb.save_messages(&msg_nums, &filename, true)?;
@@ -670,7 +670,7 @@ fn cmd_followup(
     let mut composed = compose_reply(original, reply_to_all, vars);
 
     // Record to file named after first recipient
-    let record_file = extract_login(original.from());
+    let record_file = author_filename(original.from())?;
     let record_file = expand_filename(record_file, vars);
 
     // Enter input mode
@@ -704,7 +704,7 @@ fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<Command
         mb.current = msg_num;
     }
 
-    let screen = vars.get_number("screen").unwrap_or(20) as usize;
+    let screen = vars.screen_lines().get();
     let start = if mb.current > 0 {
         ((mb.current - 1) / screen) * screen + 1
     } else {
@@ -1150,7 +1150,7 @@ fn cmd_save_author(
     };
 
     if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
-        let filename = extract_login(first_msg.from());
+        let filename = author_filename(first_msg.from())?;
         let filename = expand_filename(filename, vars);
 
         mb.save_messages(&msg_nums, &filename, true)?;
@@ -1527,7 +1527,7 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRe
 }
 
 fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
-    let screen = vars.get_number("screen").unwrap_or(20) as usize;
+    let screen = vars.screen_lines().get();
     let direction = if args.starts_with('-') { -1i32 } else { 1 };
 
     let current_page = (mb.current.saturating_sub(1)) / screen;

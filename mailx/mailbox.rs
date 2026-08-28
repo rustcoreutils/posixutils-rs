@@ -244,7 +244,7 @@ impl Mailbox {
 
     /// Print header summary for messages
     pub fn print_headers(&self, msg_nums: Option<&[usize]>, vars: &Variables) {
-        let screen = vars.get_number("screen").unwrap_or(20) as usize;
+        let screen = vars.screen_lines().get();
         let show_to = vars.get_bool("showto");
         let user = std::env::var("USER").unwrap_or_default();
 

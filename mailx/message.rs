@@ -242,10 +242,13 @@ impl Message {
                 return truncate_display(name, 18);
             }
         }
-        // Try to extract name from "(Name)" format
+        // Try to extract name from "(Name)" format. The closing paren is
+        // searched for *after* the opening one; searching from the start of the
+        // string inverts the range whenever `)` precedes `(`, which panicked
+        // while printing the start-up header summary.
         if let Some(start) = from.find('(') {
-            if let Some(end) = from.find(')') {
-                let name = &from[start + 1..end];
+            if let Some(end) = from[start + 1..].find(')') {
+                let name = &from[start + 1..start + 1 + end];
                 if !name.is_empty() {
                     return truncate_display(name, 18);
                 }
@@ -273,10 +276,14 @@ pub(crate) fn truncate_display(s: &str, max_len: usize) -> String {
 }
 
 /// Extract email address from a string like "Name <email>" or just "email"
+///
+/// The closing bracket is searched for *after* the opening one. Searching from
+/// the start of the string inverted the range for any display name containing a
+/// `>` ahead of the `<`, e.g. `Bob >_< Smith <bob@example.com>`.
 pub fn extract_address(s: &str) -> &str {
     if let Some(start) = s.find('<') {
-        if let Some(end) = s.find('>') {
-            return &s[start + 1..end];
+        if let Some(end) = s[start + 1..].find('>') {
+            return &s[start + 1..start + 1 + end];
         }
     }
     s.trim()
@@ -290,4 +297,23 @@ pub fn extract_login(addr: &str) -> &str {
     } else {
         addr
     }
+}
+
+/// The login name of a message's author, usable as a filename component.
+///
+/// `Save`, `Copy`, `followup`, and `Followup` name a file after the author, and
+/// the value comes straight out of a header an attacker controls. Anything that
+/// would escape the intended directory is rejected rather than sanitized, since
+/// a silently rewritten name is a file the user did not ask for either.
+pub fn author_filename(from: &str) -> Result<&str, String> {
+    let login = extract_login(from).trim();
+    if login.is_empty()
+        || login.contains('/')
+        || login.contains('\0')
+        || login == "."
+        || login == ".."
+    {
+        return Err(format!("{}: invalid author name", from));
+    }
+    Ok(login)
 }

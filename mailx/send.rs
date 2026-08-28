@@ -323,7 +323,7 @@ pub fn send_message(
     // Record the message if requested
     if record_to_recipient {
         if let Some(first_to) = msg.to.first() {
-            let filename = crate::message::extract_login(first_to);
+            let filename = crate::message::author_filename(first_to)?;
             record_message(msg, filename, vars)?;
         }
     } else if let Some(record_file) = vars.get("record") {

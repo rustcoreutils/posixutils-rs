@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode};
 
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::sccsfile::paths;
 
 fn usage() -> ! {
     eprintln!(
@@ -143,20 +144,110 @@ fn to_sfile(file: &str, root_dir: &Path, sccs_dir: &str) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    // Build: root_dir / dir / sccs_dir / s.name
-    let mut result = root_dir.to_path_buf();
+    // Build: root_dir / dir / sccs_dir / s.name, or root_dir / dir / s.name
+    // when there is no SCCS directory to hold it.
+    //
+    // The fallback is what plib::sccsfile::paths::sfile_from_gfile does, and
+    // what the utilities themselves therefore accept. Always inserting the
+    // SCCS component left the front end unable to address a flat directory
+    // that `get s.f` handles perfectly well.
+    let mut base = root_dir.to_path_buf();
     if !dir.as_os_str().is_empty() {
-        result = result.join(dir);
+        base = base.join(dir);
     }
-    result = result.join(sccs_dir);
-    result = result.join(format!("s.{}", name));
-
-    result
+    let sname = format!("s.{}", name);
+    let in_sccs_dir = base.join(sccs_dir);
+    if in_sccs_dir.is_dir() {
+        in_sccs_dir.join(sname)
+    } else {
+        base.join(sname)
+    }
 }
 
-/// Convert a file operand to g-file path (working file)
-fn to_gfile(file: &str, root_dir: &Path) -> PathBuf {
+/// Whether `-<letter>` for `cmd` takes an option-argument that may be given as
+/// a separate token.
+///
+/// The front end used to split argv on a leading '-', which made the value of
+/// any separated option a file operand: `sccs get -r 1.1 f` reached get as
+/// `-r SCCS/s.f SCCS/s.1.1`. Inventing an operand is a worse failure than
+/// diagnosing a missing argument.
+///
+/// The table mirrors how each sibling actually parses, which is the property
+/// that matters -- the front end must not classify a token differently from
+/// the utility it is about to hand it to. `prs -r` is absent deliberately: its
+/// argument is optional and attached-only, and prs rewrites a bare `-r` so
+/// clap cannot swallow the following operand. `admin`'s -i, -t and -y are
+/// absent for the same reason; they are pre-parsed as attached-only forms.
+fn option_takes_value(cmd: &str, letter: char) -> bool {
+    let letters = match cmd {
+        "admin" => "rmfdae",
+        "get" => "rcix",
+        "delta" => "rymg",
+        "prs" => "cd",
+        "rmdel" | "unget" => "r",
+        "val" => "mry",
+        _ => "",
+    };
+    letters.contains(letter)
+}
+
+/// Split argv into options (with their arguments) and file operands.
+fn split_options<'a>(cmd: &str, args: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    let mut opts = Vec::new();
+    let mut files = Vec::new();
+    let mut it = args.iter().copied();
+
+    while let Some(arg) = it.next() {
+        // "--" ends the options; everything after is an operand.
+        if arg == "--" {
+            files.extend(it);
+            break;
+        }
+        if arg == "-" || !arg.starts_with('-') {
+            files.push(arg);
+            continue;
+        }
+
+        opts.push(arg);
+
+        // Short options cluster, so scan for the first letter that takes a
+        // value. If it ends the token, its argument is the next token.
+        let mut chars = arg[1..].chars();
+        let mut consumes = false;
+        for c in chars.by_ref() {
+            if option_takes_value(cmd, c) {
+                // Anything left in this token is the attached argument.
+                consumes = chars.as_str().is_empty();
+                break;
+            }
+        }
+        if consumes {
+            if let Some(value) = it.next() {
+                opts.push(value);
+            }
+        }
+    }
+
+    (opts, files)
+}
+
+/// The source file a `sccs create` operand names, relative to the -d root.
+///
+/// This is the file the user is handing to admin, not a g-file that get
+/// produced, so it is the operand as given.
+fn to_source_file(file: &str, root_dir: &Path) -> PathBuf {
     root_dir.join(file)
+}
+
+/// The working file a retrieval of `sfile` produces.
+///
+/// `get` writes the g-file as a bare name in the current directory, and
+/// `delta` and `unget` look for it there. The front end computed
+/// `root_dir.join(file)` instead, so under -d it addressed a different file
+/// than the utilities it drives -- the exact placement bug plib's
+/// gfile_from_sfile was fixed for. Asking plib is what keeps them agreed.
+fn to_gfile(sfile: &Path) -> PathBuf {
+    paths::gfile_from_sfile(sfile).unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// One editing record, mirroring a p-file entry:
@@ -185,43 +276,35 @@ fn get_editing_info(
             if let Some(name) = path.file_name() {
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with("p.") {
-                    // Read p-file
-                    if let Ok(contents) = fs::read_to_string(&path) {
-                        for line in contents.lines() {
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            if parts.len() >= 5 {
-                                let old_sid = parts[0];
-                                let new_sid = parts[1];
-                                let user = parts[2];
-                                let date = parts[3];
-                                let time = parts[4];
+                    // Parse with the shared p-file reader rather than by hand.
+                    // The hand-rolled version required five whitespace fields
+                    // where PfileEntry::parse requires four and defaults the
+                    // time, so a line every other utility accepts was silently
+                    // dropped here -- and it detected a branch by counting '.'
+                    // characters instead of asking the SID.
+                    let entries = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|c| plib::sccsfile::parse_pfile(&c).ok())
+                        .unwrap_or_default();
 
-                                // Filter by branch
-                                if branch_only {
-                                    // Branch SIDs have 4 components (R.L.B.S)
-                                    if new_sid.matches('.').count() < 3 {
-                                        continue;
-                                    }
-                                }
-
-                                // Filter by user
-                                if let Some(u) = user_filter {
-                                    if user != u {
-                                        continue;
-                                    }
-                                }
-
-                                let gfile = name_str.strip_prefix("p.").unwrap().to_string();
-                                results.push(EditInfo {
-                                    gfile,
-                                    old_sid: old_sid.to_string(),
-                                    new_sid: new_sid.to_string(),
-                                    user: user.to_string(),
-                                    date: date.to_string(),
-                                    time: time.to_string(),
-                                });
+                    for entry in entries {
+                        if branch_only && entry.new_sid.is_trunk() {
+                            continue;
+                        }
+                        if let Some(u) = user_filter {
+                            if entry.user != u {
+                                continue;
                             }
                         }
+
+                        results.push(EditInfo {
+                            gfile: name_str.strip_prefix("p.").unwrap().to_string(),
+                            old_sid: entry.old_sid.to_string(),
+                            new_sid: entry.new_sid.to_string(),
+                            user: entry.user,
+                            date: entry.datetime.date_string(),
+                            time: entry.datetime.time_string(),
+                        });
                     }
                 }
             }
@@ -396,7 +479,7 @@ fn main() -> ExitCode {
 
             for file in &files {
                 let sfile = to_sfile(file, &root_dir, &sccs_dir);
-                let gfile = to_gfile(file, &root_dir);
+                let gfile = to_source_file(file, &root_dir);
 
                 // Ensure SCCS directory exists
                 if let Some(parent) = sfile.parent() {
@@ -611,7 +694,7 @@ fn main() -> ExitCode {
 
             for file in files.iter() {
                 let sfile = to_sfile(file, &root_dir, &sccs_dir);
-                let gfile = to_gfile(file, &root_dir);
+                let gfile = to_gfile(&sfile);
 
                 // The retrieved text goes to a temporary file created with
                 // mkstemp. A name built from the pid was guessable, and the
@@ -686,8 +769,8 @@ fn run_sccs_command(
     sccs_dir: &str,
     use_real_uid: bool,
 ) -> ExitCode {
-    // Separate options from file operands
-    let (opts, files): (Vec<&str>, Vec<&str>) = args.iter().partition(|a| a.starts_with("-"));
+    // Separate options (with their arguments) from file operands.
+    let (opts, files) = split_options(cmd, args);
 
     // Convert file operands to s-file paths
     let sfiles: Vec<PathBuf> = files

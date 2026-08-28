@@ -1111,3 +1111,120 @@ fn delta_refuses_a_user_removed_from_the_authorized_list_mid_edit() {
     let out = super::common::run_in("prs", &["-d:I:", "-r", &sfile_s], tmp.path(), "");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1.1");
 }
+
+/// An exclusion recorded on a delta must survive into that delta's successors.
+///
+/// compute_applied_set honored `included` for every delta it walked -- they
+/// are pushed onto the traversal stack -- but removed `excluded` only for the
+/// target. So 1.4, made with `get -e -x1.2`, retrieved correctly while 1.5,
+/// its own successor, resurrected the excluded line. The asymmetry was latent
+/// only for as long as delta recorded no exclusions at all.
+#[test]
+fn delta_exclusion_survives_into_the_next_delta() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "surv", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "two");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\nc\n").unwrap();
+    run_delta(&sfile, "three");
+
+    // 1.4 excludes 1.2.
+    let out = super::common::run_in("get", &["-e", "-x1.2", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -x1.2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::write(&gfile, "a\nc\nd\n").unwrap();
+    run_delta(&sfile, "four");
+
+    let out = super::common::run_in("get", &["-p", "-s", "-r1.4", &sfile_s], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nc\nd\n");
+
+    // 1.5 is an ordinary edit on top of 1.4 and must inherit the exclusion.
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nc\nd\ne\n").unwrap();
+    run_delta(&sfile, "five");
+
+    let out = super::common::run_in("get", &["-p", "-s", "-r1.5", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\nc\nd\ne\n",
+        "the excluded line must not resurrect in a successor delta"
+    );
+}
+
+/// `get -e` and `delta` must gate on the same release, or an edit that `get`
+/// allowed can never be committed.
+///
+/// get checked the release being retrieved; delta checked the release being
+/// created. With release 2 locked, `get -e -r2` succeeded and announced the
+/// new delta 2.1, then delta refused forever -- the work stranded behind a
+/// p-file lock nothing would clear. CSSC gates the retrieved release.
+#[test]
+fn delta_commits_an_edit_get_allowed_against_a_locked_target_release() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "gate", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    // Lock release 2, which does not exist yet.
+    let out = super::common::run_in("admin", &["-fl2", &sfile_s], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", "-r2", &sfile_s], tmp.path(), "");
+    let allowed = out.status.success();
+    fs::write(&gfile, "a\nz\n").unwrap();
+    let out = super::common::run_in("delta", &["-ygate", &sfile_s], tmp.path(), "");
+
+    assert_eq!(
+        allowed,
+        out.status.success(),
+        "get -e and delta must agree: get {} the edit, delta {} it ({})",
+        if allowed { "allowed" } else { "refused" },
+        if out.status.success() {
+            "accepted"
+        } else {
+            "refused"
+        },
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `-i` and `-x` naming the same delta must resolve the same way at retrieval
+/// and at re-retrieval, or the delta re-reads as content the user never had.
+#[test]
+fn delta_round_trips_an_overlapping_include_and_exclude() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "olap", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "two");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\nc\n").unwrap();
+    run_delta(&sfile, "three");
+
+    let out = super::common::run_in("get", &["-e", "-i1.2", "-x1.2", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -i -x: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let handed_out = fs::read_to_string(&gfile).unwrap();
+    assert_eq!(handed_out, "a\nb\nc\n", "-i outranks -x per POSIX 99084");
+
+    fs::write(&gfile, format!("{handed_out}z\n")).unwrap();
+    run_delta(&sfile, "four");
+
+    let out = super::common::run_in("get", &["-p", "-s", "-r1.4", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\nb\nc\nz\n",
+        "re-retrieval must agree with what get -e handed out"
+    );
+}

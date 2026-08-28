@@ -1067,10 +1067,40 @@ impl SccsFile {
             }
         }
 
-        // Remove excluded deltas
-        if let Some(target) = self.find_delta_by_serial(target_serial) {
-            for &exc in &target.excluded {
+        // Remove excluded deltas.
+        //
+        // Every delta reached contributes its exclusion list, not just the
+        // target: an exclusion recorded on an ancestor is part of what that
+        // ancestor's content *is*. Honoring it only at the target -- while
+        // honoring `included` at every delta, since those are pushed during
+        // the walk -- meant a delta made with `get -e -x` produced correct
+        // content itself, and then its own successor resurrected the excluded
+        // lines. That was latent for as long as delta recorded no exclusions.
+        for serial in &visited {
+            let Some(delta) = self.find_delta_by_serial(*serial) else {
+                continue;
+            };
+            for &exc in &delta.excluded {
                 applied.remove(&exc);
+            }
+        }
+
+        // An inclusion outranks an exclusion, matching POSIX 99084 ("forced to
+        // be applied") and `applied_set_with`, which layers the command-line
+        // -i/-x on top of this set and must not resolve the overlap the other
+        // way.
+        for serial in &visited {
+            let Some(delta) = self.find_delta_by_serial(*serial) else {
+                continue;
+            };
+            for &inc in &delta.included {
+                let mut cur = inc;
+                while cur != 0 && applied.insert(cur) {
+                    match self.find_delta_by_serial(cur) {
+                        Some(d) => cur = d.pred_serial,
+                        None => break,
+                    }
+                }
             }
         }
 
@@ -1346,17 +1376,35 @@ impl SccsFile {
         false
     }
 
-    /// Resolve a `-i`/`-x`/`-g` list into delta serial numbers.
+    /// Resolve a `-i`/`-x` list into delta serial numbers.
     ///
     /// The grammar is POSIX 99085-99087: `<list> ::= <range> | <list> , <range>`
     /// and `<range> ::= SID | SID - SID`. Separators are commas, spaces and
-    /// tabs. A bare integer that names no SID is taken as a serial number,
-    /// which is how historical SCCS accepted the `-g` list.
+    /// tabs.
     ///
     /// A malformed range is a hard error: silently recording the wrong list
     /// would bake the mistake into the delta table. A token that merely names
-    /// no such delta is reported by the caller and skipped.
+    /// no such delta is returned as unresolved for the caller to report.
     pub fn resolve_sid_list(&self, list: &str) -> Result<(Vec<u16>, Vec<String>), String> {
+        self.resolve_delta_list(list, false)
+    }
+
+    /// As [`Self::resolve_sid_list`], but a bare integer naming no SID is also
+    /// accepted as a serial number.
+    ///
+    /// This is a `delta -g` convenience from historical SCCS, and it must not
+    /// leak into `get -i`/`-x`: there, `-x2` means the SID `2`, and silently
+    /// reading it as serial 2 hands the user a different version than they
+    /// asked for with no diagnostic. CSSC treats `-x2` as naming no delta.
+    pub fn resolve_ignore_list(&self, list: &str) -> Result<(Vec<u16>, Vec<String>), String> {
+        self.resolve_delta_list(list, true)
+    }
+
+    fn resolve_delta_list(
+        &self,
+        list: &str,
+        allow_serial: bool,
+    ) -> Result<(Vec<u16>, Vec<String>), String> {
         let mut serials = Vec::new();
         let mut unresolved = Vec::new();
 
@@ -1387,9 +1435,8 @@ impl SccsFile {
                 }
             }
 
-            // Fall back to a bare serial number before giving up.
             match tok.parse::<u16>() {
-                Ok(n) if self.find_delta_by_serial(n).is_some() => serials.push(n),
+                Ok(n) if allow_serial && self.find_delta_by_serial(n).is_some() => serials.push(n),
                 _ => unresolved.push(tok.to_string()),
             }
         }

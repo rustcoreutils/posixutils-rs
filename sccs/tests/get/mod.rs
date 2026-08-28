@@ -1338,3 +1338,52 @@ fn get_e_allows_a_listed_user_and_a_listed_group() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// In `-i`/`-x`, a bare number is a SID, not a serial number.
+///
+/// Sharing one list resolver between `get -i`/`-x` and `delta -g` brought
+/// delta's historical bare-serial convenience with it, so `get -x2` silently
+/// excluded delta 1.2 -- serial 2 -- and handed back a different version than
+/// the user asked for, with no diagnostic. CSSC treats `-x2` as naming no
+/// delta.
+#[test]
+fn get_x_with_a_bare_number_names_a_sid_not_a_serial() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "bare");
+
+    let out = super::common::run_in("get", &["-p", "-s", "-x2", &sfile], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\nb\nc\n",
+        "-x2 names no delta, so nothing is excluded"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no such delta"),
+        "an unresolvable token must be diagnosed, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The SID form still works.
+    let out = super::common::run_in("get", &["-p", "-s", "-x1.2", &sfile], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nc\n");
+}
+
+/// `delta -g` keeps the bare-serial form it has always accepted.
+#[test]
+fn delta_g_still_accepts_a_bare_serial_number() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "gbare");
+
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert!(out.status.success());
+    std::fs::write(tmp.path().join("gbare"), "a\nb\nc\nd\n").unwrap();
+
+    let out = super::common::run_in("delta", &["-g2", "-yg", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta -g2 should accept a serial: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = super::common::run_in("prs", &["-d:Dg:", "-r1.4", &sfile], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
+}

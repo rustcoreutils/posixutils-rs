@@ -73,15 +73,29 @@ fn split<T: PartialEq>(
         for _ in alo..ahi {
             ops.push(LineOp::Delete);
         }
-    } else {
+    } else if let Some((x, y, u, v)) = middle_snake(old, alo, ahi, new, blo, bhi) {
         // Both sides still hold lines, and neither end matches, so an optimal
         // path crosses a snake somewhere in the middle. Recurse around it.
-        let (x, y, u, v) = middle_snake(old, alo, ahi, new, blo, bhi);
         split(old, alo, x, new, blo, y, ops);
         for _ in x..u {
             ops.push(LineOp::Keep);
         }
         split(old, u, ahi, new, v, bhi, ops);
+    } else {
+        // The search gave up on this region: replace it wholesale. The script
+        // is still correct, just not minimal.
+        //
+        // This arm must not recurse. Returning a zero-length snake at the
+        // region's start, as an earlier "cannot happen" fallback did, made
+        // `split` call itself on the interval it was already working on, so
+        // reaching it at all would have been a stack overflow rather than the
+        // graceful degrade the comment claimed.
+        for _ in alo..ahi {
+            ops.push(LineOp::Delete);
+        }
+        for j in blo..bhi {
+            ops.push(LineOp::Insert(j));
+        }
     }
 
     for _ in 0..suffix {
@@ -102,12 +116,19 @@ fn middle_snake<T: PartialEq>(
     new: &[T],
     blo: usize,
     bhi: usize,
-) -> (usize, usize, usize, usize) {
+) -> Option<(usize, usize, usize, usize)> {
     let n = (ahi - alo) as isize;
     let m = (bhi - blo) as isize;
     let delta = n - m;
     let odd = delta & 1 != 0;
     let max = (n + m + 1) / 2;
+
+    // Myers costs O(N*D), so a region that is almost entirely rewritten costs
+    // O(N^2): a 50 000-line full rewrite took 7.5 s, and delta on a
+    // regenerated file would look like a hang. Bound the search the way GNU
+    // diff does, and fall back to replacing the region when the bound is hit.
+    // A realistic edit has a small D and never reaches it.
+    let cutoff = isqrt(n + m).max(256);
 
     // Diagonal k is indexed at `off + k`; the extra slot on each side lets the
     // k == -d and k == d edges read their neighbour without a bounds check.
@@ -116,7 +137,7 @@ fn middle_snake<T: PartialEq>(
     let mut vf = vec![0isize; size];
     let mut vr = vec![0isize; size];
 
-    for d in 0..=max {
+    for d in 0..=max.min(cutoff) {
         // Forward: furthest-reaching D-path on each diagonal.
         let mut k = -d;
         while k <= d {
@@ -142,12 +163,12 @@ fn middle_snake<T: PartialEq>(
                 if kr > -d && kr < d {
                     let ir = (off as isize + kr) as usize;
                     if vf[i] + vr[ir] >= n {
-                        return (
+                        return Some((
                             alo + x0 as usize,
                             blo + y0 as usize,
                             alo + x as usize,
                             blo + y as usize,
-                        );
+                        ));
                     }
                 }
             }
@@ -180,12 +201,12 @@ fn middle_snake<T: PartialEq>(
                 if kf >= -d && kf <= d {
                     let idx = (off as isize + kf) as usize;
                     if vr[i] + vf[idx] >= n {
-                        return (
+                        return Some((
                             alo + (n - x) as usize,
                             blo + (m - y) as usize,
                             alo + (n - x0) as usize,
                             blo + (m - y0) as usize,
-                        );
+                        ));
                     }
                 }
             }
@@ -193,10 +214,24 @@ fn middle_snake<T: PartialEq>(
         }
     }
 
-    // Unreachable: the two searches must meet by d == ceil((n+m)/2), since
-    // together they span every diagonal. Degrade to "replace everything"
-    // rather than panicking in a utility that is rewriting a history file.
-    (alo, blo, alo, blo)
+    // Either the edit distance exceeded the cutoff, or -- impossibly, since
+    // the two searches together span every diagonal by d == ceil((n+m)/2) --
+    // they never met. Either way the caller replaces the region.
+    None
+}
+
+/// Integer square root, for the search bound.
+fn isqrt(n: isize) -> isize {
+    if n <= 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 #[cfg(test)]
@@ -304,6 +339,60 @@ mod tests {
             "a pure insertion must record no deletions: {ops:?}"
         );
         assert_eq!(apply(&ops, old, new), new);
+    }
+
+    /// A region whose edit distance exceeds the search bound is replaced
+    /// wholesale rather than searched to the end.
+    ///
+    /// The bail arm must not recurse: an earlier "cannot happen" fallback
+    /// returned a zero-length snake at the region's start, which made `split`
+    /// call itself on the interval it was already working on. Reaching it
+    /// would have been a stack overflow, not the graceful degrade it claimed.
+    /// This test reaches it.
+    #[test]
+    fn a_region_past_the_search_bound_is_replaced_not_searched() {
+        let old: Vec<u32> = (0..400).collect();
+        let new: Vec<u32> = (1000..1400).collect();
+        let ops = diff(&old, &new);
+
+        assert_eq!(
+            ops.iter().filter(|o| matches!(o, LineOp::Delete)).count(),
+            old.len()
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|o| matches!(o, LineOp::Insert(_)))
+                .count(),
+            new.len()
+        );
+
+        // Still a valid script: it rebuilds the new text exactly.
+        let mut out = Vec::new();
+        let mut i = 0;
+        for op in &ops {
+            match op {
+                LineOp::Keep => {
+                    out.push(old[i]);
+                    i += 1;
+                }
+                LineOp::Delete => i += 1,
+                LineOp::Insert(j) => out.push(new[*j]),
+            }
+        }
+        assert_eq!(i, old.len());
+        assert_eq!(out, new);
+    }
+
+    /// A small edit in a large file stays minimal and cheap: the bound is only
+    /// reached by a region that is genuinely almost entirely rewritten.
+    #[test]
+    fn a_small_edit_in_a_large_input_is_still_minimal() {
+        let old: Vec<u32> = (0..50_000).collect();
+        let mut new = old.clone();
+        new.insert(25_000, 999_999);
+
+        let ops = diff(&old, &new);
+        assert_eq!(edit_count(&ops), 1, "one inserted line, nothing else");
     }
 
     #[test]

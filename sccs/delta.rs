@@ -584,8 +584,15 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // The user list can be narrowed while an edit is outstanding, so the
     // p-file lock taken by an earlier `get -e` is no evidence of present
     // permission. Re-check before anything is written.
+    //
+    // The release checked is the one `get -e` checked -- the release the edit
+    // was *retrieved* from, not the one it will create. Checking the new SID
+    // here instead let `get -e -r2` succeed against a locked release 2 and
+    // then made the resulting delta permanently uncommittable, stranding the
+    // work behind a p-file lock nothing would clear. CSSC gates the retrieved
+    // release too.
     if let Err(refusal) =
-        protect::check_edit(&sccs, pfile_entry.new_sid.rel, &posixutils_sccs::username())
+        protect::check_edit(&sccs, pfile_entry.old_sid.rel, &posixutils_sccs::username())
     {
         diag::error_path("delta", sfile_path, refusal.message());
         return Ok(false);
@@ -636,7 +643,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // A malformed range aborts before anything is written: recording the delta
     // with a silently wrong ignore-list would bake the mistake into history.
     let ignored = match &args.glist {
-        Some(list) => match sccs.resolve_sid_list(list) {
+        Some(list) => match sccs.resolve_ignore_list(list) {
             Ok((serials, unresolved)) => {
                 for tok in unresolved {
                     diag::error_path(

@@ -44,35 +44,56 @@ fn split_delget_opts<'a>(
     let mut delta_opts = Vec::new();
     let mut get_opts = Vec::new();
 
-    for &a in args {
-        if let Some(rest) = a.strip_prefix('-') {
-            let letter = rest.chars().next();
-            match letter {
-                Some(c) => {
-                    let to_delta = delta_letters.contains(c);
-                    let to_get = get_letters.contains(c);
-                    if to_delta {
-                        delta_opts.push(a);
-                    }
-                    if to_get {
-                        get_opts.push(a);
-                    }
-                    if !to_delta && !to_get {
-                        // Unknown option: let both phases see it (and diagnose).
-                        delta_opts.push(a);
-                        get_opts.push(a);
-                    }
-                }
-                None => {
-                    // A bare "-" operand.
-                    delta_opts.push(a);
-                    get_opts.push(a);
-                }
-            }
-        } else {
+    // A detached option-argument follows its option into whichever phase the
+    // option went to. Classifying it by its own leading character sent it to
+    // *both* phases as a file operand, so `sccs delget -y c1 g` committed the
+    // delta and then ran the get phase on a nonexistent SCCS/s.c1 -- the same
+    // invented-operand failure split_options fixes for the plain subcommands.
+    let mut it = args.iter().copied().peekable();
+    while let Some(a) = it.next() {
+        let Some(rest) = a.strip_prefix('-') else {
             // File operand: needed by both phases.
             delta_opts.push(a);
             get_opts.push(a);
+            continue;
+        };
+        let Some(c) = rest.chars().next() else {
+            // A bare "-" operand.
+            delta_opts.push(a);
+            get_opts.push(a);
+            continue;
+        };
+
+        let to_delta = delta_letters.contains(c);
+        let to_get = get_letters.contains(c);
+        // Unknown option: let both phases see it (and diagnose).
+        let (to_delta, to_get) = if to_delta || to_get {
+            (to_delta, to_get)
+        } else {
+            (true, true)
+        };
+
+        if to_delta {
+            delta_opts.push(a);
+        }
+        if to_get {
+            get_opts.push(a);
+        }
+
+        // Does this option consume the next token? Ask the utility that will
+        // receive it.
+        let attached = rest.len() > 1;
+        let takes_value = (to_delta && option_takes_value("delta", c))
+            || (to_get && option_takes_value("get", c));
+        if !attached && takes_value {
+            if let Some(value) = it.next() {
+                if to_delta {
+                    delta_opts.push(value);
+                }
+                if to_get {
+                    get_opts.push(value);
+                }
+            }
         }
     }
 
@@ -128,6 +149,21 @@ fn drop_privileges() {
 
 /// Convert a file operand to SCCS file path
 fn to_sfile(file: &str, root_dir: &Path, sccs_dir: &str) -> PathBuf {
+    to_sfile_opt(file, root_dir, sccs_dir, false)
+}
+
+/// As [`to_sfile`], but `force_sccs_dir` keeps the `SCCS/` component even when
+/// that directory does not exist yet.
+///
+/// `sccs create` is the one caller that needs it: it is *creating* the project,
+/// so the sibling fallback below would put `s.foo.c` in the working directory,
+/// where `sccs clean` and `sccs unedit` -- which address the SCCS directory
+/// directly -- would never find it again.
+fn to_sfile_created(file: &str, root_dir: &Path, sccs_dir: &str) -> PathBuf {
+    to_sfile_opt(file, root_dir, sccs_dir, true)
+}
+
+fn to_sfile_opt(file: &str, root_dir: &Path, sccs_dir: &str, force_sccs_dir: bool) -> PathBuf {
     let path = Path::new(file);
 
     // If already an s-file, use as-is (but prepend root_dir)
@@ -157,7 +193,7 @@ fn to_sfile(file: &str, root_dir: &Path, sccs_dir: &str) -> PathBuf {
     }
     let sname = format!("s.{}", name);
     let in_sccs_dir = base.join(sccs_dir);
-    if in_sccs_dir.is_dir() {
+    if force_sccs_dir || in_sccs_dir.is_dir() {
         in_sccs_dir.join(sname)
     } else {
         base.join(sname)
@@ -478,7 +514,7 @@ fn main() -> ExitCode {
                 .collect();
 
             for file in &files {
-                let sfile = to_sfile(file, &root_dir, &sccs_dir);
+                let sfile = to_sfile_created(file, &root_dir, &sccs_dir);
                 let gfile = to_source_file(file, &root_dir);
 
                 // Ensure SCCS directory exists

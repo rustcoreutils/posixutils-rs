@@ -607,3 +607,81 @@ fn sccs_diffs_under_d_compares_the_file_get_actually_wrote() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `sccs create` builds the project, so it must place the s-file in SCCS/.
+///
+/// The sibling-s-file fallback added for flat directories keyed on whether
+/// SCCS/ already exists -- which, for create, it does not. So `sccs create
+/// foo.c` in a fresh project wrote ./s.foo.c, a layout that `sccs clean` and
+/// `sccs unedit` address the SCCS directory directly and would never find
+/// again.
+#[test]
+fn sccs_create_puts_the_sfile_in_the_sccs_directory() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("foo.c"), "hello\n").unwrap();
+
+    let out = run("sccs", &["create", "foo.c"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs create: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tmp.path().join("SCCS/s.foo.c").exists(),
+        "create must build the SCCS directory, got: {:?}",
+        std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !tmp.path().join("s.foo.c").exists(),
+        "create must not leave a sibling s-file"
+    );
+
+    // And the project it built is usable through the front end.
+    let out = run("sccs", &["get", "foo.c"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs get after create: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `delget` and `deledit` route options to two phases, and a detached
+/// option-argument must follow its option rather than being copied into both
+/// phases as a file operand.
+///
+/// `sccs delget -y c1 g` committed the delta and then ran the get phase on a
+/// nonexistent SCCS/s.c1, exiting 1 -- the same invented-operand failure the
+/// plain subcommands were fixed for.
+#[test]
+fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
+    let tmp = TempDir::new().unwrap();
+    setup_project(&tmp, "dg.txt", "one\n");
+
+    let out = run("sccs", &["edit", "dg.txt"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs edit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.path().join("dg.txt"), "one\ntwo\n").unwrap();
+
+    let out = run("sccs", &["delget", "-y", "c1", "dg.txt"], tmp.path(), "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("s.c1"),
+        "the option-argument must not become an operand: {stderr}"
+    );
+    assert!(out.status.success(), "sccs delget failed: {stderr}");
+
+    // The comment reached delta, and the get phase left the file behind.
+    let out = run("prs", &["-d:C:", "-r1.2", "SCCS/s.dg.txt"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "c1");
+    assert!(
+        tmp.path().join("dg.txt").exists(),
+        "delget re-gets the file"
+    );
+}

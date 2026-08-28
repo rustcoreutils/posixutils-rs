@@ -4005,3 +4005,333 @@ fn editor_temp_file_honors_tmpdir() {
         },
     );
 }
+
+// =============================================================================
+// mbox serialization and message state
+// =============================================================================
+
+/// Saved messages must be separated by an empty line (spec 104420-104427).
+///
+/// The separator was smuggled through the message body, so it only appeared
+/// when the source file happened to have one -- never for the last message of a
+/// mailbox, and never for anything `save` had written.
+#[test]
+fn saved_messages_are_separated_by_a_blank_line() {
+    // Deliberately no trailing empty line: that separator used to be smuggled
+    // through the body, so a message without one produced output whose second
+    // `From ` line abutted the first message's last body line.
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: only message\n\
+         \n\
+         single body line\n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+    let out = NamedTempFile::new().expect("out file");
+    let out_path = out.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!("save 1 {}\nsave 1 {}\nexit\n", out_path, out_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            let saved = std::fs::read_to_string(&out_path).expect("read saved mailbox");
+            let lines: Vec<&str> = saved.lines().collect();
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with("From ")).count(),
+                2,
+                "expected two messages: {:?}",
+                saved
+            );
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 && line.starts_with("From ") {
+                    assert_eq!(
+                        lines[i - 1],
+                        "",
+                        "a From line must be preceded by an empty line: {:?}",
+                        saved
+                    );
+                }
+            }
+            assert!(
+                !saved.contains("\n\n\nFrom "),
+                "the separator was doubled: {:?}",
+                saved
+            );
+        },
+    );
+}
+
+/// Repeated quit cycles must not accumulate blank lines.
+///
+/// Normalizing on load and emitting exactly one separator on write is what
+/// keeps the naive "always append an empty line" fix from growing the mailbox
+/// by one line per session.
+#[test]
+fn repeated_quit_cycles_do_not_grow_the_mailbox() {
+    let out = NamedTempFile::new().expect("out file");
+    let out_path = out.path().to_str().unwrap().to_string();
+
+    // Feed each round's output back in as the next round's input. If the writer
+    // adds a separator the reader does not consume, the blank lines pile up.
+    let mut previous = String::new();
+    for round in 0..3 {
+        let mbox = if round == 0 {
+            create_temp_mbox(
+                "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+                 From: alice@example.com\n\
+                 Subject: only message\n\
+                 \n\
+                 single body line\n",
+            )
+        } else {
+            create_temp_mbox(&previous)
+        };
+        let mbox_path = mbox.path().to_str().unwrap().to_string();
+        std::fs::write(&out_path, "").expect("truncate out");
+
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![
+                    String::from("-n"),
+                    String::from("-N"),
+                    String::from("-f"),
+                    mbox_path,
+                ],
+                stdin_data: format!("save 1 {}\nexit\n", out_path),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_plan, _output| {},
+        );
+
+        let current = std::fs::read_to_string(&out_path).expect("read saved");
+        if round > 0 {
+            assert_eq!(
+                current,
+                previous,
+                "round {} changed a mailbox that round {} had already written",
+                round,
+                round - 1
+            );
+        }
+        previous = current;
+    }
+}
+
+/// Read state must survive a reopen, via the `Status:` header (spec 104625).
+#[test]
+fn read_state_survives_a_reopen() {
+    let folder = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: first\n\
+         \n\
+         body one\n\
+         \n\
+         From bob@example.org Fri Nov 29 11:00:00 2024\n\
+         From: bob@example.org\n\
+         Subject: second\n\
+         \n\
+         body two\n\
+         \n",
+    );
+    let folder_path = folder.path().to_str().unwrap().to_string();
+
+    // Read message 1, delete message 2 so the folder is rewritten.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                folder_path.clone(),
+            ],
+            stdin_data: String::from("print 1\ndelete 2\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            let after = std::fs::read_to_string(&folder_path).expect("folder");
+            assert!(
+                after.contains("Status:"),
+                "read state was never written back: {:?}",
+                after
+            );
+        },
+    );
+
+    // Reopening must show it as read, not new.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-f"), folder_path.clone()],
+            stdin_data: String::from("exit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            let row = out
+                .lines()
+                .find(|l| l.contains("first"))
+                .unwrap_or_else(|| panic!("no header row for message 1: {}", out));
+            assert!(
+                !row.contains('N'),
+                "a message read in the previous session came back as new: {}",
+                row
+            );
+        },
+    );
+}
+
+/// `undelete` must restore the state the message had, not blanket it as read.
+#[test]
+fn undelete_restores_the_previous_read_state() {
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: never read\n\
+         \n\
+         body one\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("delete 1\nundelete 1\nheaders\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            let row = out
+                .lines()
+                .find(|l| l.contains("never read"))
+                .unwrap_or_else(|| panic!("no header row: {}", out));
+            assert!(
+                row.contains('N'),
+                "undelete marked an unread message as read: {}",
+                row
+            );
+        },
+    );
+}
+
+/// `preserve` must not erase read state: `:r` still has to match afterwards.
+#[test]
+fn preserve_keeps_read_state() {
+    let sys = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: read then held\n\
+         \n\
+         body one\n\
+         \n",
+    );
+    let sys_path = sys.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: String::from("print 1\npreserve 1\nfrom :r\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path)],
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("read then held"),
+                "`preserve` erased the read state, so `:r` no longer matched: {}",
+                out
+            );
+        },
+    );
+}
+
+/// A body line beginning `From ` must round-trip through save unchanged.
+#[test]
+fn from_line_in_body_round_trips() {
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: quoting\n\
+         \n\
+         ordinary line\n\
+         From here it gets interesting\n\
+         >From already quoted\n\
+         >>From doubly quoted\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+    let out = NamedTempFile::new().expect("out file");
+    let out_path = out.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!("save 1 {}\nexit\n", out_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            let saved = std::fs::read_to_string(&out_path).expect("read saved");
+            // Exactly one envelope line: the body's `From ` must stay escaped.
+            assert_eq!(
+                saved.lines().filter(|l| l.starts_with("From ")).count(),
+                1,
+                "an unescaped body line split the message: {:?}",
+                saved
+            );
+            assert!(
+                saved.contains(">From here it gets interesting"),
+                "the body's From line lost its quoting: {:?}",
+                saved
+            );
+            // `>From already quoted` on disk means `From already quoted` in
+            // the message, so it comes back out with one `>`; the doubly
+            // quoted line keeps its extra level. Quoting only `From ` and
+            // never `>From ` lost a level on every round trip.
+            assert!(
+                saved.contains(">>From doubly quoted"),
+                "a doubly quoted body line lost a level of quoting: {:?}",
+                saved
+            );
+        },
+    );
+}

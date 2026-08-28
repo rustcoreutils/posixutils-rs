@@ -67,10 +67,19 @@ impl Mailbox {
         let mut in_headers = false;
         let mut header_continuation = false;
         let mut last_header_key = String::new();
+        // A `From ` line only begins a message at the start of the file or
+        // after an empty line (spec 104427-104428). Splitting on every body
+        // line that happened to start with `From ` tore messages in half --
+        // and the format explicitly permits such a line when it does not
+        // follow an empty line.
+        let mut at_message_boundary = true;
 
         for line in content.lines() {
+            let boundary = at_message_boundary;
+            at_message_boundary = line.is_empty();
+
             // Check for message separator (From line)
-            if line.starts_with("From ") && !in_headers {
+            if line.starts_with("From ") && !in_headers && boundary {
                 // Save previous message if any
                 if let Some(msg) = current_msg.take() {
                     mailbox.messages.push(msg);
@@ -121,6 +130,14 @@ impl Mailbox {
                             }
                         }
 
+                        if key == "status" {
+                            // Not retained in `header_lines`: the writer
+                            // regenerates it from `read`, and keeping the loaded
+                            // copy would emit a stale one beside the fresh one.
+                            msg.headers.insert(key, value);
+                            continue;
+                        }
+
                         msg.headers.insert(key.clone(), value);
                         msg.header_lines.push(line.to_string());
                         last_header_key = key;
@@ -132,13 +149,12 @@ impl Mailbox {
                         msg.body.push('\n');
                     }
                 } else {
-                    // Body
-                    // Handle escaped From lines (>From)
-                    if line.starts_with(">From ") {
-                        msg.body.push_str(&line[1..]);
-                    } else {
-                        msg.body.push_str(line);
-                    }
+                    // Body. Undo the mbox `From ` quoting: a run of `>`
+                    // followed by `From ` loses one `>`. Stripping it only from
+                    // `>From ` (and never adding one to `>>From `) meant a body
+                    // line that genuinely read `>From x` was silently turned
+                    // into `From x`.
+                    msg.body.push_str(unquote_from_line(line));
                     msg.body.push('\n');
                 }
             }
@@ -147,6 +163,18 @@ impl Mailbox {
         // Don't forget the last message
         if let Some(msg) = current_msg {
             mailbox.messages.push(msg);
+        }
+
+        // The empty line that separates one message from the next belongs to
+        // the mbox framing, not to the message. Leaving it in the body meant
+        // the writer round-tripped it by accident for messages that had one and
+        // omitted it entirely for those that did not -- and an unconditional
+        // separator on write would then have doubled it, growing the mailbox by
+        // a blank line every session.
+        for msg in &mut mailbox.messages {
+            if msg.body.ends_with("\n\n") {
+                msg.body.pop();
+            }
         }
 
         // Set current to first new/unread message, or first message
@@ -276,6 +304,18 @@ impl Mailbox {
         }
     }
 
+    /// Whether any message's read state differs from the `Status:` it loaded.
+    fn state_differs_from_disk(&self) -> bool {
+        self.messages.iter().any(|m| {
+            let on_disk = m.get_header("status");
+            match (on_disk, m.read.status_value()) {
+                (None, None) => false,
+                (Some(a), Some(b)) => a != b,
+                _ => true,
+            }
+        })
+    }
+
     /// Handle quit - save read messages to mbox, delete saved, etc.
     pub fn quit(&mut self, vars: &Variables) -> Result<(), String> {
         if !self.modified
@@ -348,7 +388,7 @@ impl Mailbox {
         // Leaving the file alone otherwise is not just an optimization: it is
         // what keeps mail delivered while mailx was running untouched in the
         // common case, and it avoids re-timestamping a mailbox nobody changed.
-        if keep_messages.len() != self.messages.len() {
+        if keep_messages.len() != self.messages.len() || self.state_differs_from_disk() {
             rewrite_mailbox(&self.path, &keep_messages, self.loaded_len, keep)
                 .map_err(|e| format!("{}: {}", self.path, e))?;
         }
@@ -357,21 +397,48 @@ impl Mailbox {
     }
 
     /// Save messages to a file
+    /// Append messages to `path`.
+    ///
+    /// `include_from_line` distinguishes a mailbox (`save`, `copy`) from a
+    /// plain text dump (`write`). It was previously named `include_headers`,
+    /// which is not what the value controls.
     pub fn save_messages(
         &self,
         msg_nums: &[usize],
         path: &str,
-        include_headers: bool,
+        include_from_line: bool,
     ) -> Result<(), String> {
         let messages: Vec<&Message> = msg_nums.iter().filter_map(|&n| self.get(n)).collect();
 
         let msgs: Vec<Message> = messages.iter().map(|m| (*m).clone()).collect();
-        append_messages_to_file(path, &msgs, include_headers)
+        append_messages_to_file(path, &msgs, include_from_line)
             .map_err(|e| format!("{}: {}", path, e))
     }
 }
 
-/// Serialize messages in mbox format.
+/// Remove one level of mbox `From ` quoting from a body line.
+///
+/// mboxrd: `>From ` came from `From `, `>>From ` from `>From `, and so on.
+fn unquote_from_line(line: &str) -> &str {
+    let rest = line.trim_start_matches('>');
+    if rest.starts_with("From ") && rest.len() < line.len() {
+        &line[1..]
+    } else {
+        line
+    }
+}
+
+/// Whether a body line needs mbox `From ` quoting on the way out.
+pub(crate) fn needs_from_quoting(line: &str) -> bool {
+    line.trim_start_matches('>').starts_with("From ")
+}
+
+/// Serialize messages in mbox format (spec 104420-104436).
+///
+/// Each message is an envelope `From ` line, its header fields with a
+/// regenerated `Status:`, an empty line, the `From `-quoted body, and one
+/// trailing empty line -- so the next `From ` line is preceded by an empty
+/// line, as the format requires.
 fn write_messages<W: Write>(
     w: &mut W,
     messages: &[Message],
@@ -384,18 +451,21 @@ fn write_messages<W: Write>(
         for header in &msg.header_lines {
             writeln!(w, "{}", header)?;
         }
+        // `Status:` is written from the message's read state rather than echoed
+        // from the file, so a message read this session comes back as read.
+        // The loader keeps it out of `header_lines` for exactly this reason.
+        if let Some(status) = msg.read.status_value() {
+            writeln!(w, "Status: {}", status)?;
+        }
         writeln!(w)?;
-        // Handle From escaping in body
         for line in msg.body.lines() {
-            if line.starts_with("From ") {
+            if needs_from_quoting(line) {
                 write!(w, ">")?;
             }
             writeln!(w, "{}", line)?;
         }
-        // Ensure blank line between messages
-        if !msg.body.ends_with('\n') {
-            writeln!(w)?;
-        }
+        // The separator before the next message.
+        writeln!(w)?;
     }
 
     Ok(())

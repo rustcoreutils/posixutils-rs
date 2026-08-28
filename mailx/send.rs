@@ -349,7 +349,19 @@ pub fn send_message(
 }
 
 /// Record a sent message to a file
-fn record_message(msg: &ComposedMessage, filename: &str, vars: &Variables) -> Result<(), String> {
+/// Append an outgoing message to a record file, in mbox format.
+///
+/// `record`, and the author-named file `followup` writes, are ordinary
+/// mailboxes that get read back with `mailx -f`. They are written through the
+/// same `From `-quoting and separator rules as any other mailbox: writing the
+/// body verbatim meant a composed line beginning `From ` split the entry in two
+/// on the next read, and a missing trailing empty line ran consecutive records
+/// together.
+pub(crate) fn record_message(
+    msg: &ComposedMessage,
+    filename: &str,
+    vars: &Variables,
+) -> Result<(), String> {
     let path = if vars.get_bool("outfolder") && !filename.starts_with('/') {
         if let Some(folder) = vars.get("folder") {
             let folder = expand_folder(folder);
@@ -362,9 +374,9 @@ fn record_message(msg: &ComposedMessage, filename: &str, vars: &Variables) -> Re
     };
 
     // Create "From " line
-    let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let user = crate::user_login();
+    let user = if user.is_empty() { "unknown" } else { &user };
     let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
-    let from_line = format!("From {} {}", user, date);
 
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -372,12 +384,27 @@ fn record_message(msg: &ComposedMessage, filename: &str, vars: &Variables) -> Re
         .open(&path)
         .map_err(|e| format!("Cannot open {}: {}", path, e))?;
 
-    writeln!(file, "{}", from_line).map_err(|e| e.to_string())?;
-    write!(file, "{}", msg.format()).map_err(|e| e.to_string())?;
-    if !msg.body.ends_with('\n') {
-        writeln!(file).map_err(|e| e.to_string())?;
-    }
-    writeln!(file).map_err(|e| e.to_string())?;
+    let write = || -> io::Result<()> {
+        let mut file = &file;
+        writeln!(file, "From {} {}", user, date)?;
+        let formatted = msg.format();
+        let (headers, body) = match formatted.split_once("\n\n") {
+            Some((h, b)) => (h, b),
+            None => (formatted.as_str(), ""),
+        };
+        writeln!(file, "{}", headers)?;
+        writeln!(file)?;
+        for line in body.lines() {
+            if crate::mailbox::needs_from_quoting(line) {
+                write!(file, ">")?;
+            }
+            writeln!(file, "{}", line)?;
+        }
+        writeln!(file)?;
+        Ok(())
+    };
+    write().map_err(|e| format!("{}: {}", path, e))?;
+    file.flush().map_err(|e| format!("{}: {}", path, e))?;
 
     Ok(())
 }

@@ -41,6 +41,17 @@ pub enum Disposition {
     Saved,
 }
 
+impl ReadState {
+    /// The `Status:` value recording this state, or `None` for a new message.
+    pub fn status_value(&self) -> Option<&'static str> {
+        match self {
+            ReadState::New => None,
+            ReadState::Unread => Some("O"),
+            ReadState::Read => Some("RO"),
+        }
+    }
+}
+
 impl Message {
     /// The state character shown in a header summary.
     ///

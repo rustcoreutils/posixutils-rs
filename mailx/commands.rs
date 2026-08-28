@@ -687,7 +687,9 @@ fn cmd_followup(
 
     // Send and record
     send_message(&composed, vars, false)?;
-    record_to_file(&composed, &record_file)?;
+    // `followup` records through the same writer as `record`, so it honors
+    // `outfolder` -- its private copy of this logic did not.
+    crate::send::record_message(&composed, &record_file, vars)?;
 
     if let Some(m) = mb.get_mut(msg_num) {
         m.read = ReadState::Read;
@@ -1737,27 +1739,6 @@ fn compose_message(
 
         composed.body.push_str(&line);
     }
-
-    Ok(())
-}
-
-fn record_to_file(msg: &ComposedMessage, path: &str) -> Result<(), String> {
-    let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
-    let from_line = format!("From {} {}", user, date);
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("{}: {}", path, e))?;
-
-    writeln!(file, "{}", from_line).map_err(|e| e.to_string())?;
-    write!(file, "{}", msg.format()).map_err(|e| e.to_string())?;
-    if !msg.body.ends_with('\n') {
-        writeln!(file).map_err(|e| e.to_string())?;
-    }
-    writeln!(file).map_err(|e| e.to_string())?;
 
     Ok(())
 }

@@ -348,14 +348,21 @@ findings and reported complete without them. They are unchanged since.
 
 ### Critical
 
-- [ ] **#63 — Inference rules never compare timestamps.** `build_target_uncached`
-  invokes an inference rule with `up_to_date=false` and no mtime check, so
-  `make foo.o` with a `.c.o` rule recompiles on every invocation. GNU reports
-  it up to date. Since the built-in rules (#54) made this path load-bearing,
-  incremental builds are broken for nearly every makefile.
-- [ ] **#64 — Pattern rules never compare timestamps, and `$?` is wrong.** Same
-  shortcut: the branch builds prerequisites then runs unconditionally, and fills
-  `newer` with every prerequisite rather than the out-of-date ones.
+- [x] **#63 — Inference rules never compare timestamps.** ✓ fixed 2026-08-28.
+  The inference branch now goes through `run_rule_with_prerequisites` like every
+  other path. That needed the staleness check to stop re-deriving the rule by
+  name — `rule_by_target_name` excludes pattern rules and never sees
+  `inference_rules`, so it reported no prerequisites for exactly these targets,
+  and routing alone would have flipped "always rebuilds" into "never rebuilds".
+  Prerequisites now come from the resolved rule, with an inference rule's
+  implicit source derived from its suffixes. Test
+  `an_inference_rule_is_not_rerun_when_current`.
+- [x] **#64 — Pattern rules never compare timestamps, and `$?` is wrong.**
+  ✓ fixed 2026-08-28. Same routing. `$?` is now the prerequisites newer than the
+  target rather than all of them, and prerequisites are brought up to date before
+  staleness is judged so a rebuilt one counts whatever the timestamps say. Tests
+  `a_pattern_rule_is_not_rerun_when_current`,
+  `question_mark_lists_only_newer_prerequisites`.
 - [x] **#65 — A self-referential pattern rule deadlocks.** ✓ fixed 2026-08-28.
   Two halves: the pattern branch never called `find_cycle`, and
   `Edges::prerequisites_of` went through `rule_by_target_name`, which filters out
@@ -380,10 +387,12 @@ findings and reported complete without them. They are unchanged since.
 
 ### Major
 
-- [ ] **#66 — `VPATH` is skipped for a prerequisite with no rule of its own.** The
-  up-to-date probe uses the unresolved name, so `VPATH = src` with only
-  `src/dep.c` present fails with `no target 'dep.c'`. This is the primary use of
-  VPATH; the existing tests only cover the inference-rule path.
+- [x] **#66 — `VPATH` is skipped for a prerequisite with no rule of its own.**
+  ✓ fixed 2026-08-28. The up-to-date probe and the staleness comparison both
+  resolve through `resolve_vpath`, and `Rule::run` takes the same resolver
+  `run_for_target` already had, so `$<` names where the file was found.
+  Byte-identical to GNU on the probe. Test
+  `vpath_supplies_a_prerequisite_with_no_rule`.
 - [ ] **#70 — A nested reference in a `$(x:a=b)` replacement is rejected.** The
   spec is read with a flat loop that stops at the first `)`, so
   `$(SRC:%.c=$(D)/%.o)` fails the whole makefile. The function path already has

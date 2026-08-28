@@ -182,6 +182,9 @@ impl Rule {
         target: &Target,
         up_to_date: bool,
         newer: &[String],
+        // Maps a prerequisite to where it was actually found, so `$<` names the
+        // file the recipe will read when `VPATH` supplied it.
+        resolve: &dyn Fn(&str) -> String,
     ) -> Result<(), ErrorCode> {
         // One pass. The first prerequisite is the input file, so `$<` names it
         // in an ordinary rule as well as an inferred one -- POSIX defines `$<`
@@ -196,7 +199,7 @@ impl Rule {
         let input = self
             .prerequisites()
             .next()
-            .map(|p| PathBuf::from(p.as_ref()))
+            .map(|p| PathBuf::from(resolve(p.as_ref())))
             .unwrap_or_default();
         let files = vec![(input, PathBuf::from(target.as_ref()))];
         self.run_with_files(global_config, macros, target, up_to_date, files, newer)

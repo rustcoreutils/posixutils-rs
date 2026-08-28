@@ -1670,3 +1670,99 @@ mod builtins {
         let _ = fs::remove_file("builtin_r_probe.c");
     }
 }
+
+// Whether a target is up to date. The inference and pattern branches used to
+// bypass the check entirely, so every build recompiled everything.
+mod up_to_date {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    // Audit #63: an inference rule ran with up_to_date=false and no mtime
+    // comparison, so `make foo.o` recompiled on every invocation.
+    #[test]
+    fn an_inference_rule_is_not_rerun_when_current() {
+        let _ = fs::write("utd_inf.c", "");
+        let _ = fs::remove_file("utd_inf.o");
+        let (first, _) = run(&["-f", "tests/makefiles/uptodate/inference.mk", "utd_inf.o"]);
+        assert!(first.contains("COMPILING"), "first run must build: {first}");
+        let (second, code) = run(&["-f", "tests/makefiles/uptodate/inference.mk", "utd_inf.o"]);
+        assert!(
+            !second.contains("COMPILING"),
+            "second run rebuilt: {second}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_file("utd_inf.o");
+        let _ = fs::remove_file("utd_inf.c");
+    }
+
+    // Audit #64: same for a pattern rule. The phony root matters -- with a
+    // real-file intermediate the traversal short-circuits and hides this.
+    #[test]
+    fn a_pattern_rule_is_not_rerun_when_current() {
+        let _ = fs::write("utd_pat.c", "");
+        let _ = fs::remove_file("utd_pat.o");
+        let (first, _) = run(&["-f", "tests/makefiles/uptodate/pattern.mk", "all"]);
+        assert!(
+            first.contains("PATCOMPILE"),
+            "first run must build: {first}"
+        );
+        let (second, _) = run(&["-f", "tests/makefiles/uptodate/pattern.mk", "all"]);
+        assert!(
+            !second.contains("PATCOMPILE"),
+            "second run rebuilt: {second}"
+        );
+        assert!(
+            second.contains("ALL"),
+            "phony root must still run: {second}"
+        );
+        let _ = fs::remove_file("utd_pat.o");
+        let _ = fs::remove_file("utd_pat.c");
+    }
+
+    // Audit #64: `$?` is the prerequisites *newer* than the target, not all of
+    // them. The pattern branch filled it with every prerequisite.
+    #[test]
+    fn question_mark_lists_only_newer_prerequisites() {
+        use std::{thread, time::Duration};
+        let _ = fs::write("utd_old", "");
+        thread::sleep(Duration::from_millis(1100));
+        let _ = fs::write("utd_target", "");
+        thread::sleep(Duration::from_millis(1100));
+        let _ = fs::write("utd_new", "");
+        let _ = fs::write(
+            "utd_question.mk",
+            "utd_target: utd_old utd_new\n\t@echo \"Q=[$?]\"\n",
+        );
+        let (out, _) = run(&["-f", "utd_question.mk", "utd_target"]);
+        assert!(out.contains("Q=[utd_new]"), "out: {out}");
+        for f in ["utd_old", "utd_new", "utd_target", "utd_question.mk"] {
+            let _ = fs::remove_file(f);
+        }
+    }
+
+    // Audit #66: a prerequisite with no rule of its own, supplied by VPATH. The
+    // up-to-date probe used the unresolved name, so it looked missing.
+    #[test]
+    fn vpath_supplies_a_prerequisite_with_no_rule() {
+        let _ = fs::create_dir_all("utd_vpath_src");
+        let _ = fs::write("utd_vpath_src/utd_dep.c", "");
+        let (out, code) = run(&["-f", "tests/makefiles/uptodate/vpath_prereq.mk", "all"]);
+        assert!(out.contains("IN=[utd_vpath_src/utd_dep.c]"), "out: {out}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all("utd_vpath_src");
+    }
+}

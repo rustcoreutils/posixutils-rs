@@ -181,29 +181,6 @@ fn push_fractional_digits(result: &mut String, value: &BigInt, base: u64, count:
     }
 }
 
-/// Split very long numeric output across lines, matching bc's convention (and
-/// GNU bc): continued lines hold up to 68 characters followed by a `<backslash>`
-/// continuation, and the final line holds the remainder. Output is ASCII, so
-/// character and column counts coincide.
-fn wrap_long_output(s: String) -> String {
-    const CHUNK: usize = 68;
-    if s.len() <= CHUNK {
-        return s;
-    }
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / CHUNK * 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let end = usize::min(i + CHUNK, bytes.len());
-        out.push_str(&s[i..end]);
-        if end < bytes.len() {
-            out.push_str("\\\n");
-        }
-        i = end;
-    }
-    out
-}
-
 pub type NumericResult = Result<Number, &'static str>;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -313,7 +290,7 @@ impl Number {
         }
 
         if scale == 0 {
-            return wrap_long_output(result);
+            return result;
         }
         result.push('.');
         let count = fractional_digits_for(base, scale);
@@ -321,7 +298,7 @@ impl Number {
         // fraction in `base`.
         let digits = fraction_numerator * BigInt::from(base).pow(count as u32) / &ten_to_scale;
         push_fractional_digits(&mut result, &digits, base, count);
-        wrap_long_output(result)
+        result
     }
 
     /// The number of decimal digits in the number.
@@ -616,18 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn test_long_output_is_wrapped() {
-        // 2^240 has 73 decimal digits: a 68-char line ending in a backslash
-        // continuation, then the 5-character remainder (audit #B6).
-        let n = Number::from(2).pow(&Number::from(240), 0).unwrap();
-        let s = n.to_string(10);
-        let first_line = s.split('\n').next().unwrap();
-        assert_eq!(first_line.len(), 69);
-        assert!(first_line.ends_with('\\'));
-        assert_eq!(s.replace("\\\n", "").len(), 73);
-    }
-
-    #[test]
     fn test_add() {
         let n = Number::parse("10.25", 10)
             .unwrap()
@@ -785,11 +750,6 @@ mod tests {
         assert_eq!(n.to_string(10), "-4.5");
     }
 
-    /// Long output is split across lines; these tests care about the digits.
-    fn digits(n: &Number, base: u64) -> String {
-        n.to_string(base).replace("\\\n", "")
-    }
-
     fn ten_to_the(n: u64) -> Number {
         Number::from(10).pow(&Number::from(n), 0).unwrap()
     }
@@ -799,18 +759,18 @@ mod tests {
         // bigdecimal's default context stops at 100 significant digits, so
         // every digit past that used to be a fabricated zero.
         let n = Number::from(1).div(&Number::from(3), 105).unwrap();
-        assert_eq!(digits(&n, 10), format!("0.{}", "3".repeat(105)));
+        assert_eq!(n.to_string(10), format!("0.{}", "3".repeat(105)));
 
         let n = Number::from(1).div(&Number::from(7), 105).unwrap();
         let repeating: String = "142857".repeat(18).chars().take(105).collect();
-        assert_eq!(digits(&n, 10), format!("0.{}", repeating));
+        assert_eq!(n.to_string(10), format!("0.{}", repeating));
     }
 
     #[test]
     fn test_division_truncates_rather_than_rounds() {
         // 2/3 to 100 places is a hundred sixes; rounding would end in a seven.
         let n = Number::from(2).div(&Number::from(3), 100).unwrap();
-        assert_eq!(digits(&n, 10), format!("0.{}", "6".repeat(100)));
+        assert_eq!(n.to_string(10), format!("0.{}", "6".repeat(100)));
     }
 
     #[test]
@@ -818,23 +778,23 @@ mod tests {
         // No large scale involved: the quotient alone exceeded the context.
         let q = ten_to_the(100).div(&Number::from(7), 0).unwrap();
         let expected: String = "142857".repeat(17).chars().take(100).collect();
-        assert_eq!(digits(&q, 10), expected);
+        assert_eq!(q.to_string(10), expected);
     }
 
     #[test]
     fn test_modulus_with_large_operands() {
         // a - (a/b)*b over a rounded quotient produced -3 here.
         let a = Number::from(2).pow(&Number::from(500), 0).unwrap();
-        assert_eq!(digits(&a.modulus(&Number::from(7), 0).unwrap(), 10), "4");
+        assert_eq!(a.modulus(&Number::from(7), 0).unwrap().to_string(10), "4");
 
         let a = ten_to_the(200);
-        assert_eq!(digits(&a.modulus(&Number::from(97), 0).unwrap(), 10), "81");
+        assert_eq!(a.modulus(&Number::from(97), 0).unwrap().to_string(10), "81");
     }
 
     #[test]
     fn test_sqrt_of_a_large_perfect_square_is_exact() {
         let root = ten_to_the(200).sqrt(0).unwrap();
-        assert_eq!(digits(&root, 10), format!("1{}", "0".repeat(100)));
+        assert_eq!(root.to_string(10), format!("1{}", "0".repeat(100)));
     }
 
     #[test]
@@ -890,11 +850,17 @@ mod tests {
     #[test]
     fn test_pow_by_squaring_stays_exact() {
         assert_eq!(
-            digits(&Number::from(2).pow(&Number::from(10), 0).unwrap(), 10),
+            Number::from(2)
+                .pow(&Number::from(10), 0)
+                .unwrap()
+                .to_string(10),
             "1024"
         );
         assert_eq!(
-            digits(&Number::from(3).pow(&Number::from(5), 0).unwrap(), 10),
+            Number::from(3)
+                .pow(&Number::from(5), 0)
+                .unwrap()
+                .to_string(10),
             "243"
         );
         assert_eq!(
@@ -935,7 +901,7 @@ mod tests {
         // Printing used to cost a full-precision operation per digit, which
         // made a high-scale result far slower to print than to compute.
         let n = Number::from(1).div(&Number::from(3), 20_000).unwrap();
-        let text = digits(&n, 10);
+        let text = n.to_string(10);
         assert_eq!(text.len(), 20_002); // "0." and 20000 threes
         assert!(text.ends_with("333"));
     }

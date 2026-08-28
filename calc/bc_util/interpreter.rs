@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{collections::HashMap, fmt::Write, rc::Rc};
+use std::{collections::HashMap, io, rc::Rc};
 
 use crate::bc_util::instructions::Variable;
 
@@ -17,6 +17,7 @@ use super::{
         NamedExpr, Program, Register, StmtInstruction,
     },
     number::Number,
+    output::OutputWriter,
 };
 
 #[derive(Debug)]
@@ -28,9 +29,8 @@ struct ErrorCall {
 
 #[derive(Debug)]
 pub struct ExecutionError {
-    message: &'static str,
+    message: String,
     call_stack: Vec<ErrorCall>,
-    partial_output: String,
 }
 
 impl ExecutionError {
@@ -51,18 +51,22 @@ impl ExecutionError {
         });
         self
     }
-
-    pub fn partial_output(&self) -> &str {
-        &self.partial_output
-    }
 }
 
 impl From<&'static str> for ExecutionError {
     fn from(message: &'static str) -> Self {
         Self {
-            message,
+            message: message.to_string(),
             call_stack: Vec::new(),
-            partial_output: String::new(),
+        }
+    }
+}
+
+impl From<io::Error> for ExecutionError {
+    fn from(e: io::Error) -> Self {
+        Self {
+            message: format!("cannot write output: {e}"),
+            call_stack: Vec::new(),
         }
     }
 }
@@ -190,7 +194,6 @@ pub struct Interpreter {
     scale: u64,
     ibase: u64,
     obase: u64,
-    output: String,
     has_quit: bool,
     instruction_counter: usize,
     depth: usize,
@@ -206,7 +209,6 @@ impl Default for Interpreter {
             scale: 0,
             ibase: 10,
             obase: 10,
-            output: String::new(),
             has_quit: false,
             instruction_counter: 0,
             depth: 0,
@@ -215,15 +217,13 @@ impl Default for Interpreter {
 }
 
 impl Interpreter {
-    fn take_and_clear_output(&mut self) -> String {
-        let mut string = String::new();
-        std::mem::swap(&mut self.output, &mut string);
-        string
-    }
-
     /// Evaluate an array subscript, checked against `BC_DIM_MAX`.
-    fn array_index(&mut self, index: &ExprInstruction) -> ExecutionResult<usize> {
-        let value = self.eval_expr(index)?;
+    fn array_index(
+        &mut self,
+        index: &ExprInstruction,
+        out: &mut OutputWriter,
+    ) -> ExecutionResult<usize> {
+        let value = self.eval_expr(index, out)?;
         if value.is_negative() {
             return Err("array index cannot be negative".into());
         }
@@ -236,11 +236,11 @@ impl Interpreter {
 
     /// Read a named expression. An element that was never assigned reads as
     /// zero, without being created.
-    fn read_named(&mut self, named: &NamedExpr) -> ExecutionResult<Number> {
+    fn read_named(&mut self, named: &NamedExpr, out: &mut OutputWriter) -> ExecutionResult<Number> {
         match named {
             NamedExpr::VariableNumber(c) => Ok(self.variables[name_index(*c)].clone()),
             NamedExpr::ArrayItem { name, index } => {
-                let index = self.array_index(index)?;
+                let index = self.array_index(index, out)?;
                 Ok(self.array_variables[name_index(*name)]
                     .get(&index)
                     .cloned()
@@ -251,11 +251,15 @@ impl Interpreter {
 
     /// Borrow a named expression for assignment, creating the element if it
     /// does not exist yet.
-    fn write_named(&mut self, named: &NamedExpr) -> ExecutionResult<&mut Number> {
+    fn write_named(
+        &mut self,
+        named: &NamedExpr,
+        out: &mut OutputWriter,
+    ) -> ExecutionResult<&mut Number> {
         match named {
             NamedExpr::VariableNumber(c) => Ok(&mut self.variables[name_index(*c)]),
             NamedExpr::ArrayItem { name, index } => {
-                let index = self.array_index(index)?;
+                let index = self.array_index(index, out)?;
                 Ok(self.array_variables[name_index(*name)]
                     .entry(index)
                     .or_insert_with(Number::zero))
@@ -278,13 +282,18 @@ impl Interpreter {
         }
     }
 
-    fn call_function(&mut self, name: char, args: &[FunctionArgument]) -> ExecutionResult<Number> {
+    fn call_function(
+        &mut self,
+        name: char,
+        args: &[FunctionArgument],
+        out: &mut OutputWriter,
+    ) -> ExecutionResult<Number> {
         self.depth += 1;
         if self.depth > MAX_EVAL_DEPTH {
             self.depth -= 1;
             return Err("evaluation nested too deeply".into());
         }
-        let result = self.call_function_inner(name, args);
+        let result = self.call_function_inner(name, args, out);
         self.depth -= 1;
         result
     }
@@ -293,6 +302,7 @@ impl Interpreter {
         &mut self,
         name: char,
         args: &[FunctionArgument],
+        out: &mut OutputWriter,
     ) -> ExecutionResult<Number> {
         let saved_instruction_counter = self.instruction_counter;
         let function = &self.functions[name_index(name)].clone();
@@ -310,7 +320,7 @@ impl Interpreter {
         for (arg, param) in args.iter().zip(function.parameters.iter()) {
             match (arg, param) {
                 (FunctionArgument::Expr(expr), Variable::Number(name)) => {
-                    let value = self.eval_expr(expr)?;
+                    let value = self.eval_expr(expr, out)?;
                     bindings.push(Binding::Number(name_index(*name), value));
                 }
                 (FunctionArgument::ArrayVariable(arg_name), Variable::Array(param_name)) => {
@@ -357,7 +367,7 @@ impl Interpreter {
 
         self.call_frames.push(call_frame);
         for stmt in body.iter() {
-            let evaluated_statement = self.eval_stmt(stmt).map_err(|e| {
+            let evaluated_statement = self.eval_stmt(stmt, out).map_err(|e| {
                 e.add_call(
                     function.name,
                     function.source_locations[self.instruction_counter],
@@ -475,18 +485,26 @@ impl Interpreter {
         Ok(if prefix { new } else { Number::from(old) })
     }
 
-    fn eval_expr(&mut self, expr: &ExprInstruction) -> ExecutionResult<Number> {
+    fn eval_expr(
+        &mut self,
+        expr: &ExprInstruction,
+        out: &mut OutputWriter,
+    ) -> ExecutionResult<Number> {
         self.depth += 1;
         if self.depth > MAX_EVAL_DEPTH {
             self.depth -= 1;
             return Err("evaluation nested too deeply".into());
         }
-        let result = self.eval_expr_inner(expr);
+        let result = self.eval_expr_inner(expr, out);
         self.depth -= 1;
         result
     }
 
-    fn eval_expr_inner(&mut self, expr: &ExprInstruction) -> ExecutionResult<Number> {
+    fn eval_expr_inner(
+        &mut self,
+        expr: &ExprInstruction,
+        out: &mut OutputWriter,
+    ) -> ExecutionResult<Number> {
         match expr {
             ExprInstruction::Number(x) => {
                 Number::parse(x, self.ibase).ok_or("invalid digit for the current ibase".into())
@@ -496,33 +514,33 @@ impl Interpreter {
                 Register::IBase => Ok(self.ibase.into()),
                 Register::OBase => Ok(self.obase.into()),
             },
-            ExprInstruction::Named(named) => self.read_named(named),
+            ExprInstruction::Named(named) => self.read_named(named, out),
             ExprInstruction::Builtin { function, arg } => match function {
-                BuiltinFunction::Length => Ok(self.eval_expr(arg)?.length().into()),
+                BuiltinFunction::Length => Ok(self.eval_expr(arg, out)?.length().into()),
                 BuiltinFunction::Sqrt => self
-                    .eval_expr(arg)?
+                    .eval_expr(arg, out)?
                     .sqrt(self.scale)
                     .map_err(ExecutionError::from),
-                BuiltinFunction::Scale => Ok(self.eval_expr(arg)?.scale().into()),
+                BuiltinFunction::Scale => Ok(self.eval_expr(arg, out)?.scale().into()),
             },
             ExprInstruction::PreIncrement(named) => {
-                let value = self.write_named(named)?;
+                let value = self.write_named(named, out)?;
                 value.inc();
                 Ok(value.clone())
             }
             ExprInstruction::PreDecrement(named) => {
-                let value = self.write_named(named)?;
+                let value = self.write_named(named, out)?;
                 value.dec();
                 Ok(value.clone())
             }
             ExprInstruction::PostIncrement(named) => {
-                let value = self.write_named(named)?;
+                let value = self.write_named(named, out)?;
                 let result = value.clone();
                 value.inc();
                 Ok(result)
             }
             ExprInstruction::PostDecrement(named) => {
-                let value = self.write_named(named)?;
+                let value = self.write_named(named, out)?;
                 let result = value.clone();
                 value.dec();
                 Ok(result)
@@ -530,13 +548,13 @@ impl Interpreter {
             ExprInstruction::Call { name, args } => {
                 let ic = self.instruction_counter;
                 self.instruction_counter = 0;
-                let call_result = self.call_function(*name, args);
+                let call_result = self.call_function(*name, args, out);
                 self.instruction_counter = ic;
                 call_result
             }
             ExprInstruction::Assignment { named, value } => {
-                let value = self.eval_expr(value)?;
-                self.write_named(named)?.clone_from(&value);
+                let value = self.eval_expr(value, out)?;
+                self.write_named(named, out)?.clone_from(&value);
                 Ok(value)
             }
             ExprInstruction::SetRegister { register, value } => {
@@ -548,7 +566,7 @@ impl Interpreter {
                         // the value is a valid hexadecimal number
                         Number::parse(n, 16).unwrap()
                     }
-                    _ => self.eval_expr(value)?,
+                    _ => self.eval_expr(value, out)?,
                 };
 
                 self.set_register(*register, &value)?;
@@ -560,39 +578,63 @@ impl Interpreter {
             ExprInstruction::DecrementRegister { register, prefix } => {
                 self.step_register(*register, -1, *prefix)
             }
-            ExprInstruction::UnaryMinus(expr) => Ok(self.eval_expr(expr)?.negate()),
-            ExprInstruction::Add(lhs, rhs) => Ok(self.eval_expr(lhs)?.add(&self.eval_expr(rhs)?)),
-            ExprInstruction::Sub(lhs, rhs) => Ok(self.eval_expr(lhs)?.sub(&self.eval_expr(rhs)?)),
-            ExprInstruction::Mul(lhs, rhs) => {
-                Ok(self.eval_expr(lhs)?.mul(&self.eval_expr(rhs)?, self.scale))
+            ExprInstruction::UnaryMinus(expr) => Ok(self.eval_expr(expr, out)?.negate()),
+            ExprInstruction::Add(lhs, rhs) => {
+                Ok(self.eval_expr(lhs, out)?.add(&self.eval_expr(rhs, out)?))
             }
+            ExprInstruction::Sub(lhs, rhs) => {
+                Ok(self.eval_expr(lhs, out)?.sub(&self.eval_expr(rhs, out)?))
+            }
+            ExprInstruction::Mul(lhs, rhs) => Ok(self
+                .eval_expr(lhs, out)?
+                .mul(&self.eval_expr(rhs, out)?, self.scale)),
             ExprInstruction::Div(lhs, rhs) => Ok(self
-                .eval_expr(lhs)?
-                .div(&self.eval_expr(rhs)?, self.scale)?),
+                .eval_expr(lhs, out)?
+                .div(&self.eval_expr(rhs, out)?, self.scale)?),
             ExprInstruction::Mod(lhs, rhs) => self
-                .eval_expr(lhs)?
-                .modulus(&self.eval_expr(rhs)?, self.scale)
+                .eval_expr(lhs, out)?
+                .modulus(&self.eval_expr(rhs, out)?, self.scale)
                 .map_err(ExecutionError::from),
             ExprInstruction::Pow(lhs, rhs) => self
-                .eval_expr(lhs)?
-                .pow(&self.eval_expr(rhs)?, self.scale)
+                .eval_expr(lhs, out)?
+                .pow(&self.eval_expr(rhs, out)?, self.scale)
                 .map_err(ExecutionError::from),
         }
     }
 
-    fn eval_condition(&mut self, condition: &ConditionInstruction) -> ExecutionResult<bool> {
+    fn eval_condition(
+        &mut self,
+        condition: &ConditionInstruction,
+        out: &mut OutputWriter,
+    ) -> ExecutionResult<bool> {
         match condition {
-            ConditionInstruction::Expr(expr) => self.eval_expr(expr).map(|val| !val.is_zero()),
-            ConditionInstruction::Eq(lhs, rhs) => Ok(self.eval_expr(lhs)? == self.eval_expr(rhs)?),
-            ConditionInstruction::Ne(lhs, rhs) => Ok(self.eval_expr(lhs)? != self.eval_expr(rhs)?),
-            ConditionInstruction::Lt(lhs, rhs) => Ok(self.eval_expr(lhs)? < self.eval_expr(rhs)?),
-            ConditionInstruction::Gt(lhs, rhs) => Ok(self.eval_expr(lhs)? > self.eval_expr(rhs)?),
-            ConditionInstruction::Leq(lhs, rhs) => Ok(self.eval_expr(lhs)? <= self.eval_expr(rhs)?),
-            ConditionInstruction::Geq(lhs, rhs) => Ok(self.eval_expr(lhs)? >= self.eval_expr(rhs)?),
+            ConditionInstruction::Expr(expr) => self.eval_expr(expr, out).map(|val| !val.is_zero()),
+            ConditionInstruction::Eq(lhs, rhs) => {
+                Ok(self.eval_expr(lhs, out)? == self.eval_expr(rhs, out)?)
+            }
+            ConditionInstruction::Ne(lhs, rhs) => {
+                Ok(self.eval_expr(lhs, out)? != self.eval_expr(rhs, out)?)
+            }
+            ConditionInstruction::Lt(lhs, rhs) => {
+                Ok(self.eval_expr(lhs, out)? < self.eval_expr(rhs, out)?)
+            }
+            ConditionInstruction::Gt(lhs, rhs) => {
+                Ok(self.eval_expr(lhs, out)? > self.eval_expr(rhs, out)?)
+            }
+            ConditionInstruction::Leq(lhs, rhs) => {
+                Ok(self.eval_expr(lhs, out)? <= self.eval_expr(rhs, out)?)
+            }
+            ConditionInstruction::Geq(lhs, rhs) => {
+                Ok(self.eval_expr(lhs, out)? >= self.eval_expr(rhs, out)?)
+            }
         }
     }
 
-    fn eval_stmt(&mut self, stmt: &StmtInstruction) -> ExecutionResult<ControlFlow> {
+    fn eval_stmt(
+        &mut self,
+        stmt: &StmtInstruction,
+        out: &mut OutputWriter,
+    ) -> ExecutionResult<ControlFlow> {
         let instruction_counter_start = self.instruction_counter;
         let mut stmt_instruction_count = 1;
         match stmt {
@@ -606,7 +648,7 @@ impl Interpreter {
                 return Ok(ControlFlow::Return(Number::zero()));
             }
             StmtInstruction::ReturnExpr(expr) => {
-                let value = self.eval_expr(expr)?;
+                let value = self.eval_expr(expr, out)?;
                 return Ok(ControlFlow::Return(value));
             }
             StmtInstruction::If {
@@ -615,11 +657,11 @@ impl Interpreter {
                 body,
             } => {
                 stmt_instruction_count = *instruction_count + 1;
-                if self.eval_condition(condition)? {
+                if self.eval_condition(condition, out)? {
                     // count the condition
                     self.instruction_counter += 1;
                     for stmt in body {
-                        let control_flow = self.eval_stmt(stmt)?;
+                        let control_flow = self.eval_stmt(stmt, out)?;
                         // any control flow instruction in the body of the
                         // if needs to be handled by the caller
                         if control_flow != ControlFlow::None {
@@ -634,11 +676,11 @@ impl Interpreter {
                 body,
             } => {
                 stmt_instruction_count = *instruction_count + 1;
-                'while_loop: while self.eval_condition(condition)? {
+                'while_loop: while self.eval_condition(condition, out)? {
                     // count the condition
                     self.instruction_counter += 1;
                     for stmt in body {
-                        let control_flow = self.eval_stmt(stmt)?;
+                        let control_flow = self.eval_stmt(stmt, out)?;
                         if control_flow == ControlFlow::Break {
                             break 'while_loop;
                         }
@@ -660,12 +702,12 @@ impl Interpreter {
                 body,
             } => {
                 stmt_instruction_count = *instruction_count + 1;
-                self.eval_expr(init)?;
-                'for_loop: while self.eval_condition(condition)? {
+                self.eval_expr(init, out)?;
+                'for_loop: while self.eval_condition(condition, out)? {
                     // count init condition and update
                     self.instruction_counter += 1;
                     for stmt in body {
-                        let control_flow = self.eval_stmt(stmt)?;
+                        let control_flow = self.eval_stmt(stmt, out)?;
                         if control_flow == ControlFlow::Break {
                             break 'for_loop;
                         }
@@ -675,16 +717,15 @@ impl Interpreter {
                     }
                     // reset the instruction counter to the start of the loop
                     self.instruction_counter = instruction_counter_start;
-                    self.eval_expr(update)?;
+                    self.eval_expr(update, out)?;
                 }
             }
-            StmtInstruction::String(s) => self.output.push_str(s),
+            StmtInstruction::String(s) => out.write_text(s)?,
             StmtInstruction::Expr(expr) => {
-                let value = self.eval_expr(expr)?;
+                let value = self.eval_expr(expr, out)?;
                 if should_print(expr) {
-                    // this should never fail
-                    writeln!(&mut self.output, "{}", value.to_string(self.obase))
-                        .expect("error appending to string");
+                    out.write_text(&value.to_string(self.obase))?;
+                    out.write_text("\n")?;
                 }
             }
             StmtInstruction::DefineFunction { .. } => {
@@ -696,7 +737,7 @@ impl Interpreter {
         Ok(ControlFlow::None)
     }
 
-    pub fn exec(&mut self, program: Program) -> ExecutionResult<String> {
+    pub fn exec(&mut self, program: Program, out: &mut OutputWriter) -> ExecutionResult<()> {
         self.instruction_counter = 0;
         for stmt in program.instructions {
             if let StmtInstruction::DefineFunction { name, function } = stmt {
@@ -709,13 +750,12 @@ impl Interpreter {
                 // in which case we need to stop execution
                 if function.body.iter().any(contains_quit) {
                     self.has_quit = true;
-                    return Ok(self.take_and_clear_output());
+                    return Ok(());
                 }
 
                 self.functions[name_index(name)] = function;
             } else {
-                let control_flow = self.eval_stmt(&stmt).map_err(|mut e| {
-                    e.partial_output = self.take_and_clear_output();
+                let control_flow = self.eval_stmt(&stmt, out).map_err(|e| {
                     e.global_source(
                         program.source_locations[self.instruction_counter],
                         program.file.clone(),
@@ -737,15 +777,28 @@ impl Interpreter {
                 // but we need still need to stop execution
                 if contains_quit(&stmt) || self.has_quit {
                     self.has_quit = true;
-                    return Ok(self.take_and_clear_output());
+                    return Ok(());
                 }
             }
         }
-        Ok(self.take_and_clear_output())
+        Ok(())
     }
 
     pub fn has_quit(&self) -> bool {
         self.has_quit
+    }
+}
+
+#[cfg(test)]
+impl Interpreter {
+    /// Run a program, collecting its output for tests that assert on it.
+    fn exec_to_string(&mut self, program: Program) -> ExecutionResult<String> {
+        let mut buffer = Vec::new();
+        {
+            let mut out = OutputWriter::new(&mut buffer);
+            self.exec(program, &mut out)?;
+        }
+        Ok(String::from_utf8(buffer).expect("bc output is UTF-8"))
     }
 }
 
@@ -760,7 +813,7 @@ mod tests {
         // 5
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::Expr(ExprInstruction::Number(
                     "5".to_string(),
                 ))]
@@ -777,7 +830,7 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::Expr(ExprInstruction::Named(
                     NamedExpr::VariableNumber('a'),
                 ))]
@@ -794,7 +847,7 @@ mod tests {
         // scale(5)
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::Expr(ExprInstruction::Builtin {
                     function: BuiltinFunction::Scale,
                     arg: Box::new(ExprInstruction::Number("5".to_string())),
@@ -812,7 +865,7 @@ mod tests {
         // sqrt(25)
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::Expr(ExprInstruction::Builtin {
                     function: BuiltinFunction::Sqrt,
                     arg: Box::new(ExprInstruction::Number("25".to_string())),
@@ -830,7 +883,7 @@ mod tests {
         // length(5)
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::Expr(ExprInstruction::Builtin {
                     function: BuiltinFunction::Length,
                     arg: Box::new(ExprInstruction::Number("5".to_string())),
@@ -849,7 +902,7 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::Expr(ExprInstruction::PreIncrement(
                         NamedExpr::VariableNumber('a'),
@@ -870,7 +923,7 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::Expr(ExprInstruction::PreDecrement(
                         NamedExpr::VariableNumber('a'),
@@ -891,7 +944,7 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::Expr(ExprInstruction::PostIncrement(
                         NamedExpr::VariableNumber('a'),
@@ -912,7 +965,7 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::Expr(ExprInstruction::PostDecrement(
                         NamedExpr::VariableNumber('a'),
@@ -935,7 +988,7 @@ mod tests {
         // f()
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',
@@ -967,7 +1020,7 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::Expr(ExprInstruction::Assignment {
                         named: NamedExpr::VariableNumber('a'),
@@ -988,7 +1041,7 @@ mod tests {
         // quit
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::Quit].into())
+            .exec_to_string(vec![StmtInstruction::Quit].into())
             .unwrap();
         assert_eq!(output, "");
         assert!(interpreter.has_quit());
@@ -1001,7 +1054,7 @@ mod tests {
         // while (1) { break; 1 }
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::While {
                     condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
                     instruction_count: 2,
@@ -1025,7 +1078,7 @@ mod tests {
         // f()
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',
@@ -1055,7 +1108,7 @@ mod tests {
         // f()
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',
@@ -1088,7 +1141,7 @@ mod tests {
         // }
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::If {
                     condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
                     instruction_count: 1,
@@ -1111,7 +1164,7 @@ mod tests {
         // }
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::If {
                     condition: ConditionInstruction::Expr(ExprInstruction::Number("0".to_string())),
                     instruction_count: 1,
@@ -1132,7 +1185,7 @@ mod tests {
         // a = 5
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![StmtInstruction::Expr(ExprInstruction::Assignment {
                     named: NamedExpr::VariableNumber('a'),
                     value: Box::new(ExprInstruction::Number("5".to_string())),
@@ -1151,7 +1204,7 @@ mod tests {
         // a[0]
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::Expr(ExprInstruction::Assignment {
                         named: NamedExpr::ArrayItem {
@@ -1181,7 +1234,7 @@ mod tests {
         // 1
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',
@@ -1211,7 +1264,7 @@ mod tests {
         // 1
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::If {
                         condition: ConditionInstruction::Expr(ExprInstruction::Number(
@@ -1243,7 +1296,7 @@ mod tests {
         // 1
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::While {
                         condition: ConditionInstruction::Expr(ExprInstruction::Number(
@@ -1276,7 +1329,7 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',
@@ -1315,7 +1368,7 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',
@@ -1358,7 +1411,7 @@ mod tests {
         // f(5)
         //```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',
@@ -1398,7 +1451,7 @@ mod tests {
         // a[0]
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',
@@ -1454,7 +1507,7 @@ mod tests {
         // obase
         // ```
         let output = interpreter
-            .exec(
+            .exec_to_string(
                 vec![
                     StmtInstruction::Expr(ExprInstruction::SetRegister {
                         register: Register::OBase,
@@ -1474,7 +1527,7 @@ mod tests {
         // ```
         // f()
         // ```
-        let output = interpreter.exec(Program {
+        let output = interpreter.exec_to_string(Program {
             instructions: vec![StmtInstruction::Expr(ExprInstruction::Call {
                 name: 'f',
                 args: vec![],
@@ -1497,7 +1550,7 @@ mod tests {
         // }
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![
                     StmtInstruction::Expr(ExprInstruction::Assignment {
                         named: NamedExpr::VariableNumber('i'),
@@ -1541,7 +1594,7 @@ mod tests {
         // 1 ^ 2.2
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![
                     StmtInstruction::Expr(ExprInstruction::Assignment {
                         named: NamedExpr::VariableNumber('i'),
@@ -1582,7 +1635,7 @@ mod tests {
         // 1 ^ 2.2
         //```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![
                     StmtInstruction::While {
                         condition: ConditionInstruction::Expr(ExprInstruction::Number(
@@ -1619,7 +1672,7 @@ mod tests {
         // }
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![StmtInstruction::For {
                     init: ExprInstruction::Assignment {
                         named: NamedExpr::VariableNumber('a'),
@@ -1659,7 +1712,7 @@ mod tests {
         // 1 ^ 2.2
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![
                     StmtInstruction::For {
                         init: ExprInstruction::Assignment {
@@ -1701,7 +1754,7 @@ mod tests {
         // 1 ^ 2.2
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![
                     StmtInstruction::For {
                         init: ExprInstruction::Assignment {
@@ -1742,7 +1795,7 @@ mod tests {
         // }
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![StmtInstruction::If {
                     condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
                     instruction_count: 2,
@@ -1771,7 +1824,7 @@ mod tests {
         // 1 ^ 2.2
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![
                     StmtInstruction::If {
                         condition: ConditionInstruction::Expr(ExprInstruction::Number(
@@ -1807,7 +1860,7 @@ mod tests {
         // 1 ^ 2.2
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![
                     StmtInstruction::If {
                         condition: ConditionInstruction::Expr(ExprInstruction::Number(
@@ -1843,7 +1896,7 @@ mod tests {
         // f()
         // ```
         let err = interpreter
-            .exec(Program {
+            .exec_to_string(Program {
                 instructions: vec![
                     StmtInstruction::DefineFunction {
                         name: 'f',

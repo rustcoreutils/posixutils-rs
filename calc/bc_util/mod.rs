@@ -11,4 +11,5 @@ pub mod instructions;
 pub mod interpreter;
 mod lexer;
 mod number;
+pub mod output;
 pub mod parser;

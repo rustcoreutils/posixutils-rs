@@ -8,11 +8,9 @@
 //
 
 use std::ffi::OsString;
+use std::io::BufWriter;
 
-use bc_util::{
-    interpreter::{ExecutionResult, Interpreter},
-    parser::parse_program,
-};
+use bc_util::{interpreter::Interpreter, output::OutputWriter, parser::parse_program};
 use clap::Parser;
 
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -30,18 +28,13 @@ struct Args {
     files: Vec<OsString>,
 }
 
-// Write program output to stdout and any diagnostic to stderr (POSIX: the
-// standard error shall be used only for diagnostic messages). The partial
-// output captured before an error is genuine program output, so it still goes
-// to stdout. Returns true if an error occurred.
-fn print_output_or_error(result: ExecutionResult<String>) -> bool {
+// Program output goes to stdout as it is produced; diagnostics go to stderr
+// (POSIX: the standard error shall be used only for diagnostic messages).
+// Returns true if an error occurred.
+fn report_error(result: Result<(), impl std::fmt::Display>) -> bool {
     match result {
-        Ok(output) => {
-            print!("{}", output);
-            false
-        }
+        Ok(()) => false,
         Err(e) => {
-            print!("{}", e.partial_output());
             eprintln!("{}", e);
             true
         }
@@ -85,11 +78,17 @@ fn run() {
 
     let mut interpreter = Interpreter::default();
     let mut had_error = false;
+    // Block-buffered so a long-running loop streams rather than accumulating
+    // its whole output in memory; flushed after each input item so interactive
+    // output appears without delay, as POSIX requires.
+    let stdout = std::io::stdout();
+    let mut sink = BufWriter::new(stdout.lock());
+    let mut out = OutputWriter::new(&mut sink);
 
     if args.define_math_functions {
         let load = parse_program(include_str!("bc_util/math_functions.bc"), None)
             .map_err(|e| e.to_string())
-            .and_then(|lib| interpreter.exec(lib).map(|_| ()).map_err(|e| e.to_string()));
+            .and_then(|lib| interpreter.exec(lib, &mut out).map_err(|e| e.to_string()));
         if let Err(e) = load {
             eprintln!("bc: internal error loading standard math functions: {}", e);
             std::process::exit(1);
@@ -100,7 +99,8 @@ fn run() {
         match std::fs::read_to_string(&file) {
             Ok(s) => match parse_program(&s, file.to_str()) {
                 Ok(program) => {
-                    had_error |= print_output_or_error(interpreter.exec(program));
+                    had_error |= report_error(interpreter.exec(program, &mut out));
+                    had_error |= report_error(out.flush());
                 }
                 Err(e) => {
                     eprintln!("{}", e);
@@ -115,6 +115,7 @@ fn run() {
             }
         };
         if interpreter.has_quit() {
+            had_error |= report_error(out.flush());
             std::process::exit(if had_error { 1 } else { 0 });
         }
     }
@@ -135,7 +136,10 @@ fn run() {
                 line_buffer.push('\n');
                 match parse_program(&line_buffer, None) {
                     Ok(program) => {
-                        print_output_or_error(interpreter.exec(program));
+                        // A runtime error in the REPL is recovered from: the
+                        // session continues and its exit status is unaffected.
+                        report_error(interpreter.exec(program, &mut out));
+                        report_error(out.flush());
                         line_buffer.clear();
                     }
                     Err(e) if !e.is_incomplete => {
@@ -155,5 +159,6 @@ fn run() {
         }
     }
 
+    had_error |= report_error(out.flush());
     std::process::exit(if had_error { 1 } else { 0 });
 }

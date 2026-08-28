@@ -1387,3 +1387,47 @@ fn delta_g_still_accepts_a_bare_serial_number() {
     let out = super::common::run_in("prs", &["-d:Dg:", "-r1.4", &sfile], tmp.path(), "");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
 }
+
+/// `get` must replace the g-file, never write through a symlink standing in
+/// its place.
+///
+/// The original `File::create` followed one, so anyone who could plant
+/// `./f` as a symlink could have `get f` overwrite the target with the
+/// retrieved text -- and `sccs` may be installed setuid. Replacing by rename
+/// leaves the pointed-at file alone.
+#[test]
+fn get_replaces_a_gfile_symlink_instead_of_following_it() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_ok("admin", &["-i", "s.link"], tmp.path(), "retrieved\n");
+    assert!(out.status.success());
+
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, "ORIGINAL\n").unwrap();
+    std::os::unix::fs::symlink(&victim, tmp.path().join("link")).unwrap();
+
+    let out = super::common::run_in("get", &["s.link"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "ORIGINAL\n",
+        "get must not write through the symlink"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("link")).unwrap(),
+        "retrieved\n",
+        "the g-file itself holds the retrieved text"
+    );
+    assert!(
+        !tmp.path()
+            .join("link")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink(),
+        "the symlink is replaced by the g-file"
+    );
+}

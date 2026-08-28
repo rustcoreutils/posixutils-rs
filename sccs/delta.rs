@@ -594,7 +594,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     if let Err(refusal) =
         protect::check_edit(&sccs, pfile_entry.old_sid.rel, &posixutils_sccs::username())
     {
-        diag::error_path("delta", sfile_path, refusal.message());
+        diag::error_path("delta", sfile_path, &refusal.message());
         return Ok(false);
     }
 

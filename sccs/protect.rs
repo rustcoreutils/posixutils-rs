@@ -23,6 +23,7 @@
 //! Retrieval without `-e` is deliberately not gated. The spec attaches these
 //! checks to editing, and CSSC does the same.
 
+use gettextrs::gettext;
 use plib::sccsfile::SccsFile;
 
 /// Why an edit was refused. The wording matches CSSC 1.4.1, which is what
@@ -35,10 +36,15 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    pub fn message(&self) -> &'static str {
+    /// The diagnostic to print, translated.
+    ///
+    /// Localized here rather than at each call site so a third caller cannot
+    /// forget: these were the only user-visible strings in the crate reaching
+    /// the terminal untranslated.
+    pub fn message(&self) -> String {
         match self {
-            Refusal::ReleaseLocked => "Requested release is locked.",
-            Refusal::NotAuthorized => "You are not authorized to make deltas.",
+            Refusal::ReleaseLocked => gettext("Requested release is locked."),
+            Refusal::NotAuthorized => gettext("You are not authorized to make deltas."),
         }
     }
 }

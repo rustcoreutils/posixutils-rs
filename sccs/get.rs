@@ -598,7 +598,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         if let Err(refusal) =
             protect::check_edit(&sccs, target_sid.rel, &posixutils_sccs::username())
         {
-            diag::error_path("get", sfile_path, refusal.message());
+            diag::error_path("get", sfile_path, &refusal.message());
             return Ok(false);
         }
 

@@ -19,6 +19,7 @@
 use std::io;
 use std::path::Path;
 
+use gettextrs::gettext;
 use plib::sccsfile::ZLock;
 
 /// Install the SIGINT cleanup handler. Every utility that acquires a lock or
@@ -39,7 +40,11 @@ pub fn is_held(e: &io::Error) -> bool {
 pub fn acquire(sfile: &Path) -> io::Result<ZLock> {
     ZLock::acquire(sfile).map_err(|e| {
         if e.kind() == io::ErrorKind::AlreadyExists {
-            io::Error::new(io::ErrorKind::AlreadyExists, "being edited")
+            // Localized here rather than at the call sites: `admin` propagates
+            // this error for `main` to print instead of matching on it, so an
+            // untranslated literal would reach the user from that one path
+            // while every other utility printed a translated one.
+            io::Error::new(io::ErrorKind::AlreadyExists, gettext("being edited"))
         } else {
             e
         }

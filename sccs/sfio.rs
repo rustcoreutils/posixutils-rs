@@ -14,22 +14,24 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-/// Write `data` to `path` and set its mode, replacing any existing file.
+/// Write `data` to `path` with `mode`, replacing whatever is there.
 ///
-/// The unlink is the point. `get` writes the g-file mode 0444, so on the next
-/// `get` of the same file `File::create` reopens that read-only file for
-/// writing and fails with EACCES — a second `get` of any file could never
-/// succeed, and neither could a second `get -l`. Removing the old file first
-/// is what every SCCS implementation does, and it also detaches any hard link
-/// rather than writing through it.
+/// `get` writes the g-file mode 0444, so on the next `get` of the same file
+/// `File::create` reopens that read-only file for writing and fails with
+/// EACCES — a second `get` of any file could never succeed, and neither could
+/// a second `get -l`. Replacing rather than reopening is the fix, and a
+/// `rename(2)` over the old file does it without needing write permission on
+/// the file itself.
+///
+/// It must be a rename and not an unlink followed by a write. Unlinking first
+/// destroys the old contents before the new ones exist, so a write that fails
+/// part way — a full disk, a signal — leaves nothing at all. That is merely
+/// inconvenient for a g-file, which `get` can regenerate, and data loss for
+/// the p-file, which is the only record that an edit is outstanding. The
+/// unlink also opens a window for another process to create something at the
+/// path first.
 pub fn write_replacing(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    fs::write(path, data)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    plib::io::write_atomic_mode(path, data, mode)
 }
 
 /// Write `serialized` to the x-file, apply `perms`, and atomically rename over

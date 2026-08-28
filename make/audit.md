@@ -273,6 +273,16 @@ wrong build.
   #43 exposed it. Either implement SCCS retrieval or reject the target, but do
   not keep accepting it silently.
 
+- [ ] **#62 — A function applied to an automatic variable sees its literal text.**
+  `$(notdir $^)` yields `src/a.o src/b.o` where GNU yields `a.o b.o`; `$(dir $^)`
+  yields `./`; `$(basename $<)` is a no-op. Recipe macro/function expansion runs
+  at read time (`expand_command_lines`), but automatic variables are substituted
+  at run time (`substitute_internal_macros`) — so a function only ever sees the
+  literal `$^`. The two phases cannot compose in that order. Fixing it means
+  expanding automatic variables *first* and running function expansion against
+  the result at run time, which needs the macro table available there.
+  Found by the corpus differential, not by the review.
+
 ## Minor
 
 - [x] **#43 — `-p` prints a `Debug` dump of the built-in table, never the
@@ -326,6 +336,31 @@ built on it cannot express two targets on a line (#27), a slash in a filename
 scoped per rule rather than a whole-file textual fixpoint (#32, #34, #35), and
 target names should be `OsStr`/`PathBuf` rather than `String` + `leak()`
 (#39, #45).
+
+## Acceptance gate
+
+`/tmp/makecorpus.sh` (rebuilt per session, per the project's convention for gate
+scripts). Three checks per corpus project:
+
+| check | what it does | catches |
+|---|---|---|
+| build | make succeeds, artifact exists, artifact runs | outright breakage |
+| noop | `make -n` straight after a build prints nothing | always-rebuild |
+| diff | `make -n` on a clean tree matches `gmake -n` | silent divergence |
+
+Two things the earlier single-check gate got wrong, both worth keeping:
+
+- **The corpus needs a phony target directly over an inferred one.** Both original
+  projects put a real-file intermediate between the phony root and the pattern
+  rule, so the traversal short-circuits on a rerun and an always-rebuild bug
+  stays invisible. The `phony` project exists to expose exactly that.
+- **The differential is opt-in per project.** A project relying on the *built-in*
+  `.c.o` legitimately differs from GNU: POSIX specifies
+  `$(CC) $(CFLAGS) -c $<`, GNU's is `-c -o $@ $<`. Lua is exempted for that
+  reason, with the reason recorded in the run output rather than silently.
+
+A gate is only worth having if it can fail. On the tree of 2026-08-28 this one
+fails on two real defects (`phony`/noop, `synthetic`/diff) and exits nonzero.
 
 ## Re-probe of the 2026-06-12 findings (2026-08-27)
 

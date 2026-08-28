@@ -170,9 +170,10 @@ wrong build.
   matching GNU, except under `-e` where the environment wins. Tests
   `makefile_macro_absent_from_env_is_not_exported`,
   `makefile_macro_present_in_env_is_updated`, `dash_e_lets_the_environment_win`.
-  _Known residual: `main.rs` appends command-line macros to the makefile text,
-  so they are indistinguishable from makefile macros and are also not exported.
-  POSIX 105866 requires that they be. Recorded as **#50**._
+  _The residual noted here — command-line macros appended to the makefile text,
+  and so indistinguishable from makefile macros — is gone as of #71: they are
+  seeded into the reader's table before the read and locked against a later
+  assignment._
 - [x] **#50 — Command-line `macro=value` operands are not exported to recipes.**
   ✓ fixed 2026-08-27 (P7). POSIX 105866 requires them in make's environment;
   putting them there is also what makes them visible to recipes, since #49's
@@ -466,6 +467,19 @@ findings and reported complete without them. They are unchanged since.
   prerequisites means "as if -i". `rule::config` had no members left and is
   deleted. Tests `ignore_applies_to_the_named_target_only`,
   `silent_applies_to_the_named_target_only`, plus unit tests on `Attributes`.
+
+## Still open
+
+- **Full POSIX macro source-1..4 precedence.** No macro records where its value
+  came from. Precedence is emergent: built-in defaults are seeded only where
+  the makefile is silent, the environment is consulted as a fallback (or wins
+  under `-e`), and command-line macros are locked. That answers every case
+  probed against GNU Make 4.3, and #71/#73 closed the two that were wrong, but
+  it is not the four-source model the spec describes, and a case that needs to
+  ask "which source set this?" cannot be answered today.
+- **XSI `~` suffix rules** (`.c~.o`, `.sh~` and friends), which build directly
+  from an SCCS history file. Separate machinery from `.SCCS_GET` retrieval
+  (#61), which is implemented.
 
 ## Acceptance gate
 

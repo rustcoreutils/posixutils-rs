@@ -5,8 +5,8 @@ history — `git show 49de59d3^:make/audit.md` recovers the file as it stood
 before it was deleted on 2026-08-27, and `git log --follow -- make/audit.md`
 walks its whole history.
 
-**Implementation:** `make/src/` (~3,074 lines across 16 files)
-**Tests:** `make/tests/` (fixture makefiles + `mod.rs` harness, ~1,511 lines)
+**Implementation:** `make/src/` (~6,589 lines across 19 files)
+**Tests:** `make/tests/` (fixture makefiles + two harnesses, ~3,811 lines)
 **Spec:** POSIX.1-2024 (IEEE Std 1003.1-2024), Vol. 3 §3 `make`, pp. 3130–3146.
 No sliced spec tree covers `make`; the section was extracted from the mega-PDF.
 
@@ -468,6 +468,107 @@ findings and reported complete without them. They are unchanged since.
   deleted. Tests `ignore_applies_to_the_named_target_only`,
   `silent_applies_to_the_named_target_only`, plus unit tests on `Attributes`.
 
+## From the 2026-08-28 branch review
+
+Ten defects found by review of the `updates` branch, two more found while
+verifying them. All reproduce against the built binary and were diffed against
+GNU Make 4.3; each fix carries a regression test.
+
+### Critical
+
+- [x] **#79 — A function call nested around an automatic variable is
+  truncated.** ✓ fixed 2026-08-28. `substitute_internal_macros` read `$(...)`
+  to the *first* `)` with no nesting count, and then evaluated that truncated
+  call, so `$(addprefix o/,$(notdir $^))` printed `[o/x.c)]` — the inner call's
+  result plus the outer call's stray paren. It reads to the matching close now,
+  the way the preprocessor's `read_balanced` already did. A regression against
+  `main`, which re-emitted the bracketed form verbatim and stayed correct. Test
+  `nested_functions_read_to_the_matching_paren`.
+- [x] **#80 — Two inference rules that derive each other's source hang.**
+  ✓ fixed 2026-08-28. `Edges::prerequisites_of` reported named and `%`-pattern
+  edges only, so an inference rule's implicit source was invisible to
+  `find_cycle`; `Ledger::claim` then blocked the *one* thread on a target it
+  was itself in the middle of building. With `.c.o:` and `.o.c:` both defined,
+  `make foo.o` never returned and printed nothing. `prerequisites_of` now
+  mirrors the dispatch order in `build_target_uncached` — named rule, else
+  pattern rule, else the inferred source — so the cycle is reported. Not a `-j`
+  race: it deadlocked single-threaded. Test
+  `mutually_recursive_inference_rules_are_a_cycle_not_a_hang`.
+- [x] **#81 — A trailing comment reaches the directive.** ✓ fixed 2026-08-28.
+  `handle_line` recognized directives on the raw line, before `strip_comment`,
+  so the comment became part of the condition: `ifeq ($(X),1)   # why` failed
+  the whole makefile with `malformed conditional`, and `ifdef X  # why`
+  silently evaluated false and took the `else` arm. Every line but a
+  `<tab>`-indented command line now loses its comment first, which is where
+  POSIX 105629 draws the line too. Test
+  `a_trailing_comment_does_not_reach_the_condition`.
+- [x] **#82 — `-t` empties the target.** ✓ fixed 2026-08-28. The touch path
+  opened the target with `File::create`, which is `O_TRUNC`, so `make -t`
+  destroyed the contents of every out-of-date target it marked. Opened without
+  truncation now: `-t` records a time, it does not write the file. Test
+  `touch_preserves_the_target_contents`.
+- [x] **#83 — An explicit prerequisite list hides the inferred source.**
+  ✓ fixed 2026-08-28. Staleness was judged from `effective_prerequisites`,
+  which for an explicit dispatch is only the named rule's list, and the
+  up-to-date early return came *before* the "no commands → check inference
+  rules" branch. The standard `foo.o: foo.h` plus `.c.o:` idiom therefore never
+  saw `foo.c`, and a changed source never recompiled — make reported the target
+  up to date. The inference rule is resolved once, before the comparison, and
+  its source joins the prerequisite list. Test
+  `an_inference_rule_sees_a_changed_source_through_an_explicit_rule`.
+- [x] **#84 — A later rule leaks prerequisites to sibling targets.** ✓ fixed
+  2026-08-28. `Rule::absorb` merged into a rule that may name several targets,
+  so `a b:` followed by `a: extra` gave `extra` to `b` as well — the same leak
+  #78 fixed for attributes, unfixed for prerequisites. POSIX 105643 makes the
+  target side a `<blank>`-separated list of targets, each a target in its own
+  right — `a b: c` is `a: c` and `b: c` — so `Rule::split_targets` expands a
+  multi-target rule into one rule per target at construction and absorption
+  only ever merges rules for the same single target. A `%` pattern rule is left
+  whole: it is a template matched by name, not a target. Test
+  `a_later_rule_does_not_leak_prerequisites_to_siblings`.
+
+### Major
+
+- [x] **#85 — `VPATH` resolves only `$<`.** ✓ fixed 2026-08-28.
+  `expand_internal_macro` passed `files.0` through the resolver and took `$^`,
+  `$+` and `$?` straight from the raw prerequisite names, so a recipe using
+  them named a file that does not exist in the working directory. Every
+  prerequisite-derived macro is resolved now. Test
+  `vpath_resolves_every_prerequisite_macro`.
+- [x] **#86 — A double-colon rule parses as a prerequisite named `:`.**
+  ✓ fixed 2026-08-28. `split_rule_line` took the first `:`, so `all:: a` became
+  target `all` with prerequisites `[":", "a"]` and the build failed with
+  `no target ':'` — a diagnostic about the wrong thing entirely. GNU's
+  double-colon rule is not POSIX and is not implemented; it is now named and
+  rejected rather than misread. Tests `scan::rejects_a_double_colon_rule`,
+  `scan::accepts_a_colon_in_a_prerequisite`, `double_colon_rule_is_diagnosed`.
+- [x] **#87 — A trailing `$` fails the makefile.** ✓ fixed 2026-08-28. A `$` as
+  the last character of a line raised `UnexpectedEOF` from `substitute`, which
+  aborts the entire read, so a recipe as ordinary as `@echo end$` was rejected.
+  It is emitted literally, as the rule stage already did for the same input.
+  Test `a_trailing_dollar_is_literal`.
+- [x] **#88 — A computed macro name fails the makefile.** ✓ fixed 2026-08-28.
+  `$($(X))` made `get_reference_name` return empty and the whole makefile was
+  rejected with `BadMacroName`, where POSIX 105833 makes even an unresolvable
+  reference the empty string. The inner reference is resolved and its result
+  looked up; an inner reference that expands to nothing yields the empty
+  string. Test `a_computed_macro_name_resolves`.
+- [x] **#90 — A deferred function's error is swallowed.** ✓ fixed 2026-08-28.
+  A call that mentions an automatic variable is deferred to the rule stage, and
+  the fallback there was `Err(_) => push_str(&call)`: the unevaluated call went
+  to the shell, which reported `error: not found` and the build exited 0. So
+  `$(error bad $@)` — deferred precisely because it names `$@` — did nothing.
+  `substitute_internal_macros` returns a `Result` and the error propagates.
+  Test `a_deferred_function_error_is_reported`.
+
+### Minor
+
+- [x] **#89 — The failure diagnostic does not name the target.** ✓ fixed
+  2026-08-28. `make: execution error: 1` left the reader to guess which target
+  it belonged to, which under `-k` is the whole question. `ExecutionError`
+  carries the target and the message reads `make: [xd] execution error: 1`.
+  Covered by the updated `dash_k` and `dash_cap_s` expectations.
+
 ## Still open
 
 - **Full POSIX macro source-1..4 precedence.** No macro records where its value
@@ -477,6 +578,11 @@ findings and reported complete without them. They are unchanged since.
   probed against GNU Make 4.3, and #71/#73 closed the two that were wrong, but
   it is not the four-source model the spec describes, and a case that needs to
   ask "which source set this?" cannot be answered today.
+- **GNU double-colon rules** (`target:: prerequisites`), where several rules
+  for one target each carry their own commands and all of them run. POSIX has
+  no such construct. As of #86 the form is recognized and rejected by name
+  rather than misparsed, so a makefile using it fails with a diagnostic that
+  says what is unsupported.
 - **XSI `~` suffix rules** (`.c~.o`, `.sh~` and friends), which build directly
   from an SCCS history file. Separate machinery from `.SCCS_GET` retrieval
   (#61), which is implemented.

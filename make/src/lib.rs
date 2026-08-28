@@ -931,14 +931,26 @@ impl TryFrom<(Makefile, Config)> for Make {
                 // POSIX 105653: several rules may name the same target, with
                 // prerequisites accumulating. The old lookup returned the first
                 // match and silently dropped the rest (audit #30).
-                let name = target.to_string();
-                match make
-                    .rules
-                    .iter_mut()
-                    .find(|existing| existing.targets().any(|t| t.as_ref() == name))
-                {
-                    Some(existing) => existing.absorb(rule),
-                    None => make.rules.push(rule),
+                //
+                // Each target of a multi-target rule is folded in separately.
+                // POSIX 105643 makes the target side a `<blank>`-separated
+                // list of targets, each a target in its own right, so `a b: c`
+                // is `a: c` and `b: c`. Absorbing a later `a: extra` into the
+                // rule the two shared handed
+                // `extra` to `b` as well -- the same leak `.IGNORE: a` had
+                // before attributes were keyed by target (audit #84).
+                for rule in rule.split_targets() {
+                    let Some(name) = rule.targets().next().map(|t| t.to_string()) else {
+                        continue;
+                    };
+                    match make
+                        .rules
+                        .iter_mut()
+                        .find(|existing| existing.targets().any(|t| t.as_ref() == name))
+                    {
+                        Some(existing) => existing.absorb(rule),
+                        None => make.rules.push(rule),
+                    }
                 }
             }
         }

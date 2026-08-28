@@ -1433,6 +1433,32 @@ mod build_graph {
         let _ = std::fs::remove_file("infcyc.c");
         let _ = std::fs::remove_file("infcyc.o");
     }
+
+    // Audit #84: `sib_a sib_b:` is two rules. A later `sib_a: sib_extra` was
+    // absorbed into the rule both targets shared, so building `sib_b` built
+    // `sib_extra` too and reported it in `$^`.
+    #[test]
+    fn a_later_rule_does_not_leak_prerequisites_to_siblings() {
+        let (stdout, code) = run(&[
+            "-f",
+            "tests/makefiles/graph/sibling_prerequisites.mk",
+            "sib_b",
+        ]);
+        assert!(stdout.contains("T=sib_b CARET=[]"), "stdout: {stdout}");
+        assert!(!stdout.contains("BUILT-EXTRA"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        // ...and the target that *does* name it still gets it.
+        let (stdout, _) = run(&[
+            "-f",
+            "tests/makefiles/graph/sibling_prerequisites.mk",
+            "sib_a",
+        ]);
+        assert!(stdout.contains("BUILT-EXTRA"), "stdout: {stdout}");
+        assert!(
+            stdout.contains("T=sib_a CARET=[sib_extra]"),
+            "stdout: {stdout}"
+        );
+    }
 }
 
 // Inference rules, `%` pattern rules, and default-target selection.

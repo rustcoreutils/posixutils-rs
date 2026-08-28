@@ -150,6 +150,33 @@ impl Rule {
         })
     }
 
+    /// One rule per target.
+    ///
+    /// POSIX 105643 makes the target side a `<blank>`-separated list of
+    /// targets, each one a target in its own right: `a b: c` is `a: c` and
+    /// `b: c`. The targets share the prerequisites and the commands, they do
+    /// not share a rule — GNU reads it the same way. Keeping them
+    /// in one made every later rule for *any* of them add prerequisites to all
+    /// the others, the same leak attributes had before they were keyed by
+    /// target (audit #84).
+    ///
+    /// A `%` pattern rule is left whole: it is a template matched by name
+    /// rather than a target, and splitting it would only give the pattern
+    /// lookup duplicates to walk.
+    pub fn split_targets(self) -> Vec<Rule> {
+        if self.targets.len() < 2 || self.is_pattern() {
+            return vec![self];
+        }
+        self.targets
+            .iter()
+            .map(|target| Rule {
+                targets: vec![target.clone()],
+                prerequisites: self.prerequisites.clone(),
+                recipes: self.recipes.clone(),
+            })
+            .collect()
+    }
+
     /// Fold another rule for the same target into this one.
     ///
     /// POSIX 105653: "A target that has prerequisites, but does not have any

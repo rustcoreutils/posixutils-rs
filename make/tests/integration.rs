@@ -1565,6 +1565,96 @@ mod execution {
         assert_eq!(output.status.code(), Some(2));
     }
 
+    // Audit #71: a command-line macro must beat a definition in the makefile,
+    // including in a rule *header*. Appending the operand after the text left
+    // the header already expanded by the time it was read. POSIX 105866.
+    #[test]
+    fn a_command_line_macro_overrides_a_rule_header() {
+        let _ = std::fs::write(
+            "cmdline_hdr.mk",
+            "OBJ = a.o\nall: $(OBJ)\n\t@echo \"prereqs=$^\"\na.o:\n\t@echo MADE-A\nb.o:\n\t@echo MADE-B\n",
+        );
+        let (stdout, _, _) = run(&["-f", "cmdline_hdr.mk", "OBJ=b.o", "all"]);
+        assert!(stdout.contains("MADE-B"), "stdout: {stdout}");
+        assert!(stdout.contains("prereqs=b.o"), "stdout: {stdout}");
+        let _ = std::fs::remove_file("cmdline_hdr.mk");
+    }
+
+    // ...and a later ordinary assignment must not undo it, which is what the
+    // append-at-the-end arrangement was implicitly providing.
+    #[test]
+    fn a_later_assignment_does_not_clobber_a_command_line_macro() {
+        let _ = std::fs::write("cmdline_late.mk", "all:\n\t@echo [$(V)]\nV = fromfile\n");
+        let (stdout, _, _) = run(&["-f", "cmdline_late.mk", "V=fromcmd", "all"]);
+        assert!(stdout.contains("[fromcmd]"), "stdout: {stdout}");
+        let _ = std::fs::remove_file("cmdline_late.mk");
+    }
+
+    // `override` is the documented escape hatch.
+    #[test]
+    fn override_defeats_a_command_line_macro() {
+        let _ = std::fs::write(
+            "cmdline_override.mk",
+            "CFLAGS = -O2\noverride CFLAGS += -fPIC\nall:\n\t@echo [$(CFLAGS)]\n",
+        );
+        let (stdout, _, _) = run(&["-f", "cmdline_override.mk", "CFLAGS=-O0", "all"]);
+        assert!(stdout.contains("[-O0 -fPIC]"), "stdout: {stdout}");
+        let _ = std::fs::remove_file("cmdline_override.mk");
+    }
+
+    // Audit #73: `?=` and `+=` consult the environment, which is macro source 3.
+    #[test]
+    fn conditional_and_append_see_the_environment() {
+        let _ = std::fs::write("env_ops.mk", "CC ?= gcc\nall:\n\t@echo [$(CC)]\n");
+        let bin = get_binary_path("make");
+        let out = Command::new(&bin)
+            .args(["-f", "env_ops.mk", "all"])
+            .env("CC", "clang")
+            .output()
+            .expect("run make");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("[clang]"),
+            "?= ignored the environment"
+        );
+        let _ = std::fs::write("env_ops.mk", "CC += -Wall\nall:\n\t@echo [$(CC)]\n");
+        let out = Command::new(&bin)
+            .args(["-f", "env_ops.mk", "all"])
+            .env("CC", "clang")
+            .output()
+            .expect("run make");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("[clang -Wall]"),
+            "+= dropped the inherited value"
+        );
+        let _ = std::fs::remove_file("env_ops.mk");
+    }
+
+    // Audit #74: a valueless `export NAME` put the macro in the recipe
+    // environment; it used to reach the rule scanner and fail on a missing colon.
+    #[test]
+    fn export_directive_puts_a_macro_in_the_environment() {
+        let _ = std::fs::write(
+            "export_dir.mk",
+            "MYVAR = fromfile\nexport MYVAR\nall:\n\t@echo \"env=[$$MYVAR]\"\n",
+        );
+        let (stdout, _, code) = run(&["-f", "export_dir.mk", "all"]);
+        assert!(stdout.contains("env=[fromfile]"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = std::fs::remove_file("export_dir.mk");
+    }
+
+    // Without the directive it stays out, per POSIX 105869.
+    #[test]
+    fn a_macro_is_not_exported_without_the_directive() {
+        let _ = std::fs::write(
+            "export_none.mk",
+            "MYVAR = fromfile\nall:\n\t@echo \"env=[$$MYVAR]\"\n",
+        );
+        let (stdout, _, _) = run(&["-f", "export_none.mk", "all"]);
+        assert!(stdout.contains("env=[]"), "stdout: {stdout}");
+        let _ = std::fs::remove_file("export_none.mk");
+    }
+
     // Audit #40: POSIX 105866 -- make passes its options down through
     // MAKEFLAGS. It was never constructed, so a sub-make saw nothing.
     #[test]

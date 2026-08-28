@@ -91,6 +91,8 @@ pub struct Make {
     ledger: graph::Ledger,
     /// `vpath` search paths, in declaration order.
     vpaths: Vec<VPathEntry>,
+    /// Macros an `export` directive put in the recipe environment.
+    exports: Vec<String>,
     pub config: Config,
 }
 
@@ -528,15 +530,23 @@ impl Make {
             return self.run_inference(rule, target, up_to_date, &newer);
         }
 
-        rule.run(
-            &self.config,
-            &self.macros,
-            target,
-            up_to_date,
-            &newer,
-            &|name| self.resolve_vpath(name),
-        )?;
+        self.with_env(|env| rule.run(env, target, up_to_date, &newer))?;
         Ok(true)
+    }
+
+    /// Assemble the invariants a recipe runs against, and hand them to `f`.
+    ///
+    /// The `VPATH` resolver borrows `self`, so it cannot outlive the call; a
+    /// callback keeps that borrow local instead of asking every caller to
+    /// spell the closure out.
+    fn with_env<R>(&self, f: impl FnOnce(&rule::Env<'_>) -> R) -> R {
+        let resolve = |name: &str| self.resolve_vpath(name);
+        f(&rule::Env {
+            config: &self.config,
+            macros: &self.macros,
+            exports: &self.exports,
+            resolve: &resolve,
+        })
     }
 
     fn run_inference(
@@ -546,14 +556,7 @@ impl Make {
         up_to_date: bool,
         newer: &[String],
     ) -> Result<bool, ErrorCode> {
-        rule.run_for_target(
-            &self.config,
-            &self.macros,
-            target,
-            up_to_date,
-            newer,
-            &|name| self.resolve_vpath(name),
-        )?;
+        self.with_env(|env| rule.run_for_target(env, target, up_to_date, newer))?;
         Ok(true)
     }
 
@@ -753,7 +756,7 @@ impl TryFrom<(Makefile, Config)> for Make {
         // are available when determining whether a rule like `.txt.out:` is an
         // inference rule.
 
-        let (parsed_rules, macros, vpaths) = makefile.into_parts();
+        let (parsed_rules, macros, vpaths, exports) = makefile.into_parts();
 
         let mut suffixes_rules = vec![];
         let mut remaining_parsed_rules = vec![];
@@ -783,6 +786,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             pool,
             ledger: graph::Ledger::new(),
             vpaths,
+            exports,
             config,
         };
 
@@ -847,7 +851,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             }
             builtin.push_str(&BUILTIN_RULES.replace("\\t", "\t"));
             if let Ok(parsed) = builtin.parse::<Makefile>() {
-                let (rules, _, _) = parsed.into_parts();
+                let (rules, _, _, _) = parsed.into_parts();
                 for parsed_rule in rules {
                     let rule = Rule::from(parsed_rule);
                     let Some(target) = rule.targets().next() else {

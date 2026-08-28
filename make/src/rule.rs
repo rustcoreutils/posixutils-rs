@@ -52,6 +52,21 @@ pub struct InterruptInfo {
 pub static INTERRUPT_FLAG: LazyArcMutex<Option<InterruptInfo>> =
     LazyLock::new(|| Arc::new(Mutex::new(None)));
 
+/// Everything a recipe needs that does not vary from one rule to the next.
+///
+/// The three run entry points all carry the same invariants -- the global
+/// options, the macro table, the export list, and the `VPATH` resolver -- and
+/// threading them one by one had pushed each signature past seven parameters.
+pub struct Env<'a> {
+    pub config: &'a GlobalConfig,
+    pub macros: &'a [Macro],
+    /// Names an `export` directive made visible to recipes.
+    pub exports: &'a [String],
+    /// Maps a prerequisite name to where it was actually found, so `$<` names
+    /// the file the recipe will read when `VPATH` supplied it.
+    pub resolve: &'a dyn Fn(&str) -> String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rule {
     /// The targets of the rule
@@ -139,15 +154,12 @@ impl Rule {
     /// are substituted based on the target name and the inference rule's suffixes.
     pub fn run_for_target(
         &self,
-        global_config: &GlobalConfig,
-        macros: &[Macro],
+        env: &Env<'_>,
         target: &Target,
         up_to_date: bool,
         newer: &[String],
-        // Maps a prerequisite name to where it was actually found, so `$<`
-        // names the file the recipe will read when `VPATH` supplied it.
-        resolve: &dyn Fn(&str) -> String,
     ) -> Result<(), ErrorCode> {
+        let resolve = env.resolve;
         // For an inference rule applied to a specific target, compute the
         // input/output pair from the target name and the rule's suffixes.
         let files = if let Some(Target::Inference { from, to, .. }) = self.targets().next() {
@@ -170,7 +182,7 @@ impl Rule {
             vec![(PathBuf::from(""), PathBuf::from(""))]
         };
 
-        self.run_with_files(global_config, macros, target, up_to_date, files, newer)
+        self.run_with_files(env, target, up_to_date, files, newer)
     }
 
     /// Runs the rule with the global config and macros passed in.
@@ -178,14 +190,10 @@ impl Rule {
     /// Returns `Ok` on success and `Err` on any errors while running the rule.
     pub fn run(
         &self,
-        global_config: &GlobalConfig,
-        macros: &[Macro],
+        env: &Env<'_>,
         target: &Target,
         up_to_date: bool,
         newer: &[String],
-        // Maps a prerequisite to where it was actually found, so `$<` names the
-        // file the recipe will read when `VPATH` supplied it.
-        resolve: &dyn Fn(&str) -> String,
     ) -> Result<(), ErrorCode> {
         // One pass. The first prerequisite is the input file, so `$<` names it
         // in an ordinary rule as well as an inferred one -- POSIX defines `$<`
@@ -200,22 +208,27 @@ impl Rule {
         let input = self
             .prerequisites()
             .next()
-            .map(|p| PathBuf::from(resolve(p.as_ref())))
+            .map(|p| PathBuf::from((env.resolve)(p.as_ref())))
             .unwrap_or_default();
         let files = vec![(input, PathBuf::from(target.as_ref()))];
-        self.run_with_files(global_config, macros, target, up_to_date, files, newer)
+        self.run_with_files(env, target, up_to_date, files, newer)
     }
 
     /// Internal helper: runs the rule's recipes for the given input/output file pairs.
     fn run_with_files(
         &self,
-        global_config: &GlobalConfig,
-        macros: &[Macro],
+        env: &Env<'_>,
         target: &Target,
         up_to_date: bool,
         files: Vec<(PathBuf, PathBuf)>,
         newer: &[String],
     ) -> Result<(), ErrorCode> {
+        let Env {
+            config: global_config,
+            macros,
+            exports,
+            resolve: _,
+        } = *env;
         let GlobalConfig {
             ignore: global_ignore,
             dry_run: global_dry_run,
@@ -326,7 +339,7 @@ impl Rule {
                     .unwrap_or_else(|| DEFAULT_SHELL.to_string());
                 let mut command = Command::new(shell);
 
-                self.init_env(env_macros, &mut command, macros);
+                self.init_env(env_macros, &mut command, macros, exports);
                 let recipe = expanded;
                 // POSIX: when errors are not being ignored, the shell -e option
                 // shall also be in effect, so the recipe aborts on the first
@@ -520,8 +533,14 @@ impl Rule {
     }
 
     /// A helper function to initialize env vars for shell commands.
-    fn init_env(&self, env_macros: bool, command: &mut Command, variables: &[Macro]) {
-        command.envs(exported_macros(env_macros, variables));
+    fn init_env(
+        &self,
+        env_macros: bool,
+        command: &mut Command,
+        variables: &[Macro],
+        exports: &[String],
+    ) {
+        command.envs(exported_macros(env_macros, variables, exports));
     }
 }
 
@@ -538,14 +557,25 @@ impl Rule {
 ///
 /// The child inherits make's own environment regardless; this only decides what
 /// is added on top.
-fn exported_macros(env_macros: bool, variables: &[Macro]) -> HashMap<String, String> {
+fn exported_macros(
+    env_macros: bool,
+    variables: &[Macro],
+    exports: &[String],
+) -> HashMap<String, String> {
     if env_macros {
         return HashMap::new();
     }
     let inherited: HashMap<String, String> = std::env::vars().collect();
+    // `export` with no names means all of them (GNU), recorded as `*`.
+    let export_all = exports.iter().any(|e| e == "*");
     variables
         .iter()
-        .filter(|(name, _)| name != DEFAULT_SHELL_VAR && inherited.contains_key(name))
+        .filter(|(name, _)| name != DEFAULT_SHELL_VAR)
+        .filter(|(name, _)| {
+            // Inherited names keep their POSIX 105869 treatment; an explicit
+            // `export` adds a name make did not inherit (audit #74).
+            inherited.contains_key(name) || export_all || exports.iter().any(|e| e == name)
+        })
         .cloned()
         .collect()
 }

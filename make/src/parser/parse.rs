@@ -13,7 +13,7 @@
 //! is left is rule lines and command lines, which this walks one line at a
 //! time.
 
-use super::preprocessor::{is_include_line, is_macro_definition, preprocess, VPathEntry};
+use super::preprocessor::{is_include_line, is_macro_definition, preprocess_with, VPathEntry};
 use super::scan::{self, RuleLine};
 use crate::Macro;
 use std::fmt::{self, Display, Formatter};
@@ -86,6 +86,8 @@ pub struct Makefile {
     macros: Vec<Macro>,
     /// `vpath` search paths, in declaration order.
     vpaths: Vec<VPathEntry>,
+    /// Macros an `export` directive named.
+    exports: Vec<String>,
 }
 
 impl Makefile {
@@ -101,9 +103,14 @@ impl Makefile {
         &self.vpaths
     }
 
-    /// Consume the makefile, yielding its rules, macros and search paths.
-    pub fn into_parts(self) -> (Vec<Rule>, Vec<Macro>, Vec<VPathEntry>) {
-        (self.rules, self.macros, self.vpaths)
+    pub fn exports(&self) -> &[String] {
+        &self.exports
+    }
+
+    /// Consume the makefile, yielding its rules, macros, search paths and
+    /// exported macro names.
+    pub fn into_parts(self) -> (Vec<Rule>, Vec<Macro>, Vec<VPathEntry>, Vec<String>) {
+        (self.rules, self.macros, self.vpaths, self.exports)
     }
 }
 
@@ -211,6 +218,7 @@ impl Builder {
         mut self,
         macros: Vec<Macro>,
         vpaths: Vec<VPathEntry>,
+        exports: Vec<String>,
     ) -> Result<Makefile, ParseError> {
         self.close();
         // A makefile that defines no rules at all cannot be built from.
@@ -222,6 +230,7 @@ impl Builder {
                 rules: self.rules,
                 macros,
                 vpaths,
+                exports,
             })
         } else {
             Err(ParseError(self.errors))
@@ -231,13 +240,14 @@ impl Builder {
 
 /// Parse preprocessed makefile text into rules.
 pub fn parse(text: &str) -> Result<Makefile, ParseError> {
-    parse_scanned(text, Vec::new(), Vec::new())
+    parse_scanned(text, Vec::new(), Vec::new(), Vec::new())
 }
 
 fn parse_scanned(
     text: &str,
     macros: Vec<Macro>,
     vpaths: Vec<VPathEntry>,
+    exports: Vec<String>,
 ) -> Result<Makefile, ParseError> {
     let mut builder = Builder::default();
 
@@ -251,14 +261,27 @@ fn parse_scanned(
         }
     }
 
-    builder.finish(macros, vpaths)
+    builder.finish(macros, vpaths, exports)
 }
 
 impl FromStr for Makefile {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let scanned = preprocess(s).map_err(|e| ParseError(vec![e.to_string()]))?;
-        parse_scanned(&scanned.text, scanned.macros, scanned.vpaths)
+        Makefile::parse_with_macros(s, &[])
+    }
+}
+
+impl Makefile {
+    /// Parse `text` with command-line macros already in force.
+    pub fn parse_with_macros(text: &str, cmdline: &[Macro]) -> Result<Makefile, ParseError> {
+        let scanned =
+            preprocess_with(text, cmdline).map_err(|e| ParseError(vec![e.to_string()]))?;
+        parse_scanned(
+            &scanned.text,
+            scanned.macros,
+            scanned.vpaths,
+            scanned.exports,
+        )
     }
 }

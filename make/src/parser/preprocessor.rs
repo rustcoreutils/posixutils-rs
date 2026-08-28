@@ -212,6 +212,11 @@ pub fn is_macro_definition(line: &str) -> bool {
     // Drop a trailing assignment-operator prefix (`:`, `?`, `+`, `!`) so that
     // `:=`, `::=`, `:::=`, `?=`, `+=`, and `!=` all reduce to the name.
     let mut name = line[..eq].trim_end_matches([':', '?', '+', '!']).trim();
+    if let Some(rest) = name.strip_prefix("override") {
+        if rest.starts_with(char::is_whitespace) {
+            name = rest.trim();
+        }
+    }
     if let Some(rest) = name.strip_prefix("export") {
         // Require whitespace after `export` so `exported=1` is not mis-split.
         if rest.starts_with(char::is_whitespace) {
@@ -338,6 +343,9 @@ fn take_till_eol(letters: &mut Peekable<impl Iterator<Item = char>>) -> String {
 pub struct MacroTable {
     values: HashMap<String, String>,
     order: Vec<String>,
+    /// Names a command-line operand defined. An ordinary assignment in the
+    /// makefile must not overwrite one (POSIX 105866); only `override` may.
+    locked: std::collections::HashSet<String>,
 }
 
 impl MacroTable {
@@ -347,10 +355,25 @@ impl MacroTable {
     }
 
     fn set(&mut self, name: String, body: String) {
+        if self.locked.contains(&name) {
+            return;
+        }
+        self.force(name, body);
+    }
+
+    /// Assign regardless of the lock -- a command-line operand establishing it,
+    /// or an `override` assignment defeating it.
+    fn force(&mut self, name: String, body: String) {
         if !self.values.contains_key(&name) {
             self.order.push(name.clone());
         }
         self.values.insert(name, body);
+    }
+
+    /// Seed a command-line macro, which no ordinary assignment may replace.
+    pub fn lock(&mut self, name: String, body: String) {
+        self.force(name.clone(), body);
+        self.locked.insert(name);
     }
 
     /// Current body of `name`, used by `?=` and `+=`.
@@ -499,11 +522,15 @@ fn apply_operator(
         Operator::Colon | Operator::Colon2 => expand_to_fixpoint(&body, table.values(), state),
         Operator::Colon3 => Ok(substitute(&body, table.values(), state)?.0),
         Operator::Bang => shell_assign(&substitute(&body, table.values(), state)?.0),
-        Operator::QuestionMark => Ok(match table.get(name) {
-            Some(existing) => existing.clone(),
+        // `?=` and `+=` ask what the macro is *now*, and the environment is a
+        // macro source (POSIX 105845) -- consulting only the table made
+        // `CC ?= gcc` ignore an inherited `CC=clang`, and `CC += -Wall` drop it
+        // entirely (audit #73).
+        Operator::QuestionMark => Ok(match existing_value(name, table) {
+            Some(existing) => existing,
             None => body,
         }),
-        Operator::Plus => Ok(match table.get(name) {
+        Operator::Plus => Ok(match existing_value(name, table) {
             Some(existing) => format!("{existing} {body}"),
             None => body,
         }),
@@ -518,6 +545,17 @@ fn parse_macro_name(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<S
         return get_ident(text);
     }
     Ok(name)
+}
+
+/// What `name` holds now, from the makefile or from the environment.
+///
+/// `None` means undefined, which is what `?=` tests; an explicitly empty value
+/// is defined and is left alone.
+fn existing_value(name: &str, table: &MacroTable) -> Option<String> {
+    table
+        .get(name)
+        .cloned()
+        .or_else(|| std::env::var(name).ok())
 }
 
 /// Parse one macro-definition line into the name and the value its operator
@@ -751,6 +789,8 @@ pub struct Preprocessed {
     pub text: String,
     pub macros: Vec<Macro>,
     pub vpaths: Vec<VPathEntry>,
+    /// Macros an `export` directive asked to put in the recipe environment.
+    pub exports: Vec<String>,
 }
 
 /// One level of `if.../else/endif` nesting.
@@ -790,6 +830,7 @@ struct Reader {
     depth: usize,
     eval_depth: usize,
     vpaths: Vec<VPathEntry>,
+    exports: Vec<String>,
     /// Shared by every expansion this reader performs, so recursion is bounded
     /// and `$(eval ...)` has somewhere to leave text.
     state: func::Expansion,
@@ -804,6 +845,7 @@ impl Reader {
             depth: 0,
             eval_depth: 0,
             vpaths: Vec::new(),
+            exports: Vec::new(),
             state: func::Expansion::new(),
         }
     }
@@ -981,6 +1023,26 @@ impl Reader {
         Ok(())
     }
 
+    /// `export NAME...` / `unexport NAME...`.
+    ///
+    /// A bare `export` with no names exports everything, which is GNU's meaning;
+    /// recorded as the marker `*` so the rule stage can tell it apart.
+    fn handle_export(&mut self, names: &str, exporting: bool) -> Result<()> {
+        let expanded = self.expand(names)?;
+        let names: Vec<String> = super::scan::split_words(&expanded);
+        if names.is_empty() && exporting {
+            self.exports.push("*".to_string());
+            return Ok(());
+        }
+        for name in names {
+            self.exports.retain(|e| *e != name);
+            if exporting {
+                self.exports.push(name);
+            }
+        }
+        Ok(())
+    }
+
     /// Capture a `define ... endef` body, returning the lines consumed.
     fn capture_define(&mut self, name: &str, lines: &[&str], start: usize) -> usize {
         let mut body: Vec<&str> = Vec::new();
@@ -1120,6 +1182,18 @@ impl Reader {
                     }
                     self.drop_line();
                 }
+                Directive::Export(names) => {
+                    if self.active() {
+                        self.handle_export(&names, true)?;
+                    }
+                    self.drop_line();
+                }
+                Directive::Unexport(names) => {
+                    if self.active() {
+                        self.handle_export(&names, false)?;
+                    }
+                    self.drop_line();
+                }
                 other => {
                     self.push_branch(&other)?;
                     self.drop_line();
@@ -1145,8 +1219,18 @@ impl Reader {
     }
 
     fn define_macro(&mut self, line: &str) -> Result<()> {
+        // `override NAME = v` is the documented way for a makefile to beat a
+        // command-line macro; without it `override CFLAGS += -fPIC` would be
+        // silently ignored.
+        let (line, overriding) = match line.trim_start().strip_prefix("override ") {
+            Some(rest) => (rest, true),
+            None => (line, false),
+        };
         let (name, body) = parse_macro_definition(line, &self.table, &self.state)?;
-        self.table.set(name, body);
+        match overriding {
+            true => self.table.force(name, body),
+            false => self.table.set(name, body),
+        }
         Ok(())
     }
 
@@ -1200,7 +1284,20 @@ pub fn expand_recipe(text: &str, macros: &[Macro]) -> std::result::Result<String
 /// sees and the macro definitions it must not (they are consumed here, but
 /// `Make` needs them for `SHELL` and for the recipe environment).
 pub fn preprocess(source: &str) -> Result<Preprocessed> {
+    preprocess_with(source, &[])
+}
+
+/// Preprocess with command-line macros already in force.
+///
+/// They are seeded before the read rather than appended after it, because a
+/// rule header is expanded where it appears -- appending left `all: $(OBJ)`
+/// already expanded by the time the operand was seen (audit #71). The lock is
+/// what keeps a later assignment in the makefile from undoing them.
+pub fn preprocess_with(source: &str, cmdline: &[Macro]) -> Result<Preprocessed> {
     let mut reader = Reader::new();
+    for (name, value) in cmdline {
+        reader.table.lock(name.clone(), value.clone());
+    }
     reader.read(&fold_continuations(source))?;
     if !reader.branches.is_empty() {
         return Err(PreprocError::UnmatchedConditional("endif".to_string()));
@@ -1210,5 +1307,6 @@ pub fn preprocess(source: &str) -> Result<Preprocessed> {
         text,
         macros: reader.table.into_macros(),
         vpaths: reader.vpaths,
+        exports: reader.exports,
     })
 }

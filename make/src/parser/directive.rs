@@ -39,6 +39,10 @@ pub(crate) enum Directive {
     /// `vpath` with its raw argument text: a pattern and its directories, a
     /// pattern alone (clear that pattern), or nothing (clear every pattern).
     VPath(String),
+    /// `export NAME...` with no value: mark macros for the recipe environment.
+    Export(String),
+    /// `unexport NAME...`: the inverse.
+    Unexport(String),
 }
 
 /// Split a directive line into its keyword and the rest.
@@ -90,6 +94,10 @@ pub(crate) fn parse_directive(line: &str) -> Option<Directive> {
         "define" => Some(Directive::Define(define_name(rest))),
         "endef" => Some(Directive::EndDef),
         "vpath" => Some(Directive::VPath(rest.to_string())),
+        // Only the valueless form: `export NAME = v` is a macro definition that
+        // happens to be exported, and `is_macro_definition` already handles it.
+        "export" if !rest.contains('=') => Some(Directive::Export(rest.to_string())),
+        "unexport" => Some(Directive::Unexport(rest.to_string())),
         _ => None,
     }
 }
@@ -214,6 +222,21 @@ mod tests {
             Some(Directive::Define("BODY".to_string()))
         );
         assert_eq!(parse_directive("endef"), Some(Directive::EndDef));
+    }
+
+    #[test]
+    fn recognizes_export_forms() {
+        assert_eq!(
+            parse_directive("export FOO"),
+            Some(Directive::Export("FOO".to_string()))
+        );
+        assert_eq!(
+            parse_directive("unexport FOO BAR"),
+            Some(Directive::Unexport("FOO BAR".to_string()))
+        );
+        // `export NAME = v` is a macro definition, not this directive.
+        assert_eq!(parse_directive("export FOO = v"), None);
+        assert_eq!(parse_directive("exported: dep"), None);
     }
 
     #[test]

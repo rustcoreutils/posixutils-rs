@@ -399,19 +399,31 @@ findings and reported complete without them. They are unchanged since.
   ✓ fixed 2026-08-28. The spec is read with `read_balanced`, the same reader the
   function path uses, so `$(SRC:%.c=$(D)/%.o)` yields `obj/a.o obj/b.o`. Test
   `test_subst_replacement_may_nest_a_reference`.
-- [ ] **#71 — Command-line macros do not override macros used in rule headers.**
-  They are appended after the makefile text, but rule headers are expanded at
-  read time. `make OBJ=b.o all` builds `a.o`. POSIX 105866.
+- [x] **#71 — Command-line macros do not override macros used in rule headers.**
+  ✓ fixed 2026-08-28. They are now seeded into the reader's macro table before
+  the read, so a header earlier in the file sees them. Seeding alone would have
+  been the same bug in the other direction — a later `OBJ = a.o` in the makefile
+  would clobber the command line — so the table carries a `locked` set that an
+  ordinary assignment cannot write through, with GNU's `override` directive as
+  the documented way past it. `Makefile::parse_with_macros` is the entry point.
+  Tests `a_command_line_macro_overrides_a_rule_header`,
+  `a_later_assignment_does_not_clobber_a_command_line_macro`,
+  `override_defeats_a_command_line_macro`.
 - [x] **#72 — A lone `$` rejects the whole makefile.** ✓ fixed 2026-08-28. `$X`
   for any single character is a reference to a macro named `X`, matching GNU;
   an unknown one expands to nothing rather than erroring. `@echo "cost 5 $ each"`
   now prints. Test `test_a_lone_dollar_is_a_single_char_reference`.
-- [ ] **#73 — `?=` and `+=` ignore the environment.** Both consult `MacroTable`
-  directly rather than `lookup_macro`, so `CC ?= gcc` with `CC=clang` inherited
-  yields `gcc`, and `CC += -Wall` drops the inherited value entirely.
-- [ ] **#74 — A bare `export NAME` fails to parse.** `is_macro_definition` bails
-  on a line with no `=`, so it reaches the rule scanner and fails on the missing
-  colon. `unexport` likewise.
+- [x] **#73 — `?=` and `+=` ignore the environment.** ✓ fixed 2026-08-28. Both
+  operators now resolve their existing value through the macro table *then* the
+  environment, so `CC ?= gcc` with `CC=clang` inherited yields `clang` and
+  `CC += -Wall` yields `clang -Wall`, matching GNU. Test
+  `conditional_and_append_see_the_environment`.
+- [x] **#74 — A bare `export NAME` fails to parse.** ✓ fixed 2026-08-28.
+  `export`/`unexport` are directives now, like `vpath`, and the names they carry
+  are threaded through `Preprocessed` to `Rule::run` so the directive actually
+  adds to the recipe environment rather than merely parsing. Bare `export` marks
+  every macro. Tests `export_directive_puts_a_macro_in_the_environment`,
+  `a_macro_is_not_exported_without_the_directive`.
 - [ ] **#75 — `INTERRUPT_FLAG` is never cleared and is shared under `-j`.** Written
   before every recipe line, never reset, one global for all workers. A SIGINT
   after a build consults a stale target; concurrent recipes overwrite each other.

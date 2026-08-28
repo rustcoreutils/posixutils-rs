@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use core::str::FromStr;
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -255,11 +254,20 @@ fn parse_makefile(paths: &[PathBuf], cmdline_macros: &[String]) -> Result<Makefi
         }
     }
 
-    for macro_def in cmdline_macros {
-        append_part(&mut contents, macro_def);
-    }
+    // Command-line macros are *seeded*, not appended: a rule header is expanded
+    // where it appears, so appending left `all: $(OBJ)` already expanded by the
+    // time the operand was read (audit #71).
+    let seeded: Vec<(String, String)> = cmdline_macros
+        .iter()
+        .filter_map(|def| def.split_once('='))
+        .map(|(name, value)| {
+            let name = name.trim_end_matches([':', '?', '+', '!']).trim();
+            (name.to_string(), value.to_string())
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
 
-    match Makefile::from_str(&contents) {
+    match Makefile::parse_with_macros(&contents, &seeded) {
         Ok(makefile) => Ok(makefile),
         Err(err) => Err(ErrorCode::ParserError { constraint: err }),
     }

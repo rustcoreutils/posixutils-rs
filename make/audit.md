@@ -374,10 +374,15 @@ findings and reported complete without them. They are unchanged since.
   _Divergence noted: GNU drops a circular dependency with a warning and
   continues; we error, consistent with how named-rule cycles already behave._
 
-- [ ] **#67 — A multi-line macro deletes every built-in rule.** Built-ins are
-  seeded by generating `"{name} ::= {value}\n"` and re-parsing it inside
-  `if let Ok(parsed)`. Any `define` body contains a newline, the parse fails, the
-  error is swallowed, and every built-in rule silently disappears.
+- [x] **#67 — A multi-line macro deletes every built-in rule.** ✓ fixed
+  2026-08-28. The round-trip through generated makefile text is gone: the rule
+  text is a constant, so only its recipe lines need the makefile's macros, and
+  those are expanded directly. Nothing carries a macro value back through a
+  parser, which was the whole failure mode — a `define` body has a newline in
+  it, so the generated text stopped parsing and `if let Ok` threw the error
+  away. Any expansion failure is now reported. Tests
+  `a_multi_line_macro_does_not_delete_the_builtin_rules`,
+  `a_broken_builtin_expansion_is_reported`.
 - [x] **#68 — `$(if)`/`$(or)`/`$(and)` recurse unbounded into a crash.** ✓ fixed
   2026-08-28. All three now take the depth guard the other lazy functions had.
   #58 added it to `eval`, `foreach` and `call` and stopped there, so half the

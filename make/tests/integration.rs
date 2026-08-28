@@ -1675,6 +1675,22 @@ mod builtins {
     use super::*;
     use std::fs;
 
+    /// Like `run`, but keeps stderr too.
+    fn run3(args: &[&str]) -> (String, String, Option<i32>) {
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
     fn run(args: &[&str]) -> (String, Option<i32>) {
         let bin = get_binary_path("make");
         let output = Command::new(bin)
@@ -1740,6 +1756,52 @@ mod builtins {
         assert!(std::path::Path::new("builtin_probe.o").exists());
         let _ = fs::remove_file("builtin_probe.o");
         let _ = fs::remove_file("builtin_probe.c");
+    }
+
+    // Audit #67: the built-ins used to be seeded by pasting every macro back
+    // into makefile text as `NAME ::= value` and re-parsing it. A `define`
+    // body has a newline in it, so the text no longer parsed, and the error
+    // was swallowed -- every built-in rule vanished silently.
+    #[test]
+    fn a_multi_line_macro_does_not_delete_the_builtin_rules() {
+        let _ = fs::write("builtin_define_probe.c", "int probe(void){return 0;}\n");
+        let _ = fs::write(
+            "builtin_define.mk",
+            "define GREETING\nhello\nworld\nendef\n\nall: builtin_define_probe.o\n\t@echo LINKED\n",
+        );
+        let (stdout, _, code) = run3(&["-n", "-f", "builtin_define.mk", "all"]);
+        assert!(
+            stdout.contains("-c builtin_define_probe.c"),
+            "built-in .c.o rule was lost; stdout: {stdout}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_file("builtin_define.mk");
+        let _ = fs::remove_file("builtin_define_probe.c");
+    }
+
+    // A built-in recipe that cannot be expanded must be reported. Seeding used
+    // to be wrapped in `if let Ok`, which is why losing every rule was silent.
+    // A command-line macro carries its text unexpanded to the seeding step, so
+    // this reaches that expansion and nothing earlier -- under `-r`, which
+    // skips seeding entirely, the same run is merely "no target".
+    #[test]
+    fn a_broken_builtin_expansion_is_reported() {
+        let _ = fs::write("builtin_broken_probe.c", "int probe(void){return 0;}\n");
+        let _ = fs::write(
+            "builtin_broken.mk",
+            "all: builtin_broken_probe.o\n\t@echo LINKED\n",
+        );
+        let args = [
+            "-n",
+            "-f",
+            "builtin_broken.mk",
+            "CFLAGS=$(wordlist x,2,a b)",
+        ];
+        let (_, stderr, code) = run3(&args);
+        assert_eq!(code, Some(4), "stderr: {stderr}");
+        assert!(stderr.contains("is not a number"), "stderr: {stderr}");
+        let _ = fs::remove_file("builtin_broken.mk");
+        let _ = fs::remove_file("builtin_broken_probe.c");
     }
 
     // -r suppresses them, as POSIX requires. Its own fixture and source file,

@@ -20,7 +20,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use parser::{Makefile, VPathEntry};
+use parser::{preprocessor, Makefile, VPathEntry};
 
 /// An owned macro definition `(name, value)`. Owning the data (rather than
 /// holding a rowan AST node) keeps `Make` `Send`/`Sync` for parallel builds.
@@ -534,6 +534,27 @@ impl Make {
         Ok(true)
     }
 
+    /// Register the built-in inference rules, expanded against the macros in
+    /// force, skipping any the makefile already defines.
+    fn seed_builtin_rules(&mut self) -> Result<(), ErrorCode> {
+        let text = expand_builtin_rules(&self.macros)?;
+        let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
+        for parsed_rule in parsed.rules() {
+            let rule = Rule::from(parsed_rule.clone());
+            let Some(name) = rule.targets().next().map(Target::to_string) else {
+                continue;
+            };
+            let already = self
+                .inference_rules
+                .iter()
+                .any(|r| r.targets().any(|t| t.as_ref() == name));
+            if !already {
+                self.inference_rules.push(rule);
+            }
+        }
+        Ok(())
+    }
+
     /// Assemble the invariants a recipe runs against, and hand them to `f`.
     ///
     /// The `VPATH` resolver borrows `self`, so it cannot outlive the call; a
@@ -840,37 +861,42 @@ impl TryFrom<(Makefile, Config)> for Make {
         // Built-in inference rules come last, so a rule of the same name in
         // the makefile is found first.
         if !make.config.clear {
-            // The built-in recipes reference $(CC), $(CFLAGS) and friends, so
-            // they must be expanded against the macros the makefile defined
-            // plus the defaults it did not. Emitting those as immediate
-            // definitions ahead of the rules runs the whole thing through the
-            // ordinary reader.
-            let mut builtin = String::new();
-            for (name, value) in &make.macros {
-                builtin.push_str(&format!("{name} ::= {value}\n"));
-            }
-            builtin.push_str(&BUILTIN_RULES.replace("\\t", "\t"));
-            if let Ok(parsed) = builtin.parse::<Makefile>() {
-                let (rules, _, _, _) = parsed.into_parts();
-                for parsed_rule in rules {
-                    let rule = Rule::from(parsed_rule);
-                    let Some(target) = rule.targets().next() else {
-                        continue;
-                    };
-                    let name = target.to_string();
-                    let already = make
-                        .inference_rules
-                        .iter()
-                        .any(|r| r.targets().any(|t| t.as_ref() == name));
-                    if !already {
-                        make.inference_rules.push(rule);
-                    }
-                }
-            }
+            make.seed_builtin_rules()?;
         }
 
         Ok(make)
     }
+}
+
+/// Expand the built-in recipes against the macros actually in force.
+///
+/// The rule text is a constant, so it always parses; only the recipe lines
+/// need the makefile's macros. The previous arrangement pasted every macro
+/// back into that text as `NAME ::= value` and re-parsed the lot, so any value
+/// containing a newline -- every `define` body -- made the whole thing fail to
+/// parse, and an `if let Ok` swallowed the error. Every built-in rule
+/// disappeared without a word (audit #67).
+fn expand_builtin_rules(macros: &[Macro]) -> Result<String, ErrorCode> {
+    let mut out = String::with_capacity(BUILTIN_RULES.len());
+    for line in BUILTIN_RULES.lines() {
+        match line.strip_prefix('\t') {
+            Some(body) => {
+                out.push('\t');
+                out.push_str(&expand_builtin_recipe(body, macros)?);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Expand one built-in recipe line. `$@`, `$<` and `$*` are left for the rule
+/// stage, which is the only place that knows the target.
+fn expand_builtin_recipe(line: &str, macros: &[Macro]) -> Result<String, ErrorCode> {
+    preprocessor::expand_recipe(line, macros).map_err(|message| ParserError {
+        constraint: parser::ParseError(vec![message]),
+    })
 }
 
 /// Retrieves the modified time of the file at the given path.

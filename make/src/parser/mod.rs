@@ -12,5 +12,5 @@ pub mod parse;
 pub mod preprocessor;
 pub(crate) mod scan;
 
-pub use parse::{Makefile, Rule};
+pub use parse::{parse, Makefile, ParseError, Rule};
 pub use preprocessor::VPathEntry;

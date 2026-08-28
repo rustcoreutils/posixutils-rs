@@ -818,3 +818,133 @@ fn mrs_of_a_delta_made_with(name: &str, mopt: &str) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+
+/// Deleting two or more trailing lines panicked: the diff's lookahead read
+/// `new_lines[j]` in the branch it entered precisely because the new text was
+/// exhausted. CSSC records this as 0 inserted / 3 deleted / 1 unchanged.
+#[test]
+fn delta_deleting_trailing_lines_does_not_panic() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "trail", "a\nb\nc\nd\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\n").unwrap();
+
+    let out = super::common::run_in(
+        "delta",
+        &["-ytrim", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "delta failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("0 inserted"), "got {stdout:?}");
+    assert!(stdout.contains("3 deleted"), "got {stdout:?}");
+    assert!(stdout.contains("1 unchanged"), "got {stdout:?}");
+
+    get_version_silent(&sfile, "a\n");
+}
+
+/// Deleting the whole body is the same shape, with nothing left to anchor on.
+#[test]
+fn delta_deleting_every_line_does_not_panic() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "wipe", "a\nb\nc\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "").unwrap();
+
+    let out = super::common::run_in(
+        "delta",
+        &["-ywipe", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "delta failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("3 deleted"));
+}
+
+/// The edit script must be minimal. Inserting twelve lines between two
+/// unchanged ones was recorded as thirteen insertions and one deletion,
+/// because the anchor line sat past the old ten-line lookahead window. CSSC
+/// records 12 inserted / 0 deleted / 2 unchanged.
+#[test]
+fn delta_records_a_minimal_edit_script() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "wide", "a\nz\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\nz\n").unwrap();
+
+    let out = super::common::run_in(
+        "delta",
+        &["-ywide", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "delta failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("12 inserted"), "got {stdout:?}");
+    assert!(stdout.contains("0 deleted"), "got {stdout:?}");
+    assert!(stdout.contains("2 unchanged"), "got {stdout:?}");
+}
+
+/// An encoded (binary) s-file could be created and retrieved but never
+/// updated: `delta` read the g-file's raw bytes as UTF-8 lines and diffed them
+/// against the uuencoded text held in the s-file, failing with "stream did not
+/// contain valid UTF-8". CSSC segfaults on this case, so it is not an oracle
+/// here; the invariant under test is the round trip itself.
+#[test]
+fn delta_round_trips_a_binary_file() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.bin");
+    let sfile_s = sfile.to_string_lossy().to_string();
+
+    let original: &[u8] = b"A\x00B\xffC\n";
+    let edited: &[u8] = b"A\x00B\xffC\nD\x80E\n";
+    fs::write(tmp.path().join("seed.bin"), original).unwrap();
+
+    let out = super::common::run_in("admin", &["-iseed.bin", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "admin: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("get", &["-e", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read(tmp.path().join("bin")).unwrap(),
+        original,
+        "get -e must write the raw bytes back"
+    );
+
+    fs::write(tmp.path().join("bin"), edited).unwrap();
+    let out = super::common::run_in("delta", &["-ybin", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta on an encoded file: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("get", &["-p", "-s", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        out.stdout, edited,
+        "the re-gotten binary must match byte for byte"
+    );
+}

@@ -17,6 +17,7 @@ use std::process::{Command, ExitCode};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::linediff::LineOp;
 use plib::sccsfile::{
     paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, PfileEntry, SccsDateTime, SccsFile,
     SccsFlag, Sid,
@@ -148,6 +149,26 @@ fn read_gfile(sfile_path: &Path) -> io::Result<Vec<String>> {
     reader.lines().collect()
 }
 
+/// Read the g-file as the lines to diff against the stored body.
+///
+/// An encoded (binary) s-file stores uuencoded text, and `get` writes the
+/// decoded bytes to the g-file, so the two are only comparable after encoding
+/// the g-file back. `delta` never checked `is_encoded()` at all: it read the
+/// raw bytes as UTF-8 lines and diffed them against uuencoded text, so a
+/// binary file could be created and retrieved but never updated -- it failed
+/// with "stream did not contain valid UTF-8".
+fn read_gfile_for(sccs: &SccsFile, sfile_path: &Path) -> io::Result<Vec<String>> {
+    if !sccs.is_encoded() {
+        return read_gfile(sfile_path);
+    }
+
+    let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
+    })?;
+    let raw = fs::read(&gfile_path)?;
+    Ok(plib::sccsfile::uuencode_sccs(&raw))
+}
+
 /// Reconstruct the base version (what was gotten with get -e)
 fn reconstruct_base(sccs: &SccsFile, base_serial: u16) -> io::Result<Vec<String>> {
     let applied_set = sccs
@@ -157,102 +178,29 @@ fn reconstruct_base(sccs: &SccsFile, base_serial: u16) -> io::Result<Vec<String>
     Ok(sccs.evaluate_body(&applied_set))
 }
 
-/// Simple line-based diff algorithm
-/// Returns (unchanged_count, inserted_lines, deleted_lines)
-/// and generates the new body records
-fn compute_diff(
-    base_lines: &[String],
-    new_lines: &[String],
-    _new_serial: u16,
-) -> (DeltaStats, Vec<DiffOp>) {
-    // Use a simple diff algorithm (Myers or similar would be better, but this works)
-    let mut ops = Vec::new();
-    let mut i = 0; // index into base_lines
-    let mut j = 0; // index into new_lines
+/// Diff the base version against the g-file.
+///
+/// The edit script is minimal (see `plib::linediff`). The previous greedy scan
+/// with a ten-line lookahead recorded more edits than necessary whenever the
+/// next matching line lay outside that window, and indexed the new text
+/// unguarded once it had run past the end, panicking on any change that
+/// deleted two or more trailing lines.
+fn compute_diff(base_lines: &[String], new_lines: &[String]) -> (DeltaStats, Vec<LineOp>) {
+    let ops = plib::linediff::diff(base_lines, new_lines);
 
-    let mut inserted = 0u32;
-    let mut deleted = 0u32;
-    let mut unchanged = 0u32;
-
-    while i < base_lines.len() || j < new_lines.len() {
-        if i < base_lines.len() && j < new_lines.len() && base_lines[i] == new_lines[j] {
-            // Lines match - unchanged
-            ops.push(DiffOp::Keep);
-            unchanged += 1;
-            i += 1;
-            j += 1;
-        } else {
-            // Look ahead to find matching lines
-            let mut found_match = false;
-
-            // Try to find new_lines[j] in remaining base_lines
-            for look_ahead in 1..=10.min(base_lines.len() - i) {
-                if i + look_ahead < base_lines.len() && base_lines[i + look_ahead] == new_lines[j] {
-                    // Delete lines from base up to the match
-                    for _ in 0..look_ahead {
-                        ops.push(DiffOp::Delete);
-                        deleted += 1;
-                    }
-                    i += look_ahead;
-                    found_match = true;
-                    break;
-                }
-            }
-
-            if !found_match {
-                // Try to find base_lines[i] in remaining new_lines (only when
-                // base still has a line to anchor on).
-                let mut found_insert = false;
-                if i < base_lines.len() {
-                    for look_ahead in 1..=10.min(new_lines.len() - j) {
-                        if j + look_ahead < new_lines.len()
-                            && new_lines[j + look_ahead] == base_lines[i]
-                        {
-                            // Insert lines from new up to the match
-                            for k in 0..look_ahead {
-                                ops.push(DiffOp::Insert(new_lines[j + k].clone()));
-                                inserted += 1;
-                            }
-                            j += look_ahead;
-                            found_insert = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !found_insert {
-                    if i < base_lines.len() && j < new_lines.len() {
-                        // Replace: delete old, insert new
-                        ops.push(DiffOp::Delete);
-                        deleted += 1;
-                        ops.push(DiffOp::Insert(new_lines[j].clone()));
-                        inserted += 1;
-                        i += 1;
-                        j += 1;
-                    } else if i < base_lines.len() {
-                        // Delete remaining base lines
-                        ops.push(DiffOp::Delete);
-                        deleted += 1;
-                        i += 1;
-                    } else if j < new_lines.len() {
-                        // Insert remaining new lines
-                        ops.push(DiffOp::Insert(new_lines[j].clone()));
-                        inserted += 1;
-                        j += 1;
-                    }
-                }
-            }
+    let mut stats = DeltaStats::default();
+    for op in &ops {
+        match op {
+            LineOp::Keep => stats.unchanged += 1,
+            LineOp::Delete => stats.deleted += 1,
+            LineOp::Insert(_) => stats.inserted += 1,
         }
     }
 
-    (DeltaStats::new(inserted, deleted, unchanged), ops)
+    (stats, ops)
 }
 
-/// Render the diff ops in `diff`-normal format (e.g. `2c2`, `< old`, `---`,
-/// `> new`), matching historical `delta -p` output. Consecutive insert/delete
-/// runs are grouped into a single change ("c"), addition ("a"), or deletion
-/// ("d") hunk.
-fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[DiffOp]) {
+fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]) {
     // Render a single line-range as "a" or "a,b".
     fn range(start: usize, count: usize) -> String {
         if count == 0 {
@@ -272,12 +220,12 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[DiffOp]
 
     while k < ops.len() {
         match &ops[k] {
-            DiffOp::Keep => {
+            LineOp::Keep => {
                 bi += 1;
                 ni += 1;
                 k += 1;
             }
-            DiffOp::Delete | DiffOp::Insert(_) => {
+            LineOp::Delete | LineOp::Insert(_) => {
                 // Collect a maximal run of deletes then inserts (a replace),
                 // or just deletes, or just inserts.
                 let del_start = bi;
@@ -287,7 +235,7 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[DiffOp]
 
                 while k < ops.len() {
                     match &ops[k] {
-                        DiffOp::Delete => {
+                        LineOp::Delete => {
                             dels.push(base_lines[bi].clone());
                             bi += 1;
                             k += 1;
@@ -297,7 +245,7 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[DiffOp]
                 }
                 while k < ops.len() {
                     match &ops[k] {
-                        DiffOp::Insert(_) => {
+                        LineOp::Insert(_) => {
                             inss.push(new_lines[ni].clone());
                             ni += 1;
                             k += 1;
@@ -337,19 +285,13 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[DiffOp]
     }
 }
 
-#[derive(Debug)]
-enum DiffOp {
-    Keep,
-    Insert(String),
-    Delete,
-}
-
 /// Apply diff operations to the SCCS body
 fn apply_diff_to_body(
     sccs: &SccsFile,
     base_serial: u16,
     new_serial: u16,
-    diff_ops: &[DiffOp],
+    new_lines: &[String],
+    diff_ops: &[LineOp],
 ) -> Vec<BodyRecord> {
     let applied_set = sccs.compute_applied_set(base_serial).unwrap();
 
@@ -362,19 +304,19 @@ fn apply_diff_to_body(
 
     for op in diff_ops {
         match op {
-            DiffOp::Keep => {
+            LineOp::Keep => {
                 if !inserts_at_pos.is_empty() {
                     insert_after.push((base_idx, inserts_at_pos.clone()));
                     inserts_at_pos.clear();
                 }
                 base_idx += 1;
             }
-            DiffOp::Delete => {
+            LineOp::Delete => {
                 delete_set.insert(base_idx);
                 base_idx += 1;
             }
-            DiffOp::Insert(line) => {
-                inserts_at_pos.push(line.clone());
+            LineOp::Insert(j) => {
+                inserts_at_pos.push(new_lines[*j].clone());
             }
         }
     }
@@ -617,13 +559,13 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     let base_serial = base_delta.serial;
 
     // Read g-file
-    let new_lines = read_gfile(sfile_path)?;
+    let new_lines = read_gfile_for(&sccs, sfile_path)?;
 
     // Reconstruct base version
     let base_lines = reconstruct_base(&sccs, base_serial)?;
 
     // Compute diff
-    let (stats, diff_ops) = compute_diff(&base_lines, &new_lines, sccs.max_serial() + 1);
+    let (stats, diff_ops) = compute_diff(&base_lines, &new_lines);
 
     // Gather MRs (honoring the v flag) and the comment. The MR prompt, if any,
     // must precede the comment prompt.
@@ -692,7 +634,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     }
 
     // Apply diff to body
-    let new_body = apply_diff_to_body(&sccs, base_serial, new_serial, &diff_ops);
+    let new_body = apply_diff_to_body(&sccs, base_serial, new_serial, &new_lines, &diff_ops);
     sccs.body = new_body;
 
     // Add new delta to header (at the beginning - deltas are stored newest first)

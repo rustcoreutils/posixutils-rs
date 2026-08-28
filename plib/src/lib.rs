@@ -13,6 +13,7 @@ pub mod diag;
 pub mod exec;
 pub mod group;
 pub mod io;
+pub mod linediff;
 pub mod locale;
 pub mod lzw;
 pub mod modestr;

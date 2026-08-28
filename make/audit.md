@@ -377,14 +377,15 @@ findings and reported complete without them. They are unchanged since.
   seeded by generating `"{name} ::= {value}\n"` and re-parsing it inside
   `if let Ok(parsed)`. Any `define` body contains a newline, the parse fails, the
   error is swallowed, and every built-in rule silently disappears.
-- [ ] **#68 — `$(if)`/`$(or)`/`$(and)` recurse unbounded into a crash.** They are
-  dispatched through `call_lazy` but never take `ctx.state.enter()`, unlike
-  `eval`/`foreach`/`call`. `A = $(if 1,$(A))` aborts with a stack overflow. Same
-  defect as #58, fixed on three of six lazy functions.
-- [ ] **#69 — `$(wordlist)` panics on an inverted range.**
-  `$(wordlist 5,1,a b c d e f)` panics with `slice index starts at 4 but ends at
-  1`, exit 101. GNU returns the empty string.
-
+- [x] **#68 — `$(if)`/`$(or)`/`$(and)` recurse unbounded into a crash.** ✓ fixed
+  2026-08-28. All three now take the depth guard the other lazy functions had.
+  #58 added it to `eval`, `foreach` and `call` and stopped there, so half the
+  class stayed open. Tests `recursion_through_if_is_capped`,
+  `recursion_through_or_and_is_capped`.
+- [x] **#69 — `$(wordlist)` panics on an inverted range.** ✓ fixed 2026-08-28.
+  An inverted span is an empty list, as GNU. Test
+  `wordlist_with_an_inverted_range_is_empty`, which also pins the single-word
+  and past-the-end cases.
 ### Major
 
 - [x] **#66 — `VPATH` is skipped for a prerequisite with no rule of its own.**
@@ -393,16 +394,17 @@ findings and reported complete without them. They are unchanged since.
   `run_for_target` already had, so `$<` names where the file was found.
   Byte-identical to GNU on the probe. Test
   `vpath_supplies_a_prerequisite_with_no_rule`.
-- [ ] **#70 — A nested reference in a `$(x:a=b)` replacement is rejected.** The
-  spec is read with a flat loop that stops at the first `)`, so
-  `$(SRC:%.c=$(D)/%.o)` fails the whole makefile. The function path already has
-  `read_balanced` for this.
+- [x] **#70 — A nested reference in a `$(x:a=b)` replacement is rejected.**
+  ✓ fixed 2026-08-28. The spec is read with `read_balanced`, the same reader the
+  function path uses, so `$(SRC:%.c=$(D)/%.o)` yields `obj/a.o obj/b.o`. Test
+  `test_subst_replacement_may_nest_a_reference`.
 - [ ] **#71 — Command-line macros do not override macros used in rule headers.**
   They are appended after the makefile text, but rule headers are expanded at
   read time. `make OBJ=b.o all` builds `a.o`. POSIX 105866.
-- [ ] **#72 — A lone `$` rejects the whole makefile.** `@echo "cost 5 $ each"`
-  gives a parse error; GNU prints `cost 5 each`. `substitute_internal_macros`
-  already emits a lone `$` literally, so the two halves disagree.
+- [x] **#72 — A lone `$` rejects the whole makefile.** ✓ fixed 2026-08-28. `$X`
+  for any single character is a reference to a macro named `X`, matching GNU;
+  an unknown one expands to nothing rather than erroring. `@echo "cost 5 $ each"`
+  now prints. Test `test_a_lone_dollar_is_a_single_char_reference`.
 - [ ] **#73 — `?=` and `+=` ignore the environment.** Both consult `MacroTable`
   directly rather than `lookup_macro`, so `CC ?= gcc` with `CC=clang` inherited
   yields `gcc`, and `CC += -Wall` drops the inherited value entirely.

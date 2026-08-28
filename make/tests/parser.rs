@@ -119,6 +119,29 @@ all:
 
     // Review (c3): a `$(name:subst=...)` form missing its closing delimiter is a
     // clear error rather than silently consuming to EOF.
+    // Audit #70: the replacement may contain a reference of its own. Reading
+    // the spec with a flat loop stopped at the first `)` and rejected the file.
+    #[test]
+    fn test_subst_replacement_may_nest_a_reference() {
+        let out = preprocess("D = obj\nSRC = a.c b.c\nall:\n\t@echo [$(SRC:%.c=$(D)/%.o)]\n")
+            .expect("must preprocess")
+            .text;
+        assert!(out.contains("[obj/a.o obj/b.o]"), "got: {out:?}");
+    }
+
+    // Audit #72: `$` followed by anything unrecognized rejected the whole
+    // makefile. GNU treats `$X` as a reference to a macro named X.
+    #[test]
+    fn test_a_lone_dollar_is_a_single_char_reference() {
+        let out = preprocess("all:\n\t@echo \"cost 5 $ each\"\n")
+            .expect("must preprocess")
+            .text;
+        assert!(
+            out.contains("cost 5  each") || out.contains("cost 5 each"),
+            "got: {out:?}"
+        );
+    }
+
     #[test]
     fn test_subst_missing_close_errors() {
         let result = preprocess("V = a.c\nall:\n\t@echo $(V:.c=.o\n");
@@ -674,6 +697,27 @@ mod functions {
 
     // An unimplemented function is refused rather than silently expanding to
     // nothing, so a makefile using one fails loudly instead of building wrong.
+    // Audit #69: an inverted span asked for an inverted slice and panicked.
+    #[test]
+    fn wordlist_with_an_inverted_range_is_empty() {
+        assert_eq!(echoed("$(wordlist 5,1,a b c d e f)"), "");
+        assert_eq!(echoed("$(wordlist 3,3,a b c d)"), "c");
+        assert_eq!(echoed("$(wordlist 2,99,a b c)"), "b c");
+    }
+
+    // Audit #68: the depth guard was added to eval/foreach/call and missed on
+    // if/or/and, which recurse through `expand` the same way.
+    #[test]
+    fn recursion_through_if_is_capped() {
+        assert!(preprocess("A = $(if 1,$(A))\nall:\n\t@echo $(A)\n").is_err());
+    }
+
+    #[test]
+    fn recursion_through_or_and_is_capped() {
+        assert!(preprocess("A = $(or $(A))\nall:\n\t@echo $(A)\n").is_err());
+        assert!(preprocess("A = $(and 1,$(A))\nall:\n\t@echo $(A)\n").is_err());
+    }
+
     #[test]
     fn an_unknown_function_name_is_refused() {
         assert!(preprocess("all:\n\t@echo $(nosuchthing foo)\n").is_err());

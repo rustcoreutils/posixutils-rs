@@ -303,10 +303,11 @@ fn f_wordlist(from: &str, to: &str, text: &str) -> Result<String, String> {
         return Err("wordlist: index must be greater than 0".to_string());
     }
     let ws = words(text);
-    if from > ws.len() {
+    let end = to.min(ws.len());
+    // `$(wordlist 5,1,...)` asks for an empty span, not an inverted slice.
+    if from > ws.len() || from > end {
         return Ok(String::new());
     }
-    let end = to.min(ws.len());
     Ok(join(ws[from - 1..end].iter().map(|s| s.to_string())))
 }
 
@@ -436,6 +437,9 @@ fn f_eval(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
 }
 
 fn f_if(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
+    // `A = $(if 1,$(A))` recurses through `expand` just as `$(call)` does; the
+    // guard was added to three of the six lazy functions and missed here.
+    let _guard = ctx.state.enter()?;
     let args = split_args(raw);
     let condition = expand(args.first().map(String::as_str).unwrap_or(""), ctx)?;
     let branch = if condition.trim().is_empty() { 2 } else { 1 };
@@ -448,6 +452,7 @@ fn f_if(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
 /// `$(or ...)` returns the first non-empty argument; `$(and ...)` returns the
 /// last, or empty if any is empty. Both short-circuit.
 fn f_or_and(raw: &str, ctx: &Ctx, expand: Expand, is_or: bool) -> Result<String, String> {
+    let _guard = ctx.state.enter()?;
     let mut last = String::new();
     for arg in split_args(raw) {
         let value = expand(&arg, ctx)?;

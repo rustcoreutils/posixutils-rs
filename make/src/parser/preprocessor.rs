@@ -609,20 +609,11 @@ fn substitute(
                 // `$(name:subst1=subst2)` substitution form.
                 if letters.peek() == Some(&':') {
                     letters.next();
-                    let mut spec = String::new();
-                    let mut closed = false;
-                    for c in letters.by_ref() {
-                        if c == close {
-                            closed = true;
-                            break;
-                        }
-                        spec.push(c);
-                    }
-                    // Like the plain `$(name)` path, require the closing
-                    // delimiter rather than silently accepting EOF.
-                    if !closed {
-                        Err(PreprocError::UnexpectedEOF)?
-                    }
+                    // The replacement may itself contain a reference, as in
+                    // `$(SRC:%.c=$(D)/%.o)`. Stopping at the first `)` cut that
+                    // in half and rejected the makefile (audit #70); the
+                    // balanced reader is the same one the function path uses.
+                    let spec = read_balanced(&mut letters, open, close)?;
                     // Expand the body before substituting: a delayed macro
                     // holds unexpanded text, and `$(SRC:.c=.o)` has to see the
                     // words, not `$(wildcard *.c)`.
@@ -658,7 +649,14 @@ fn substitute(
 
                 continue;
             }
-            c => Err(PreprocError::UnexpectedSymbol(c))?,
+            // Any other single character names a macro, as GNU does -- so a
+            // stray `$` in a recipe expands to nothing rather than rejecting
+            // the whole makefile (audit #72).
+            c => {
+                let macro_body = lookup_macro(&c.to_string(), table, env_macros);
+                result.push_str(&macro_body);
+                substitutions += 1;
+            }
         }
     }
 

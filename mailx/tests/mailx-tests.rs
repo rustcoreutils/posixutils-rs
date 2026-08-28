@@ -8,6 +8,7 @@
 //
 
 mod cli;
+mod common;
 mod receive;
 mod send;
 mod variables;

@@ -16,10 +16,11 @@ use std::process::Command;
 
 use crate::escapes::handle_escape;
 use crate::mailbox::Mailbox;
-use crate::message::{extract_login, MessageState};
-use crate::msglist::{parse_message, parse_msglist};
+use crate::message::{author_filename, Disposition, ReadState};
+use crate::msglist::{msglist_or_current, parse_message, parse_msglist};
 use crate::send::{compose_reply, send_message, ComposedMessage};
-use crate::variables::{parse_set_arg, Variables};
+use crate::util::expand_local_prefixes;
+use crate::variables::{parse_set_arg, split_args, Variables};
 
 /// Result of executing a command
 pub enum CommandResult {
@@ -28,309 +29,567 @@ pub enum CommandResult {
     Exit,
 }
 
+/// Where a command line came from, which decides what is legal there.
+///
+/// The three contexts used to be three separate interpreters -- command mode,
+/// start-up files, and `~:` from input mode -- each with its own abbreviation
+/// list, its own `!` handling, and its own idea of which commands existed. They
+/// drifted, so they are one interpreter and one table now, with the differences
+/// expressed as a mask on each command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Context {
+    /// The interactive command loop.
+    Command,
+    /// A start-up file or a file read by `source`.
+    Startup,
+    /// A `~:` or `~_` request from input mode.
+    Input,
+}
+
+impl Context {
+    fn bit(self) -> u8 {
+        match self {
+            Context::Command => CMD,
+            Context::Startup => RC,
+            Context::Input => INPUT,
+        }
+    }
+
+    fn where_invalid(self) -> &'static str {
+        match self {
+            Context::Command => "command not valid here",
+            Context::Startup => "command not valid in a start-up file",
+            Context::Input => "command not valid in input mode",
+        }
+    }
+}
+
+const CMD: u8 = 1 << 0;
+const RC: u8 = 1 << 1;
+const INPUT: u8 = 1 << 2;
+
+/// Legal everywhere: needs no message store and changes only settings.
+const ANY: u8 = CMD | RC | INPUT;
+/// Legal in command mode and start-up files, but not from input mode.
+const CMD_RC: u8 = CMD | RC;
+
+type Handler = fn(&str, &mut Mailbox, &mut Variables) -> Result<CommandResult, String>;
+
+/// One command: its full name, the shortest accepted abbreviation, where it is
+/// legal, and what runs it.
+struct Cmd {
+    /// The full command name, in the case POSIX spells it.
+    name: &'static str,
+    /// Length of the shortest accepted prefix (the part before `[` in the
+    /// POSIX synopsis).
+    min: usize,
+    /// Contexts this command may be used in.
+    ctx: u8,
+    run: Handler,
+}
+
+/// Every command, with the abbreviation rule POSIX states for it.
+///
+/// Matching is case-sensitive, which is the whole point: `Copy`, `Save`,
+/// `Print`, `Type`, `Reply`, and `Followup` are distinct commands from their
+/// lowercase forms (spec 104734-104742, 104949-104961, 104876, 104893-104902,
+/// 104803-104813). Dispatching on a lowercased command word made all six
+/// unreachable, and their handlers dead code.
+///
+/// The start-up exclusions are spec 104557-104559 exactly: `!`, `edit`, `hold`,
+/// `mail`, `preserve`, `reply`, `Reply`, `Save`, `shell`, `visual`, `Copy`,
+/// `followup`, and `Followup`. Note that lowercase `copy` and `save` are
+/// *legal* there; only the capitalized forms are not.
+const COMMANDS: &[Cmd] = &[
+    Cmd {
+        name: "alias",
+        min: 1,
+        ctx: ANY,
+        run: |a, _, v| cmd_alias(a, v),
+    },
+    Cmd {
+        name: "group",
+        min: 1,
+        ctx: ANY,
+        run: |a, _, v| cmd_alias(a, v),
+    },
+    Cmd {
+        name: "alternates",
+        min: 3,
+        ctx: ANY,
+        run: |a, _, v| cmd_alternates(a, v),
+    },
+    Cmd {
+        name: "echo",
+        min: 2,
+        ctx: ANY,
+        run: |a, _, _| {
+            println!("{}", a);
+            Ok(CommandResult::Continue)
+        },
+    },
+    Cmd {
+        name: "set",
+        min: 2,
+        ctx: ANY,
+        run: |a, _, v| cmd_set(a, v),
+    },
+    Cmd {
+        name: "unset",
+        min: 3,
+        ctx: ANY,
+        run: |a, _, v| cmd_unset(a, v),
+    },
+    Cmd {
+        name: "cd",
+        min: 2,
+        ctx: CMD_RC,
+        run: |a, _, _| cmd_cd(a),
+    },
+    Cmd {
+        name: "chdir",
+        min: 2,
+        ctx: CMD_RC,
+        run: |a, _, _| cmd_cd(a),
+    },
+    Cmd {
+        name: "copy",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_copy(a, m, v, false),
+    },
+    Cmd {
+        name: "Copy",
+        min: 1,
+        ctx: CMD,
+        run: |a, m, v| cmd_copy_author(a, m, v, false),
+    },
+    Cmd {
+        name: "delete",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_delete,
+    },
+    Cmd {
+        name: "discard",
+        min: 2,
+        ctx: CMD_RC,
+        run: |a, _, v| cmd_discard(a, v),
+    },
+    Cmd {
+        name: "ignore",
+        min: 2,
+        ctx: CMD_RC,
+        run: |a, _, v| cmd_discard(a, v),
+    },
+    Cmd {
+        name: "dp",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_dp,
+    },
+    Cmd {
+        name: "dt",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_dp,
+    },
+    Cmd {
+        name: "edit",
+        min: 1,
+        ctx: CMD,
+        run: cmd_edit,
+    },
+    Cmd {
+        name: "exit",
+        min: 2,
+        ctx: CMD_RC,
+        run: |_, _, _| Ok(CommandResult::Exit),
+    },
+    Cmd {
+        name: "xit",
+        min: 1,
+        ctx: CMD_RC,
+        run: |_, _, _| Ok(CommandResult::Exit),
+    },
+    Cmd {
+        name: "file",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_file,
+    },
+    Cmd {
+        name: "folder",
+        min: 4,
+        ctx: CMD_RC,
+        run: cmd_file,
+    },
+    Cmd {
+        name: "folders",
+        min: 7,
+        ctx: CMD_RC,
+        run: |_, _, v| cmd_folders(v),
+    },
+    Cmd {
+        name: "followup",
+        min: 2,
+        ctx: CMD,
+        run: |a, m, v| cmd_followup(a, m, v, false),
+    },
+    Cmd {
+        name: "Followup",
+        min: 2,
+        ctx: CMD,
+        run: |a, m, v| cmd_followup(a, m, v, true),
+    },
+    Cmd {
+        name: "from",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_from,
+    },
+    Cmd {
+        name: "headers",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_headers,
+    },
+    Cmd {
+        name: "help",
+        min: 3,
+        ctx: CMD_RC,
+        run: |_, _, _| cmd_help(),
+    },
+    Cmd {
+        name: "hold",
+        min: 2,
+        ctx: CMD,
+        run: cmd_hold,
+    },
+    Cmd {
+        name: "preserve",
+        min: 3,
+        ctx: CMD,
+        run: cmd_hold,
+    },
+    Cmd {
+        name: "list",
+        min: 1,
+        ctx: CMD_RC,
+        run: |_, _, _| cmd_list(),
+    },
+    Cmd {
+        name: "mail",
+        min: 1,
+        ctx: CMD,
+        run: cmd_mail,
+    },
+    Cmd {
+        name: "mbox",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_mbox,
+    },
+    Cmd {
+        name: "next",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_next,
+    },
+    Cmd {
+        name: "pipe",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_pipe,
+    },
+    Cmd {
+        name: "print",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_print(a, m, v, false),
+    },
+    Cmd {
+        name: "Print",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_print(a, m, v, true),
+    },
+    Cmd {
+        name: "type",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_print(a, m, v, false),
+    },
+    Cmd {
+        name: "Type",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_print(a, m, v, true),
+    },
+    Cmd {
+        name: "quit",
+        min: 1,
+        ctx: CMD_RC,
+        run: |_, _, _| Ok(CommandResult::Quit),
+    },
+    Cmd {
+        name: "reply",
+        min: 1,
+        ctx: CMD,
+        run: |a, m, v| cmd_reply_flipr(a, m, v, true),
+    },
+    Cmd {
+        name: "respond",
+        min: 3,
+        ctx: CMD,
+        run: |a, m, v| cmd_reply_flipr(a, m, v, true),
+    },
+    Cmd {
+        name: "Reply",
+        min: 1,
+        ctx: CMD,
+        run: |a, m, v| cmd_reply_flipr(a, m, v, false),
+    },
+    Cmd {
+        name: "Respond",
+        min: 3,
+        ctx: CMD,
+        run: |a, m, v| cmd_reply_flipr(a, m, v, false),
+    },
+    Cmd {
+        name: "retain",
+        min: 3,
+        ctx: CMD_RC,
+        run: |a, _, v| cmd_retain(a, v),
+    },
+    Cmd {
+        name: "save",
+        min: 1,
+        ctx: CMD_RC,
+        run: |a, m, v| cmd_save(a, m, v, true),
+    },
+    Cmd {
+        name: "Save",
+        min: 1,
+        ctx: CMD,
+        run: |a, m, v| cmd_copy_author(a, m, v, true),
+    },
+    Cmd {
+        name: "shell",
+        min: 2,
+        ctx: CMD,
+        run: |_, _, v| cmd_shell_interactive(v),
+    },
+    Cmd {
+        name: "size",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_size,
+    },
+    Cmd {
+        name: "source",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_source,
+    },
+    Cmd {
+        name: "top",
+        min: 2,
+        ctx: CMD_RC,
+        run: cmd_top,
+    },
+    Cmd {
+        name: "touch",
+        min: 3,
+        ctx: CMD_RC,
+        run: cmd_touch,
+    },
+    Cmd {
+        name: "unalias",
+        min: 3,
+        ctx: CMD_RC,
+        run: |a, _, v| cmd_unalias(a, v),
+    },
+    Cmd {
+        name: "undelete",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_undelete,
+    },
+    Cmd {
+        name: "visual",
+        min: 1,
+        ctx: CMD,
+        run: cmd_visual,
+    },
+    Cmd {
+        name: "write",
+        min: 1,
+        ctx: CMD_RC,
+        run: cmd_write,
+    },
+];
+
+/// Commands spelled with punctuation rather than a name.
+const PUNCTUATION: &[(&str, u8, Handler)] =
+    &[("?", CMD_RC, |_, _, _| cmd_help()), ("|", CMD_RC, cmd_pipe)];
+
+/// Find the command `word` names, if any.
+///
+/// A command may be entered as any prefix of its name at least `min` characters
+/// long (spec 104689-104693). The comparison is case-sensitive.
+fn lookup(word: &str, ctx: Context) -> Option<Result<&'static Cmd, String>> {
+    let cmd = COMMANDS
+        .iter()
+        .find(|c| word.len() >= c.min && c.name.len() >= word.len() && c.name.starts_with(word))?;
+    Some(if cmd.ctx & ctx.bit() == 0 {
+        Err(format!("{}: {}", word, ctx.where_invalid()))
+    } else {
+        Ok(cmd)
+    })
+}
+
+/// `reply`/`Reply` differ only in who the reply goes to, and `flipr` swaps
+/// which spelling means which (spec 104899-104902).
+fn cmd_reply_flipr(
+    args: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+    lowercase_form: bool,
+) -> Result<CommandResult, String> {
+    let reply_to_all = lowercase_form != vars.get_bool("flipr");
+    cmd_reply(args, mb, vars, reply_to_all)
+}
+
 /// Execute a command in Receive Mode
 pub fn execute_command(
     line: &str,
     mb: &mut Mailbox,
     vars: &mut Variables,
 ) -> Result<CommandResult, String> {
+    execute_in(line, mb, vars, Context::Command)
+}
+
+/// Execute one command line in `ctx`.
+///
+/// This is the single interpreter. `mb` is a scratch, empty mailbox in the
+/// start-up and input-mode contexts, where there is no message store; commands
+/// that need one are excluded by their context mask rather than by a separate
+/// dispatch table.
+pub fn execute_in(
+    line: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+    ctx: Context,
+) -> Result<CommandResult, String> {
     let line = line.trim();
 
-    // Check for blank line
-    if line.is_empty() {
+    if line.is_empty() || line.starts_with('#') {
         return Ok(CommandResult::Continue);
     }
 
-    // Check for comment
-    if line.starts_with('#') {
-        return Ok(CommandResult::Continue);
-    }
+    let (cmd, args) = parse_command_line(line);
 
-    // Conditional execution (if/else/endif) in command mode. execute_command is
-    // the Receive-Mode interpreter, so the `r` condition is true and `s` false.
-    {
-        let (cword, cargs) = parse_command_line(line);
-        match cword.to_lowercase().as_str() {
-            "i" | "if" => {
-                let matches = matches!(cargs.trim().to_lowercase().as_str(), "r");
-                vars.cond_stack.push((matches, false));
-                return Ok(CommandResult::Continue);
-            }
-            "el" | "els" | "else" => {
-                match vars.cond_stack.pop() {
-                    // A second else in the same if block is an error.
-                    Some((_, true)) | None => return Err("mailx: unexpected else".to_string()),
-                    Some((matches, false)) => vars.cond_stack.push((!matches, true)),
-                }
-                return Ok(CommandResult::Continue);
-            }
-            "en" | "end" | "endi" | "endif" => {
-                if vars.cond_stack.pop().is_none() {
-                    return Err("mailx: unexpected endif".to_string());
-                }
-                return Ok(CommandResult::Continue);
-            }
-            _ => {}
-        }
+    // Conditionals are handled before the context check, so an `if` guarding a
+    // command that is illegal here still suppresses it rather than diagnosing
+    // it.
+    if let Some(result) = conditional(cmd, args, vars) {
+        return result.map(|_| CommandResult::Continue);
     }
-
-    // Inside a non-matching conditional branch, skip the command.
     if !vars.cond_active() {
         return Ok(CommandResult::Continue);
     }
 
-    // Check for shell escape
-    if let Some(cmd) = line.strip_prefix('!') {
-        return cmd_shell(cmd, vars);
+    // Shell escape. Not valid in a start-up file (spec 104557-104559).
+    if let Some(rest) = line.strip_prefix('!') {
+        if ctx == Context::Startup {
+            return Err("!: command not valid in a start-up file".to_string());
+        }
+        return cmd_shell(rest, vars);
     }
 
-    // Check for = (current message number)
+    // Current message number.
     if line == "=" {
         println!("{}", mb.current);
         return Ok(CommandResult::Continue);
     }
 
-    // Parse command and arguments
-    let (cmd, args) = parse_command_line(line);
-
-    // Match command
-    match cmd.to_lowercase().as_str() {
-        // No command means "next"
-        "" => cmd_next(args, mb, vars),
-
-        // Aliases
-        "a" | "al" | "ali" | "alia" | "alias" => cmd_alias(args, vars),
-        "g" | "gr" | "gro" | "grou" | "group" => cmd_alias(args, vars),
-
-        // Alternates
-        "alt" | "alte" | "alter" | "altern" | "alterna" | "alternat" | "alternate"
-        | "alternates" => cmd_alternates(args, vars),
-
-        // Change directory
-        "cd" => cmd_cd(args),
-        "ch" | "chd" | "chdi" | "chdir" => cmd_cd(args),
-
-        // Copy
-        "c" | "co" | "cop" | "copy" => cmd_copy(args, mb, vars, false),
-        "C" | "Co" | "Cop" | "Copy" => cmd_copy_author(args, mb, vars),
-
-        // Delete
-        "d" | "de" | "del" | "dele" | "delet" | "delete" => cmd_delete(args, mb, vars),
-
-        // Discard/Ignore headers
-        "di" | "dis" | "disc" | "disca" | "discar" | "discard" => cmd_discard(args, vars),
-        "ig" | "ign" | "igno" | "ignor" | "ignore" => cmd_discard(args, vars),
-
-        // Delete and print
-        "dp" => cmd_dp(args, mb, vars),
-        "dt" => cmd_dp(args, mb, vars),
-
-        // Echo
-        "ec" | "ech" | "echo" => {
-            println!("{}", args);
-            Ok(CommandResult::Continue)
+    if let Some((_, bits, run)) = PUNCTUATION.iter().find(|(name, _, _)| *name == cmd) {
+        if bits & ctx.bit() == 0 {
+            return Err(format!("{}: {}", cmd, ctx.where_invalid()));
         }
+        return run(args, mb, vars);
+    }
 
-        // Edit
-        "e" | "ed" | "edi" | "edit" => cmd_edit(args, mb, vars),
-
-        // Exit
-        "ex" | "exi" | "exit" => Ok(CommandResult::Exit),
-        "x" | "xi" | "xit" => Ok(CommandResult::Exit),
-
-        // File/Folder
-        "fi" | "fil" | "file" => cmd_file(args, mb, vars),
-        "fold" | "folde" | "folder" => cmd_file(args, mb, vars),
-
-        // Folders
-        "folders" => cmd_folders(vars),
-
-        // Followup
-        "fo" | "fol" | "foll" | "follo" | "follow" | "followu" | "followup" => {
-            cmd_followup(args, mb, vars, false)
-        }
-        "F" | "Fo" | "Fol" | "Foll" | "Follo" | "Follow" | "Followu" | "Followup" => {
-            cmd_followup(args, mb, vars, true)
-        }
-
-        // From
-        "f" | "fr" | "fro" | "from" => cmd_from(args, mb, vars),
-
-        // Headers
-        "h" | "he" | "hea" | "head" | "heade" | "header" | "headers" => cmd_headers(args, mb, vars),
-
-        // Help
-        "hel" | "help" | "?" => cmd_help(),
-
-        // Hold/Preserve
-        "ho" | "hol" | "hold" => cmd_hold(args, mb),
-        "pre" | "pres" | "prese" | "preser" | "preserv" | "preserve" => cmd_hold(args, mb),
-
-        // If/Else/Endif (for startup files)
-        "i" | "if" => Ok(CommandResult::Continue), // Simplified - ignore conditionals
-        "el" | "els" | "else" => Ok(CommandResult::Continue),
-        "en" | "end" | "endi" | "endif" => Ok(CommandResult::Continue),
-
-        // List
-        "l" | "li" | "lis" | "list" => cmd_list(),
-
-        // Mail
-        "m" | "ma" | "mai" | "mail" => cmd_mail(args, mb, vars),
-
-        // Mbox
-        "mb" | "mbo" | "mbox" => cmd_mbox(args, mb),
-
-        // Next
-        "n" | "ne" | "nex" | "next" => cmd_next(args, mb, vars),
-
-        // Pipe
-        "pi" | "pip" | "pipe" | "|" => cmd_pipe(args, mb, vars),
-
-        // Print/Type (with headers)
-        "P" | "Pr" | "Pri" | "Prin" | "Print" => cmd_print(args, mb, vars, true),
-        "T" | "Ty" | "Typ" | "Type" => cmd_print(args, mb, vars, true),
-
-        // Print/Type
-        "p" | "pr" | "pri" | "prin" | "print" => cmd_print(args, mb, vars, false),
-        "t" | "ty" | "typ" | "type" => cmd_print(args, mb, vars, false),
-
-        // Quit
-        "q" | "qu" | "qui" | "quit" => Ok(CommandResult::Quit),
-
-        // Reply (to sender only)
-        "R" | "Re" | "Rep" | "Repl" | "Reply" | "Res" | "Resp" | "Respo" | "Respon" | "Respond" => {
-            if vars.get_bool("flipr") {
-                cmd_reply(args, mb, vars, true)
-            } else {
-                cmd_reply(args, mb, vars, false)
+    // Scrolling: `z`, `z+`, `z-`.
+    if let Some(direction) = cmd.strip_prefix('z') {
+        if direction.is_empty() || direction == "+" || direction == "-" {
+            if ctx != Context::Command {
+                return Err(format!("{}: {}", cmd, ctx.where_invalid()));
             }
-        }
-
-        // Reply (to all)
-        "r" | "re" | "rep" | "repl" | "reply" | "res" | "resp" | "respo" | "respon" | "respond" => {
-            if vars.get_bool("flipr") {
-                cmd_reply(args, mb, vars, false)
-            } else {
-                cmd_reply(args, mb, vars, true)
-            }
-        }
-
-        // Retain headers
-        "ret" | "reta" | "retai" | "retain" => cmd_retain(args, vars),
-
-        // Save
-        "s" | "sa" | "sav" | "save" => cmd_save(args, mb, vars, true),
-        "S" | "Sa" | "Sav" | "Save" => cmd_save_author(args, mb, vars),
-
-        // Set
-        "se" | "set" => cmd_set(args, vars),
-
-        // Shell
-        "sh" | "she" | "shel" | "shell" => cmd_shell_interactive(vars),
-
-        // Size
-        "si" | "siz" | "size" => cmd_size(args, mb),
-
-        // Source
-        "so" | "sou" | "sour" | "sourc" | "source" => cmd_source(args, vars),
-
-        // Top
-        "to" | "top" => cmd_top(args, mb, vars),
-
-        // Touch
-        "tou" | "touc" | "touch" => cmd_touch(args, mb),
-
-        // Unalias
-        "una" | "unal" | "unali" | "unalia" | "unalias" => cmd_unalias(args, vars),
-
-        // Undelete
-        "u" | "un" | "und" | "unde" | "undel" | "undele" | "undelet" | "undelete" => {
-            cmd_undelete(args, mb, vars)
-        }
-
-        // Unset
-        "uns" | "unse" | "unset" => cmd_unset(args, vars),
-
-        // Visual
-        "v" | "vi" | "vis" | "visu" | "visua" | "visual" => cmd_visual(args, mb, vars),
-
-        // Write
-        "w" | "wr" | "wri" | "writ" | "write" => cmd_write(args, mb, vars),
-
-        // Scroll
-        "z" => cmd_scroll(args, mb, vars),
-        "z+" => cmd_scroll("+", mb, vars),
-        "z-" => cmd_scroll("-", mb, vars),
-
-        // Message number
-        _ => {
-            // Try to parse as a message number/list
-            if let Ok(num) = cmd.parse::<usize>() {
-                if num > 0 && num <= mb.message_count() {
-                    mb.current = num;
-                    cmd_print("", mb, vars, false)
-                } else {
-                    Err(format!("Invalid message number: {}", num))
-                }
-            } else {
-                Err(format!("Unknown command: {}", cmd))
-            }
+            return cmd_scroll(direction, mb, vars);
         }
     }
+
+    if let Some(found) = lookup(cmd, ctx) {
+        return (found?.run)(args, mb, vars);
+    }
+
+    // A bare message number selects and prints that message.
+    if let Ok(num) = cmd.parse::<usize>() {
+        if ctx != Context::Command {
+            return Err(format!("{}: {}", cmd, ctx.where_invalid()));
+        }
+        return if num > 0 && num <= mb.message_count() {
+            mb.current = num;
+            cmd_print("", mb, vars, false)
+        } else {
+            Err(format!("Invalid message number: {}", num))
+        };
+    }
+
+    Err(format!("Unknown command: {}", cmd))
 }
 
-/// Execute commands allowed in startup files
-pub fn execute_startup_command(line: &str, vars: &mut Variables) -> Result<(), String> {
-    let line = line.trim();
+/// Handle `if`/`else`/`endif`, returning `None` when `cmd` is none of them.
+///
+/// One engine for both contexts. There used to be two, disagreeing on whether a
+/// stray `else` was a warning or an error, and on whether `if s` was even
+/// recognized; a third copy in the start-up dispatcher matched the same words
+/// and did nothing with them.
+fn conditional(cmd: &str, args: &str, vars: &mut Variables) -> Option<Result<(), String>> {
+    let is = |name: &str, min: usize| {
+        cmd.len() >= min && name.len() >= cmd.len() && name.starts_with(cmd)
+    };
 
-    if line.is_empty() || line.starts_with('#') {
-        return Ok(());
+    if is("if", 1) {
+        // `s` is true while reading a start-up file for Send Mode, `r` for
+        // Receive Mode. The command loop is Receive Mode by definition.
+        let matches = match args.trim() {
+            "r" => !vars.send_mode,
+            "s" => vars.send_mode,
+            _ => false,
+        };
+        vars.cond_stack.push((matches, false));
+        return Some(Ok(()));
     }
-
-    // A shell escape (`!command`) is not valid in a start-up file (spec
-    // 104557-104559).
-    if line.starts_with('!') {
-        return Err("!: command not valid in a start-up file".to_string());
+    if is("else", 2) {
+        return Some(match vars.cond_stack.pop() {
+            Some((_, true)) | None => Err("unexpected else".to_string()),
+            Some((matches, false)) => {
+                vars.cond_stack.push((!matches, true));
+                Ok(())
+            }
+        });
     }
-
-    let (cmd, args) = parse_command_line(line);
-
-    match cmd.to_lowercase().as_str() {
-        "a" | "al" | "ali" | "alia" | "alias" | "g" | "gr" | "gro" | "grou" | "group" => {
-            cmd_alias_startup(args, vars)
-        }
-        "alt" | "alte" | "alter" | "altern" | "alterna" | "alternat" | "alternate"
-        | "alternates" => cmd_alternates_startup(args, vars),
-        "di" | "dis" | "disc" | "disca" | "discar" | "discard" | "ig" | "ign" | "igno"
-        | "ignor" | "ignore" => cmd_discard_startup(args, vars),
-        "ret" | "reta" | "retai" | "retain" => cmd_retain_startup(args, vars),
-        "se" | "set" => cmd_set_startup(args, vars),
-        "uns" | "unse" | "unset" => cmd_unset_startup(args, vars),
-        "so" | "sou" | "sour" | "sourc" | "source" => cmd_source_startup(args, vars),
-        "i" | "if" | "el" | "els" | "else" | "en" | "end" | "endi" | "endif" => Ok(()),
-
-        // Other legal start-up commands that do not require the message store.
-        "cd" | "ch" | "chd" | "chdi" | "chdir" => cmd_cd(args).map(|_| ()),
-        "ec" | "ech" | "echo" => {
-            println!("{}", args);
+    if is("endif", 2) {
+        return Some(if vars.cond_stack.pop().is_none() {
+            Err("unexpected endif".to_string())
+        } else {
             Ok(())
-        }
-
-        // Commands explicitly not valid in a start-up file (spec 104557-104559).
-        // The match is over the lowercased command, so copy/save/reply/followup
-        // also catch their Copy/Save/Reply/Followup forms.
-        "e" | "ed" | "edi" | "edit" | "ho" | "hol" | "hold" | "pre" | "pres" | "prese"
-        | "preser" | "preserv" | "preserve" | "m" | "ma" | "mai" | "mail" | "r" | "re" | "rep"
-        | "repl" | "reply" | "c" | "co" | "cop" | "copy" | "s" | "sa" | "sav" | "save" | "sh"
-        | "she" | "shel" | "shell" | "v" | "vi" | "vis" | "visu" | "visua" | "visual" | "fo"
-        | "fol" | "foll" | "follo" | "follow" | "followu" | "followup" => {
-            Err(format!("{}: command not valid in a start-up file", cmd))
-        }
-
-        // Other commands require the message store, which is not available
-        // during start-up; leave them as no-ops rather than diagnosing.
-        _ => Ok(()),
+        });
     }
+    None
 }
 
 fn parse_command_line(line: &str) -> (&str, &str) {
@@ -343,6 +602,73 @@ fn parse_command_line(line: &str) -> (&str, &str) {
 }
 
 // ============ Command implementations ============
+
+/// Report what a `save`, `copy`, `Save`, `Copy`, or `write` wrote.
+fn report_written(mb: &Mailbox, msg_nums: &[usize], filename: &str) {
+    let total: usize = msg_nums
+        .iter()
+        .filter_map(|&n| mb.get(n))
+        .map(|m| m.size())
+        .sum();
+    println!(
+        "\"{}\" {} messages {} bytes",
+        filename,
+        msg_nums.len(),
+        total
+    );
+}
+
+/// Mark messages saved and note that the mailbox needs writing back.
+fn mark_messages_saved(mb: &mut Mailbox, msg_nums: &[usize]) {
+    for &num in msg_nums {
+        if let Some(m) = mb.get_mut(num) {
+            m.disposition = Disposition::Saved;
+        }
+    }
+    mb.modified = true;
+}
+
+/// Mark messages read and make the last of them current.
+fn mark_read(mb: &mut Mailbox, msg_nums: &[usize]) {
+    for &num in msg_nums {
+        if let Some(m) = mb.get_mut(num) {
+            m.read = ReadState::Read;
+        }
+    }
+    if let Some(&last) = msg_nums.last() {
+        mb.current = last;
+    }
+}
+
+/// Split `[msglist] file` into its two halves.
+///
+/// The trailing word is the filename; everything before it is the message list.
+/// With a single argument the intent is ambiguous, so a msglist that parses
+/// wins and anything else is taken as a filename.
+fn msglist_and_file(
+    args: &str,
+    mb: &Mailbox,
+    vars: &Variables,
+    file_required: bool,
+) -> Result<(Vec<usize>, String), String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.len() {
+        0 => {
+            if file_required {
+                return Err("No file specified".to_string());
+            }
+            Ok((vec![mb.current], crate::util::mbox_path(vars)))
+        }
+        1 => match parse_msglist(parts[0], mb, false, vars) {
+            Ok(nums) if !file_required => Ok((nums, crate::util::mbox_path(vars))),
+            _ => Ok((vec![mb.current], expand_filename(parts[0], vars))),
+        },
+        n => {
+            let nums = parse_msglist(&parts[..n - 1].join(" "), mb, false, vars)?;
+            Ok((nums, expand_filename(parts[n - 1], vars)))
+        }
+    }
+}
 
 pub(crate) fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
@@ -371,18 +697,6 @@ pub(crate) fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResul
     Ok(CommandResult::Continue)
 }
 
-fn cmd_alias_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    if !args.is_empty() {
-        let parts: Vec<&str> = args.split_whitespace().collect();
-        if parts.len() > 1 {
-            let name = parts[0].to_string();
-            let addrs: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-            vars.aliases.insert(name, addrs);
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     if args.is_empty() {
         println!("{}", vars.alternates.join(" "));
@@ -394,15 +708,6 @@ pub(crate) fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<Command
         }
     }
     Ok(CommandResult::Continue)
-}
-
-fn cmd_alternates_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for name in args.split_whitespace() {
-        if !vars.alternates.contains(&name.to_string()) {
-            vars.alternates.push(name.to_string());
-        }
-    }
-    Ok(())
 }
 
 fn cmd_cd(args: &str) -> Result<CommandResult, String> {
@@ -419,95 +724,60 @@ fn cmd_cd(args: &str) -> Result<CommandResult, String> {
 fn cmd_copy(
     args: &str,
     mb: &mut Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
     mark_saved: bool,
 ) -> Result<CommandResult, String> {
-    // Parse arguments: [msglist] file
-    let parts: Vec<&str> = args.split_whitespace().collect();
-
-    if parts.is_empty() {
-        return Err("No file specified".to_string());
-    }
-
-    let (msg_nums, filename) = if parts.len() == 1 {
-        (vec![mb.current], expand_filename(parts[0], vars))
-    } else {
-        let file = parts.last().unwrap();
-        let msglist = parts[..parts.len() - 1].join(" ");
-        let nums = parse_msglist(&msglist, mb, false)?;
-        (nums, expand_filename(file, vars))
-    };
+    let (msg_nums, filename) = msglist_and_file(args, mb, vars, true)?;
 
     mb.save_messages(&msg_nums, &filename, true)?;
 
     if mark_saved {
-        for num in &msg_nums {
-            if let Some(m) = mb.get_mut(*num) {
-                m.state = MessageState::Saved;
-            }
-        }
+        mark_messages_saved(mb, &msg_nums);
     }
 
-    let total_size: usize = msg_nums
-        .iter()
-        .filter_map(|&n| mb.get(n))
-        .map(|m| m.size())
-        .sum();
-    println!(
-        "\"{}\" {} messages {} bytes",
-        filename,
-        msg_nums.len(),
-        total_size
-    );
+    report_written(mb, &msg_nums, &filename);
 
     Ok(CommandResult::Continue)
 }
 
+/// `Copy` and `Save`: file the messages under the author's name.
+///
+/// The two differ only in whether the messages are then marked saved
+/// (spec 104738-104742, 104958-104961), so they are one function. They were two
+/// near-identical copies, and -- because dispatch lowercased the command word
+/// before matching -- both were unreachable.
 fn cmd_copy_author(
     args: &str,
     mb: &mut Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
+    mark_saved: bool,
 ) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
-        let filename = extract_login(first_msg.from());
-        let filename = expand_filename(filename, vars);
+        let filename = author_filename(first_msg.from())?;
+        let filename = expand_author_filename(filename, vars);
 
         mb.save_messages(&msg_nums, &filename, true)?;
 
-        let total_size: usize = msg_nums
-            .iter()
-            .filter_map(|&n| mb.get(n))
-            .map(|m| m.size())
-            .sum();
-        println!(
-            "\"{}\" {} messages {} bytes",
-            filename,
-            msg_nums.len(),
-            total_size
-        );
+        if mark_saved {
+            mark_messages_saved(mb, &msg_nums);
+        }
+
+        report_written(mb, &msg_nums, &filename);
     }
 
     Ok(CommandResult::Continue)
 }
 
-fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     let max_deleted = msg_nums.iter().copied().max().unwrap_or(0);
 
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Deleted;
+            m.disposition = Disposition::Deleted;
         }
     }
 
@@ -525,7 +795,7 @@ fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandR
         && mb.current > 0
         && mb
             .get(mb.current)
-            .map(|m| m.state != MessageState::Deleted)
+            .map(|m| m.disposition != Disposition::Deleted)
             .unwrap_or(false)
     {
         cmd_print("", mb, vars, false)?;
@@ -549,16 +819,7 @@ fn cmd_discard(args: &str, vars: &mut Variables) -> Result<CommandResult, String
     Ok(CommandResult::Continue)
 }
 
-fn cmd_discard_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for header in args.split_whitespace() {
-        if !vars.ignored_headers.contains(&header.to_string()) {
-            vars.ignored_headers.push(header.to_string());
-        }
-    }
-    Ok(())
-}
-
-fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Delete and print next
     cmd_delete(args, mb, vars)?;
 
@@ -566,7 +827,7 @@ fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResul
     if mb.current > 0
         && mb
             .get(mb.current)
-            .map(|m| m.state != MessageState::Deleted)
+            .map(|m| m.disposition != Disposition::Deleted)
             .unwrap_or(false)
     {
         cmd_print("", mb, vars, false)?;
@@ -577,26 +838,31 @@ fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResul
     Ok(CommandResult::Continue)
 }
 
-fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     let editor = vars.get("EDITOR").unwrap_or("ed");
+    edit_messages(&msg_nums, mb, editor)
+}
 
-    for num in msg_nums {
+/// Run `editor` over each message in turn, on a private temporary copy.
+///
+/// The temporary comes from `mkstemp` (`O_EXCL`, mode 0600, honoring `$TMPDIR`)
+/// rather than a name built from the pid: `/tmp/mailx.<pid>.<n>` is predictable,
+/// world-readable, and `fs::write` follows a symlink planted there first.
+fn edit_messages(msg_nums: &[usize], mb: &Mailbox, editor: &str) -> Result<CommandResult, String> {
+    for &num in msg_nums {
         if let Some(msg) = mb.get(num) {
-            let temp_path = format!("/tmp/mailx.{}.{}", std::process::id(), num);
-            fs::write(&temp_path, msg.format_full()).map_err(|e| e.to_string())?;
+            let mut tmp = plib::tmp::NamedTempFile::new().map_err(|e| e.to_string())?;
+            tmp.as_file_mut()
+                .write_all(msg.format_full().as_bytes())
+                .map_err(|e| e.to_string())?;
+            tmp.as_file_mut().flush().map_err(|e| e.to_string())?;
 
             Command::new(editor)
-                .arg(&temp_path)
+                .arg(tmp.path())
                 .status()
                 .map_err(|e| e.to_string())?;
-
-            let _ = fs::remove_file(&temp_path);
         }
     }
 
@@ -617,16 +883,20 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
             None => return Err("No previous folder".to_string()),
         }
     } else {
-        expand_folder_name(args, vars)
+        expand_filename(args, vars)
     };
 
     // Remember the folder we are leaving for a later `#`.
     let leaving = mb.path.clone();
 
-    // Save current mailbox first
+    // Check the new folder can be opened *before* flushing the old one, so a
+    // bad path does not leave the session pointing at a mailbox already written
+    // out. The load itself has to happen after the flush: reading it first
+    // would record a byte length taken before `quit` rewrote the file, and if
+    // the two are the same mailbox everything `quit` appended would then look
+    // like newly delivered mail and be copied through a second time.
+    fs::File::open(&path).map_err(|e| format!("{}: {}", path, e))?;
     mb.quit(vars)?;
-
-    // Open new mailbox
     let mut new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
     new_mb.prev_path = Some(leaving);
 
@@ -636,18 +906,11 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     Ok(CommandResult::Continue)
 }
 
-fn cmd_folders(vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_folders(vars: &mut Variables) -> Result<CommandResult, String> {
     if let Some(folder) = vars.get("folder") {
         let folder = expand_filename(folder, vars);
         let lister = vars.get("LISTER").unwrap_or("ls");
-        let shell = vars.get("SHELL").unwrap_or("/bin/sh");
-
-        Command::new(shell)
-            .arg("-c")
-            .arg("--")
-            .arg(format!("{} {}", lister, folder))
-            .status()
-            .map_err(|e| e.to_string())?;
+        crate::util::shell(&format!("{} {}", lister, folder), vars)?;
     } else {
         println!("No folder variable set");
     }
@@ -663,48 +926,50 @@ fn cmd_followup(
     let msg_num = if args.is_empty() {
         mb.current
     } else {
-        parse_message(args, mb)?
+        parse_message(args, mb, vars)?
     };
 
     let original = mb.get(msg_num).ok_or("No message")?;
     let mut composed = compose_reply(original, reply_to_all, vars);
 
     // Record to file named after first recipient
-    let record_file = extract_login(original.from());
-    let record_file = expand_filename(record_file, vars);
+    let record_file = author_filename(original.from())?;
+    let record_file = expand_author_filename(record_file, vars);
 
     // Enter input mode
-    compose_message(&mut composed, mb, vars)?;
+    compose_body(&mut composed, Some(mb), vars)?;
 
     // Send and record
     send_message(&composed, vars, false)?;
-    record_to_file(&composed, &record_file)?;
+    // `followup` records through the same writer as `record`, so it honors
+    // `outfolder` -- its private copy of this logic did not.
+    crate::send::record_message(&composed, &record_file, vars)?;
 
     if let Some(m) = mb.get_mut(msg_num) {
-        m.state = MessageState::Read;
+        m.read = ReadState::Read;
     }
 
     Ok(CommandResult::Continue)
 }
 
-fn cmd_from(args: &str, mb: &Mailbox, vars: &Variables) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+fn cmd_from(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     mb.print_headers(Some(&msg_nums), vars);
     Ok(CommandResult::Continue)
 }
 
-fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_headers(
+    args: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+) -> Result<CommandResult, String> {
     if !args.is_empty() {
-        let msg_num = parse_message(args, mb)?;
+        let msg_num = parse_message(args, mb, vars)?;
         mb.current = msg_num;
     }
 
-    let screen = vars.get_number("screen").unwrap_or(20) as usize;
+    let screen = vars.screen_lines().get();
     let start = if mb.current > 0 {
         ((mb.current - 1) / screen) * screen + 1
     } else {
@@ -717,66 +982,38 @@ fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<Command
     Ok(CommandResult::Continue)
 }
 
+/// The command list, generated from the dispatch table.
+///
+/// `help` and `list` used to carry hand-written inventories. They had already
+/// drifted from what dispatch accepted: `list` advertised `Copy`, `Save`,
+/// `Print`, `Type`, `Reply`, and `Followup`, none of which could run.
+fn command_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = COMMANDS.iter().map(|c| c.name).collect();
+    names.extend(PUNCTUATION.iter().map(|(n, _, _)| *n));
+    names.push("z");
+    names
+}
+
 fn cmd_help() -> Result<CommandResult, String> {
-    println!(
-        r#"
-Commands:
-  ?           help
-  =           print current message number
-  alias       define/list aliases
-  alternates  define alternate addresses
-  cd          change directory
-  copy        copy messages to file
-  delete      delete messages
-  dp          delete and print next
-  edit        edit messages
-  exit        exit without saving
-  file        change mailbox
-  folders     list folder directory
-  from        print header summary
-  headers     print header page
-  hold        hold messages in mailbox
-  list        list available commands
-  mail        send mail
-  mbox        mark for moving to mbox
-  next        print next message
-  pipe        pipe messages to command
-  print       print messages
-  quit        quit, saving changes
-  reply       reply to message
-  retain      retain headers
-  save        save messages to file
-  set         set/print variables
-  shell       invoke shell
-  size        print message sizes
-  source      read commands from file
-  top         print top lines of messages
-  touch       mark messages for mbox
-  undelete    undelete messages
-  unset       unset variables
-  visual      edit with visual editor
-  write       write messages to file (no headers)
-  z           scroll header display
-"#
-    );
+    println!("Commands:");
+    for chunk in command_names().chunks(6) {
+        println!("  {}", chunk.join("  "));
+    }
+    println!("Any command may be abbreviated to its shortest unique prefix.");
     Ok(CommandResult::Continue)
 }
 
-fn cmd_hold(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+fn cmd_hold(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104831).
     if !mb.is_system_mailbox {
         return Err("hold: Allowed only in the system mailbox".to_string());
     }
 
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
-            m.state = MessageState::Preserved;
+            m.disposition = Disposition::Preserved;
         }
     }
 
@@ -784,18 +1021,11 @@ fn cmd_hold(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
 }
 
 fn cmd_list() -> Result<CommandResult, String> {
-    println!(
-        "alias alternates cd chdir copy Copy delete discard dp dt \
-         echo edit exit file folder folders followup Followup from \
-         headers help hold if else endif ignore list mail mbox next \
-         pipe Print print quit Reply reply retain save Save set shell \
-         size source top touch Type type unalias undelete unset visual \
-         write z"
-    );
+    println!("{}", command_names().join(" "));
     Ok(CommandResult::Continue)
 }
 
-fn cmd_mail(args: &str, mb: &Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+fn cmd_mail(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let mut composed = ComposedMessage::new();
 
     for addr in args.split_whitespace() {
@@ -810,41 +1040,32 @@ fn cmd_mail(args: &str, mb: &Mailbox, vars: &mut Variables) -> Result<CommandRes
         }
     }
 
-    // Prompt for subject if needed
-    if io::stdin().is_terminal() && vars.get_bool("asksub") {
-        print!("Subject: ");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-
-        let mut subject = String::new();
-        io::stdin()
-            .read_line(&mut subject)
-            .map_err(|e| e.to_string())?;
-        composed.subject = subject.trim().to_string();
+    // `mail` prompts for the same optional headers Send Mode does; its own
+    // copy of this asked only for the subject, so `askcc`/`askbcc` were
+    // silently ignored here.
+    if io::stdin().is_terminal() {
+        crate::send::prompt_optional_headers(&mut composed, vars)?;
     }
 
-    compose_message(&mut composed, mb, vars)?;
+    compose_body(&mut composed, Some(mb), vars)?;
     send_message(&composed, vars, false)?;
 
     Ok(CommandResult::Continue)
 }
 
-fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+fn cmd_mbox(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104853).
     if !mb.is_system_mailbox {
         return Err("mbox: Allowed only in the system mailbox".to_string());
     }
 
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
             // Force the message to the secondary mbox at quit, overriding a set
             // `hold` variable; this also clears any preserve mark.
-            m.state = MessageState::Read;
+            m.read = ReadState::Read;
             m.force_mbox = true;
         }
     }
@@ -852,9 +1073,9 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
     Ok(CommandResult::Continue)
 }
 
-fn cmd_next(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_next(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     if !args.is_empty() {
-        let msg_num = parse_message(args, mb)?;
+        let msg_num = parse_message(args, mb, vars)?;
         mb.current = msg_num;
     }
 
@@ -873,7 +1094,7 @@ fn cmd_next(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
     cmd_print("", mb, vars, false)
 }
 
-fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Parse: [msglist] command
     let (msg_nums, cmd) = if args.is_empty() {
         (
@@ -888,14 +1109,14 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
 
         for i in 0..words.len() {
             let potential_msglist = words[..=i].join(" ");
-            if parse_msglist(&potential_msglist, mb, false).is_ok() {
+            if parse_msglist(&potential_msglist, mb, false, vars).is_ok() {
                 msglist_end = i + 1;
             }
         }
 
         if msglist_end == 0 || msglist_end >= words.len() {
             // All command or all msglist
-            if let Ok(nums) = parse_msglist(args, mb, false) {
+            if let Ok(nums) = parse_msglist(args, mb, false, vars) {
                 (
                     nums,
                     vars.get("cmd").ok_or("No command specified")?.to_string(),
@@ -906,7 +1127,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
         } else {
             let msglist = words[..msglist_end].join(" ");
             let cmd = words[msglist_end..].join(" ");
-            let nums = parse_msglist(&msglist, mb, false)?;
+            let nums = parse_msglist(&msglist, mb, false, vars)?;
             (nums, cmd)
         }
     };
@@ -925,8 +1146,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
                 .map_err(|e| e.to_string())?;
 
             if let Some(stdin) = child.stdin.as_mut() {
-                let content =
-                    msg.format_display(false, &vars.ignored_headers, &vars.retained_headers);
+                let content = msg.format_display(false, vars);
                 stdin
                     .write_all(content.as_bytes())
                     .map_err(|e| e.to_string())?;
@@ -939,15 +1159,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
         }
     }
 
-    // Mark as read
-    for num in &msg_nums {
-        if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Read;
-        }
-    }
-    if let Some(&last) = msg_nums.last() {
-        mb.current = last;
-    }
+    mark_read(mb, &msg_nums);
 
     Ok(CommandResult::Continue)
 }
@@ -955,60 +1167,21 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
 fn cmd_print(
     args: &str,
     mb: &mut Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
     show_all_headers: bool,
 ) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
-
-    let crt = vars.get_number("crt");
-    let pager = vars.get("PAGER").unwrap_or("more");
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in &msg_nums {
         if let Some(msg) = mb.get(*num) {
-            let content = if show_all_headers {
-                msg.format_display(true, &[], &[])
-            } else {
-                msg.format_display(false, &vars.ignored_headers, &vars.retained_headers)
-            };
-
-            // Check if we need to page (only when stdout is a terminal, spec
-            // 104362-104367).
-            if let Some(crt_lines) = crt {
-                if io::stdout().is_terminal() && content.lines().count() > crt_lines as usize {
-                    // Use pager
-                    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
-                    let mut child = std::process::Command::new(shell)
-                        .arg("-c")
-                        .arg("--")
-                        .arg(pager)
-                        .stdin(std::process::Stdio::piped())
-                        .spawn()
-                        .map_err(|e| e.to_string())?;
-
-                    if let Some(stdin) = child.stdin.as_mut() {
-                        stdin
-                            .write_all(content.as_bytes())
-                            .map_err(|e| e.to_string())?;
-                    }
-
-                    child.wait().map_err(|e| e.to_string())?;
-                } else {
-                    print!("{}", content);
-                }
-            } else {
-                print!("{}", content);
-            }
+            crate::util::page_or_print(&msg.format_display(show_all_headers, vars), vars);
         }
     }
 
     // Mark as read and update current
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Read;
+            m.read = ReadState::Read;
             m.displayed = true;
         }
     }
@@ -1025,24 +1198,20 @@ fn cmd_reply(
     vars: &mut Variables,
     reply_to_all: bool,
 ) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for &num in &msg_nums {
         let original = mb.get(num).ok_or("No message")?;
         let mut composed = compose_reply(original, reply_to_all, vars);
 
-        compose_message(&mut composed, mb, vars)?;
+        compose_body(&mut composed, Some(mb), vars)?;
         send_message(&composed, vars, false)?;
     }
 
     // Mark as read
     for &num in &msg_nums {
         if let Some(m) = mb.get_mut(num) {
-            m.state = MessageState::Read;
+            m.read = ReadState::Read;
         }
     }
     if let Some(&last) = msg_nums.last() {
@@ -1067,113 +1236,21 @@ fn cmd_retain(args: &str, vars: &mut Variables) -> Result<CommandResult, String>
     Ok(CommandResult::Continue)
 }
 
-fn cmd_retain_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for header in args.split_whitespace() {
-        if !vars.retained_headers.contains(&header.to_string()) {
-            vars.retained_headers.push(header.to_string());
-        }
-    }
-    Ok(())
-}
-
 fn cmd_save(
     args: &str,
     mb: &mut Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
     mark_saved: bool,
 ) -> Result<CommandResult, String> {
-    // Parse arguments: [msglist] [file]
-    let parts: Vec<&str> = args.split_whitespace().collect();
-
-    let (msg_nums, filename) = if parts.is_empty() {
-        // Save current to mbox
-        let mbox = vars.get("MBOX").map(|s| s.to_string()).unwrap_or_else(|| {
-            let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            format!("{}/mbox", home)
-        });
-        (vec![mb.current], mbox)
-    } else if parts.len() == 1 {
-        // Could be msglist or file
-        if let Ok(nums) = parse_msglist(parts[0], mb, false) {
-            // It's a msglist, save to mbox
-            let mbox = vars.get("MBOX").map(|s| s.to_string()).unwrap_or_else(|| {
-                let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                format!("{}/mbox", home)
-            });
-            (nums, mbox)
-        } else {
-            // It's a file
-            (vec![mb.current], expand_filename(parts[0], vars))
-        }
-    } else {
-        let file = parts.last().unwrap();
-        let msglist = parts[..parts.len() - 1].join(" ");
-        let nums = parse_msglist(&msglist, mb, false)?;
-        (nums, expand_filename(file, vars))
-    };
+    let (msg_nums, filename) = msglist_and_file(args, mb, vars, false)?;
 
     mb.save_messages(&msg_nums, &filename, true)?;
 
     if mark_saved {
-        for num in &msg_nums {
-            if let Some(m) = mb.get_mut(*num) {
-                m.state = MessageState::Saved;
-            }
-        }
-        mb.modified = true;
+        mark_messages_saved(mb, &msg_nums);
     }
 
-    let total_size: usize = msg_nums
-        .iter()
-        .filter_map(|&n| mb.get(n))
-        .map(|m| m.size())
-        .sum();
-    println!(
-        "\"{}\" {} messages {} bytes",
-        filename,
-        msg_nums.len(),
-        total_size
-    );
-
-    Ok(CommandResult::Continue)
-}
-
-fn cmd_save_author(
-    args: &str,
-    mb: &mut Mailbox,
-    vars: &Variables,
-) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
-
-    if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
-        let filename = extract_login(first_msg.from());
-        let filename = expand_filename(filename, vars);
-
-        mb.save_messages(&msg_nums, &filename, true)?;
-
-        for num in &msg_nums {
-            if let Some(m) = mb.get_mut(*num) {
-                m.state = MessageState::Saved;
-            }
-        }
-        mb.modified = true;
-
-        let total_size: usize = msg_nums
-            .iter()
-            .filter_map(|&n| mb.get(n))
-            .map(|m| m.size())
-            .sum();
-        println!(
-            "\"{}\" {} messages {} bytes",
-            filename,
-            msg_nums.len(),
-            total_size
-        );
-    }
+    report_written(mb, &msg_nums, &filename);
 
     Ok(CommandResult::Continue)
 }
@@ -1184,61 +1261,82 @@ pub(crate) fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult,
         return Ok(CommandResult::Continue);
     }
 
-    for arg in args.split_whitespace() {
-        if arg.starts_with("no") && !arg.contains('=') {
-            vars.unset(&arg[2..]);
+    for arg in split_args(args) {
+        if let Some(name) = variable_being_cleared(&arg, vars) {
+            let name = name.to_string();
+            vars.unset(&name);
+            continue;
+        }
+        let (name, value) = parse_set_arg(&arg);
+        // Reject onehop - we permanently operate in noonehop mode
+        if name == "onehop" {
+            return Err("onehop is not supported; operating in noonehop mode".to_string());
+        }
+        if let Some(val) = value {
+            vars.set(name, val);
         } else {
-            let (name, value) = parse_set_arg(arg);
-            // Reject onehop - we permanently operate in noonehop mode
-            if name == "onehop" {
-                return Err("onehop is not supported; operating in noonehop mode".to_string());
-            }
-            if let Some(val) = value {
-                vars.set(name, val);
-            } else {
-                vars.set_bool(name, true);
-            }
+            vars.set_bool(name, true);
         }
     }
 
     Ok(CommandResult::Continue)
 }
 
-fn cmd_set_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for arg in args.split_whitespace() {
-        if arg.starts_with("no") && !arg.contains('=') {
-            vars.unset(&arg[2..]);
-        } else {
-            let (name, value) = parse_set_arg(arg);
-            // Silently skip onehop - we permanently operate in noonehop mode
-            if name == "onehop" {
-                continue;
-            }
-            if let Some(val) = value {
-                vars.set(name, val);
-            } else {
-                vars.set_bool(name, true);
-            }
-        }
+/// The variable `arg` clears, if it is a `noname` form (spec 104963-104966).
+///
+/// `no` is stripped when what follows names a variable that is currently set,
+/// or one of the internal booleans mailx knows about even when unset. Stripping
+/// it from any name merely beginning with those two letters turned `set notify`
+/// into `unset tify`; requiring the remainder to be a *known* boolean was the
+/// opposite mistake, and stopped `set nocrt` and every user-defined variable
+/// from being cleared at all.
+fn variable_being_cleared<'a>(arg: &'a str, vars: &Variables) -> Option<&'a str> {
+    if arg.contains('=') {
+        return None;
     }
-    Ok(())
+    let rest = arg.strip_prefix("no")?;
+    (BOOLEAN_VARIABLES.contains(&rest) || vars.is_set(rest)).then_some(rest)
 }
+
+/// The internal variables that hold a boolean value (spec 104568-104681).
+const BOOLEAN_VARIABLES: &[&str] = &[
+    "allnet",
+    "append",
+    "ask",
+    "askbcc",
+    "askcc",
+    "asksub",
+    "autoprint",
+    "bang",
+    "debug",
+    "dot",
+    "flipr",
+    "header",
+    "hold",
+    "ignore",
+    "ignoreeof",
+    "keep",
+    "keepsave",
+    "metoo",
+    "onehop",
+    "outfolder",
+    "page",
+    "quiet",
+    "save",
+    "sendwait",
+    "showto",
+    "verbose",
+];
 
 fn cmd_shell(cmd: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     // Expand ! to previous command if bang is set
     let cmd = if vars.get_bool("bang") {
-        expand_bang(cmd, vars.last_shell_cmd.as_deref())
+        crate::util::expand_bang(cmd, vars.last_shell_cmd.as_deref())
     } else {
         cmd.to_string()
     };
 
-    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
-    Command::new(shell)
-        .arg("-c")
-        .arg("--")
-        .arg(&cmd)
-        .status()
-        .map_err(|e| e.to_string())?;
+    crate::util::shell(&cmd, vars)?;
 
     // Save as last command
     vars.last_shell_cmd = Some(cmd);
@@ -1247,46 +1345,14 @@ fn cmd_shell(cmd: &str, vars: &mut Variables) -> Result<CommandResult, String> {
     Ok(CommandResult::Continue)
 }
 
-/// Expand unescaped ! to the previous command
-fn expand_bang(cmd: &str, prev: Option<&str>) -> String {
-    let prev = prev.unwrap_or("");
-    let mut result = String::new();
-    let mut chars = cmd.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            // Escaped character
-            if let Some(&next) = chars.peek() {
-                if next == '!' {
-                    result.push('!');
-                    chars.next();
-                    continue;
-                }
-            }
-            result.push(c);
-        } else if c == '!' {
-            // Expand to previous command
-            result.push_str(prev);
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-fn cmd_shell_interactive(vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_shell_interactive(vars: &mut Variables) -> Result<CommandResult, String> {
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     Command::new(shell).status().map_err(|e| e.to_string())?;
     Ok(CommandResult::Continue)
 }
 
-fn cmd_size(args: &str, mb: &Mailbox) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+fn cmd_size(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in msg_nums {
         if let Some(msg) = mb.get(num) {
@@ -1297,41 +1363,40 @@ fn cmd_size(args: &str, mb: &Mailbox) -> Result<CommandResult, String> {
     Ok(CommandResult::Continue)
 }
 
-fn cmd_source(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+/// `source`: read commands from a file and return to command mode.
+///
+/// The file goes through the same interpreter as a start-up file, so its
+/// `if`/`else`/`endif` work. `source` used to call the start-up dispatcher
+/// directly, which recognized those words and did nothing with them -- a
+/// conditional in a sourced file was silently ignored.
+fn cmd_source(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let path = expand_filename(args.trim(), vars);
     let content = fs::read_to_string(&path).map_err(|e| format!("{}: {}", path, e))?;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if !line.is_empty() && !line.starts_with('#') {
-            if let Err(e) = execute_startup_command(line, vars) {
-                eprintln!("{}: {}", path, e);
-            }
-        }
-    }
-
+    run_script(&content, &path, mb, vars);
     Ok(CommandResult::Continue)
 }
 
-fn cmd_source_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    let path = expand_filename(args.trim(), vars);
-    if let Ok(content) = fs::read_to_string(&path) {
-        for line in content.lines() {
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with('#') {
-                execute_startup_command(line, vars)?;
-            }
+/// Run every line of `content` as a start-up script.
+///
+/// Errors are reported and the script continues, which is one of the two
+/// behaviors spec 104559-104561 permits. An unterminated `if` is diagnosed at
+/// the end and the conditional stack is reset, so a malformed file cannot leave
+/// the rest of the session suppressed.
+pub fn run_script(content: &str, path: &str, mb: &mut Mailbox, vars: &mut Variables) {
+    let depth = vars.cond_stack.len();
+    for line in content.lines() {
+        if let Err(e) = execute_in(line, mb, vars, Context::Startup) {
+            eprintln!("mailx: {}: {}", path, e);
         }
     }
-    Ok(())
+    if vars.cond_stack.len() > depth {
+        eprintln!("mailx: {}: missing endif", path);
+        vars.cond_stack.truncate(depth);
+    }
 }
 
-fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+fn cmd_top(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     let toplines = vars.get_number("toplines").unwrap_or(5) as usize;
 
@@ -1353,37 +1418,25 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResu
         }
     }
 
-    // Mark as read
-    for num in &msg_nums {
-        if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Read;
-        }
-    }
-    if let Some(&last) = msg_nums.last() {
-        mb.current = last;
-    }
+    mark_read(mb, &msg_nums);
 
     Ok(CommandResult::Continue)
 }
 
-fn cmd_touch(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
+fn cmd_touch(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     // Allowed only in the system mailbox (spec 104853, touch grouping).
     if !mb.is_system_mailbox {
         return Err("touch: Allowed only in the system mailbox".to_string());
     }
 
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
             // touch marks a message read so it moves to the mbox at quit,
             // overriding a set `hold` variable (grouped with mbox, spec 104627).
-            if m.state == MessageState::New || m.state == MessageState::Unread {
-                m.state = MessageState::Read;
+            if m.read == ReadState::New || m.read == ReadState::Unread {
+                m.read = ReadState::Read;
             }
             m.force_mbox = true;
         }
@@ -1399,7 +1452,11 @@ fn cmd_unalias(args: &str, vars: &mut Variables) -> Result<CommandResult, String
     Ok(CommandResult::Continue)
 }
 
-fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_undelete(
+    args: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+) -> Result<CommandResult, String> {
     let msg_nums = if args.is_empty() {
         // Find deleted message
         if let Some(num) = mb.next_deleted(mb.current.saturating_sub(1)) {
@@ -1410,13 +1467,16 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<Comman
             return Err("No deleted messages".to_string());
         }
     } else {
-        parse_msglist(args, mb, true)?
+        parse_msglist(args, mb, true, vars)?
     };
 
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            if m.state == MessageState::Deleted {
-                m.state = MessageState::Read;
+            if m.disposition == Disposition::Deleted {
+                // Clear the deletion and leave the read state alone. Undeleting
+                // used to mark the message read, so a message that arrived new,
+                // was deleted, and was undeleted came back as already read.
+                m.disposition = Disposition::Keep;
             }
         }
     }
@@ -1439,55 +1499,17 @@ pub(crate) fn cmd_unset(args: &str, vars: &mut Variables) -> Result<CommandResul
     Ok(CommandResult::Continue)
 }
 
-fn cmd_unset_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
-    for name in args.split_whitespace() {
-        vars.unset(name);
-    }
-    Ok(())
-}
-
-fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false)?
-    };
+fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     let editor = vars.get("VISUAL").unwrap_or("vi");
-
-    for num in msg_nums {
-        if let Some(msg) = mb.get(num) {
-            let temp_path = format!("/tmp/mailx.{}.{}", std::process::id(), num);
-            fs::write(&temp_path, msg.format_full()).map_err(|e| e.to_string())?;
-
-            Command::new(editor)
-                .arg(&temp_path)
-                .status()
-                .map_err(|e| e.to_string())?;
-
-            let _ = fs::remove_file(&temp_path);
-        }
-    }
+    edit_messages(&msg_nums, mb, editor)?;
 
     Ok(CommandResult::Continue)
 }
 
-fn cmd_write(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
-    // Parse arguments: [msglist] file
-    let parts: Vec<&str> = args.split_whitespace().collect();
-
-    if parts.is_empty() {
-        return Err("No file specified".to_string());
-    }
-
-    let (msg_nums, filename) = if parts.len() == 1 {
-        (vec![mb.current], expand_filename(parts[0], vars))
-    } else {
-        let file = parts.last().unwrap();
-        let msglist = parts[..parts.len() - 1].join(" ");
-        let nums = parse_msglist(&msglist, mb, false)?;
-        (nums, expand_filename(file, vars))
-    };
+fn cmd_write(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+    let (msg_nums, filename) = msglist_and_file(args, mb, vars, true)?;
 
     // Write without headers
     let mut file = fs::OpenOptions::new()
@@ -1505,12 +1527,7 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRe
         }
     }
 
-    for num in &msg_nums {
-        if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Saved;
-        }
-    }
-    mb.modified = true;
+    mark_messages_saved(mb, &msg_nums);
 
     println!(
         "\"{}\" {} messages {} bytes",
@@ -1522,8 +1539,8 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRe
     Ok(CommandResult::Continue)
 }
 
-fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult, String> {
-    let screen = vars.get_number("screen").unwrap_or(20) as usize;
+fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
+    let screen = vars.screen_lines().get();
     let direction = if args.starts_with('-') { -1i32 } else { 1 };
 
     let current_page = (mb.current.saturating_sub(1)) / screen;
@@ -1553,50 +1570,57 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandR
 
 // ============ Helper functions ============
 
+/// Resolve a filename typed in command mode.
+///
+/// POSIX applies two transformations in sequence (spec 104704-104711): a
+/// leading unquoted `+` becomes the `folder` variable and a slash, then shell
+/// word expansion. mailx's own `%`, `%user`, and `&` notations are resolved
+/// first; `#` needs the previous folder, so `cmd_file` handles it.
+///
+/// Only one pathname may result. The old expansion interpolated the name into
+/// `sh -c "printf '%s' <name>"` unquoted and joined whatever came back, so
+/// `my file.txt` silently became `myfile.txt`; a name the shell could not parse
+/// fell back to itself with no diagnostic.
 fn expand_filename(name: &str, vars: &Variables) -> String {
-    let name = name.trim();
-
-    if let Some(rest) = name.strip_prefix('+') {
-        if let Some(folder) = vars.get("folder") {
-            let folder = if folder.starts_with('/') {
-                folder.to_string()
-            } else {
-                let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                format!("{}/{}", home, folder)
-            };
-            return format!("{}/{}", folder, rest);
-        }
-    }
-
-    if let Some(rest) = name.strip_prefix('~') {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        return format!("{}{}", home, rest);
-    }
-
-    name.to_string()
+    let expanded = expand_local_prefixes(name, vars);
+    shell_expand(&expanded, vars).unwrap_or(expanded)
 }
 
-fn expand_folder_name(name: &str, vars: &Variables) -> String {
-    match name {
-        "%" => {
-            let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-            format!("/var/mail/{}", user)
-        }
-        "&" => vars.get("MBOX").map(|s| s.to_string()).unwrap_or_else(|| {
-            let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            format!("{}/mbox", home)
-        }),
-        // `#` (previous folder) is resolved by cmd_file, which has the prior
-        // path; reaching here means there was none.
-        "#" => name.to_string(),
-        _ => {
-            if let Some(user) = name.strip_prefix('%') {
-                format!("/var/mail/{}", user)
-            } else {
-                expand_filename(name, vars)
-            }
-        }
+/// Resolve a filename derived from message content, without the shell.
+///
+/// `Save`, `Copy`, `followup`, and `Followup` name their file after the
+/// message author. That name is attacker-controlled, so it gets the `+folder`
+/// and `%`/`&` notations that are mailx's own, and stops there -- the shell
+/// word expansion POSIX applies to a *typed* filename (spec 104709) would make
+/// a `From:` header a command line.
+fn expand_author_filename(name: &str, vars: &Variables) -> String {
+    expand_local_prefixes(name, vars)
+}
+
+/// Apply shell word expansion to a filename, requiring a single result.
+///
+/// `printf '%s\n'` puts each resulting word on its own line, so a name that
+/// expands to several pathnames can be recognized rather than silently
+/// concatenated. Returns `None` when the name is left as typed.
+fn shell_expand(name: &str, vars: &Variables) -> Option<String> {
+    // The word is interpolated into a shell command, so this must only ever be
+    // reached for a name the user typed. A filename derived from message
+    // content goes through `expand_author_filename`, which stops short of the
+    // shell.
+    // Nothing to expand: no shell metacharacter, no `~`, no variable.
+    if !name.contains(['~', '$', '*', '?', '[', '`', '"', '\'', '\\']) {
+        return None;
     }
+
+    let out = crate::util::shell_output(&format!("printf '%s\\n' {}", name), vars).ok()?;
+    let mut words = out.lines();
+    let first = words.next()?;
+    if words.next().is_some() {
+        // More than one pathname where one is expected: effects are unspecified
+        // (spec 104710-104711), so leave the name alone rather than guess.
+        return None;
+    }
+    Some(first.to_string())
 }
 
 /// Handle a `SIGINT` received while composing a message in input mode.
@@ -1625,9 +1649,16 @@ pub(crate) fn interrupt_message(
     false
 }
 
-fn compose_message(
+/// Read a message body from standard input, handling command escapes.
+///
+/// Shared by every entry into input mode: `mail`, `reply`, `followup`, and Send
+/// Mode. There were two copies of this loop, and they had diverged -- the one
+/// used by `mail`/`reply`/`followup` ignored the escape result's request to
+/// save the partial message, so `~q` from those commands never wrote
+/// `dead.letter` although `~q` in Send Mode did.
+pub(crate) fn compose_body(
     composed: &mut ComposedMessage,
-    mb: &Mailbox,
+    mb: Option<&Mailbox>,
     vars: &mut Variables,
 ) -> Result<(), String> {
     let escape_char = vars.escape_char();
@@ -1671,7 +1702,7 @@ fn compose_message(
         {
             // A tilde-escape error is diagnosed but does not abort the message
             // (spec 105114-105119).
-            let result = match handle_escape(&line[ec.len_utf8()..], composed, vars, Some(mb)) {
+            let result = match handle_escape(&line[ec.len_utf8()..], composed, vars, mb) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("{}", e);
@@ -1680,6 +1711,12 @@ fn compose_message(
             };
             if result.done {
                 if result.abort {
+                    // `~q` saves the partial message, `~x` does not
+                    // (spec 105081-105083, 105097).
+                    if result.save_dead_letter && vars.get_bool("save") && !composed.body.is_empty()
+                    {
+                        crate::send::save_dead_letter(composed, vars);
+                    }
                     return Err("Aborted".to_string());
                 }
                 break;
@@ -1694,27 +1731,6 @@ fn compose_message(
 
         composed.body.push_str(&line);
     }
-
-    Ok(())
-}
-
-fn record_to_file(msg: &ComposedMessage, path: &str) -> Result<(), String> {
-    let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
-    let from_line = format!("From {} {}", user, date);
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("{}: {}", path, e))?;
-
-    writeln!(file, "{}", from_line).map_err(|e| e.to_string())?;
-    write!(file, "{}", msg.format()).map_err(|e| e.to_string())?;
-    if !msg.body.ends_with('\n') {
-        writeln!(file).map_err(|e| e.to_string())?;
-    }
-    writeln!(file).map_err(|e| e.to_string())?;
 
     Ok(())
 }

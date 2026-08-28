@@ -15,6 +15,7 @@ mod message;
 mod msglist;
 mod send;
 mod signals;
+mod util;
 mod variables;
 
 use std::env;
@@ -115,7 +116,7 @@ fn run_receive_mode(args: &Args) -> i32 {
     load_startup_files(&mut vars, RcMode::Receive, args.no_init);
 
     let mailbox_path = if args.read_mbox {
-        args.file.clone().unwrap_or_else(get_mbox_path)
+        args.file.clone().unwrap_or_else(|| util::mbox_path(&vars))
     } else {
         args.file.clone().unwrap_or_else(get_system_mailbox)
     };
@@ -285,107 +286,48 @@ enum RcMode {
 }
 
 fn load_rc_content(content: &str, path: &str, vars: &mut Variables, mode: RcMode) {
-    // Stack to track conditional state: (condition_matches, in_else_branch)
-    let mut cond_stack: Vec<(bool, bool)> = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Parse the command
-        let (cmd, args) = if let Some(pos) = line.find(char::is_whitespace) {
-            (&line[..pos], line[pos..].trim())
-        } else {
-            (line, "")
-        };
-        let cmd_lower = cmd.to_lowercase();
-
-        // Handle if/else/endif
-        match cmd_lower.as_str() {
-            "i" | "if" => {
-                // `if s` for send mode, `if r` for receive mode
-                let arg = args.trim().to_lowercase();
-                let condition_matches = match arg.as_str() {
-                    "s" => mode == RcMode::Send,
-                    "r" => mode == RcMode::Receive,
-                    _ => false, // Unknown condition, treat as false
-                };
-                cond_stack.push((condition_matches, false));
-                continue;
-            }
-            "el" | "els" | "else" => {
-                if let Some((matches, in_else)) = cond_stack.pop() {
-                    // Toggle the condition for else branch
-                    cond_stack.push((!matches, true));
-                    if in_else {
-                        // Nested else without endif - error but continue
-                        eprintln!("mailx: {}: unexpected else", path);
-                    }
-                }
-                continue;
-            }
-            "en" | "end" | "endi" | "endif" => {
-                if cond_stack.pop().is_none() {
-                    eprintln!("mailx: {}: unexpected endif", path);
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        // Check if we should execute this command
-        let should_execute = cond_stack.iter().all(|(matches, _)| *matches);
-        if !should_execute {
-            continue;
-        }
-
-        // Execute command
-        if let Err(e) = commands::execute_startup_command(line, vars) {
-            eprintln!("mailx: {}: {}", path, e);
-        }
-    }
-
-    // Warn about unclosed conditionals
-    if !cond_stack.is_empty() {
-        eprintln!("mailx: {}: missing endif", path);
-    }
+    // `if s` / `if r` ask which mode mailx is running in; the interpreter reads
+    // it from here rather than from a parameter only this path could supply.
+    vars.send_mode = mode == RcMode::Send;
+    // Start-up files have no message store. Commands that need one are excluded
+    // by their context mask, so this scratch mailbox is never read from.
+    let mut scratch = Mailbox::new(String::new());
+    commands::run_script(content, path, &mut scratch, vars);
 }
 
 fn get_system_mailbox() -> String {
-    // Check MAIL environment variable first (common extension)
+    // MAIL names the mailbox outright when it is set (a widely relied-on
+    // extension); otherwise the spool is searched.
     if let Ok(mail) = env::var("MAIL") {
         return mail;
     }
-
-    let user = get_user();
-    // Try common mailbox locations
-    let paths = [
-        format!("/var/mail/{}", user),
-        format!("/var/spool/mail/{}", user),
-        format!("/usr/spool/mail/{}", user),
-    ];
-
-    for path in &paths {
-        if std::path::Path::new(path).exists() {
-            return path.clone();
-        }
-    }
-
-    // Default to /var/mail/user
-    paths[0].clone()
-}
-
-fn get_mbox_path() -> String {
-    env::var("MBOX").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/mbox", home)
-    })
+    util::spool_path(&get_user())
 }
 
 fn get_user() -> String {
-    env::var("USER")
-        .or_else(|_| env::var("LOGNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    user_login_or("unknown")
+}
+
+/// The login name of the user running mailx, or an empty string if unknown.
+///
+/// `USER` may be present but empty, which is not a login name; treat it the
+/// same as absent rather than letting "" stand in for the user's identity.
+pub fn user_login() -> String {
+    user_login_or("")
+}
+
+/// The login name, or `unknown` when the environment does not say.
+pub fn user_login_or_unknown() -> String {
+    user_login_or("unknown")
+}
+
+fn user_login_or(fallback: &str) -> String {
+    for var in ["USER", "LOGNAME"] {
+        if let Ok(v) = env::var(var) {
+            if !v.trim().is_empty() {
+                return v;
+            }
+        }
+    }
+    fallback.to_string()
 }

@@ -15,7 +15,6 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 use crate::args::Args;
-use crate::escapes::handle_escape;
 use crate::message::Message;
 use crate::variables::Variables;
 
@@ -89,6 +88,34 @@ impl ComposedMessage {
     }
 }
 
+/// Prompt for the header fields the `asksub`, `askcc`, and `askbcc` variables
+/// request (spec 104582-104583, and the askcc/askbcc entries).
+pub(crate) fn prompt_optional_headers(
+    msg: &mut ComposedMessage,
+    vars: &Variables,
+) -> Result<(), String> {
+    if msg.subject.is_empty() && vars.get_bool("asksub") {
+        if let Some(v) = crate::util::prompt_field("Subject", "")? {
+            msg.subject = v;
+        }
+    }
+    if vars.get_bool("askcc") {
+        if let Some(v) = crate::util::prompt_field("Cc", "")? {
+            for addr in crate::util::addresses(&v) {
+                msg.add_cc(addr);
+            }
+        }
+    }
+    if vars.get_bool("askbcc") {
+        if let Some(v) = crate::util::prompt_field("Bcc", "")? {
+            for addr in crate::util::addresses(&v) {
+                msg.add_bcc(addr);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run send mode
 pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
     let is_tty = io::stdin().is_terminal();
@@ -108,129 +135,20 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
         }
     }
 
-    // Add subject from command line
+    // A -s subject supplies the Subject header; otherwise `asksub` may prompt
+    // for it. `askcc`/`askbcc` are asked either way.
     if let Some(ref subject) = args.subject {
         msg.subject = subject.clone();
-    } else if is_tty && vars.get_bool("asksub") {
-        // Prompt for subject
-        print!("Subject: ");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-
-        let mut subject = String::new();
-        io::stdin()
-            .read_line(&mut subject)
-            .map_err(|e| e.to_string())?;
-        msg.subject = subject.trim().to_string();
     }
-
-    // Prompt for Cc if askcc is set
-    if is_tty && vars.get_bool("askcc") {
-        print!("Cc: ");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-
-        let mut cc = String::new();
-        io::stdin().read_line(&mut cc).map_err(|e| e.to_string())?;
-        for addr in cc.split(',') {
-            let addr = addr.trim();
-            if !addr.is_empty() {
-                msg.add_cc(addr);
-            }
-        }
-    }
-
-    // Prompt for Bcc if askbcc is set
-    if is_tty && vars.get_bool("askbcc") {
-        print!("Bcc: ");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-
-        let mut bcc = String::new();
-        io::stdin().read_line(&mut bcc).map_err(|e| e.to_string())?;
-        for addr in bcc.split(',') {
-            let addr = addr.trim();
-            if !addr.is_empty() {
-                msg.add_bcc(addr);
-            }
-        }
+    if is_tty {
+        prompt_optional_headers(&mut msg, vars)?;
     }
 
     // Read message body
     let stdin = io::stdin();
-    let escape_char = vars.escape_char();
-    let mut interrupt_count = 0;
 
     if is_tty {
-        // Interactive mode - handle escapes
-        loop {
-            let mut line = String::new();
-            match crate::signals::read_line_interruptible(&mut line) {
-                Ok(0) => {
-                    // EOF - if ignoreeof is set, ignore it
-                    if vars.get_bool("ignoreeof") {
-                        println!("Use \".\" to terminate letter.");
-                        continue;
-                    }
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::Interrupted {
-                        crate::signals::take_sigint();
-                        if crate::commands::interrupt_message(&msg, vars, &mut interrupt_count) {
-                            return Err("Interrupt".to_string());
-                        }
-                        continue;
-                    }
-                    return Err(e.to_string());
-                }
-            }
-
-            // A SIGINT may have arrived between reads.
-            if crate::signals::take_sigint()
-                && crate::commands::interrupt_message(&msg, vars, &mut interrupt_count)
-            {
-                return Err("Interrupt".to_string());
-            }
-
-            interrupt_count = 0;
-
-            // Check for escape character (disabled when `escape` is null).
-            // Slice past the escape char by its UTF-8 length so a multibyte
-            // escape does not split a character boundary.
-            if let Some(ec) =
-                escape_char.filter(|ec| line.starts_with(*ec) && line.len() > ec.len_utf8())
-            {
-                // A tilde-escape error is diagnosed but does not abort the
-                // message (spec 105114-105119).
-                let result = match handle_escape(&line[ec.len_utf8()..], &mut msg, vars, None) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        continue;
-                    }
-                };
-                if result.done {
-                    if result.abort {
-                        // Only save to dead letter if the escape requested it (~q)
-                        // The ~x escape does NOT save to dead letter
-                        if result.save_dead_letter && vars.get_bool("save") && !msg.body.is_empty()
-                        {
-                            save_dead_letter(&msg, vars);
-                        }
-                        return Err("Aborted".to_string());
-                    }
-                    break;
-                }
-                continue;
-            }
-
-            // Check for single period (if dot is set, or ignoreeof forces it)
-            if (vars.get_bool("dot") || vars.get_bool("ignoreeof")) && line.trim() == "." {
-                break;
-            }
-
-            // Add to body
-            msg.body.push_str(&line);
-        }
+        crate::commands::compose_body(&mut msg, None, vars)?;
     } else {
         // Non-interactive - just read stdin
         for line in stdin.lock().lines() {
@@ -265,12 +183,23 @@ pub fn send_message(
     // Debug mode - don't actually send, just print diagnostics
     if vars.get_bool("debug") {
         eprintln!("--- Debug mode: message not sent ---");
+        // The envelope is what the delivery software is handed; the headers are
+        // what the recipients see. Blind recipients appear in the first and not
+        // the second, so the two are reported separately.
+        eprintln!(
+            "Envelope: {}",
+            msg.all_recipients()
+                .into_iter()
+                .map(crate::message::extract_address)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         eprintln!("To: {}", msg.to.join(", "));
         if !msg.cc.is_empty() {
             eprintln!("Cc: {}", msg.cc.join(", "));
         }
         if !msg.bcc.is_empty() {
-            eprintln!("Bcc: {}", msg.bcc.join(", "));
+            eprintln!("Bcc(envelope only): {}", msg.bcc.join(", "));
         }
         eprintln!("Subject: {}", msg.subject);
         eprintln!("Body: {} bytes", msg.body.len());
@@ -290,9 +219,29 @@ pub fn send_message(
         .find(|p| std::path::Path::new(p).exists())
         .ok_or("Cannot find sendmail")?;
 
+    // Name the recipients on the command line rather than asking sendmail to
+    // read them from the headers with `-t`. `format()` deliberately emits no
+    // `Bcc:` header, so under `-t` the blind recipients were simply never
+    // delivered to; naming them here also means a blind address cannot leak
+    // into the delivered message however the mail system is configured.
+    // Envelope operands are bare addresses. `compose_reply` fills the recipient
+    // lists from header values, so they carry display names -- and a display
+    // name containing a comma or a quote is not something to hand an MTA as a
+    // recipient.
+    let recipients: Vec<&str> = msg
+        .all_recipients()
+        .into_iter()
+        .map(crate::message::extract_address)
+        .filter(|a| !a.is_empty())
+        .collect();
+    if recipients.is_empty() {
+        return Err("No recipients specified".to_string());
+    }
+
     let mut cmd = Command::new(sendmail);
-    cmd.arg("-t") // Read recipients from headers
-        .arg("-oi") // Don't treat . as end of message
+    cmd.arg("-oi") // Don't treat . as end of message
+        .arg("--")
+        .args(&recipients)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -323,7 +272,7 @@ pub fn send_message(
     // Record the message if requested
     if record_to_recipient {
         if let Some(first_to) = msg.to.first() {
-            let filename = crate::message::extract_login(first_to);
+            let filename = crate::message::author_filename(first_to)?;
             record_message(msg, filename, vars)?;
         }
     } else if let Some(record_file) = vars.get("record") {
@@ -334,7 +283,19 @@ pub fn send_message(
 }
 
 /// Record a sent message to a file
-fn record_message(msg: &ComposedMessage, filename: &str, vars: &Variables) -> Result<(), String> {
+/// Append an outgoing message to a record file, in mbox format.
+///
+/// `record`, and the author-named file `followup` writes, are ordinary
+/// mailboxes that get read back with `mailx -f`. They are written through the
+/// same `From `-quoting and separator rules as any other mailbox: writing the
+/// body verbatim meant a composed line beginning `From ` split the entry in two
+/// on the next read, and a missing trailing empty line ran consecutive records
+/// together.
+pub(crate) fn record_message(
+    msg: &ComposedMessage,
+    filename: &str,
+    vars: &Variables,
+) -> Result<(), String> {
     let path = if vars.get_bool("outfolder") && !filename.starts_with('/') {
         if let Some(folder) = vars.get("folder") {
             let folder = expand_folder(folder);
@@ -347,9 +308,9 @@ fn record_message(msg: &ComposedMessage, filename: &str, vars: &Variables) -> Re
     };
 
     // Create "From " line
-    let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let user = crate::user_login();
+    let user = if user.is_empty() { "unknown" } else { &user };
     let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
-    let from_line = format!("From {} {}", user, date);
 
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -357,22 +318,34 @@ fn record_message(msg: &ComposedMessage, filename: &str, vars: &Variables) -> Re
         .open(&path)
         .map_err(|e| format!("Cannot open {}: {}", path, e))?;
 
-    writeln!(file, "{}", from_line).map_err(|e| e.to_string())?;
-    write!(file, "{}", msg.format()).map_err(|e| e.to_string())?;
-    if !msg.body.ends_with('\n') {
-        writeln!(file).map_err(|e| e.to_string())?;
-    }
-    writeln!(file).map_err(|e| e.to_string())?;
+    let write = || -> io::Result<()> {
+        let mut file = &file;
+        writeln!(file, "From {} {}", user, date)?;
+        let formatted = msg.format();
+        let (headers, body) = match formatted.split_once("\n\n") {
+            Some((h, b)) => (h, b),
+            None => (formatted.as_str(), ""),
+        };
+        writeln!(file, "{}", headers)?;
+        writeln!(file)?;
+        for line in body.lines() {
+            if crate::mailbox::needs_from_quoting(line) {
+                write!(file, ">")?;
+            }
+            writeln!(file, "{}", line)?;
+        }
+        writeln!(file)?;
+        Ok(())
+    };
+    write().map_err(|e| format!("{}: {}", path, e))?;
+    file.flush().map_err(|e| format!("{}: {}", path, e))?;
 
     Ok(())
 }
 
 /// Save message to dead letter file
 pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
-    let dead_path = vars.get("DEAD").map(|s| s.to_string()).unwrap_or_else(|| {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/dead.letter", home)
-    });
+    let dead_path = crate::util::dead_letter_path(vars);
 
     if let Ok(mut file) = File::create(&dead_path) {
         let _ = write!(file, "{}", msg.format());
@@ -415,9 +388,8 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
             msg.add_to(original.from());
         }
 
-        // Add all To: recipients
-        // If metoo is not set, exclude ourselves and our alternates
-        let user = env::var("USER").unwrap_or_default();
+        // Add all To: recipients.  Unless metoo is set, the user's own login
+        // and any declared alternates come out of the list (spec 104926-104928).
         let include_self = vars.get_bool("metoo");
 
         for addr in original.to().split(',') {
@@ -425,10 +397,7 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
             if addr.is_empty() {
                 continue;
             }
-            // Skip self unless metoo is set
-            if !include_self
-                && (addr.to_lowercase().contains(&user.to_lowercase()) || vars.is_alternate(addr))
-            {
+            if !include_self && vars.is_me(addr) {
                 continue;
             }
             msg.add_to(addr);
@@ -441,11 +410,7 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
                 if addr.is_empty() {
                     continue;
                 }
-                // Skip self unless metoo is set
-                if !include_self
-                    && (addr.to_lowercase().contains(&user.to_lowercase())
-                        || vars.is_alternate(addr))
-                {
+                if !include_self && vars.is_me(addr) {
                     continue;
                 }
                 msg.add_cc(addr);

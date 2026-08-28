@@ -12,26 +12,68 @@
 use std::collections::HashMap;
 
 /// Message state as defined by POSIX
+/// How much of a message the user has seen.
+///
+/// This is the axis the `Status:` header records and the `:n`/`:o`/`:r`/`:u`
+/// selectors ask about. It is deliberately separate from [`Disposition`]:
+/// folding both into one enum meant deleting, preserving, or saving a message
+/// erased the knowledge of whether it had been read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageState {
+pub enum ReadState {
+    /// Never seen in any session; no `Status:` header.
     New,
+    /// Seen in an earlier session but not read; `Status: O`.
     Unread,
+    /// Read; `Status: RO`.
     Read,
+}
+
+/// What should become of a message when the mailbox is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Nothing requested; the mailbox's own rules apply.
+    Keep,
+    /// Marked for deletion by `delete`.
     Deleted,
+    /// Held in place by `hold` or `preserve`.
     Preserved,
+    /// Written out by `save`, `Save`, or `write`.
     Saved,
 }
 
-impl MessageState {
-    pub fn status_char(&self) -> char {
+impl ReadState {
+    /// The `Status:` value recording this state, or `None` for a new message.
+    pub fn status_value(&self) -> Option<&'static str> {
         match self {
-            MessageState::New => 'N',
-            MessageState::Unread => 'U',
-            MessageState::Read => 'R',
-            MessageState::Deleted => 'D',
-            MessageState::Preserved => 'P',
-            MessageState::Saved => '*',
+            ReadState::New => None,
+            ReadState::Unread => Some("O"),
+            ReadState::Read => Some("RO"),
         }
+    }
+}
+
+impl Message {
+    /// The state character shown in a header summary.
+    ///
+    /// A requested disposition is what the user most needs to see, so it wins
+    /// over the read state rather than replacing it in the model.
+    pub fn status_char(&self) -> char {
+        match self.disposition {
+            Disposition::Deleted => 'D',
+            Disposition::Saved => '*',
+            Disposition::Preserved => 'P',
+            Disposition::Keep => match self.read {
+                ReadState::New => 'N',
+                ReadState::Unread => 'U',
+                ReadState::Read => 'R',
+            },
+        }
+    }
+
+    /// Whether the message is `old`: seen before, and not new or read
+    /// (spec 104540).
+    pub fn is_old(&self) -> bool {
+        self.read == ReadState::Unread
     }
 }
 
@@ -46,8 +88,10 @@ pub struct Message {
     pub header_lines: Vec<String>,
     /// Message body
     pub body: String,
-    /// Current state
-    pub state: MessageState,
+    /// How much of the message the user has seen.
+    pub read: ReadState,
+    /// What should become of it when the mailbox closes.
+    pub disposition: Disposition,
     /// Whether this message has been displayed
     pub displayed: bool,
     /// Set by the `mbox`/`touch` commands: force this message into the secondary
@@ -62,7 +106,8 @@ impl Message {
             headers: HashMap::new(),
             header_lines: Vec::new(),
             body: String::new(),
-            state: MessageState::New,
+            read: ReadState::New,
+            disposition: Disposition::Keep,
             displayed: false,
             force_mbox: false,
         }
@@ -105,12 +150,21 @@ impl Message {
     }
 
     /// Format the message for display with header filtering
+    /// Render the message for display.
+    ///
+    /// `show_all_headers` is the capitalized `Print`/`Type` form, which
+    /// overrides `discard`/`ignore`/`retain` (spec 104756). The three callers
+    /// each repeated the same choice of header lists; the choice belongs here.
     pub fn format_display(
         &self,
         show_all_headers: bool,
-        ignored: &[String],
-        retained: &[String],
+        vars: &crate::variables::Variables,
     ) -> String {
+        let (ignored, retained): (&[String], &[String]) = if show_all_headers {
+            (&[], &[])
+        } else {
+            (&vars.ignored_headers, &vars.retained_headers)
+        };
         let mut output = String::new();
 
         // Add headers
@@ -208,10 +262,13 @@ impl Message {
                 return truncate_display(name, 18);
             }
         }
-        // Try to extract name from "(Name)" format
+        // Try to extract name from "(Name)" format. The closing paren is
+        // searched for *after* the opening one; searching from the start of the
+        // string inverts the range whenever `)` precedes `(`, which panicked
+        // while printing the start-up header summary.
         if let Some(start) = from.find('(') {
-            if let Some(end) = from.find(')') {
-                let name = &from[start + 1..end];
+            if let Some(end) = from[start + 1..].find(')') {
+                let name = &from[start + 1..start + 1 + end];
                 if !name.is_empty() {
                     return truncate_display(name, 18);
                 }
@@ -239,10 +296,14 @@ pub(crate) fn truncate_display(s: &str, max_len: usize) -> String {
 }
 
 /// Extract email address from a string like "Name <email>" or just "email"
+///
+/// The closing bracket is searched for *after* the opening one. Searching from
+/// the start of the string inverted the range for any display name containing a
+/// `>` ahead of the `<`, e.g. `Bob >_< Smith <bob@example.com>`.
 pub fn extract_address(s: &str) -> &str {
     if let Some(start) = s.find('<') {
-        if let Some(end) = s.find('>') {
-            return &s[start + 1..end];
+        if let Some(end) = s[start + 1..].find('>') {
+            return &s[start + 1..start + 1 + end];
         }
     }
     s.trim()
@@ -256,4 +317,27 @@ pub fn extract_login(addr: &str) -> &str {
     } else {
         addr
     }
+}
+
+/// The login name of a message's author, usable as a filename component.
+///
+/// `Save`, `Copy`, `followup`, and `Followup` name a file after the author
+/// (spec 104958-104960), and the value comes straight out of a header the
+/// sender controls. It is checked against a conservative allow-list rather
+/// than a list of things to reject: a login is a login, and anything else --
+/// a path separator, a shell metacharacter, a leading `-` that would read as
+/// an option -- means the header is not naming one. Rejecting beats
+/// sanitizing, since a silently rewritten name is also a file the user did
+/// not ask for.
+pub fn author_filename(from: &str) -> Result<&str, String> {
+    let login = extract_login(from).trim();
+    let acceptable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+');
+    if login.is_empty()
+        || login.starts_with('-')
+        || login.starts_with('.')
+        || !login.chars().all(acceptable)
+    {
+        return Err(format!("{}: invalid author name", from));
+    }
+    Ok(login)
 }

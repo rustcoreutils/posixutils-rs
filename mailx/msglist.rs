@@ -11,12 +11,20 @@
 //! Handles the various message specification formats defined by POSIX
 
 use crate::mailbox::Mailbox;
-use crate::message::{extract_login, MessageState};
+use crate::message::{extract_login, Disposition, ReadState};
+use crate::variables::Variables;
 
 /// Parse a message list specification and return matching message numbers
-/// If allnet is true, address matching compares only the login part (before @)
-pub fn parse_msglist(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec<usize>, String> {
-    parse_msglist_with_opts(spec, mb, for_undelete, false)
+///
+/// When the `allnet` variable is set, address matching compares only the login
+/// part before the `@` (spec 104575-104577).
+pub fn parse_msglist(
+    spec: &str,
+    mb: &Mailbox,
+    for_undelete: bool,
+    vars: &Variables,
+) -> Result<Vec<usize>, String> {
+    parse_msglist_with_opts(spec, mb, for_undelete, vars.get_bool("allnet"))
 }
 
 fn parse_msglist_with_opts(
@@ -52,7 +60,7 @@ fn parse_msglist_with_opts(
     if !for_undelete {
         result.retain(|&n| {
             mb.get(n)
-                .map(|m| m.state != MessageState::Deleted)
+                .map(|m| m.disposition != Disposition::Deleted)
                 .unwrap_or(false)
         });
     }
@@ -70,20 +78,26 @@ fn parse_single_spec(
     for_undelete: bool,
     allnet: bool,
 ) -> Result<Vec<usize>, String> {
-    // Check for range (n-m)
+    // Check for range (n-m). A range is a pair of message numbers
+    // (spec 104533), so both halves must name one before the `-` is read as a
+    // separator. Treating any embedded hyphen as a range turned an ordinary
+    // address like `alpha-zeta@example.net` into the span between whatever its
+    // two halves happened to match.
     if let Some(dash_pos) = spec.find('-') {
-        if dash_pos > 0 && dash_pos < spec.len() - 1 {
-            let start_str = &spec[..dash_pos];
-            let end_str = &spec[dash_pos + 1..];
-
-            let start = parse_single_number(start_str, mb, for_undelete, allnet)?;
-            let end = parse_single_number(end_str, mb, for_undelete, allnet)?;
-
+        let (start_str, end_str) = (&spec[..dash_pos], &spec[dash_pos + 1..]);
+        if let (Some(start), Some(end)) =
+            (range_endpoint(start_str, mb), range_endpoint(end_str, mb))
+        {
             if start > end {
                 return Err("Invalid range".to_string());
             }
-
-            return Ok((start..=end).collect());
+            // Clamp to the mailbox rather than reject: `undelete 1-$` and
+            // `undelete 1-9999` both mean "the rest of them".
+            let last = mb.message_count();
+            if start > last {
+                return Err(format!("Invalid message number: {}", start));
+            }
+            return Ok((start..=end.min(last)).collect());
         }
     }
 
@@ -102,13 +116,13 @@ fn parse_single_spec(
             if for_undelete {
                 mb.messages
                     .iter()
-                    .position(|m| m.state == MessageState::Deleted)
+                    .position(|m| m.disposition == Disposition::Deleted)
                     .map(|i| vec![i + 1])
                     .ok_or_else(|| "No deleted messages".to_string())
             } else {
                 mb.messages
                     .iter()
-                    .position(|m| m.state != MessageState::Deleted)
+                    .position(|m| m.disposition != Disposition::Deleted)
                     .map(|i| vec![i + 1])
                     .ok_or_else(|| "No messages".to_string())
             }
@@ -129,7 +143,7 @@ fn parse_single_spec(
                 Ok((1..=mb.message_count())
                     .filter(|&n| {
                         mb.get(n)
-                            .map(|m| m.state != MessageState::Deleted)
+                            .map(|m| m.disposition != Disposition::Deleted)
                             .unwrap_or(false)
                     })
                     .collect())
@@ -169,7 +183,7 @@ fn parse_single_spec(
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
-                        (for_undelete || m.state != MessageState::Deleted)
+                        (for_undelete || m.disposition != Disposition::Deleted)
                             && m.subject().to_lowercase().contains(&search)
                     })
                     .map(|(i, _)| i + 1)
@@ -188,15 +202,13 @@ fn parse_single_spec(
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| match type_char {
-                        'd' => m.state == MessageState::Deleted,
-                        'n' => m.state == MessageState::New,
-                        'o' => {
-                            m.state != MessageState::New
-                                && m.state != MessageState::Read
-                                && m.state != MessageState::Deleted
-                        }
-                        'r' => m.state == MessageState::Read,
-                        'u' => m.state == MessageState::Unread,
+                        'd' => m.disposition == Disposition::Deleted,
+                        'n' => m.read == ReadState::New,
+                        // `old` is now a state the model names outright, rather
+                        // than "not new, not read, and not deleted".
+                        'o' => m.is_old(),
+                        'r' => m.read == ReadState::Read,
+                        'u' => m.read == ReadState::Unread,
                         _ => false,
                     })
                     .map(|(i, _)| i + 1)
@@ -227,7 +239,7 @@ fn parse_single_spec(
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
-                        if !(for_undelete || m.state != MessageState::Deleted) {
+                        if !(for_undelete || m.disposition != Disposition::Deleted) {
                             return false;
                         }
                         if allnet {
@@ -250,21 +262,42 @@ fn parse_single_spec(
     }
 }
 
-fn parse_single_number(
-    spec: &str,
+/// Resolve one end of an `n-m` range, or `None` if `s` does not name a message
+/// number.
+///
+/// A plain number, or the `^`, `$`, and `.` forms that stand for one
+/// (spec 104525-104533). Anything else -- an address, a subject search -- means
+/// the `-` was part of the token, not a separator.
+fn range_endpoint(s: &str, mb: &Mailbox) -> Option<usize> {
+    match s {
+        "^" => Some(1),
+        "$" => Some(mb.message_count()),
+        "." => Some(mb.current),
+        _ if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The messages an optional msglist argument names, defaulting to the current
+/// one.
+///
+/// Nearly every command begins this way; the three-line form was written out
+/// sixteen times.
+pub fn msglist_or_current(
+    args: &str,
     mb: &Mailbox,
-    for_undelete: bool,
-    allnet: bool,
-) -> Result<usize, String> {
-    let msgs = parse_single_spec(spec, mb, for_undelete, allnet)?;
-    msgs.first()
-        .copied()
-        .ok_or_else(|| "Invalid message specification".to_string())
+    vars: &Variables,
+) -> Result<Vec<usize>, String> {
+    if args.is_empty() {
+        Ok(vec![mb.current])
+    } else {
+        parse_msglist(args, mb, false, vars)
+    }
 }
 
 /// Parse a message list and return just the first message
-pub fn parse_message(spec: &str, mb: &Mailbox) -> Result<usize, String> {
-    let list = parse_msglist(spec, mb, false)?;
+pub fn parse_message(spec: &str, mb: &Mailbox, vars: &Variables) -> Result<usize, String> {
+    let list = parse_msglist(spec, mb, false, vars)?;
     list.first()
         .copied()
         .ok_or_else(|| "No message".to_string())

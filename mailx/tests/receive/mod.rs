@@ -19,33 +19,6 @@
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use plib::tmp::NamedTempFile;
 use std::io::Write;
-use std::path::PathBuf;
-
-/// Get path to static test data file in tests/ directory
-fn test_data_path(filename: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests");
-    path.push(filename);
-    path
-}
-
-/// Copy a static test data file to a temporary location
-/// Use this for tests that may modify the mailbox (quit saves changes)
-fn copy_test_data(filename: &str) -> NamedTempFile {
-    let src_path = test_data_path(filename);
-    let content = std::fs::read_to_string(&src_path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", src_path.display(), e));
-    create_temp_mbox(&content)
-}
-
-/// Helper to create a temporary mbox file (for tests needing custom content)
-fn create_temp_mbox(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mbox");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mbox");
-    file.flush().expect("failed to flush temp mbox");
-    file
-}
 
 /// Test headers display (-H option)
 /// Verifies:
@@ -1031,17 +1004,20 @@ fn cmd_print_uppercase() {
                 String::from("-f"),
                 String::from(mbox_path),
             ],
-            stdin_data: String::from("Print 1\nquit\n"),
+            // `discard` first: without it this asserts nothing, because the
+            // lowercase form prints Date: and From: too when no header is
+            // suppressed. That is how both of these passed while `Print` was
+            // unreachable and silently ran `print`.
+            stdin_data: String::from("discard Date\nPrint 1\nquit\n"),
             expected_out: String::new(),
             expected_err: String::new(),
             expected_exit_code: 0,
         },
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Print should show all headers including Date
             assert!(
                 stdout.contains("Date:") && stdout.contains("From:"),
-                "Print should show all headers: {}",
+                "Print must override discard and show all headers: {}",
                 stdout
             );
             assert!(output.status.success());
@@ -1064,7 +1040,8 @@ fn cmd_type_uppercase() {
                 String::from("-f"),
                 String::from(mbox_path),
             ],
-            stdin_data: String::from("Type 1\nquit\n"),
+            // `discard` first, for the same reason as cmd_print_uppercase.
+            stdin_data: String::from("discard Date\nType 1\nquit\n"),
             expected_out: String::new(),
             expected_err: String::new(),
             expected_exit_code: 0,
@@ -1073,7 +1050,7 @@ fn cmd_type_uppercase() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
                 stdout.contains("Date:") && stdout.contains("From:"),
-                "Type should work like Print: {}",
+                "Type must override discard, like Print: {}",
                 stdout
             );
             assert!(output.status.success());
@@ -2391,16 +2368,11 @@ fn conditional_commands_outside() {
     );
 }
 
-/// Helper to create a temporary mailrc file
-fn create_temp_mailrc(content: &str) -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("failed to create temp mailrc");
-    file.write_all(content.as_bytes())
-        .expect("failed to write temp mailrc");
-    file.flush().expect("failed to flush temp mailrc");
-    file
-}
-
 use plib::testing::run_test_with_checker_and_env;
+
+use crate::common::{
+    assert_no_panic, copy_test_data, create_temp_mailrc, create_temp_mbox, test_data_path,
+};
 
 // =============================================================================
 // `new` message state and the :n selector (audit #8)
@@ -3006,6 +2978,1983 @@ fn startup_copy_is_diagnosed() {
                 stderr.contains("not valid in a start-up file"),
                 "Copy in a start-up file should be diagnosed: {}",
                 stderr
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Mailbox write path: locking, atomicity, and message migration
+// =============================================================================
+
+/// Mail delivered while mailx is running must survive the rewrite at quit.
+///
+/// `quit` truncates the mailbox and writes back only the messages it loaded, so
+/// anything an MDA appended in the meantime was silently destroyed.
+#[test]
+fn quit_preserves_mail_delivered_while_running() {
+    let sys = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: first\n\
+         \n\
+         body one\n\
+         \n",
+    );
+    let sys_path = sys.path().to_str().unwrap().to_string();
+
+    // `delete 1` forces the rewrite branch. The `!` shell escape appends a new
+    // message from a separate process first, exactly as an MDA would.
+    let deliver = format!(
+        "printf 'From carol@example.com Fri Nov 29 12:00:00 2024\\nFrom: \
+         carol@example.com\\nSubject: delivered late\\n\\nbody three\\n\\n' >> {}",
+        sys_path
+    );
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: format!("!{}\ndelete 1\nquit\n", deliver),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path)],
+        |_plan, _output| {
+            let after = std::fs::read_to_string(&sys_path).expect("mailbox should still exist");
+            assert!(
+                after.contains("delivered late"),
+                "mail delivered while mailx ran was destroyed by quit: {:?}",
+                after
+            );
+        },
+    );
+}
+
+/// The quit rewrite must keep the same inode.
+///
+/// Unlinking or renaming the spool file breaks an MDA holding it open and
+/// discards its mode, owner, and group.
+#[test]
+fn quit_rewrite_preserves_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let sys = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: first\n\
+         \n\
+         body one\n\
+         \n\
+         From bob@example.org Fri Nov 29 11:00:00 2024\n\
+         From: bob@example.org\n\
+         Subject: second\n\
+         \n\
+         body two\n\
+         \n",
+    );
+    let sys_path = sys.path().to_str().unwrap().to_string();
+    let before = std::fs::metadata(&sys_path).expect("stat before").ino();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: String::from("delete 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path)],
+        |_plan, _output| {
+            let after = std::fs::metadata(&sys_path).expect("stat after").ino();
+            assert_eq!(
+                before, after,
+                "quit replaced the mailbox inode instead of rewriting it in place"
+            );
+        },
+    );
+}
+
+/// `noappend` places migrated messages at the *start* of mbox (spec 104579).
+///
+/// It must never truncate mbox: the previously-saved mail has to survive.
+#[test]
+fn quit_migration_does_not_truncate_mbox() {
+    let sys = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: fresh mail\n\
+         \n\
+         body one\n\
+         \n",
+    );
+    let mbox = create_temp_mbox(
+        "From older@example.com Fri Nov 22 09:00:00 2024\n\
+         From: older@example.com\n\
+         Subject: previously saved\n\
+         \n\
+         old body\n\
+         \n",
+    );
+    let sys_path = sys.path().to_str().unwrap().to_string();
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            // Reading message 1 marks it read, so quit migrates it to mbox.
+            stdin_data: String::from("print 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path), ("MBOX", &mbox_path)],
+        |_plan, _output| {
+            let after = std::fs::read_to_string(&mbox_path).expect("mbox should still exist");
+            assert!(
+                after.contains("previously saved"),
+                "migrating a read message truncated mbox and destroyed saved mail: {:?}",
+                after
+            );
+            assert!(
+                after.contains("fresh mail"),
+                "the migrated message never reached mbox: {:?}",
+                after
+            );
+            // noappend => the new message goes first.
+            let new_at = after.find("fresh mail").unwrap();
+            let old_at = after.find("previously saved").unwrap();
+            assert!(
+                new_at < old_at,
+                "noappend must place migrated messages before existing mbox content: {:?}",
+                after
+            );
+        },
+    );
+}
+
+/// `keepsave` must be honored in a secondary folder, not only the system mailbox.
+///
+/// The quit partition consulted `keepsave` only when `is_system_mailbox` was
+/// true, so a saved message was dropped from a folder even with `keepsave` set.
+#[test]
+fn keepsave_retains_saved_message_in_folder() {
+    let folder = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: keep me here\n\
+         \n\
+         body one\n\
+         \n\
+         From bob@example.org Fri Nov 29 11:00:00 2024\n\
+         From: bob@example.org\n\
+         Subject: untouched\n\
+         \n\
+         body two\n\
+         \n",
+    );
+    let folder_path = folder.path().to_str().unwrap().to_string();
+    let out = NamedTempFile::new().expect("out file");
+    let out_path = out.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                folder_path.clone(),
+            ],
+            stdin_data: format!("set keepsave\nsave 1 {}\nquit\n", out_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            let saved = std::fs::read_to_string(&out_path).unwrap_or_default();
+            assert!(
+                saved.contains("keep me here"),
+                "save did not write the message to the target file: {:?}",
+                saved
+            );
+            let after = std::fs::read_to_string(&folder_path).expect("folder should still exist");
+            assert!(
+                after.contains("keep me here"),
+                "keepsave was ignored in a secondary folder; the saved message was dropped: {:?}",
+                after
+            );
+        },
+    );
+}
+
+/// The rewrite branch (not the unlink branch) must also keep newly delivered mail.
+#[test]
+fn quit_rewrite_preserves_delivered_tail() {
+    let sys = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: first\n\
+         \n\
+         body one\n\
+         \n\
+         From bob@example.org Fri Nov 29 11:00:00 2024\n\
+         From: bob@example.org\n\
+         Subject: second\n\
+         \n\
+         body two\n\
+         \n",
+    );
+    let sys_path = sys.path().to_str().unwrap().to_string();
+
+    let deliver = format!(
+        "printf 'From carol@example.com Fri Nov 29 12:00:00 2024\\nFrom: \
+         carol@example.com\\nSubject: delivered late\\n\\nbody three\\n\\n' >> {}",
+        sys_path
+    );
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: format!("!{}\ndelete 1\nquit\n", deliver),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path)],
+        |_plan, _output| {
+            let after = std::fs::read_to_string(&sys_path).expect("mailbox should still exist");
+            assert!(
+                after.contains("delivered late"),
+                "the rewrite dropped mail delivered while mailx ran: {:?}",
+                after
+            );
+            assert!(
+                after.contains("second"),
+                "the rewrite dropped the kept message: {:?}",
+                after
+            );
+        },
+    );
+}
+
+/// An emptied mailbox is removed, or truncated when `keep` is set (spec 104636).
+#[test]
+fn emptied_mailbox_removed_unless_keep_is_set() {
+    let one = "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+               From: alice@example.com\n\
+               Subject: only message\n\
+               \n\
+               body one\n\
+               \n";
+
+    let nokeep = create_temp_mbox(one);
+    let nokeep_path = nokeep.path().to_str().unwrap().to_string();
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: String::from("delete 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &nokeep_path)],
+        |_plan, _output| {
+            assert!(
+                !std::path::Path::new(&nokeep_path).exists(),
+                "nokeep should remove an emptied mailbox"
+            );
+        },
+    );
+
+    let keep = create_temp_mbox(one);
+    let keep_path = keep.path().to_str().unwrap().to_string();
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: String::from("set keep\ndelete 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &keep_path)],
+        |_plan, _output| {
+            let meta = std::fs::metadata(&keep_path)
+                .expect("keep should truncate the mailbox, not remove it");
+            assert_eq!(meta.len(), 0, "keep should leave the mailbox zero-length");
+        },
+    );
+}
+
+/// `append` places migrated messages after the existing mbox content (spec 104579).
+#[test]
+fn append_places_migrated_messages_last() {
+    let sys = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: fresh mail\n\
+         \n\
+         body one\n\
+         \n",
+    );
+    let mbox = create_temp_mbox(
+        "From older@example.com Fri Nov 22 09:00:00 2024\n\
+         From: older@example.com\n\
+         Subject: previously saved\n\
+         \n\
+         old body\n\
+         \n",
+    );
+    let sys_path = sys.path().to_str().unwrap().to_string();
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: String::from("set append\nprint 1\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path), ("MBOX", &mbox_path)],
+        |_plan, _output| {
+            let after = std::fs::read_to_string(&mbox_path).expect("mbox should still exist");
+            let new_at = after.find("fresh mail").expect("migrated message missing");
+            let old_at = after
+                .find("previously saved")
+                .expect("saved mail destroyed");
+            assert!(
+                old_at < new_at,
+                "append must place migrated messages after existing mbox content: {:?}",
+                after
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Inputs that aborted the process
+// =============================================================================
+
+/// A `From:` whose display name contains `>` before `<` must not abort.
+///
+/// `extract_address` searched for `>` from the start of the string rather than
+/// after the `<`, producing an inverted slice range.
+#[test]
+fn from_with_reversed_angle_brackets_no_panic() {
+    let mbox = create_temp_mbox(
+        "From bob@example.com Fri Nov 29 10:00:00 2024\n\
+         From: Bob >_< Smith <bob@example.com>\n\
+         Subject: reversed brackets\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("followup 1\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| assert_no_panic(output, "followup on a reversed-bracket From:"),
+    );
+}
+
+/// A `From:` whose parenthesised comment closes before it opens must not abort.
+///
+/// `short_from` had the same inverted-range bug, and it fires from the header
+/// summary printed at start-up -- before the prompt is ever reached.
+#[test]
+fn from_with_reversed_parens_no_panic() {
+    let mbox = create_temp_mbox(
+        "From bob@example.com Fri Nov 29 10:00:00 2024\n\
+         From: Smith) Jr (John\n\
+         Subject: reversed parens\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-f"), mbox_path],
+            stdin_data: String::from("headers\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| assert_no_panic(output, "header summary for a reversed-paren From:"),
+    );
+}
+
+/// A multibyte character straight after the escape character must not abort.
+///
+/// `handle_escape` sliced at byte 1 after reading a `char`, so `~élan` split a
+/// UTF-8 sequence. The callers already slice by `len_utf8`; only this function
+/// reintroduced the bug.
+#[test]
+fn multibyte_after_escape_char_no_panic() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("mail someone@example.com\n~élan\n~x\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| assert_no_panic(output, "a multibyte character after the escape char"),
+    );
+}
+
+/// `set screen=0` must not divide by zero in `headers` or `z`.
+#[test]
+fn screen_zero_no_panic() {
+    for cmd in ["headers", "z", "z-"] {
+        let mbox = copy_test_data("testdata.mbox");
+        let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![
+                    String::from("-n"),
+                    String::from("-N"),
+                    String::from("-f"),
+                    mbox_path,
+                ],
+                stdin_data: format!("set screen=0\n{}\nexit\n", cmd),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_plan, output| assert_no_panic(output, &format!("`set screen=0` then `{}`", cmd)),
+        );
+    }
+}
+
+/// A cyclic alias must be diagnosed, not recursed into until the stack dies.
+#[test]
+fn cyclic_alias_no_stack_overflow() {
+    for defs in ["alias a b\nalias b a\n", "alias a a\n"] {
+        let mbox = copy_test_data("testdata-single.mbox");
+        let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![
+                    String::from("-n"),
+                    String::from("-N"),
+                    String::from("-f"),
+                    mbox_path,
+                ],
+                stdin_data: format!("{}mail a\n~x\nexit\n", defs),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_plan, output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !stderr.contains("stack overflow"),
+                    "cyclic alias overflowed the stack: {}",
+                    stderr
+                );
+                assert_no_panic(output, "a cyclic alias");
+            },
+        );
+    }
+}
+
+/// A `From:` crafted to escape the current directory must not name a file.
+///
+/// `Save`, `Copy`, `followup`, and `Followup` derive a filename from the
+/// author, and the value comes straight out of an attacker-controlled header.
+#[test]
+fn author_derived_filename_rejects_path_traversal() {
+    let mbox = create_temp_mbox(
+        "From bob@example.com Fri Nov 29 10:00:00 2024\n\
+         From: ../../../../tmp/mailx-traversal-probe@example.com\n\
+         Subject: traversal\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+    let probe = std::path::Path::new("/tmp/mailx-traversal-probe");
+    let _ = std::fs::remove_file(probe);
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("followup 1\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            assert_no_panic(output, "a traversal-shaped author name");
+            assert!(
+                !probe.exists(),
+                "an author-derived filename escaped the working directory"
+            );
+        },
+    );
+    let _ = std::fs::remove_file(probe);
+}
+
+// =============================================================================
+// Send path, filename handling, and argument quoting
+// =============================================================================
+
+/// Bcc recipients must actually be handed to the mail delivery software, and
+/// must not appear as a header in the delivered message.
+#[test]
+fn bcc_reaches_the_envelope_but_not_the_message() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from(
+                "set debug\nmail to@example.com\n~b blind@example.com\n~s subj\nbody\n.\nexit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let envelope = err
+                .lines()
+                .find(|l| l.starts_with("Envelope:"))
+                .unwrap_or_else(|| panic!("debug output has no envelope line: {}", err));
+            assert!(
+                envelope.contains("blind@example.com"),
+                "bcc recipient never reached the envelope: {}",
+                envelope
+            );
+            assert!(
+                !err.contains("\nBcc: "),
+                "the blind recipient leaked into the message headers: {}",
+                err
+            );
+        },
+    );
+}
+
+/// An empty `$USER` must not drop every recipient of a reply.
+///
+/// The self-exclusion compared with `contains`, so an empty login matched every
+/// address and `reply` silently addressed nobody but the sender.
+#[test]
+fn reply_with_empty_user_keeps_recipients() {
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         To: me@example.com, carol@example.com\n\
+         Cc: dave@example.com\n\
+         Subject: group thread\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set debug\nreply 1\nbody\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", ""), ("LOGNAME", "")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            for who in ["carol@example.com", "dave@example.com"] {
+                assert!(
+                    err.contains(who),
+                    "an empty $USER dropped {} from the reply: {}",
+                    who,
+                    err
+                );
+            }
+        },
+    );
+}
+
+/// A short login must not remove recipients merely because it is a substring.
+#[test]
+fn reply_self_exclusion_is_not_a_substring_match() {
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         To: ed@example.com, edward@example.com, ted@example.com\n\
+         Subject: group thread\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set debug\nreply 1\nbody\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", "ed"), ("LOGNAME", "ed")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            for who in ["edward@example.com", "ted@example.com"] {
+                assert!(
+                    err.contains(who),
+                    "login `ed` over-matched and dropped {}: {}",
+                    who,
+                    err
+                );
+            }
+        },
+    );
+}
+
+/// A hyphen inside an address is not a message range (spec 104533).
+#[test]
+fn hyphenated_address_is_not_a_range() {
+    let mbox = create_temp_mbox(
+        "From alpha@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alpha@example.com\n\
+         Subject: first message\n\
+         \n\
+         body one\n\
+         \n\
+         From beta@example.org Fri Nov 29 11:00:00 2024\n\
+         From: beta@example.org\n\
+         Subject: second message\n\
+         \n\
+         body two\n\
+         \n\
+         From alpha-zeta@example.net Fri Nov 29 12:00:00 2024\n\
+         From: alpha-zeta@example.net\n\
+         Subject: third message\n\
+         \n\
+         body three\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("from alpha-zeta\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("third message"),
+                "the hyphenated address did not match its own message: {}",
+                out
+            );
+            assert!(
+                !out.contains("first message") && !out.contains("second message"),
+                "`alpha-zeta` was parsed as the range alpha..zeta: {}",
+                out
+            );
+        },
+    );
+}
+
+/// `~|` must not deadlock when the filter writes more than a pipe buffer.
+///
+/// The body was written to the child's stdin in full before its output was
+/// read, so a filter producing more than one pipe buffer blocked writing while
+/// mailx blocked writing. This test runs mailx under its own watchdog rather
+/// than the shared harness, which has no timeout: a regression here hangs
+/// forever instead of failing.
+#[test]
+fn tilde_pipe_survives_large_output() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    // A body far larger than the 64 KiB pipe buffer, read from a file so it
+    // does not have to travel through stdin a kilobyte at a time.
+    let big = NamedTempFile::new().expect("big body file");
+    let big_path = big.path().to_str().unwrap().to_string();
+    let line = "the quick brown fox jumps over the lazy dog\n";
+    std::fs::write(&big_path, line.repeat(6000)).expect("write big body");
+
+    let mut child = Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-n", "-N", "-f", &mbox_path])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mailx");
+
+    let script = format!(
+        "set debug\nmail to@example.com\n~r {}\n~| cat\n~x\nexit\n",
+        big_path
+    );
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write script");
+
+    let (tx, rx) = mpsc::channel();
+    let handle = child.id();
+    std::thread::spawn(move || {
+        let status = child.wait_with_output();
+        let _ = tx.send(status);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Ok(output)) => {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "`~| cat` on a large body failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(Err(e)) => panic!("waiting for mailx failed: {}", e),
+        Err(_) => {
+            // SAFETY: `handle` is this child's pid; the process is still running
+            // because the wait has not completed, so the pid has not been reused.
+            unsafe { libc::kill(handle as libc::pid_t, libc::SIGKILL) };
+            panic!("`~| cat` deadlocked on a body larger than one pipe buffer");
+        }
+    }
+}
+
+/// `~w` names a pathname (spec 105094); it is not a shell word.
+#[test]
+fn tilde_w_does_not_run_the_shell() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let target = dir.path().join("my file.txt");
+    let probe = dir.path().join("PWNED");
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!(
+                "mail to@example.com\nbody text\n~w {}\n~w $(touch {})out.txt\n~x\nexit\n",
+                target.display(),
+                probe.display()
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            assert!(
+                target.exists(),
+                "~w did not write to the literal pathname, so the name was word-split"
+            );
+            assert!(
+                !probe.exists(),
+                "~w ran command substitution on the filename"
+            );
+        },
+    );
+}
+
+/// A `set` value may contain blanks when quoted (spec 104965, 104694-104699).
+#[test]
+fn set_value_may_contain_blanks() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set indentprefix=\"> \"\nset\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("indentprefix=\"> \""),
+                "a quoted set value lost its trailing blank: {}",
+                out
+            );
+            assert!(
+                !out.lines().any(|l| l.trim() == "\""),
+                "the set tokenizer produced a junk variable named `\"`: {}",
+                out
+            );
+        },
+    );
+}
+
+/// `set noX` unsets `X`, and must not strip `no` from an unrelated name.
+#[test]
+fn set_no_prefix_only_strips_a_known_boolean() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set notify\nset\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.lines().any(|l| l.trim() == "notify"),
+                "`set notify` was read as `set no tify`: {}",
+                out
+            );
+        },
+    );
+}
+
+/// Editor temporaries must live under `$TMPDIR` with a name nobody can predict.
+#[test]
+fn editor_temp_file_honors_tmpdir() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let log = dir.path().join("editor.log");
+    let editor = dir.path().join("fake-editor");
+    std::fs::write(
+        &editor,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\n", log.display()),
+    )
+    .expect("write fake editor");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake editor");
+    }
+
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+    let tmpdir = dir.path().to_str().unwrap().to_string();
+    let editor_path = editor.to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!("set EDITOR={}\nedit 1\nexit\n", editor_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("TMPDIR", &tmpdir)],
+        |_plan, _output| {
+            let logged = std::fs::read_to_string(&log).unwrap_or_default();
+            let path = logged.trim();
+            assert!(!path.is_empty(), "the editor was never invoked");
+            assert!(
+                path.starts_with(&tmpdir),
+                "the editor temporary ignored $TMPDIR: {}",
+                path
+            );
+            assert!(
+                !path.contains("mailx."),
+                "the editor temporary still uses a predictable name: {}",
+                path
+            );
+        },
+    );
+}
+
+// =============================================================================
+// mbox serialization and message state
+// =============================================================================
+
+/// Saved messages must be separated by an empty line (spec 104420-104427).
+///
+/// The separator was smuggled through the message body, so it only appeared
+/// when the source file happened to have one -- never for the last message of a
+/// mailbox, and never for anything `save` had written.
+#[test]
+fn saved_messages_are_separated_by_a_blank_line() {
+    // Deliberately no trailing empty line: that separator used to be smuggled
+    // through the body, so a message without one produced output whose second
+    // `From ` line abutted the first message's last body line.
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: only message\n\
+         \n\
+         single body line\n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+    let out = NamedTempFile::new().expect("out file");
+    let out_path = out.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!("save 1 {}\nsave 1 {}\nexit\n", out_path, out_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            let saved = std::fs::read_to_string(&out_path).expect("read saved mailbox");
+            let lines: Vec<&str> = saved.lines().collect();
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with("From ")).count(),
+                2,
+                "expected two messages: {:?}",
+                saved
+            );
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 && line.starts_with("From ") {
+                    assert_eq!(
+                        lines[i - 1],
+                        "",
+                        "a From line must be preceded by an empty line: {:?}",
+                        saved
+                    );
+                }
+            }
+            assert!(
+                !saved.contains("\n\n\nFrom "),
+                "the separator was doubled: {:?}",
+                saved
+            );
+        },
+    );
+}
+
+/// Repeated quit cycles must not accumulate blank lines.
+///
+/// Normalizing on load and emitting exactly one separator on write is what
+/// keeps the naive "always append an empty line" fix from growing the mailbox
+/// by one line per session.
+#[test]
+fn repeated_quit_cycles_do_not_grow_the_mailbox() {
+    let out = NamedTempFile::new().expect("out file");
+    let out_path = out.path().to_str().unwrap().to_string();
+
+    // Feed each round's output back in as the next round's input. If the writer
+    // adds a separator the reader does not consume, the blank lines pile up.
+    let mut previous = String::new();
+    for round in 0..3 {
+        let mbox = if round == 0 {
+            create_temp_mbox(
+                "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+                 From: alice@example.com\n\
+                 Subject: only message\n\
+                 \n\
+                 single body line\n",
+            )
+        } else {
+            create_temp_mbox(&previous)
+        };
+        let mbox_path = mbox.path().to_str().unwrap().to_string();
+        std::fs::write(&out_path, "").expect("truncate out");
+
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![
+                    String::from("-n"),
+                    String::from("-N"),
+                    String::from("-f"),
+                    mbox_path,
+                ],
+                stdin_data: format!("save 1 {}\nexit\n", out_path),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_plan, _output| {},
+        );
+
+        let current = std::fs::read_to_string(&out_path).expect("read saved");
+        if round > 0 {
+            assert_eq!(
+                current,
+                previous,
+                "round {} changed a mailbox that round {} had already written",
+                round,
+                round - 1
+            );
+        }
+        previous = current;
+    }
+}
+
+/// Read state must survive a reopen, via the `Status:` header (spec 104625).
+#[test]
+fn read_state_survives_a_reopen() {
+    let folder = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: first\n\
+         \n\
+         body one\n\
+         \n\
+         From bob@example.org Fri Nov 29 11:00:00 2024\n\
+         From: bob@example.org\n\
+         Subject: second\n\
+         \n\
+         body two\n\
+         \n",
+    );
+    let folder_path = folder.path().to_str().unwrap().to_string();
+
+    // Read message 1, delete message 2 so the folder is rewritten.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                folder_path.clone(),
+            ],
+            stdin_data: String::from("print 1\ndelete 2\nquit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            let after = std::fs::read_to_string(&folder_path).expect("folder");
+            assert!(
+                after.contains("Status:"),
+                "read state was never written back: {:?}",
+                after
+            );
+        },
+    );
+
+    // Reopening must show it as read, not new.
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-f"), folder_path.clone()],
+            stdin_data: String::from("exit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            let row = out
+                .lines()
+                .find(|l| l.contains("first"))
+                .unwrap_or_else(|| panic!("no header row for message 1: {}", out));
+            assert!(
+                !row.contains('N'),
+                "a message read in the previous session came back as new: {}",
+                row
+            );
+        },
+    );
+}
+
+/// `undelete` must restore the state the message had, not blanket it as read.
+#[test]
+fn undelete_restores_the_previous_read_state() {
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: never read\n\
+         \n\
+         body one\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("delete 1\nundelete 1\nheaders\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            let row = out
+                .lines()
+                .find(|l| l.contains("never read"))
+                .unwrap_or_else(|| panic!("no header row: {}", out));
+            assert!(
+                row.contains('N'),
+                "undelete marked an unread message as read: {}",
+                row
+            );
+        },
+    );
+}
+
+/// `preserve` must not erase read state: `:r` still has to match afterwards.
+#[test]
+fn preserve_keeps_read_state() {
+    let sys = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: read then held\n\
+         \n\
+         body one\n\
+         \n",
+    );
+    let sys_path = sys.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![String::from("-n"), String::from("-N")],
+            stdin_data: String::from("print 1\npreserve 1\nfrom :r\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAIL", &sys_path)],
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("read then held"),
+                "`preserve` erased the read state, so `:r` no longer matched: {}",
+                out
+            );
+        },
+    );
+}
+
+/// A body line beginning `From ` must round-trip through save unchanged.
+#[test]
+fn from_line_in_body_round_trips() {
+    let mbox = create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alice@example.com\n\
+         Subject: quoting\n\
+         \n\
+         ordinary line\n\
+         From here it gets interesting\n\
+         >From already quoted\n\
+         >>From doubly quoted\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+    let out = NamedTempFile::new().expect("out file");
+    let out_path = out.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!("save 1 {}\nexit\n", out_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            let saved = std::fs::read_to_string(&out_path).expect("read saved");
+            // Exactly one envelope line: the body's `From ` must stay escaped.
+            assert_eq!(
+                saved.lines().filter(|l| l.starts_with("From ")).count(),
+                1,
+                "an unescaped body line split the message: {:?}",
+                saved
+            );
+            assert!(
+                saved.contains(">From here it gets interesting"),
+                "the body's From line lost its quoting: {:?}",
+                saved
+            );
+            // `>From already quoted` on disk means `From already quoted` in
+            // the message, so it comes back out with one `>`; the doubly
+            // quoted line keeps its extra level. Quoting only `From ` and
+            // never `>From ` lost a level on every round trip.
+            assert!(
+                saved.contains(">>From doubly quoted"),
+                "a doubly quoted body line lost a level of quoting: {:?}",
+                saved
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Capitalized command forms (spec 104689-104693)
+// =============================================================================
+
+/// A mailbox with a header that `discard` can suppress.
+fn capitalized_fixture() -> NamedTempFile {
+    create_temp_mbox(
+        "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+         From: Alice <alice@example.com>\n\
+         To: me@example.com, carol@example.com\n\
+         Cc: dave@example.com\n\
+         Subject: hello\n\
+         X-Secret: hidden-header\n\
+         \n\
+         body one\n\
+         \n",
+    )
+}
+
+/// `Print` and `Type` override `discard`; `print` and `type` honor it
+/// (spec 104756).
+#[test]
+fn capitalized_print_overrides_discard() {
+    for (cmd, want_secret) in [
+        ("print 1", false),
+        ("Print 1", true),
+        ("P 1", true),
+        ("type 1", false),
+        ("Type 1", true),
+        ("T 1", true),
+    ] {
+        let mbox = capitalized_fixture();
+        let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![
+                    String::from("-n"),
+                    String::from("-N"),
+                    String::from("-f"),
+                    mbox_path,
+                ],
+                stdin_data: format!("discard X-Secret\n{}\nexit\n", cmd),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_plan, output| {
+                let out = String::from_utf8_lossy(&output.stdout);
+                assert_eq!(
+                    out.contains("hidden-header"),
+                    want_secret,
+                    "`{}` handled the discarded header wrongly: {}",
+                    cmd,
+                    out
+                );
+            },
+        );
+    }
+}
+
+/// `Reply` addresses the sender; `reply` addresses everyone (spec 104905-104916).
+#[test]
+fn capitalized_reply_addresses_sender_only() {
+    for (cmd, want_all) in [("reply 1", true), ("Reply 1", false), ("R 1", false)] {
+        let mbox = capitalized_fixture();
+        let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+        run_test_with_checker_and_env(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![
+                    String::from("-n"),
+                    String::from("-N"),
+                    String::from("-f"),
+                    mbox_path,
+                ],
+                stdin_data: format!("set debug\n{}\nbody\n.\nexit\n", cmd),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            &[("USER", "me"), ("LOGNAME", "me")],
+            |_plan, output| {
+                let err = String::from_utf8_lossy(&output.stderr);
+                let envelope = err
+                    .lines()
+                    .find(|l| l.starts_with("Envelope:"))
+                    .unwrap_or_else(|| panic!("no envelope for `{}`: {}", cmd, err));
+                assert!(
+                    envelope.contains("alice@example.com"),
+                    "`{}` dropped the sender: {}",
+                    cmd,
+                    envelope
+                );
+                assert_eq!(
+                    envelope.contains("carol@example.com"),
+                    want_all,
+                    "`{}` addressed the wrong set of recipients: {}",
+                    cmd,
+                    envelope
+                );
+            },
+        );
+    }
+}
+
+/// `Save` and `Copy` name a file after the author; only `Save` marks the
+/// message saved (spec 104738-104742, 104958-104961).
+#[test]
+fn capitalized_save_and_copy_use_the_author_name() {
+    for (cmd, want_saved) in [("Copy 1", false), ("Save 1", true), ("S 1", true)] {
+        let dir = plib::tmp::TempDir::new().expect("temp dir");
+        let mbox = dir.path().join("box");
+        std::fs::write(
+            &mbox,
+            "From alice@example.com Fri Nov 29 10:00:00 2024\n\
+             From: Alice <alice@example.com>\n\
+             Subject: hello\n\
+             \n\
+             body one\n\
+             \n",
+        )
+        .expect("write mbox");
+
+        let out = std::process::Command::new(plib::testing::get_binary_path("mailx"))
+            .args(["-n", "-N", "-f", mbox.to_str().unwrap()])
+            .current_dir(dir.path())
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write as _;
+                c.stdin
+                    .take()
+                    .unwrap()
+                    .write_all(format!("{}\nheaders\nexit\n", cmd).as_bytes())?;
+                c.wait_with_output()
+            })
+            .expect("run mailx");
+
+        assert!(
+            dir.path().join("alice").exists(),
+            "`{}` did not create a file named after the author: {}",
+            cmd,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let row = stdout
+            .lines()
+            .find(|l| l.contains("hello"))
+            .unwrap_or_else(|| panic!("no header row for `{}`: {}", cmd, stdout));
+        assert_eq!(
+            row.contains('*'),
+            want_saved,
+            "`{}` marked the message saved incorrectly: {}",
+            cmd,
+            row
+        );
+    }
+}
+
+/// A command word is matched case-sensitively: `COPY` is not `Copy`.
+#[test]
+fn wrong_case_command_is_unknown() {
+    let mbox = capitalized_fixture();
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("COPY 1\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                err.contains("Unknown command: COPY"),
+                "`COPY` should not match `Copy`: {}",
+                err
+            );
+        },
+    );
+}
+
+/// Lowercase `copy`/`save` are legal in a start-up file; only the capitalized
+/// forms are not (spec 104557-104559).
+#[test]
+fn startup_rejects_only_the_capitalized_file_commands() {
+    for (line, rejected) in [
+        ("copy", false),
+        ("save", false),
+        ("Copy 1", true),
+        ("Save 1", true),
+    ] {
+        let mbox = capitalized_fixture();
+        let mbox_path = mbox.path().to_str().unwrap().to_string();
+        let rc = create_temp_mailrc(&format!("{}\n", line));
+        let rc_path = rc.path().to_str().unwrap().to_string();
+
+        run_test_with_checker_and_env(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![String::from("-N"), String::from("-f"), mbox_path],
+                stdin_data: String::from("exit\n"),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            &[("MAILRC", &rc_path)],
+            |_plan, output| {
+                let err = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    err.contains("not valid in a start-up file"),
+                    rejected,
+                    "start-up handling of `{}` is wrong: {}",
+                    line,
+                    err
+                );
+            },
+        );
+    }
+}
+
+/// `if`/`else`/`endif` work in a file read by `source`.
+#[test]
+fn source_honors_conditionals() {
+    let mbox = capitalized_fixture();
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+    let script = create_temp_mailrc(
+        "if r\nset marker=receive-branch\nelse\nset marker=send-branch\nendif\n",
+    );
+    let script_path = script.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!("source {}\nset\nexit\n", script_path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("marker=\"receive-branch\""),
+                "a conditional in a sourced file was ignored: {}",
+                out
+            );
+        },
+    );
+}
+
+// =============================================================================
+// Filename handling and msglist regressions
+// =============================================================================
+
+/// A filename derived from a message header must never reach the shell.
+///
+/// `Save`, `Copy`, `followup`, and `Followup` name their file after the author,
+/// and command-mode filenames get shell word expansion (spec 104709) -- so
+/// routing the two through one expander made a `From:` header a command line.
+#[test]
+fn author_derived_filename_never_reaches_the_shell() {
+    for cmd in ["Save 1", "Copy 1", "followup 1\n."] {
+        let dir = plib::tmp::TempDir::new().expect("temp dir");
+        let mbox = dir.path().join("box");
+        // A bare name: a path separator would be caught by the author-name
+        // check on its own, which would hide whether the shell ran at all.
+        std::fs::write(
+            &mbox,
+            "From x@example.com Fri Nov 29 10:00:00 2024\n\
+             From: <`touch INJECTED`@example.com>\n\
+             Subject: injection\n\
+             \n\
+             body\n\
+             \n",
+        )
+        .expect("write mbox");
+
+        let out = std::process::Command::new(plib::testing::get_binary_path("mailx"))
+            .args(["-n", "-N", "-f", mbox.to_str().unwrap()])
+            .current_dir(dir.path())
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write as _;
+                c.stdin
+                    .take()
+                    .unwrap()
+                    .write_all(format!("{}\nexit\n", cmd).as_bytes())?;
+                c.wait_with_output()
+            })
+            .expect("run mailx");
+
+        assert!(
+            !dir.path().join("INJECTED").exists(),
+            "`{}` executed a command from the From: header: {}",
+            cmd,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `file` onto the mailbox already open must not duplicate a fragment of it.
+///
+/// Reading the new mailbox before `quit` rewrote the old one recorded a byte
+/// length taken before the rewrite, so everything `quit` appended looked like
+/// mail delivered since and was copied through a second time.
+#[test]
+fn file_onto_the_current_mailbox_does_not_duplicate_it() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: a@example.com\n\
+         Subject: first\n\
+         \n\
+         one\n\
+         \n\
+         From c@example.org Fri Nov 29 11:00:00 2024\n\
+         From: c@example.org\n\
+         Subject: second\n\
+         \n\
+         two\n\
+         \n",
+    );
+    let path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                path.clone(),
+            ],
+            stdin_data: format!("print 1\nfile {}\nprint 1\nquit\n", path),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            let after = std::fs::read_to_string(&path).expect("mailbox");
+            // Byte-exact: a duplicated tail is a few bytes appended past the
+            // last message, which a message count or a suffix check misses.
+            let expected = "From a@example.com Fri Nov 29 10:00:00 2024\n\
+                            From: a@example.com\n\
+                            Subject: first\n\
+                            Status: RO\n\
+                            \n\
+                            one\n\
+                            \n\
+                            From c@example.org Fri Nov 29 11:00:00 2024\n\
+                            From: c@example.org\n\
+                            Subject: second\n\
+                            \n\
+                            two\n\
+                            \n";
+            assert_eq!(
+                after, expected,
+                "reopening the current mailbox corrupted it"
+            );
+        },
+    );
+}
+
+/// `set noX` clears X for any variable that is set, not just a known boolean.
+#[test]
+fn set_no_prefix_clears_valued_and_user_variables() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from(
+                "set crt=1\nset nocrt\nset myvar=1\nset nomyvar\nset notify\nset\nexit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            for gone in ["crt=", "myvar=", "nocrt", "nomyvar"] {
+                assert!(
+                    !out.contains(gone),
+                    "`set no...` left `{}` behind: {}",
+                    gone,
+                    out
+                );
+            }
+            assert!(
+                out.lines().any(|l| l.trim() == "notify"),
+                "`set notify` was read as `set no tify`: {}",
+                out
+            );
+        },
+    );
+}
+
+/// `^`, `$`, and `.` are message numbers, so they may end a range (spec 104533).
+#[test]
+fn range_endpoints_accept_the_positional_forms() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: a@example.com\n\
+         Subject: first\n\
+         \n\
+         one\n\
+         \n\
+         From c@example.org Fri Nov 29 11:00:00 2024\n\
+         From: c@example.org\n\
+         Subject: second\n\
+         \n\
+         two\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    for spec in ["1-$", "^-$", "1-2"] {
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![
+                    String::from("-n"),
+                    String::from("-N"),
+                    String::from("-f"),
+                    mbox_path.clone(),
+                ],
+                stdin_data: format!("from {}\nexit\n", spec),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_plan, output| {
+                let out = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    out.contains("first") && out.contains("second"),
+                    "`from {}` did not select the whole range: {}",
+                    spec,
+                    out
+                );
+            },
+        );
+    }
+}
+
+/// A range running past the last message is clamped, not rejected.
+#[test]
+fn undelete_range_past_the_end_is_clamped() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("delete 1 2\nundelete 1-9999\nfrom *\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !err.contains("Invalid message number"),
+                "an over-long range was rejected instead of clamped: {}",
+                err
+            );
+            let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            assert!(
+                out.contains("alice") && out.contains("bob"),
+                "undelete over a clamped range did not restore the messages: {}",
+                out
+            );
+        },
+    );
+}
+
+/// `save` must work to a target that is not a seekable, syncable regular file.
+#[test]
+fn save_to_a_character_device_succeeds() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("save 1 /dev/null\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                err.trim().is_empty(),
+                "saving to /dev/null reported an error: {}",
+                err
+            );
+        },
+    );
+}
+
+/// A folded line after `Status:` belongs to it, not to the header before it.
+#[test]
+fn status_continuation_does_not_corrupt_the_previous_header() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: a@example.com\n\
+         Subject: folded\n\
+         X-Long: first\n\
+         Status: RO\n\
+         \tcontinued\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("print 1\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !out.contains("continued"),
+                "a continuation of the dropped Status: header was glued onto \
+                 the header before it: {}",
+                out
+            );
+            assert!(
+                out.contains("X-Long: first"),
+                "the preceding header was lost: {}",
+                out
+            );
+        },
+    );
+}
+
+/// Envelope operands are bare addresses, not `Name <addr>` header values.
+#[test]
+fn envelope_recipients_carry_no_display_names() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: Bob Smith <bob@example.com>\n\
+         To: me@example.com, carol@example.com\n\
+         Subject: s\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set debug\nreply 1\nbody\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", "me"), ("LOGNAME", "me")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let envelope = err
+                .lines()
+                .find(|l| l.starts_with("Envelope:"))
+                .unwrap_or_else(|| panic!("no envelope line: {}", err));
+            assert!(
+                !envelope.contains('<') && !envelope.contains("Bob Smith"),
+                "a display name reached the envelope: {}",
+                envelope
+            );
+            assert!(
+                envelope.contains("bob@example.com"),
+                "the sender's address is missing: {}",
+                envelope
+            );
+        },
+    );
+}
+
+/// `~w` resolves the mailx filename notations, just not the shell's.
+#[test]
+fn tilde_w_expands_the_home_prefix() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let home = dir.path().to_str().unwrap().to_string();
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("mail to@example.com\nbody text\n~w ~/out.txt\n~x\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("HOME", &home)],
+        |_plan, _output| {
+            assert!(
+                dir.path().join("out.txt").exists(),
+                "~w did not expand the ~ prefix"
             );
         },
     );

@@ -13,8 +13,6 @@ gettext-rs.workspace = true
 libc.workspace = true
 plib = { path = "../plib" }
 
-[dev-dependencies]
-filetime = "0.2"
 
 [lints]
 workspace = true

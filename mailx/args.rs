@@ -158,17 +158,7 @@ impl Args {
         // /var/mail. Read access is governed by the file's permissions, which
         // provide the "appropriate privileges" check (spec 104287-104289).
         if let Some(ref user) = result.user {
-            let candidates = [
-                format!("/var/mail/{}", user),
-                format!("/var/spool/mail/{}", user),
-                format!("/usr/spool/mail/{}", user),
-            ];
-            let path = candidates
-                .iter()
-                .find(|p| std::path::Path::new(p).exists())
-                .cloned()
-                .unwrap_or_else(|| candidates[0].clone());
-            result.file = Some(path);
+            result.file = Some(crate::util::spool_path(user));
         }
 
         Ok(result)

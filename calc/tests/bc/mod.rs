@@ -84,6 +84,18 @@ fn test_bc_missing_file() {
 
 // POSIX limit maxima are enforced so pathological inputs cannot drive
 // unbounded allocation (audit #B3 scale, #B4 obase, #B5 array index).
+/// Assert that the program fails with a diagnostic containing `needle`.
+fn bc_runtime_error_contains(program: &str, needle: &str) {
+    let output = plib::testing::run_test_base("bc", &[], format!("{}\nquit\n", program).as_bytes());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(needle),
+        "expected stderr to contain {:?}, got {:?}",
+        needle,
+        stderr
+    );
+}
+
 fn bc_runtime_error(program: &str, expected_err: &str) {
     run_test(TestPlan {
         cmd: String::from("bc"),
@@ -113,10 +125,114 @@ fn test_bc_obase_too_large() {
 
 #[test]
 fn test_bc_array_index_out_of_bounds() {
+    // POSIX: an array holds up to {BC_DIM_MAX} elements and is indexed from 0
+    // to {BC_DIM_MAX}-1, so the last valid subscript is one below the limit.
+    test_bc("a[16777215]=1\nquit\n", "");
     bc_runtime_error(
-        "a[16777215]=1",
+        "a[16777216]=1",
         "runtime error (line 1): array index out of bounds",
     );
+    bc_runtime_error(
+        "a[-1]=1",
+        "runtime error (line 1): array index cannot be negative",
+    );
+}
+
+/// POSIX: "references to any of these names from other functions that are
+/// called from this function also refer to the new value". A callee saw the
+/// global instead of the caller's parameter or auto.
+#[test]
+fn test_bc_dynamic_scoping() {
+    test_bc(
+        "define g(){\nreturn(a)\n}\ndefine f(a){\nreturn(g())\n}\na=1\nf(9)\nquit\n",
+        "9\n",
+    );
+    test_bc(
+        "define g(){\nreturn(x)\n}\ndefine f(){\nauto x\nx=5\nreturn(g())\n}\nx=1\nf()\nquit\n",
+        "5\n",
+    );
+    // The caller's value must come back afterwards.
+    test_bc("define f(a){\nreturn(a)\n}\na=1\nf(9)\na\nquit\n", "9\n1\n");
+}
+
+/// An array argument was always read from the global of that name, so passing
+/// a local array on to another function passed the wrong array.
+#[test]
+fn test_bc_array_argument_uses_the_active_binding() {
+    test_bc(
+        "define g(x[]){\nreturn(x[0])\n}\ndefine f(x[]){\nreturn(g(x[]))\n}\nx[0]=99\nq[0]=7\nf(q[])\nquit\n",
+        "7\n",
+    );
+    test_bc(
+        "define g(x[]){\nreturn(x[0])\n}\ndefine f(){\nauto y[]\ny[0]=42\nreturn(g(y[]))\n}\nf()\nquit\n",
+        "42\n",
+    );
+}
+
+/// A mismatch used to bind the missing parameter to the global of the same
+/// name, and silently drop extra arguments without evaluating them.
+#[test]
+fn test_bc_argument_count_mismatch_is_an_error() {
+    bc_runtime_error(
+        "define f(a,b){\nreturn(b)\n}\nb=5\nf(1)",
+        "runtime error (line 1): wrong number of arguments",
+    );
+    bc_runtime_error(
+        "define f(a){\nreturn(a)\n}\nf(1,2)",
+        "runtime error (line 1): wrong number of arguments",
+    );
+}
+
+/// POSIX makes scale, ibase and obase named expressions, so they increment.
+#[test]
+fn test_bc_register_increment() {
+    // Postfix yields the old value, prefix the new one.
+    test_bc("scale=1\nscale++\nscale\nquit\n", "1\n2\n");
+    test_bc("scale=1\n++scale\nscale\nquit\n", "2\n2\n");
+    test_bc("ibase=9\nibase--\nibase\nquit\n", "9\n8\n");
+    // Stepping obase changes the base the result is then printed in: the old
+    // value 16 and the new value 15 are both rendered in base 15. Verified
+    // against GNU bc.
+    test_bc("obase=16\nobase--\nobase\nquit\n", "11\n10\n");
+    // The bounds still apply. The REPL executes one line at a time, so the
+    // failing line is line 1 of its own program.
+    bc_runtime_error(
+        "ibase=16\nibase++",
+        "runtime error (line 1): ibase must be between 2 and 16",
+    );
+    bc_runtime_error(
+        "obase=2\nobase--",
+        "runtime error (line 1): obase must be greater than 1",
+    );
+}
+
+/// A negative value is out of range in the other direction; reporting it as
+/// "too large" was simply wrong.
+#[test]
+fn test_bc_negative_register_diagnostics() {
+    bc_runtime_error(
+        "scale=-1",
+        "runtime error (line 1): scale cannot be negative",
+    );
+    bc_runtime_error(
+        "obase=-5",
+        "runtime error (line 1): obase must be greater than 1",
+    );
+}
+
+/// Recursion must report a limit rather than abort on a guard page.
+#[test]
+fn test_bc_runaway_recursion_is_diagnosed() {
+    bc_runtime_error_contains(
+        "define f(x){\nreturn(f(x))\n}\nf(1)",
+        "evaluation nested too deeply",
+    );
+}
+
+/// A sparse write must not allocate every element below it.
+#[test]
+fn test_bc_sparse_array() {
+    test_bc("a[16777215]=7\na[16777215]\na[5]\nquit\n", "7\n0\n");
 }
 
 // x^0 is 1 with scale 0, regardless of the scale register (audit #B8).

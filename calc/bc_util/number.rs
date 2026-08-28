@@ -396,6 +396,10 @@ impl Number {
     pub fn is_zero(&self) -> bool {
         self.0.is_zero()
     }
+
+    pub fn is_negative(&self) -> bool {
+        self.0.is_negative()
+    }
 }
 
 impl From<u64> for Number {

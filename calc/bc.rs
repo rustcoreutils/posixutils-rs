@@ -48,7 +48,35 @@ fn print_output_or_error(result: ExecutionResult<String>) -> bool {
     }
 }
 
+/// Stack for the interpreter thread.
+///
+/// Expression and function-call evaluation recurse on the machine stack, and
+/// bc programs recurse legitimately -- a recursive factorial is the textbook
+/// example. The default thread stack bounds that far below `MAX_EVAL_DEPTH`,
+/// so the work runs on a thread large enough that the interpreter's own limit
+/// is what reports the problem, with a diagnostic, instead of the process
+/// aborting on a guard page.
+const INTERPRETER_STACK_SIZE: usize = 512 * 1024 * 1024;
+
 fn main() {
+    match std::thread::Builder::new()
+        .stack_size(INTERPRETER_STACK_SIZE)
+        .spawn(run)
+    {
+        // `run` ends the process itself; join only returns if it panicked.
+        Ok(interpreter) => {
+            if interpreter.join().is_err() {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("bc: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run() {
     setlocale(LocaleCategory::LcAll, "");
     let _ = textdomain("posixutils-rs");
     let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");

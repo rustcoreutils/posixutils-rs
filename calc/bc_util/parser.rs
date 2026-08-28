@@ -391,11 +391,23 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Incr) => {
                 self.advance();
-                Ok(ExprInstruction::PreIncrement(self.parse_named_expr()?))
+                Ok(match self.parse_target()? {
+                    Target::Named(named) => ExprInstruction::PreIncrement(named),
+                    Target::Register(register) => ExprInstruction::IncrementRegister {
+                        register,
+                        prefix: true,
+                    },
+                })
             }
             Some(Token::Decr) => {
                 self.advance();
-                Ok(ExprInstruction::PreDecrement(self.parse_named_expr()?))
+                Ok(match self.parse_target()? {
+                    Target::Named(named) => ExprInstruction::PreDecrement(named),
+                    Target::Register(register) => ExprInstruction::DecrementRegister {
+                        register,
+                        prefix: true,
+                    },
+                })
             }
             Some(Token::Letter(c)) if self.peek_at(1) == Some(&Token::LParen) => {
                 let name = *c;
@@ -423,7 +435,23 @@ impl<'a> Parser<'a> {
                         }
                         Ok(ExprInstruction::Named(named))
                     }
-                    Target::Register(register) => Ok(ExprInstruction::GetRegister(register)),
+                    Target::Register(register) => {
+                        if self.at(&Token::Incr) {
+                            self.advance();
+                            return Ok(ExprInstruction::IncrementRegister {
+                                register,
+                                prefix: false,
+                            });
+                        }
+                        if self.at(&Token::Decr) {
+                            self.advance();
+                            return Ok(ExprInstruction::DecrementRegister {
+                                register,
+                                prefix: false,
+                            });
+                        }
+                        Ok(ExprInstruction::GetRegister(register))
+                    }
                 }
             }
             _ => Err(self.expected("an expression")),

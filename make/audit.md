@@ -356,11 +356,16 @@ findings and reported complete without them. They are unchanged since.
 - [ ] **#64 — Pattern rules never compare timestamps, and `$?` is wrong.** Same
   shortcut: the branch builds prerequisites then runs unconditionally, and fills
   `newer` with every prerequisite rather than the out-of-date ones.
-- [ ] **#65 — A self-referential pattern rule deadlocks.** The pattern branch
-  calls `build_target` without the `find_cycle` check, so `%.a: %.a` re-enters
-  `Ledger::claim` for a target whose `Running` entry it posted itself and blocks
-  on the condvar forever. `Edges::prerequisites_of` cannot see the self-edge
-  either, so adding the check alone would not catch it.
+- [x] **#65 — A self-referential pattern rule deadlocks.** ✓ fixed 2026-08-28.
+  Two halves: the pattern branch never called `find_cycle`, and
+  `Edges::prerequisites_of` went through `rule_by_target_name`, which filters out
+  pattern rules — so even calling the check would have seen no edge. The edge
+  source now falls back to instantiating a matching pattern, and the branch runs
+  the check. `%.a: %.a` reports a recursive prerequisite instead of blocking on
+  the ledger forever. Test `self_referential_pattern_is_a_cycle_not_a_hang`.
+  _Divergence noted: GNU drops a circular dependency with a warning and
+  continues; we error, consistent with how named-rule cycles already behave._
+
 - [ ] **#67 — A multi-line macro deletes every built-in rule.** Built-ins are
   seeded by generating `"{name} ::= {value}\n"` and re-parsing it inside
   `if let Ok(parsed)`. Any `define` body contains a newline, the parse fails, the

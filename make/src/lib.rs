@@ -95,16 +95,33 @@ pub struct Make {
 }
 
 impl graph::Edges for Make {
+    /// The prerequisites the cycle check must see.
+    ///
+    /// A named rule is not the only way a target acquires prerequisites: a `%`
+    /// pattern rule contributes them once instantiated for a concrete name.
+    /// Looking only at named rules made `%.a: %.a` invisible to `find_cycle`,
+    /// so the self-edge went undetected and the build deadlocked on it
+    /// (audit #65).
     fn prerequisites_of(&self, target: &str) -> Vec<String> {
-        match self.rule_by_target_name(target) {
-            Some(rule) => rule
-                .prerequisites()
-                .map(|p| p.as_ref().to_string())
-                .filter(|p| p != WAIT_TARGET)
-                .collect(),
+        let named = self
+            .rule_by_target_name(target)
+            .map(|rule| edge_names(rule.prerequisites()));
+        if let Some(edges) = named {
+            return edges;
+        }
+        match self.find_pattern_rule(target) {
+            Some(rule) => edge_names(rule.prerequisites()),
             None => Vec::new(),
         }
     }
+}
+
+/// Prerequisite names as graph edges. `.WAIT` is a barrier marker, not a target.
+fn edge_names<'a>(prerequisites: impl Iterator<Item = &'a Prerequisite>) -> Vec<String> {
+    prerequisites
+        .map(|p| p.as_ref().to_string())
+        .filter(|p| p != WAIT_TARGET)
+        .collect()
 }
 
 impl Make {
@@ -365,6 +382,12 @@ impl Make {
                     // makefile that writes `%.o: %.c` means it, and must not
                     // lose to the built-in `.c.o`. GNU orders them the same way.
                     if let Some(rule) = self.find_pattern_rule(name.as_ref()) {
+                        // A pattern whose prerequisite matches the same pattern
+                        // makes the target its own prerequisite; without this
+                        // the build blocks on the ledger forever (audit #65).
+                        if let Some(origin) = graph::find_cycle(self, name.as_ref()) {
+                            return Err(RecursivePrerequisite { origin });
+                        }
                         let target = Target::new(name.as_ref());
                         for prerequisite in rule.prerequisites() {
                             self.build_target(prerequisite.as_ref())?;

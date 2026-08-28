@@ -936,11 +936,15 @@ mod special_targets {
         // both recipes must run even though files of those names exist. This
         // used to be asserted against the `-p` mirror table; with that gone the
         // behaviour itself is what to check, which is the better test anyway.
-        for target in ["a", "b"] {
+        // Distinctive names: these files are created in the crate root, which
+        // every test shares. Plain `a`/`b` collided with the parallel fixtures'
+        // target names, making those tests see an up-to-date target and fail
+        // intermittently depending on interleaving.
+        for target in ["phony_probe_a", "phony_probe_b"] {
             let _ = File::create(target);
         }
         let bin = get_binary_path("make");
-        for target in ["a", "b"] {
+        for target in ["phony_probe_a", "phony_probe_b"] {
             let output = Command::new(&bin)
                 .args([
                     "-f",
@@ -955,7 +959,7 @@ mod special_targets {
                 "{target} was treated as up to date: {stdout}"
             );
         }
-        for target in ["a", "b"] {
+        for target in ["phony_probe_a", "phony_probe_b"] {
             let _ = std::fs::remove_file(target);
         }
     }
@@ -1355,6 +1359,16 @@ mod build_graph {
     fn indirect_cycle_is_diagnosed_not_a_stack_overflow() {
         let (_, code) = run(&["-f", "tests/makefiles/graph/indirect_cycle.mk", "a"]);
         assert_eq!(code, Some(8), "expected a clean cycle diagnostic");
+    }
+
+    // Audit #65: a pattern whose prerequisite matches the same pattern makes the
+    // target its own prerequisite. The pattern branch skipped the cycle check,
+    // and `Edges::prerequisites_of` could not see a pattern-contributed edge, so
+    // the build blocked on the ledger condvar forever waiting for itself.
+    #[test]
+    fn self_referential_pattern_is_a_cycle_not_a_hang() {
+        let (_, code) = run(&["-f", "tests/makefiles/graph/pattern_self_cycle.mk", "all"]);
+        assert_eq!(code, Some(8), "expected a cycle diagnostic, not a hang");
     }
 
     // Audit #30: POSIX 105653 lets several rules name one target, with

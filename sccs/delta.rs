@@ -19,8 +19,9 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{
     paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, PfileEntry, SccsDateTime, SccsFile,
-    SccsFlag, Sid, ZLock,
+    SccsFlag, Sid,
 };
+use posixutils_sccs::{diag, mrlist, operands, pfile, sfio, zlock};
 
 /// True if standard input is a terminal.
 fn stdin_is_tty() -> bool {
@@ -36,14 +37,6 @@ fn read_stdin_line() -> String {
         line.pop();
     }
     line
-}
-
-/// Split an MR list on blanks/commas into individual MR numbers.
-fn parse_mr_list(list: &str) -> Vec<String> {
-    list.split([' ', '\t', ','])
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
 }
 
 /// delta - make a delta (change) to an SCCS file
@@ -75,15 +68,10 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-fn get_username() -> String {
-    plib::sccsfile::real_login_name()
-}
-
 /// Find the p-file entry for this user
 fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Result<PfileEntry> {
-    let pfile_path = paths::pfile_from_sfile(sfile_path);
-
-    if !pfile_path.exists() {
+    let entries = pfile::read(sfile_path)?;
+    if entries.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
@@ -95,11 +83,7 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
         ));
     }
 
-    let contents = fs::read_to_string(&pfile_path)?;
-    let entries = plib::sccsfile::parse_pfile(&contents)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    let user = get_username();
+    let user = posixutils_sccs::username();
 
     // Filter to this user's entries
     let user_entries: Vec<_> = entries.into_iter().filter(|e| e.user == user).collect();
@@ -419,7 +403,7 @@ fn apply_diff_to_body(
                 new_body.push(record.clone());
             }
             BodyRecord::Text(_line) => {
-                let visible = is_line_visible(&stack, &applied_set);
+                let visible = plib::sccsfile::is_line_visible(&stack, &applied_set);
 
                 if visible {
                     // Check for inserts before this position
@@ -464,34 +448,9 @@ fn apply_diff_to_body(
     new_body
 }
 
-/// Check if a line should be visible given the current stack state
-fn is_line_visible(stack: &[(bool, u16)], applied_set: &HashSet<u16>) -> bool {
-    for &(is_insert, serial) in stack {
-        if is_insert {
-            if !applied_set.contains(&serial) {
-                return false;
-            }
-        } else if applied_set.contains(&serial) {
-            return false;
-        }
-    }
-    true
-}
-
 /// Remove entry from p-file
 fn remove_pfile_entry(sfile_path: &Path, entry_to_remove: &PfileEntry) -> io::Result<()> {
-    let pfile_path = paths::pfile_from_sfile(sfile_path);
-
-    if !pfile_path.exists() {
-        return Ok(());
-    }
-
-    let contents = fs::read_to_string(&pfile_path)?;
-    let entries = plib::sccsfile::parse_pfile(&contents)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    // Filter out the entry we're removing
-    let remaining: Vec<_> = entries
+    let remaining: Vec<_> = pfile::read(sfile_path)?
         .into_iter()
         .filter(|e| {
             !(e.old_sid == entry_to_remove.old_sid
@@ -500,64 +459,7 @@ fn remove_pfile_entry(sfile_path: &Path, entry_to_remove: &PfileEntry) -> io::Re
         })
         .collect();
 
-    if remaining.is_empty() {
-        // Remove p-file entirely
-        fs::remove_file(&pfile_path)?;
-    } else {
-        // Rewrite p-file with remaining entries
-        let mut file = File::create(&pfile_path)?;
-        for entry in remaining {
-            writeln!(file, "{}", entry.to_line())?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Resolve a `-g` list into delta serial numbers.
-///
-/// The option-argument is a list "as defined by get" (92229), so each
-/// comma-separated element may be a single SID or an inclusive `lo-hi` range.
-/// A bare serial number is also accepted as a convenience. Unknown tokens are
-/// reported and skipped; a range whose first SID is not an ancestor of the
-/// second is fatal, matching `get -i`/`-x`.
-fn resolve_ignore_list(sccs: &SccsFile, list: &str) -> Result<Vec<u16>, String> {
-    let mut serials = Vec::new();
-    for tok in list.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
-        if let Some((lo, hi)) = tok.split_once('-') {
-            let (lo_sid, hi_sid) = match (lo.parse::<Sid>(), hi.parse::<Sid>()) {
-                (Ok(l), Ok(h)) => (l, h),
-                _ => return Err(format!("{}: {}", tok, gettext("invalid SID range"))),
-            };
-            match sccs.ancestor_chain(&lo_sid, &hi_sid) {
-                Some(mut r) => serials.append(&mut r),
-                None => {
-                    return Err(format!(
-                        "{}: {}",
-                        tok,
-                        gettext("first SID in range is not an ancestor of the second")
-                    ))
-                }
-            }
-            continue;
-        }
-
-        if let Ok(sid) = tok.parse::<Sid>() {
-            if let Some(d) = sccs.find_delta_by_sid(&sid) {
-                serials.push(d.serial);
-                continue;
-            }
-        }
-        // Fall back to a bare serial number.
-        if let Ok(serial) = tok.parse::<u16>() {
-            if sccs.find_delta_by_serial(serial).is_some() {
-                serials.push(serial);
-                continue;
-            }
-        }
-        eprintln!("delta: {}: {}", tok, gettext("no such delta"));
-    }
-    Ok(serials)
+    pfile::write(sfile_path, &remaining)
 }
 
 /// Determine the MR list for the new delta, honoring the `v` flag.
@@ -597,7 +499,7 @@ fn gather_mrs(
         }
     };
 
-    let mrs: Vec<String> = raw.as_deref().map(parse_mr_list).unwrap_or_default();
+    let mrs: Vec<String> = mrlist::parse(raw.as_deref());
 
     if !v_set {
         // MRs are only meaningful when the v flag is set.
@@ -681,7 +583,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
 
     // Acquire the per-command z-file lock around the s-file rewrite (POSIX
     // `shall`). If another SCCS command holds it, report and skip.
-    let _zlock = match ZLock::acquire(sfile_path) {
+    let _zlock = match zlock::acquire(sfile_path) {
         Ok(z) => z,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             eprintln!(
@@ -735,10 +637,19 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // A malformed range aborts before anything is written: recording the delta
     // with a silently wrong ignore-list would bake the mistake into history.
     let ignored = match &args.glist {
-        Some(list) => match resolve_ignore_list(&sccs, list) {
-            Ok(v) => v,
+        Some(list) => match sccs.resolve_sid_list(list) {
+            Ok((serials, unresolved)) => {
+                for tok in unresolved {
+                    diag::error_path(
+                        "delta",
+                        sfile_path,
+                        &format!("{}: {}", tok, gettext("no such delta")),
+                    );
+                }
+                serials
+            }
             Err(e) => {
-                eprintln!("delta: {}: {}", sfile_path.display(), e);
+                diag::error_path("delta", sfile_path, &e);
                 return Ok(false);
             }
         },
@@ -751,7 +662,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         delta_type: DeltaType::Normal,
         sid: pfile_entry.new_sid,
         datetime: SccsDateTime::now(),
-        user: get_username(),
+        user: posixutils_sccs::username(),
         serial: new_serial,
         pred_serial: base_serial,
         stats,
@@ -787,24 +698,14 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // Add new delta to header (at the beginning - deltas are stored newest first)
     sccs.header.deltas.insert(0, new_delta);
 
-    // Write atomically via x-file. Register the x-file for SIGINT cleanup
+    // Write atomically via the x-file, which is registered for SIGINT cleanup
     // around the write+rename so an interrupt removes the temporary.
-    let x_file = paths::xfile_from_sfile(sfile_path);
-    let original_perms = fs::metadata(sfile_path)?.permissions();
-
-    let serialized = sccs.to_bytes();
-    plib::sccsfile::register_cleanup(&x_file);
-    let res = (|| -> io::Result<()> {
-        fs::write(&x_file, &serialized)?;
-        fs::set_permissions(&x_file, original_perms)?;
-        fs::rename(&x_file, sfile_path)?;
-        Ok(())
-    })();
-    plib::sccsfile::unregister_cleanup(&x_file);
-    if res.is_err() {
-        let _ = fs::remove_file(&x_file);
-    }
-    res?;
+    sfio::write_xfile_atomic(
+        sfile_path,
+        &paths::xfile_from_sfile(sfile_path),
+        &sccs.to_bytes(),
+        sfio::sfile_perms(sfile_path),
+    )?;
 
     // Remove p-file entry
     remove_pfile_entry(sfile_path, &pfile_entry)?;
@@ -824,7 +725,7 @@ fn main() -> ExitCode {
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
-    plib::sccsfile::install_sigint_cleanup();
+    zlock::install_cleanup();
 
     let args = Args::parse();
 
@@ -842,7 +743,7 @@ fn main() -> ExitCode {
 
     // Expand operands: lone '-' reads pathnames from stdin; directories expand
     // to their sorted s.* members.
-    let files = paths::expand_operands(&args.files);
+    let files = operands::expand(&args.files);
 
     let mut exit_code = ExitCode::SUCCESS;
 

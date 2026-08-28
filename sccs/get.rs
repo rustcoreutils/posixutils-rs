@@ -10,7 +10,7 @@
 //! get - get a version of an SCCS file
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid, ZLock};
+use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid};
+use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, zlock};
 
 /// get - get a version of an SCCS file
 #[derive(Parser)]
@@ -71,161 +72,6 @@ struct Args {
 
     #[arg(required = true, help = gettext("SCCS files to process"))]
     files: Vec<PathBuf>,
-}
-
-fn get_username() -> String {
-    plib::sccsfile::real_login_name()
-}
-
-/// Parse a `-c cutoff` date-time string into (year, month, day, hour, min, sec).
-///
-/// Digits are grouped YY[MM[DD[HH[MM[SS]]]]] with non-numeric separators
-/// ignored. The 2-digit-year POSIX pivot applies: 69-99 => 1900+, 00-68 =>
-/// 2000+. Units omitted from the cutoff default to their maximum possible
-/// value (so `-c 7502` means up to the end of February 1975), per the spec.
-fn parse_cutoff(cutoff: &str) -> Option<(u16, u8, u8, u8, u8, u8)> {
-    let digits: String = cutoff.chars().filter(|c| c.is_ascii_digit()).collect();
-
-    let len = digits.len();
-    if len < 2 {
-        return None;
-    }
-
-    // POSIX -c uses a 2-digit year (YY) with the documented century pivot:
-    // 69-99 => 1900+, 00-68 => 2000+.
-    let yy: u16 = digits[0..2].parse().ok()?;
-    let year = if yy < 69 { 2000 + yy } else { 1900 + yy };
-    let rest = &digits[2..];
-
-    let month = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(12)
-    } else {
-        12
-    };
-    let rest = if rest.len() >= 2 { &rest[2..] } else { "" };
-
-    let day = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(31)
-    } else {
-        31
-    };
-    let rest = if rest.len() >= 2 { &rest[2..] } else { "" };
-
-    let hour = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(23)
-    } else {
-        23
-    };
-    let rest = if rest.len() >= 2 { &rest[2..] } else { "" };
-
-    let min = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(59)
-    } else {
-        59
-    };
-    let rest = if rest.len() >= 2 { &rest[2..] } else { "" };
-
-    let sec = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(59)
-    } else {
-        59
-    };
-
-    // Reject out-of-range fields so an invalid -c cutoff is surfaced as an
-    // error rather than silently filtering nonsensically.
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
-        return None;
-    }
-
-    Some((year, month, day, hour, min, sec))
-}
-
-/// Full 4-digit year for a delta's 2-digit datetime year (POSIX pivot).
-fn delta_full_year(dt: &SccsDateTime) -> u16 {
-    if dt.year < 100 {
-        if dt.year < 69 {
-            2000 + dt.year
-        } else {
-            1900 + dt.year
-        }
-    } else {
-        dt.year
-    }
-}
-
-/// True if the delta was created after the cutoff date-time.
-fn delta_after_cutoff(delta: &DeltaEntry, cutoff: (u16, u8, u8, u8, u8, u8)) -> bool {
-    let dt = &delta.datetime;
-    (
-        delta_full_year(dt),
-        dt.month,
-        dt.day,
-        dt.hour,
-        dt.minute,
-        dt.second,
-    ) > cutoff
-}
-
-/// Resolve a comma/space-separated SID list (e.g. "1.2,1.3") into the set of
-/// delta serial numbers. Unknown SIDs are reported and skipped.
-/// Resolve an -i/-x option-argument into delta serials.
-///
-/// The list grammar is `<list> ::= <range> | <list> , <range>` with
-/// `<range> ::= SID | SID - SID` (99085-99087). A SID never contains '-', so
-/// the separator is unambiguous.
-fn resolve_sid_list(sccs: &SccsFile, list: &str) -> Result<Vec<u16>, String> {
-    let mut serials = Vec::new();
-    for tok in list.split([',', ' ']).filter(|s| !s.is_empty()) {
-        if let Some((lo, hi)) = tok.split_once('-') {
-            let (lo_sid, hi_sid) = match (lo.parse::<Sid>(), hi.parse::<Sid>()) {
-                (Ok(l), Ok(h)) => (l, h),
-                _ => return Err(format!("{}: {}", tok, gettext("invalid SID range"))),
-            };
-            match sccs.ancestor_chain(&lo_sid, &hi_sid) {
-                Some(mut r) => serials.append(&mut r),
-                // "A diagnostic message shall be written if the first SID in
-                // the range is not an ancestor of the second SID."
-                None => {
-                    return Err(format!(
-                        "{}: {}",
-                        tok,
-                        gettext("first SID in range is not an ancestor of the second")
-                    ))
-                }
-            }
-            continue;
-        }
-
-        match tok.parse::<Sid>() {
-            Ok(sid) => {
-                if let Some(d) = sccs.find_delta_by_sid(&sid) {
-                    serials.push(d.serial);
-                } else {
-                    eprintln!("get: {}: {}", tok, gettext("no such delta"));
-                }
-            }
-            Err(_) => {
-                eprintln!("get: {}: {}", tok, gettext("invalid SID"));
-            }
-        }
-    }
-    Ok(serials)
-}
-
-/// True if `ancestor` is `serial` itself or appears in `serial`'s predecessor
-/// chain (used to cascade -x exclusions to descendant deltas).
-fn is_descendant_of(sccs: &SccsFile, serial: u16, ancestor: u16) -> bool {
-    let mut cur = serial;
-    while cur != 0 {
-        if cur == ancestor {
-            return true;
-        }
-        match sccs.find_delta_by_serial(cur) {
-            Some(d) => cur = d.pred_serial,
-            None => break,
-        }
-    }
-    false
 }
 
 /// Expand SCCS keywords in a line
@@ -453,7 +299,7 @@ fn find_top_delta<'a>(
         .filter(|d| release.is_none_or(|r| d.sid.rel == r))
         .max_by(|a, b| {
             let ka = (
-                delta_full_year(&a.datetime),
+                cutoff::full_year(&a.datetime),
                 a.datetime.month,
                 a.datetime.day,
                 a.datetime.hour,
@@ -462,7 +308,7 @@ fn find_top_delta<'a>(
                 a.serial,
             );
             let kb = (
-                delta_full_year(&b.datetime),
+                cutoff::full_year(&b.datetime),
                 b.datetime.month,
                 b.datetime.day,
                 b.datetime.hour,
@@ -548,40 +394,19 @@ fn compute_new_sid(
 
 /// Check if there's an existing p-file entry for this SID
 fn check_pfile_lock(sfile_path: &Path, new_sid: &Sid) -> Result<(), String> {
-    let pfile_path = paths::pfile_from_sfile(sfile_path);
-    if pfile_path.exists() {
-        let contents = fs::read_to_string(&pfile_path)
-            .map_err(|e| format!("{}: {}", gettext("Cannot read p-file"), e))?;
+    let entries =
+        pfile::read(sfile_path).map_err(|e| format!("{}: {}", gettext("Invalid p-file"), e))?;
 
-        for entry in plib::sccsfile::parse_pfile(&contents)
-            .map_err(|e| format!("{}: {}", gettext("Invalid p-file"), e))?
-        {
-            if entry.new_sid == *new_sid {
-                return Err(format!(
-                    "{} {} {} {}",
-                    gettext("SID"),
-                    new_sid,
-                    gettext("is being edited by"),
-                    entry.user
-                ));
-            }
-        }
+    match pfile::find_by_new_sid(&entries, new_sid) {
+        Some(entry) => Err(format!(
+            "{} {} {} {}",
+            gettext("SID"),
+            new_sid,
+            gettext("is being edited by"),
+            entry.user
+        )),
+        None => Ok(()),
     }
-    Ok(())
-}
-
-/// True if the line contains an SCCS identification keyword of the form `%X%`
-/// where X is a single uppercase letter.
-fn line_has_id_keyword(line: &str) -> bool {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        if bytes[i] == b'%' && bytes[i + 1].is_ascii_uppercase() && bytes[i + 2] == b'%' {
-            return true;
-        }
-        i += 1;
-    }
-    false
 }
 
 /// Create or append to p-file
@@ -592,31 +417,16 @@ fn create_pfile_entry(
     included: Option<String>,
     excluded: Option<String>,
 ) -> io::Result<()> {
-    let pfile_path = paths::pfile_from_sfile(sfile_path);
-    let user = get_username();
-    let now = SccsDateTime::now();
-
     let entry = PfileEntry {
         old_sid: *old_sid,
         new_sid: *new_sid,
-        user,
-        datetime: now,
+        user: posixutils_sccs::username(),
+        datetime: SccsDateTime::now(),
         included,
         excluded,
     };
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&pfile_path)?;
-
-    writeln!(file, "{}", entry.to_line())?;
-
-    // Set permissions: writable by owner only
-    let perms = fs::Permissions::from_mode(0o644);
-    fs::set_permissions(&pfile_path, perms)?;
-
-    Ok(())
+    pfile::append(sfile_path, &entry)
 }
 
 /// Evaluate body with SID tracking for -m option
@@ -651,7 +461,7 @@ fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(S
                 }
             }
             BodyRecord::Text(line) => {
-                if is_line_visible(&stack, applied_set) {
+                if plib::sccsfile::is_line_visible(&stack, applied_set) {
                     // Find which delta inserted this line
                     let inserting_serial = current_insert_serial.unwrap_or(1);
                     let sid = sccs
@@ -665,20 +475,6 @@ fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(S
     }
 
     output
-}
-
-/// Check if a line should be visible given the current stack state
-fn is_line_visible(stack: &[(bool, u16)], applied_set: &HashSet<u16>) -> bool {
-    for &(is_insert, serial) in stack {
-        if is_insert {
-            if !applied_set.contains(&serial) {
-                return false;
-            }
-        } else if applied_set.contains(&serial) {
-            return false;
-        }
-    }
-    true
 }
 
 /// Render the delta-summary table (the l-file body). Deltas are listed newest
@@ -790,10 +586,10 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // early-return (encoded) path below and is removed on every return.
     let _zlock;
     let new_sid = if args.edit {
-        _zlock = match ZLock::acquire(sfile_path) {
+        _zlock = match zlock::acquire(sfile_path) {
             Ok(z) => z,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                eprintln!("get: {}: {}", sfile_path.display(), gettext("being edited"));
+            Err(e) if zlock::is_held(&e) => {
+                diag::error_path("get", sfile_path, &gettext("being edited"));
                 return Ok(false);
             }
             Err(e) => return Err(e),
@@ -823,8 +619,17 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // written from the wrong delta set.
     let mut list_error = None;
     let mut resolve = |list: Option<&str>| -> Vec<u16> {
-        match list.map(|l| resolve_sid_list(&sccs, l)) {
-            Some(Ok(v)) => v,
+        match list.map(|l| sccs.resolve_sid_list(l)) {
+            Some(Ok((serials, unresolved))) => {
+                for tok in unresolved {
+                    diag::error_path(
+                        "get",
+                        sfile_path,
+                        &format!("{}: {}", tok, gettext("no such delta")),
+                    );
+                }
+                serials
+            }
             Some(Err(e)) => {
                 list_error.get_or_insert(e);
                 Vec::new()
@@ -835,7 +640,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     let included_serials: Vec<u16> = resolve(args.include.as_deref());
     let excluded_serials: Vec<u16> = resolve(args.exclude.as_deref());
     if let Some(e) = list_error {
-        eprintln!("get: {}: {}", sfile_path.display(), e);
+        diag::error_path("get", sfile_path, &e);
         return Ok(false);
     }
 
@@ -846,7 +651,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
 
     // -c cutoff: drop any applied delta created after the cutoff date-time.
     if let Some(cutoff_str) = args.cutoff.as_deref() {
-        let cutoff = parse_cutoff(cutoff_str).ok_or_else(|| {
+        let cutoff = cutoff::parse(cutoff_str).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{}: '{}'", gettext("Invalid cutoff date"), cutoff_str),
@@ -854,7 +659,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         })?;
         applied_set.retain(|&serial| {
             sccs.find_delta_by_serial(serial)
-                .map(|d| !delta_after_cutoff(d, cutoff))
+                .map(|d| !cutoff.is_after(d))
                 .unwrap_or(false)
         });
     }
@@ -879,7 +684,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             .filter(|&s| {
                 excluded_serials
                     .iter()
-                    .any(|&x| is_descendant_of(&sccs, s, x))
+                    .any(|&x| sccs.is_descendant_of(s, x))
             })
             .collect();
         excluded_effective.sort_by_key(|&s| {
@@ -1018,7 +823,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             .into_iter()
             .enumerate()
             .map(|(i, (line, sid))| {
-                if line_has_id_keyword(&line) {
+                if idkw::in_line(&line) {
                     had_keyword = true;
                 }
                 let expanded = if suppress_keywords {
@@ -1042,7 +847,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             .into_iter()
             .enumerate()
             .map(|(i, line)| {
-                if line_has_id_keyword(&line) {
+                if idkw::in_line(&line) {
                     had_keyword = true;
                 }
                 let expanded = if suppress_keywords {
@@ -1135,14 +940,12 @@ fn main() -> ExitCode {
 
     // Expand operands: a lone "-" reads s-file pathnames from stdin, and
     // directory operands expand to their sorted s.* members.
-    let files = paths::expand_operands(&args.files);
+    let files = operands::expand(&args.files);
 
     // Per spec, when a directory or standard input ("-") is named, each
     // pathname is written before its output even if it resolves to a single
     // file.
-    let multiple_files = files.len() > 1
-        || (args.files.len() == 1 && args.files[0].as_os_str() == "-")
-        || args.files.iter().any(|p| p.is_dir());
+    let multiple_files = operands::wants_banner(&args.files, &files);
     let mut exit_code = ExitCode::SUCCESS;
 
     for file_path in &files {
@@ -1150,7 +953,7 @@ fn main() -> ExitCode {
             Ok(true) => {}
             Ok(false) => exit_code = ExitCode::FAILURE,
             Err(e) => {
-                eprintln!("get: {}: {}", file_path.display(), e);
+                diag::error_path("get", file_path, &e.to_string());
                 exit_code = ExitCode::FAILURE;
             }
         }

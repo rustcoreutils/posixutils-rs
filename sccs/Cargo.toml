@@ -19,6 +19,10 @@ libc.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "posixutils_sccs"
+path = "./lib.rs"
+
 [[bin]]
 name = "what"
 path = "./what.rs"

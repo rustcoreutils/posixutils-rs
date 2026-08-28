@@ -604,6 +604,42 @@ pub struct DeltaEntry {
 // SCCS Flags
 // =============================================================================
 
+/// The release list carried by the `l` flag (POSIX 84047-84054).
+///
+/// The `a` form locks *every* release, which is the opposite of locking none.
+/// Encoding `a` as an empty `Vec` made the two indistinguishable, so `:LK:`
+/// reported `none` for the most restrictive setting a file can carry. The
+/// distinction belongs in the type, not in a convention about vector length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseLock {
+    /// `l a` - every release is locked.
+    All,
+    /// `l <list>` - only the named releases are locked.
+    List(Vec<u16>),
+}
+
+impl ReleaseLock {
+    /// True if deltas to `rel` are forbidden.
+    pub fn locks(&self, rel: u16) -> bool {
+        match self {
+            ReleaseLock::All => true,
+            ReleaseLock::List(v) => v.contains(&rel),
+        }
+    }
+
+    /// The flag value as it appears in the s-file and in `prs -d:LK:`.
+    pub fn value_string(&self) -> String {
+        match self {
+            ReleaseLock::All => "a".to_string(),
+            ReleaseLock::List(v) => v
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    }
+}
+
 /// SCCS file flags (from ^Af lines)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SccsFlag {
@@ -621,8 +657,8 @@ pub enum SccsFlag {
     IdKeywordError(Option<String>),
     /// 'j' - Joint edit allowed
     JointEdit,
-    /// 'l' <list> - Locked releases
-    LockedReleases(Vec<u16>),
+    /// 'l' <list> - Locked releases (`a` == all, see [`ReleaseLock`])
+    LockedReleases(ReleaseLock),
     /// 'm' <name> - Module name
     ModuleName(String),
     /// 'n' - Create null deltas
@@ -673,14 +709,13 @@ impl SccsFlag {
             'j' => Ok(SccsFlag::JointEdit),
             'l' => {
                 if value == "a" {
-                    // 'a' means all releases
-                    Ok(SccsFlag::LockedReleases(vec![]))
+                    Ok(SccsFlag::LockedReleases(ReleaseLock::All))
                 } else {
                     let releases: Result<Vec<u16>, _> =
                         value.split(',').map(|s| s.trim().parse()).collect();
-                    Ok(SccsFlag::LockedReleases(releases.map_err(|_| {
-                        SccsError::InvalidFlag(format!("l{}", value))
-                    })?))
+                    Ok(SccsFlag::LockedReleases(ReleaseLock::List(
+                        releases.map_err(|_| SccsError::InvalidFlag(format!("l{}", value)))?,
+                    )))
                 }
             }
             'm' => Ok(SccsFlag::ModuleName(value.to_string())),
@@ -728,16 +763,7 @@ impl SccsFlag {
             SccsFlag::Floor(n) => n.to_string(),
             SccsFlag::IdKeywordError(s) => s.clone().unwrap_or_default(),
             SccsFlag::JointEdit => String::new(),
-            SccsFlag::LockedReleases(v) => {
-                if v.is_empty() {
-                    "a".to_string()
-                } else {
-                    v.iter()
-                        .map(|n| n.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }
-            }
+            SccsFlag::LockedReleases(lock) => lock.value_string(),
             SccsFlag::ModuleName(s) => s.clone(),
             SccsFlag::NullDelta => String::new(),
             SccsFlag::QText(s) => s.clone(),
@@ -1197,10 +1223,183 @@ impl SccsFile {
             .iter()
             .any(|f| matches!(f, SccsFlag::JointEdit))
     }
+
+    /// Ceiling release, the highest release `get -e` may retrieve (`c` flag,
+    /// POSIX 84030-84032). "The default value for an unspecified c flag shall
+    /// be 9 999."
+    pub fn ceiling(&self) -> u16 {
+        self.header
+            .flags
+            .iter()
+            .find_map(|f| match f {
+                SccsFlag::Ceiling(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(9999)
+    }
+
+    /// Floor release, the lowest release `get -e` may retrieve (`f` flag,
+    /// POSIX 84033-84035). "The default value for an unspecified f flag shall
+    /// be 1."
+    pub fn floor(&self) -> u16 {
+        self.header
+            .flags
+            .iter()
+            .find_map(|f| match f {
+                SccsFlag::Floor(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(1)
+    }
+
+    /// Default SID for a `get` with no `-r` (`d` flag, POSIX 84036).
+    pub fn default_sid(&self) -> Option<Sid> {
+        self.header.flags.iter().find_map(|f| match f {
+            SccsFlag::DefaultSid(sid) => Some(*sid),
+            _ => None,
+        })
+    }
+
+    /// Releases closed to further deltas (`l` flag, POSIX 84047-84054).
+    pub fn locked_releases(&self) -> Option<&ReleaseLock> {
+        self.header.flags.iter().find_map(|f| match f {
+            SccsFlag::LockedReleases(lock) => Some(lock),
+            _ => None,
+        })
+    }
+
+    /// MR-number validation program (`v` flag). The outer `Option` is "flag
+    /// absent", the inner one "flag present with no program".
+    pub fn mr_program(&self) -> Option<Option<&str>> {
+        self.header.flags.iter().find_map(|f| match f {
+            SccsFlag::MrValidation(p) => Some(p.as_deref()),
+            _ => None,
+        })
+    }
+
+    /// User-defined `%Q%` text (`q` flag).
+    pub fn q_text(&self) -> Option<&str> {
+        self.header.flags.iter().find_map(|f| match f {
+            SccsFlag::QText(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    /// ID-keyword check (`i` flag). The outer `Option` is "flag absent" (the
+    /// missing-keyword message is only a warning); the inner one is the
+    /// optional exact-match string. POSIX 84037-84043.
+    pub fn id_keyword_check(&self) -> Option<Option<&str>> {
+        self.header.flags.iter().find_map(|f| match f {
+            SccsFlag::IdKeywordError(s) => Some(s.as_deref()),
+            _ => None,
+        })
+    }
+
+    /// The set of deltas applied when reconstructing `base_serial`, adjusted
+    /// by forced `-i` inclusions and `-x` exclusions.
+    ///
+    /// `-i` is applied *after* `-x` because POSIX 99084 defines the included
+    /// list as "forced to be applied": a delta named by both options ends up
+    /// applied. CSSC resolves the overlap the same way. Including a delta
+    /// pulls in its whole predecessor chain; excluding one drops only the
+    /// named delta, since its descendants may still be wanted.
+    pub fn applied_set_with(
+        &self,
+        base_serial: u16,
+        included: &[u16],
+        excluded: &[u16],
+    ) -> SccsResult<HashSet<u16>> {
+        let mut set = self.compute_applied_set(base_serial)?;
+
+        for x in excluded {
+            set.remove(x);
+        }
+
+        for &inc in included {
+            let mut cur = inc;
+            while cur != 0 {
+                set.insert(cur);
+                match self.find_delta_by_serial(cur) {
+                    Some(d) => cur = d.pred_serial,
+                    None => break,
+                }
+            }
+        }
+
+        Ok(set)
+    }
+
+    /// True if `serial` is `ancestor` itself, or has it in its predecessor
+    /// chain. Used to cascade `-x` exclusions to descendant deltas for the
+    /// `Excluded:` notation.
+    pub fn is_descendant_of(&self, serial: u16, ancestor: u16) -> bool {
+        let mut cur = serial;
+        while cur != 0 {
+            if cur == ancestor {
+                return true;
+            }
+            match self.find_delta_by_serial(cur) {
+                Some(d) => cur = d.pred_serial,
+                None => break,
+            }
+        }
+        false
+    }
+
+    /// Resolve a `-i`/`-x`/`-g` list into delta serial numbers.
+    ///
+    /// The grammar is POSIX 99085-99087: `<list> ::= <range> | <list> , <range>`
+    /// and `<range> ::= SID | SID - SID`. Separators are commas, spaces and
+    /// tabs. A bare integer that names no SID is taken as a serial number,
+    /// which is how historical SCCS accepted the `-g` list.
+    ///
+    /// A malformed range is a hard error: silently recording the wrong list
+    /// would bake the mistake into the delta table. A token that merely names
+    /// no such delta is reported by the caller and skipped.
+    pub fn resolve_sid_list(&self, list: &str) -> Result<(Vec<u16>, Vec<String>), String> {
+        let mut serials = Vec::new();
+        let mut unresolved = Vec::new();
+
+        for tok in list.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+            if let Some((lo, hi)) = tok.split_once('-') {
+                let (lo_sid, hi_sid) = match (lo.parse::<Sid>(), hi.parse::<Sid>()) {
+                    (Ok(l), Ok(h)) => (l, h),
+                    _ => return Err(format!("{}: invalid SID range", tok)),
+                };
+                match self.ancestor_chain(&lo_sid, &hi_sid) {
+                    Some(mut r) => serials.append(&mut r),
+                    // "A diagnostic message shall be written if the first SID
+                    // in the range is not an ancestor of the second SID."
+                    None => {
+                        return Err(format!(
+                            "{}: first SID in range is not an ancestor of the second",
+                            tok
+                        ))
+                    }
+                }
+                continue;
+            }
+
+            if let Ok(sid) = tok.parse::<Sid>() {
+                if let Some(d) = self.find_delta_by_sid(&sid) {
+                    serials.push(d.serial);
+                    continue;
+                }
+            }
+
+            // Fall back to a bare serial number before giving up.
+            match tok.parse::<u16>() {
+                Ok(n) if self.find_delta_by_serial(n).is_some() => serials.push(n),
+                _ => unresolved.push(tok.to_string()),
+            }
+        }
+
+        Ok((serials, unresolved))
+    }
 }
 
 /// Check if a line should be visible given the current stack state
-fn is_line_visible(stack: &[(bool, u16)], applied_set: &HashSet<u16>) -> bool {
+pub fn is_line_visible(stack: &[(bool, u16)], applied_set: &HashSet<u16>) -> bool {
     for &(is_insert, serial) in stack {
         if is_insert {
             // Insert block: line visible only if serial is in applied set
@@ -1596,6 +1795,20 @@ impl<'a> SccsParser<'a> {
 // =============================================================================
 // Checksum
 // =============================================================================
+
+/// The checksum over an s-file's stored bytes: everything after the first
+/// line, which is the `^Ah` checksum line itself.
+///
+/// `admin -h` and `val` each open-coded this, and guarded it differently:
+/// `admin` with `content_start < data.len()`, `val` with `<=`. No s-file that
+/// parses can tell the two apart — even a body-less file has a delta table
+/// after the checksum line — but two spellings of one rule is how the next
+/// difference becomes reachable.
+pub fn stored_body_checksum(data: &[u8]) -> u16 {
+    let newline_pos = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+    let body = data.get(newline_pos + 1..).unwrap_or(&[]);
+    compute_checksum(body)
+}
 
 /// Compute SCCS checksum (sum of all bytes modulo 65536)
 pub fn compute_checksum(data: &[u8]) -> u16 {

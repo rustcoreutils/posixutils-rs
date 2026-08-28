@@ -759,3 +759,62 @@ fn delta_sigint_removes_transient_files() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "l1\n");
 }
+
+/// `admin -m` split its MR list on whitespace and `delta -m` split on
+/// whitespace *and* commas, so the same option-argument produced one MR from
+/// one utility and two from the other. CSSC 1.4.1 records one MR named `1,2`
+/// in both cases: a comma is an ordinary character inside an MR number, not a
+/// separator.
+#[test]
+fn delta_m_treats_a_comma_as_part_of_the_mr_number() {
+    assert_eq!(mrs_of_a_delta_made_with("mrcomma", "-m1,2"), vec!["1,2"]);
+}
+
+/// Blanks, by contrast, do separate MR numbers — in both utilities.
+#[test]
+fn delta_m_splits_the_mr_list_on_blanks() {
+    assert_eq!(mrs_of_a_delta_made_with("mrblank", "-m3 4"), vec!["3", "4"]);
+}
+
+/// Build a one-delta file with the `v` flag set, commit a second delta passing
+/// `mopt`, and report the `:MR:` lines recorded for it.
+fn mrs_of_a_delta_made_with(name: &str, mopt: &str) -> Vec<String> {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join(format!("s.{}", name));
+    let sfile_s = sfile.to_string_lossy().to_string();
+
+    // The v flag is what makes MR numbers acceptable at all.
+    let out = super::common::run_in(
+        "admin",
+        &["-i", "-fv", "-minit", &sfile_s],
+        tmp.path(),
+        "a\n",
+    );
+    assert!(
+        out.status.success(),
+        "admin: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("get", &["-e", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.path().join(name), "a\nb\n").unwrap();
+
+    let out = super::common::run_in("delta", &[mopt, "-ychanged", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("prs", &["-d:MR:", "-r1.2", &sfile_s], tmp.path(), "");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}

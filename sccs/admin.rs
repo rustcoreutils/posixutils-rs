@@ -19,8 +19,9 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{
     paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, SccsDateTime, SccsFile, SccsFlag,
-    SccsHeader, Sid, ZLock,
+    SccsHeader, Sid,
 };
+use posixutils_sccs::{diag, idkw, mrlist, sfio, zlock};
 
 /// admin - create and administer SCCS files
 #[derive(Parser)]
@@ -110,18 +111,6 @@ where
     (opts, rest)
 }
 
-/// Split a `-m` mrlist option-argument into individual MR numbers.
-fn attached_mr_list(mrlist: Option<&str>) -> Vec<String> {
-    match mrlist {
-        Some(s) => s.split_whitespace().map(String::from).collect(),
-        None => Vec::new(),
-    }
-}
-
-fn get_username() -> String {
-    plib::sccsfile::real_login_name()
-}
-
 fn read_input_file(path: Option<&str>) -> io::Result<Vec<u8>> {
     let mut reader: Box<dyn BufRead> = match path {
         Some(p) => Box::new(BufReader::new(File::open(p)?)),
@@ -201,19 +190,6 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     Ok(flag)
 }
 
-/// Whether `data` contains an SCCS identification keyword of the form `%X%`
-/// where X is an uppercase ASCII letter (matching get/delta's keyword set).
-fn content_has_id_keyword(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 2 < data.len() {
-        if data[i] == b'%' && data[i + 1].is_ascii_uppercase() && data[i + 2] == b'%' {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
 /// Inputs for creating a new SCCS file.
 struct NewFileParams<'a> {
     content: Vec<u8>,
@@ -225,48 +201,9 @@ struct NewFileParams<'a> {
     mr_numbers: Vec<String>,
 }
 
-/// Acquire the per-command z-file lock, mapping the "already locked" case to a
-/// clear diagnostic so the caller's `Err` arm reports the s-file is being
-/// edited rather than a raw "File exists".
-fn acquire_zlock(path: &Path) -> io::Result<ZLock> {
-    ZLock::acquire(path).map_err(|e| {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                gettext("being edited (z-file lock held)"),
-            )
-        } else {
-            e
-        }
-    })
-}
-
-/// Write `serialized` to the x-file, apply `perms`, and atomically rename over
-/// `path`. The x-file is registered for SIGINT cleanup for the duration of the
-/// write+rename, and removed on error.
-fn write_xfile_atomic(
-    path: &Path,
-    x_file: &Path,
-    serialized: &[u8],
-    perms: fs::Permissions,
-) -> io::Result<()> {
-    plib::sccsfile::register_cleanup(x_file);
-    let res = (|| -> io::Result<()> {
-        fs::write(x_file, serialized)?;
-        fs::set_permissions(x_file, perms)?;
-        fs::rename(x_file, path)?;
-        Ok(())
-    })();
-    plib::sccsfile::unregister_cleanup(x_file);
-    if res.is_err() {
-        let _ = fs::remove_file(x_file);
-    }
-    res
-}
-
 fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     // Per-command z-file lock around the create.
-    let _zlock = acquire_zlock(path)?;
+    let _zlock = zlock::acquire(path)?;
 
     let NewFileParams {
         content,
@@ -293,7 +230,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     }
 
     let now = SccsDateTime::now();
-    let user = get_username();
+    let user = posixutils_sccs::username();
 
     // Create default comment if not provided
     let comment_text = match comment {
@@ -310,7 +247,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     let encoded = content_needs_encoding(&content);
 
     // Warn (non-fatal) when a text body has no SCCS id keyword, matching cssc.
-    if !encoded && !content_has_id_keyword(&content) {
+    if !encoded && !idkw::contains(&content) {
         eprintln!(
             "admin: {}: {}: {}",
             gettext("warning"),
@@ -381,7 +318,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     let serialized = sccs.to_bytes();
 
     // SCCS s-files are read-only (r--r--r--).
-    write_xfile_atomic(
+    sfio::write_xfile_atomic(
         path,
         &x_file,
         &serialized,
@@ -397,29 +334,28 @@ fn check_sccs_file(path: &Path) -> io::Result<bool> {
     // Parse to verify structure
     match SccsFile::from_bytes(&data) {
         Ok(sccs) => {
-            // Verify checksum
-            // Find end of first line (checksum line)
-            let newline_pos = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
-            let content_start = newline_pos + 1;
-
-            if content_start < data.len() {
-                let computed = plib::sccsfile::compute_checksum(&data[content_start..]);
-                if computed != sccs.header.checksum {
-                    eprintln!(
-                        "{}: {} {}, {} {}",
-                        path.display(),
+            // Verify the checksum. A header-only s-file has an empty body,
+            // which still has a checksum: skipping the check for it let
+            // `admin -h` pass a file `val` rejected.
+            let computed = plib::sccsfile::stored_body_checksum(&data);
+            if computed != sccs.header.checksum {
+                diag::error_path(
+                    "admin",
+                    path,
+                    &format!(
+                        "{} {}, {} {}",
                         gettext("checksum error: stored"),
                         sccs.header.checksum,
                         gettext("computed"),
                         computed
-                    );
-                    return Ok(false);
-                }
+                    ),
+                );
+                return Ok(false);
             }
             Ok(true)
         }
         Err(e) => {
-            eprintln!("{}: {}", path.display(), e);
+            diag::error_path("admin", path, &e.to_string());
             Ok(false)
         }
     }
@@ -427,7 +363,7 @@ fn check_sccs_file(path: &Path) -> io::Result<bool> {
 
 fn recompute_checksum(path: &Path) -> io::Result<()> {
     // Per-command z-file lock around the rewrite.
-    let _zlock = acquire_zlock(path)?;
+    let _zlock = zlock::acquire(path)?;
 
     // Read and parse
     let sccs = SccsFile::from_path(path)
@@ -440,7 +376,7 @@ fn recompute_checksum(path: &Path) -> io::Result<()> {
     // Get original permissions
     let original_perms = fs::metadata(path)?.permissions();
 
-    write_xfile_atomic(path, &x_file, &serialized, original_perms)?;
+    sfio::write_xfile_atomic(path, &x_file, &serialized, original_perms)?;
 
     Ok(())
 }
@@ -454,7 +390,7 @@ fn modify_existing_file(
     remove_users: Vec<String>,
 ) -> io::Result<()> {
     // Per-command z-file lock around the modify.
-    let _zlock = acquire_zlock(path)?;
+    let _zlock = zlock::acquire(path)?;
 
     // Read existing file
     let mut sccs = SccsFile::from_path(path)
@@ -495,7 +431,7 @@ fn modify_existing_file(
     let original_perms = fs::metadata(path)?.permissions();
 
     let serialized = sccs.to_bytes();
-    write_xfile_atomic(path, &x_file, &serialized, original_perms)?;
+    sfio::write_xfile_atomic(path, &x_file, &serialized, original_perms)?;
 
     Ok(())
 }
@@ -505,7 +441,7 @@ fn main() -> ExitCode {
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
-    plib::sccsfile::install_sigint_cleanup();
+    zlock::install_cleanup();
 
     // Pre-process argv to strip the attached-only options (-i/-t/-y) before
     // clap parses; clap cannot express "attached value only".
@@ -548,7 +484,7 @@ fn main() -> ExitCode {
         .any(|f| matches!(f, SccsFlag::MrValidation(_)));
 
     // Parse -m MR numbers (whitespace-separated list).
-    let mr_numbers: Vec<String> = attached_mr_list(args.mrlist.as_deref());
+    let mr_numbers: Vec<String> = mrlist::parse(args.mrlist.as_deref());
 
     // -m requires the v flag (spec: "the application shall ensure that the v
     // flag is set"). Diagnose using cssc-compatible wording.

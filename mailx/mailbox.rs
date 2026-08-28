@@ -12,7 +12,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 
-use crate::message::{truncate_display, Message, MessageState};
+use crate::message::{truncate_display, Disposition, Message, ReadState};
 use crate::variables::Variables;
 
 /// A mailbox containing messages
@@ -70,7 +70,7 @@ impl Mailbox {
                 // (spec 104491-104496); a Status: header may downgrade it below.
                 let mut msg = Message::new();
                 msg.from_line = line;
-                msg.state = MessageState::New;
+                msg.read = ReadState::New;
                 current_msg = Some(msg);
                 in_headers = true;
                 header_continuation = false;
@@ -105,9 +105,9 @@ impl Mailbox {
                         // Absence of Status: leaves the message `new`.
                         if key == "status" {
                             if value.contains('R') {
-                                msg.state = MessageState::Read;
+                                msg.read = ReadState::Read;
                             } else if value.contains('O') {
-                                msg.state = MessageState::Unread;
+                                msg.read = ReadState::Unread;
                             }
                         }
 
@@ -143,7 +143,7 @@ impl Mailbox {
         mailbox.current = mailbox
             .messages
             .iter()
-            .position(|m| m.state == MessageState::New || m.state == MessageState::Unread)
+            .position(|m| m.read == ReadState::New || m.read == ReadState::Unread)
             .map(|i| i + 1)
             .unwrap_or(if mailbox.messages.is_empty() { 0 } else { 1 });
 
@@ -159,7 +159,7 @@ impl Mailbox {
     pub fn undeleted_count(&self) -> usize {
         self.messages
             .iter()
-            .filter(|m| m.state != MessageState::Deleted)
+            .filter(|m| m.disposition != Disposition::Deleted)
             .count()
     }
 
@@ -189,7 +189,7 @@ impl Mailbox {
     /// Find first undeleted message after the given number
     pub fn next_undeleted(&self, after: usize) -> Option<usize> {
         for i in after..self.messages.len() {
-            if self.messages[i].state != MessageState::Deleted {
+            if self.messages[i].disposition != Disposition::Deleted {
                 return Some(i + 1);
             }
         }
@@ -202,7 +202,7 @@ impl Mailbox {
             return None;
         }
         for i in (0..before - 1).rev() {
-            if self.messages[i].state != MessageState::Deleted {
+            if self.messages[i].disposition != Disposition::Deleted {
                 return Some(i + 1);
             }
         }
@@ -212,7 +212,7 @@ impl Mailbox {
     /// Find first deleted message after current for undelete
     pub fn next_deleted(&self, after: usize) -> Option<usize> {
         for i in after..self.messages.len() {
-            if self.messages[i].state == MessageState::Deleted {
+            if self.messages[i].disposition == Disposition::Deleted {
                 return Some(i + 1);
             }
         }
@@ -225,7 +225,7 @@ impl Mailbox {
             return None;
         }
         for i in (0..before - 1).rev() {
-            if self.messages[i].state == MessageState::Deleted {
+            if self.messages[i].disposition == Disposition::Deleted {
                 return Some(i + 1);
             }
         }
@@ -245,7 +245,7 @@ impl Mailbox {
         for &num in nums.iter().take(screen) {
             if let Some(msg) = self.get(num) {
                 let current_marker = if num == self.current { '>' } else { ' ' };
-                let state_char = msg.state.status_char();
+                let state_char = msg.status_char();
 
                 // Decide whether to show To or From
                 let address_field = if show_to && msg.from().contains(&user) {
@@ -271,9 +271,9 @@ impl Mailbox {
     pub fn quit(&mut self, vars: &Variables) -> Result<(), String> {
         if !self.modified
             && !self.messages.iter().any(|m| {
-                m.state == MessageState::Read
-                    || m.state == MessageState::Deleted
-                    || m.state == MessageState::Saved
+                m.read == ReadState::Read
+                    || m.disposition == Disposition::Deleted
+                    || m.disposition == Disposition::Saved
             })
         {
             return Ok(());
@@ -290,32 +290,27 @@ impl Mailbox {
         for msg in &self.messages {
             // The mbox/touch commands force a message into the secondary mbox,
             // overriding a set `hold` variable (spec 104853-104855).
-            if msg.force_mbox && msg.state != MessageState::Deleted {
+            if msg.force_mbox && msg.disposition != Disposition::Deleted {
                 mbox_messages.push(msg.clone());
                 continue;
             }
-            match msg.state {
-                MessageState::Deleted => {
+            match msg.disposition {
+                Disposition::Deleted => {
                     // Discard
                 }
-                MessageState::Saved => {
+                Disposition::Saved => {
                     if self.is_system_mailbox && keepsave {
                         mbox_messages.push(msg.clone());
                     }
                     // Otherwise discard from current mailbox
                 }
-                MessageState::Read => {
-                    if self.is_system_mailbox && !hold {
+                Disposition::Preserved => keep_messages.push(msg.clone()),
+                Disposition::Keep => {
+                    if self.is_system_mailbox && !hold && msg.read == ReadState::Read {
                         mbox_messages.push(msg.clone());
                     } else {
                         keep_messages.push(msg.clone());
                     }
-                }
-                MessageState::Preserved => {
-                    keep_messages.push(msg.clone());
-                }
-                MessageState::New | MessageState::Unread => {
-                    keep_messages.push(msg.clone());
                 }
             }
         }
@@ -336,7 +331,7 @@ impl Mailbox {
             || self
                 .messages
                 .iter()
-                .any(|m| m.state == MessageState::Deleted)
+                .any(|m| m.disposition == Disposition::Deleted)
         {
             // Rewrite the mailbox
             save_messages_to_file(&self.path, &keep_messages, false, true)

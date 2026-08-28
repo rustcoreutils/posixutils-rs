@@ -16,7 +16,7 @@ use std::process::Command;
 
 use crate::escapes::handle_escape;
 use crate::mailbox::Mailbox;
-use crate::message::{extract_login, MessageState};
+use crate::message::{extract_login, Disposition, ReadState};
 use crate::msglist::{parse_message, parse_msglist};
 use crate::send::{compose_reply, send_message, ComposedMessage};
 use crate::variables::{parse_set_arg, Variables};
@@ -443,7 +443,7 @@ fn cmd_copy(
     if mark_saved {
         for num in &msg_nums {
             if let Some(m) = mb.get_mut(*num) {
-                m.state = MessageState::Saved;
+                m.disposition = Disposition::Saved;
             }
         }
     }
@@ -507,7 +507,7 @@ fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandR
 
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Deleted;
+            m.disposition = Disposition::Deleted;
         }
     }
 
@@ -525,7 +525,7 @@ fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandR
         && mb.current > 0
         && mb
             .get(mb.current)
-            .map(|m| m.state != MessageState::Deleted)
+            .map(|m| m.disposition != Disposition::Deleted)
             .unwrap_or(false)
     {
         cmd_print("", mb, vars, false)?;
@@ -566,7 +566,7 @@ fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResul
     if mb.current > 0
         && mb
             .get(mb.current)
-            .map(|m| m.state != MessageState::Deleted)
+            .map(|m| m.disposition != Disposition::Deleted)
             .unwrap_or(false)
     {
         cmd_print("", mb, vars, false)?;
@@ -681,7 +681,7 @@ fn cmd_followup(
     record_to_file(&composed, &record_file)?;
 
     if let Some(m) = mb.get_mut(msg_num) {
-        m.state = MessageState::Read;
+        m.read = ReadState::Read;
     }
 
     Ok(CommandResult::Continue)
@@ -776,7 +776,7 @@ fn cmd_hold(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
 
     for num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
-            m.state = MessageState::Preserved;
+            m.disposition = Disposition::Preserved;
         }
     }
 
@@ -844,7 +844,7 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
         if let Some(m) = mb.get_mut(num) {
             // Force the message to the secondary mbox at quit, overriding a set
             // `hold` variable; this also clears any preserve mark.
-            m.state = MessageState::Read;
+            m.read = ReadState::Read;
             m.force_mbox = true;
         }
     }
@@ -942,7 +942,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRes
     // Mark as read
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Read;
+            m.read = ReadState::Read;
         }
     }
     if let Some(&last) = msg_nums.last() {
@@ -1008,7 +1008,7 @@ fn cmd_print(
     // Mark as read and update current
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Read;
+            m.read = ReadState::Read;
             m.displayed = true;
         }
     }
@@ -1042,7 +1042,7 @@ fn cmd_reply(
     // Mark as read
     for &num in &msg_nums {
         if let Some(m) = mb.get_mut(num) {
-            m.state = MessageState::Read;
+            m.read = ReadState::Read;
         }
     }
     if let Some(&last) = msg_nums.last() {
@@ -1117,7 +1117,7 @@ fn cmd_save(
     if mark_saved {
         for num in &msg_nums {
             if let Some(m) = mb.get_mut(*num) {
-                m.state = MessageState::Saved;
+                m.disposition = Disposition::Saved;
             }
         }
         mb.modified = true;
@@ -1157,7 +1157,7 @@ fn cmd_save_author(
 
         for num in &msg_nums {
             if let Some(m) = mb.get_mut(*num) {
-                m.state = MessageState::Saved;
+                m.disposition = Disposition::Saved;
             }
         }
         mb.modified = true;
@@ -1356,7 +1356,7 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandResu
     // Mark as read
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Read;
+            m.read = ReadState::Read;
         }
     }
     if let Some(&last) = msg_nums.last() {
@@ -1382,8 +1382,8 @@ fn cmd_touch(args: &str, mb: &mut Mailbox) -> Result<CommandResult, String> {
         if let Some(m) = mb.get_mut(num) {
             // touch marks a message read so it moves to the mbox at quit,
             // overriding a set `hold` variable (grouped with mbox, spec 104627).
-            if m.state == MessageState::New || m.state == MessageState::Unread {
-                m.state = MessageState::Read;
+            if m.read == ReadState::New || m.read == ReadState::Unread {
+                m.read = ReadState::Read;
             }
             m.force_mbox = true;
         }
@@ -1415,8 +1415,12 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<Comman
 
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            if m.state == MessageState::Deleted {
-                m.state = MessageState::Read;
+            if m.disposition == Disposition::Deleted {
+                // Clear the deletion and leave the read state alone. With the
+                // two collapsed into one enum, undeleting had to pick some
+                // state, and it picked `Read` -- so a message that arrived new,
+                // was deleted, and was undeleted came back as already read.
+                m.disposition = Disposition::Keep;
             }
         }
     }
@@ -1507,7 +1511,7 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &Variables) -> Result<CommandRe
 
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            m.state = MessageState::Saved;
+            m.disposition = Disposition::Saved;
         }
     }
     mb.modified = true;

@@ -11,7 +11,7 @@
 //! Handles the various message specification formats defined by POSIX
 
 use crate::mailbox::Mailbox;
-use crate::message::{extract_login, MessageState};
+use crate::message::{extract_login, Disposition, ReadState};
 
 /// Parse a message list specification and return matching message numbers
 /// If allnet is true, address matching compares only the login part (before @)
@@ -52,7 +52,7 @@ fn parse_msglist_with_opts(
     if !for_undelete {
         result.retain(|&n| {
             mb.get(n)
-                .map(|m| m.state != MessageState::Deleted)
+                .map(|m| m.disposition != Disposition::Deleted)
                 .unwrap_or(false)
         });
     }
@@ -102,13 +102,13 @@ fn parse_single_spec(
             if for_undelete {
                 mb.messages
                     .iter()
-                    .position(|m| m.state == MessageState::Deleted)
+                    .position(|m| m.disposition == Disposition::Deleted)
                     .map(|i| vec![i + 1])
                     .ok_or_else(|| "No deleted messages".to_string())
             } else {
                 mb.messages
                     .iter()
-                    .position(|m| m.state != MessageState::Deleted)
+                    .position(|m| m.disposition != Disposition::Deleted)
                     .map(|i| vec![i + 1])
                     .ok_or_else(|| "No messages".to_string())
             }
@@ -129,7 +129,7 @@ fn parse_single_spec(
                 Ok((1..=mb.message_count())
                     .filter(|&n| {
                         mb.get(n)
-                            .map(|m| m.state != MessageState::Deleted)
+                            .map(|m| m.disposition != Disposition::Deleted)
                             .unwrap_or(false)
                     })
                     .collect())
@@ -169,7 +169,7 @@ fn parse_single_spec(
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
-                        (for_undelete || m.state != MessageState::Deleted)
+                        (for_undelete || m.disposition != Disposition::Deleted)
                             && m.subject().to_lowercase().contains(&search)
                     })
                     .map(|(i, _)| i + 1)
@@ -188,15 +188,13 @@ fn parse_single_spec(
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| match type_char {
-                        'd' => m.state == MessageState::Deleted,
-                        'n' => m.state == MessageState::New,
-                        'o' => {
-                            m.state != MessageState::New
-                                && m.state != MessageState::Read
-                                && m.state != MessageState::Deleted
-                        }
-                        'r' => m.state == MessageState::Read,
-                        'u' => m.state == MessageState::Unread,
+                        'd' => m.disposition == Disposition::Deleted,
+                        'n' => m.read == ReadState::New,
+                        // `old` is now a state the model names outright, rather
+                        // than "not new, not read, and not deleted".
+                        'o' => m.is_old(),
+                        'r' => m.read == ReadState::Read,
+                        'u' => m.read == ReadState::Unread,
                         _ => false,
                     })
                     .map(|(i, _)| i + 1)
@@ -227,7 +225,7 @@ fn parse_single_spec(
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
-                        if !(for_undelete || m.state != MessageState::Deleted) {
+                        if !(for_undelete || m.disposition != Disposition::Deleted) {
                             return false;
                         }
                         if allnet {

@@ -128,9 +128,6 @@ impl Mailbox {
                             } else if value.contains('O') {
                                 msg.read = ReadState::Unread;
                             }
-                        }
-
-                        if key == "status" {
                             // Not retained in `header_lines`: the writer
                             // regenerates it from `read`, and keeping the loaded
                             // copy would emit a stale one beside the fresh one.
@@ -318,16 +315,6 @@ impl Mailbox {
 
     /// Handle quit - save read messages to mbox, delete saved, etc.
     pub fn quit(&mut self, vars: &Variables) -> Result<(), String> {
-        if !self.modified
-            && !self.messages.iter().any(|m| {
-                m.read == ReadState::Read
-                    || m.disposition == Disposition::Deleted
-                    || m.disposition == Disposition::Saved
-            })
-        {
-            return Ok(());
-        }
-
         let hold = vars.get_bool("hold");
         let keepsave = vars.get_bool("keepsave");
         let keep = vars.get_bool("keep");
@@ -362,9 +349,14 @@ impl Mailbox {
                         }
                     }
                 }
+                // `hold` and `preserve` keep a message where it is, whatever
+                // its read state. That state is no longer overwritten by the
+                // request, so `:r` still matches a preserved message that was
+                // read, and the `Status:` written back stays accurate.
                 Disposition::Preserved => keep_messages.push(msg.clone()),
                 Disposition::Keep => {
-                    if self.is_system_mailbox && !hold && msg.read == ReadState::Read {
+                    let migrate = self.is_system_mailbox && !hold && msg.read == ReadState::Read;
+                    if migrate {
                         mbox_messages.push(msg.clone());
                     } else {
                         keep_messages.push(msg.clone());
@@ -375,19 +367,25 @@ impl Mailbox {
 
         // Save to mbox if needed
         if !mbox_messages.is_empty() {
-            let mbox_path = get_mbox_path(vars);
+            let mbox_path = crate::util::mbox_path(vars);
             let append = vars.get_bool("append");
             migrate_to_mbox(&mbox_path, &mbox_messages, append)
                 .map_err(|e| format!("{}: {}", mbox_path, e))?;
         }
 
         // Rewrite the current mailbox only when its set of messages actually
-        // changed. A message deleted or moved out is covered, since it is
-        // absent from `keep_messages`.
+        // changed. A message that merely left the mailbox is enough; a message
+        // deleted is covered too, since it is absent from `keep_messages`.
         //
         // Leaving the file alone otherwise is not just an optimization: it is
         // what keeps mail delivered while mailx was running untouched in the
-        // common case, and it avoids re-timestamping a mailbox nobody changed.
+        // common case, and it avoids rewriting -- and so re-timestamping -- a
+        // mailbox nobody changed.
+        // Rewrite when the set of messages changed, or when a message's
+        // recorded state no longer matches what is on disk. The second case is
+        // what lets read state survive a reopen at all: a session that only
+        // read messages changes no membership, but it does change every
+        // `Status:` header the mailbox should now carry.
         if keep_messages.len() != self.messages.len() || self.state_differs_from_disk() {
             rewrite_mailbox(&self.path, &keep_messages, self.loaded_len, keep)
                 .map_err(|e| format!("{}: {}", self.path, e))?;
@@ -589,10 +587,4 @@ fn append_messages_to_file(
         w.flush()?;
     }
     commit(file)
-}
-fn get_mbox_path(vars: &Variables) -> String {
-    vars.get("MBOX").map(|s| s.to_string()).unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/mbox", home)
-    })
 }

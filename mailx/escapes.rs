@@ -11,11 +11,11 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 use crate::mailbox::Mailbox;
-use crate::msglist::parse_msglist;
+use crate::msglist::msglist_or_current;
 use crate::send::ComposedMessage;
 use crate::variables::Variables;
 
@@ -90,12 +90,12 @@ pub fn handle_escape(
             // Shell escape with bang expansion
             let cmd = if vars.get_bool("bang") {
                 // Expand ! to previous command
-                expand_bang(args, vars.last_shell_cmd.as_deref())
+                crate::util::expand_bang(args, vars.last_shell_cmd.as_deref())
             } else {
                 args.to_string()
             };
 
-            run_shell_command(&cmd, vars)?;
+            crate::util::shell(&cmd, vars)?;
 
             // Store for future bang expansion
             vars.last_shell_cmd = Some(cmd);
@@ -152,10 +152,7 @@ pub fn handle_escape(
         }
         'd' => {
             // Read dead letter file
-            let dead_path = vars.get("DEAD").map(|s| s.to_string()).unwrap_or_else(|| {
-                let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                format!("{}/dead.letter", home)
-            });
+            let dead_path = crate::util::dead_letter_path(vars);
 
             if let Ok(content) = fs::read_to_string(&dead_path) {
                 msg.body.push_str(&content);
@@ -232,21 +229,7 @@ pub fn handle_escape(
             output.push_str(&msg.body);
             output.push_str("-------\n");
 
-            // Check if we should use pager (crt variable); only when stdout is
-            // a terminal (spec 104362-104367).
-            let line_count = output.lines().count();
-            let use_pager = io::stdout().is_terminal()
-                && vars
-                    .get_number("crt")
-                    .map(|crt| line_count > crt as usize)
-                    .unwrap_or(false);
-
-            if use_pager {
-                let pager = vars.get("PAGER").unwrap_or("more");
-                pipe_output_through_pager(&output, pager);
-            } else {
-                print!("{}", output);
-            }
+            crate::util::page_or_print(&output, vars);
             Ok(EscapeResult::continue_input())
         }
         'q' => {
@@ -257,7 +240,7 @@ pub fn handle_escape(
             // Read file or command output
             if let Some(cmd) = args.strip_prefix('!') {
                 // Read command output
-                let output = run_shell_command_output(cmd, vars)?;
+                let output = crate::util::shell_output(cmd, vars)?;
                 msg.body.push_str(&output);
                 println!("{} bytes", output.len());
             } else {
@@ -338,56 +321,6 @@ pub fn handle_escape(
             Ok(EscapeResult::continue_input())
         }
     }
-}
-
-fn run_shell_command(cmd: &str, vars: &Variables) -> Result<(), String> {
-    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
-    Command::new(shell)
-        .arg("-c")
-        .arg("--")
-        .arg(cmd)
-        .status()
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Expand ! to the previous shell command when bang is set
-/// Backslash-escaped ! characters (\!) are preserved as literal !
-fn expand_bang(cmd: &str, last_cmd: Option<&str>) -> String {
-    let last = last_cmd.unwrap_or("");
-    let mut result = String::new();
-    let mut chars = cmd.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            // Check for escaped !
-            if chars.peek() == Some(&'!') {
-                result.push('!');
-                chars.next(); // consume the !
-            } else {
-                result.push(c);
-            }
-        } else if c == '!' {
-            // Replace with last command
-            result.push_str(last);
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-fn run_shell_command_output(cmd: &str, vars: &Variables) -> Result<String, String> {
-    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
-    let output = Command::new(shell)
-        .arg("-c")
-        .arg("--")
-        .arg(cmd)
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn print_escape_help() {
@@ -533,69 +466,34 @@ fn parse_edited_message(content: &str, msg: &mut ComposedMessage) -> Result<(), 
     Ok(())
 }
 
+/// `~h`: prompt for the Subject, To, Cc, and Bcc header fields.
+///
+/// Only when standard input is a terminal (spec 105065).
 fn prompt_headers(msg: &mut ComposedMessage) -> Result<(), String> {
-    // ~h prompts only when standard input is a terminal (spec 105065).
     if !io::stdin().is_terminal() {
         return Ok(());
     }
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-
-    // Subject
-    print!("Subject: {}", msg.subject);
-    stdout.flush().map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    if !line.trim().is_empty() {
-        msg.subject = line.trim().to_string();
+    if let Some(v) = crate::util::prompt_field("Subject", &msg.subject)? {
+        msg.subject = v;
     }
-
-    // To
-    print!("To: {}", msg.to.join(", "));
-    stdout.flush().map_err(|e| e.to_string())?;
-    line.clear();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    if !line.trim().is_empty() {
-        msg.to.clear();
-        for addr in line.split(',') {
-            msg.add_to(addr);
-        }
-    }
-
-    // Cc
-    print!("Cc: {}", msg.cc.join(", "));
-    stdout.flush().map_err(|e| e.to_string())?;
-    line.clear();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    if !line.trim().is_empty() {
-        msg.cc.clear();
-        for addr in line.split(',') {
-            msg.add_cc(addr);
-        }
-    }
-
-    // Bcc
-    print!("Bcc: {}", msg.bcc.join(", "));
-    stdout.flush().map_err(|e| e.to_string())?;
-    line.clear();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    if !line.trim().is_empty() {
-        msg.bcc.clear();
-        for addr in line.split(',') {
-            msg.add_bcc(addr);
+    for (label, current, list) in [
+        ("To", msg.to.join(", "), 0),
+        ("Cc", msg.cc.join(", "), 1),
+        ("Bcc", msg.bcc.join(", "), 2),
+    ] {
+        if let Some(v) = crate::util::prompt_field(label, &current)? {
+            let target = match list {
+                0 => &mut msg.to,
+                1 => &mut msg.cc,
+                _ => &mut msg.bcc,
+            };
+            target.clear();
+            for addr in crate::util::addresses(&v) {
+                if !target.contains(&addr.to_string()) {
+                    target.push(addr.to_string());
+                }
+            }
         }
     }
 
@@ -609,18 +507,14 @@ fn forward_messages(
     vars: &Variables,
     all_headers: bool,
 ) -> Result<(), String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false, vars)?
-    };
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in msg_nums {
         if let Some(m) = mb.get(num) {
             let content = if all_headers {
-                m.format_display(true, &[], &[])
+                m.format_display(true, vars)
             } else {
-                m.format_display(false, &vars.ignored_headers, &vars.retained_headers)
+                m.format_display(false, vars)
             };
             msg.body.push_str(&content);
         }
@@ -637,11 +531,7 @@ fn insert_messages(
     all_headers: bool,
     with_indent: bool,
 ) -> Result<(), String> {
-    let msg_nums = if args.is_empty() {
-        vec![mb.current]
-    } else {
-        parse_msglist(args, mb, false, vars)?
-    };
+    let msg_nums = msglist_or_current(args, mb, vars)?;
 
     let indent = if with_indent {
         vars.get("indentprefix").unwrap_or("\t")
@@ -652,9 +542,9 @@ fn insert_messages(
     for num in msg_nums {
         if let Some(m) = mb.get(num) {
             let content = if all_headers {
-                m.format_display(true, &[], &[])
+                m.format_display(true, vars)
             } else {
-                m.format_display(false, &vars.ignored_headers, &vars.retained_headers)
+                m.format_display(false, vars)
             };
 
             for line in content.lines() {
@@ -714,24 +604,6 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
             stderr
         ))
     }
-}
-
-/// Pipe output through a pager (e.g., more, less)
-fn pipe_output_through_pager(text: &str, pager: &str) {
-    let mut child = match Command::new(pager).stdin(Stdio::piped()).spawn() {
-        Ok(c) => c,
-        Err(_) => {
-            // Fallback: just print directly
-            print!("{}", text);
-            return;
-        }
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
-    }
-
-    let _ = child.wait();
 }
 
 /// Execute a mailx command-level request from input mode (`~:` / `~_`).

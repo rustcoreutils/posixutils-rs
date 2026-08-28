@@ -15,6 +15,7 @@ mod message;
 mod msglist;
 mod send;
 mod signals;
+mod util;
 mod variables;
 
 use std::env;
@@ -115,7 +116,7 @@ fn run_receive_mode(args: &Args) -> i32 {
     load_startup_files(&mut vars, RcMode::Receive, args.no_init);
 
     let mailbox_path = if args.read_mbox {
-        args.file.clone().unwrap_or_else(get_mbox_path)
+        args.file.clone().unwrap_or_else(|| util::mbox_path(&vars))
     } else {
         args.file.clone().unwrap_or_else(get_system_mailbox)
     };
@@ -295,34 +296,12 @@ fn load_rc_content(content: &str, path: &str, vars: &mut Variables, mode: RcMode
 }
 
 fn get_system_mailbox() -> String {
-    // Check MAIL environment variable first (common extension)
+    // MAIL names the mailbox outright when it is set (a widely relied-on
+    // extension); otherwise the spool is searched.
     if let Ok(mail) = env::var("MAIL") {
         return mail;
     }
-
-    let user = get_user();
-    // Try common mailbox locations
-    let paths = [
-        format!("/var/mail/{}", user),
-        format!("/var/spool/mail/{}", user),
-        format!("/usr/spool/mail/{}", user),
-    ];
-
-    for path in &paths {
-        if std::path::Path::new(path).exists() {
-            return path.clone();
-        }
-    }
-
-    // Default to /var/mail/user
-    paths[0].clone()
-}
-
-fn get_mbox_path() -> String {
-    env::var("MBOX").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/mbox", home)
-    })
+    util::spool_path(&get_user())
 }
 
 fn get_user() -> String {

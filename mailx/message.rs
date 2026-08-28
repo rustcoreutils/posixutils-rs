@@ -150,12 +150,21 @@ impl Message {
     }
 
     /// Format the message for display with header filtering
+    /// Render the message for display.
+    ///
+    /// `show_all_headers` is the capitalized `Print`/`Type` form, which
+    /// overrides `discard`/`ignore`/`retain` (spec 104756). The three callers
+    /// each repeated the same choice of header lists; the choice belongs here.
     pub fn format_display(
         &self,
         show_all_headers: bool,
-        ignored: &[String],
-        retained: &[String],
+        vars: &crate::variables::Variables,
     ) -> String {
+        let (ignored, retained): (&[String], &[String]) = if show_all_headers {
+            (&[], &[])
+        } else {
+            (&vars.ignored_headers, &vars.retained_headers)
+        };
         let mut output = String::new();
 
         // Add headers

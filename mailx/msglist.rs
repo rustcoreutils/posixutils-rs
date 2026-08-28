@@ -279,6 +279,23 @@ fn parse_single_number(
         .ok_or_else(|| "Invalid message specification".to_string())
 }
 
+/// The messages an optional msglist argument names, defaulting to the current
+/// one.
+///
+/// Nearly every command begins this way; the three-line form was written out
+/// sixteen times.
+pub fn msglist_or_current(
+    args: &str,
+    mb: &Mailbox,
+    vars: &Variables,
+) -> Result<Vec<usize>, String> {
+    if args.is_empty() {
+        Ok(vec![mb.current])
+    } else {
+        parse_msglist(args, mb, false, vars)
+    }
+}
+
 /// Parse a message list and return just the first message
 pub fn parse_message(spec: &str, mb: &Mailbox, vars: &Variables) -> Result<usize, String> {
     let list = parse_msglist(spec, mb, false, vars)?;

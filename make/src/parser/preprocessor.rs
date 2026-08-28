@@ -614,8 +614,12 @@ fn substitute(
             continue;
         }
 
+        // A `$` with nothing after it is an ordinary character. Rejecting it
+        // failed the whole makefile over a recipe as ordinary as
+        // `@echo end$` (audit #87); the rule stage already emits it literally.
         let Some(letter) = letters.next() else {
-            Err(PreprocError::UnexpectedEOF)?
+            result.push('$');
+            break;
         };
 
         match letter {
@@ -655,8 +659,28 @@ fn substitute(
                 }
 
                 skip_blank(&mut letters);
-                let Ok(macro_name) = get_reference_name(&mut letters) else {
-                    Err(PreprocError::BadMacroName)?
+                let macro_name = match get_reference_name(&mut letters) {
+                    Ok(name) => name,
+                    // A computed name -- `$($(X))` names the macro whose name
+                    // `$(X)` spells. Resolve the inner reference and look the
+                    // result up; POSIX 105833 makes an unresolvable reference
+                    // the empty string, so failing the whole makefile was
+                    // never the right outcome (audit #88).
+                    Err(_) if letters.peek() == Some(&'$') => {
+                        let raw = read_balanced(&mut letters, open, close)?;
+                        let name = expand_to_fixpoint(&raw, table, state)?;
+                        substitutions += 1;
+                        let name = name.trim();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let (text, nested) =
+                            substitute(&format!("${open}{name}{close}"), table, state)?;
+                        result.push_str(&text);
+                        substitutions += nested;
+                        continue;
+                    }
+                    Err(_) => Err(PreprocError::BadMacroName)?,
                 };
 
                 // `$(fn args...)` -- a function call, not a macro reference.

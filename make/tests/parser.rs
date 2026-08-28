@@ -35,6 +35,30 @@ all:
         assert_eq!(scanned.text, EXPECTED);
     }
 
+    // Audit #87: a `$` with nothing after it is an ordinary character. It used
+    // to raise `UnexpectedEOF`, which fails the entire makefile over a recipe
+    // as ordinary as `@echo end$`.
+    #[test]
+    fn a_trailing_dollar_is_literal() {
+        let result = preprocess("all:\n\t@echo end$\n").unwrap().text;
+        assert!(result.contains("@echo end$"), "got: {result:?}");
+    }
+
+    // Audit #88: `$($(X))` names the macro whose name `$(X)` spells. The inner
+    // reference is not an identifier, so the name parse failed and the whole
+    // makefile was rejected with `BadMacroName` -- where POSIX 105833 makes
+    // even an unresolvable reference the empty string.
+    #[test]
+    fn a_computed_macro_name_resolves() {
+        let result = preprocess("X = Y\nY = hello\nall:\n\t@echo [$($(X))]\n")
+            .unwrap()
+            .text;
+        assert!(result.contains("@echo [hello]"), "got: {result:?}");
+        // An unresolvable one is empty, not an error.
+        let result = preprocess("all:\n\t@echo [$($(NOPE))]\n").unwrap().text;
+        assert!(result.contains("@echo []"), "got: {result:?}");
+    }
+
     // Audit #6: `$(VAR:subst1=subst2)` suffix substitution.
     #[test]
     fn test_subst_suffix() {

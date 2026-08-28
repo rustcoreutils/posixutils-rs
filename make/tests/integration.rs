@@ -343,10 +343,16 @@ mod internal_macros {
             .output()
             .expect("failed to run make");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // /bin/echo consumes the leading `-e` as its own "enable escapes"
-        // flag, so what it prints back is the rest of the invocation. Seeing
-        // it at all proves /bin/echo, not /bin/sh, ran the recipe.
-        assert_eq!(stdout, "-c echo hi\n", "stdout: {stdout}");
+        // What /bin/echo prints back is its own argument list, which proves
+        // /bin/echo -- not /bin/sh -- ran the recipe. Only the tail is
+        // asserted: GNU coreutils echo consumes the leading `-e` as its
+        // "enable escapes" flag, while the BSD echo on macOS prints it, so the
+        // agreement to assert is the invocation, not the platform's opinion of
+        // `-e`.
+        assert!(
+            stdout.trim_end().ends_with("-c echo hi"),
+            "stdout: {stdout}"
+        );
         assert_eq!(output.status.code(), Some(0));
     }
 

@@ -7,7 +7,71 @@
 // SPDX-License-Identifier: MIT
 //
 
-use bigdecimal::{num_bigint::BigInt, BigDecimal, Num, One, Signed, ToPrimitive, Zero};
+use bigdecimal::{num_bigint::BigInt, BigDecimal, Num, One, Pow, Signed, ToPrimitive, Zero};
+
+/// Upper bound on the number of decimal digits a single operation may build.
+///
+/// `scale` may legally be as large as `BC_SCALE_MAX`, and an operation at that
+/// scale would need a multi-gigabyte integer. Fail fast instead, well above any
+/// scale a real program uses.
+const MAX_WORKING_DIGITS: u64 = 1_000_000;
+
+/// `10^n`, or `None` if that many digits exceeds what we are willing to build.
+fn ten_pow(n: u64) -> Option<BigInt> {
+    if n > MAX_WORKING_DIGITS {
+        return None;
+    }
+    Some(BigInt::from(10u8).pow(n as u32))
+}
+
+/// Floor of the square root of a non-negative integer, by Newton's method.
+///
+/// POSIX requires `sqrt` to be truncated, and the floor of the integer square
+/// root of the scaled radicand is exactly the truncated result.
+fn integer_sqrt(n: &BigInt) -> BigInt {
+    if n.is_zero() {
+        return BigInt::zero();
+    }
+    // Any starting point at or above the true root converges down to the floor.
+    let mut x = BigInt::one() << (n.bits() as usize).div_ceil(2);
+    loop {
+        let next = (&x + n / &x) >> 1;
+        if next >= x {
+            return x;
+        }
+        x = next;
+    }
+}
+
+/// `a / b`, truncated toward zero, as a value with exactly `scale` fractional
+/// digits.
+///
+/// POSIX (XCU bc, "when an exact result is not achieved ... the result shall be
+/// truncated") requires the quotient's digits to be real digits of the true
+/// quotient. Computing it through `BigDecimal`'s `Div` would instead apply that
+/// crate's 100-significant-digit default context and round, so every digit past
+/// the hundredth would be invented. Shifting the numerator and dividing the
+/// underlying integers is exact at any scale.
+fn divide_exact(a: &BigDecimal, b: &BigDecimal, scale: u64) -> Result<BigDecimal, &'static str> {
+    let (a_int, a_scale) = a.as_bigint_and_exponent();
+    let (b_int, b_scale) = b.as_bigint_and_exponent();
+    // a/b truncated to `scale` digits is
+    //     trunc(a_int * 10^(b_scale - a_scale + scale) / b_int) * 10^-scale
+    let shift = b_scale - a_scale + scale as i64;
+    let (numerator, denominator) = if shift >= 0 {
+        (
+            a_int * ten_pow(shift as u64).ok_or("number too large")?,
+            b_int,
+        )
+    } else {
+        (
+            a_int,
+            b_int * ten_pow(shift.unsigned_abs()).ok_or("number too large")?,
+        )
+    };
+    // Integer division truncates toward zero, which is the rule bc wants.
+    Ok(BigDecimal::new(numerator / denominator, scale as i64))
+}
 
 /// Converts a character to a number
 /// # Panics
@@ -118,7 +182,11 @@ impl Number {
                     nominator += digit;
                 }
             }
-            fractional_part = BigDecimal::from(nominator) / BigDecimal::from(denominator);
+            // Truncate to the number of fractional digits written. Dividing
+            // through BigDecimal would cap the quotient at its default
+            // 100-digit context and invent every digit past that.
+            let scaled = nominator * ten_pow(max_scale as u64)?;
+            fractional_part = BigDecimal::new(scaled / denominator, max_scale as i64);
         } else {
             integer_part = BigInt::from_str_radix(s, base as u32).unwrap().into();
         }
@@ -127,7 +195,7 @@ impl Number {
         // The following matches the GNU implementation, which sets the scale
         // to the number of fractional digits in the string, regardless of the base
         Some(Self(
-            integer_part + fractional_part.with_scale(max_scale as i64),
+            (integer_part + fractional_part).with_scale(max_scale as i64),
         ))
     }
 
@@ -214,12 +282,20 @@ impl Number {
         Self(-self.0)
     }
 
+    // POSIX: the scale of a sum or difference is max(scale(a), scale(b)).
+    // bigdecimal's `Sub` short-circuits when either operand is zero and returns
+    // the other one unchanged, dropping the zero's scale, so the scale is set
+    // explicitly here rather than inherited. `Add` does not currently
+    // short-circuit, but it is pinned the same way so it cannot start to.
+
     pub fn add(self, other: &Number) -> Number {
-        Self(self.0 + &other.0)
+        let scale = self.scale().max(other.scale());
+        Self((self.0 + &other.0).with_scale(scale as i64))
     }
 
     pub fn sub(self, other: &Number) -> Number {
-        Self(self.0 - &other.0)
+        let scale = self.scale().max(other.scale());
+        Self((self.0 - &other.0).with_scale(scale as i64))
     }
 
     pub fn mul(self, other: &Number, scale: u64) -> Number {
@@ -234,8 +310,7 @@ impl Number {
         if other.is_zero() {
             return Err("division by zero");
         }
-        let result = self.0 / &other.0;
-        Ok(Self(result).rescale(scale))
+        Ok(Self(divide_exact(&self.0, &other.0, scale)?))
     }
 
     pub fn pow(self, other: &Number, scale: u64) -> NumericResult {
@@ -244,42 +319,70 @@ impl Number {
         }
 
         let a = self.scale();
-        let b = other
-            .0
-            .to_i64()
-            .ok_or("exponent is too large")?
-            .unsigned_abs();
+        let exponent = other.0.to_i64().ok_or("exponent is too large")?;
+        let b = exponent.unsigned_abs();
         // Per POSIX: if b >= 0 the scale is min(a*b, max(scale, a)); if b < 0
         // it is the scale register. b == 0 takes the first branch, giving a
         // scale of 0 (so e.g. `scale=5; 2.5^0` is "1", not "1.00000").
-        let scale = if !other.0.is_negative() {
-            u64::min(a * b, u64::max(scale, a))
+        let result_scale = if exponent >= 0 {
+            u64::min(a.saturating_mul(b), u64::max(scale, a))
         } else {
             scale
         };
+        if exponent < 0 && self.is_zero() {
+            return Err("division by zero");
+        }
+        // The result has roughly `b * digits(self)` digits. Refuse the ones
+        // that could not be held in memory rather than looping toward them.
+        if b.saturating_mul(self.0.digits()) > MAX_WORKING_DIGITS {
+            return Err("exponent is too large");
+        }
+
+        // Exponentiation by squaring: the operand count is logarithmic in b,
+        // where repeated multiplication was linear.
         let mut result = BigDecimal::one();
-        for _ in 0..b {
-            result *= &self.0;
+        let mut base = self.0.clone();
+        let mut remaining = b;
+        while remaining > 0 {
+            if remaining & 1 == 1 {
+                result *= &base;
+            }
+            remaining >>= 1;
+            if remaining > 0 {
+                base = &base * &base;
+            }
         }
-        if other.0.is_negative() {
-            result = BigDecimal::one() / result;
+        if exponent < 0 {
+            result = divide_exact(&BigDecimal::one(), &result, result_scale)?;
         }
-        Ok(Self(result).rescale(scale))
+        Ok(Self(result).rescale(result_scale))
     }
 
     pub fn modulus(self, other: &Number, scale: u64) -> NumericResult {
+        // POSIX defines a%b as a - (a/b)*b, with a/b evaluated at `scale`.
         let a_over_b = self.clone().div(other, scale)?;
-        let scale = u64::max(scale + other.scale(), self.scale());
-        let result = self.sub(&a_over_b.mul(other, scale));
-        Ok(result)
+        let scale = u64::max(scale.saturating_add(other.scale()), self.scale());
+        Ok(self.sub(&a_over_b.mul(other, scale)))
     }
 
     pub fn sqrt(self, min_scale: u64) -> NumericResult {
-        let scale = self.scale().max(min_scale);
-        if let Some(result) = self.0.sqrt() {
-            return Ok(Self(result).rescale(scale));
+        if self.0.is_negative() {
+            return Err("square root of negative number");
         }
-        Err("square root of negative number")
+        // POSIX: the scale of the result is the larger of the expression's
+        // scale and the scale register.
+        let scale = self.scale().max(min_scale);
+        let (radicand, radicand_scale) = self.0.into_bigint_and_exponent();
+        // floor(sqrt(x) * 10^scale) == floor(sqrt(x_int * 10^(2*scale - x_scale)))
+        // and floor(sqrt(floor(n))) == floor(sqrt(n)), so truncating the shift
+        // when it is negative is exact too.
+        let shift = 2 * scale as i64 - radicand_scale;
+        let n = if shift >= 0 {
+            radicand * ten_pow(shift as u64).ok_or("number too large")?
+        } else {
+            radicand / ten_pow(shift.unsigned_abs()).ok_or("number too large")?
+        };
+        Ok(Self(BigDecimal::new(integer_sqrt(&n), scale as i64)))
     }
 
     pub fn inc(&mut self) {
@@ -618,5 +721,131 @@ mod tests {
         let n = Number::parse("4.5", 10).unwrap().negate();
         assert_eq!(n.to_string(10), "-4.5");
         assert_eq!(n.to_string(10), "-4.5");
+    }
+
+    /// Long output is split across lines; these tests care about the digits.
+    fn digits(n: &Number, base: u64) -> String {
+        n.to_string(base).replace("\\\n", "")
+    }
+
+    fn ten_to_the(n: u64) -> Number {
+        Number::from(10).pow(&Number::from(n), 0).unwrap()
+    }
+
+    #[test]
+    fn test_division_is_exact_past_the_hundredth_digit() {
+        // bigdecimal's default context stops at 100 significant digits, so
+        // every digit past that used to be a fabricated zero.
+        let n = Number::from(1).div(&Number::from(3), 105).unwrap();
+        assert_eq!(digits(&n, 10), format!("0.{}", "3".repeat(105)));
+
+        let n = Number::from(1).div(&Number::from(7), 105).unwrap();
+        let repeating: String = "142857".repeat(18).chars().take(105).collect();
+        assert_eq!(digits(&n, 10), format!("0.{}", repeating));
+    }
+
+    #[test]
+    fn test_division_truncates_rather_than_rounds() {
+        // 2/3 to 100 places is a hundred sixes; rounding would end in a seven.
+        let n = Number::from(2).div(&Number::from(3), 100).unwrap();
+        assert_eq!(digits(&n, 10), format!("0.{}", "6".repeat(100)));
+    }
+
+    #[test]
+    fn test_integer_division_with_a_hundred_digit_quotient() {
+        // No large scale involved: the quotient alone exceeded the context.
+        let q = ten_to_the(100).div(&Number::from(7), 0).unwrap();
+        let expected: String = "142857".repeat(17).chars().take(100).collect();
+        assert_eq!(digits(&q, 10), expected);
+    }
+
+    #[test]
+    fn test_modulus_with_large_operands() {
+        // a - (a/b)*b over a rounded quotient produced -3 here.
+        let a = Number::from(2).pow(&Number::from(500), 0).unwrap();
+        assert_eq!(digits(&a.modulus(&Number::from(7), 0).unwrap(), 10), "4");
+
+        let a = ten_to_the(200);
+        assert_eq!(digits(&a.modulus(&Number::from(97), 0).unwrap(), 10), "81");
+    }
+
+    #[test]
+    fn test_sqrt_of_a_large_perfect_square_is_exact() {
+        let root = ten_to_the(200).sqrt(0).unwrap();
+        assert_eq!(digits(&root, 10), format!("1{}", "0".repeat(100)));
+    }
+
+    #[test]
+    fn test_sqrt_is_the_largest_truncated_root() {
+        // r must satisfy r^2 <= n < (r + one ulp)^2 at the requested scale.
+        let two = Number::from(2);
+        let root = two.clone().sqrt(150).unwrap();
+        assert_eq!(root.scale(), 150);
+        assert!(
+            root.clone().mul(&root, 300) <= two,
+            "the truncated root must not exceed the true root"
+        );
+        let ulp = Number::from(1).div(&ten_to_the(150), 150).unwrap();
+        let above = root.add(&ulp);
+        assert!(
+            above.clone().mul(&above, 300) > two,
+            "the truncated root must be the largest one that fits"
+        );
+    }
+
+    #[test]
+    fn test_subtraction_keeps_the_scale_of_a_zero_operand() {
+        // bigdecimal's Sub returns the other operand untouched when one side
+        // is zero, which dropped that side's scale.
+        let a = Number::parse("1.5", 10).unwrap();
+        let zero = Number::parse("0.0000", 10).unwrap();
+        assert_eq!(a.clone().sub(&zero).scale(), 4);
+        assert_eq!(zero.clone().sub(&a).scale(), 4);
+        assert_eq!(a.add(&zero).scale(), 4);
+    }
+
+    #[test]
+    fn test_zero_to_a_negative_power_is_an_error() {
+        // This reached bigdecimal's own division-by-zero panic.
+        assert_eq!(
+            Number::zero().pow(&Number::from(2).negate(), 10),
+            Err("division by zero")
+        );
+    }
+
+    #[test]
+    fn test_absurd_exponent_is_rejected_rather_than_looped() {
+        assert_eq!(
+            Number::from(2).pow(&Number::from(10_000_000_000u64), 0),
+            Err("exponent is too large")
+        );
+        assert_eq!(
+            Number::from(1).pow(&Number::from(10_000_000_000u64), 0),
+            Err("exponent is too large")
+        );
+    }
+
+    #[test]
+    fn test_pow_by_squaring_stays_exact() {
+        assert_eq!(
+            digits(&Number::from(2).pow(&Number::from(10), 0).unwrap(), 10),
+            "1024"
+        );
+        assert_eq!(
+            digits(&Number::from(3).pow(&Number::from(5), 0).unwrap(), 10),
+            "243"
+        );
+        assert_eq!(
+            Number::from(2).pow(&Number::from(400), 0).unwrap().length(),
+            121
+        );
+    }
+
+    #[test]
+    fn test_scale_beyond_the_working_limit_is_rejected() {
+        assert_eq!(
+            Number::from(1).div(&Number::from(3), 2_000_000),
+            Err("number too large")
+        );
     }
 }

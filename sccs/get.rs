@@ -10,16 +10,14 @@
 //! get - get a version of an SCCS file
 
 use std::collections::HashSet;
-use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid};
-use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, zlock};
+use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, sfio, zlock};
 
 /// get - get a version of an SCCS file
 #[derive(Parser)]
@@ -532,10 +530,11 @@ fn write_lfile(
     if to_stdout {
         io::stdout().write_all(table.as_bytes())?;
     } else {
+        // The l-file is read-only, so it must be replaced rather than
+        // reopened: writing it a second time in the same directory otherwise
+        // fails with EACCES on the file this same code wrote.
         let lfile_path = paths::lfile_from_sfile(sfile_path);
-        fs::write(&lfile_path, table.as_bytes())?;
-        // l-file is read-only, owned by the real user.
-        fs::set_permissions(&lfile_path, fs::Permissions::from_mode(0o444))?;
+        sfio::write_replacing(&lfile_path, table.as_bytes(), 0o444)?;
     }
     Ok(())
 }
@@ -790,9 +789,8 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
             })?;
-            fs::write(&gfile_path, &raw)?;
             let mode = if args.edit { 0o644 } else { 0o444 };
-            fs::set_permissions(&gfile_path, fs::Permissions::from_mode(mode))?;
+            sfio::write_replacing(&gfile_path, &raw, mode)?;
         }
 
         if !args.silent {
@@ -907,15 +905,16 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
         })?;
 
-        let mut file = File::create(&gfile_path)?;
+        // A non-edit g-file is read-only, so the previous run's g-file must be
+        // replaced rather than reopened: `File::create` on it fails EACCES,
+        // which made a second `get` of any file impossible.
+        let mut content = Vec::new();
         for line in &lines {
-            writeln!(file, "{}", line)?;
+            content.extend_from_slice(line.as_bytes());
+            content.push(b'\n');
         }
-
-        // Set permissions: read-only unless editing
         let mode = if args.edit { 0o644 } else { 0o444 };
-        let perms = fs::Permissions::from_mode(mode);
-        fs::set_permissions(&gfile_path, perms)?;
+        sfio::write_replacing(&gfile_path, &content, mode)?;
     }
 
     // Print line count (unless silent)
@@ -935,6 +934,10 @@ fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
+    // `get -e` takes the z-file lock and registers it for cleanup; without the
+    // handler installed the registry is inert and ^C strands z.<name>.
+    zlock::install_cleanup();
 
     let args = Args::parse();
 

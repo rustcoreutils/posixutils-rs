@@ -11,6 +11,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode};
 
@@ -608,30 +609,39 @@ fn main() -> ExitCode {
                 drop_privileges();
             }
 
-            for (idx, file) in files.iter().enumerate() {
+            for file in files.iter() {
                 let sfile = to_sfile(file, &root_dir, &sccs_dir);
                 let gfile = to_gfile(file, &root_dir);
 
-                // Get SCCS version to a temp file in the system temp directory.
-                // Include the pid and a per-file index to reduce predictability
-                // and avoid collisions when diffing multiple files.
-                let tmp = env::temp_dir().join(format!("sccs_diff.{}.{}", std::process::id(), idx));
+                // The retrieved text goes to a temporary file created with
+                // mkstemp. A name built from the pid was guessable, and the
+                // plain create-and-truncate that followed would happily write
+                // through a symlink an attacker had left in its place -- in a
+                // binary that carries drop_privileges() precisely because it
+                // may be installed setuid.
+                let mut tmp = match plib::tmp::Builder::new().prefix("sccs_diff.").tempfile() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("sccs: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+
                 let mut get_cmd = Command::new(sibling("get"));
                 get_cmd.args(&get_opts).arg("-p").arg("-s").arg(&sfile);
 
-                let output = get_cmd.output();
-                if let Ok(o) = output {
-                    fs::write(&tmp, &o.stdout).ok();
+                if let Ok(o) = get_cmd.output() {
+                    if tmp.as_file_mut().write_all(&o.stdout).is_err() {
+                        continue;
+                    }
 
                     // Run diff (a system tool, not an SCCS sibling).
                     Command::new("diff")
                         .args(&diff_opts)
-                        .arg(&tmp)
+                        .arg(tmp.path())
                         .arg(&gfile)
                         .status()
                         .ok();
-
-                    fs::remove_file(&tmp).ok();
                 }
             }
             ExitCode::SUCCESS

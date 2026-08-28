@@ -994,3 +994,104 @@ fn get_skips_a_removed_delta() {
         "a removed delta must not be retrieved"
     );
 }
+
+/// A second `get` of the same file must succeed.
+///
+/// `get` writes the g-file mode 0444, and then reopened that read-only file
+/// with `File::create` on the next run, which fails with EACCES. Every file
+/// was effectively get-once.
+#[test]
+fn get_can_retrieve_the_same_file_twice() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_ok("admin", &["-i", "s.twice"], tmp.path(), "one\ntwo\n");
+    assert!(out.status.success());
+
+    let first = super::common::run_in("get", &["s.twice"], tmp.path(), "");
+    assert!(
+        first.status.success(),
+        "first get failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = super::common::run_in("get", &["s.twice"], tmp.path(), "");
+    assert!(
+        second.status.success(),
+        "second get of the same file failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("twice")).unwrap(),
+        "one\ntwo\n",
+        "the re-gotten g-file must hold the retrieved text"
+    );
+}
+
+/// The same defect, for the l-file: `get -l` could only ever succeed once in a
+/// given directory.
+#[test]
+fn get_l_can_write_the_lfile_twice() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_ok("admin", &["-i", "s.ltwice"], tmp.path(), "body\n");
+    assert!(out.status.success());
+
+    // -p keeps the g-file out of the way so only the l-file is under test.
+    let first = super::common::run_in("get", &["-p", "-l", "s.ltwice"], tmp.path(), "");
+    assert!(
+        first.status.success(),
+        "first get -l failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = super::common::run_in("get", &["-p", "-l", "s.ltwice"], tmp.path(), "");
+    assert!(
+        second.status.success(),
+        "second get -l failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(tmp.path().join("l.ltwice").exists(), "l-file should exist");
+}
+
+/// `get -e` acquires the z-file lock and registers it for cleanup, but never
+/// installed the SIGINT handler that consults the registry, so the registry
+/// was inert and ^C stranded `z.<name>`.
+///
+/// The block is deterministic rather than timed: `-p` writes the retrieved
+/// text to standard output, and with a pipe nobody reads and a body larger
+/// than the pipe buffer, `get` blocks in `write` while holding the lock.
+#[test]
+fn get_sigint_removes_the_zfile_lock() {
+    use std::process::{Command, Stdio};
+
+    let tmp = TempDir::new().unwrap();
+    let body: String = (0..20000).map(|i| format!("line {i}\n")).collect();
+    let out = super::common::run_ok("admin", &["-i", "s.sigint"], tmp.path(), &body);
+    assert!(out.status.success());
+
+    let mut child = Command::new(plib::testing::get_binary_path("get"))
+        .args(["-e", "-p", "s.sigint"])
+        .current_dir(tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn get");
+
+    let zfile = tmp.path().join("z.sigint");
+    let mut waited = 0;
+    while !zfile.exists() && waited < 5000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 10;
+    }
+    assert!(
+        zfile.exists(),
+        "get -e should hold the z-file lock while blocked writing"
+    );
+
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let _ = child.wait().expect("wait for get");
+
+    assert!(
+        !zfile.exists(),
+        "SIGINT must remove the z-file lock, not strand it"
+    );
+}

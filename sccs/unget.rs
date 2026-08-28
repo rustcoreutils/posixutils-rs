@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{paths, Sid};
-use posixutils_sccs::{diag, operands, pfile};
+use posixutils_sccs::{diag, operands, pfile, zlock};
 
 /// unget - undo a previous get of an SCCS file
 #[derive(Parser)]
@@ -42,6 +42,19 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
         diag::error_path("unget", sfile, &gettext("not an SCCS file"));
         return Ok(false);
     }
+
+    // Removing the g-file and rewriting the p-file is a read-modify-write, so
+    // it needs the same lock every other mutating utility takes. Without it a
+    // concurrent `get -e` appending to the p-file between the read and the
+    // write had its edit record silently dropped.
+    let _zlock = match zlock::acquire(sfile) {
+        Ok(z) => z,
+        Err(e) if zlock::is_held(&e) => {
+            diag::error_path("unget", sfile, &gettext("being edited"));
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut entries = pfile::read(sfile)?;
     if entries.is_empty() {
@@ -134,6 +147,8 @@ fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
+
+    zlock::install_cleanup();
 
     let args = Args::parse();
 

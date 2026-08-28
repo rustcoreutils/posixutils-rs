@@ -387,3 +387,53 @@ fn sccs_rejects_a_non_posix_pseudo_command() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `sccs diffs` compares the working file against the retrieved version, using
+/// a temporary file for the latter.
+///
+/// That temporary used to be `$TMPDIR/sccs_diff.<pid>.<n>` written with a
+/// plain create-and-truncate, so its name was guessable and the write followed
+/// a symlink left in its place — in a binary that carries `drop_privileges()`
+/// because it may be installed setuid. It is now created with mkstemp, which
+/// picks an unpredictable name and refuses to open an existing path. This test
+/// covers the functional half: the diff is still right, and nothing is left
+/// behind in TMPDIR.
+#[test]
+fn sccs_diffs_reports_changes_and_leaves_no_temporary() {
+    let tmp = TempDir::new().unwrap();
+    let tmpdir = TempDir::new().unwrap();
+    setup_project(&tmp, "d.txt", "one\ntwo\n");
+
+    let out = run("sccs", &["edit", "d.txt"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs edit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.path().join("d.txt"), "one\ntwo\nthree\n").unwrap();
+
+    let out = run_env(
+        "sccs",
+        &["diffs", "d.txt"],
+        tmp.path(),
+        "",
+        &[("TMPDIR", tmpdir.path().to_str().unwrap())],
+        false,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("three"),
+        "diffs should report the added line, got {stdout:?} / {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let leftovers: Vec<String> = std::fs::read_dir(tmpdir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "sccs diffs left temporaries behind: {leftovers:?}"
+    );
+}

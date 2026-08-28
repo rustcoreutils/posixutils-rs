@@ -759,3 +759,472 @@ fn delta_sigint_removes_transient_files() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "l1\n");
 }
+
+/// `admin -m` split its MR list on whitespace and `delta -m` split on
+/// whitespace *and* commas, so the same option-argument produced one MR from
+/// one utility and two from the other. CSSC 1.4.1 records one MR named `1,2`
+/// in both cases: a comma is an ordinary character inside an MR number, not a
+/// separator.
+#[test]
+fn delta_m_treats_a_comma_as_part_of_the_mr_number() {
+    assert_eq!(mrs_of_a_delta_made_with("mrcomma", "-m1,2"), vec!["1,2"]);
+}
+
+/// Blanks, by contrast, do separate MR numbers — in both utilities.
+#[test]
+fn delta_m_splits_the_mr_list_on_blanks() {
+    assert_eq!(mrs_of_a_delta_made_with("mrblank", "-m3 4"), vec!["3", "4"]);
+}
+
+/// Build a one-delta file with the `v` flag set, commit a second delta passing
+/// `mopt`, and report the `:MR:` lines recorded for it.
+fn mrs_of_a_delta_made_with(name: &str, mopt: &str) -> Vec<String> {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join(format!("s.{}", name));
+    let sfile_s = sfile.to_string_lossy().to_string();
+
+    // The v flag is what makes MR numbers acceptable at all.
+    let out = super::common::run_in(
+        "admin",
+        &["-i", "-fv", "-minit", &sfile_s],
+        tmp.path(),
+        "a\n",
+    );
+    assert!(
+        out.status.success(),
+        "admin: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("get", &["-e", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.path().join(name), "a\nb\n").unwrap();
+
+    let out = super::common::run_in("delta", &[mopt, "-ychanged", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("prs", &["-d:MR:", "-r1.2", &sfile_s], tmp.path(), "");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Deleting two or more trailing lines panicked: the diff's lookahead read
+/// `new_lines[j]` in the branch it entered precisely because the new text was
+/// exhausted. CSSC records this as 0 inserted / 3 deleted / 1 unchanged.
+#[test]
+fn delta_deleting_trailing_lines_does_not_panic() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "trail", "a\nb\nc\nd\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\n").unwrap();
+
+    let out = super::common::run_in(
+        "delta",
+        &["-ytrim", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "delta failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("0 inserted"), "got {stdout:?}");
+    assert!(stdout.contains("3 deleted"), "got {stdout:?}");
+    assert!(stdout.contains("1 unchanged"), "got {stdout:?}");
+
+    get_version_silent(&sfile, "a\n");
+}
+
+/// Deleting the whole body is the same shape, with nothing left to anchor on.
+#[test]
+fn delta_deleting_every_line_does_not_panic() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "wipe", "a\nb\nc\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "").unwrap();
+
+    let out = super::common::run_in(
+        "delta",
+        &["-ywipe", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "delta failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("3 deleted"));
+}
+
+/// The edit script must be minimal. Inserting twelve lines between two
+/// unchanged ones was recorded as thirteen insertions and one deletion,
+/// because the anchor line sat past the old ten-line lookahead window. CSSC
+/// records 12 inserted / 0 deleted / 2 unchanged.
+#[test]
+fn delta_records_a_minimal_edit_script() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "wide", "a\nz\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\nz\n").unwrap();
+
+    let out = super::common::run_in(
+        "delta",
+        &["-ywide", sfile.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "delta failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("12 inserted"), "got {stdout:?}");
+    assert!(stdout.contains("0 deleted"), "got {stdout:?}");
+    assert!(stdout.contains("2 unchanged"), "got {stdout:?}");
+}
+
+/// An encoded (binary) s-file could be created and retrieved but never
+/// updated: `delta` read the g-file's raw bytes as UTF-8 lines and diffed them
+/// against the uuencoded text held in the s-file, failing with "stream did not
+/// contain valid UTF-8". CSSC segfaults on this case, so it is not an oracle
+/// here; the invariant under test is the round trip itself.
+#[test]
+fn delta_round_trips_a_binary_file() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.bin");
+    let sfile_s = sfile.to_string_lossy().to_string();
+
+    let original: &[u8] = b"A\x00B\xffC\n";
+    let edited: &[u8] = b"A\x00B\xffC\nD\x80E\n";
+    fs::write(tmp.path().join("seed.bin"), original).unwrap();
+
+    let out = super::common::run_in("admin", &["-iseed.bin", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "admin: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("get", &["-e", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read(tmp.path().join("bin")).unwrap(),
+        original,
+        "get -e must write the raw bytes back"
+    );
+
+    fs::write(tmp.path().join("bin"), edited).unwrap();
+    let out = super::common::run_in("delta", &["-ybin", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta on an encoded file: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("get", &["-p", "-s", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        out.stdout, edited,
+        "the re-gotten binary must match byte for byte"
+    );
+}
+
+/// `get -e -x` records the exclusion in the p-file, and `delta` must both diff
+/// against the version the user actually edited and record the exclusion on
+/// the new delta.
+///
+/// It did neither: `reconstruct_base` called compute_applied_set on the base
+/// serial alone, so the base still contained the excluded delta's line and the
+/// diff charged its absence to the user as a deletion; and the new DeltaEntry
+/// hardcoded empty included/excluded lists, losing the provenance that POSIX
+/// requires prs :Dn:/:Dx: to report. CSSC reports 1 inserted / 0 deleted /
+/// 2 unchanged and records ^Ax 2.
+#[test]
+fn delta_honors_and_records_the_pfile_exclude_list() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "excl", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    // 1.2 adds b, 1.3 adds c.
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "two");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\nc\n").unwrap();
+    run_delta(&sfile, "three");
+
+    // Edit 1.3 with 1.2 forced out: the working file is "a\nc\n".
+    let out = super::common::run_in("get", &["-e", "-x1.2", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -x1.2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&gfile).unwrap(),
+        "a\nc\n",
+        "the g-file must omit the excluded delta's line"
+    );
+
+    // Append one line: exactly one insertion and nothing else.
+    fs::write(&gfile, "a\nc\nd\n").unwrap();
+    let out = super::common::run_in("delta", &["-yfour", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 inserted"), "got {stdout:?}");
+    assert!(
+        stdout.contains("0 deleted"),
+        "the exclusion must not be charged to the user as a deletion: {stdout:?}"
+    );
+    assert!(stdout.contains("2 unchanged"), "got {stdout:?}");
+
+    // The exclusion is recorded on the new delta, by serial.
+    let out = super::common::run_in("prs", &["-d:Dx:", "-r1.4", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "2",
+        "the new delta must record the excluded serial"
+    );
+
+    // And the retrieved 1.4 is what the user edited.
+    get_version_silent(&sfile, "a\nc\nd\n");
+}
+
+/// The include side of the same rule: `get -e -i` forces a delta in, and the
+/// new delta records it.
+#[test]
+fn delta_honors_and_records_the_pfile_include_list() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "incl", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    // 1.2 adds b, then a branch-free 1.3 removes it again.
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "two");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\n").unwrap();
+    run_delta(&sfile, "three");
+
+    // Retrieve 1.1 with 1.2 forced back in.
+    let out = super::common::run_in("get", &["-e", "-r1.1", "-i1.2", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -i1.2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&gfile).unwrap(),
+        "a\nb\n",
+        "the g-file must contain the forced-in delta's line"
+    );
+
+    fs::write(&gfile, "a\nb\nz\n").unwrap();
+    let out = super::common::run_in("delta", &["-yfour", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 inserted") && stdout.contains("0 deleted"),
+        "the inclusion must not be charged to the user as an edit: {stdout:?}"
+    );
+
+    let sid = stdout.lines().next().unwrap_or("").trim().to_string();
+    let out = super::common::run_in(
+        "prs",
+        &["-d:Dn:", &format!("-r{sid}"), &sfile_s],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "2",
+        "the new delta must record the included serial"
+    );
+}
+
+/// The authorized-user list is checked again when the delta is committed, not
+/// only when the edit starts.
+///
+/// The window is real: `admin -a` can narrow the list while an edit is
+/// outstanding, and the p-file lock taken earlier is no evidence of present
+/// permission. CSSC refuses here too, with the same message.
+#[test]
+fn delta_refuses_a_user_removed_from_the_authorized_list_mid_edit() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "revoked", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    // Start the edit while still permitted...
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+
+    // ...then hand the file to somebody else.
+    let out = super::common::run_in("admin", &["-asomeoneelse", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "admin -a: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("delta", &["-ynope", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "delta must re-check the user list; stdout {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not authorized"),
+        "got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Nothing was recorded: the trunk head is still 1.1.
+    let out = super::common::run_in("prs", &["-d:I:", "-r", &sfile_s], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1.1");
+}
+
+/// An exclusion recorded on a delta must survive into that delta's successors.
+///
+/// compute_applied_set honored `included` for every delta it walked -- they
+/// are pushed onto the traversal stack -- but removed `excluded` only for the
+/// target. So 1.4, made with `get -e -x1.2`, retrieved correctly while 1.5,
+/// its own successor, resurrected the excluded line. The asymmetry was latent
+/// only for as long as delta recorded no exclusions at all.
+#[test]
+fn delta_exclusion_survives_into_the_next_delta() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "surv", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "two");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\nc\n").unwrap();
+    run_delta(&sfile, "three");
+
+    // 1.4 excludes 1.2.
+    let out = super::common::run_in("get", &["-e", "-x1.2", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -x1.2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::write(&gfile, "a\nc\nd\n").unwrap();
+    run_delta(&sfile, "four");
+
+    let out = super::common::run_in("get", &["-p", "-s", "-r1.4", &sfile_s], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nc\nd\n");
+
+    // 1.5 is an ordinary edit on top of 1.4 and must inherit the exclusion.
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nc\nd\ne\n").unwrap();
+    run_delta(&sfile, "five");
+
+    let out = super::common::run_in("get", &["-p", "-s", "-r1.5", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\nc\nd\ne\n",
+        "the excluded line must not resurrect in a successor delta"
+    );
+}
+
+/// `get -e` and `delta` must gate on the same release, or an edit that `get`
+/// allowed can never be committed.
+///
+/// get checked the release being retrieved; delta checked the release being
+/// created. With release 2 locked, `get -e -r2` succeeded and announced the
+/// new delta 2.1, then delta refused forever -- the work stranded behind a
+/// p-file lock nothing would clear. CSSC gates the retrieved release.
+#[test]
+fn delta_commits_an_edit_get_allowed_against_a_locked_target_release() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "gate", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    // Lock release 2, which does not exist yet.
+    let out = super::common::run_in("admin", &["-fl2", &sfile_s], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", "-r2", &sfile_s], tmp.path(), "");
+    let allowed = out.status.success();
+    fs::write(&gfile, "a\nz\n").unwrap();
+    let out = super::common::run_in("delta", &["-ygate", &sfile_s], tmp.path(), "");
+
+    assert_eq!(
+        allowed,
+        out.status.success(),
+        "get -e and delta must agree: get {} the edit, delta {} it ({})",
+        if allowed { "allowed" } else { "refused" },
+        if out.status.success() {
+            "accepted"
+        } else {
+            "refused"
+        },
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `-i` and `-x` naming the same delta must resolve the same way at retrieval
+/// and at re-retrieval, or the delta re-reads as content the user never had.
+#[test]
+fn delta_round_trips_an_overlapping_include_and_exclude() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _p, gfile) = setup_sccs_file(&tmp, "olap", "a\n");
+    let sfile_s = sfile.to_str().unwrap().to_string();
+
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\n").unwrap();
+    run_delta(&sfile, "two");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "a\nb\nc\n").unwrap();
+    run_delta(&sfile, "three");
+
+    let out = super::common::run_in("get", &["-e", "-i1.2", "-x1.2", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -i -x: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let handed_out = fs::read_to_string(&gfile).unwrap();
+    assert_eq!(handed_out, "a\nb\nc\n", "-i outranks -x per POSIX 99084");
+
+    fs::write(&gfile, format!("{handed_out}z\n")).unwrap();
+    run_delta(&sfile, "four");
+
+    let out = super::common::run_in("get", &["-p", "-s", "-r1.4", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\nb\nc\nz\n",
+        "re-retrieval must agree with what get -e handed out"
+    );
+}

@@ -642,3 +642,51 @@ fn admin_warns_when_the_body_has_no_id_keywords() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// "The level number is optional, and defaults to 1" (POSIX 84017-84019).
+///
+/// `admin -r2` stored the parsed SID verbatim, and `"2"` parses to a release
+/// with level 0. A level-0 SID is not a valid delta number, so the file was
+/// born unusable: every later get and delta works from it.
+#[test]
+fn admin_r_defaults_the_level_to_one() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.rel");
+    let sfile_s = sfile.to_string_lossy().to_string();
+
+    let out = super::common::run_in("admin", &["-i", "-r2", &sfile_s], tmp.path(), "body\n");
+    assert!(
+        out.status.success(),
+        "admin -r2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("prs", &["-d:I:", "-r", &sfile_s], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "2.1",
+        "a release-only -r must default the level to 1"
+    );
+
+    // And the file is usable: the SID it minted can be retrieved and edited.
+    let out = super::common::run_in("get", &["-e", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "the created SID must be usable: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// An explicit level is still honored.
+#[test]
+fn admin_r_keeps_an_explicit_level() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.rel2");
+    let sfile_s = sfile.to_string_lossy().to_string();
+
+    let out = super::common::run_in("admin", &["-i", "-r3.4", &sfile_s], tmp.path(), "body\n");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("prs", &["-d:I:", "-r", &sfile_s], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.4");
+}

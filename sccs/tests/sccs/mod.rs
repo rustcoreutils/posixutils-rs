@@ -387,3 +387,301 @@ fn sccs_rejects_a_non_posix_pseudo_command() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `sccs diffs` compares the working file against the retrieved version, using
+/// a temporary file for the latter.
+///
+/// That temporary used to be `$TMPDIR/sccs_diff.<pid>.<n>` written with a
+/// plain create-and-truncate, so its name was guessable and the write followed
+/// a symlink left in its place — in a binary that carries `drop_privileges()`
+/// because it may be installed setuid. It is now created with mkstemp, which
+/// picks an unpredictable name and refuses to open an existing path. This test
+/// covers the functional half: the diff is still right, and nothing is left
+/// behind in TMPDIR.
+#[test]
+fn sccs_diffs_reports_changes_and_leaves_no_temporary() {
+    let tmp = TempDir::new().unwrap();
+    let tmpdir = TempDir::new().unwrap();
+    setup_project(&tmp, "d.txt", "one\ntwo\n");
+
+    let out = run("sccs", &["edit", "d.txt"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs edit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.path().join("d.txt"), "one\ntwo\nthree\n").unwrap();
+
+    let out = run_env(
+        "sccs",
+        &["diffs", "d.txt"],
+        tmp.path(),
+        "",
+        &[("TMPDIR", tmpdir.path().to_str().unwrap())],
+        false,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("three"),
+        "diffs should report the added line, got {stdout:?} / {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let leftovers: Vec<String> = std::fs::read_dir(tmpdir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "sccs diffs left temporaries behind: {leftovers:?}"
+    );
+}
+
+/// A detached option-argument is not a file operand.
+///
+/// The front end partitioned argv on a leading '-', so the value token of a
+/// separated option fell into the file list and was rewritten through
+/// to_sfile: `sccs get -r 1.1 f` reached get as `-r SCCS/s.f SCCS/s.1.1`,
+/// which it rejected as an invalid SID. Inventing a bogus operand is a worse
+/// failure than diagnosing a missing one, and CSSC mishandles this too.
+#[test]
+fn sccs_keeps_a_detached_option_argument_out_of_the_file_list() {
+    let tmp = TempDir::new().unwrap();
+    setup_project(&tmp, "r.txt", "one\ntwo\n");
+
+    let out = run("sccs", &["get", "-r", "1.1", "r.txt"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs get -r 1.1 failed: {} / {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("r.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("s.1.1"),
+        "the option-argument must not become an operand: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The same shape with a comment that looks nothing like a filename.
+#[test]
+fn sccs_keeps_a_detached_comment_out_of_the_file_list() {
+    let tmp = TempDir::new().unwrap();
+    setup_project(&tmp, "c.txt", "one\n");
+
+    let out = run("sccs", &["edit", "c.txt"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs edit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.path().join("c.txt"), "one\ntwo\n").unwrap();
+
+    let out = run(
+        "sccs",
+        &["delta", "-y", "some comment", "c.txt"],
+        tmp.path(),
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "sccs delta -y <comment> failed: {} / {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("some comment"),
+        "the comment must not become an operand: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The comment reached delta: prs reports it.
+    let out = run("prs", &["-d:C:", "-r1.2", "SCCS/s.c.txt"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "some comment");
+}
+
+/// With no SCCS/ directory, an s-file beside the working file is the s-file.
+///
+/// to_sfile always inserted SCCS/, where plib's sfile_from_gfile falls back to
+/// a sibling, so the front end could not address a flat directory that the
+/// utilities themselves handle.
+#[test]
+fn sccs_finds_a_sibling_sfile_when_there_is_no_sccs_directory() {
+    let tmp = TempDir::new().unwrap();
+    let out = run("admin", &["-i", "s.flat"], tmp.path(), "flat\n");
+    assert!(
+        out.status.success(),
+        "admin: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run("sccs", &["get", "flat"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs get on a flat directory failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("flat")).unwrap(),
+        "flat\n"
+    );
+}
+
+/// `sccs info` must report a p-file line that carries no time field.
+///
+/// get_editing_info hand-parsed p-files and required at least five
+/// whitespace-separated fields, where PfileEntry::parse requires four and
+/// defaults the time. A line every other utility accepts was silently dropped
+/// here, so `info`, `tell`, `check` and `clean` disagreed with `sact`.
+#[test]
+fn sccs_info_reports_a_pfile_line_without_a_time_field() {
+    let tmp = TempDir::new().unwrap();
+    setup_project(&tmp, "t.txt", "body\n");
+
+    // What a p-file written by an older SCCS looks like: no time.
+    std::fs::write(
+        tmp.path().join("SCCS/p.t.txt"),
+        format!("1.1 1.2 {} 26/08/28\n", plib::sccsfile::real_login_name()),
+    )
+    .unwrap();
+
+    let out = run("sccs", &["info"], tmp.path(), "");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("t.txt") && stdout.contains("1.1 1.2"),
+        "info dropped a p-file line that sact accepts: {stdout:?}"
+    );
+}
+
+/// Under `-d`, `sccs diffs` must compare the same working file that `get`
+/// wrote and `delta` will read.
+///
+/// get places the g-file as a bare name in the current directory; the front
+/// end computed `root_dir.join(file)` instead, so with -d it diffed a file at
+/// a path no other utility uses -- and reported no differences no matter what
+/// the user had edited.
+#[test]
+fn sccs_diffs_under_d_compares_the_file_get_actually_wrote() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(project.join("SCCS")).unwrap();
+
+    let out = run("admin", &["-i", "SCCS/s.d.txt"], &project, "one\ntwo\n");
+    assert!(
+        out.status.success(),
+        "admin: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Work from a sibling directory, addressing the project through -d.
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let root = project.to_str().unwrap().to_string();
+
+    let out = run("sccs", &["-d", &root, "edit", "d.txt"], &work, "");
+    assert!(
+        out.status.success(),
+        "sccs -d edit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // get wrote the g-file into the current directory, not under -d.
+    let gfile = work.join("d.txt");
+    assert!(
+        gfile.exists(),
+        "get -e must write the g-file in the current directory"
+    );
+    std::fs::write(&gfile, "one\ntwo\nthree\n").unwrap();
+
+    let out = run("sccs", &["-d", &root, "diffs", "d.txt"], &work, "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("three"),
+        "diffs must compare the g-file get wrote, got {stdout:?} / {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `sccs create` builds the project, so it must place the s-file in SCCS/.
+///
+/// The sibling-s-file fallback added for flat directories keyed on whether
+/// SCCS/ already exists -- which, for create, it does not. So `sccs create
+/// foo.c` in a fresh project wrote ./s.foo.c, a layout that `sccs clean` and
+/// `sccs unedit` address the SCCS directory directly and would never find
+/// again.
+#[test]
+fn sccs_create_puts_the_sfile_in_the_sccs_directory() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("foo.c"), "hello\n").unwrap();
+
+    let out = run("sccs", &["create", "foo.c"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs create: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tmp.path().join("SCCS/s.foo.c").exists(),
+        "create must build the SCCS directory, got: {:?}",
+        std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !tmp.path().join("s.foo.c").exists(),
+        "create must not leave a sibling s-file"
+    );
+
+    // And the project it built is usable through the front end.
+    let out = run("sccs", &["get", "foo.c"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs get after create: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `delget` and `deledit` route options to two phases, and a detached
+/// option-argument must follow its option rather than being copied into both
+/// phases as a file operand.
+///
+/// `sccs delget -y c1 g` committed the delta and then ran the get phase on a
+/// nonexistent SCCS/s.c1, exiting 1 -- the same invented-operand failure the
+/// plain subcommands were fixed for.
+#[test]
+fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
+    let tmp = TempDir::new().unwrap();
+    setup_project(&tmp, "dg.txt", "one\n");
+
+    let out = run("sccs", &["edit", "dg.txt"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "sccs edit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.path().join("dg.txt"), "one\ntwo\n").unwrap();
+
+    let out = run("sccs", &["delget", "-y", "c1", "dg.txt"], tmp.path(), "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("s.c1"),
+        "the option-argument must not become an operand: {stderr}"
+    );
+    assert!(out.status.success(), "sccs delget failed: {stderr}");
+
+    // The comment reached delta, and the get phase left the file behind.
+    let out = run("prs", &["-d:C:", "-r1.2", "SCCS/s.dg.txt"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "c1");
+    assert!(
+        tmp.path().join("dg.txt").exists(),
+        "delget re-gets the file"
+    );
+}

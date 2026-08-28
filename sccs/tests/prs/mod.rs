@@ -665,3 +665,50 @@ fn prs_cutoff_invalid_field_rejected() {
         assert!(!out.stderr.is_empty(), "{bad} needs a diagnostic");
     }
 }
+
+/// The `l a` flag locks *every* release (POSIX 84054). Encoding "all" as an
+/// empty release list made it indistinguishable from "no releases locked", so
+/// `:LK:` reported `none` for the most restrictive setting a file can carry —
+/// exactly inverted. CSSC prints `a` here.
+#[test]
+fn prs_lk_reports_a_when_all_releases_are_locked() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "alllocked", "body\n");
+    let sfile = sfile.to_string_lossy().to_string();
+
+    let out = super::common::run_in("admin", &["-fla", &sfile], tmp.path(), "");
+    assert!(out.status.success(), "admin -fla should succeed");
+
+    let out = super::common::run_in("prs", &["-d:LK:", "-r", &sfile], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "a",
+        "all-releases lock must render as 'a', not 'none'"
+    );
+}
+
+/// An explicit release list still renders as that list, so the `All` variant
+/// did not swallow the ordinary case.
+#[test]
+fn prs_lk_reports_the_release_list_when_some_are_locked() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "onelocked", "body\n");
+    let sfile = sfile.to_string_lossy().to_string();
+
+    let out = super::common::run_in("admin", &["-fl1", &sfile], tmp.path(), "");
+    assert!(out.status.success(), "admin -fl1 should succeed");
+
+    let out = super::common::run_in("prs", &["-d:LK:", "-r", &sfile], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}
+
+/// An s-file with no `l` flag at all reports `none`.
+#[test]
+fn prs_lk_reports_none_when_no_releases_are_locked() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "unlocked", "body\n");
+    let sfile = sfile.to_string_lossy().to_string();
+
+    let out = super::common::run_in("prs", &["-d:LK:", "-r", &sfile], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "none");
+}

@@ -9,14 +9,14 @@
 
 //! prs - print SCCS file information
 
-use std::fs;
-use std::io::{self, BufRead};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{paths, DeltaEntry, DeltaType, SccsFile, SccsFlag, Sid};
+use posixutils_sccs::{cutoff, diag, operands};
 
 /// prs - print SCCS file information
 #[derive(Parser)]
@@ -53,10 +53,6 @@ struct Args {
 // Default output format (per POSIX, there's a header and per-delta format)
 const DEFAULT_HEADER_FORMAT: &str = ":PN::\n\n";
 const DEFAULT_DELTA_FORMAT: &str = ":Dt:\t:DL:\nMRs:\n:MR:COMMENTS:\n:C:\n";
-
-fn format_sid(sid: &Sid) -> String {
-    sid.to_string()
-}
 
 fn flag_yes_no(val: bool) -> &'static str {
     if val {
@@ -226,16 +222,31 @@ fn expand_single_keyword(
             matches!(f, SccsFlag::BranchEnabled)
         }))
         .to_string(),
-        "CB" => get_ceiling(&sccs.header.flags)
-            .map(|v| v.to_string())
+        "CB" => sccs
+            .header
+            .flags
+            .iter()
+            .find_map(|f| match f {
+                SccsFlag::Ceiling(v) => Some(v.to_string()),
+                _ => None,
+            })
             .unwrap_or_else(|| "none".to_string()),
-        "Ds" => get_default_sid(&sccs.header.flags).unwrap_or_else(|| "none".to_string()),
+        "Ds" => sccs
+            .default_sid()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "none".to_string()),
         "F" => sfile_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
-        "FB" => get_floor(&sccs.header.flags)
-            .map(|v| v.to_string())
+        "FB" => sccs
+            .header
+            .flags
+            .iter()
+            .find_map(|f| match f {
+                SccsFlag::Floor(v) => Some(v.to_string()),
+                _ => None,
+            })
             .unwrap_or_else(|| "none".to_string()),
         "FD" => {
             if sccs.header.descriptive_text.is_empty() {
@@ -253,15 +264,14 @@ fn expand_single_keyword(
             matches!(f, SccsFlag::IdKeywordError(_))
         }))
         .to_string(),
-        "KV" => get_keyword_validation(&sccs.header.flags).unwrap_or_default(),
-        "LK" => {
-            let locked = get_locked_releases(&sccs.header.flags);
-            if locked.is_empty() {
-                "none".to_string()
-            } else {
-                locked
-            }
-        }
+        "KV" => sccs.id_keyword_check().flatten().unwrap_or("").to_string(),
+        // An absent `l` flag is "none"; `l a` locks every release and renders
+        // as "a", matching CSSC. Encoding "all" as an empty list made the most
+        // restrictive setting a file can carry report as the least.
+        "LK" => sccs
+            .locked_releases()
+            .map(|lock| lock.value_string())
+            .unwrap_or_else(|| "none".to_string()),
         "M" => sccs
             .module_name()
             .map(|s| s.to_string())
@@ -270,14 +280,14 @@ fn expand_single_keyword(
             matches!(f, SccsFlag::MrValidation(_))
         }))
         .to_string(),
-        "MP" => get_mr_program(&sccs.header.flags).unwrap_or_default(),
+        "MP" => sccs.mr_program().flatten().unwrap_or("").to_string(),
         "ND" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
             matches!(f, SccsFlag::NullDelta)
         }))
         .to_string(),
         // POSIX: the SCCS-file pathname as given (the operand), not resolved.
         "PN" => sfile_path.to_string_lossy().to_string(),
-        "Q" => get_q_flag(&sccs.header.flags).unwrap_or_default(),
+        "Q" => sccs.q_text().unwrap_or("").to_string(),
         "UN" => {
             if sccs.header.users.is_empty() {
                 "none".to_string()
@@ -378,7 +388,7 @@ fn expand_single_keyword(
             .collect::<Vec<_>>()
             .join(" "),
         "Dy" => format!("{:02}", delta.datetime.year % 100),
-        "I" => format_sid(&delta.sid),
+        "I" => delta.sid.to_string(),
         "L" => delta.sid.lev.to_string(),
         "Ld" => format!("{:05}", delta.stats.deleted.min(99999)),
         "Li" => format!("{:05}", delta.stats.inserted.min(99999)),
@@ -439,172 +449,12 @@ where
     flags.iter().any(predicate)
 }
 
-fn get_ceiling(flags: &[SccsFlag]) -> Option<u16> {
-    for flag in flags {
-        if let SccsFlag::Ceiling(v) = flag {
-            return Some(*v);
-        }
-    }
-    None
-}
-
-fn get_floor(flags: &[SccsFlag]) -> Option<u16> {
-    for flag in flags {
-        if let SccsFlag::Floor(v) = flag {
-            return Some(*v);
-        }
-    }
-    None
-}
-
-fn get_default_sid(flags: &[SccsFlag]) -> Option<String> {
-    for flag in flags {
-        if let SccsFlag::DefaultSid(sid) = flag {
-            return Some(sid.to_string());
-        }
-    }
-    None
-}
-
-fn get_locked_releases(flags: &[SccsFlag]) -> String {
-    for flag in flags {
-        if let SccsFlag::LockedReleases(releases) = flag {
-            return releases
-                .iter()
-                .map(|r| r.to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-        }
-    }
-    String::new()
-}
-
-fn get_mr_program(flags: &[SccsFlag]) -> Option<String> {
-    for flag in flags {
-        if let SccsFlag::MrValidation(prog) = flag {
-            return prog.clone();
-        }
-    }
-    None
-}
-
-fn get_q_flag(flags: &[SccsFlag]) -> Option<String> {
-    for flag in flags {
-        if let SccsFlag::QText(val) = flag {
-            return Some(val.clone());
-        }
-    }
-    None
-}
-
-fn get_keyword_validation(flags: &[SccsFlag]) -> Option<String> {
-    for flag in flags {
-        if let SccsFlag::IdKeywordError(val) = flag {
-            return val.clone();
-        }
-    }
-    None
-}
-
 fn format_flags(flags: &[SccsFlag]) -> String {
     flags
         .iter()
         .filter_map(|f| f.prs_fl_line())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Parse a cutoff date/time string
-fn parse_cutoff(cutoff: &str) -> Option<(u16, u8, u8, u8, u8, u8)> {
-    // Remove any separators
-    let digits: String = cutoff.chars().filter(|c| c.is_ascii_digit()).collect();
-
-    let len = digits.len();
-    if len < 2 {
-        return None;
-    }
-
-    // POSIX -c uses a 2-digit year (YY) with the documented century pivot:
-    // 69-99 => 1900+, 00-68 => 2000+ (112236-112237). There is no 4-digit-year
-    // form: guessing one from "the first two digits look like a century"
-    // misreads conforming input, e.g. -c2508 (August 2025) became year 2508.
-    let yy: u16 = digits[0..2].parse().ok()?;
-    let year = if yy < 69 { 2000 + yy } else { 1900 + yy };
-    let rest = &digits[2..];
-
-    let month = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(12)
-    } else {
-        12
-    };
-    let rest = if rest.len() >= 2 { &rest[2..] } else { "" };
-
-    let day = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(31)
-    } else {
-        31
-    };
-    let rest = if rest.len() >= 2 { &rest[2..] } else { "" };
-
-    let hour = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(23)
-    } else {
-        23
-    };
-    let rest = if rest.len() >= 2 { &rest[2..] } else { "" };
-
-    let min = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(59)
-    } else {
-        59
-    };
-    let rest = if rest.len() >= 2 { &rest[2..] } else { "" };
-
-    let sec = if rest.len() >= 2 {
-        rest[0..2].parse().unwrap_or(59)
-    } else {
-        59
-    };
-
-    // Reject an out-of-range component rather than filtering nonsensically:
-    // `-c251312` (month 13) or an hour of 25 would otherwise silently select
-    // some arbitrary set of deltas. `get` applies the same check.
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
-        return None;
-    }
-
-    Some((year, month, day, hour, min, sec))
-}
-
-/// Compare delta datetime with cutoff
-fn delta_before_cutoff(delta: &DeltaEntry, cutoff: (u16, u8, u8, u8, u8, u8)) -> bool {
-    let dt = &delta.datetime;
-    let delta_year = if dt.year < 100 {
-        if dt.year < 69 {
-            2000 + dt.year
-        } else {
-            1900 + dt.year
-        }
-    } else {
-        dt.year
-    };
-
-    (delta_year, dt.month, dt.day, dt.hour, dt.minute, dt.second) <= cutoff
-}
-
-fn delta_after_cutoff(delta: &DeltaEntry, cutoff: (u16, u8, u8, u8, u8, u8)) -> bool {
-    let dt = &delta.datetime;
-    let delta_year = if dt.year < 100 {
-        if dt.year < 69 {
-            2000 + dt.year
-        } else {
-            1900 + dt.year
-        }
-    } else {
-        dt.year
-    };
-
-    (delta_year, dt.month, dt.day, dt.hour, dt.minute, dt.second) >= cutoff
 }
 
 fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
@@ -659,7 +509,7 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     // dropping it would report every delta, which looks like a successful
     // query rather than a rejected one.
     let cutoff = match args.cutoff.as_deref() {
-        Some(c) => Some(parse_cutoff(c).ok_or_else(|| {
+        Some(c) => Some(cutoff::parse(c).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{}: '{}'", gettext("Invalid cutoff date"), c),
@@ -683,12 +533,12 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
             if let Some(ref target) = target_sid {
                 if args.earlier {
                     // Include deltas at or before target SID
-                    if !sid_le(&d.sid, target) {
+                    if d.sid > *target {
                         return false;
                     }
                 } else if args.later {
                     // Include deltas at or after target SID
-                    if !sid_ge(&d.sid, target) {
+                    if d.sid < *target {
                         return false;
                     }
                 } else {
@@ -707,10 +557,10 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
             // it asks for deltas at or later than the cutoff.
             if let Some(cutoff) = cutoff {
                 if args.later {
-                    if !delta_after_cutoff(d, cutoff) {
+                    if !cutoff.is_at_or_after(d) {
                         return false;
                     }
-                } else if !delta_before_cutoff(d, cutoff) {
+                } else if !cutoff.is_at_or_before(d) {
                     return false;
                 }
             }
@@ -742,35 +592,6 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     Ok(true)
 }
 
-fn sid_le(a: &Sid, b: &Sid) -> bool {
-    (a.rel, a.lev, a.br, a.seq) <= (b.rel, b.lev, b.br, b.seq)
-}
-
-fn sid_ge(a: &Sid, b: &Sid) -> bool {
-    (a.rel, a.lev, a.br, a.seq) >= (b.rel, b.lev, b.br, b.seq)
-}
-
-fn process_directory(dir: &Path, args: &Args) -> io::Result<bool> {
-    let mut success = true;
-
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if paths::is_sfile(&path) {
-                match prs_file(&path, args) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", path.display(), e);
-                        success = false;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(success)
-}
-
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs").ok();
@@ -783,57 +604,12 @@ fn main() -> ExitCode {
     let args = Args::parse_from(argv);
 
     let mut success = true;
-
-    // Check if reading from stdin
-    if args.files.len() == 1 && args.files[0].to_string_lossy() == "-" {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-
-            let path = PathBuf::from(line.trim());
-            if !path.exists() {
-                continue;
-            }
-
-            if path.is_dir() {
-                match process_directory(&path, &args) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", path.display(), e);
-                        success = false;
-                    }
-                }
-            } else {
-                match prs_file(&path, &args) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", path.display(), e);
-                        success = false;
-                    }
-                }
-            }
-        }
-    } else {
-        for file in &args.files {
-            if file.is_dir() {
-                match process_directory(file, &args) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", file.display(), e);
-                        success = false;
-                    }
-                }
-            } else {
-                match prs_file(file, &args) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", file.display(), e);
-                        success = false;
-                    }
-                }
+    for path in operands::expand(&args.files) {
+        match prs_file(&path, &args) {
+            Ok(ok) => success = success && ok,
+            Err(e) => {
+                diag::error_path("prs", &path, &e.to_string());
+                success = false;
             }
         }
     }

@@ -100,20 +100,11 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
         }
     };
 
-    // Verify checksum
+    // Verify checksum. A header-only file (no body) still has one.
     if let Ok(data) = std::fs::read(file_path) {
-        // Find end of first line
-        let newline_pos = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
-        let content_start = newline_pos + 1;
-
-        // A header-only file (no body) still has a checksum to verify.
-        if content_start <= data.len() {
-            let body = data.get(content_start..).unwrap_or(&[]);
-            let computed = plib::sccsfile::compute_checksum(body);
-            if computed != sccs.header.checksum {
-                diags.push(gettext("corrupted SCCS file (checksum error)"));
-                errors |= ERR_CORRUPTED_FILE;
-            }
+        if plib::sccsfile::stored_body_checksum(&data) != sccs.header.checksum {
+            diags.push(gettext("corrupted SCCS file (checksum error)"));
+            errors |= ERR_CORRUPTED_FILE;
         }
     }
 

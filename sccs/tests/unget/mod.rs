@@ -443,3 +443,39 @@ fn unget_reads_a_hand_written_pfile() {
     );
     assert!(!pfile.exists(), "the p-file must be removed");
 }
+
+/// `unget` removes the g-file and rewrites the p-file, but took no z-file
+/// lock, so a concurrent `get -e` appending to the p-file between unget's read
+/// and its write silently lost its edit record. Every other mutating utility
+/// holds the lock; prove unget does too, from the side that is deterministic:
+/// a lock another command already holds must block it.
+#[test]
+fn unget_is_blocked_by_an_existing_zfile() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_sccs_file(&tmp, "locked", "body\n");
+    get_for_editing(&sfile);
+
+    // Stand in for another SCCS command mid-update.
+    std::fs::write(tmp.path().join("z.locked"), "1\n").unwrap();
+
+    let out = super::common::run_in("unget", &["s.locked"], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an existing z-file must block unget; stderr was {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("being edited"),
+        "expected the lock diagnostic, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tmp.path().join("p.locked").exists(),
+        "the blocked unget must leave the pending edit intact"
+    );
+    assert!(
+        tmp.path().join("z.locked").exists(),
+        "unget must not remove a z-file it did not create"
+    );
+}

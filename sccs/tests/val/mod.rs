@@ -390,3 +390,66 @@ fn val_reads_command_lines_from_standard_input() {
         "a command line with no error is not echoed: {combined:?}"
     );
 }
+
+/// `admin -h` and `val` both verify the stored checksum, and they must agree.
+///
+/// They open-coded the check separately and guarded it differently — `admin`
+/// with `content_start < data.len()`, `val` with `<=`. The difference turns
+/// out to be unreachable, because even an `admin -n` file with no body still
+/// has a delta table after the checksum line, so both guards fire. Both now
+/// call one helper, and this test pins the agreement so a future edit to
+/// either side cannot reintroduce a gap that is only accidentally harmless.
+#[test]
+fn admin_h_and_val_agree_on_a_corrupt_header_only_file() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.headeronly");
+    let sfile_s = sfile.to_string_lossy().to_string();
+
+    // -n creates the file with control information but no file data.
+    let out = super::common::run_in("admin", &["-n", &sfile_s], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "admin -n: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Intact, both accept it.
+    let admin_ok = super::common::run_in("admin", &["-h", &sfile_s], tmp.path(), "");
+    let val_ok = super::common::run_in("val", &[&sfile_s], tmp.path(), "");
+    assert_eq!(
+        admin_ok.status.success(),
+        val_ok.status.success(),
+        "admin -h and val must agree on an intact header-only file"
+    );
+    assert!(admin_ok.status.success(), "an intact file should pass");
+
+    // Corrupt the stored checksum on the first line, leaving everything else
+    // byte-identical. The s-file is read-only, as SCCS keeps it.
+    let mut perms = fs::metadata(&sfile).unwrap().permissions();
+    let orig = perms.clone();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&sfile, perms).unwrap();
+
+    let data = fs::read(&sfile).unwrap();
+    let nl = data.iter().position(|&b| b == b'\n').unwrap();
+    let mut corrupt = b"\x01h99999".to_vec();
+    corrupt.extend_from_slice(&data[nl..]);
+    fs::write(&sfile, &corrupt).unwrap();
+    fs::set_permissions(&sfile, orig).unwrap();
+
+    let admin_bad = super::common::run_in("admin", &["-h", &sfile_s], tmp.path(), "");
+    let val_bad = super::common::run_in("val", &[&sfile_s], tmp.path(), "");
+    assert_eq!(
+        admin_bad.status.success(),
+        val_bad.status.success(),
+        "admin -h and val must agree on a corrupt header-only file: \
+         admin said {:?}, val said {:?}",
+        admin_bad.status.code(),
+        val_bad.status.code()
+    );
+    assert!(
+        !admin_bad.status.success(),
+        "a corrupt checksum must be diagnosed, not passed"
+    );
+}

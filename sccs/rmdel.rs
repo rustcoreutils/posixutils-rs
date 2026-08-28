@@ -10,14 +10,15 @@
 //! rmdel - remove a delta from an SCCS file
 
 use std::fs;
-use std::io::{self, BufRead};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::sccsfile::{parse_pfile, paths, DeltaType, SccsFile, Sid, ZLock};
+use plib::sccsfile::{paths, DeltaType, SccsFile, Sid};
+use posixutils_sccs::{diag, operands, pfile, sfio, zlock};
 
 /// rmdel - remove a delta from an SCCS file
 #[derive(Parser)]
@@ -30,23 +31,19 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-fn get_current_user() -> String {
-    plib::sccsfile::real_login_name()
-}
-
 fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     // Check if it's a valid s-file
     if !paths::is_sfile(sfile) {
-        eprintln!("{}: {}", sfile.display(), gettext("not an SCCS file"));
+        diag::error_path("rmdel", sfile, &gettext("not an SCCS file"));
         return Ok(false);
     }
 
     // Acquire the per-command z-file lock around the read-modify-write. If
     // another SCCS command already holds it, report and skip.
-    let _zlock = match ZLock::acquire(sfile) {
+    let _zlock = match zlock::acquire(sfile) {
         Ok(z) => z,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            eprintln!("{}: {}", sfile.display(), gettext("being edited"));
+        Err(e) if zlock::is_held(&e) => {
+            diag::error_path("rmdel", sfile, &gettext("being edited"));
             return Ok(false);
         }
         Err(e) => return Err(e),
@@ -81,7 +78,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     //   1. the user who made the delta,
     //   2. the owner of the SCCS file, or
     //   3. the owner of the directory containing the SCCS file.
-    let current_user = get_current_user();
+    let current_user = posixutils_sccs::username();
     let current_uid = unsafe { libc::getuid() };
 
     let is_delta_author = sccs.header.deltas[delta_idx].user == current_user;
@@ -128,22 +125,19 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     }
 
     // Check that delta is not checked out for editing
-    let pfile = paths::pfile_from_sfile(sfile);
-    if pfile.exists() {
-        let contents = fs::read_to_string(&pfile)?;
-        if let Ok(entries) = parse_pfile(&contents) {
-            for entry in &entries {
-                if &entry.old_sid == sid || &entry.new_sid == sid {
-                    eprintln!(
-                        "{}: {} {} {}",
-                        sfile.display(),
-                        gettext("delta"),
-                        sid,
-                        gettext("is being edited")
-                    );
-                    return Ok(false);
-                }
-            }
+    for entry in pfile::read(sfile)? {
+        if entry.old_sid == *sid || entry.new_sid == *sid {
+            diag::error_path(
+                "rmdel",
+                sfile,
+                &format!(
+                    "{} {} {}",
+                    gettext("delta"),
+                    sid,
+                    gettext("is being edited")
+                ),
+            );
+            return Ok(false);
         }
     }
 
@@ -159,59 +153,21 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Capture the original s-file mode so we can restore the SCCS read-only
-    // (r--r--r--) permissions after the rewrite.
-    let orig_mode = fs::metadata(sfile).map(|m| m.permissions().mode()).ok();
+    // Preserve the s-file's own mode across the rewrite.
+    let perms = sfio::sfile_perms(sfile);
 
     // Mark delta as removed and reweave the body so its footprint is undone.
     let serial = sccs.header.deltas[delta_idx].serial;
     sccs.remove_delta(serial);
 
-    // Write the modified file back
-    let contents = sccs.to_bytes();
-
-    // Write atomically via the canonical x-file, then rename over the s-file.
-    // Register the x-file for SIGINT cleanup around the write+rename.
-    let tmp_path = paths::xfile_from_sfile(sfile);
-    plib::sccsfile::register_cleanup(&tmp_path);
-    let res = (|| -> io::Result<()> {
-        fs::write(&tmp_path, contents)?;
-
-        // Restore the SCCS read-only mode (preserve the original, else 0444).
-        let mode = orig_mode.unwrap_or(0o444);
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))?;
-
-        fs::rename(&tmp_path, sfile)?;
-        Ok(())
-    })();
-    plib::sccsfile::unregister_cleanup(&tmp_path);
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    res?;
+    sfio::write_xfile_atomic(
+        sfile,
+        &paths::xfile_from_sfile(sfile),
+        &sccs.to_bytes(),
+        perms,
+    )?;
 
     Ok(true)
-}
-
-fn process_directory(dir: &Path, sid: &Sid) -> io::Result<bool> {
-    let mut success = true;
-
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if paths::is_sfile(&path) {
-                match rmdel_file(&path, sid) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", path.display(), e);
-                        success = false;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(success)
 }
 
 fn main() -> ExitCode {
@@ -219,7 +175,7 @@ fn main() -> ExitCode {
     textdomain("posixutils-rs").ok();
     bind_textdomain_codeset("posixutils-rs", "UTF-8").ok();
 
-    plib::sccsfile::install_sigint_cleanup();
+    zlock::install_cleanup();
 
     let args = Args::parse();
 
@@ -227,63 +183,21 @@ fn main() -> ExitCode {
     let sid: Sid = match args.sid.parse() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{} '{}': {}", gettext("Invalid SID"), args.sid, e);
+            diag::error(
+                "rmdel",
+                &format!("{} '{}': {}", gettext("Invalid SID"), args.sid, e),
+            );
             return ExitCode::FAILURE;
         }
     };
 
     let mut success = true;
-
-    // Check if reading from stdin
-    if args.files.len() == 1 && args.files[0].to_string_lossy() == "-" {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-
-            let path = PathBuf::from(line.trim());
-            if !path.exists() {
-                continue;
-            }
-
-            if path.is_dir() {
-                match process_directory(&path, &sid) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", path.display(), e);
-                        success = false;
-                    }
-                }
-            } else {
-                match rmdel_file(&path, &sid) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", path.display(), e);
-                        success = false;
-                    }
-                }
-            }
-        }
-    } else {
-        for file in &args.files {
-            if file.is_dir() {
-                match process_directory(file, &sid) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", file.display(), e);
-                        success = false;
-                    }
-                }
-            } else {
-                match rmdel_file(file, &sid) {
-                    Ok(ok) => success = success && ok,
-                    Err(e) => {
-                        eprintln!("{}: {}", file.display(), e);
-                        success = false;
-                    }
-                }
+    for path in operands::expand(&args.files) {
+        match rmdel_file(&path, &sid) {
+            Ok(ok) => success = success && ok,
+            Err(e) => {
+                diag::error_path("rmdel", &path, &e.to_string());
+                success = false;
             }
         }
     }

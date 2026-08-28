@@ -994,3 +994,440 @@ fn get_skips_a_removed_delta() {
         "a removed delta must not be retrieved"
     );
 }
+
+/// A second `get` of the same file must succeed.
+///
+/// `get` writes the g-file mode 0444, and then reopened that read-only file
+/// with `File::create` on the next run, which fails with EACCES. Every file
+/// was effectively get-once.
+#[test]
+fn get_can_retrieve_the_same_file_twice() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_ok("admin", &["-i", "s.twice"], tmp.path(), "one\ntwo\n");
+    assert!(out.status.success());
+
+    let first = super::common::run_in("get", &["s.twice"], tmp.path(), "");
+    assert!(
+        first.status.success(),
+        "first get failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = super::common::run_in("get", &["s.twice"], tmp.path(), "");
+    assert!(
+        second.status.success(),
+        "second get of the same file failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("twice")).unwrap(),
+        "one\ntwo\n",
+        "the re-gotten g-file must hold the retrieved text"
+    );
+}
+
+/// The same defect, for the l-file: `get -l` could only ever succeed once in a
+/// given directory.
+#[test]
+fn get_l_can_write_the_lfile_twice() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_ok("admin", &["-i", "s.ltwice"], tmp.path(), "body\n");
+    assert!(out.status.success());
+
+    // -p keeps the g-file out of the way so only the l-file is under test.
+    let first = super::common::run_in("get", &["-p", "-l", "s.ltwice"], tmp.path(), "");
+    assert!(
+        first.status.success(),
+        "first get -l failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = super::common::run_in("get", &["-p", "-l", "s.ltwice"], tmp.path(), "");
+    assert!(
+        second.status.success(),
+        "second get -l failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(tmp.path().join("l.ltwice").exists(), "l-file should exist");
+}
+
+/// `get -e` acquires the z-file lock and registers it for cleanup, but never
+/// installed the SIGINT handler that consults the registry, so the registry
+/// was inert and ^C stranded `z.<name>`.
+///
+/// The block is deterministic rather than timed: `-p` writes the retrieved
+/// text to standard output, and with a pipe nobody reads and a body larger
+/// than the pipe buffer, `get` blocks in `write` while holding the lock.
+#[test]
+fn get_sigint_removes_the_zfile_lock() {
+    use std::process::{Command, Stdio};
+
+    let tmp = TempDir::new().unwrap();
+    let body: String = (0..20000).map(|i| format!("line {i}\n")).collect();
+    let out = super::common::run_ok("admin", &["-i", "s.sigint"], tmp.path(), &body);
+    assert!(out.status.success());
+
+    let mut child = Command::new(plib::testing::get_binary_path("get"))
+        .args(["-e", "-p", "s.sigint"])
+        .current_dir(tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn get");
+
+    let zfile = tmp.path().join("z.sigint");
+    let mut waited = 0;
+    while !zfile.exists() && waited < 5000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 10;
+    }
+    assert!(
+        zfile.exists(),
+        "get -e should hold the z-file lock while blocked writing"
+    );
+
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let _ = child.wait().expect("wait for get");
+
+    assert!(
+        !zfile.exists(),
+        "SIGINT must remove the z-file lock, not strand it"
+    );
+}
+
+/// Build a 1.1/1.2/1.3 file in `dir` and return its s-file path as a string.
+fn three_delta_file(dir: &std::path::Path, name: &str) -> String {
+    let sfile = dir.join(format!("s.{name}"));
+    let sfile_s = sfile.to_string_lossy().to_string();
+    let out = super::common::run_in("admin", &["-i", &sfile_s], dir, "a\n");
+    assert!(
+        out.status.success(),
+        "admin: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for (n, body) in [("two", "a\nb\n"), ("three", "a\nb\nc\n")] {
+        let out = super::common::run_in("get", &["-e", &sfile_s], dir, "");
+        assert!(
+            out.status.success(),
+            "get -e: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::write(dir.join(name), body).unwrap();
+        let out = super::common::run_in("delta", &[&format!("-y{n}"), &sfile_s], dir, "");
+        assert!(
+            out.status.success(),
+            "delta: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = std::fs::remove_file(dir.join(name));
+    sfile_s
+}
+
+/// The `d` flag names "the default delta number (SID) to be used by a get
+/// command" (POSIX 84036). It was stored by admin, reported by prs, and
+/// ignored by get, which always retrieved the trunk head.
+#[test]
+fn get_uses_the_default_sid_flag() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "dflag");
+
+    let out = super::common::run_in("admin", &["-fd1.1", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "admin -fd1.1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("get", &["-p", "-s", &sfile], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\n",
+        "a bare get must honor the d flag"
+    );
+
+    // An explicit -r still outranks the default.
+    let out = super::common::run_in("get", &["-p", "-s", "-r1.3", &sfile], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\nc\n");
+}
+
+/// "get -e against one of these locked releases fails" (POSIX 84047-84048).
+#[test]
+fn get_e_refuses_a_locked_release() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "locked");
+
+    let out = super::common::run_in("admin", &["-fl1", &sfile], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "get -e on a locked release must fail; stdout {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("locked"),
+        "got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !tmp.path().join("p.locked").exists(),
+        "a refused get -e must not leave an edit lock"
+    );
+
+    // Retrieval without -e is unaffected: the protection is on editing.
+    let out = super::common::run_in("get", &["-p", "-s", &sfile], tmp.path(), "");
+    assert!(out.status.success(), "plain get must still work");
+}
+
+/// `l a` locks every release, not none.
+#[test]
+fn get_e_refuses_every_release_when_all_are_locked() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "alll");
+
+    let out = super::common::run_in("admin", &["-fla", &sfile], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "l a must lock release 1 too");
+}
+
+/// The ceiling is "the highest release ... which may be retrieved by a get
+/// command for editing" (POSIX 84030-84032), enforced for -e per 99077-99078.
+#[test]
+fn get_e_refuses_a_release_above_the_ceiling() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "ceil");
+
+    // Move the head to release 2, then set the ceiling below it.
+    let out = super::common::run_in("get", &["-e", "-r2", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get -e -r2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(tmp.path().join("ceil"), "a\nb\nc\nd\n").unwrap();
+    let out = super::common::run_in("delta", &["-yrel2", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = super::common::run_in("admin", &["-fc1", &sfile], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "release 2 is above a ceiling of 1; stdout {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = super::common::run_in("get", &["-p", "-s", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "plain get is not gated by the ceiling"
+    );
+}
+
+/// The floor is the lowest release retrievable for editing (84033-84035).
+#[test]
+fn get_e_refuses_a_release_below_the_floor() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "floor");
+
+    let out = super::common::run_in("admin", &["-ff2", &sfile], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "release 1 is below a floor of 2; stdout {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// "SCCS file protection specified via the ceiling, floor, and authorized user
+/// list stored in the SCCS file shall be enforced when the -e option is used"
+/// (POSIX 99077-99078). The list was written by admin -a, reported by prs, and
+/// consulted by nobody.
+#[test]
+fn get_e_refuses_a_user_not_on_the_authorized_list() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "auth");
+
+    let out = super::common::run_in("admin", &["-asomeoneelse", &sfile], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unlisted user must not be able to start an edit; stdout {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not authorized"),
+        "got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !tmp.path().join("p.auth").exists(),
+        "a refused get -e must not leave an edit lock"
+    );
+
+    let out = super::common::run_in("get", &["-p", "-s", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "plain get is not gated by the user list"
+    );
+}
+
+/// "If login or group ID is preceded by a '!', the users so specified shall be
+/// denied permission to make deltas" (POSIX 84089-84090).
+#[test]
+fn get_e_refuses_a_user_denied_with_a_bang() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "bang");
+    let me = plib::sccsfile::real_login_name();
+
+    let out = super::common::run_in("admin", &[&format!("-a!{me}"), &sfile], tmp.path(), "");
+    assert!(out.status.success());
+
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an explicitly denied user must be refused; stdout {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A user named on the list may edit, and the numeric-group-ID form means
+/// every login in that group (POSIX 84085-84086).
+#[test]
+fn get_e_allows_a_listed_user_and_a_listed_group() {
+    let tmp = TempDir::new().unwrap();
+    let me = plib::sccsfile::real_login_name();
+
+    let sfile = three_delta_file(tmp.path(), "byname");
+    let out = super::common::run_in("admin", &[&format!("-a{me}"), &sfile], tmp.path(), "");
+    assert!(out.status.success());
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "a listed user must be allowed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let gid = unsafe { libc::getgid() };
+    let sfile = three_delta_file(tmp.path(), "bygroup");
+    let out = super::common::run_in("admin", &[&format!("-a{gid}"), &sfile], tmp.path(), "");
+    assert!(out.status.success());
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "a listed group must admit its members: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// In `-i`/`-x`, a bare number is a SID, not a serial number.
+///
+/// Sharing one list resolver between `get -i`/`-x` and `delta -g` brought
+/// delta's historical bare-serial convenience with it, so `get -x2` silently
+/// excluded delta 1.2 -- serial 2 -- and handed back a different version than
+/// the user asked for, with no diagnostic. CSSC treats `-x2` as naming no
+/// delta.
+#[test]
+fn get_x_with_a_bare_number_names_a_sid_not_a_serial() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "bare");
+
+    let out = super::common::run_in("get", &["-p", "-s", "-x2", &sfile], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\nb\nc\n",
+        "-x2 names no delta, so nothing is excluded"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no such delta"),
+        "an unresolvable token must be diagnosed, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The SID form still works.
+    let out = super::common::run_in("get", &["-p", "-s", "-x1.2", &sfile], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nc\n");
+}
+
+/// `delta -g` keeps the bare-serial form it has always accepted.
+#[test]
+fn delta_g_still_accepts_a_bare_serial_number() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = three_delta_file(tmp.path(), "gbare");
+
+    let out = super::common::run_in("get", &["-e", &sfile], tmp.path(), "");
+    assert!(out.status.success());
+    std::fs::write(tmp.path().join("gbare"), "a\nb\nc\nd\n").unwrap();
+
+    let out = super::common::run_in("delta", &["-g2", "-yg", &sfile], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "delta -g2 should accept a serial: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = super::common::run_in("prs", &["-d:Dg:", "-r1.4", &sfile], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
+}
+
+/// `get` must replace the g-file, never write through a symlink standing in
+/// its place.
+///
+/// The original `File::create` followed one, so anyone who could plant
+/// `./f` as a symlink could have `get f` overwrite the target with the
+/// retrieved text -- and `sccs` may be installed setuid. Replacing by rename
+/// leaves the pointed-at file alone.
+#[test]
+fn get_replaces_a_gfile_symlink_instead_of_following_it() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_ok("admin", &["-i", "s.link"], tmp.path(), "retrieved\n");
+    assert!(out.status.success());
+
+    let victim = tmp.path().join("victim");
+    std::fs::write(&victim, "ORIGINAL\n").unwrap();
+    std::os::unix::fs::symlink(&victim, tmp.path().join("link")).unwrap();
+
+    let out = super::common::run_in("get", &["s.link"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "get failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "ORIGINAL\n",
+        "get must not write through the symlink"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("link")).unwrap(),
+        "retrieved\n",
+        "the g-file itself holds the retrieved text"
+    );
+    assert!(
+        !tmp.path()
+            .join("link")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink(),
+        "the symlink is replaced by the g-file"
+    );
+}

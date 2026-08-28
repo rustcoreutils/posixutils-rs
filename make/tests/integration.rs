@@ -126,7 +126,7 @@ mod arguments {
         run_test_helper(
             &["-SC", "tests/makefiles/arguments/dash_cap_s"],
             "OK\n",
-            "make: execution error: 1\n",
+            "make: [bar] execution error: 1\n",
             2,
         )
     }
@@ -279,7 +279,7 @@ mod arguments {
         run_test_helper(
             &["-kf", "tests/makefiles/arguments/dash_k.mk"],
             "OK\necho 12\n12\n",
-            "make: execution error: 1\nmake: Target z not remade because of errors\n",
+            "make: [bar] execution error: 1\nmake: Target z not remade because of errors\n",
             2,
         );
     }
@@ -485,7 +485,7 @@ mod recipe_execution {
         run_test_helper(
             &["-sf", "tests/makefiles/recipe_execution/shell_e.mk"],
             "",
-            "make: execution error: 1\n",
+            "make: [all] execution error: 1\n",
             2,
         );
     }

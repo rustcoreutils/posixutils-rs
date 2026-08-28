@@ -411,6 +411,7 @@ impl Rule {
                 // traversal, and the diagnostic is printed by the caller.
                 if !status.success() && !ignore {
                     return Err(ExecutionError {
+                        target: target.as_ref().to_string(),
                         exit_code: status.code(),
                     });
                 }

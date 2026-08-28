@@ -1998,6 +1998,32 @@ mod up_to_date {
         let _ = fs::remove_dir_all("nf_probe_src");
     }
 
+    // Audit #83: `foo.o: foo.h` with no commands, plus a `.c.o:` rule. The
+    // staleness test used only the *named* prerequisites and returned before
+    // the inference rule was ever looked up, so a changed `foo.c` never
+    // recompiled -- make reported the target up to date.
+    #[test]
+    fn an_inference_rule_sees_a_changed_source_through_an_explicit_rule() {
+        use std::{thread, time::Duration};
+        let _ = fs::write("inf_prereq.c", "");
+        let _ = fs::write("inf_prereq.h", "");
+        let _ = fs::remove_file("inf_prereq.o");
+        let mk = "tests/makefiles/uptodate/inference_with_prereq.mk";
+        let (first, _) = run(&["-f", mk, "inf_prereq.o"]);
+        assert!(first.contains("COMPILE inf_prereq.c"), "first: {first}");
+        thread::sleep(Duration::from_millis(1100));
+        let _ = fs::write("inf_prereq.c", "changed");
+        let (second, code) = run(&["-f", mk, "inf_prereq.o"]);
+        assert!(
+            second.contains("COMPILE inf_prereq.c"),
+            "a changed source did not recompile: {second}"
+        );
+        assert_eq!(code, Some(0));
+        for f in ["inf_prereq.c", "inf_prereq.h", "inf_prereq.o"] {
+            let _ = fs::remove_file(f);
+        }
+    }
+
     // Audit #85: only `$<` was resolved through VPATH, so `$^`, `$+` and `$?`
     // named a file that does not exist in the working directory.
     #[test]

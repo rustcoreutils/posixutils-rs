@@ -512,7 +512,24 @@ impl Make {
             return Err(RecursivePrerequisite { origin });
         }
 
-        let prerequisites = self.effective_prerequisites(rule, target, dispatch);
+        let mut prerequisites = self.effective_prerequisites(rule, target, dispatch);
+
+        // POSIX 105929: "When no target rule with commands is found to update a
+        // target, the inference rules shall be checked." The rule that will
+        // actually run is the one that decides staleness, so its source joins
+        // the prerequisite list here, before the comparison. Looking it up only
+        // *after* the up-to-date test meant the standard `foo.o: foo.h` plus
+        // `.c.o:` idiom never saw `foo.c` at all, and a changed source never
+        // recompiled (audit #83).
+        let inferred = match rule.recipes().count() {
+            0 => self.find_inference_rule(target.as_ref()),
+            _ => None,
+        };
+        if let Some(source) = inferred.and_then(|rule| inference_source(rule, target)) {
+            if !prerequisites.contains(&source) {
+                prerequisites.insert(0, source);
+            }
+        }
 
         // Bring every prerequisite up to date before judging staleness. One that
         // was actually rebuilt makes this target stale whatever the timestamps
@@ -530,12 +547,8 @@ impl Make {
             return Ok(false);
         }
 
-        // Per POSIX: "When no target rule with commands is found to update a
-        // target, the inference rules shall be checked."
-        if rule.recipes().count() == 0 {
-            if let Some(inference_rule) = self.find_inference_rule(target.as_ref()) {
-                return self.run_inference(inference_rule, target, up_to_date, &newer);
-            }
+        if let Some(inference_rule) = inferred {
+            return self.run_inference(inference_rule, target, up_to_date, &newer);
         }
 
         // An inference rule derives `$<` from its suffixes rather than from a

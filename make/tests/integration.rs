@@ -1983,6 +1983,61 @@ mod up_to_date {
         let _ = fs::remove_file("fn_shellvar.mk");
     }
 
+    // Audit #79: a function call nested inside another. `$(...)` was read to
+    // the first `)`, so the outer call was evaluated truncated and the real
+    // closing paren was left in the shell command: `[o/x.c)]`.
+    #[test]
+    fn nested_functions_read_to_the_matching_paren() {
+        let _ = fs::create_dir_all("nf_probe_src");
+        let _ = fs::write("nf_probe_src/x.c", "");
+        let (out, code) = run(&["-f", "tests/makefiles/uptodate/nested_functions.mk", "all"]);
+        assert!(out.contains("prefixed=[o/x.c]"), "out: {out}");
+        assert!(out.contains("stem=[x]"), "out: {out}");
+        assert!(out.contains("deep=[o/x]"), "out: {out}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all("nf_probe_src");
+    }
+
+    // Audit #85: only `$<` was resolved through VPATH, so `$^`, `$+` and `$?`
+    // named a file that does not exist in the working directory.
+    #[test]
+    fn vpath_resolves_every_prerequisite_macro() {
+        let _ = fs::create_dir_all("vpm_probe_src");
+        let _ = fs::write("vpm_probe_src/vpm_a.txt", "");
+        let (out, code) = run(&["-f", "tests/makefiles/uptodate/vpath_macros.mk", "all"]);
+        assert!(
+            out.contains(
+                "LT=[vpm_probe_src/vpm_a.txt] CARET=[vpm_probe_src/vpm_a.txt] \
+PLUS=[vpm_probe_src/vpm_a.txt] Q=[vpm_probe_src/vpm_a.txt]"
+            ),
+            "out: {out}"
+        );
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all("vpm_probe_src");
+    }
+
+    // Audit #90: a call that mentions an automatic variable is deferred to the
+    // rule stage, and its error was swallowed there -- the unevaluated call
+    // was handed to the shell, which reported `error: not found` and carried
+    // on with exit 0.
+    #[test]
+    fn a_deferred_function_error_is_reported() {
+        let _ = fs::write("def_err.mk", "all:\n\t@echo \"[$(error bad $@)]\"\n");
+        let bin = get_binary_path("make");
+        let output = Command::new(bin)
+            .args(["-f", "def_err.mk", "all"])
+            .output()
+            .expect("failed to run make");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("bad all"), "stderr: {stderr}");
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "the error must not be ignored"
+        );
+        let _ = fs::remove_file("def_err.mk");
+    }
+
     // Audit #66: a prerequisite with no rule of its own, supplied by VPATH. The
     // up-to-date probe used the unresolved name, so it looked missing.
     #[test]

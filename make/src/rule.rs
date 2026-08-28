@@ -338,7 +338,7 @@ impl Rule {
                 // recipe is either shown or run, so the line printed under -n
                 // (or when not silent) is the line that executes.
                 let expanded =
-                    self.substitute_internal_macros(target, recipe, &inout, newer, macros);
+                    self.substitute_internal_macros(env, target, recipe, &inout, newer)?;
 
                 if !always_run {
                     // -n flag
@@ -450,6 +450,7 @@ impl Rule {
     /// (`F`) part of each element.
     fn expand_internal_macro(
         &self,
+        env: &Env<'_>,
         sigil: char,
         modifier: Option<char>,
         target: &Target,
@@ -465,15 +466,18 @@ impl Rule {
             .map(|(_, m)| m.strip_suffix(')').unwrap_or(m))
             .unwrap_or("");
 
-        let all_prereqs: Vec<String> = self
-            .prerequisites()
-            .map(|p| p.as_ref().to_string())
-            .collect();
+        // Every prerequisite name is resolved through `VPATH`, exactly as `$<`
+        // is. A recipe reads the file make found, so `$^` and `$?` have to
+        // name it; leaving them raw handed the recipe a path that does not
+        // exist whenever a search directory supplied the prerequisite
+        // (audit #85).
+        let resolve = env.resolve;
+        let all_prereqs: Vec<String> = self.prerequisites().map(|p| resolve(p.as_ref())).collect();
 
         let base: Vec<String> = match sigil {
             '@' => vec![archive_name.to_string()],
             '%' => vec![member.to_string()],
-            '?' => newer.to_vec(),
+            '?' => newer.iter().map(|n| resolve(n)).collect(),
             '^' => {
                 // All prerequisites, duplicates removed, order preserved.
                 let mut seen = std::collections::HashSet::new();
@@ -498,15 +502,23 @@ impl Rule {
         parts.join(" ")
     }
 
+    /// Expand `$@`, `$<`, `$*`, `$^`, `$+` and `$?` in a recipe line, and
+    /// evaluate the deferred function calls that read them.
+    ///
+    /// Fails rather than pass the line on: a call reaching this stage can still
+    /// report an error — `$(error bad $@)` mentions an automatic variable, so
+    /// it is deferred to here — and re-emitting the unevaluated call handed
+    /// `error` to the shell as a command instead (audit #90).
     fn substitute_internal_macros(
         &self,
+        env: &Env<'_>,
         target: &Target,
         recipe: &Recipe,
         files: &(PathBuf, PathBuf),
         newer: &[String],
-        macros: &[Macro],
-    ) -> Recipe {
+    ) -> Result<Recipe, ErrorCode> {
         const SIGILS: [char; 7] = ['@', '%', '?', '<', '*', '^', '+'];
+        let macros = env.macros;
         let recipe = recipe.inner();
         let mut stream = recipe.chars().peekable();
         let mut result = String::new();
@@ -525,27 +537,38 @@ impl Rule {
                 // Two-character form, e.g. `$@`, `$^`, `$?`.
                 Some(c) if SIGILS.contains(&c) => {
                     stream.next();
-                    result.push_str(&self.expand_internal_macro(c, None, target, files, newer));
+                    result
+                        .push_str(&self.expand_internal_macro(env, c, None, target, files, newer));
                 }
                 // Bracketed form, e.g. `$(@)`, `$(@D)`, `$(?F)`.
                 Some(open @ ('(' | '{')) => {
                     let close = if open == '(' { ')' } else { '}' };
-                    let mut inner = String::new();
                     stream.next();
-                    while let Some(&c) = stream.peek() {
-                        if c == close {
-                            stream.next();
-                            break;
+                    // Read to the *matching* close, not the first one. A
+                    // deferred call nests -- `$(addprefix o/,$(notdir $^))` --
+                    // and stopping at the inner `)` both evaluated a truncated
+                    // call and left the real `)` in the command (audit #79).
+                    let mut inner = String::new();
+                    let mut depth = 0usize;
+                    for c in stream.by_ref() {
+                        if c == open {
+                            depth += 1;
+                        } else if c == close {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
                         }
                         inner.push(c);
-                        stream.next();
                     }
                     let mut chars = inner.chars();
                     match chars.next() {
                         Some(sigil) if SIGILS.contains(&sigil) => {
                             let modifier = chars.next().filter(|m| matches!(m, 'D' | 'F'));
                             result.push_str(
-                                &self.expand_internal_macro(sigil, modifier, target, files, newer),
+                                &self.expand_internal_macro(
+                                    env, sigil, modifier, target, files, newer,
+                                ),
                             );
                         }
                         // The special `MAKE` macro expands to the make program.
@@ -558,19 +581,22 @@ impl Rule {
                         // two characters `$^` (audit #62).
                         _ => {
                             let inner = self.substitute_internal_macros(
+                                env,
                                 target,
                                 &Recipe::new(inner),
                                 files,
                                 newer,
-                                macros,
-                            );
+                            )?;
                             let call = format!("${open}{}{close}", inner.inner());
                             // Evaluate just this call, not the whole line: a
                             // line-wide pass would also eat a shell `$VAR`.
-                            match preprocessor::expand_recipe(&call, macros) {
-                                Ok(text) => result.push_str(&text),
-                                Err(_) => result.push_str(&call),
-                            }
+                            let text =
+                                preprocessor::expand_recipe(&call, macros).map_err(|message| {
+                                    ParserError {
+                                        constraint: crate::parser::ParseError(vec![message]),
+                                    }
+                                })?;
+                            result.push_str(&text);
                         }
                     }
                 }
@@ -579,7 +605,7 @@ impl Rule {
             }
         }
 
-        Recipe::new(result)
+        Ok(Recipe::new(result))
     }
 
     /// A helper function to initialize env vars for shell commands.

@@ -84,21 +84,101 @@ fn to_digit(c: u8) -> u8 {
     }
 }
 
-/// Convert a number to a character
-/// # Panics
-/// panics if the number is bigger than 15
-fn to_char(val: u8) -> char {
-    match val {
-        0..=9 => (val + b'0') as char,
-        10..=15 => (val - 10 + b'A') as char,
-        _ => panic!("number bigger than biggest representable base {}", val),
+/// The number of decimal columns one digit of `base` occupies, for the
+/// space-separated form POSIX defines for bases above 16.
+///
+/// The width comes from the largest digit, `base - 1`, not from the base:
+/// POSIX says "for bases from 17 to 100, bc shall write two-digit decimal
+/// numbers; for bases from 101 to 1 000, three-digit", and base 100's largest
+/// digit is 99. Taking the base's own width makes every exact power of ten one
+/// column too wide.
+fn digit_width(base: u64) -> usize {
+    (base - 1).ilog10() as usize + 1
+}
+
+/// Renders one digit zero-padded to `width` columns.
+fn pad_digit(d: u64, width: usize) -> String {
+    format!("{:0width$}", d, width = width)
+}
+
+/// How many digits of `base` to print for a value carrying `scale` decimal
+/// fractional digits: the smallest k with `base^k >= 10^scale`.
+///
+/// POSIX leaves the count unspecified beyond "the number of digits output
+/// shall be s if obase is 10, less than or equal to s if obase is greater than
+/// 10, or greater than or equal to s if obase is less than 10"; this is the
+/// rule GNU bc uses.
+fn fractional_digits_for(base: u64, scale: u64) -> u64 {
+    if scale == 0 {
+        return 0;
+    }
+    if base == 10 {
+        return scale;
+    }
+    let target = match ten_pow(scale) {
+        Some(target) => target,
+        None => return scale,
+    };
+    let base_big = BigInt::from(base);
+    // Start from a floating-point estimate, then correct it exactly.
+    let mut k = ((scale as f64) / (base as f64).log10()).ceil().max(1.0) as u64;
+    while Pow::pow(&base_big, k as u32) < target {
+        k += 1;
+    }
+    while k > 1 && Pow::pow(&base_big, k as u32 - 1) >= target {
+        k -= 1;
+    }
+    k
+}
+
+/// Appends `value` (non-negative) in `base`, most significant digit first.
+fn push_integer_digits(result: &mut String, value: &BigInt, base: u64) {
+    if base <= 16 {
+        // to_str_radix is far cheaper than extracting one digit at a time.
+        result.push_str(&value.to_str_radix(base as u32).to_uppercase());
+        return;
+    }
+    let width = digit_width(base);
+    let base_big = BigInt::from(base);
+    let mut remaining = value.clone();
+    let mut stack = Vec::new();
+    while !remaining.is_zero() {
+        let digit = (&remaining % &base_big).to_u64().unwrap_or(0);
+        remaining /= &base_big;
+        stack.push(digit);
+    }
+    for digit in stack.iter().rev() {
+        result.push(' ');
+        result.push_str(&pad_digit(*digit, width));
     }
 }
 
-/// converts a number to a string of len `base_ilog10`, padding with zeros
-fn pad_digit(d: u64, base_ilog10: u32) -> String {
-    let width = base_ilog10 + 1;
-    format!("{:0width$}", d, width = width as usize)
+/// Appends exactly `count` fractional digits of `value` in `base`.
+fn push_fractional_digits(result: &mut String, value: &BigInt, base: u64, count: u64) {
+    let count = count as usize;
+    if base <= 16 {
+        let digits = value.to_str_radix(base as u32).to_uppercase();
+        for _ in digits.len()..count {
+            result.push('0');
+        }
+        result.push_str(&digits);
+        return;
+    }
+    let width = digit_width(base);
+    let base_big = BigInt::from(base);
+    let mut remaining = value.clone();
+    let mut stack = Vec::with_capacity(count);
+    for _ in 0..count {
+        let digit = (&remaining % &base_big).to_u64().unwrap_or(0);
+        remaining /= &base_big;
+        stack.push(digit);
+    }
+    for (i, digit) in stack.iter().rev().enumerate() {
+        if i > 0 {
+            result.push(' ');
+        }
+        result.push_str(&pad_digit(*digit, width));
+    }
 }
 
 /// Split very long numeric output across lines, matching bc's convention (and
@@ -200,72 +280,47 @@ impl Number {
     }
 
     /// Convert the number to a string in the given base.
+    ///
+    /// Digits are produced in bulk rather than one at a time: extracting them
+    /// by repeatedly multiplying the whole value costs a full-precision
+    /// operation per digit, which is quadratic in the digit count and made
+    /// printing a high-scale result far slower than computing it.
     pub fn to_string(&self, base: u64) -> String {
-        let mut number = self.0.clone();
-        if number.is_zero() {
+        if self.0.is_zero() {
             return "0".to_string();
         }
+
+        let scale = self.scale();
+        let magnitude = self.0.abs().with_scale(scale as i64);
+        let (unscaled, _) = magnitude.into_bigint_and_exponent();
+        let ten_to_scale = match ten_pow(scale) {
+            Some(value) => value,
+            // A scale this large cannot be rendered; the arithmetic that
+            // produced it would already have been refused.
+            None => return "0".to_string(),
+        };
+        let integer_part = &unscaled / &ten_to_scale;
+        let fraction_numerator = &unscaled - &integer_part * &ten_to_scale;
 
         let mut result = String::new();
         if self.0.is_negative() {
             result.push('-');
-            number = -number;
         }
-
-        let base_ilog10 = base.ilog10();
-        let integer_part = number.with_scale(0);
-        let mut fractional_part = number - &integer_part;
-
         if integer_part.is_zero() {
             result.push('0');
         } else {
-            let (mut integer_part, _) = integer_part.into_bigint_and_exponent();
-
-            let mut stack = Vec::new();
-            while !integer_part.is_zero() {
-                let remainder = &integer_part % base;
-                integer_part /= base;
-                stack.push(remainder.to_u64().unwrap());
-            }
-
-            for digit in stack.iter().rev() {
-                if base <= 16 {
-                    result.push(to_char(*digit as u8));
-                } else {
-                    result.push(' ');
-                    result.push_str(&pad_digit(*digit, base_ilog10))
-                }
-            }
+            push_integer_digits(&mut result, &integer_part, base);
         }
 
-        if fractional_part.fractional_digit_count() == 0 {
+        if scale == 0 {
             return wrap_long_output(result);
         }
-
         result.push('.');
-        let mut temp = BigDecimal::one();
-        let scale = self.scale();
-        // The standard doesn't specify how many fractional digits to print.
-        // Here, we set the scale of the number to the value smallest value of
-        // i such that: (base ^ i).digits() > scale.
-        // This method is also used in other implementations, including GNU bc.
-        while temp.digits() <= scale {
-            fractional_part *= base;
-            let integer_part = fractional_part.with_scale(0);
-            let digit = integer_part.to_u64().unwrap();
-            if base <= 16 {
-                result.push(to_char(digit as u8));
-            } else {
-                result.push_str(&pad_digit(digit, base_ilog10));
-                result.push(' ');
-            }
-            fractional_part -= &integer_part;
-            temp *= base
-        }
-        // remove trailing space
-        if base > 16 {
-            result.pop();
-        }
+        let count = fractional_digits_for(base, scale);
+        // floor(fraction * base^count), the first `count` digits of the
+        // fraction in `base`.
+        let digits = fraction_numerator * BigInt::from(base).pow(count as u32) / &ten_to_scale;
+        push_fractional_digits(&mut result, &digits, base, count);
         wrap_long_output(result)
     }
 
@@ -274,8 +329,11 @@ impl Number {
         self.0.fractional_digit_count().max(0) as u64
     }
 
+    /// POSIX: "the total number of significant decimal digits". A value below
+    /// one still has the digits its scale gives it, so `length(.001)` is 3;
+    /// counting the digits of the unscaled mantissa alone reported 1.
     pub fn length(&self) -> u64 {
-        self.0.digits()
+        self.0.digits().max(self.scale()).max(1)
     }
 
     pub fn negate(self) -> Self {
@@ -843,6 +901,43 @@ mod tests {
             Number::from(2).pow(&Number::from(400), 0).unwrap().length(),
             121
         );
+    }
+
+    #[test]
+    fn test_digit_width_comes_from_the_largest_digit() {
+        // POSIX: bases 17-100 write two-digit groups, 101-1000 three, and so
+        // on. Taking the width from the base made every power of ten one
+        // column too wide.
+        assert_eq!(Number::from(1024).to_string(100), " 10 24");
+        assert_eq!(Number::from(1024).to_string(1000), " 001 024");
+        assert_eq!(Number::from(1024).to_string(10000), " 1024");
+        assert_eq!(Number::from(1024).to_string(99), " 10 34");
+        assert_eq!(Number::from(1024).to_string(101), " 010 014");
+        // The two worked examples from the standard.
+        assert_eq!(Number::from(1024).to_string(25), " 01 15 24");
+        assert_eq!(Number::from(1024).to_string(125), " 008 024");
+    }
+
+    #[test]
+    fn test_length_counts_leading_fractional_zeros() {
+        // POSIX: "the total number of significant decimal digits".
+        assert_eq!(Number::parse(".001", 10).unwrap().length(), 3);
+        assert_eq!(Number::parse(".0001234", 10).unwrap().length(), 7);
+        assert_eq!(Number::parse("0.000", 10).unwrap().length(), 3);
+        assert_eq!(Number::parse("0.10", 10).unwrap().length(), 2);
+        assert_eq!(Number::parse("1.100", 10).unwrap().length(), 4);
+        assert_eq!(Number::from(0).length(), 1);
+        assert_eq!(Number::from(1000).length(), 4);
+    }
+
+    #[test]
+    fn test_high_scale_rendering_is_not_quadratic() {
+        // Printing used to cost a full-precision operation per digit, which
+        // made a high-scale result far slower to print than to compute.
+        let n = Number::from(1).div(&Number::from(3), 20_000).unwrap();
+        let text = digits(&n, 10);
+        assert_eq!(text.len(), 20_002); // "0." and 20000 threes
+        assert!(text.ends_with("333"));
     }
 
     #[test]

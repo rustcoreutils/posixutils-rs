@@ -337,6 +337,77 @@ scoped per rule rather than a whole-file textual fixpoint (#32, #34, #35), and
 target names should be `OsStr`/`PathBuf` rather than `String` + `leak()`
 (#39, #45).
 
+## From the 2026-08-27 branch review
+
+Thirteen defects found by review, three more found while verifying them. All
+reproduce against the built binary and were diffed against GNU Make 4.3.
+
+**#75-#78 were planned and dropped.** The design pass named them N2-N5 and the
+plan listed them for its execution phase; that phase shipped the numbered
+findings and reported complete without them. They are unchanged since.
+
+### Critical
+
+- [ ] **#63 — Inference rules never compare timestamps.** `build_target_uncached`
+  invokes an inference rule with `up_to_date=false` and no mtime check, so
+  `make foo.o` with a `.c.o` rule recompiles on every invocation. GNU reports
+  it up to date. Since the built-in rules (#54) made this path load-bearing,
+  incremental builds are broken for nearly every makefile.
+- [ ] **#64 — Pattern rules never compare timestamps, and `$?` is wrong.** Same
+  shortcut: the branch builds prerequisites then runs unconditionally, and fills
+  `newer` with every prerequisite rather than the out-of-date ones.
+- [ ] **#65 — A self-referential pattern rule deadlocks.** The pattern branch
+  calls `build_target` without the `find_cycle` check, so `%.a: %.a` re-enters
+  `Ledger::claim` for a target whose `Running` entry it posted itself and blocks
+  on the condvar forever. `Edges::prerequisites_of` cannot see the self-edge
+  either, so adding the check alone would not catch it.
+- [ ] **#67 — A multi-line macro deletes every built-in rule.** Built-ins are
+  seeded by generating `"{name} ::= {value}\n"` and re-parsing it inside
+  `if let Ok(parsed)`. Any `define` body contains a newline, the parse fails, the
+  error is swallowed, and every built-in rule silently disappears.
+- [ ] **#68 — `$(if)`/`$(or)`/`$(and)` recurse unbounded into a crash.** They are
+  dispatched through `call_lazy` but never take `ctx.state.enter()`, unlike
+  `eval`/`foreach`/`call`. `A = $(if 1,$(A))` aborts with a stack overflow. Same
+  defect as #58, fixed on three of six lazy functions.
+- [ ] **#69 — `$(wordlist)` panics on an inverted range.**
+  `$(wordlist 5,1,a b c d e f)` panics with `slice index starts at 4 but ends at
+  1`, exit 101. GNU returns the empty string.
+
+### Major
+
+- [ ] **#66 — `VPATH` is skipped for a prerequisite with no rule of its own.** The
+  up-to-date probe uses the unresolved name, so `VPATH = src` with only
+  `src/dep.c` present fails with `no target 'dep.c'`. This is the primary use of
+  VPATH; the existing tests only cover the inference-rule path.
+- [ ] **#70 — A nested reference in a `$(x:a=b)` replacement is rejected.** The
+  spec is read with a flat loop that stops at the first `)`, so
+  `$(SRC:%.c=$(D)/%.o)` fails the whole makefile. The function path already has
+  `read_balanced` for this.
+- [ ] **#71 — Command-line macros do not override macros used in rule headers.**
+  They are appended after the makefile text, but rule headers are expanded at
+  read time. `make OBJ=b.o all` builds `a.o`. POSIX 105866.
+- [ ] **#72 — A lone `$` rejects the whole makefile.** `@echo "cost 5 $ each"`
+  gives a parse error; GNU prints `cost 5 each`. `substitute_internal_macros`
+  already emits a lone `$` literally, so the two halves disagree.
+- [ ] **#73 — `?=` and `+=` ignore the environment.** Both consult `MacroTable`
+  directly rather than `lookup_macro`, so `CC ?= gcc` with `CC=clang` inherited
+  yields `gcc`, and `CC += -Wall` drops the inherited value entirely.
+- [ ] **#74 — A bare `export NAME` fails to parse.** `is_macro_definition` bails
+  on a line with no `=`, so it reaches the rule scanner and fails on the missing
+  colon. `unexport` likewise.
+- [ ] **#75 — `INTERRUPT_FLAG` is never cleared and is shared under `-j`.** Written
+  before every recipe line, never reset, one global for all workers. A SIGINT
+  after a build consults a stale target; concurrent recipes overwrite each other.
+  Planned as N3.
+- [ ] **#76 — `-q` calls `process::exit` from a worker thread.** Under `-j` that
+  exits mid `thread::scope`, abandoning siblings. Planned as N2.
+- [ ] **#77 — A bare `.PHONY:` marks every rule phony.** POSIX 105677 says a
+  `.PHONY` with no prerequisites shall be ignored; instead nothing is ever
+  up to date. Planned as N4.
+- [ ] **#78 — `.IGNORE`/`.SILENT`/`.PRECIOUS` apply per rule, not per target.**
+  `a b: dep` with `.IGNORE: a` silences `b` too, because both targets live on one
+  rule. Planned as N5.
+
 ## Acceptance gate
 
 `/tmp/makecorpus.sh` (rebuilt per session, per the project's convention for gate

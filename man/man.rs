@@ -588,21 +588,33 @@ fn format_man_page(
     let content = man_util::roff::preprocess_with_loader(&content, line_length, load_so);
 
     // Legacy man(7) pages (`.TH`/`.SH`/…) are handled by a dedicated renderer;
-    // the mdoc engine only understands mdoc(7) and would otherwise emit an empty
-    // page. The synopsis-only mode (-h) is mdoc-specific.
-    if !synopsis && man7::is_man7(&content) {
-        return man7::format_man7(&content, formatting).ok_or(ManError::EmptyPage);
+    // the mdoc engine only understands mdoc(7) and would otherwise emit an
+    // empty page. Synopsis mode used to be routed away from this renderer into
+    // the mdoc engine, which knows none of these macros, so `-h` produced zero
+    // bytes and exit 0 for every man(7) page on the system.
+    if man7::is_man7(&content) {
+        let out = if synopsis {
+            man7::format_man7_synopsis(&content, formatting)
+        } else {
+            man7::format_man7(&content, formatting)
+        };
+        return out.ok_or(ManError::EmptyPage);
     }
 
     let mut formatter = MdocFormatter::new(*formatting);
 
     let document = MdocParser::parse_mdoc(&content)?;
-    let formatted_document = match synopsis {
-        true => formatter.format_synopsis_section(document),
-        false => formatter.format_mdoc(document),
-    };
+    if synopsis {
+        let out = formatter.format_synopsis_section(document);
+        // A page with no SYNOPSIS used to return Ok with an empty body, so -h
+        // reported success having printed nothing. Both paths now say so.
+        if out.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err(ManError::EmptyPage);
+        }
+        return Ok(out);
+    }
 
-    Ok(formatted_document)
+    Ok(formatter.format_mdoc(document))
 }
 
 /// Write formatted output to either a pager or directly to stdout if `copy = true`.

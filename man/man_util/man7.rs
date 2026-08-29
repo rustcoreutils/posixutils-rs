@@ -58,6 +58,46 @@ pub fn format_man7(content: &str, settings: &FormattingSettings) -> Option<Vec<u
     Man7Formatter::new(settings).render(content)
 }
 
+/// Render only the SYNOPSIS section of a man(7) page, for `-h`.
+///
+/// The section's source lines are sliced out and handed to the ordinary
+/// renderer rather than threading a mode flag through it, which keeps one
+/// rendering path. The slice carries no `.TH`, so no header or footer is set --
+/// matching the mdoc synopsis path, which sets neither.
+pub fn format_man7_synopsis(content: &str, settings: &FormattingSettings) -> Option<Vec<u8>> {
+    Man7Formatter::new(settings).render(&synopsis_source(content)?)
+}
+
+/// The source lines of the first `.SH SYNOPSIS` section, heading included.
+fn synopsis_source(content: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut in_synopsis = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed
+            .strip_prefix('.')
+            .or_else(|| trimmed.strip_prefix('\''))
+        {
+            let rest = rest.trim_start();
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if name == "SH" {
+                let title = macro_args(rest[name.len()..].trim_start()).join(" ");
+                in_synopsis = title.eq_ignore_ascii_case("SYNOPSIS");
+                if !in_synopsis && !out.is_empty() {
+                    break;
+                }
+            }
+        }
+        if in_synopsis {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
 /// Map a manual section number to its conventional volume title (used to center
 /// the page header, matching the mdoc renderer's headers).
 fn volume_title(section: &str) -> &'static str {
@@ -504,6 +544,25 @@ mod tests {
 
     fn render(content: &str) -> String {
         String::from_utf8(format_man7(content, &SETTINGS).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn synopsis_mode_renders_only_the_synopsis_section() {
+        // `-h` was routed away from this renderer into the mdoc engine, which
+        // knows none of these macros: every man(7) page produced zero bytes
+        // and exit 0.
+        let page = ".TH LS 1\n.SH NAME\nls \\- list\n.SH SYNOPSIS\n.B ls\n[\\fIoption\\fR]...\n.SH DESCRIPTION\nLong prose.\n";
+        let out = String::from_utf8(format_man7_synopsis(page, &SETTINGS).unwrap()).unwrap();
+        assert!(out.contains("SYNOPSIS"), "{out}");
+        assert!(out.contains("ls"), "{out}");
+        assert!(!out.contains("Long prose."), "body leaked: {out}");
+        // The slice carries no .TH, so the page is not framed.
+        assert!(!out.contains("LS(1)"), "header must be suppressed: {out}");
+    }
+
+    #[test]
+    fn synopsis_mode_reports_a_page_with_none() {
+        assert!(format_man7_synopsis(".TH T 1\n.SH NAME\nt \\- t\n", &SETTINGS).is_none());
     }
 
     #[test]

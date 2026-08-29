@@ -226,20 +226,29 @@ mod tests {
     }
 
     #[test]
-    fn synopsis_with_name() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-h", "printf", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -h printf");
-
-        println!("Output: \"{}\"", String::from_utf8(output.stdout).unwrap());
-        println!("Error: \"{}\"", String::from_utf8(output.stderr).unwrap());
-
+    fn synopsis_renders_for_both_page_formats() {
+        // -h routed man(7) pages into the mdoc engine, so it produced zero
+        // bytes and exit 0 for every one of them.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-c",
+            "-h",
+            "gzcat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("SYNOPSIS"), "man(7) synopsis: {out}");
+        assert!(out.contains("gzcat"), "man(7) synopsis: {out}");
         assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
+            !out.contains("Expand files to standard output"),
+            "the body must not be included: {out}"
         );
+
+        let (code, out, _) = man(&["-M", "test_files", "-c", "-h", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("SYNOPSIS"), "mdoc synopsis: {out}");
     }
 
     // -------------------------------------------------------------------------

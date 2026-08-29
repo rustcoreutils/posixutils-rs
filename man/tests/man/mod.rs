@@ -59,6 +59,42 @@ mod tests {
     }
 
     #[test]
+    fn apropos_reports_each_operand_that_matched_nothing() {
+        // The status and the diagnostic were computed from the aggregate
+        // result list, so an operand that matched nothing was silently dropped
+        // whenever any other operand matched -- and the exit status was 0.
+        for flag in ["-k", "-f"] {
+            let (code, out, err) = man(&[
+                "-M",
+                "test_files",
+                flag,
+                "cat",
+                "zzzznosuchpage",
+                "-C",
+                "man.test.conf",
+            ]);
+            assert!(out.contains("cat(1)"), "{flag}: stdout: {out}");
+            assert!(
+                err.contains("zzzznosuchpage: "),
+                "{flag}: the unmatched operand must be named: {err}"
+            );
+            assert_eq!(code, Some(1), "{flag}: stdout: {out} stderr: {err}");
+        }
+
+        // All operands matching is still success.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-f",
+            "cat",
+            "gzcat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+    }
+
+    #[test]
     fn apropos_reports_nothing_appropriate() {
         let (code, _, err) = man(&[
             "-M",

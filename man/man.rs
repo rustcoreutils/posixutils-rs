@@ -870,21 +870,19 @@ enum SearchMode {
     Exact,
 }
 
-fn native_keyword_search(
-    search_paths: &[PathBuf],
-    sections: &[Section],
-    keywords: &[String],
-    mode: SearchMode,
-) -> Vec<String> {
-    let pages = scan_man_pages(search_paths, sections);
+/// Summary lines for the pages matching a single `keyword`.
+///
+/// One keyword at a time, so the caller can tell which operands matched
+/// nothing: deciding from the aggregate hid an operand that found nothing
+/// whenever any other operand found something.
+fn native_keyword_search(pages: &[ManPageInfo], keyword: &str, mode: SearchMode) -> Vec<String> {
+    let keywords = [keyword];
     let mut results = Vec::new();
 
     if mode == SearchMode::Exact {
-        for page in &pages {
-            for keyword in keywords {
-                if let Some(name) = page.names.iter().find(|n| n.eq_ignore_ascii_case(keyword)) {
-                    results.push(format!("{}({}) - {}", name, page.section, page.description));
-                }
+        for page in pages {
+            if let Some(name) = page.names.iter().find(|n| n.eq_ignore_ascii_case(keyword)) {
+                results.push(format!("{}({}) - {}", name, page.section, page.description));
             }
         }
         results.sort();
@@ -918,7 +916,7 @@ fn native_keyword_search(
         })
         .collect();
 
-    for page in &pages {
+    for page in pages {
         // Check if any keyword matches name or description (case-insensitive ERE)
         let matches = matchers
             .iter()
@@ -1179,17 +1177,20 @@ impl Man {
             } else {
                 SearchMode::Exact
             };
-            let results =
-                native_keyword_search(&self.search_paths, &self.sections, &self.args.names, mode);
+            // Scan once, then match each operand against the result: an
+            // operand that matches nothing must still be reported when a later
+            // one matches.
+            let pages = scan_man_pages(&self.search_paths, &self.sections);
 
-            if results.is_empty() {
-                for keyword in &self.args.names {
+            for keyword in &self.args.names {
+                let results = native_keyword_search(&pages, keyword, mode);
+                if results.is_empty() {
                     eprintln!("{}: {}", keyword, gettext("nothing appropriate"));
-                }
-                no_errors = false;
-            } else {
-                for line in results {
-                    println!("{}", line);
+                    no_errors = false;
+                } else {
+                    for line in results {
+                        println!("{}", line);
+                    }
                 }
             }
 

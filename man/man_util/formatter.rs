@@ -2907,7 +2907,7 @@ impl MdocFormatter {
 
         let trailing_punctuation = extract_trailing_delims(macro_node);
 
-        let mut result = open_char.to_string();
+        let mut body = String::new();
         let mut prev_was_open = false;
         let mut is_first_node = true;
 
@@ -2918,13 +2918,14 @@ impl MdocFormatter {
                         prev_was_open = true;
                         text.clone()
                     }
-                    ")" | "]" => {
+                    // A closing delimiter attaches to the preceding word.
+                    // Trailing ones have already been lifted out by
+                    // extract_trailing_delims, so anything reaching here is
+                    // interior content -- it used to be dropped, losing the
+                    // comma in `.Dq word1 , word2`.
+                    ")" | "]" | "." | "," | ":" | ";" | "!" | "?" => {
                         prev_was_open = false;
                         text.clone()
-                    }
-                    "." | "," | ":" | ";" | "!" | "?" => {
-                        prev_was_open = false;
-                        String::new()
                     }
                     _ => {
                         let formatted_text = self.format_text_node(text);
@@ -2947,14 +2948,21 @@ impl MdocFormatter {
             };
 
             if !content.is_empty() {
-                result.push_str(&content);
+                body.push_str(&content);
             }
             is_first_node = false;
         }
 
-        result = result.trim().to_string();
-
-        format!("{}{}{}", result, close_char, trailing_punctuation)
+        // Trim the body, not the assembled string: `open_char` is whitespace for
+        // `.D1`, which passes its indent that way, and trimming afterwards
+        // deleted the indentation the macro exists to produce.
+        format!(
+            "{}{}{}{}",
+            open_char,
+            body.trim(),
+            close_char,
+            trailing_punctuation
+        )
     }
 
     fn format_aq(&mut self, mut macro_node: MacroNode) -> String {
@@ -2966,20 +2974,31 @@ impl MdocFormatter {
     }
 
     fn format_brq(&mut self, mut macro_node: MacroNode) -> String {
-        self.format_partial_implicit_block(&mut macro_node, "{{", "}}")
+        // Single braces: these are plain strings, not a format string, so
+        // doubling them emitted them literally as `{{value}}`.
+        self.format_partial_implicit_block(&mut macro_node, "{", "}")
     }
 
-    fn format_d1(&mut self, mut macro_node: MacroNode) -> String {
-        let spaces = " ".repeat(self.formatting_settings.indent);
-        self.format_partial_implicit_block(&mut macro_node, &spaces, "")
-    }
-
-    fn format_dl(&mut self, mut macro_node: MacroNode) -> String {
+    /// A one-line indented display (`.D1`, `.Dl`).
+    ///
+    /// Both set their argument on its own line at the current indent plus one
+    /// level. `.D1` used to pass that indent as `open_char` and lose it to the
+    /// trim inside `format_partial_implicit_block`, and it counted only the
+    /// settings indent, so it was under-indented inside a block as well.
+    fn format_display_line(&mut self, mut macro_node: MacroNode) -> String {
         let content = self.format_partial_implicit_block(&mut macro_node, "", "");
         let spaces =
             " ".repeat(self.formatting_state.current_indent + self.formatting_settings.indent);
 
         format!("\n{}{}\n", spaces, content)
+    }
+
+    fn format_d1(&mut self, macro_node: MacroNode) -> String {
+        self.format_display_line(macro_node)
+    }
+
+    fn format_dl(&mut self, macro_node: MacroNode) -> String {
+        self.format_display_line(macro_node)
     }
 
     fn format_dq(&mut self, mut macro_node: MacroNode) -> String {
@@ -7105,6 +7124,45 @@ footer text                     January 1, 1970                    footer text";
 
     mod partial_implicit {
         use crate::man_util::formatter::tests::test_formatting;
+
+        /// Render a document with the shared test settings.
+        fn render(input: &str) -> String {
+            use crate::man_util::formatter::tests::{get_ast, FORMATTING_SETTINGS};
+            use crate::man_util::formatter::MdocFormatter;
+            let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
+            String::from_utf8(formatter.format_mdoc(get_ast(input))).unwrap()
+        }
+
+        #[test]
+        fn interior_delimiter_is_kept() {
+            // Trailing delimiters are lifted out before the loop, so a
+            // delimiter reaching it is content. It used to be replaced with an
+            // empty string, silently dropping the comma.
+            let out = render(".Dd January 1, 1970\n.Os f\n.Dq word1 , word2");
+            assert!(out.contains("\u{201c}word1, word2\u{201d}"), "got: {out:?}");
+        }
+
+        #[test]
+        fn brq_emits_single_braces() {
+            // The delimiters are plain strings, not a format string.
+            let out = render(".Dd January 1, 1970\n.Os f\n.Brq value");
+            assert!(out.contains("{value}"), "got: {out:?}");
+            assert!(!out.contains("{{"), "got: {out:?}");
+        }
+
+        #[test]
+        fn d1_is_indented_on_its_own_line() {
+            // `.D1` passed its indent as the opening delimiter, and the trim
+            // over the assembled string deleted it, collapsing the display into
+            // the surrounding paragraph.
+            let out =
+                render(".Dd January 1, 1970\n.Dt T 1\n.Os f\n.Sh DESCRIPTION\ntext\n.D1 indented");
+            assert!(
+                out.lines()
+                    .any(|l| l.starts_with(' ') && l.trim() == "indented"),
+                "the display must be alone on an indented line: {out:?}"
+            );
+        }
 
         #[test]
         fn block_empty() {

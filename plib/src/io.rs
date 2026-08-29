@@ -145,6 +145,33 @@ pub fn restore_sigpipe() {
     }
 }
 
+/// Make sure standard input, output and error are open before anything else
+/// runs.
+///
+/// A process can be started with one of them closed. The first file anything
+/// opens then lands on that descriptor, and what the utility believes it is
+/// writing to standard output goes silently into that file instead -- a
+/// message catalog opened while installing the locale is enough to trigger it.
+/// Taking the free slots with `/dev/null` first, as coreutils does, keeps
+/// output out of an unrelated file.
+///
+/// Call this as the first statement of `main`, before opening anything.
+pub fn ensure_std_fds_open() {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    while let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+    {
+        if file.as_raw_fd() > 2 {
+            // 0, 1 and 2 were all taken already; this one closes on drop.
+            break;
+        }
+        // Leak it deliberately: it is holding a standard descriptor open.
+        let _ = file.into_raw_fd();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

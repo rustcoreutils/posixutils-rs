@@ -272,6 +272,16 @@ pub fn radix_char() -> String {
 /// argument contains an interior NUL byte, falls back to byte-wise comparison
 /// (since `strcoll` can't accept NULs).
 pub fn strcoll(a: &str, b: &str) -> std::cmp::Ordering {
+    strcoll_bytes(a.as_bytes(), b.as_bytes())
+}
+
+/// Compare two byte strings using `strcoll(3)`, honoring `LC_COLLATE`.
+///
+/// POSIX operands are byte strings, so this is the form utilities that keep
+/// their operands as bytes want; the `&str` entry point delegates here.
+/// Falls back to a byte-wise comparison if either argument contains an
+/// interior NUL, which `strcoll` cannot be given.
+pub fn strcoll_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     let (ca, cb) = match (CString::new(a), CString::new(b)) {
         (Ok(ca), Ok(cb)) => (ca, cb),
         _ => return a.cmp(b),
@@ -506,7 +516,18 @@ impl MbDecoder {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    #[test]
+    fn strcoll_bytes_agrees_with_the_str_form() {
+        use std::cmp::Ordering;
+        assert_eq!(strcoll_bytes(b"a", b"b"), strcoll("a", "b"));
+        assert_eq!(strcoll_bytes(b"b", b"a"), strcoll("b", "a"));
+        assert_eq!(strcoll_bytes(b"a", b"a"), Ordering::Equal);
+        // Bytes that are not valid text still compare.
+        assert_eq!(strcoll_bytes(b"a\xff", b"a\xff"), Ordering::Equal);
+    }
 
     #[test]
     fn isprint_ascii_printable() {

@@ -97,7 +97,19 @@ impl Match {
     }
 
     /// Extract the matched substring from the original input.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the match does not fall on character boundaries. Offsets come
+    /// from `regexec` and are byte offsets, and in a single-byte locale a
+    /// pattern such as `.` matches one byte of a multi-byte character. Use
+    /// [`Match::as_bytes`] where the input may not be text.
     pub fn as_str<'a>(&self, input: &'a str) -> &'a str {
+        &input[self.start..self.end]
+    }
+
+    /// Extract the matched bytes from the original input.
+    pub fn as_bytes<'a>(&self, input: &'a [u8]) -> &'a [u8] {
         &input[self.start..self.end]
     }
 }
@@ -105,10 +117,13 @@ impl Match {
 /// A compiled POSIX regular expression.
 pub struct Regex {
     raw: regex_t,
-    /// Original pattern string, kept for Clone and Debug
-    pattern: String,
+    /// Original pattern, kept for Clone and Debug. Bytes rather than a String
+    /// because POSIX patterns are byte strings.
+    pattern: Vec<u8>,
     /// Flags used for compilation, kept for Clone
     flags: RegexFlags,
+    /// An empty pattern is not compiled at all; see [`Regex::new_bytes`].
+    empty: bool,
 }
 
 // SAFETY: regex_t is thread-safe for matching (regexec is reentrant)
@@ -127,9 +142,28 @@ impl Regex {
     ///
     /// Returns an error if the pattern is invalid.
     pub fn new(pattern: &str, flags: RegexFlags) -> std::io::Result<Self> {
-        // Handle macOS quirk: empty pattern causes REG_EMPTY error
-        #[cfg(target_os = "macos")]
-        let pattern = if pattern.is_empty() { ".*" } else { pattern };
+        Self::new_bytes(pattern.as_bytes(), flags)
+    }
+
+    /// Compile a regular expression given as bytes.
+    ///
+    /// POSIX patterns are byte strings, and this is the implementation the
+    /// `&str` entry points delegate to.
+    pub fn new_bytes(pattern: &[u8], flags: RegexFlags) -> std::io::Result<Self> {
+        // An empty pattern matches the empty string at the start of the
+        // subject. It is not handed to regcomp: macOS rejects it outright with
+        // REG_EMPTY, and rewriting it to something else (".*" was tried) gives
+        // a pattern with entirely different behavior. Matching it directly
+        // makes both platforms agree, and agree with what glibc's regcomp
+        // already does for it.
+        if pattern.is_empty() {
+            return Ok(Regex {
+                raw: unsafe { std::mem::zeroed::<regex_t>() },
+                pattern: Vec::new(),
+                flags,
+                empty: true,
+            });
+        }
 
         let c_pattern =
             CString::new(pattern).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
@@ -145,14 +179,19 @@ impl Regex {
             unsafe { regfree(&mut raw) };
             return Err(Error::new(
                 ErrorKind::InvalidInput,
-                format!("invalid regex '{}': {}", pattern, err_msg),
+                format!(
+                    "invalid regex '{}': {}",
+                    String::from_utf8_lossy(pattern),
+                    err_msg
+                ),
             ));
         }
 
         Ok(Regex {
             raw,
-            pattern: pattern.to_string(),
+            pattern: pattern.to_vec(),
             flags,
+            empty: false,
         })
     }
 
@@ -168,6 +207,28 @@ impl Regex {
     /// Convenience method equivalent to `Regex::new(pattern, RegexFlags::ere())`.
     pub fn ere(pattern: &str) -> std::io::Result<Self> {
         Self::new(pattern, RegexFlags::ere())
+    }
+
+    /// Compile a Basic Regular Expression (BRE) given as bytes.
+    pub fn bre_bytes(pattern: &[u8]) -> std::io::Result<Self> {
+        Self::new_bytes(pattern, RegexFlags::bre())
+    }
+
+    /// Compile an Extended Regular Expression (ERE) given as bytes.
+    pub fn ere_bytes(pattern: &[u8]) -> std::io::Result<Self> {
+        Self::new_bytes(pattern, RegexFlags::ere())
+    }
+
+    /// All capture groups set to an empty match at `offset`, the result for an
+    /// empty pattern.
+    fn empty_captures(offset: usize) -> Vec<Match> {
+        vec![
+            Match {
+                start: offset,
+                end: offset
+            };
+            MAX_CAPTURES
+        ]
     }
 
     /// Get error message from regcomp failure using regerror.
@@ -197,6 +258,14 @@ impl Regex {
     ///
     /// `true` if the pattern matches, `false` otherwise.
     pub fn is_match(&self, text: &str) -> bool {
+        self.is_match_bytes(text.as_bytes())
+    }
+
+    /// Returns true if the pattern matches anywhere in the input bytes.
+    pub fn is_match_bytes(&self, text: &[u8]) -> bool {
+        if self.empty {
+            return true;
+        }
         let Ok(c_text) = CString::new(text) else {
             return false;
         };
@@ -216,6 +285,14 @@ impl Regex {
     ///
     /// `Some(Match)` with the location of the first match, or `None` if no match.
     pub fn find(&self, text: &str) -> Option<Match> {
+        self.find_bytes(text.as_bytes())
+    }
+
+    /// Find the first match in the input bytes.
+    pub fn find_bytes(&self, text: &[u8]) -> Option<Match> {
+        if self.empty {
+            return Some(Match { start: 0, end: 0 });
+        }
         let c_text = CString::new(text).ok()?;
 
         let mut pmatch = regmatch_t {
@@ -246,6 +323,14 @@ impl Regex {
     /// Find the first match, treating the start of the string as NOT the beginning of a line.
     /// This prevents `^` from matching at the start of `text`.
     pub fn find_notbol(&self, text: &str) -> Option<Match> {
+        self.find_notbol_bytes(text.as_bytes())
+    }
+
+    /// As [`Regex::find_notbol`], over bytes.
+    pub fn find_notbol_bytes(&self, text: &[u8]) -> Option<Match> {
+        if self.empty {
+            return Some(Match { start: 0, end: 0 });
+        }
         let c_text = CString::new(text).ok()?;
 
         let mut pmatch = regmatch_t {
@@ -287,6 +372,17 @@ impl Regex {
     /// `Some(Vec<Match>)` with all capture groups, or `None` if no match.
     /// Empty/unused groups have `start == end == 0`.
     pub fn captures(&self, text: &str) -> Option<Vec<Match>> {
+        self.captures_bytes(text.as_bytes())
+    }
+
+    /// Find all capture groups in the input bytes.
+    ///
+    /// Offsets are byte offsets, so a caller holding text must slice with
+    /// [`Match::as_bytes`] or check character boundaries itself.
+    pub fn captures_bytes(&self, text: &[u8]) -> Option<Vec<Match>> {
+        if self.empty {
+            return Some(Self::empty_captures(0));
+        }
         let c_text = CString::new(text).ok()?;
 
         let mut pmatch: [regmatch_t; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
@@ -336,8 +432,16 @@ impl Regex {
     /// `Some(Vec<Match>)` with captures (positions relative to start of `text`),
     /// or `None` if no match found at or after offset.
     pub fn captures_at(&self, text: &str, offset: usize) -> Option<Vec<Match>> {
+        self.captures_at_bytes(text.as_bytes(), offset)
+    }
+
+    /// As [`Regex::captures_at`], over bytes.
+    pub fn captures_at_bytes(&self, text: &[u8], offset: usize) -> Option<Vec<Match>> {
         if offset > text.len() {
             return None;
+        }
+        if self.empty {
+            return Some(Self::empty_captures(offset));
         }
 
         let substring = &text[offset..];
@@ -392,8 +496,14 @@ impl Regex {
         }
     }
 
-    /// Returns the original pattern string.
+    /// Returns the original pattern as text, or the empty string if the
+    /// pattern is not valid UTF-8 (only a byte constructor can produce that).
     pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.pattern).unwrap_or_default()
+    }
+
+    /// Returns the original pattern bytes.
+    pub fn as_bytes(&self) -> &[u8] {
         &self.pattern
     }
 }
@@ -401,20 +511,23 @@ impl Regex {
 impl Clone for Regex {
     fn clone(&self) -> Self {
         // Re-compile the pattern (regex_t cannot be safely copied)
-        Regex::new(&self.pattern, self.flags).expect("failed to clone already-valid regex")
+        Regex::new_bytes(&self.pattern, self.flags).expect("failed to clone already-valid regex")
     }
 }
 
 impl Drop for Regex {
     fn drop(&mut self) {
-        unsafe { regfree(&mut self.raw) }
+        // An empty pattern was never compiled, so there is nothing to free.
+        if !self.empty {
+            unsafe { regfree(&mut self.raw) }
+        }
     }
 }
 
 impl std::fmt::Debug for Regex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Regex")
-            .field("pattern", &self.pattern)
+            .field("pattern", &String::from_utf8_lossy(&self.pattern))
             .field("flags", &self.flags)
             .finish()
     }
@@ -475,6 +588,54 @@ impl Iterator for MatchIter<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn empty_pattern_matches_empty_at_the_start() {
+        // macOS regcomp rejects an empty pattern outright, so it is matched
+        // directly rather than compiled; both platforms must agree with what
+        // glibc does for it.
+        let re = Regex::bre("").expect("an empty pattern is valid");
+        assert!(re.is_match("abc"));
+        assert_eq!(re.find("abc"), Some(Match { start: 0, end: 0 }));
+        let caps = re.captures("abc").expect("empty matches");
+        assert_eq!(caps[0], Match { start: 0, end: 0 });
+        assert_eq!(
+            re.captures_at("abc", 2).unwrap()[0],
+            Match { start: 2, end: 2 }
+        );
+        assert_eq!(re.as_str(), "");
+    }
+
+    #[test]
+    fn byte_patterns_and_subjects() {
+        // POSIX operands are byte strings, and need not be valid text.
+        let re = Regex::bre_bytes(b"a.b").expect("valid");
+        let subject = b"xa\xffb";
+        let caps = re.captures_bytes(subject).expect("should match");
+        assert_eq!(caps[0], Match { start: 1, end: 4 });
+        assert_eq!(caps[0].as_bytes(subject), b"a\xffb");
+        assert!(re.is_match_bytes(subject));
+        assert_eq!(re.find_bytes(subject), Some(Match { start: 1, end: 4 }));
+    }
+
+    #[test]
+    fn byte_and_str_entry_points_agree() {
+        let re = Regex::bre("h\\(.*\\)o").expect("valid");
+        assert_eq!(re.captures("hello"), re.captures_bytes(b"hello"));
+        assert_eq!(re.find("hello"), re.find_bytes(b"hello"));
+        assert_eq!(re.is_match("hello"), re.is_match_bytes(b"hello"));
+    }
+
+    #[test]
+    fn match_offsets_are_bytes_not_characters() {
+        // The offsets come from regexec and are byte offsets; a caller holding
+        // text has to slice with as_bytes or check boundaries.
+        let re = Regex::bre("..").expect("valid");
+        let subject = "é".as_bytes(); // two bytes, one character
+        let m = re.find_bytes(subject).expect("matches two bytes");
+        assert_eq!(m, Match { start: 0, end: 2 });
+        assert_eq!(m.as_bytes(subject), subject);
+    }
     use super::*;
 
     #[test]
@@ -572,7 +733,8 @@ mod tests {
 
     #[test]
     fn test_empty_pattern() {
-        // Should work on all platforms (macOS workaround)
+        // An empty pattern is matched directly rather than compiled, so this
+        // holds on macOS too, where regcomp rejects it.
         let re = Regex::bre("").unwrap();
         assert!(re.is_match("anything"));
     }

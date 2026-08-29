@@ -46,32 +46,8 @@ const STDIN_NAME: &str = "(standard_in)";
 /// aborting on a guard page.
 const INTERPRETER_STACK_SIZE: usize = 512 * 1024 * 1024;
 
-/// Make sure standard input, output and error are open before anything else
-/// runs.
-///
-/// A process can be started with one of them closed. The first file anything
-/// opens then lands on that descriptor, and program output goes silently into
-/// it -- here the message catalog, opened while installing the locale. Taking
-/// the free slots with /dev/null first, as coreutils does, keeps output out of
-/// an unrelated file.
-fn ensure_std_fds_open() {
-    use std::os::fd::{AsRawFd, IntoRawFd};
-    while let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-    {
-        if file.as_raw_fd() > 2 {
-            // 0, 1 and 2 were all taken already; this one closes on drop.
-            break;
-        }
-        // Leak it deliberately: it is holding a standard descriptor open.
-        let _ = file.into_raw_fd();
-    }
-}
-
 fn main() {
-    ensure_std_fds_open();
+    plib::io::ensure_std_fds_open();
     match std::thread::Builder::new()
         .stack_size(INTERPRETER_STACK_SIZE)
         .spawn(run)

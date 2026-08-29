@@ -142,6 +142,21 @@ fn does_start_with_macro(word: &str) -> bool {
     )
 }
 
+/// Whether `line` is a control line invoking the macro `name`.
+///
+/// The macro name must be followed by whitespace or end the line, so prose that
+/// merely mentions `.Ed` is not mistaken for a block end and `.Blah` is not
+/// mistaken for `.Bl`.
+fn is_macro_line(line: &str, name: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('.') else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix(name) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(char::is_whitespace)
+}
+
 pub fn prepare_document(text: &str) -> String {
     let mut is_bd_literal_block = false;
     let mut bl_depth: i32 = 0;
@@ -152,12 +167,12 @@ pub fn prepare_document(text: &str) -> String {
             // can be rendered as plain text instead of being silently dropped by
             // the grammar (which only recognizes `.It` within a list).
             let trimmed = l.trim_start();
-            if trimmed.starts_with(".Bl") {
+            if is_macro_line(trimmed, "Bl") {
                 bl_depth += 1;
-            } else if trimmed.starts_with(".El") {
+            } else if is_macro_line(trimmed, "El") {
                 bl_depth = (bl_depth - 1).max(0);
             }
-            let stray_it = bl_depth == 0 && trimmed.starts_with(".It");
+            let stray_it = bl_depth == 0 && is_macro_line(trimmed, "It");
             let source = if stray_it {
                 trimmed.strip_prefix(".It").unwrap_or(trimmed).trim()
             } else {
@@ -170,11 +185,18 @@ pub fn prepare_document(text: &str) -> String {
                 source.to_string()
             };
 
-            if line.contains(".Bd") && (line.contains("-literal") || line.contains("-unfilled")) {
+            // Match the control line, not a substring of it: prose mentioning
+            // `.Ed` used to end literal mode part-way through a block, and any
+            // line merely naming `.Bd -literal` used to start one.
+            if is_macro_line(&line, "Bd")
+                && (line.contains("-literal") || line.contains("-unfilled"))
+            {
                 is_bd_literal_block = true;
             }
 
-            if is_bd_literal_block && line.contains(".Ed") {
+            // A section heading closes an unterminated display, matching what
+            // the parser's own frame stack does.
+            if is_bd_literal_block && (is_macro_line(&line, "Ed") || is_macro_line(&line, "Sh")) {
                 is_bd_literal_block = false;
             }
 
@@ -219,17 +241,16 @@ pub fn prepare_document(text: &str) -> String {
         .join("\n")
 }
 
-/// Strip a single pair of surrounding double quotes (unless escaped with `\&`).
-pub fn trim_quotes(mut s: String) -> String {
-    if !s.starts_with("\\&\"") {
-        if let Some(stripped) = s.strip_prefix("\"") {
-            s = stripped.to_string();
-        }
-    }
-    if !s.ends_with("\\&\"") {
-        if let Some(stripped) = s.strip_suffix("\"") {
-            s = stripped.to_string();
-        }
+/// Strip a single *matching* pair of surrounding double quotes (unless the
+/// closing one is escaped with `\&`).
+///
+/// The leading and trailing quotes used to be stripped independently, so a
+/// string that merely ended in a quote lost it: `#include "myheader.h"` came
+/// out as `#include "myheader.h`, in prose and inside `.Bd -literal` alike,
+/// which is exactly where code samples live.
+pub fn trim_quotes(s: String) -> String {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') && !s.ends_with("\\&\"") {
+        return s[1..s.len() - 1].to_string();
     }
 
     s
@@ -285,5 +306,49 @@ impl MdocParser {
     /// parser; pest has been removed). The parser is total — it never fails.
     pub fn parse_mdoc(input: &str) -> MdocDocument {
         crate::man_util::parse::mdoc::parse_mdoc_v2(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_macro_line, prepare_document, trim_quotes};
+
+    #[test]
+    fn trim_quotes_needs_a_matching_pair() {
+        // The two quotes used to be stripped independently, so any line that
+        // merely ended in one lost it.
+        assert_eq!(trim_quotes("\"quoted\"".into()), "quoted");
+        assert_eq!(
+            trim_quotes("#include \"myheader.h\"".into()),
+            "#include \"myheader.h\""
+        );
+        assert_eq!(trim_quotes("\"unclosed".into()), "\"unclosed");
+        assert_eq!(trim_quotes("unopened\"".into()), "unopened\"");
+        assert_eq!(trim_quotes("\"".into()), "\"");
+        assert_eq!(trim_quotes(String::new()), "");
+    }
+
+    #[test]
+    fn is_macro_line_matches_the_whole_name() {
+        assert!(is_macro_line(".Ed", "Ed"));
+        assert!(is_macro_line(".Bl -tag", "Bl"));
+        assert!(is_macro_line("  .El", "El"));
+        // A longer macro whose name merely starts with the one asked for.
+        assert!(!is_macro_line(".Edx", "Ed"));
+        assert!(!is_macro_line(".Blah", "Bl"));
+        // Prose, not a control line.
+        assert!(!is_macro_line("See .Ed for details", "Ed"));
+    }
+
+    #[test]
+    fn prose_mentioning_ed_does_not_end_literal_mode() {
+        // Literal tracking tested `line.contains(".Ed")`, so a sentence naming
+        // the macro ended the block and the rest of it lost its indentation.
+        let out = prepare_document(".Bd -literal\n    a\nSee .Ed for details\n    b\n.Ed\n");
+        assert_eq!(
+            out.matches("\\^").count(),
+            8,
+            "both indented lines keep their escaped leading spaces: {out:?}"
+        );
     }
 }

@@ -216,11 +216,31 @@ impl Parser {
         self.control(name, rest);
     }
 
+    /// Whether an unfilled display is open. Derived from the frame stack rather
+    /// than tracked separately, so it cannot drift from the block structure.
+    fn in_literal(&self) -> bool {
+        self.stack.iter().any(|f| {
+            matches!(
+                f.mac,
+                Some(Macro::Bd {
+                    block_type: BdType::Literal | BdType::Unfilled,
+                    ..
+                })
+            )
+        })
+    }
+
     fn text_line(&mut self, line: &str) {
         if line.trim().is_empty() {
             return;
         }
-        self.push(Element::Text(trim_quotes(line.to_string())));
+        // Text inside an unfilled display is copied verbatim.
+        let text = if self.in_literal() {
+            line.to_string()
+        } else {
+            trim_quotes(line.to_string())
+        };
+        self.push(Element::Text(text));
     }
 
     fn control(&mut self, name: &str, rest: &str) {

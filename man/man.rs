@@ -45,10 +45,11 @@ const MAN_SECTIONS: [Section; 10] = [
 ];
 
 /// Possible default config file paths to check if `-C` is not provided.
-const MAN_CONFS: [&str; 3] = [
-    "/etc/man.conf",
-    "/etc/examples/man.conf",
-    "/etc/manpath.config",
+const MAN_CONFS: [&str; 4] = [
+    "/etc/man.conf",          // BSD, mandoc
+    "/etc/examples/man.conf", // OpenBSD sample
+    "/etc/man_db.conf",       // Fedora, RHEL, Arch, openSUSE (man-db)
+    "/etc/manpath.config",    // Debian, Ubuntu (man-db)
 ];
 
 #[derive(Parser, Debug, Default)]
@@ -348,27 +349,24 @@ impl Default for FormattingSettings {
 /// Try to locate the configuration file:
 /// - If `path` is Some, check if it exists; error if not.
 /// - If `path` is None, try each of MAN_CONFS; return an error if none exist.
-fn get_config_file_path(path: &Option<PathBuf>) -> Result<PathBuf, ManError> {
+fn get_config_file_path(path: &Option<PathBuf>) -> Result<Option<PathBuf>, ManError> {
     if let Some(user_path) = path {
-        if user_path.exists() {
-            Ok(user_path.clone())
+        // An explicit -C naming a file that does not exist is an error: the
+        // user asked for that file.
+        return if user_path.exists() {
+            Ok(Some(user_path.clone()))
         } else {
             Err(ManError::ConfigFileNotFound(
                 user_path.display().to_string(),
             ))
-        }
-    } else {
-        // No -C provided, so check defaults:
-        for default in MAN_CONFS {
-            let p = PathBuf::from(default);
-            if p.exists() {
-                return Ok(p);
-            }
-        }
-        Err(ManError::ConfigFileNotFound(
-            "No valid man.conf found".to_string(),
-        ))
+        };
     }
+
+    // No -C: use the first default that exists. Finding none is not an error.
+    // A minimal container ships none of these, and the built-in manual roots
+    // are a complete fallback -- refusing to run `man ls` because
+    // /etc/man.conf is absent made the utility unusable on such a system.
+    Ok(MAN_CONFS.iter().map(PathBuf::from).find(|p| p.exists()))
 }
 
 /// Gets page width.
@@ -958,8 +956,10 @@ impl Man {
             }
         }
 
-        let config_path = get_config_file_path(&args.config_file)?;
-        let config = parse_config_file(config_path)?;
+        let config = match get_config_file_path(&args.config_file)? {
+            Some(path) => parse_config_file(path)?,
+            None => ManConfig::default(),
+        };
 
         let mut man = Self {
             args,
@@ -1159,7 +1159,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_page, is_safe_so_target, pager_command, ManError};
+    use super::{decode_page, get_config_file_path, is_safe_so_target, pager_command, ManError};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_missing_default_config_is_not_an_error() {
+        // With none of MAN_CONFS present, `man ls` exited 1 before ever
+        // consulting the built-in manual roots -- which is every minimal
+        // container. An explicit -C naming a missing file is still an error.
+        assert!(get_config_file_path(&None).is_ok());
+        assert!(matches!(
+            get_config_file_path(&Some(PathBuf::from("/nonexistent/man.conf"))),
+            Err(ManError::ConfigFileNotFound(_))
+        ));
+    }
 
     #[test]
     fn pager_falls_back_to_more_when_unset_or_null() {

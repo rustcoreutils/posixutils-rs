@@ -33,7 +33,11 @@ None is open work; each bounds what the closed findings guarantee.
   than the process aborting on a guard page. The constant has to hold for
   unoptimized builds too, whose frames are several times larger, so the
   release binary stops well below what its stack could take: bc recursion runs
-  some thousands deep, against GNU's tens of thousands.
+  some thousands deep, against GNU's tens of thousands. Where the address
+  space is capped tightly enough to refuse that stack -- `RLIMIT_AS`, or
+  strict overcommit -- bc falls back to the default one and runs; a program
+  that recurses far enough to need the room then aborts as it did before the
+  large stack existed, which is still better than not running at all.
 - **`expr` computes in `i128`, not arbitrary precision.** POSIX does not
   mandate bignum and `i128` covers every realistic shell use, but GNU expr is
   arbitrary-precision, so `expr 10^40 + 1` reports "integer out of range"

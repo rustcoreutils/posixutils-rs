@@ -44,14 +44,33 @@ const STDIN_NAME: &str = "(standard_in)";
 /// so the work runs on a thread large enough that the interpreter's own limit
 /// is what reports the problem, with a diagnostic, instead of the process
 /// aborting on a guard page.
+///
+/// The size is what a runaway recursion actually touches before that limit
+/// fires, with margin. An unoptimized build uses several times the frame space
+/// of a release one, so it needs the larger reservation; sizing the release
+/// binary for the debug case would reserve address space no release run uses.
+#[cfg(debug_assertions)]
 const INTERPRETER_STACK_SIZE: usize = 512 * 1024 * 1024;
+#[cfg(not(debug_assertions))]
+const INTERPRETER_STACK_SIZE: usize = 128 * 1024 * 1024;
+
+/// Start the interpreter thread, falling back to the default stack size.
+///
+/// A constrained address space -- `RLIMIT_AS`, or strict overcommit -- can
+/// refuse a stack this large, and refusing to run at all would be a worse
+/// answer than running with less room: only a program that recurses far enough
+/// to need it is affected, and such a program then fails the way it did before
+/// the large stack existed.
+fn spawn_interpreter() -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .stack_size(INTERPRETER_STACK_SIZE)
+        .spawn(run)
+        .or_else(|_| std::thread::Builder::new().spawn(run))
+}
 
 fn main() {
     plib::io::ensure_std_fds_open();
-    match std::thread::Builder::new()
-        .stack_size(INTERPRETER_STACK_SIZE)
-        .spawn(run)
-    {
+    match spawn_interpreter() {
         // `run` ends the process itself; join only returns if it panicked.
         Ok(interpreter) => {
             if interpreter.join().is_err() {

@@ -52,9 +52,15 @@ impl ParseError {
     /// The diagnostics, as (line, column, message), for a caller that reports
     /// them itself.
     pub fn diagnostics(&self) -> impl Iterator<Item = (u32, u16, &str)> {
-        self.errors
-            .iter()
-            .map(|e| (e.line as u32, e.col as u16, e.message.as_str()))
+        self.errors.iter().map(|e| {
+            // plib::diag::Position carries a u32 line and a u16 column, so a
+            // position past either has to be clamped rather than wrapped: a
+            // line of more than 65535 characters would otherwise report a
+            // column that never existed.
+            let line = u32::try_from(e.line).unwrap_or(u32::MAX);
+            let col = u16::try_from(e.col).unwrap_or(u16::MAX);
+            (line, col, e.message.as_str())
+        })
     }
 }
 
@@ -1532,6 +1538,18 @@ mod test {
             "expected a depth diagnostic, got: {}",
             err
         );
+    }
+
+    /// A column past what the diagnostic position can hold is clamped, not
+    /// wrapped: reporting column 4467 for column 70003 points at a place the
+    /// error is not.
+    #[test]
+    fn test_diagnostic_column_is_clamped_not_wrapped() {
+        let long_line = format!("{}1+*\n", " ".repeat(70_000));
+        let err = program_err(&long_line);
+        let (line, col, _) = err.diagnostics().next().expect("one diagnostic");
+        assert_eq!(line, 1);
+        assert_eq!(col, u16::MAX);
     }
 
     #[test]

@@ -102,46 +102,43 @@ impl Parser {
         self.stack.last_mut().unwrap().nodes.push(node);
     }
 
-    /// Close the nearest explicit block matching `is_match` (and any frames
-    /// nested inside it), for `.Ed`/`.Ef`/`.Ek`.
-    fn close_explicit(&mut self, is_match: MacroPred) {
-        while self.stack.len() > 1 {
-            let matched = self
-                .stack
-                .last()
-                .unwrap()
-                .mac
-                .as_ref()
-                .map(is_match)
-                .unwrap_or(false);
+    /// Index of the innermost open frame whose macro satisfies `is_match`. The
+    /// document root has `mac == None` and so never matches.
+    fn find_open(&self, is_match: MacroPred) -> Option<usize> {
+        self.stack
+            .iter()
+            .rposition(|f| f.mac.as_ref().map(is_match).unwrap_or(false))
+    }
+
+    /// Close the innermost frame satisfying `is_match`, and every frame nested
+    /// inside it, applying `tail` to that frame just before it closes.
+    ///
+    /// Returns false and changes nothing when no such frame is open, so a stray
+    /// `.Ed`/`.Ec`/`.Re`/`.Fc` is ignored the way mandoc ignores it. Searching
+    /// before unwinding is the point: closing frames while looking for the match
+    /// destroyed every enclosing block back to the document root whenever the
+    /// match did not exist, so one stray closer moved the rest of the page out
+    /// of the section it was written in.
+    fn close_matching(&mut self, is_match: MacroPred, tail: impl FnOnce(&mut Frame)) -> bool {
+        let Some(i) = self.find_open(is_match) else {
+            return false;
+        };
+        while self.stack.len() > i + 1 {
             self.close_top();
-            if matched {
-                break;
-            }
         }
+        tail(self.stack.last_mut().unwrap());
+        self.close_top();
+        true
     }
 
     /// Close a block-partial-explicit enclosure: the closer node becomes the
     /// opener's final child, then the opener frame is closed.
     fn close_partial(&mut self, closer: Element, opener_is: MacroPred) {
-        while self.stack.len() > 1 {
-            let matched = self
-                .stack
-                .last()
-                .unwrap()
-                .mac
-                .as_ref()
-                .map(opener_is)
-                .unwrap_or(false);
-            if matched {
-                break;
-            }
-            self.close_top();
-        }
-        if self.stack.len() > 1 {
-            self.stack.last_mut().unwrap().nodes.push(closer);
-            self.close_top();
+        if self.find_open(opener_is).is_some() {
+            self.close_matching(opener_is, |f| f.nodes.push(closer));
         } else {
+            // No matching opener: keep the closer's own text where it appeared
+            // rather than unwinding the stack in search of one.
             self.push(closer);
         }
     }
@@ -171,20 +168,14 @@ impl Parser {
 
     /// Close the nearest `.Eo` enclosure, recording its closing delimiter.
     fn close_eo(&mut self, close: Option<char>) {
-        while self.stack.len() > 1
-            && !matches!(self.stack.last().unwrap().mac, Some(Macro::Eo { .. }))
-        {
-            self.close_top();
-        }
-        if matches!(self.stack.last().unwrap().mac, Some(Macro::Eo { .. })) {
+        self.close_matching(is_eo, |f| {
             if let Some(Macro::Eo {
                 closing_delimiter, ..
-            }) = self.stack.last_mut().unwrap().mac.as_mut()
+            }) = f.mac.as_mut()
             {
                 *closing_delimiter = close;
             }
-            self.close_top();
-        }
+        });
     }
 
     /// Close every open block and return the document elements.
@@ -332,9 +323,15 @@ impl Parser {
                 &[],
             ),
             "Bk" => self.open_block(Macro::Bk, &[]),
-            "Ed" => self.close_explicit(is_bd),
-            "Ef" => self.close_explicit(is_bf),
-            "Ek" => self.close_explicit(is_bk),
+            "Ed" => {
+                self.close_matching(is_bd, |_| {});
+            }
+            "Ef" => {
+                self.close_matching(is_bf, |_| {});
+            }
+            "Ek" => {
+                self.close_matching(is_bk, |_| {});
+            }
             "Bl" => self.open_block(parse_bl(rest), &[]),
             "It" => {
                 self.close_open_items();
@@ -346,23 +343,15 @@ impl Parser {
             }
             "El" => {
                 self.close_open_items();
-                self.close_explicit(is_bl);
+                self.close_matching(is_bl, |_| {});
             }
             "Rs" => self.stack.push(Frame {
                 mac: Some(Macro::Rs),
                 nodes: Vec::new(),
             }),
             "Re" => {
-                while self.stack.len() > 1
-                    && !matches!(self.stack.last().unwrap().mac, Some(Macro::Rs))
-                {
-                    self.close_top();
-                }
-                if matches!(self.stack.last().unwrap().mac, Some(Macro::Rs)) {
-                    // .Rs sorts its reference submacros by a fixed order.
-                    self.stack.last_mut().unwrap().nodes.sort_by_key(rs_rank);
-                    self.close_top();
-                }
+                // .Rs sorts its reference submacros by a fixed order.
+                self.close_matching(is_rs, |f| f.nodes.sort_by_key(rs_rank));
             }
             _ if rs_submacro(name).is_some() => {
                 // A reference submacro (%A …): one Text node per word. It requires
@@ -421,17 +410,8 @@ impl Parser {
             }
             "Fc" => {
                 // .Fc closes .Fo and is not itself kept; any args flow into Fo.
-                while self.stack.len() > 1
-                    && !matches!(self.stack.last().unwrap().mac, Some(Macro::Fo { .. }))
-                {
-                    self.close_top();
-                }
-                if matches!(self.stack.last().unwrap().mac, Some(Macro::Fo { .. })) {
-                    for el in parse_inline_seq(tokenize(rest)) {
-                        self.stack.last_mut().unwrap().nodes.push(el);
-                    }
-                    self.close_top();
-                }
+                let extra = parse_inline_seq(tokenize(rest));
+                self.close_matching(is_fo, move |f| f.nodes.extend(extra));
             }
             "Sm" => {
                 // Optional on/off spacing mode; the first arg is consumed either
@@ -814,6 +794,15 @@ fn is_bf(m: &Macro) -> bool {
 }
 fn is_bk(m: &Macro) -> bool {
     matches!(m, Macro::Bk)
+}
+fn is_eo(m: &Macro) -> bool {
+    matches!(m, Macro::Eo { .. })
+}
+fn is_rs(m: &Macro) -> bool {
+    matches!(m, Macro::Rs)
+}
+fn is_fo(m: &Macro) -> bool {
+    matches!(m, Macro::Fo { .. })
 }
 
 /// Partial-implicit container macros: each wraps the remainder of the line.
@@ -1276,6 +1265,44 @@ mod tests {
     #[test]
     fn sh_without_body() {
         parity(".Sh SECTION");
+    }
+
+    #[test]
+    fn stray_block_end_does_not_unwind_enclosing_blocks() {
+        // Closing frames while searching for the match destroyed every block
+        // back to the root when no match existed, so one stray `.Ed` moved the
+        // rest of the page out of the section it was written in.
+        let doc = parse_mdoc_v2(".Sh DESCRIPTION\nbefore\n.Ed\nafter\n");
+        assert_eq!(
+            doc.elements.len(),
+            1,
+            "the stray .Ed must not close .Sh: {:?}",
+            doc.elements
+        );
+    }
+
+    #[test]
+    fn stray_closers_are_ignored() {
+        for input in [
+            ".Sh A\n.Ed\n",
+            ".Sh A\n.Ef\n",
+            ".Sh A\n.Ek\n",
+            ".Sh A\n.El\n",
+            ".Sh A\n.Ec\n",
+            ".Sh A\n.Re\n",
+            ".Sh A\n.Fc\n",
+        ] {
+            let doc = parse_mdoc_v2(input);
+            assert_eq!(doc.elements.len(), 1, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn matched_block_ends_still_close_their_opener() {
+        // The guard against over-unwinding must not stop a real closer working.
+        parity(".Sh A\n.Bd -literal\ntext\n.Ed\nafter\n");
+        parity(".Sh A\n.Bl -bullet\n.It\nitem\n.El\nafter\n");
+        parity(".Sh A\n.Rs\n.%A Author\n.Re\n");
     }
 
     #[test]

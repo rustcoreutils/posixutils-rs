@@ -130,16 +130,11 @@ mod tests {
 
     #[test]
     fn all_flag_with_names() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-a", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -a ls");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // -a lists every matching page rather than the first. The fixture tree
+        // has cat(1) in both the generic and the amd64 directory.
+        let (code, out, _) = man(&["-M", "test_files", "-a", "-w", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("test_files/man1/cat.1"), "{out}");
     }
 
     // -------------------------------------------------------------------------
@@ -195,15 +190,13 @@ mod tests {
 
     #[test]
     fn copy_flag_with_name() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-c", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -c ls");
-
+        // -c writes the rendered page to stdout instead of paging it.
+        let (code, out, _) = man(&["-M", "test_files", "-c", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
         assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
+            out.ends_with('\n'),
+            "a rendered page ends with a newline: {out:?}"
         );
     }
 
@@ -271,16 +264,12 @@ mod tests {
 
     #[test]
     fn local_file_without_other_args() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-l", "test.mdoc", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -l tests/test_data.1");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // This named test.mdoc, which does not exist in the crate, so it only
+        // ever exercised the not-found path -- and passed because exit 1 was
+        // accepted. Render a file that is actually there.
+        let (code, out, _) = man(&["-c", "-l", "test_files/man1/cat.1", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
     }
 
     // -------------------------------------------------------------------------
@@ -369,16 +358,19 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn augment_paths_single() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-m", "/opt/mylocalman", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -m /opt/mylocalman ls");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // -m adds a root in front of the existing list.
+        let (code, out, _) = man(&[
+            "-M",
+            "/nonexistent",
+            "-m",
+            "test_files",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
     }
 
     #[test]
@@ -394,11 +386,20 @@ mod tests {
             .output()
             .expect("Failed to run man -m /first/path:/second/path ls");
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // A ':'-separated -m value contributes several roots.
+        let (code, out, _) = man(&[
+            "-M",
+            "/nonexistent",
+            "-m",
+            "/first/path:test_files",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
+        let _ = output;
     }
 
     // -------------------------------------------------------------------------
@@ -460,16 +461,21 @@ mod tests {
 
     #[test]
     fn subsection_flag_with_name() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-S", "amd64", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -S amd64 ls");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // An architecture with no page of its own still resolves the generic
+        // one; the selecting case is covered by
+        // subsection_selects_the_architecture_page.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-S",
+            "sparc64",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
     }
 
     // -------------------------------------------------------------------------
@@ -537,16 +543,10 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn list_pathnames_flag_no_name() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-w", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -w");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // -w with no operand is an error, like every other mode.
+        let (code, _, err) = man(&["-w", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(1));
+        assert!(err.contains("no names specified"), "stderr: {err}");
     }
 
     #[test]
@@ -591,30 +591,29 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn single_name_argument() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man ls");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        let (code, out, _) = man(&["-M", "test_files", "-c", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
     }
 
     #[test]
     fn multiple_name_arguments() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["ls", "cat", "nonexistent", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man ls cat nonexistent");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // Every operand is attempted; one failure is reported but does not
+        // abort the rest, and the overall status is still non-zero.
+        let (code, out, err) = man(&[
+            "-M",
+            "test_files",
+            "-c",
+            "cat",
+            "gzcat",
+            "nonexistent",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(1), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
+        assert!(out.contains("expand compressed files"), "{out}");
+        assert!(err.contains("nonexistent"), "stderr: {err}");
     }
 
     // -------------------------------------------------------------------------
@@ -999,7 +998,12 @@ mod malformed {
                 continue;
             }
             let output = Command::new(env!("CARGO_BIN_EXE_man"))
-                .args(["-l".as_ref(), path.as_os_str()])
+                .args([
+                    "-C".as_ref(),
+                    "man.test.conf".as_ref(),
+                    "-l".as_ref(),
+                    path.as_os_str(),
+                ])
                 .env("COLUMNS", "40")
                 .output()
                 .unwrap_or_else(|e| panic!("failed to run man on {}: {e}", path.display()));

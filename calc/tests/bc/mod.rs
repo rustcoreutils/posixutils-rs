@@ -343,6 +343,29 @@ fn test_bc_write_error_is_reported() {
     );
 }
 
+/// The math library carries guard digits through its argument reductions, so
+/// results are correct to the scale asked for. Without them e() and l() were
+/// wrong in their leading digits for a large argument: e(10) at scale 2 gave
+/// 19656.33 against a true 22026.46. Every value here matches GNU bc.
+#[test]
+fn test_bc_math_library_accuracy() {
+    let cases = [
+        ("scale=20\ne(1)\n", "2.71828182845904523536\n"),
+        ("scale=20\nl(2)\n", "0.69314718055994530941\n"),
+        ("scale=20\ns(1)\n", "0.84147098480789650665\n"),
+        ("scale=20\ne(-2)\n", "0.13533528323661269189\n"),
+        // 4*a(1) multiplies the truncated a(1), as bc arithmetic requires.
+        ("scale=20\n4*a(1)\n", "3.14159265358979323844\n"),
+        // The cases that used to be wrong in their leading digits.
+        ("scale=2\ne(10)\n", "22026.46\n"),
+        ("scale=5\ne(10)\n", "22026.46579\n"),
+        ("scale=5\nl(100)\n", "4.60517\n"),
+    ];
+    for (program, expected) in cases {
+        test_bc_with_math_library(&format!("{program}quit\n"), expected);
+    }
+}
+
 // x^0 is 1 with scale 0, regardless of the scale register (audit #B8).
 #[test]
 fn test_bc_pow_zero_scale() {

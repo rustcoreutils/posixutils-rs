@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2024 Hemi Labs, Inc.
+* Copyright (c) 2024-2026 Hemi Labs, Inc.
 *
 * This file is part of the posixutils-rs project covered under
 * the MIT License.  For the full license text, please see the LICENSE
@@ -7,13 +7,28 @@
 * SPDX-License-Identifier: MIT
 */
 
+/*
+Each function computes at a scale above the caller's and truncates back on
+return, because a Taylor series accumulates a rounding error in every term and
+the argument reductions below amplify what is left:
+
+  - e(x) computes e(x/2^k) and raises it to the power 2^k, which multiplies the
+    relative error by 2^k.
+  - l(x) takes repeated square roots and multiplies the result by that power of
+    two, which multiplies the absolute error by the same factor.
+  - s(x) and c(x) reduce x modulo 2*pi, which cancels the leading digits of x,
+    so a large argument needs as many extra digits as it has ahead of the point.
+
+Without those guard digits the last digits of every result are wrong, and for
+e() and l() with a large argument the error reaches the leading digits.
+*/
 
 /*
 Uses sin(x) = x - x^3/3! + x^5/5! - x^7/7! + ...
 (http://www.hvks.com/Numerical/Downloads/HVE%20Fast%20Trigonometric%20functions%20for%20arbitrary%20precision.pdf)
 */
 define s(x) {
-	auto b, y, f, i, v, r, z, p, s, m;
+	auto b, y, f, i, v, r, z, p, s, m, g, t;
 
 	/* b: previous ibase */
 	/* y: x^i */
@@ -25,17 +40,30 @@ define s(x) {
 	/* p: the value of pi */
 	/* s: previous scale */
 	/* m: 1 if pi has been subtracted from x */
+	/* g: guard digits */
+	/* t: scratch */
 
 	b = ibase;
 	ibase = A;
+	s = scale;
+
+	/* Reducing modulo 2*pi cancels the digits of x ahead of the point. */
+	scale = 0;
+	g = 10;
+	t = x / 1;
+	if (t < 0) t = -t;
+	while (t > 0) {
+		g += 1;
+		t /= 10;
+	}
+	scale = s + g;
 
 	p = 4 * a(1);
 
 	/* sin(x) = sin(x mod (2 * pi)) */
-	s = scale;
 	scale = 0;
 	x %= 2 * p;
-	scale = s;
+	scale = s + g;
 
 	/* sin(x) = -sin(x - pi) for x >= pi */
 	if (x >= p) {
@@ -55,21 +83,37 @@ define s(x) {
 	}
 
 	ibase = b;
+	scale = s;
 
-	if (m) return(-r);
-	return(r);
+	if (m) return(-r / 1);
+	return(r / 1);
 }
 
 /*
 Uses cos(x) = sin(x + pi/2)
 */
 define c(x) {
-	auto b, r;
+	auto b, r, s, g, t;
+
 	b = ibase;
 	ibase = A;
-	r = s(x + 2 * a(1))
+	s = scale;
+
+	scale = 0;
+	g = 10;
+	t = x / 1;
+	if (t < 0) t = -t;
+	while (t > 0) {
+		g += 1;
+		t /= 10;
+	}
+	scale = s + g;
+
+	r = s(x + 2 * a(1));
+
 	ibase = b;
-	return(r);
+	scale = s;
+	return(r / 1);
 }
 
 /*
@@ -79,7 +123,7 @@ to get the value of |x| below 1.
 (http://www.hvks.com/Numerical/Downloads/HVE%20Fast%20Trigonometric%20functions%20for%20arbitrary%20precision.pdf)
 */
 define a(x) {
-	auto b, r, i, y, d, m, z, v;
+	auto b, r, i, y, d, m, z, v, s;
 
 	/* b: previous ibase */
 	/* r: current estimate for atan(x) */
@@ -89,10 +133,13 @@ define a(x) {
 	/* m: 1 if x is negative */
 	/* z: -x^2 */
 	/* v: y / i */
-
+	/* s: previous scale */
 
 	b = ibase;
 	ibase = A;
+	s = scale;
+	/* The result is at most doubled, so a fixed guard is enough. */
+	scale = s + 10;
 
 	if (x < 0) {
 		m = 1;
@@ -114,11 +161,13 @@ define a(x) {
 		r += v;
 	}
 
-	ibase = b;
-
 	r *= d;
-	if (m) return(-r);
-	return(r);
+
+	ibase = b;
+	scale = s;
+
+	if (m) return(-r / 1);
+	return(r / 1);
 }
 
 /*
@@ -129,7 +178,7 @@ between 0.9 and 1.2 (values chosen through testing).
 (http://www.hvks.com/Numerical/Downloads/HVE%20Fast%20Log()%20calculation%20for%20arbitrary%20precision.pdf)
 */
 define l(x) {
-	auto b, r, i, d, v, y, z;
+	auto b, r, i, d, v, y, z, s;
 
 	/* b: previous ibase */
 	/* r: current estimate for ln(x) */
@@ -138,16 +187,25 @@ define l(x) {
 	/* v: y / i */
 	/* y: ((x - 1) / (x + 1))^i */
 	/* z: y^2 */
+	/* s: previous scale */
 
 	b = ibase;
 	ibase = A;
+	s = scale;
 
 	/* the function is not defined for x < 0
 	   this matches the behavior of GNU bc */
-	if(x <= 0) return((1 - 10^scale) / 1)
+	if (x <= 0) {
+		ibase = b;
+		return((1 - 10^s) / 1);
+	}
+
+	/* Each square root halves the exponent, so only a handful are ever
+	   needed; the result is multiplied by that power of two. */
+	scale = s + 20;
 
 	d = 1;
-	while(x > 1.2) {
+	while (x > 1.2) {
 		x = sqrt(x);
 		d *= 2;
 	}
@@ -160,15 +218,17 @@ define l(x) {
 	z = y * y;
 	r = y;
 	v = 1;
-	for(i = 3; v; i += 2) {
+	for (i = 3; v; i += 2) {
 		y *= z;
 		v = y / i;
 		r += v;
 	}
 
-	ibase = b;
+	r = d * 2 * r;
 
-	return (d * 2 * r)
+	ibase = b;
+	scale = s;
+	return(r / 1);
 }
 
 /*
@@ -176,12 +236,12 @@ Uses e ^ x = 1 + x + x/2! + x/3! + ...
 For x > 1, the Taylor series converges very slowly, so the
 function uses the identity e(x) = e(x/2)^2 to get the value of x
 under 1.
-If x is negative we negate x and divide compute the reciprocal of
+If x is negative we negate x and compute the reciprocal of
 the result at the end.
 (http://www.hvks.com/Numerical/Downloads/HVE%20Fast%20Exp()%20calculation%20for%20arbitrary%20precision.pdf)
 */
 define e(x) {
-	auto f, y, v, i, r, d, s, b, m;
+	auto f, y, v, i, r, d, s, b, m, g, t;
 
 	/* f: i! */
 	/* y: x^i */
@@ -192,27 +252,35 @@ define e(x) {
 	/* s: previous scale */
 	/* b: previous ibase */
 	/* m: 1 if x is negative */
+	/* g: guard digits */
+	/* t: scratch */
 
 	b = ibase;
-	s = scale;
 	ibase = A;
+	s = scale;
 
-	if (x < 1) {
+	if (x < 0) {
 		m = 1;
 		x = -x;
 	}
 
-	/* each division by 2 can add at most one fractional digit to
-	   x so we need to increase scale by one on every iteration */
-	scale = scale(x) + 1;
+	/* The series result is raised to the power d, which multiplies its
+	   relative error by d. Count the halvings first, at scale zero, so the
+	   working scale is set before x loses any digits. */
+	scale = 0;
+	g = 10;
+	t = x / 1;
+	while (t > 0) {
+		g += 1;
+		t /= 2;
+	}
+	scale = s + g;
+
 	d = 1;
 	while (x > 1) {
 		x /= 2;
 		d *= 2;
-		scale += 1;
 	}
-
-	scale = s;
 
 	f = 1;
 	v = 1;
@@ -232,7 +300,7 @@ define e(x) {
 	scale = s;
 
 	if (m) return(1 / r);
-	return(r/1);
+	return(r / 1);
 }
 
 /*
@@ -240,7 +308,7 @@ Uses j(n, x) = x^n / (2^n * n!) * (1 - x^2/(2^2*1!*(n+1)) + x^4/(2^4*2!*(n+1)*(n
 and j(-n, x) = (-1)^n * j(n, x)
 */
 define j(n, x) {
-	auto b, r, y, v, z, i, d, g, m, s;
+	auto b, r, y, v, z, i, d, g, m, s, w, t;
 
 	/* b: previous ibase */
 	/* r: current estimate for j(n, x) */
@@ -252,10 +320,13 @@ define j(n, x) {
 	/* g: x^n / (2^n * n!) */
 	/* m: 1 if n is negative */
 	/* s: previous scale */
+	/* w: guard digits */
+	/* t: scratch */
 
 	b = ibase;
-
+	ibase = A;
 	s = scale;
+
 	scale = 0;
 	/* make n an integer */
 	n /= 1;
@@ -263,7 +334,17 @@ define j(n, x) {
 		n = -n;
 		if (n % 2) m = 1;
 	}
-	scale = s;
+
+	/* Terms grow with x before they shrink, so a large argument cancels
+	   leading digits the same way the trigonometric reduction does. */
+	w = 10;
+	t = x / 1;
+	if (t < 0) t = -t;
+	while (t > 0) {
+		w += 1;
+		t /= 10;
+	}
+	scale = s + w;
 
 	y = r = v = 1;
 	z = -(x * x);
@@ -279,10 +360,13 @@ define j(n, x) {
 	for (i = 1; i <= n; ++i) g *= i;
 	g = x^n / (2^n * g);
 
-	ibase = b;
+	r = g * r;
 
-	if (m) return(-g * r);
-	return(g * r);
+	ibase = b;
+	scale = s;
+
+	if (m) return(-r / 1);
+	return(r / 1);
 }
 
 scale = 20;

@@ -1887,27 +1887,52 @@ impl MdocFormatter {
             let mut head = head.clone();
 
             if !is_first_block[i] {
-                let first_line = body
-                    .first()
-                    .cloned()
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>();
-                let mut i = 0;
-                let mut j = 0;
+                // Lift whole words off the first body line onto the head line while
+                // they fit. `cut` is a real byte offset into that line, advanced only
+                // past bytes actually consumed, so it is always a char boundary and
+                // can never run past the end. Deriving it from word lengths instead
+                // charges a separator that does not precede the first word, which
+                // overruns the line and aborts (e.g. sudoers(5)).
+                let first_body = body.first().cloned().unwrap_or_default();
+                let bytes = first_body.as_bytes();
+                let mut cut = 0;
                 if head.len() > indent.saturating_sub(1) {
-                    while head.len() < line_width + indent && i < first_line.len() {
-                        if head.len() + first_line[i].len() >= line_width + indent {
+                    let mut pos = 0;
+                    while pos < first_body.len() && head.len() < line_width + indent {
+                        let mut word_start = pos;
+                        while word_start < first_body.len()
+                            && bytes[word_start].is_ascii_whitespace()
+                        {
+                            word_start += 1;
+                        }
+                        let mut word_end = word_start;
+                        while word_end < first_body.len() && !bytes[word_end].is_ascii_whitespace()
+                        {
+                            word_end += 1;
+                        }
+                        if word_end == word_start {
                             break;
                         }
-                        head.push_str(&(" ".to_string() + &first_line[i]));
-                        j += first_line[i].len() + 1;
-                        i += 1;
+                        let word = &first_body[word_start..word_end];
+                        if head.len() + word.len() >= line_width + indent {
+                            break;
+                        }
+                        head.push(' ');
+                        head.push_str(word);
+                        // Take the separator that followed the word as well, so the
+                        // remainder does not start with the whitespace we split on.
+                        let mut after = word_end;
+                        while after < first_body.len() && bytes[after].is_ascii_whitespace() {
+                            after += 1;
+                        }
+                        cut = after;
+                        pos = after;
                     }
                 }
-                if let Some(line) = body.get_mut(0) {
-                    line.replace_range(0..j, "");
+                if cut > 0 {
+                    if let Some(line) = body.get_mut(0) {
+                        line.replace_range(0..cut, "");
+                    }
                 }
             }
 
@@ -4872,6 +4897,48 @@ head2   Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris
         nisi ut aliquip ex ea commodo consequat.
 head3   Duis aute irure dolor in reprehenderit in voluptate velit esse cillum
         dolore eu fugiat nulla pariatur.
+
+footer text                     January 1, 1970                    footer text";
+                test_formatting(input, output);
+            }
+
+            // A -hang head long enough to pull words off the body line used to
+            // derive the cut offset from word lengths, charging a separator that
+            // does not precede the first word. Once every word was lifted the
+            // offset ran one byte past the end and aborted; sudoers(5) hits this.
+            #[test]
+            fn bl_hang_head_consumes_whole_body_line() {
+                let input = ".Dd January 1, 1970
+.Dt PROGNAME 1
+.Os footer text
+.Bl -hang -width 0n
+.It Dv EXEC No and Dv NOEXEC
+a b
+.El";
+                let output =
+                    "PROGNAME(1)                 General Commands Manual                PROGNAME(1)
+
+EXEC and NOEXEC a b
+
+footer text                     January 1, 1970                    footer text";
+                test_formatting(input, output);
+            }
+
+            // The same lift, with a multi-byte body: a reconstructed offset can
+            // land inside a UTF-8 sequence, which panics just as an overrun does.
+            #[test]
+            fn bl_hang_head_consumes_multibyte_body_line() {
+                let input = ".Dd January 1, 1970
+.Dt PROGNAME 1
+.Os footer text
+.Bl -hang -width 0n
+.It Dv LONGISH TAG HERE
+café naïve
+.El";
+                let output =
+                    "PROGNAME(1)                 General Commands Manual                PROGNAME(1)
+
+LONGISH TAG HERE café naïve
 
 footer text                     January 1, 1970                    footer text";
                 test_formatting(input, output);

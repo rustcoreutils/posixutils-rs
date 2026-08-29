@@ -818,6 +818,6 @@ mod malformed {
             checked += 1;
         }
 
-        assert!(checked >= 20, "corpus shrank: only {checked} files");
+        assert!(checked >= 21, "corpus shrank: only {checked} files");
     }
 }

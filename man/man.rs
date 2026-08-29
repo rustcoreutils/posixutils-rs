@@ -902,7 +902,7 @@ impl Man {
     /// # Errors
     ///
     /// [ManError] if man page not found, or any display error happened.
-    fn display_man_page(&self, path: &PathBuf) -> Result<(), ManError> {
+    fn display_man_page(&self, path: &Path) -> Result<(), ManError> {
         let raw = get_man_page_from_path(path)?;
         let formatted = format_man_page(raw, &self.formatting_settings, self.args.synopsis)?;
         display_pager(formatted, self.args.copy)

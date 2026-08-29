@@ -2612,116 +2612,66 @@ impl MdocFormatter {
         result.trim().to_string()
     }
 
+    /// Split an enclosure's children at its closing macro, returning the
+    /// enclosed body and the text that follows the closing delimiter.
+    ///
+    /// A plain `Element::Text` is content, not a terminator. Scanning with
+    /// `take_while`/`skip_while` over a predicate that answered "false" for text
+    /// ended the body at the first bare word and made the tail re-include it, so
+    /// `.Po parens content Pc` rendered as `() parens content`.
+    fn split_at_closer(nodes: Vec<Element>, closer: &Macro) -> (Vec<Element>, Vec<Element>) {
+        let Some(i) = nodes
+            .iter()
+            .position(|el| matches!(el, Element::Macro(n) if n.mdoc_macro == *closer))
+        else {
+            return (nodes, Vec::new());
+        };
+        let mut body = nodes;
+        let mut rest = body.split_off(i).into_iter();
+        // The closer's own children are the trailing text; anything after the
+        // closer node itself is only reachable from a malformed page.
+        let mut tail = match rest.next() {
+            Some(Element::Macro(n)) => n.nodes,
+            _ => Vec::new(),
+        };
+        tail.extend(rest);
+        (body, tail)
+    }
+
+    /// Render a partial-explicit enclosure: `open`/`close` wrap the body, and
+    /// the tail follows, separated by a space unless it opens with a delimiter.
+    fn format_enclosure(
+        &mut self,
+        macro_node: MacroNode,
+        closer: Macro,
+        open: &str,
+        close: &str,
+    ) -> String {
+        let (body, tail) = Self::split_at_closer(macro_node.nodes, &closer);
+        let body = self.format_partial_explicit_block(body.into_iter());
+        let tail = self.format_partial_explicit_block(tail.into_iter());
+        let sep = if tail.is_empty() || is_first_word_delimiter(&tail) {
+            ""
+        } else {
+            " "
+        };
+        format!("{open}{body}{close}{sep}{tail}")
+    }
+
     fn format_a_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Ac)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Ac)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("⟨{}⟩{}", formatted_body, formatted_tail);
-        }
-
-        format!("⟨{}⟩ {}", formatted_body, formatted_tail)
+        self.format_enclosure(macro_node, Macro::Ac, "\u{27e8}", "\u{27e9}")
     }
 
     fn format_b_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Bc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Bc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("[{}]{}", formatted_body.trim(), formatted_tail.trim());
-        }
-
-        format!("[{}] {}", formatted_body.trim(), formatted_tail.trim())
+        self.format_enclosure(macro_node, Macro::Bc, "[", "]")
     }
 
     fn format_br_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Brc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Brc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("{{{}}}{}", formatted_body.trim(), formatted_tail.trim());
-        }
-
-        format!("{{{}}} {}", formatted_body, formatted_tail.trim())
+        self.format_enclosure(macro_node, Macro::Brc, "{", "}")
     }
 
     fn format_d_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Dc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Dc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("“{}”{}", formatted_body.trim(), formatted_tail.trim());
-        }
-
-        format!("“{}” {}", formatted_body.trim(), formatted_tail.trim())
+        self.format_enclosure(macro_node, Macro::Dc, "\u{201c}", "\u{201d}")
     }
 
     fn format_e_block(
@@ -2730,54 +2680,14 @@ impl MdocFormatter {
         closing_delimiter: Option<char>,
         macro_node: MacroNode,
     ) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Dc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Dc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        match (opening_delimiter, closing_delimiter) {
-            (Some(open), Some(close)) => {
-                format!(
-                    "{}{}{} {} ",
-                    open,
-                    formatted_body.trim(),
-                    close,
-                    formatted_tail.trim()
-                )
-            }
-            (Some(open), None) => {
-                format!(
-                    "{}{} {} ",
-                    open,
-                    formatted_body.trim(),
-                    formatted_tail.trim()
-                )
-            }
-            (None, Some(close)) => {
-                format!(
-                    "{}{} {} ",
-                    formatted_body.trim(),
-                    close,
-                    formatted_tail.trim()
-                )
-            }
-            (None, None) => format!("{} {}", formatted_body.trim(), formatted_tail.trim()),
-        }
+        // `.Ec`, not `.Dc` -- the latter was a copy-paste from format_d_block
+        // and let a `.Dc` inside an `.Eo` truncate the enclosure. The parser
+        // never builds a `Macro::Ec` node (`.Ec` is consumed when the `.Eo`
+        // frame closes), so the split finds no closer and the whole node is
+        // body, which is what an `.Eo` should render as.
+        let open = opening_delimiter.map(String::from).unwrap_or_default();
+        let close = closing_delimiter.map(String::from).unwrap_or_default();
+        self.format_enclosure(macro_node, Macro::Ec, &open, &close)
     }
 
     fn format_f_block(&mut self, funcname: String, macro_node: MacroNode) -> String {
@@ -2802,143 +2712,23 @@ impl MdocFormatter {
     }
 
     fn format_o_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Oc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Oc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("[{}]{}", formatted_body, formatted_tail);
-        }
-
-        format!("[{}] {}", formatted_body, formatted_tail)
+        self.format_enclosure(macro_node, Macro::Oc, "[", "]")
     }
 
     fn format_p_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Pc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Pc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("({}){}", formatted_body, formatted_tail);
-        }
-
-        format!("({}) {} ", formatted_body.trim(), formatted_tail.trim())
+        self.format_enclosure(macro_node, Macro::Pc, "(", ")")
     }
 
     fn format_q_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Qc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Qc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("\"{}\"{} ", formatted_body, formatted_tail);
-        }
-
-        format!("\"{}\" {} ", formatted_body.trim(), formatted_tail.trim())
+        self.format_enclosure(macro_node, Macro::Qc, "\"", "\"")
     }
 
     fn format_s_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Sc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Sc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("'{}'{} ", formatted_body, formatted_tail);
-        }
-
-        format!("'{}' {} ", formatted_body, formatted_tail)
+        self.format_enclosure(macro_node, Macro::Sc, "'", "'")
     }
 
     fn format_x_block(&mut self, macro_node: MacroNode) -> String {
-        let iter = macro_node.nodes.into_iter();
-        let body = iter.clone().take_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Xc)
-            } else {
-                false
-            }
-        });
-
-        let tail = iter.skip_while(|p| {
-            if let Element::Macro(ref macro_node) = p {
-                !matches!(macro_node.mdoc_macro, Macro::Xc)
-            } else {
-                false
-            }
-        });
-
-        let formatted_body = self.format_partial_explicit_block(body);
-        let formatted_tail = self.format_partial_explicit_block(tail);
-
-        if is_first_word_delimiter(&formatted_tail) {
-            return format!("{}{} ", formatted_body, formatted_tail);
-        }
-
-        format!("{} {} ", formatted_body, formatted_tail)
+        self.format_enclosure(macro_node, Macro::Xc, "", "")
     }
 }
 
@@ -7349,6 +7139,36 @@ footer text                     January 1, 1970                    footer text";
         use crate::man_util::formatter::tests::test_formatting;
 
         #[test]
+        fn text_belongs_to_the_enclosure_body() {
+            // A plain text node terminated the body scan, so `.Po` closed
+            // immediately and its content trailed outside the parens.
+            let input = ".Dd January 1, 1970
+.Os footer text
+.Po parens content Pc";
+            let out = render(input);
+            assert!(out.contains("(parens content)"), "got: {out:?}");
+        }
+
+        #[test]
+        fn enclosure_tail_follows_the_closing_delimiter() {
+            let input = ".Dd January 1, 1970
+.Os footer text
+.Bo
+word
+.Bc , more";
+            let out = render(input);
+            assert!(out.contains("[word], more"), "got: {out:?}");
+        }
+
+        /// Render a document with the shared test settings.
+        fn render(input: &str) -> String {
+            use crate::man_util::formatter::tests::{get_ast, FORMATTING_SETTINGS};
+            use crate::man_util::formatter::MdocFormatter;
+            let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
+            String::from_utf8(formatter.format_mdoc(get_ast(input))).unwrap()
+        }
+
+        #[test]
         fn block_empty() {
             let input = r#".Dd January 1, 1970
 .Os footer text
@@ -7396,10 +7216,15 @@ Text loooooooong line
 Text loooooooong line
 Text loooooooong line
 .Ac"#;
+            // The text lines are between `.Ao` and `.Ac`, so they belong inside
+            // the brackets. This expectation used to close the enclosure before
+            // them, which was the body scan stopping at the first text node --
+            // the sibling `.Aq` test in partial_implicit already encloses its
+            // text, and the two paths disagreed.
             let output = r#"UNTITLED                             LOCAL                            UNTITLED
 
-⟨addr addr addr⟩ Text loooooooong line Text loooooooong line Text loooooooong
-line Text loooooooong line Text loooooooong line Text loooooooong line
+⟨addr addr addr Text loooooooong line Text loooooooong line Text loooooooong
+line Text loooooooong line Text loooooooong line Text loooooooong line⟩
 
 footer text                     January 1, 1970                    footer text"#;
             test_formatting(input, output);

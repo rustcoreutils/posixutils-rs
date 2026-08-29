@@ -2895,9 +2895,12 @@ impl MdocFormatter {
                             break;
                         }
                         delim_sequence = format!("{}{}", inner_delims, delim_sequence);
-                        if inner_macro_node.nodes.is_empty() {
-                            node.nodes.pop();
-                        }
+                        // Emptying a macro's child list does not make the macro
+                        // itself empty: `Nm`, `Xr`, `In` and friends carry their
+                        // text in the variant, not in `nodes`. Popping the node
+                        // here discarded that text, so `.Pq Nm ssh-keygen .`
+                        // rendered as "()." with the name gone.
+                        break;
                     }
                     _ => break,
                 }
@@ -7139,6 +7142,21 @@ footer text                     January 1, 1970                    footer text";
             use crate::man_util::formatter::MdocFormatter;
             let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
             String::from_utf8(formatter.format_mdoc(get_ast(input))).unwrap()
+        }
+
+        #[test]
+        fn a_macro_keeps_its_name_when_its_children_are_lifted() {
+            // Lifting a trailing delimiter empties a leaf macro's child list,
+            // and the node was then popped entirely -- but `Nm` and friends
+            // carry their text in the macro variant, not in `nodes`, so the
+            // name went with it: `.Pq Nm ssh-keygen .` rendered as "().".
+            let out = render(".Dd January 1, 1970\n.Os f\n.Pq Nm ssh-keygen .");
+            assert!(out.contains("(ssh-keygen)."), "got: {out:?}");
+
+            // The same shape with a name that was always stored in the variant,
+            // which is why this predates the hyphenated-name fix.
+            let out = render(".Dd January 1, 1970\n.Os f\n.Pq Nm ls .");
+            assert!(out.contains("(ls)."), "got: {out:?}");
         }
 
         #[test]

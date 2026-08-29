@@ -545,6 +545,12 @@ fn so_roots(page: &Path, search_paths: &[PathBuf]) -> Vec<PathBuf> {
         .map(Path::to_path_buf)
         .into_iter()
         .chain(search_paths.iter().cloned())
+        // An empty root is the working directory: `Path::new("man1/x.1")` has
+        // grandparent Some("") rather than None, and joining onto it yields a
+        // relative path again. Dropping it is what actually confines the
+        // search -- without this, `man -l man1/evil.1` containing
+        // `.so secret/notes.txt` still read that file.
+        .filter(|p| !p.as_os_str().is_empty())
         .collect()
 }
 
@@ -1268,6 +1274,12 @@ mod tests {
         // `.so secret/notes.txt` printed that file.
         let roots = so_roots(Path::new("test_files/man1/cat.1"), &[]);
         assert_eq!(roots, vec![PathBuf::from("test_files")]);
+
+        // A page only one directory deep has an *empty* grandparent, not none,
+        // and joining a target onto "" gives a working-directory-relative path
+        // -- so the confinement has to drop empty roots, not just refuse None.
+        assert!(so_roots(Path::new("man1/evil.1"), &[]).is_empty());
+        assert!(so_roots(Path::new("evil.1"), &[]).is_empty());
 
         // The page's own manual root resolves its aliases...
         assert!(load_so_from(&roots, "man1/cat.1").is_some());

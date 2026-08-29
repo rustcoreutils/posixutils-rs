@@ -19,7 +19,7 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read, Write};
 use std::num::ParseIntError;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::string::FromUtf8Error;
 use thiserror::Error;
@@ -371,55 +371,6 @@ fn get_config_file_path(path: &Option<PathBuf>) -> Result<PathBuf, ManError> {
     }
 }
 
-/// Spawns process with arguments and STDIN if present.
-///
-/// # Arguments
-///
-/// `name` - [str] name of process.
-/// `args` - [IntoIterator<Item = AsRef<OsStr>>] arguments of process.
-/// `stdin` - [Option<&[u8]>] STDIN content of process.
-///
-/// # Returns
-///
-/// [Output] of spawned process.
-///
-/// # Errors
-///
-/// [ManError] if process spawn failed or failed to get its output.
-fn spawn<I, S>(name: &str, args: I, stdin: Option<&[u8]>, stdout: Stdio) -> Result<Output, ManError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let mut process = Command::new(name)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(stdout)
-        .spawn()
-        .map_err(|err| match err.kind() {
-            io::ErrorKind::NotFound => ManError::CommandNotFound(name.to_string()),
-            _ => ManError::Io(err),
-        })?;
-
-    if let Some(stdin) = stdin {
-        if let Some(mut process_stdin) = process.stdin.take() {
-            process_stdin.write_all(stdin)?;
-        } else {
-            Err(io::Error::other(format!("failed to open stdin for {name}")))?;
-        }
-    }
-
-    let output = process
-        .wait_with_output()
-        .map_err(|_| io::Error::other(format!("failed to get {name} stdout")))?;
-
-    if !output.status.success() {
-        Err(io::Error::other(format!("{name} failed")))?
-    } else {
-        Ok(output)
-    }
-}
-
 /// Gets page width.
 ///
 /// # Returns
@@ -665,16 +616,64 @@ fn display_pager(man_page: Vec<u8>, copy_mode: bool) -> Result<(), ManError> {
         return Ok(());
     }
 
-    let pager = std::env::var("PAGER").unwrap_or_else(|_| "more".to_string());
-    let args = if pager.ends_with("more") {
-        vec!["-s"]
-    } else {
-        vec![]
-    };
+    let cmd = pager_command(std::env::var("PAGER").ok().as_deref());
 
-    spawn(&pager, args, Some(&man_page), Stdio::inherit())?;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| match err.kind() {
+            io::ErrorKind::NotFound => ManError::CommandNotFound("sh".to_string()),
+            _ => ManError::Io(err),
+        })?;
 
-    Ok(())
+    // The pager exits as soon as the user quits, so writing the page into it
+    // races with that exit. Rust ignores SIGPIPE, so the write returns EPIPE
+    // instead of killing us -- that is the user pressing `q`, not a failure.
+    if let Some(mut sink) = child.stdin.take() {
+        match sink.write_all(&man_page).and_then(|()| sink.flush()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                let _ = child.wait();
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        }
+        // `sink` drops here, closing the pipe so the pager sees EOF. It must
+        // drop before the wait below, or the two deadlock.
+    }
+
+    // sh's convention: 127 is "not found", 126 is "found but not executable".
+    // Any other status belongs to the pager, and a user who quits it has not
+    // made `man` fail.
+    match child.wait()?.code() {
+        Some(126) | Some(127) => Err(ManError::CommandNotFound(cmd)),
+        _ => Ok(()),
+    }
+}
+
+/// The command string to page output through.
+///
+/// POSIX: PAGER is "any string acceptable as a command_string operand to the
+/// `sh -c` command", so it is handed to the shell verbatim rather than executed
+/// as a program name -- `PAGER="less -R"` is a conforming value that used to
+/// fail with "less -R command not found". A null PAGER is spec-equivalent to an
+/// unset one; `env::var` returns Ok("") for it, which produced the empty
+/// "  command not found".
+///
+/// A whitespace-only value is treated as unset too: it is not strictly null,
+/// but `sh -c " "` discards the page and reports success, which no user means.
+fn pager_command(pager: Option<&str>) -> String {
+    match pager {
+        Some(p) if !p.trim().is_empty() => p.to_string(),
+        // `-s` belongs to the paginator we chose, not to an arbitrary user
+        // command: appending it to one would corrupt any command with its own
+        // quoting or a pipeline.
+        _ => "more -s".to_string(),
+    }
 }
 
 /// Extracts NAME section info from a parsed mdoc document.
@@ -1160,7 +1159,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_page, is_safe_so_target, ManError};
+    use super::{decode_page, is_safe_so_target, pager_command, ManError};
+
+    #[test]
+    fn pager_falls_back_to_more_when_unset_or_null() {
+        // POSIX: "If the PAGER variable is null or not set, the command shall
+        // be either more or another paginator." env::var returns Ok("") for a
+        // null PAGER, which produced `man:  command not found`.
+        assert_eq!(pager_command(None), "more -s");
+        assert_eq!(pager_command(Some("")), "more -s");
+        assert_eq!(pager_command(Some("   ")), "more -s");
+    }
+
+    #[test]
+    fn pager_keeps_a_command_string_intact() {
+        // "Any string acceptable as a command_string operand to the sh -c
+        // command shall be valid." This was executed as a program name, so a
+        // conforming value failed with `less -R command not found`. Note no
+        // `-s` is appended: that belongs to our chosen default, not to a user
+        // command that may carry its own quoting or a pipeline.
+        assert_eq!(pager_command(Some("less -R")), "less -R");
+        assert_eq!(
+            pager_command(Some("sed s/a/b/ | more")),
+            "sed s/a/b/ | more"
+        );
+    }
 
     #[test]
     fn decode_page_detects_gzip_by_magic_not_extension() {

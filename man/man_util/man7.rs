@@ -225,7 +225,7 @@ impl Man7Formatter {
                 // Relative to the paragraph margin, not to wherever the previous
                 // tag's body left the margin.
                 self.term.set_offset(self.para_base);
-                self.tp_body_indent = Some(self.para_base + extra);
+                self.tp_body_indent = Some(self.para_base.saturating_add(extra));
             }
             "IP" => self.do_ip(args),
             "HP" => self.term.blank_line(),
@@ -298,7 +298,7 @@ impl Man7Formatter {
         // As for `.TP`: relative to the paragraph margin, and filled rather than
         // emitted verbatim. pod2man writes `.IP` tags that list every option a
         // paragraph covers; openssl-s_client(1) has one 490 columns long.
-        let body_indent = self.para_base + extra;
+        let body_indent = self.para_base.saturating_add(extra);
         if let Some(tag) = tag {
             let tag = self.resolve(&tag);
             self.term.set_offset(self.para_base);
@@ -426,6 +426,51 @@ mod tests {
 
     fn render(content: &str) -> String {
         String::from_utf8(format_man7(content, &SETTINGS).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_absurd_indent_is_clamped_not_fatal() {
+        // `.RS 900000000000` reached `" ".repeat(900000000006)` in the
+        // backend's line filler: "memory allocation of 900000000006 bytes
+        // failed", which aborts the process. roff puts no upper bound on an
+        // indent, so this is a malformed page rather than an invalid one and is
+        // clamped to the right margin instead of rejected.
+        let out = render(".TH T 1\n.SH D\n.RS 900000000000\nhello\n");
+        assert!(out.contains("hello"), "{out}");
+        assert!(
+            out.lines().all(|l| l.chars().count() <= SETTINGS.width),
+            "clamped output must stay within the page width: {out}"
+        );
+    }
+
+    #[test]
+    fn chained_relative_indents_are_clamped() {
+        // push_indent accumulated with `+`, so a long chain overflowed usize in
+        // a debug build and produced an unbounded margin in release.
+        let mut src = String::from(".TH T 1\n.SH D\n");
+        for _ in 0..1000 {
+            src.push_str(".RS 1000000000\n");
+        }
+        src.push_str("hello\n");
+        let out = render(&src);
+        assert!(
+            out.lines().all(|l| l.chars().count() <= SETTINGS.width),
+            "clamped output must stay within the page width: {out}"
+        );
+    }
+
+    #[test]
+    fn tp_and_ip_indents_are_bounded() {
+        for src in [
+            ".TH T 1\n.SH D\n.TP 900000000000\ntag\nbody\n",
+            ".TH T 1\n.SH D\n.IP tag 900000000000\nbody\n",
+        ] {
+            let out = render(src);
+            assert!(
+                out.lines().all(|l| l.chars().count() <= SETTINGS.width),
+                "{src:?} produced an over-wide line: {out}"
+            );
+        }
     }
 
     #[test]

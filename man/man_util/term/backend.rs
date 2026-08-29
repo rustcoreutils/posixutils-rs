@@ -22,6 +22,10 @@ use super::style::{apply_styling, display_width};
 use crate::man_util::formatter::replace_escapes;
 
 /// Terminal output builder. See the module docs for the driving model.
+/// Columns kept for text to the right of any indent, so a clamped margin still
+/// leaves something readable.
+const MIN_TEXT_COLUMNS: usize = 8;
+
 pub struct Term {
     /// Total line width in columns.
     width: usize,
@@ -66,6 +70,20 @@ impl Term {
     /// The current left margin (front-ends read this to compute tag/body indents).
     pub fn offset(&self) -> usize {
         self.offset
+    }
+
+    /// Bound a left margin so text still has room to its right.
+    ///
+    /// roff places no upper limit on an indent -- on a physical device the text
+    /// simply runs off the page, and on a terminal that is the right margin --
+    /// so an absurd `.RS 900000000000` is a malformed page rather than an
+    /// invalid one, and is clamped the way mandoc clamps it. Left unbounded it
+    /// reached `" ".repeat(900000000006)` in `flush`, and the allocation
+    /// failure aborts the process. Clamping here rather than at each front-end
+    /// call site keeps the single choke point every front-end must pass
+    /// through: `width` is private to this type.
+    fn clamp_offset(&self, n: usize) -> usize {
+        n.min(self.width.saturating_sub(MIN_TEXT_COLUMNS))
     }
 
     /// Whether any non-blank body content has been emitted (empty-page check).
@@ -119,7 +137,7 @@ impl Term {
         // routinely produces them: tbl pads a cell containing only `\&`, then the
         // escape layer resolves `\&` to nothing, leaving the padding behind as a
         // 380-column run of spaces.
-        let line = format!("{}{}", " ".repeat(indent), text);
+        let line = format!("{}{}", " ".repeat(self.clamp_offset(indent)), text);
         self.out.push(line.trim_end().to_string());
     }
 
@@ -139,7 +157,7 @@ impl Term {
     pub fn push_indent(&mut self, n: usize) {
         self.flush();
         self.indent_stack.push(self.offset);
-        self.offset += n;
+        self.offset = self.clamp_offset(self.offset.saturating_add(n));
     }
 
     /// Leave the most recent relative indent (roff `.RE`).
@@ -153,13 +171,13 @@ impl Term {
     /// Set the left margin absolutely (e.g. a hanging-tag body indent).
     pub fn set_offset(&mut self, n: usize) {
         self.flush();
-        self.offset = n;
+        self.offset = self.clamp_offset(n);
     }
 
     /// Reset to a base margin and drop all relative-indent state (new section).
     pub fn reset_indent(&mut self, base: usize) {
         self.flush();
-        self.offset = base;
+        self.offset = self.clamp_offset(base);
         self.indent_stack.clear();
     }
 

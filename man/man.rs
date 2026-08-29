@@ -531,17 +531,34 @@ fn is_safe_so_target(target: &str) -> bool {
             .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
 }
 
+/// The roots a page's `.so` targets resolve against: the manual root the page
+/// itself was found under (`…/man1/ls.1` gives `…`), then the search list.
+///
+/// The candidate list used to begin with the bare target, resolved against the
+/// process's working directory, so a page opened with `man -l` could read any
+/// file below it: `.so secret/notes.txt` printed that file. Hard-coding the
+/// system roots also meant a page found under `-M /custom/man` could not
+/// resolve its own alias target.
+fn so_roots(page: &Path, search_paths: &[PathBuf]) -> Vec<PathBuf> {
+    page.parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(search_paths.iter().cloned())
+        .collect()
+}
+
 /// Resolve a roff `.so` include target to its (decompressed) text for the roff
-/// front-end. Tries the target as given, then under each system man root, with
-/// and without a `.gz` suffix. Returns `None` if nothing readable is found.
-fn load_so(target: &str) -> Option<String> {
+/// front-end. Tries the target under each root, with and without a `.gz`
+/// suffix. Returns `None` if nothing readable is found.
+fn load_so_from(roots: &[PathBuf], target: &str) -> Option<String> {
     if !is_safe_so_target(target) {
         return None;
     }
-    let mut candidates: Vec<PathBuf> = vec![PathBuf::from(target)];
-    for root in MAN_PATHS {
-        candidates.push(PathBuf::from(root).join(target));
-    }
+    // `is_safe_so_target` rejects absolute paths and any `..` component, so
+    // `root.join(target)` provably stays under `root` (symlinks aside, which
+    // mandoc does not chase either).
+    let candidates: Vec<PathBuf> = roots.iter().map(|root| root.join(target)).collect();
     for cand in candidates {
         let gz = PathBuf::from(format!("{}.gz", cand.display()));
         for path in [cand, gz] {
@@ -574,6 +591,7 @@ fn format_man_page(
     man_bytes: Vec<u8>,
     formatting: &FormattingSettings,
     synopsis: bool,
+    so_roots: &[PathBuf],
 ) -> Result<Vec<u8>, ManError> {
     // Most pages are UTF-8; a page that is not (e.g. Latin-1) is decoded
     // byte-for-byte into the Latin-1 Unicode block rather than rejected, so it
@@ -589,7 +607,10 @@ fn format_man_page(
     // only for tbl, which must choose a fill width for `T{`…`T}` text blocks
     // before it can lay them out.
     let line_length = formatting.width.saturating_sub(formatting.indent);
-    let content = man_util::roff::preprocess_with_loader(&content, line_length, load_so);
+    let roots = so_roots.to_vec();
+    let content = man_util::roff::preprocess_with_loader(&content, line_length, move |target| {
+        load_so_from(&roots, target)
+    });
 
     // Legacy man(7) pages (`.TH`/`.SH`/…) are handled by a dedicated renderer;
     // the mdoc engine only understands mdoc(7) and would otherwise emit an
@@ -975,7 +996,12 @@ impl Man {
     /// [ManError] if man page not found, or any display error happened.
     fn display_man_page(&self, path: &Path) -> Result<(), ManError> {
         let raw = get_man_page_from_path(path)?;
-        let formatted = format_man_page(raw, &self.formatting_settings, self.args.synopsis)?;
+        let formatted = format_man_page(
+            raw,
+            &self.formatting_settings,
+            self.args.synopsis,
+            &so_roots(path, &self.search_paths),
+        )?;
         display_pager(formatted, self.args.copy)
     }
 
@@ -1213,8 +1239,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_page, get_config_file_path, is_safe_so_target, pager_command, ManError};
-    use std::path::PathBuf;
+    use super::{
+        decode_page, get_config_file_path, is_safe_so_target, load_so_from, pager_command,
+        so_roots, ManError,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn so_resolves_only_under_the_manual_roots() {
+        // The candidate list began with the bare target, resolved against the
+        // process's working directory, so `man -l page.1` containing
+        // `.so secret/notes.txt` printed that file.
+        let roots = so_roots(Path::new("test_files/man1/cat.1"), &[]);
+        assert_eq!(roots, vec![PathBuf::from("test_files")]);
+
+        // The page's own manual root resolves its aliases...
+        assert!(load_so_from(&roots, "man1/cat.1").is_some());
+        // ...but with no root there is nothing to resolve against, however
+        // readable the target is from here.
+        assert!(load_so_from(&[], "man.test.conf").is_none());
+        // And the safety predicate still rejects escapes outright.
+        assert!(load_so_from(&roots, "/etc/passwd").is_none());
+        assert!(load_so_from(&roots, "../../../etc/passwd").is_none());
+    }
 
     #[test]
     fn a_missing_default_config_is_not_an_error() {

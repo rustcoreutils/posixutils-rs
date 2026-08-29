@@ -302,6 +302,15 @@ mod tests {
     }
 
     #[test]
+    fn so_alias_resolves_in_a_custom_root() {
+        // `.so` was resolved against the hard-coded system roots only, so an
+        // alias page under -M could not find its target.
+        let (code, out, _) = man(&["-M", "test_files", "-c", "catalias", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
+    }
+
+    #[test]
     fn override_paths_replaces_the_search_list() {
         // -M wrote its value into the MANPATH environment variable and then
         // every source was concatenated anyway, so it augmented the list

@@ -8,6 +8,7 @@
 //
 
 use clap::{ArgAction, Parser, ValueEnum};
+use flate2::read::GzDecoder;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use man_util::config::{parse_config_file, ManConfig};
 use man_util::formatter::MdocFormatter;
@@ -15,7 +16,7 @@ use man_util::man7;
 use man_util::parse::mdoc::NestingTooDeep;
 use man_util::parser::{MdocDocument, MdocParser};
 use std::ffi::OsStr;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::num::ParseIntError;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -504,17 +505,52 @@ fn apply_terminal_width(settings: &mut FormattingSettings, cols: usize) {
     }
 }
 
+/// Decode a page image, transparently gunzipping it.
+///
+/// Detection is by gzip magic rather than by a `.gz` suffix: the previous
+/// implementation chose `zcat` or `cat` from the file extension, so a
+/// compressed page stored under any other name was written to the terminal as
+/// binary. At most `limit` decoded bytes are produced, which also bounds a
+/// decompression bomb.
+fn decode_page(raw: Vec<u8>, limit: u64) -> Result<Vec<u8>, ManError> {
+    // Compressed formats we do not implement. Installed pages are gzip
+    // everywhere this runs; recognising the others turns "binary dumped to the
+    // terminal" into a clean diagnostic.
+    for magic in [
+        b"BZh".as_slice(),
+        b"\xfd7zXZ".as_slice(),
+        b"\x28\xb5\x2f\xfd".as_slice(),
+    ] {
+        if raw.starts_with(magic) {
+            return Err(ManError::EmptyPage);
+        }
+    }
+
+    if !raw.starts_with(&[0x1f, 0x8b]) {
+        return Ok(raw);
+    }
+
+    let mut out = Vec::new();
+    GzDecoder::new(raw.as_slice())
+        .take(limit)
+        .read_to_end(&mut out)?;
+    Ok(out)
+}
+
 /// Read a local man page file (possibly .gz), uncompress if needed, and return
 /// the raw content.
-fn get_man_page_from_path(path: &PathBuf) -> Result<Vec<u8>, ManError> {
-    let ext = path.extension().and_then(|ext| ext.to_str());
-    let cat_cmd = match ext {
-        Some("gz") => "zcat",
-        _ => "cat",
-    };
+fn get_man_page_from_path(path: &Path) -> Result<Vec<u8>, ManError> {
+    decode_page(std::fs::read(path)?, u64::MAX)
+}
 
-    let output = spawn(cat_cmd, [path], None, Stdio::piped())?;
-    Ok(output.stdout)
+/// Decoded bytes read from a page when only its NAME section is wanted, which
+/// is always near the top. The keyword scan visits every installed page, and
+/// decoding each one in full is the bulk of its cost.
+const PAGE_HEAD_BYTES: u64 = 64 << 10;
+
+/// Read at most [`PAGE_HEAD_BYTES`] of a page, for the keyword scan.
+fn read_page_head(path: &Path) -> Option<Vec<u8>> {
+    decode_page(std::fs::read(path).ok()?, PAGE_HEAD_BYTES).ok()
 }
 
 /// Whether a roff `.so` target is safe to resolve.
@@ -719,15 +755,14 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
                 }
 
                 // Try to read and parse the man page
-                let raw = match get_man_page_from_path(&path) {
-                    Ok(r) => r,
-                    Err(_) => continue,
+                let Some(raw) = read_page_head(&path) else {
+                    continue;
                 };
 
-                let content = match String::from_utf8(raw) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
+                // Lossy, not strict: a page that is not valid UTF-8 was skipped
+                // outright, even though the display path renders it by decoding
+                // it as Latin-1.
+                let content = String::from_utf8_lossy(&raw);
 
                 // A single pathologically nested page must not abort the scan.
                 let Ok(document) = MdocParser::parse_mdoc(&content) else {
@@ -1125,7 +1160,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_so_target, ManError};
+    use super::{decode_page, is_safe_so_target, ManError};
+
+    #[test]
+    fn decode_page_detects_gzip_by_magic_not_extension() {
+        // The decoder used to be chosen from the file extension, so a
+        // compressed page stored under any other name was written to the
+        // terminal as binary.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b".TH T 1\n").unwrap();
+        let gz = enc.finish().unwrap();
+
+        assert_eq!(decode_page(gz, u64::MAX).unwrap(), b".TH T 1\n");
+    }
+
+    #[test]
+    fn decode_page_passes_plain_text_through() {
+        let raw = b".TH T 1\n.SH NAME\n".to_vec();
+        assert_eq!(decode_page(raw.clone(), u64::MAX).unwrap(), raw);
+    }
+
+    #[test]
+    fn decode_page_rejects_compression_it_cannot_read() {
+        // Better a diagnostic than binary on the terminal.
+        for magic in [b"BZh9".as_slice(), b"\xfd7zXZ\x00".as_slice()] {
+            assert!(matches!(
+                decode_page(magic.to_vec(), u64::MAX),
+                Err(ManError::EmptyPage)
+            ));
+        }
+    }
 
     /// `.so` must not be usable to read arbitrary files. A man page is
     /// untrusted input, and `.so /etc/passwd` rendered the password file to the

@@ -420,6 +420,45 @@ mod tests {
     }
 
     #[test]
+    fn subsection_selects_the_architecture_page() {
+        // -S wrote a MACHINE environment variable that nothing in the process
+        // read, so the option was accepted and did nothing. It now names an
+        // architecture subdirectory, as in mandoc and the BSDs, searched ahead
+        // of the section directory.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-S",
+            "amd64",
+            "-c",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("Architecture-specific page."), "{out}");
+
+        // Without -S, the generic page.
+        let (_, out, _) = man(&["-M", "test_files", "-c", "cat", "-C", "man.test.conf"]);
+        assert!(!out.contains("Architecture-specific page."), "{out}");
+
+        // -S names a preference, not a filter: an architecture with no page of
+        // its own still finds the generic one.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-S",
+            "sparc64",
+            "-c",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate"), "{out}");
+    }
+
+    #[test]
     fn subsection_flag_with_name() {
         let output = Command::new(env!("CARGO_BIN_EXE_man"))
             .args(["-S", "amd64", "ls", "-C", "man.test.conf"])

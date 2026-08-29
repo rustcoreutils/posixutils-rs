@@ -959,10 +959,26 @@ impl Man {
     ///
     /// [ManError] if file not found.
     fn get_man_page_paths(&self, name: &str, all: bool) -> Result<Vec<PathBuf>, ManError> {
+        // -S names an architecture subdirectory (`man4/amd64/…`), as in mandoc
+        // and the BSDs, whose semantics this option's help text already
+        // describes. It is searched ahead of the section directory itself, so
+        // it selects a page rather than filtering one out. The option used to
+        // be accepted and do nothing at all: it wrote a MACHINE environment
+        // variable that nothing in the process ever read.
+        let machine = self.args.subsection.clone();
         let mut path_iter = self.search_paths.iter().flat_map(|path| {
+            let machine = machine.clone();
             self.sections.iter().flat_map(move |section| {
-                let base_path = format!("{}/man{section}/{name}.{section}", path.display());
-                vec![format!("{base_path}.gz"), base_path]
+                let dir = format!("{}/man{section}", path.display());
+                let mut bases = Vec::new();
+                if let Some(m) = machine.as_deref() {
+                    bases.push(format!("{dir}/{m}/{name}.{section}"));
+                }
+                bases.push(format!("{dir}/{name}.{section}"));
+                bases
+                    .into_iter()
+                    .flat_map(|b| vec![format!("{b}.gz"), b])
+                    .collect::<Vec<_>>()
             })
         });
 

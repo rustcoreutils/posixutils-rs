@@ -303,6 +303,43 @@ fn expr_deep_nesting_is_bounded() {
     expr_test(&["(", "(", "2", "+", "3", ")", "*", "4", ")"], "20\n");
 }
 
+/// POSIX makes exit 0 mean the result "was successfully written", so a failed
+/// write is an error in its own right rather than a silent success -- and
+/// never a panic. Writing to /dev/full always fails with ENOSPC.
+#[test]
+fn expr_write_error_is_reported() {
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return, // no /dev/full on this host
+    };
+    let output = std::process::Command::new(plib::testing::get_binary_path("expr"))
+        .args(["1", "+", "1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(full))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|child| child.wait_with_output())
+        .expect("failed to run expr");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "expr panicked on a write failure: {stderr}"
+    );
+    // POSIX: ">2 An error occurred."
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "expected an error status, got {:?} ({stderr})",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains("No space left on device"),
+        "expected the write failure to be named, got {stderr:?}"
+    );
+}
+
 // Run one comparison under an explicit locale.
 fn expr_test_locale(locale: &str, args: &[&str], expected_out: &str, code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

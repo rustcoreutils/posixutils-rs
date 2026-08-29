@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use plib::diag;
 use plib::regex::Regex;
 use std::io::Write;
 
@@ -531,10 +531,22 @@ fn eval_expression(tokens: Vec<Token>) -> Result<Token, &'static str> {
     Ok(result)
 }
 
+/// Write the result and flush, so a failed write is seen here rather than
+/// discarded at exit.
+fn write_result(bytes: &[u8]) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(bytes)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
+}
+
 fn main() {
-    setlocale(LocaleCategory::LcAll, "");
-    let _ = textdomain("posixutils-rs");
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    // Before anything opens a file, including the message catalog.
+    plib::io::ensure_std_fds_open();
+    // A closed pipe should kill this process the way it kills the historical
+    // utilities, rather than being reported as a write failure.
+    plib::io::restore_sigpipe();
+    diag::init_locale("expr");
 
     // tokenize and evaluate the expression
     let arg_tokens = tokenize();
@@ -543,17 +555,23 @@ fn main() {
         Ok((bytes, token_is_null_or_zero(&value)))
     }) {
         Ok((bytes, null_or_zero)) => {
-            // display the result, then return exit status per POSIX:
-            // 0 if the result is neither null nor zero, otherwise 1.
-            let mut stdout = std::io::stdout().lock();
-            let _ = stdout.write_all(&bytes);
-            let _ = stdout.write_all(b"\n");
-            let _ = stdout.flush();
+            // POSIX EXIT STATUS: 0 means the expression evaluates to neither
+            // null nor zero *and* the result was successfully written, so a
+            // failed write is an error in its own right (">2 An error
+            // occurred"), not a silent success.
+            if let Err(e) = write_result(&bytes) {
+                diag::error(&format!(
+                    "{}: {}",
+                    gettextrs::gettext("write error"),
+                    diag::io_error_text(&e)
+                ));
+                std::process::exit(3);
+            }
             std::process::exit(if null_or_zero { 1 } else { 0 });
         }
         Err(msg) => {
             // invalid expression: diagnostic to stderr, exit status 2.
-            eprintln!("expr: {}", msg);
+            diag::error(msg);
             std::process::exit(2);
         }
     }

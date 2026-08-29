@@ -242,38 +242,73 @@ mod tests {
     // -------------------------------------------------------------------------
     // -M / --override_paths
     // -------------------------------------------------------------------------
-    #[test]
-    fn override_paths_single() {
+    /// Run man with the given arguments, returning (exit code, stdout, stderr).
+    /// Tests that pass `-M test_files` never reach the host's manual tree, so
+    /// their result does not depend on what is installed.
+    fn man(args: &[&str]) -> (Option<i32>, String, String) {
         let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-M", "/tmp", "ls", "-C", "man.test.conf"])
+            .args(args)
             .output()
-            .expect("Failed to run man -M /tmp ls");
+            .expect("Failed to run man");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+    #[test]
+    fn override_paths_replaces_the_search_list() {
+        // -M wrote its value into the MANPATH environment variable and then
+        // every source was concatenated anyway, so it augmented the list
+        // instead of replacing it and the built-in roots were always searched:
+        // `man -M /empty -w ls` still found /usr/share/man/man1/ls.1.gz.
+        let (code, out, _) = man(&["-M", "test_files", "-w", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
+
+        let (code, out, err) = man(&["-M", "/nonexistent", "-w", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(1), "stdout: {out}");
+        assert!(err.contains("not found"), "stderr: {err}");
+    }
+
+    #[test]
+    fn augment_paths_still_adds_to_the_search_list() {
+        let (code, out, _) = man(&[
+            "-M",
+            "/nonexistent",
+            "-m",
+            "test_files",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
     }
 
     #[test]
     fn override_paths_multiple() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args([
-                "-M",
-                "/tmp:/nonexistent:/usr/local/man",
-                "ls",
-                "-C",
-                "man.test.conf",
-            ])
-            .output()
-            .expect("Failed to run man -M with multiple paths ls");
+        // A ':'-separated value is split into several roots, and only those.
+        let (code, out, _) = man(&[
+            "-M",
+            "/nonexistent:test_files",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
+    }
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+    #[test]
+    fn search_paths_are_not_reported_twice() {
+        // A root named by both the config and the built-in list produced one
+        // -w line per source.
+        let (_, out, _) = man(&["-w", "cat", "-C", "man.test.conf", "-M", "test_files"]);
+        assert_eq!(out.lines().count(), 1, "stdout: {out}");
     }
 
     // -------------------------------------------------------------------------

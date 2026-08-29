@@ -15,7 +15,6 @@ use man_util::formatter::MdocFormatter;
 use man_util::man7;
 use man_util::parse::mdoc::NestingTooDeep;
 use man_util::parser::{MdocDocument, MdocParser};
-use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read, Write};
 use std::num::ParseIntError;
 use std::path::{Component, Path, PathBuf};
@@ -345,6 +344,17 @@ impl Default for FormattingSettings {
 //  HELPER FUNCTIONS
 // ──────────────────────────────────────────────────────────────────────────────
 //
+
+/// Manual roots named by the MANPATH environment variable, empty components
+/// dropped.
+fn env_manpath() -> Vec<PathBuf> {
+    std::env::var("MANPATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
 
 /// Try to locate the configuration file:
 /// - If `path` is Some, check if it exists; error if not.
@@ -968,40 +978,36 @@ impl Man {
             ..Default::default()
         };
 
-        if !man.args.override_paths.is_empty() {
-            let override_paths = man
-                .args
-                .override_paths
-                .iter()
-                .filter_map(|path| path.to_str())
-                .collect::<Vec<_>>()
-                .join(":");
+        // -M replaces the search list; -m still augments it, in front. The
+        // previous code wrote the override into the MANPATH environment
+        // variable and then concatenated every source unconditionally, so -M
+        // added directories rather than replacing them and the built-in roots
+        // were searched regardless.
+        let base = if man.args.override_paths.is_empty() {
+            [
+                env_manpath(),
+                man.config.manpaths.clone(),
+                MAN_PATHS.iter().map(PathBuf::from).collect(),
+            ]
+            .concat()
+        } else {
+            man.args.override_paths.clone()
+        };
 
-            std::env::set_var("MANPATH", OsStr::new(&override_paths));
-        }
+        man.search_paths = [man.args.augment_paths.clone(), base].concat();
+        // An unset MANPATH split on ':' yields one empty component, which used
+        // to enter the list as an empty path -- and made the check below
+        // unreachable.
+        man.search_paths.retain(|p| !p.as_os_str().is_empty());
+        // Keep the first occurrence of each root, so `-w` does not report the
+        // same page once per source that happened to name its directory.
+        let mut seen = std::collections::HashSet::new();
+        man.search_paths.retain(|p| seen.insert(p.clone()));
 
-        if man.args.subsection.is_some() {
-            std::env::set_var("MACHINE", OsStr::new(&man.args.subsection.clone().unwrap()));
-        }
-
-        let manpath = std::env::var("MANPATH")
-            .unwrap_or_default()
-            .split(":")
-            .filter_map(|s| PathBuf::from_str(s).ok())
-            .collect::<Vec<_>>();
-
-        man.search_paths = [
-            man.args.augment_paths.clone(),
-            manpath,
-            man.search_paths.clone(),
-            man.config.manpaths.clone(),
-            MAN_PATHS
-                .iter()
-                .filter_map(|s| PathBuf::from_str(s).ok())
-                .collect::<Vec<_>>(),
-        ]
-        .concat();
-
+        // Defensive: the built-in roots make this unreachable today, and clap
+        // rejects the `-M ""` and `-M ":"` spellings that would otherwise empty
+        // the list. It stays so that a future change to the sources above
+        // fails loudly rather than silently finding nothing.
         if man.search_paths.is_empty() {
             return Err(ManError::ManPaths);
         }

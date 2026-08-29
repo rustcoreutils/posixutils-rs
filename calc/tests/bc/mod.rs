@@ -54,8 +54,10 @@ fn test_bc_add() {
     test_bc!(add)
 }
 
-// Diagnostics go to stderr, not stdout (audit #B2). A runtime error in the
-// REPL is recovered from, so the session still exits 0 after quit.
+// Diagnostics go to stderr, not stdout (audit #B2), prefixed with the utility
+// name. Standard input here is a pipe, not a terminal, so the run is not
+// interactive and the failure is reported in the exit status -- the same way a
+// file operand reports it.
 #[test]
 fn test_bc_error_to_stderr() {
     run_test(TestPlan {
@@ -63,8 +65,8 @@ fn test_bc_error_to_stderr() {
         args: vec![],
         stdin_data: String::from("1/0\nquit\n"),
         expected_out: String::new(),
-        expected_err: String::from("runtime error (line 1): division by zero\n"),
-        expected_exit_code: 0,
+        expected_err: String::from("bc: runtime error (line 1): division by zero\n"),
+        expected_exit_code: 1,
     });
 }
 
@@ -77,7 +79,7 @@ fn test_bc_missing_file() {
         args: vec!["/nonexistent-bc-file.bc".to_string()],
         stdin_data: String::new(),
         expected_out: String::new(),
-        expected_err: String::from("bc: cannot read file: /nonexistent-bc-file.bc\n"),
+        expected_err: String::from("bc: /nonexistent-bc-file.bc: No such file or directory\n"),
         expected_exit_code: 1,
     });
 }
@@ -102,8 +104,8 @@ fn bc_runtime_error(program: &str, expected_err: &str) {
         args: vec![],
         stdin_data: format!("{program}\nquit\n"),
         expected_out: String::new(),
-        expected_err: format!("{expected_err}\n"),
-        expected_exit_code: 0,
+        expected_err: format!("bc: {expected_err}\n"),
+        expected_exit_code: 1,
     });
 }
 
@@ -233,6 +235,112 @@ fn test_bc_runaway_recursion_is_diagnosed() {
 #[test]
 fn test_bc_sparse_array() {
     test_bc("a[16777215]=7\na[16777215]\na[5]\nquit\n", "7\n0\n");
+}
+
+/// A file that exists but is not text is not an access failure.
+#[test]
+fn test_bc_non_text_file() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("bc-nontext")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("binary.bc");
+    std::fs::write(&path, b"1+1\n\xff\xfe\n").unwrap();
+    let output = plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not a text file"),
+        "expected a text-file diagnostic, got {stderr:?}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// Input that stops in the middle of a construct must say so rather than exit
+/// as though it had run.
+#[test]
+fn test_bc_incomplete_input_at_eof() {
+    for program in ["define f(x) {\n", "\"abc\n", "/* abc\n", "{\n"] {
+        let output = plib::testing::run_test_base("bc", &[], program.as_bytes());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.is_empty(),
+            "truncated input {program:?} produced no diagnostic"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "truncated input {program:?} exited 0"
+        );
+    }
+    // Complete input is still fine.
+    let output = plib::testing::run_test_base("bc", &[], b"1+1\n");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// The same error reported the same way whether the program arrives as a file
+/// operand or on standard input.
+#[test]
+fn test_bc_exit_status_is_consistent() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("bc-status")
+        .tempdir()
+        .unwrap();
+    for program in ["1/0\n", "1+\n"] {
+        let path = dir.path().join("program.bc");
+        std::fs::write(&path, program).unwrap();
+        let as_file =
+            plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
+        let as_stdin = plib::testing::run_test_base("bc", &[], program.as_bytes());
+        assert_eq!(
+            as_file.status.code(),
+            as_stdin.status.code(),
+            "{program:?} gave different statuses as a file and on stdin"
+        );
+        assert_eq!(as_file.status.code(), Some(1));
+    }
+}
+
+/// A failed write is reported, not ignored and not a panic. Writing to
+/// /dev/full always fails with ENOSPC.
+#[test]
+fn test_bc_write_error_is_reported() {
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return, // no /dev/full on this host
+    };
+    let dir = plib::tmp::Builder::new()
+        .prefix("bc-write")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("program.bc");
+    // Enough output to leave the buffer and reach the device.
+    std::fs::write(&path, "for(i=0;i<5000;++i) i\n").unwrap();
+
+    let output = std::process::Command::new(plib::testing::get_binary_path("bc"))
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(full))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|child| child.wait_with_output())
+        .expect("failed to run bc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "bc panicked on a write failure: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected a failure status, got {:?} ({stderr})",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains("No space left on device"),
+        "expected the write failure to be named, got {stderr:?}"
+    );
 }
 
 // x^0 is 1 with scale 0, regardless of the scale register (audit #B8).

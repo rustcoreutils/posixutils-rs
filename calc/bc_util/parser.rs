@@ -48,6 +48,16 @@ pub struct ParseError {
     pub is_incomplete: bool,
 }
 
+impl ParseError {
+    /// The diagnostics, as (line, column, message), for a caller that reports
+    /// them itself.
+    pub fn diagnostics(&self) -> impl Iterator<Item = (u32, u16, &str)> {
+        self.errors
+            .iter()
+            .map(|e| (e.line as u32, e.col as u16, e.message.as_str()))
+    }
+}
+
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         for e in &self.errors {

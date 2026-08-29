@@ -694,21 +694,23 @@ fn extract_name_info(document: &MdocDocument) -> Option<(Vec<String>, String)> {
 
     let mut names: Vec<String> = Vec::new();
     let mut description = String::new();
-    let mut in_name_section = false;
 
-    for element in &document.elements {
-        if let Element::Macro(node) = element {
+    // `.Nm` and `.Nd` are children of the `.Sh NAME` block, not its siblings:
+    // `.Sh` opens a frame and everything up to the next section is nested
+    // inside it. Scanning only the top level found neither, which is the other
+    // half of why the native keyword search returned nothing.
+    fn collect(nodes: &[Element], names: &mut Vec<String>, description: &mut String) {
+        for element in nodes {
+            let Element::Macro(node) = element else {
+                continue;
+            };
             match &node.mdoc_macro {
-                Macro::Sh { title } => {
-                    in_name_section = title.eq_ignore_ascii_case("NAME");
-                }
-                Macro::Nm { name: Some(n) } if in_name_section => {
+                Macro::Nm { name: Some(n) } => {
                     if !n.is_empty() && !names.contains(n) {
                         names.push(n.clone());
                     }
                 }
-                Macro::Nd if in_name_section => {
-                    // Collect text from child nodes
+                Macro::Nd => {
                     for child in &node.nodes {
                         if let Element::Text(text) = child {
                             if !description.is_empty() {
@@ -718,7 +720,17 @@ fn extract_name_info(document: &MdocDocument) -> Option<(Vec<String>, String)> {
                         }
                     }
                 }
-                _ => {}
+                _ => collect(&node.nodes, names, description),
+            }
+        }
+    }
+
+    for element in &document.elements {
+        if let Element::Macro(node) = element {
+            if let Macro::Sh { title } = &node.mdoc_macro {
+                if title.eq_ignore_ascii_case("NAME") {
+                    collect(&node.nodes, &mut names, &mut description);
+                }
             }
         }
     }
@@ -771,12 +783,19 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
                 // it as Latin-1.
                 let content = String::from_utf8_lossy(&raw);
 
-                // A single pathologically nested page must not abort the scan.
-                let Ok(document) = MdocParser::parse_mdoc(&content) else {
-                    continue;
+                // man(7) pages carry no .Nm/.Nd, so parsing every page as mdoc
+                // meant nothing matched on a Linux system.
+                let info = if man7::is_man7(&content) {
+                    man7::extract_name(&content)
+                } else {
+                    // A single pathologically nested page must not abort the scan.
+                    match MdocParser::parse_mdoc(&content) {
+                        Ok(document) => extract_name_info(&document),
+                        Err(_) => continue,
+                    }
                 };
 
-                if let Some((names, description)) = extract_name_info(&document) {
+                if let Some((names, description)) = info {
                     results.push(ManPageInfo {
                         names,
                         description,
@@ -793,13 +812,42 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
 /// Performs native keyword search across man pages.
 ///
 /// Returns lines in format: "command(section) - description"
+/// How name operands are matched against the scanned pages.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum SearchMode {
+    /// `-k`: POSIX specifies the result as equivalent to `grep -Ei` over a
+    /// summary database, i.e. a case-insensitive ERE over names and
+    /// descriptions.
+    Keyword,
+    /// `-f`: whatis(1) semantics -- the operand must be a page name, whole.
+    /// POSIX deliberately omits -f ("due to implementation differences, it was
+    /// not included"), so the historical behaviour governs. Sharing the ERE
+    /// matcher with -k made `man -f cat` list every page whose description
+    /// merely mentioned concatenation.
+    Exact,
+}
+
 fn native_keyword_search(
     search_paths: &[PathBuf],
     sections: &[Section],
     keywords: &[String],
+    mode: SearchMode,
 ) -> Vec<String> {
     let pages = scan_man_pages(search_paths, sections);
     let mut results = Vec::new();
+
+    if mode == SearchMode::Exact {
+        for page in &pages {
+            for keyword in keywords {
+                if let Some(name) = page.names.iter().find(|n| n.eq_ignore_ascii_case(keyword)) {
+                    results.push(format!("{}({}) - {}", name, page.section, page.description));
+                }
+            }
+        }
+        results.sort();
+        results.dedup();
+        return results;
+    }
 
     // POSIX: `-k` keywords are case-insensitive extended regular expressions
     // (the spec describes the search as equivalent to `grep -Ei`). Use the
@@ -1057,43 +1105,27 @@ impl Man {
             }
             return Ok(no_errors);
         } else if self.args.apropos || self.args.whatis {
-            // Try external apropos/whatis first (uses pre-built database, fast)
-            // Fall back to native search if external command not available
-            let command = if self.args.apropos {
-                "apropos"
+            // Search our own manual roots rather than delegating to the
+            // system's apropos/whatis. Delegating consulted a database built
+            // from a different set of directories, so -M, -m and -s were
+            // silently ignored; the probe for it also spelled "is this command
+            // available" as `which`, which is not a POSIX utility.
+            let mode = if self.args.apropos {
+                SearchMode::Keyword
             } else {
-                "whatis"
+                SearchMode::Exact
             };
+            let results =
+                native_keyword_search(&self.search_paths, &self.sections, &self.args.names, mode);
 
-            // Check if external command exists and use it
-            let external_available = Command::new("which")
-                .arg(command)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            if external_available {
-                // Use external command (fast, uses system database)
+            if results.is_empty() {
                 for keyword in &self.args.names {
-                    let status = Command::new(command).arg(keyword).spawn()?.wait()?;
-                    if !status.success() {
-                        no_errors = false;
-                    }
+                    eprintln!("{}: {}", keyword, gettext("nothing appropriate"));
                 }
+                no_errors = false;
             } else {
-                // Fall back to native keyword search (slower, no database)
-                let results =
-                    native_keyword_search(&self.search_paths, &self.sections, &self.args.names);
-
-                if results.is_empty() {
-                    for keyword in &self.args.names {
-                        eprintln!("{}: {}", keyword, gettext("nothing appropriate"));
-                    }
-                    no_errors = false;
-                } else {
-                    for line in results {
-                        println!("{}", line);
-                    }
+                for line in results {
+                    println!("{}", line);
                 }
             }
 

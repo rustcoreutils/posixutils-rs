@@ -30,17 +30,46 @@ mod tests {
     }
 
     #[test]
-    fn apropos_with_keywords() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-k", "printf", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -k printf");
-
+    fn apropos_matches_names_and_descriptions() {
+        // -k parsed every page as mdoc, so on a man(7) system nothing ever
+        // matched; and .Nm/.Nd are children of the .Sh NAME block, which the
+        // extractor never descended into, so mdoc pages produced nothing
+        // either. POSIX: the result is equivalent to `grep -Ei` over a summary
+        // database, so both names and descriptions are searched.
+        let (code, out, _) = man(&["-M", "test_files", "-k", "expand", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
         assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
+            out.contains("gzcat(1) - expand compressed files"),
+            "a man(7) page must be searchable: {out}"
         );
+
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-k",
+            "concatenate",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(
+            out.contains("cat(1) - concatenate and print files"),
+            "an mdoc page must be searchable: {out}"
+        );
+    }
+
+    #[test]
+    fn apropos_reports_nothing_appropriate() {
+        let (code, _, err) = man(&[
+            "-M",
+            "test_files",
+            "-k",
+            "zzzznotapageanywhere",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(1));
+        assert!(err.contains("nothing appropriate"), "stderr: {err}");
     }
 
     // -------------------------------------------------------------------------
@@ -62,17 +91,23 @@ mod tests {
     }
 
     #[test]
-    fn whatis_one_argument() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-f", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -f ls");
+    fn whatis_is_an_exact_name_lookup() {
+        // -f shared the substring/ERE matcher with -k, so it listed every page
+        // whose description merely mentioned the operand. POSIX omits -f
+        // deliberately, so whatis(1)'s historical behaviour governs: the
+        // operand must be a page name, whole.
+        let (code, out, _) = man(&["-M", "test_files", "-f", "zcat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "zcat(1) - expand compressed files");
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // A word from the description is not a name.
+        let (code, _, err) = man(&["-M", "test_files", "-f", "expand", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(1));
+        assert!(err.contains("nothing appropriate"), "stderr: {err}");
+
+        // Nor is a prefix of a name.
+        let (code, _, _) = man(&["-M", "test_files", "-f", "zca", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(1));
     }
 
     // -------------------------------------------------------------------------

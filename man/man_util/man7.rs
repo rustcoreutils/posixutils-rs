@@ -77,6 +77,84 @@ fn volume_title(section: &str) -> &'static str {
 
 /// Tokenize a macro line into the macro name and its arguments, honoring double
 /// quotes (so `.SH "EXIT STATUS"` is one argument).
+/// Extract `(names, description)` from a man(7) NAME section.
+///
+/// A man(7) NAME section is `.SH NAME` followed by `name[, name…] \- text`.
+/// That shape is fixed enough to read directly, and the keyword scan visits
+/// every installed page -- running the full renderer over each one to recover
+/// two strings is what made it slow. Returns None when the page has no NAME
+/// section or no name in it.
+pub fn extract_name(content: &str) -> Option<(Vec<String>, String)> {
+    let mut in_name = false;
+    let mut collected = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed
+            .strip_prefix('.')
+            .or_else(|| trimmed.strip_prefix('\''))
+        {
+            let rest = rest.trim_start();
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if name == "SH" || name == "SS" {
+                if in_name {
+                    break;
+                }
+                let title = macro_args(rest[name.len()..].trim_start()).join(" ");
+                in_name = name == "SH" && title.eq_ignore_ascii_case("NAME");
+                continue;
+            }
+            if !in_name {
+                continue;
+            }
+            // Font macros carry the text as arguments: pages do write `.B ls`.
+            if matches!(
+                name,
+                "B" | "I" | "BR" | "IR" | "RB" | "RI" | "BI" | "IB" | "SM" | "SB"
+            ) {
+                let args = macro_args(rest[name.len()..].trim_start()).join(" ");
+                if !args.is_empty() {
+                    collected.push_str(&args);
+                    collected.push(' ');
+                }
+            }
+            continue;
+        }
+        if in_name && !trimmed.is_empty() {
+            collected.push_str(trimmed);
+            collected.push(' ');
+        }
+    }
+
+    if collected.trim().is_empty() {
+        return None;
+    }
+
+    // Split names from description at the mdoc-style dash. Match the escaped
+    // form first: a name may itself contain a hyphen (git-log), so only a dash
+    // that stands as its own word can be the separator.
+    let text = collected.trim();
+    let (left, right) = if let Some(i) = text.find("\\-") {
+        (&text[..i], &text[i + 2..])
+    } else if let Some(i) = text.find(" - ") {
+        (&text[..i], &text[i + 3..])
+    } else {
+        (text, "")
+    };
+
+    let names: Vec<String> = left
+        .split(',')
+        .map(|n| replace_escapes(n.trim()).trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    if names.is_empty() {
+        return None;
+    }
+
+    Some((names, replace_escapes(right.trim()).trim().to_string()))
+}
+
 fn macro_args(rest: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut cur = String::new();
@@ -426,6 +504,47 @@ mod tests {
 
     fn render(content: &str) -> String {
         String::from_utf8(format_man7(content, &SETTINGS).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn extract_name_reads_a_man7_name_section() {
+        // man(7) pages carry no .Nm/.Nd, so the keyword scan -- which parsed
+        // every page as mdoc -- found nothing on a Linux system.
+        let (names, desc) = extract_name(
+            ".TH GZCAT 1\n.SH NAME\ngzcat, zcat \\- expand compressed files\n.SH DESCRIPTION\nBody.\n",
+        )
+        .unwrap();
+        assert_eq!(names, vec!["gzcat", "zcat"]);
+        assert_eq!(desc, "expand compressed files");
+    }
+
+    #[test]
+    fn extract_name_reads_a_font_macro_name() {
+        // Pages do write `.B ls` inside NAME.
+        let (names, desc) =
+            extract_name(".TH LS 1\n.SH NAME\n.B ls\n\\- list directory contents\n").unwrap();
+        assert_eq!(names, vec!["ls"]);
+        assert_eq!(desc, "list directory contents");
+    }
+
+    #[test]
+    fn extract_name_keeps_hyphenated_names() {
+        // The separator is a dash standing alone; a name may contain one.
+        let (names, _) = extract_name(".TH X 1\n.SH NAME\ngit-log \\- show logs\n").unwrap();
+        assert_eq!(names, vec!["git-log"]);
+    }
+
+    #[test]
+    fn extract_name_stops_at_the_next_section() {
+        let (_, desc) =
+            extract_name(".TH X 1\n.SH NAME\nx \\- short\n.SH DESCRIPTION\nlong prose here\n")
+                .unwrap();
+        assert!(!desc.contains("long prose"), "description leaked: {desc}");
+    }
+
+    #[test]
+    fn extract_name_reports_a_page_without_one() {
+        assert!(extract_name(".TH X 1\n.SH DESCRIPTION\nno name section\n").is_none());
     }
 
     #[test]

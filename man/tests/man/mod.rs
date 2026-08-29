@@ -59,6 +59,23 @@ mod tests {
     }
 
     #[test]
+    fn apropos_indexes_architecture_subdirectories() {
+        // -S searches man{N}/{arch}/, so the keyword index has to cover the
+        // same tree: a page reachable by `man -S amd64 cat` was invisible to
+        // `man -k`, which is supposed to index what `man` can display.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-k",
+            "amd64-specific",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("amd64-specific concatenate"), "{out}");
+    }
+
+    #[test]
     fn apropos_reports_each_operand_that_matched_nothing() {
         // The status and the diagnostic were computed from the aggregate
         // result list, so an operand that matched nothing was silently dropped

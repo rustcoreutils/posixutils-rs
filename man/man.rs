@@ -816,12 +816,20 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
                 continue;
             }
 
-            let entries = match std::fs::read_dir(&section_dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            // The section directory, then its architecture subdirectories:
+            // -S searches those, so the keyword index has to cover them or a
+            // page reachable by `man -S amd64 foo` is invisible to `man -k`.
+            let mut dirs = vec![section_dir.clone()];
+            if let Ok(entries) = std::fs::read_dir(&section_dir) {
+                dirs.extend(entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            }
 
-            for entry in entries.flatten() {
+            let entries = dirs
+                .iter()
+                .filter_map(|dir| std::fs::read_dir(dir).ok())
+                .flat_map(|e| e.flatten());
+
+            for entry in entries {
                 let path = entry.path();
                 if !path.is_file() {
                     continue;

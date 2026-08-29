@@ -697,12 +697,16 @@ fn make_leaf(name: &str, args: Vec<String>) -> Element {
             nodes: it.map(Element::Text).collect(),
         }
     } else {
-        // Nm: first arg is the name if purely alphanumeric, else a text node.
+        // Nm: the first argument is the utility name unless it is a bare
+        // delimiter. mandoc applies no character class here, and requiring the
+        // name to be alphanumeric rejected every real name containing `-`, `_`
+        // or `.` (ssh-keygen, a.out, systemd-run), leaving `name` None so that
+        // every later bare `.Nm` expanded to nothing.
         let mut nm_name = None;
         let mut nodes = Vec::new();
         let mut it = args.into_iter();
         if let Some(first) = it.next() {
-            if first.chars().all(|c| c.is_alphanumeric()) {
+            if is_name_token(&first) {
                 nm_name = Some(first);
             } else {
                 nodes.push(Element::Text(first));
@@ -837,6 +841,13 @@ fn container_macro(name: &str) -> Option<Macro> {
 /// An mdoc opening delimiter (attaches to the following content).
 fn is_opening_delim(s: &str) -> bool {
     s == "(" || s == "["
+}
+
+/// Whether a `.Nm` argument can serve as the utility name: any non-empty token
+/// that is not a bare delimiter. A macro name cannot reach here, because the
+/// caller stops collecting arguments at the first callable token.
+fn is_name_token(s: &str) -> bool {
+    !s.is_empty() && !is_opening_delim(s) && !is_closing_delim(s)
 }
 
 /// An mdoc closing delimiter (attaches to the preceding content).
@@ -1259,6 +1270,7 @@ fn tokenize(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_mdoc_v2;
+    use super::{Element, Macro};
 
     /// Smoke test: the hand-written parser must not panic on this input and must
     /// produce a deterministic AST. (Rendering correctness is covered by the
@@ -1272,6 +1284,43 @@ mod tests {
     #[test]
     fn sh_without_body() {
         parity(".Sh SECTION");
+    }
+
+    #[test]
+    fn nm_accepts_real_utility_names() {
+        // Requiring `is_alphanumeric` dropped the name of any utility spelled
+        // with a dash, underscore or dot.
+        for input in [
+            ".Nm ssh-keygen\n",
+            ".Nm a.out\n",
+            ".Nm systemd-run\n",
+            ".Nm my_tool\n",
+        ] {
+            let doc = parse_mdoc_v2(input);
+            let Element::Macro(node) = &doc.elements[0] else {
+                panic!("expected a macro: {:?}", doc.elements);
+            };
+            assert!(
+                matches!(&node.mdoc_macro, Macro::Nm { name: Some(_) }),
+                "input {input:?} produced {:?}",
+                node.mdoc_macro
+            );
+        }
+    }
+
+    #[test]
+    fn nm_without_a_usable_name_records_none() {
+        // `chars().all()` was vacuously true on an empty token, so `.Nm ""`
+        // recorded Some("") and every later bare .Nm rendered as nothing.
+        for input in [".Nm\n", ".Nm \"\"\n"] {
+            let doc = parse_mdoc_v2(input);
+            if let Some(Element::Macro(node)) = doc.elements.first() {
+                assert!(
+                    !matches!(&node.mdoc_macro, Macro::Nm { name: Some(n) } if n.is_empty()),
+                    "input {input:?} recorded an empty name"
+                );
+            }
+        }
     }
 
     #[test]

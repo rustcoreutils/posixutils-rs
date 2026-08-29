@@ -6030,13 +6030,38 @@ footer text                     January 1, 1970                    footer text";
 .Dt PROGNAME section
 .Os footer text
 .Nm command_name";
+            // No leading space: `command_name` is now recognised as the name.
+            // The space this expectation used to carry was the empty
+            // `first_name` being rendered, because `_` is not alphanumeric and
+            // the argument fell through to a text node.
             let output =
                 "PROGNAME(section)                   section                  PROGNAME(section)
 
- command_name
+command_name
 
 footer text                     January 1, 1970                    footer text";
             test_formatting(input, output);
+        }
+
+        #[test]
+        fn nm_hyphenated_name_is_remembered() {
+            // A name containing `-`, `_` or `.` was discarded, so every later
+            // bare `.Nm` expanded to nothing: ssh-keygen, a.out, systemd-*.
+            let input = ".Dd January 1, 1970
+.Dt PROGNAME 1
+.Os footer text
+.Sh NAME
+.Nm ssh-keygen
+.Sh DESCRIPTION
+The
+.Nm
+utility.";
+            use crate::man_util::formatter::tests::{get_ast, FORMATTING_SETTINGS};
+            use crate::man_util::formatter::MdocFormatter;
+
+            let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
+            let out = String::from_utf8(formatter.format_mdoc(get_ast(input))).unwrap();
+            assert_eq!(out.matches("ssh-keygen").count(), 2, "got: {out:?}");
         }
 
         #[test]

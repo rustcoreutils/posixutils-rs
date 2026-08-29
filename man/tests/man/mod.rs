@@ -437,23 +437,51 @@ mod tests {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("invalid value '99' for '-s <SECTION>'"),
+            stderr.contains("invalid value '99' for '-s <SECTION>'")
+                && stderr.contains("invalid section: 99"),
             "Expected 'Invalid section: 99', got:\n{stderr}"
         );
     }
 
     #[test]
-    fn section_valid() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-s", "s1", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -s 1 ls");
+    fn section_accepts_posix_numbers() {
+        // Section was a clap ValueEnum, whose derived value names are the
+        // variant names, so the accepted spellings were `s1`..`s9` and
+        // `man -s 1 ls` was rejected outright. This test used to pass "s1"
+        // under an .expect string claiming it ran `man -s 1 ls`.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-s",
+            "1",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // And it really filters: cat is only in section 1.
+        let (code, _, _) = man(&[
+            "-M",
+            "test_files",
+            "-s",
+            "2",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(1));
+    }
+
+    #[test]
+    fn section_rejects_the_value_enum_spelling() {
+        // `s1` was never a section anywhere; it was an artifact of the derive.
+        let (code, _, err) = man(&["-s", "s1", "ls", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(2));
+        assert!(err.contains("invalid section: s1"), "stderr: {err}");
     }
 
     // -------------------------------------------------------------------------

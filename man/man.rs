@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser};
 use flate2::read::GzDecoder;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use man_util::config::{parse_config_file, ManConfig};
@@ -116,9 +116,13 @@ struct Args {
     )]
     subsection: Option<String>,
 
+    // Not a ValueEnum: its derived value names are the variant names, so the
+    // accepted spellings were `s1`..`s9`, and `man -s 1 ls` -- the POSIX and
+    // universal spelling -- was rejected outright. The hand-written FromStr
+    // below already mapped the right names and was dead code.
     #[arg(
         short = 's',
-        value_enum,
+        value_parser = Section::from_str,
         help = gettext("Only select manuals from the specified section")
     )]
     section: Option<Section>,
@@ -254,7 +258,7 @@ enum ParseError {
 }
 
 /// Manual type
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Section {
     /// General commands (tools and utilities)
     S1,
@@ -293,7 +297,7 @@ impl FromStr for Section {
             "7" => Ok(Section::S7),
             "8" => Ok(Section::S8),
             "9" => Ok(Section::S9),
-            _ => Err(format!("Invalid section: {}", s)),
+            _ => Err(gettext("invalid section: {}").replace("{}", s)),
         }
     }
 }

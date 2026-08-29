@@ -8,7 +8,7 @@
 //
 
 use clap::{ArgAction, Parser};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use man_util::config::{parse_config_file, ManConfig};
 use man_util::formatter::MdocFormatter;
@@ -183,6 +183,9 @@ enum ManError {
 
     /// The page produced no renderable content (e.g. an unsupported format).
     EmptyPage,
+
+    /// The page is compressed with a format this implementation cannot read.
+    UnsupportedCompression(String),
 }
 
 impl std::fmt::Display for ManError {
@@ -220,6 +223,11 @@ impl std::fmt::Display for ManError {
                 gettext("file: {} was not found").replace("{}", &path.display().to_string())
             ),
             ManError::EmptyPage => write!(f, "{}", gettext("no renderable content in page")),
+            ManError::UnsupportedCompression(format) => write!(
+                f,
+                "{}",
+                gettext("page is {}-compressed, which is not supported").replace("{}", format)
+            ),
         }
     }
 }
@@ -477,15 +485,15 @@ fn apply_terminal_width(settings: &mut FormattingSettings, cols: usize) {
 /// decompression bomb.
 fn decode_page(raw: Vec<u8>, limit: u64) -> Result<Vec<u8>, ManError> {
     // Compressed formats we do not implement. Installed pages are gzip
-    // everywhere this runs; recognising the others turns "binary dumped to the
-    // terminal" into a clean diagnostic.
-    for magic in [
-        b"BZh".as_slice(),
-        b"\xfd7zXZ".as_slice(),
-        b"\x28\xb5\x2f\xfd".as_slice(),
+    // everywhere this runs; recognising the others names the reason instead of
+    // writing binary to the terminal.
+    for (magic, name) in [
+        (b"BZh".as_slice(), "bzip2"),
+        (b"\xfd7zXZ".as_slice(), "xz"),
+        (b"\x28\xb5\x2f\xfd".as_slice(), "zstd"),
     ] {
         if raw.starts_with(magic) {
-            return Err(ManError::EmptyPage);
+            return Err(ManError::UnsupportedCompression(name.to_string()));
         }
     }
 
@@ -493,8 +501,11 @@ fn decode_page(raw: Vec<u8>, limit: u64) -> Result<Vec<u8>, ManError> {
         return Ok(raw);
     }
 
+    // MultiGzDecoder, not GzDecoder: a gzip file may hold several concatenated
+    // members, and GzDecoder stops after the first, silently truncating such a
+    // page. zcat, which this replaced, decodes all of them.
     let mut out = Vec::new();
-    GzDecoder::new(raw.as_slice())
+    MultiGzDecoder::new(raw.as_slice())
         .take(limit)
         .read_to_end(&mut out)?;
     Ok(out)
@@ -1352,13 +1363,37 @@ mod tests {
 
     #[test]
     fn decode_page_rejects_compression_it_cannot_read() {
-        // Better a diagnostic than binary on the terminal.
-        for magic in [b"BZh9".as_slice(), b"\xfd7zXZ\x00".as_slice()] {
-            assert!(matches!(
-                decode_page(magic.to_vec(), u64::MAX),
-                Err(ManError::EmptyPage)
-            ));
+        // Better a diagnostic naming the format than binary on the terminal,
+        // or a claim that the page is empty.
+        for (magic, name) in [
+            (b"BZh9".as_slice(), "bzip2"),
+            (b"\xfd7zXZ\x00".as_slice(), "xz"),
+            (b"\x28\xb5\x2f\xfd\x00".as_slice(), "zstd"),
+        ] {
+            match decode_page(magic.to_vec(), u64::MAX) {
+                Err(ManError::UnsupportedCompression(f)) => assert_eq!(f, name),
+                other => panic!("expected an unsupported-compression error, got {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn decode_page_reads_every_gzip_member() {
+        // A gzip file may hold several concatenated members. GzDecoder stops
+        // after the first, silently truncating the page; zcat, which this
+        // replaced, decodes all of them.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut gz = Vec::new();
+        for part in [b"first\n".as_slice(), b"second\n".as_slice()] {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(part).unwrap();
+            gz.extend(enc.finish().unwrap());
+        }
+
+        assert_eq!(decode_page(gz, u64::MAX).unwrap(), b"first\nsecond\n");
     }
 
     /// `.so` must not be usable to read arbitrary files. A man page is
@@ -1400,14 +1435,20 @@ mod tests {
             ),
             (ManError::GetTerminalSize, "failed to get terminal size"),
             (
-                ManError::CommandNotFound("zcat".into()),
-                "zcat command not found",
+                // The surviving producer is the pager, via sh's 126/127; pages
+                // are no longer read by forking zcat.
+                ManError::CommandNotFound("less -R".into()),
+                "less -R command not found",
             ),
             (
                 ManError::NotFound(PathBuf::from("/tmp/x.1")),
                 "file: /tmp/x.1 was not found",
             ),
             (ManError::EmptyPage, "no renderable content in page"),
+            (
+                ManError::UnsupportedCompression("xz".into()),
+                "page is xz-compressed, which is not supported",
+            ),
         ];
 
         for (err, expected) in cases {

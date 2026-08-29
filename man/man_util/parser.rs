@@ -8,6 +8,7 @@
 //
 
 use super::mdoc_macro::*;
+use super::parse::mdoc::NestingTooDeep;
 
 static BLOCK_PARTIAL_IMPLICIT: &[&str] = &[
     "Aq", "Bq", "Brq", "D1", "Dl", "Dq", "En", "Op", "Pq", "Ql", "Qq", "Sq", "Vt",
@@ -303,8 +304,13 @@ pub struct MdocDocument {
 
 impl MdocParser {
     /// Parse a full mdoc document into the AST (delegated to the hand-written
-    /// parser; pest has been removed). The parser is total — it never fails.
-    pub fn parse_mdoc(input: &str) -> MdocDocument {
+    /// parser; pest has been removed).
+    ///
+    /// The only failure is a document nested past the parser's depth cap. It is
+    /// reported rather than truncated, because the AST is walked recursively
+    /// when it is cloned, formatted and dropped, and overflowing that walk
+    /// aborts the process.
+    pub fn parse_mdoc(input: &str) -> Result<MdocDocument, NestingTooDeep> {
         crate::man_util::parse::mdoc::parse_mdoc_v2(input)
     }
 }

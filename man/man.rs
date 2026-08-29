@@ -12,6 +12,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use man_util::config::{parse_config_file, ManConfig};
 use man_util::formatter::MdocFormatter;
 use man_util::man7;
+use man_util::parse::mdoc::NestingTooDeep;
 use man_util::parser::{MdocDocument, MdocParser};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
@@ -232,6 +233,12 @@ impl From<ParseError> for ManError {
     }
 }
 
+impl From<NestingTooDeep> for ManError {
+    fn from(err: NestingTooDeep) -> Self {
+        ManError::ParseError(err.into())
+    }
+}
+
 /// Parsing error types
 #[derive(Error, Debug)]
 enum ParseError {
@@ -240,6 +247,9 @@ enum ParseError {
 
     #[error("{0}")]
     FromUtf8Error(#[from] FromUtf8Error),
+
+    #[error("{0}")]
+    NestingTooDeep(#[from] NestingTooDeep),
 }
 
 /// Manual type
@@ -591,7 +601,7 @@ fn format_man_page(
 
     let mut formatter = MdocFormatter::new(*formatting);
 
-    let document = MdocParser::parse_mdoc(&content);
+    let document = MdocParser::parse_mdoc(&content)?;
     let formatted_document = match synopsis {
         true => formatter.format_synopsis_section(document),
         false => formatter.format_mdoc(document),
@@ -719,8 +729,10 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
                     Err(_) => continue,
                 };
 
-                // The hand-written parser is total, so no panic guard is needed.
-                let document = MdocParser::parse_mdoc(&content);
+                // A single pathologically nested page must not abort the scan.
+                let Ok(document) = MdocParser::parse_mdoc(&content) else {
+                    continue;
+                };
 
                 if let Some((names, description)) = extract_name_info(&document) {
                     results.push(ManPageInfo {

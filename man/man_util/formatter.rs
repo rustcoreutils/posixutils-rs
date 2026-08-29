@@ -4034,7 +4034,7 @@ mod tests {
 
     /// Parse [`input`] into AST
     fn get_ast(input: &str) -> MdocDocument {
-        MdocParser::parse_mdoc(input)
+        MdocParser::parse_mdoc(input).expect("test input is not pathologically nested")
     }
 
     /// Universal function for all tests.

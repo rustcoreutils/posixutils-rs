@@ -499,16 +499,9 @@ mod tests {
         );
     }
 
-    // Audit #2: a single line with an absurd number of nested partial macros is
-    // rejected up front (the PEG grammar otherwise backtracks exponentially and
-    // overflows the stack). Must fail fast with a parse error, not hang/crash.
-    #[test]
-    fn deeply_nested_macros_rejected() {
-        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh D\n");
-        body.push_str(&".Aq ".repeat(20_000));
-        body.push_str("x\n");
-        let page = write_temp_page("deep", &body);
-
+    /// Run `man -c -l` on a generated page and return (exit code, stderr).
+    fn run_on_page(tag: &str, body: &str) -> (Option<i32>, String, std::time::Duration) {
+        let page = write_temp_page(tag, body);
         let start = std::time::Instant::now();
         let output = Command::new(env!("CARGO_BIN_EXE_man"))
             .args(["-c", "-l"])
@@ -518,20 +511,77 @@ mod tests {
             .expect("Failed to run man -c -l");
         let elapsed = start.elapsed();
         let _ = std::fs::remove_file(&page);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            elapsed,
+        )
+    }
 
-        // The hand-written parser has no exponential backtracking, so a
-        // pathologically nested line is handled quickly and without crashing —
-        // no panic (101) or stack overflow (134), and no need for the old
-        // nesting-limit rejection.
-        let code = output.status.code();
+    // A single line nesting partial-implicit macros past the parser's cap must
+    // be reported, not aborted. The AST is walked recursively when it is cloned,
+    // formatted and dropped, so an uncapped page overflowed the stack — which
+    // raises SIGABRT and cannot be caught.
+    //
+    // The repeated token must NOT carry a leading dot: `.Aq .Aq .Aq` tokenizes
+    // to `.Aq` tokens, which are not recognised as container macros and become
+    // plain text two levels deep. That is why the previous version of this test
+    // passed while a 10,000-deep page aborted the process.
+    #[test]
+    fn deeply_nested_inline_macros_rejected() {
+        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh D\n.");
+        body.push_str(&"Op ".repeat(10_000));
+        body.push_str("x\n");
+        let (code, stderr, elapsed) = run_on_page("deepinline", &body);
+
+        assert_eq!(
+            code,
+            Some(1),
+            "expected a diagnostic, got {code:?}: {stderr}"
+        );
         assert!(
-            matches!(code, Some(0) | Some(1)),
-            "must not crash on deep nesting, got exit {code:?}"
+            stderr.contains("nesting"),
+            "stderr must name the cause, got: {stderr}"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
-            "must handle deep nesting fast, took {elapsed:?}"
+            "must reject deep nesting fast, took {elapsed:?}"
         );
+    }
+
+    // The other depth source: one open block per line. This nests through the
+    // frame stack with no inline recursion at all, so a cap on the inline parser
+    // alone would still overflow here.
+    #[test]
+    fn deeply_nested_blocks_rejected() {
+        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh D\n");
+        body.push_str(&".Ao\n".repeat(20_000));
+        let (code, stderr, elapsed) = run_on_page("deepblock", &body);
+
+        assert_eq!(
+            code,
+            Some(1),
+            "expected a diagnostic, got {code:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("nesting"),
+            "stderr must name the cause, got: {stderr}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must reject deep nesting fast, took {elapsed:?}"
+        );
+    }
+
+    // Ordinary nesting must keep working: the cap is far above what real pages
+    // use, so a handful of levels renders normally.
+    #[test]
+    fn ordinary_nesting_still_renders() {
+        let body = String::from(
+            ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Op Op Op Op Op deep\n.Ao\n.Bo\n.Po\ntext\n.Pc\n.Bc\n.Ac\n",
+        );
+        let (code, stderr, _) = run_on_page("shallow", &body);
+        assert_eq!(code, Some(0), "expected success, got {code:?}: {stderr}");
     }
 
     // -------------------------------------------------------------------------
@@ -818,6 +868,6 @@ mod malformed {
             checked += 1;
         }
 
-        assert!(checked >= 21, "corpus shrank: only {checked} files");
+        assert!(checked >= 23, "corpus shrank: only {checked} files");
     }
 }

@@ -3857,7 +3857,15 @@ mod tests {
     pub fn test_formatting(input: &str, output: &str) {
         let ast = get_ast(input);
         let mut formatter = MdocFormatter::new(FORMATTING_SETTINGS);
-        let result = String::from_utf8(formatter.format_mdoc(ast)).unwrap();
+        let rendered = String::from_utf8(formatter.format_mdoc(ast)).unwrap();
+
+        // A rendered page always ends with a newline. Assert that once here
+        // rather than carrying a trailing blank line in every snapshot below.
+        assert!(
+            rendered.ends_with('\n'),
+            "rendered page must end with a newline: {rendered:?}"
+        );
+        let result = rendered.trim_end_matches('\n').to_string();
 
         if let Ok(path) = std::env::var("MAN_BLESS") {
             if result != output {

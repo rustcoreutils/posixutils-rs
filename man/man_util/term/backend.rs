@@ -277,6 +277,17 @@ impl Term {
         }
 
         let content = remove_empty_lines(&lines.join("\n"), 2);
-        apply_styling(&content, self.styling).into_bytes()
+        let mut out = apply_styling(&content, self.styling);
+
+        // A rendered page is a text file, and a text file ends with a newline.
+        // `lines.join("\n")` puts no separator after the last line and nothing
+        // downstream appended one, so `man -c ls | od -c` ended mid-line and an
+        // interactive `man -c` left the prompt on the footer. The empty case
+        // stays empty so it still reads as "no renderable content".
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+
+        out.into_bytes()
     }
 }

@@ -70,22 +70,32 @@ impl Parser {
         }
     }
 
-    /// Open a new implicit block, after closing the blocks it terminates.
-    fn open_block(&mut self, mac: Macro, closes: &[MacroPred]) {
+    /// Close every open block down to (but not including) the innermost frame
+    /// satisfying `stop`, or to the document root if none does.
+    ///
+    /// A section or subsection heading ends the blocks it encloses. Stopping at
+    /// the first frame that was not itself a heading left a `.Sh` nested inside
+    /// an unterminated `.Bl` or `.Bd`, so the new section and everything after
+    /// it rendered as list-item body. mandoc rewinds unconditionally here.
+    fn unwind_to(&mut self, stop: MacroPred) {
         while self.stack.len() > 1 {
-            let top_is_closable = self
+            let at_stop = self
                 .stack
                 .last()
                 .unwrap()
                 .mac
                 .as_ref()
-                .map(|m| closes.iter().any(|f| f(m)))
+                .map(stop)
                 .unwrap_or(false);
-            if !top_is_closable {
+            if at_stop {
                 break;
             }
             self.close_top();
         }
+    }
+
+    /// Push a new open block.
+    fn open_frame(&mut self, mac: Macro) {
         self.stack.push(Frame {
             mac: Some(mac),
             nodes: Vec::new(),
@@ -216,20 +226,21 @@ impl Parser {
     fn control(&mut self, name: &str, rest: &str) {
         match name {
             // The Sh/Ss title is the raw remainder (trailing space trimmed).
-            "Sh" => self.open_block(
-                Macro::Sh {
+            "Sh" => {
+                self.unwind_to(|_| false);
+                self.open_frame(Macro::Sh {
                     title: rest.trim_end().to_string(),
-                },
-                &[is_sh, is_ss, is_nd],
-            ),
-            "Ss" => self.open_block(
-                Macro::Ss {
+                });
+            }
+            "Ss" => {
+                self.unwind_to(is_sh);
+                self.open_frame(Macro::Ss {
                     title: rest.trim_end().to_string(),
-                },
-                &[is_ss, is_nd],
-            ),
+                });
+            }
             "Nd" => {
-                self.open_block(Macro::Nd, &[is_nd]);
+                self.unwind_to(|m| is_sh(m) || is_ss(m));
+                self.open_frame(Macro::Nd);
                 for word in tokenize(rest) {
                     self.push(Element::Text(word));
                 }
@@ -317,12 +328,11 @@ impl Parser {
                 }
             }
             // Block-full-explicit displays close on .Ed/.Ef/.Ek.
-            "Bd" => self.open_block(parse_bd(rest), &[]),
-            "Bf" => self.open_block(
-                Macro::Bf(bf_type(tokenize(rest).first().map(|s| s.as_str()))),
-                &[],
-            ),
-            "Bk" => self.open_block(Macro::Bk, &[]),
+            "Bd" => self.open_frame(parse_bd(rest)),
+            "Bf" => self.open_frame(Macro::Bf(bf_type(
+                tokenize(rest).first().map(|s| s.as_str()),
+            ))),
+            "Bk" => self.open_frame(Macro::Bk),
             "Ed" => {
                 self.close_matching(is_bd, |_| {});
             }
@@ -332,7 +342,7 @@ impl Parser {
             "Ek" => {
                 self.close_matching(is_bk, |_| {});
             }
-            "Bl" => self.open_block(parse_bl(rest), &[]),
+            "Bl" => self.open_frame(parse_bl(rest)),
             "It" => {
                 self.close_open_items();
                 let head = parse_inline_seq(tokenize(rest));
@@ -1185,9 +1195,6 @@ fn is_sh(m: &Macro) -> bool {
 fn is_ss(m: &Macro) -> bool {
     matches!(m, Macro::Ss { .. })
 }
-fn is_nd(m: &Macro) -> bool {
-    matches!(m, Macro::Nd)
-}
 
 /// Truncate `line` at an unescaped `\"` comment.
 fn strip_comment(line: &str) -> &str {
@@ -1265,6 +1272,31 @@ mod tests {
     #[test]
     fn sh_without_body() {
         parity(".Sh SECTION");
+    }
+
+    #[test]
+    fn section_closes_an_unterminated_list() {
+        // The unwind stopped at the first frame that was not itself a heading,
+        // so a .Sh following an unclosed .Bl was pushed inside the list and
+        // rendered, with everything after it, as list-item body.
+        let doc = parse_mdoc_v2(".Sh A\n.Bl -bullet\n.It\nx\n.Sh B\ny\n");
+        assert_eq!(
+            doc.elements.len(),
+            2,
+            "the second .Sh must be a sibling: {:?}",
+            doc.elements
+        );
+    }
+
+    #[test]
+    fn subsection_closes_a_display_but_stays_in_its_section() {
+        let doc = parse_mdoc_v2(".Sh A\n.Bd -literal\nx\n.Ss B\ny\n");
+        assert_eq!(
+            doc.elements.len(),
+            1,
+            ".Ss must stay inside its .Sh: {:?}",
+            doc.elements
+        );
     }
 
     #[test]

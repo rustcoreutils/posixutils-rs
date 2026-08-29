@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024-2025 Hemi Labs, Inc.
+// Copyright (c) 2024-2026 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -7,611 +7,827 @@
 // SPDX-License-Identifier: MIT
 //
 
+//! Recursive-descent parser for `bc`.
+//!
+//! The expression grammar follows the precedence table of POSIX.1-2024,
+//! XCU `bc`, Table 3-3, with one function per precedence level. In order of
+//! decreasing precedence: `++`/`--`, unary `-`, `^` (right associative),
+//! `*` `/` `%`, `+` binary `-`, assignment, and the relational operators —
+//! which the grammar admits only inside an `if`, `while` or `for` condition.
+//!
+//! Assignment is recognised where its left side is syntactically a named
+//! expression, so `1 + a = 2` is `1 + (a = 2)`, matching historical bc.
+
 use super::instructions::*;
-
-use pest::error::InputLocation;
-use pest::iterators::Pair;
-use pest::pratt_parser::{Assoc, Op, PrattParser};
-use pest::{Parser, Position};
+use super::lexer::{end_position, tokenize, PositionedToken, Token};
 use std::rc::Rc;
-use std::sync::LazyLock;
 
-static PRATT_PARSER: LazyLock<PrattParser<Rule>> = LazyLock::new(|| {
-    // Precedence is defined lowest to highest
-    PrattParser::new()
-        .op(Op::infix(Rule::add, Assoc::Left) | Op::infix(Rule::sub, Assoc::Left))
-        .op(Op::infix(Rule::mul, Assoc::Left)
-            | Op::infix(Rule::div, Assoc::Left)
-            | Op::infix(Rule::modulus, Assoc::Left))
-        .op(Op::infix(Rule::pow, Assoc::Right))
-        .op(Op::prefix(Rule::neg))
-});
+/// Maximum nesting of expressions and statements.
+///
+/// Recursive descent uses the machine stack, so without a limit a deeply
+/// nested input aborts the process instead of producing a diagnostic. Each
+/// level costs several frames, and unoptimized builds use far larger frames
+/// than release ones, so the limit is set well below where either would run
+/// out. Real bc programs nest a handful of levels.
+const MAX_PARSE_DEPTH: usize = 500;
 
-fn first_char(s: &str) -> char {
-    s.chars().next().unwrap()
-}
-
-fn as_letter(r: Pair<Rule>) -> char {
-    first_char(r.as_str())
-}
-
-fn first_child(r: Pair<Rule>) -> Pair<Rule> {
-    r.into_inner().next().unwrap()
-}
-
-fn as_variable(r: Pair<Rule>) -> Variable {
-    match r.as_rule() {
-        Rule::variable_number => Variable::Number(as_letter(r)),
-        Rule::array => Variable::Array(as_letter(r)),
-        _ => unreachable!(),
-    }
-}
-
-fn to_bc_str(s: &str) -> String {
-    s.trim_matches('\"').to_string()
-}
-
-fn to_bc_number(s: &str) -> String {
-    s.trim().replace("\\\n", "")
-}
-
-fn as_register(r: Pair<Rule>) -> Register {
-    match r.as_rule() {
-        Rule::scale => Register::Scale,
-        Rule::ibase => Register::IBase,
-        Rule::obase => Register::OBase,
-        _ => unreachable!(),
-    }
-}
-
-fn generate_assignment<F>(
-    op_rule: Rule,
-    named_expr: ExprInstruction,
-    value: ExprInstruction,
-    assign: F,
-) -> ExprInstruction
-where
-    F: FnOnce(Box<ExprInstruction>) -> ExprInstruction,
-{
-    match op_rule {
-        Rule::assign => assign(Box::new(value)),
-        Rule::add_assign => assign(Box::new(ExprInstruction::Add(
-            Box::new(named_expr),
-            Box::new(value),
-        ))),
-        Rule::sub_assign => assign(Box::new(ExprInstruction::Sub(
-            Box::new(named_expr),
-            Box::new(value),
-        ))),
-        Rule::mul_assign => assign(Box::new(ExprInstruction::Mul(
-            Box::new(named_expr),
-            Box::new(value),
-        ))),
-        Rule::div_assign => assign(Box::new(ExprInstruction::Div(
-            Box::new(named_expr),
-            Box::new(value),
-        ))),
-        Rule::mod_assign => assign(Box::new(ExprInstruction::Mod(
-            Box::new(named_expr),
-            Box::new(value),
-        ))),
-        Rule::pow_assign => assign(Box::new(ExprInstruction::Pow(
-            Box::new(named_expr),
-            Box::new(value),
-        ))),
-        _ => unreachable!(),
-    }
-}
-
-fn parse_named_expr(expr: Pair<Rule>) -> NamedExpr {
-    let expr = first_child(expr);
-    match expr.as_rule() {
-        Rule::variable_number => NamedExpr::VariableNumber(first_char(expr.as_str())),
-        Rule::array_item => {
-            // name [ index ]
-            let mut inner = expr.into_inner();
-            let name = as_letter(inner.next().unwrap());
-            let index = Box::new(parse_expr(inner.next().unwrap()));
-            NamedExpr::ArrayItem { name, index }
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn parse_function_argument(arg: Pair<Rule>) -> FunctionArgument {
-    match arg.as_rule() {
-        Rule::array => FunctionArgument::ArrayVariable(as_letter(arg)),
-        Rule::expression => FunctionArgument::Expr(parse_expr(arg)),
-        _ => unreachable!(),
-    }
-}
-
-fn parse_primary(expr: Pair<Rule>) -> ExprInstruction {
-    let expr = expr.into_inner().next().unwrap();
-    match expr.as_rule() {
-        Rule::number => ExprInstruction::Number(to_bc_number(expr.as_str())),
-        Rule::paren => parse_expr(first_child(expr)),
-        Rule::builtin_call => {
-            // name ( expr )
-            let mut inner = expr.into_inner();
-            let func = match inner.next().unwrap().as_str() {
-                "length" => BuiltinFunction::Length,
-                "sqrt" => BuiltinFunction::Sqrt,
-                "scale" => BuiltinFunction::Scale,
-                _ => unreachable!(),
-            };
-            let arg = parse_expr(inner.next().unwrap());
-            ExprInstruction::Builtin {
-                function: func,
-                arg: Box::new(arg),
-            }
-        }
-        Rule::fn_call => {
-            // name ( expr* )
-            let mut inner = expr.into_inner();
-            let name = as_letter(inner.next().unwrap());
-            let args = if let Some(args) = inner.next() {
-                args.into_inner().map(parse_function_argument).collect()
-            } else {
-                vec![]
-            };
-            ExprInstruction::Call { name, args }
-        }
-        Rule::prefix_increment => {
-            ExprInstruction::PreIncrement(parse_named_expr(first_child(expr)))
-        }
-        Rule::prefix_decrement => {
-            ExprInstruction::PreDecrement(parse_named_expr(first_child(expr)))
-        }
-        Rule::postfix_increment => {
-            ExprInstruction::PostIncrement(parse_named_expr(first_child(expr)))
-        }
-        Rule::postfix_decrement => {
-            ExprInstruction::PostDecrement(parse_named_expr(first_child(expr)))
-        }
-        Rule::negation => ExprInstruction::UnaryMinus(Box::new(parse_primary(first_child(expr)))),
-        Rule::register => {
-            let register = match first_child(expr).as_rule() {
-                Rule::scale => Register::Scale,
-                Rule::ibase => Register::IBase,
-                Rule::obase => Register::OBase,
-                _ => unreachable!(),
-            };
-            ExprInstruction::GetRegister(register)
-        }
-        Rule::register_assignment => {
-            // register assign_op expression
-            let mut inner = expr.into_inner();
-            let register = as_register(first_child(inner.next().unwrap()));
-            let op = inner.next().unwrap();
-            let value = parse_expr(inner.next().unwrap());
-            generate_assignment(
-                op.as_rule(),
-                ExprInstruction::GetRegister(register),
-                value,
-                |value| ExprInstruction::SetRegister { register, value },
-            )
-        }
-        Rule::assignment => {
-            // name assignment_operator expr
-            let mut inner = expr.into_inner();
-            let named = parse_named_expr(inner.next().unwrap());
-            let op = inner.next().unwrap();
-            let value = parse_expr(inner.next().unwrap());
-            generate_assignment(
-                op.as_rule(),
-                ExprInstruction::Named(named.clone()),
-                value,
-                |value| ExprInstruction::Assignment { named, value },
-            )
-        }
-
-        Rule::named_expression => ExprInstruction::Named(parse_named_expr(expr)),
-        r => unreachable!("found rule {:?}", r),
-    }
-}
-
-fn parse_expr(expr: Pair<Rule>) -> ExprInstruction {
-    PRATT_PARSER
-        .map_primary(parse_primary)
-        .map_prefix(|op, rhs| match op.as_rule() {
-            Rule::neg => ExprInstruction::UnaryMinus(Box::new(rhs)),
-            _ => unreachable!(),
-        })
-        .map_infix(|lhs, op, rhs| match op.as_rule() {
-            Rule::add => ExprInstruction::Add(Box::new(lhs), Box::new(rhs)),
-            Rule::sub => ExprInstruction::Sub(Box::new(lhs), Box::new(rhs)),
-            Rule::mul => ExprInstruction::Mul(Box::new(lhs), Box::new(rhs)),
-            Rule::div => ExprInstruction::Div(Box::new(lhs), Box::new(rhs)),
-            Rule::modulus => ExprInstruction::Mod(Box::new(lhs), Box::new(rhs)),
-            Rule::pow => ExprInstruction::Pow(Box::new(lhs), Box::new(rhs)),
-            _ => unreachable!(),
-        })
-        .parse(expr.into_inner())
-}
-
-fn parse_condition(expr: Pair<Rule>) -> ConditionInstruction {
-    let expr = first_child(expr);
-    match expr.as_rule() {
-        Rule::expression => ConditionInstruction::Expr(parse_expr(expr)),
-        Rule::relational_expression => {
-            let mut inner = expr.into_inner();
-            let left = parse_expr(inner.next().unwrap());
-            let op = inner.next().unwrap();
-            let right = parse_expr(inner.next().unwrap());
-            match op.as_rule() {
-                Rule::same => ConditionInstruction::Eq(left, right),
-                Rule::neq => ConditionInstruction::Ne(left, right),
-                Rule::lt => ConditionInstruction::Lt(left, right),
-                Rule::leq => ConditionInstruction::Leq(left, right),
-                Rule::gt => ConditionInstruction::Gt(left, right),
-                Rule::geq => ConditionInstruction::Geq(left, right),
-                _ => unreachable!(),
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-
-/// parses a statement appending instructions to the `statements` vector
-/// and source locations to the `source_locations` vector
-/// # Returns
-/// the number of statement instructions in created from `stmt`
-fn parse_stmt(
-    stmt: Pair<Rule>,
-    in_function: bool,
-    in_loop: bool,
-    statements: &mut Vec<StmtInstruction>,
-    source_locations: &mut Vec<usize>,
-) -> Result<usize, Box<PestError>> {
-    let stmt = first_child(stmt);
-    let (line, _) = stmt.line_col();
-    source_locations.push(line);
-    let mut instruction_count = 1;
-    match stmt.as_rule() {
-        Rule::break_stmt => {
-            if !in_loop {
-                return Err(Box::new(pest::error::Error::new_from_span(
-                    pest::error::ErrorVariant::CustomError {
-                        message: "break outside of loop".to_string(),
-                    },
-                    stmt.as_span(),
-                )));
-            }
-            statements.push(StmtInstruction::Break);
-        }
-        Rule::quit => {
-            statements.push(StmtInstruction::Quit);
-        }
-        Rule::return_stmt => {
-            // return ( "(" expr? ")" )?
-            if !in_function {
-                return Err(Box::new(pest::error::Error::new_from_span(
-                    pest::error::ErrorVariant::CustomError {
-                        message: "return outside of function".to_string(),
-                    },
-                    stmt.as_span(),
-                )));
-            }
-            let mut inner = stmt.into_inner();
-            if let Some(expr) = inner.next() {
-                statements.push(StmtInstruction::ReturnExpr(parse_expr(expr)));
-            } else {
-                statements.push(StmtInstruction::Return);
-            }
-        }
-        Rule::if_stmt => {
-            // if (condition) stmt
-            let mut inner = stmt.into_inner();
-            let condition = parse_condition(inner.next().unwrap());
-            let mut body = Vec::new();
-            instruction_count = parse_stmt(
-                inner.next().unwrap(),
-                in_function,
-                in_loop,
-                &mut body,
-                source_locations,
-            )?;
-            statements.push(StmtInstruction::If {
-                condition,
-                instruction_count,
-                body,
-            });
-        }
-        Rule::while_stmt => {
-            // while (condition) stmt
-            let mut inner = stmt.into_inner();
-            let condition = parse_condition(inner.next().unwrap());
-            let mut body = Vec::new();
-            instruction_count = parse_stmt(
-                inner.next().unwrap(),
-                in_function,
-                true,
-                &mut body,
-                source_locations,
-            )?;
-            statements.push(StmtInstruction::While {
-                condition,
-                instruction_count,
-                body,
-            });
-        }
-        Rule::for_stmt => {
-            // for (init; condition; update) stmt
-            let mut inner = stmt.into_inner();
-            let init = parse_expr(inner.next().unwrap());
-            let condition = parse_condition(inner.next().unwrap());
-            let update = parse_expr(inner.next().unwrap());
-            let mut body = Vec::new();
-            instruction_count = parse_stmt(
-                inner.next().unwrap(),
-                in_function,
-                true,
-                &mut body,
-                source_locations,
-            )?;
-            statements.push(StmtInstruction::For {
-                init,
-                condition,
-                update,
-                instruction_count,
-                body,
-            });
-        }
-
-        Rule::braced_statement_list => {
-            // if the list has no statements instruction_count is 0
-            instruction_count = 0;
-            // remove the source location of the braced list as it
-            // doesn't directly map to a `StmtInstruction`
-            source_locations.pop();
-            for stmt in first_child(stmt).into_inner() {
-                instruction_count +=
-                    parse_stmt(stmt, in_function, in_loop, statements, source_locations)?;
-            }
-        }
-        Rule::string => {
-            statements.push(StmtInstruction::String(to_bc_str(stmt.as_str())));
-        }
-        Rule::expression => {
-            statements.push(StmtInstruction::Expr(parse_expr(stmt)));
-        }
-        _ => unreachable!(),
-    }
-    Ok(instruction_count)
-}
-
-fn parse_function(func: Pair<Rule>, file: Rc<str>) -> Result<Function, Box<PestError>> {
-    let mut function = func.into_inner();
-
-    // define letter ( parameter_list ) auto_define_list statement_list end
-
-    let name = as_letter(function.next().unwrap());
-
-    let mut parameters = Vec::new();
-    let parameter_list = function.next().unwrap();
-    let auto_define_list = if parameter_list.as_rule() == Rule::parameter_list {
-        parameters = parameter_list.into_inner().map(as_variable).collect();
-        function.next().unwrap()
-    } else {
-        parameter_list
-    };
-
-    let mut locals = Vec::new();
-    let statement_list = if auto_define_list.as_rule() == Rule::auto_define_list {
-        locals = first_child(auto_define_list)
-            .into_inner()
-            .map(as_variable)
-            .collect();
-        function.next().unwrap()
-    } else {
-        auto_define_list
-    };
-
-    let mut body = Vec::new();
-    let mut source_locations = Vec::new();
-    for stmt in statement_list.into_inner() {
-        parse_stmt(stmt, true, false, &mut body, &mut source_locations)?;
-    }
-    Ok(Function {
-        name,
-        file,
-        parameters: parameters.into(),
-        locals: locals.into(),
-        body: body.into(),
-        source_locations: source_locations.into(),
-    })
-}
-
-#[derive(pest_derive::Parser)]
-#[grammar = "bc_util/grammar.pest"]
-pub struct BcParser;
-
-pub type PestError = pest::error::Error<Rule>;
-
-fn location_end(loc: &InputLocation) -> usize {
-    match loc {
-        InputLocation::Pos(p) => *p,
-        InputLocation::Span((_, end)) => *end,
-    }
-}
-
-fn is_incomplete(text: &str, error: &PestError) -> bool {
-    let pos = location_end(&error.location);
-    // The program is incomplete if either:
-    // - we expect something after the end of the input
-    // - the error occurs at the start of an incomplete comment
-    // - the error occurs at the start of an incomplete string
-    pos == text.len()
-        || text.as_bytes()[pos..text.len().min(pos + 2)] == *b"/*"
-        || text.as_bytes()[pos] == b'"'
-}
-
-fn improve_pest_error(err: PestError, text: &str, file_path: Option<&str>) -> PestError {
-    let err = if let Some(path) = file_path {
-        err.with_path(path)
-    } else {
-        err
-    };
-
-    // special case: if the error is at the end of the input and the last character
-    // is not a newline, we can provide a more helpful error message.
-    let err_loc = location_end(&err.location);
-    if err_loc == text.len() && text.as_bytes()[err_loc - 1] != b'\n' {
-        return PestError::new_from_pos(
-            pest::error::ErrorVariant::CustomError {
-                message: "missing newline".to_string(),
-            },
-            Position::new(text, err_loc).unwrap(),
-        );
-    }
-
-    err.renamed_rules(|rule| {
-        match *rule {
-            Rule::add => "'+'",
-            Rule::sub => "'-'",
-            Rule::mul => "'*'",
-            Rule::div => "'/'",
-            Rule::modulus => "'%'",
-            Rule::pow => "'^'",
-            Rule::neg => "'-'",
-            Rule::assign => "'='",
-            Rule::add_assign => "'+='",
-            Rule::sub_assign => "'-='",
-            Rule::mul_assign => "'*='",
-            Rule::div_assign => "'/='",
-            Rule::mod_assign => "'%='",
-            Rule::pow_assign => "'^='",
-            Rule::same => "'=='",
-            Rule::neq => "'!='",
-            Rule::lt => "'<'",
-            Rule::leq => "'<='",
-            Rule::gt => "'>'",
-            Rule::geq => "'>='",
-            Rule::primary => "expression",
-            Rule::auto_define_list => "auto definitions",
-            _ => return format!("{:?}", rule),
-        }
-        .to_string()
-    })
+#[derive(Debug)]
+struct Diagnostic {
+    message: String,
+    line: usize,
+    col: usize,
 }
 
 #[derive(Debug)]
 pub struct ParseError {
-    errors: Vec<PestError>,
-    /// is `true` if the parsed program contains an incomplete expression,
-    /// statement, comment or string.
-    /// # Examples
-    /// ```
-    /// assert!(parse_program("1 + 2 *\\\n", None).unwrap_err().is_incomplete)
-    /// assert!(parse_program("define f() {\n", None).unwrap_err().is_incomplete)
-    /// assert!(parse_program("if (c) {\n", None).unwrap_err().is_incomplete)
-    /// assert!(parse_program("while (c) {\n", None).unwrap_err().is_incomplete)
-    /// ```
+    errors: Vec<Diagnostic>,
+    file: Option<String>,
+    /// `true` when more input could complete the program: an unterminated
+    /// string, comment, brace or expression. The REPL keeps reading instead of
+    /// reporting an error.
     pub is_incomplete: bool,
+}
+
+impl ParseError {
+    /// The diagnostics, as (line, column, message), for a caller that reports
+    /// them itself.
+    pub fn diagnostics(&self) -> impl Iterator<Item = (u32, u16, &str)> {
+        self.errors.iter().map(|e| {
+            // plib::diag::Position carries a u32 line and a u16 column, so a
+            // position past either has to be clamped rather than wrapped: a
+            // line of more than 65535 characters would otherwise report a
+            // column that never existed.
+            let line = u32::try_from(e.line).unwrap_or(u32::MAX);
+            let col = u16::try_from(e.col).unwrap_or(u16::MAX);
+            (line, col, e.message.as_str())
+        })
+    }
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for err in &self.errors {
-            writeln!(f, "{}\n", err)?;
+        for e in &self.errors {
+            match &self.file {
+                Some(path) => writeln!(f, "{}:{}:{}: {}", path, e.line, e.col, e.message)?,
+                None => writeln!(f, "{}:{}: {}", e.line, e.col, e.message)?,
+            }
         }
         Ok(())
     }
 }
 
-fn next_checkpoint(text: &str) -> usize {
-    let mut index = 0;
-    while index < text.len() {
-        match text.as_bytes()[index] {
-            b'\n' | b';' | b'}' | b')' => return index + 1,
-            _ => index += 1,
-        }
-    }
-    index
+/// The left side of an assignment or an increment: a variable, an array
+/// element, or one of the three registers.
+enum Target {
+    Named(NamedExpr),
+    Register(Register),
 }
 
-fn gather_errors(text: &str, file_path: Option<&str>, first_error: PestError) -> ParseError {
-    let last_location_end = location_end(&first_error.location);
-
-    // if the text is not from a file and the error is consistent
-    // with an incomplete program we can return early
-    if file_path.is_none() && is_incomplete(text, &first_error) {
-        return ParseError {
-            errors: vec![first_error],
-            is_incomplete: true,
-        };
-    }
-
-    let mut errors = vec![improve_pest_error(first_error, text, file_path)];
-    let mut byte_index = last_location_end + next_checkpoint(&text[last_location_end..]);
-
-    while byte_index < text.len() {
-        match BcParser::parse(Rule::program, &text[byte_index..]) {
-            Ok(_) => {
-                return ParseError {
-                    errors,
-                    is_incomplete: false,
-                }
-            }
-            Err(err) => {
-                byte_index += location_end(&err.location);
-                let err_correct_position =
-                    PestError::new_from_pos(err.variant, Position::new(text, byte_index).unwrap());
-                errors.push(improve_pest_error(err_correct_position, text, file_path));
-            }
-        }
-        byte_index += next_checkpoint(&text[byte_index..]);
-    }
-    ParseError {
-        errors,
-        is_incomplete: false,
-    }
-}
-
-pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, ParseError> {
-    let program = match BcParser::parse(Rule::program, text) {
-        Ok(mut program) => program.next().unwrap(),
-        Err(err) => return Err(gather_errors(text, file_path, err)),
+/// The value `x op= v` assigns: `v` for a plain `=`, otherwise `x op v`.
+fn combine_assignment(
+    op: &Token,
+    current: ExprInstruction,
+    value: ExprInstruction,
+) -> ExprInstruction {
+    let build: fn(Box<ExprInstruction>, Box<ExprInstruction>) -> ExprInstruction = match op {
+        Token::Assign => return value,
+        Token::AddAssign => ExprInstruction::Add,
+        Token::SubAssign => ExprInstruction::Sub,
+        Token::MulAssign => ExprInstruction::Mul,
+        Token::DivAssign => ExprInstruction::Div,
+        Token::ModAssign => ExprInstruction::Mod,
+        Token::PowAssign => ExprInstruction::Pow,
+        _ => unreachable!("assign_op only returns assignment operators"),
     };
-    let file = Rc::<str>::from(file_path.unwrap_or(""));
-    let mut instructions = Vec::new();
-    let mut source_locations = Vec::new();
-    let mut errors = Vec::new();
-    for item in program.into_inner() {
-        match item.as_rule() {
-            Rule::semicolon_list => {
-                // stmt*
-                for stmt in item.into_inner() {
-                    if let Err(e) =
-                        parse_stmt(stmt, false, false, &mut instructions, &mut source_locations)
-                    {
-                        errors.push(*e);
+    build(Box::new(current), Box::new(value))
+}
+
+/// Desugar `x op= v` into an assignment of `x op v` to `x`.
+fn build_assignment(target: Target, op: &Token, value: ExprInstruction) -> ExprInstruction {
+    match target {
+        Target::Named(named) => {
+            let current = ExprInstruction::Named(named.clone());
+            ExprInstruction::Assignment {
+                named,
+                value: Box::new(combine_assignment(op, current, value)),
+            }
+        }
+        Target::Register(register) => {
+            let current = ExprInstruction::GetRegister(register);
+            ExprInstruction::SetRegister {
+                register,
+                value: Box::new(combine_assignment(op, current, value)),
+            }
+        }
+    }
+}
+
+struct Parser<'a> {
+    tokens: &'a [PositionedToken],
+    pos: usize,
+    depth: usize,
+    in_function: bool,
+    in_loop: bool,
+    /// Position just past the end of the input, for errors at end of input.
+    end: (usize, usize),
+}
+
+type PResult<T> = Result<T, Box<Diagnostic>>;
+
+impl<'a> Parser<'a> {
+    fn new(tokens: &'a [PositionedToken], end: (usize, usize)) -> Self {
+        Parser {
+            tokens,
+            pos: 0,
+            depth: 0,
+            in_function: false,
+            in_loop: false,
+            end,
+        }
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.tokens.len()
+    }
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos).map(|t| &t.token)
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset).map(|t| &t.token)
+    }
+
+    fn at(&self, token: &Token) -> bool {
+        self.peek() == Some(token)
+    }
+
+    fn advance(&mut self) -> Option<&'a PositionedToken> {
+        let t = self.tokens.get(self.pos);
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    /// The position to blame for an error discovered here.
+    fn here(&self) -> (usize, usize) {
+        match self.tokens.get(self.pos) {
+            Some(t) => (t.line, t.col),
+            None => self.end,
+        }
+    }
+
+    fn line(&self) -> usize {
+        self.here().0
+    }
+
+    fn error(&self, message: impl Into<String>) -> Box<Diagnostic> {
+        let (line, col) = self.here();
+        Box::new(Diagnostic {
+            message: message.into(),
+            line,
+            col,
+        })
+    }
+
+    fn expected(&self, what: &str) -> Box<Diagnostic> {
+        match self.peek() {
+            Some(t) => self.error(format!("expected {}, found {}", what, t)),
+            None => self.error(format!("expected {} at end of input", what)),
+        }
+    }
+
+    fn expect(&mut self, token: Token, what: &str) -> PResult<()> {
+        if self.at(&token) {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.expected(what))
+        }
+    }
+
+    fn enter(&mut self) -> PResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(self.error(format!("nested more than {} levels deep", MAX_PARSE_DEPTH)));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    // ---- expressions -------------------------------------------------
+
+    fn parse_expr(&mut self) -> PResult<ExprInstruction> {
+        self.enter()?;
+        let r = self.parse_additive();
+        self.leave();
+        r
+    }
+
+    fn parse_additive(&mut self) -> PResult<ExprInstruction> {
+        let mut lhs = self.parse_multiplicative()?;
+        loop {
+            let build: fn(Box<ExprInstruction>, Box<ExprInstruction>) -> ExprInstruction =
+                match self.peek() {
+                    Some(Token::Plus) => ExprInstruction::Add,
+                    Some(Token::Minus) => ExprInstruction::Sub,
+                    _ => return Ok(lhs),
+                };
+            self.advance();
+            let rhs = self.parse_multiplicative()?;
+            lhs = build(Box::new(lhs), Box::new(rhs));
+        }
+    }
+
+    fn parse_multiplicative(&mut self) -> PResult<ExprInstruction> {
+        let mut lhs = self.parse_power()?;
+        loop {
+            let build: fn(Box<ExprInstruction>, Box<ExprInstruction>) -> ExprInstruction =
+                match self.peek() {
+                    Some(Token::Star) => ExprInstruction::Mul,
+                    Some(Token::Slash) => ExprInstruction::Div,
+                    Some(Token::Percent) => ExprInstruction::Mod,
+                    _ => return Ok(lhs),
+                };
+            self.advance();
+            let rhs = self.parse_power()?;
+            lhs = build(Box::new(lhs), Box::new(rhs));
+        }
+    }
+
+    /// `^` is right associative, and unary minus binds tighter than it
+    /// (Table 3-3), so `-2^2` is `(-2)^2`.
+    fn parse_power(&mut self) -> PResult<ExprInstruction> {
+        let lhs = self.parse_unary()?;
+        if self.at(&Token::Caret) {
+            self.advance();
+            self.enter()?;
+            let rhs = self.parse_power();
+            self.leave();
+            return Ok(ExprInstruction::Pow(Box::new(lhs), Box::new(rhs?)));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> PResult<ExprInstruction> {
+        if self.at(&Token::Minus) {
+            self.advance();
+            self.enter()?;
+            let operand = self.parse_unary();
+            self.leave();
+            return Ok(ExprInstruction::UnaryMinus(Box::new(operand?)));
+        }
+        self.parse_primary()
+    }
+
+    /// A named expression: a variable or an array element.
+    fn parse_named_expr(&mut self) -> PResult<NamedExpr> {
+        let name = match self.peek() {
+            Some(Token::Letter(c)) => *c,
+            _ => return Err(self.expected("a variable")),
+        };
+        self.advance();
+        if self.at(&Token::LBracket) {
+            self.advance();
+            let index = self.parse_expr()?;
+            self.expect(Token::RBracket, "']'")?;
+            return Ok(NamedExpr::ArrayItem {
+                name,
+                index: Box::new(index),
+            });
+        }
+        Ok(NamedExpr::VariableNumber(name))
+    }
+
+    /// The assignment target at the current position, if there is one.
+    fn parse_target(&mut self) -> PResult<Target> {
+        match self.peek() {
+            Some(Token::Letter(_)) => Ok(Target::Named(self.parse_named_expr()?)),
+            Some(Token::Scale) => {
+                self.advance();
+                Ok(Target::Register(Register::Scale))
+            }
+            Some(Token::Ibase) => {
+                self.advance();
+                Ok(Target::Register(Register::IBase))
+            }
+            Some(Token::Obase) => {
+                self.advance();
+                Ok(Target::Register(Register::OBase))
+            }
+            _ => Err(self.expected("a named expression")),
+        }
+    }
+
+    fn assign_op(&self) -> Option<Token> {
+        match self.peek() {
+            Some(
+                t @ (Token::Assign
+                | Token::AddAssign
+                | Token::SubAssign
+                | Token::MulAssign
+                | Token::DivAssign
+                | Token::ModAssign
+                | Token::PowAssign),
+            ) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    fn parse_builtin(&mut self, function: BuiltinFunction) -> PResult<ExprInstruction> {
+        self.advance(); // the builtin's name
+        self.expect(Token::LParen, "'(' after a builtin function name")?;
+        let arg = self.parse_expr()?;
+        self.expect(Token::RParen, "')'")?;
+        Ok(ExprInstruction::Builtin {
+            function,
+            arg: Box::new(arg),
+        })
+    }
+
+    /// An argument in a call: either a whole array (`a[]`) or an expression.
+    fn parse_function_argument(&mut self) -> PResult<FunctionArgument> {
+        if let (Some(Token::Letter(c)), Some(Token::LBracket), Some(Token::RBracket)) =
+            (self.peek(), self.peek_at(1), self.peek_at(2))
+        {
+            let name = *c;
+            self.advance();
+            self.advance();
+            self.advance();
+            return Ok(FunctionArgument::ArrayVariable(name));
+        }
+        Ok(FunctionArgument::Expr(self.parse_expr()?))
+    }
+
+    fn parse_call(&mut self, name: char) -> PResult<ExprInstruction> {
+        self.advance(); // the name
+        self.advance(); // '('
+        let mut args = Vec::new();
+        if !self.at(&Token::RParen) {
+            loop {
+                args.push(self.parse_function_argument()?);
+                if self.at(&Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(ExprInstruction::Call { name, args })
+    }
+
+    fn parse_primary(&mut self) -> PResult<ExprInstruction> {
+        match self.peek() {
+            Some(Token::Number(_)) => {
+                let Some(PositionedToken {
+                    token: Token::Number(n),
+                    ..
+                }) = self.advance()
+                else {
+                    unreachable!("just matched a number")
+                };
+                Ok(ExprInstruction::Number(n.clone()))
+            }
+            Some(Token::LParen) => {
+                self.advance();
+                let e = self.parse_expr()?;
+                self.expect(Token::RParen, "')'")?;
+                Ok(e)
+            }
+            Some(Token::Length) => self.parse_builtin(BuiltinFunction::Length),
+            Some(Token::Sqrt) => self.parse_builtin(BuiltinFunction::Sqrt),
+            // `scale` is both a builtin and a register; the '(' tells them apart.
+            Some(Token::Scale) if self.peek_at(1) == Some(&Token::LParen) => {
+                self.parse_builtin(BuiltinFunction::Scale)
+            }
+            Some(Token::Incr) => {
+                self.advance();
+                Ok(match self.parse_target()? {
+                    Target::Named(named) => ExprInstruction::PreIncrement(named),
+                    Target::Register(register) => ExprInstruction::IncrementRegister {
+                        register,
+                        prefix: true,
+                    },
+                })
+            }
+            Some(Token::Decr) => {
+                self.advance();
+                Ok(match self.parse_target()? {
+                    Target::Named(named) => ExprInstruction::PreDecrement(named),
+                    Target::Register(register) => ExprInstruction::DecrementRegister {
+                        register,
+                        prefix: true,
+                    },
+                })
+            }
+            Some(Token::Letter(c)) if self.peek_at(1) == Some(&Token::LParen) => {
+                let name = *c;
+                self.parse_call(name)
+            }
+            Some(Token::Letter(_))
+            | Some(Token::Scale)
+            | Some(Token::Ibase)
+            | Some(Token::Obase) => {
+                let target = self.parse_target()?;
+                if let Some(op) = self.assign_op() {
+                    self.advance();
+                    let value = self.parse_expr()?;
+                    return Ok(build_assignment(target, &op, value));
+                }
+                match target {
+                    Target::Named(named) => {
+                        if self.at(&Token::Incr) {
+                            self.advance();
+                            return Ok(ExprInstruction::PostIncrement(named));
+                        }
+                        if self.at(&Token::Decr) {
+                            self.advance();
+                            return Ok(ExprInstruction::PostDecrement(named));
+                        }
+                        Ok(ExprInstruction::Named(named))
+                    }
+                    Target::Register(register) => {
+                        if self.at(&Token::Incr) {
+                            self.advance();
+                            return Ok(ExprInstruction::IncrementRegister {
+                                register,
+                                prefix: false,
+                            });
+                        }
+                        if self.at(&Token::Decr) {
+                            self.advance();
+                            return Ok(ExprInstruction::DecrementRegister {
+                                register,
+                                prefix: false,
+                            });
+                        }
+                        Ok(ExprInstruction::GetRegister(register))
                     }
                 }
             }
-            Rule::function => match parse_function(item, file.clone()) {
-                Ok(f) => instructions.push(StmtInstruction::DefineFunction {
-                    name: f.name,
-                    function: f,
-                }),
-                Err(e) => errors.push(*e),
-            },
-            Rule::EOI => {}
-            _ => unreachable!(),
+            _ => Err(self.expected("an expression")),
         }
     }
-    if errors.is_empty() {
+
+    fn parse_condition(&mut self) -> PResult<ConditionInstruction> {
+        let left = self.parse_expr()?;
+        let build: fn(ExprInstruction, ExprInstruction) -> ConditionInstruction = match self.peek()
+        {
+            Some(Token::Eq) => ConditionInstruction::Eq,
+            Some(Token::Ne) => ConditionInstruction::Ne,
+            Some(Token::Lt) => ConditionInstruction::Lt,
+            Some(Token::Le) => ConditionInstruction::Leq,
+            Some(Token::Gt) => ConditionInstruction::Gt,
+            Some(Token::Ge) => ConditionInstruction::Geq,
+            _ => return Ok(ConditionInstruction::Expr(left)),
+        };
+        self.advance();
+        let right = self.parse_expr()?;
+        Ok(build(left, right))
+    }
+
+    fn parse_parenthesized_condition(&mut self) -> PResult<ConditionInstruction> {
+        self.expect(Token::LParen, "'('")?;
+        let condition = self.parse_condition()?;
+        self.expect(Token::RParen, "')'")?;
+        Ok(condition)
+    }
+
+    // ---- statements --------------------------------------------------
+
+    /// Parse one statement, appending its instructions to `statements` and one
+    /// source line per flattened statement to `source_locations`.
+    ///
+    /// Returns the number of flattened statements produced. A compound
+    /// statement counts itself as well as its body; a braced list counts only
+    /// its members, since it produces no instruction of its own.
+    fn parse_stmt(
+        &mut self,
+        statements: &mut Vec<StmtInstruction>,
+        source_locations: &mut Vec<usize>,
+    ) -> PResult<usize> {
+        self.enter()?;
+        let r = self.parse_stmt_inner(statements, source_locations);
+        self.leave();
+        r
+    }
+
+    fn parse_stmt_inner(
+        &mut self,
+        statements: &mut Vec<StmtInstruction>,
+        source_locations: &mut Vec<usize>,
+    ) -> PResult<usize> {
+        let line = self.line();
+        match self.peek() {
+            Some(Token::Break) => {
+                if !self.in_loop {
+                    return Err(self.error("break outside of loop"));
+                }
+                self.advance();
+                source_locations.push(line);
+                statements.push(StmtInstruction::Break);
+                Ok(1)
+            }
+            Some(Token::Quit) => {
+                self.advance();
+                source_locations.push(line);
+                statements.push(StmtInstruction::Quit);
+                Ok(1)
+            }
+            Some(Token::Return) => {
+                if !self.in_function {
+                    return Err(self.error("return outside of function"));
+                }
+                self.advance();
+                source_locations.push(line);
+                // return | return ( ) | return ( expression )
+                if self.at(&Token::LParen) {
+                    self.advance();
+                    if self.at(&Token::RParen) {
+                        self.advance();
+                        statements.push(StmtInstruction::Return);
+                    } else {
+                        let e = self.parse_expr()?;
+                        self.expect(Token::RParen, "')'")?;
+                        statements.push(StmtInstruction::ReturnExpr(e));
+                    }
+                } else {
+                    statements.push(StmtInstruction::Return);
+                }
+                Ok(1)
+            }
+            Some(Token::If) => {
+                self.advance();
+                let condition = self.parse_parenthesized_condition()?;
+                source_locations.push(line);
+                let mut body = Vec::new();
+                let instruction_count = self.parse_stmt(&mut body, source_locations)?;
+                statements.push(StmtInstruction::If {
+                    condition,
+                    instruction_count,
+                    body,
+                });
+                Ok(instruction_count + 1)
+            }
+            Some(Token::While) => {
+                self.advance();
+                let condition = self.parse_parenthesized_condition()?;
+                source_locations.push(line);
+                let was_in_loop = self.in_loop;
+                self.in_loop = true;
+                let mut body = Vec::new();
+                let result = self.parse_stmt(&mut body, source_locations);
+                self.in_loop = was_in_loop;
+                let instruction_count = result?;
+                statements.push(StmtInstruction::While {
+                    condition,
+                    instruction_count,
+                    body,
+                });
+                Ok(instruction_count + 1)
+            }
+            Some(Token::For) => {
+                self.advance();
+                self.expect(Token::LParen, "'('")?;
+                let init = self.parse_expr()?;
+                self.expect(Token::Semicolon, "';'")?;
+                let condition = self.parse_condition()?;
+                self.expect(Token::Semicolon, "';'")?;
+                let update = self.parse_expr()?;
+                self.expect(Token::RParen, "')'")?;
+                source_locations.push(line);
+                let was_in_loop = self.in_loop;
+                self.in_loop = true;
+                let mut body = Vec::new();
+                let result = self.parse_stmt(&mut body, source_locations);
+                self.in_loop = was_in_loop;
+                let instruction_count = result?;
+                statements.push(StmtInstruction::For {
+                    init,
+                    condition,
+                    update,
+                    instruction_count,
+                    body,
+                });
+                Ok(instruction_count + 1)
+            }
+            Some(Token::LBrace) => {
+                self.advance();
+                let count = self.parse_statement_list(statements, source_locations)?;
+                self.expect(Token::RBrace, "'}'")?;
+                Ok(count)
+            }
+            Some(Token::Str(_)) => {
+                let Some(PositionedToken {
+                    token: Token::Str(s),
+                    ..
+                }) = self.advance()
+                else {
+                    unreachable!("just matched a string")
+                };
+                let s = s.clone();
+                source_locations.push(line);
+                statements.push(StmtInstruction::String(s));
+                Ok(1)
+            }
+            _ => {
+                let e = self.parse_expr()?;
+                source_locations.push(line);
+                statements.push(StmtInstruction::Expr(e));
+                Ok(1)
+            }
+        }
+    }
+
+    fn at_statement_separator(&self) -> bool {
+        self.at(&Token::Semicolon) || self.at(&Token::Newline)
+    }
+
+    /// The body of a braced list or a function: statements separated by `;` or
+    /// newline. POSIX requires a separator between two statements, so `{1 2}`
+    /// is a syntax error.
+    fn parse_statement_list(
+        &mut self,
+        statements: &mut Vec<StmtInstruction>,
+        source_locations: &mut Vec<usize>,
+    ) -> PResult<usize> {
+        let mut count = 0;
+        loop {
+            while self.at_statement_separator() {
+                self.advance();
+            }
+            if self.at(&Token::RBrace) || self.at_end() {
+                return Ok(count);
+            }
+            count += self.parse_stmt(statements, source_locations)?;
+            if !self.at_statement_separator() {
+                return Ok(count);
+            }
+        }
+    }
+
+    /// One input line's worth of statements, separated by `;`.
+    fn parse_semicolon_list(
+        &mut self,
+        statements: &mut Vec<StmtInstruction>,
+        source_locations: &mut Vec<usize>,
+    ) -> PResult<()> {
+        loop {
+            while self.at(&Token::Semicolon) {
+                self.advance();
+            }
+            if self.at(&Token::Newline) || self.at_end() {
+                return Ok(());
+            }
+            self.parse_stmt(statements, source_locations)?;
+            if !self.at(&Token::Semicolon) {
+                return Ok(());
+            }
+        }
+    }
+
+    // ---- functions ---------------------------------------------------
+
+    /// `a` or `a[]` in a parameter or auto list.
+    fn parse_variable(&mut self) -> PResult<Variable> {
+        let name = match self.peek() {
+            Some(Token::Letter(c)) => *c,
+            _ => return Err(self.expected("a variable name")),
+        };
+        self.advance();
+        if self.at(&Token::LBracket) {
+            self.advance();
+            self.expect(Token::RBracket, "']' after '[' in an array parameter")?;
+            return Ok(Variable::Array(name));
+        }
+        Ok(Variable::Number(name))
+    }
+
+    fn parse_variable_list(&mut self) -> PResult<Vec<Variable>> {
+        let mut list = vec![self.parse_variable()?];
+        while self.at(&Token::Comma) {
+            self.advance();
+            list.push(self.parse_variable()?);
+        }
+        Ok(list)
+    }
+
+    fn parse_function(&mut self, file: Rc<str>) -> PResult<Function> {
+        self.advance(); // 'define'
+        let name = match self.peek() {
+            Some(Token::Letter(c)) => *c,
+            _ => return Err(self.expected("a function name")),
+        };
+        self.advance();
+        self.expect(Token::LParen, "'(' after a function name")?;
+        let parameters = if self.at(&Token::RParen) {
+            Vec::new()
+        } else {
+            self.parse_variable_list()?
+        };
+        self.expect(Token::RParen, "')'")?;
+        self.expect(Token::LBrace, "'{'")?;
+        // POSIX: `'{' NEWLINE opt_auto_define_list statement_list '}'`.
+        self.expect(Token::Newline, "a newline after '{'")?;
+
+        let mut locals = Vec::new();
+        // POSIX: `'{' NEWLINE opt_auto_define_list statement_list '}'`. The
+        // auto list must follow the newline immediately; anywhere else `auto`
+        // is a keyword in statement position, and so a syntax error rather
+        // than a run of single-letter variable references.
+        if self.at(&Token::Auto) {
+            self.advance();
+            locals = self.parse_variable_list()?;
+            if !self.at_statement_separator() {
+                return Err(self.expected("a newline or ';' after an auto list"));
+            }
+            self.advance();
+        }
+
+        let was_in_function = self.in_function;
+        let was_in_loop = self.in_loop;
+        self.in_function = true;
+        self.in_loop = false;
+        let mut body = Vec::new();
+        let mut source_locations = Vec::new();
+        let result = self.parse_statement_list(&mut body, &mut source_locations);
+        self.in_function = was_in_function;
+        self.in_loop = was_in_loop;
+        result?;
+        self.expect(Token::RBrace, "'}'")?;
+
+        Ok(Function {
+            name,
+            file,
+            parameters: parameters.into(),
+            locals: locals.into(),
+            body: body.into(),
+            source_locations: source_locations.into(),
+        })
+    }
+
+    fn parse_program(&mut self, file: Rc<str>) -> PResult<Program> {
+        let mut instructions = Vec::new();
+        let mut source_locations = Vec::new();
+        while !self.at_end() {
+            if self.at(&Token::Define) {
+                let function = self.parse_function(file.clone())?;
+                instructions.push(StmtInstruction::DefineFunction {
+                    name: function.name,
+                    function,
+                });
+                continue;
+            }
+            self.parse_semicolon_list(&mut instructions, &mut source_locations)?;
+            // POSIX: `input_item : semicolon_list NEWLINE`.
+            if self.at_end() {
+                return Err(self.error("missing newline at end of input"));
+            }
+            self.expect(Token::Newline, "a newline")?;
+        }
         Ok(Program {
             file,
             instructions,
             source_locations,
         })
-    } else {
-        Err(ParseError {
-            errors,
-            is_incomplete: false,
-        })
+    }
+}
+
+/// Parse a complete `bc` program.
+pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, ParseError> {
+    let tokens = match tokenize(text) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            return Err(ParseError {
+                errors: vec![Diagnostic {
+                    message: e.message,
+                    line: e.line,
+                    col: e.col,
+                }],
+                file: file_path.map(String::from),
+                is_incomplete: e.incomplete,
+            })
+        }
+    };
+    let file = Rc::<str>::from(file_path.unwrap_or(""));
+    let mut parser = Parser::new(&tokens, end_position(text));
+    match parser.parse_program(file) {
+        Ok(program) => Ok(program),
+        Err(e) => {
+            // Running out of tokens means the program may yet be completed by
+            // more input; an error at a token that is present is final.
+            let is_incomplete = parser.at_end();
+            Err(ParseError {
+                errors: vec![*e],
+                file: file_path.map(String::from),
+                is_incomplete,
+            })
+        }
     }
 }
 
@@ -701,269 +917,106 @@ mod test {
 
     #[test]
     fn test_parse_builtin_call() {
-        let expr = parse_expr("length(123)\n");
+        let expr = parse_expr("length(1)\n");
         assert_eq!(
             expr,
-            (ExprInstruction::Builtin {
+            ExprInstruction::Builtin {
                 function: BuiltinFunction::Length,
-                arg: Box::new(ExprInstruction::Number("123".to_string()))
-            })
+                arg: Box::new(ExprInstruction::Number("1".to_string()))
+            }
         );
-        let expr = parse_expr("sqrt(123)\n");
+        let expr = parse_expr("sqrt(1)\n");
         assert_eq!(
             expr,
-            (ExprInstruction::Builtin {
+            ExprInstruction::Builtin {
                 function: BuiltinFunction::Sqrt,
-                arg: Box::new(ExprInstruction::Number("123".to_string()))
-            })
+                arg: Box::new(ExprInstruction::Number("1".to_string()))
+            }
         );
-        let expr = parse_expr("scale(123)\n");
+        let expr = parse_expr("scale(1)\n");
         assert_eq!(
             expr,
-            (ExprInstruction::Builtin {
+            ExprInstruction::Builtin {
                 function: BuiltinFunction::Scale,
-                arg: Box::new(ExprInstruction::Number("123".to_string()))
-            })
+                arg: Box::new(ExprInstruction::Number("1".to_string()))
+            }
         );
     }
 
     #[test]
-    fn test_parse_pre_increment() {
-        let expr = parse_expr("++d\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::PreIncrement(NamedExpr::VariableNumber('d'))
-        );
-    }
-
-    #[test]
-    fn test_parse_pre_decrement() {
-        let expr = parse_expr("--g\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::PreDecrement(NamedExpr::VariableNumber('g'))
-        );
-    }
-
-    #[test]
-    fn test_parse_post_increment() {
-        let expr = parse_expr("e++\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::PostIncrement(NamedExpr::VariableNumber('e'))
-        );
-    }
-
-    #[test]
-    fn test_parse_post_decrement() {
-        let expr = parse_expr("f--\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::PostDecrement(NamedExpr::VariableNumber('f'))
-        );
-    }
-
-    #[test]
-    fn test_parse_fn_call_no_args() {
-        let expr = parse_expr("a()\n");
+    fn test_parse_function_call() {
+        let expr = parse_expr("f()\n");
         assert_eq!(
             expr,
             ExprInstruction::Call {
-                name: 'a',
+                name: 'f',
                 args: vec![]
             }
         );
-    }
-
-    #[test]
-    fn test_parse_fn_one_arg() {
-        let expr = parse_expr("a(1)\n");
+        let expr = parse_expr("f(1)\n");
         assert_eq!(
             expr,
             ExprInstruction::Call {
-                name: 'a',
+                name: 'f',
                 args: vec![FunctionArgument::Expr(ExprInstruction::Number(
                     "1".to_string()
-                )),]
+                ))]
             }
         );
-    }
-
-    #[test]
-    fn test_parse_fn_multiple_args() {
-        let expr = parse_expr("a(1, a, b[])\n");
+        let expr = parse_expr("f(1, 2)\n");
         assert_eq!(
             expr,
             ExprInstruction::Call {
-                name: 'a',
+                name: 'f',
                 args: vec![
                     FunctionArgument::Expr(ExprInstruction::Number("1".to_string())),
-                    FunctionArgument::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                    FunctionArgument::ArrayVariable('b')
+                    FunctionArgument::Expr(ExprInstruction::Number("2".to_string()))
                 ]
             }
         );
-    }
-
-    #[test]
-    fn test_parse_register_assignment() {
-        let expr = parse_expr("scale = 10\n");
+        let expr = parse_expr("f(a[])\n");
         assert_eq!(
             expr,
-            ExprInstruction::SetRegister {
-                register: Register::Scale,
-                value: Box::new(ExprInstruction::Number("10".to_string()))
-            }
-        );
-        let expr = parse_expr("ibase = 16\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::SetRegister {
-                register: Register::IBase,
-                value: Box::new(ExprInstruction::Number("16".to_string()))
-            }
-        );
-        let expr = parse_expr("obase = 2\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::SetRegister {
-                register: Register::OBase,
-                value: Box::new(ExprInstruction::Number("2".to_string()))
+            ExprInstruction::Call {
+                name: 'f',
+                args: vec![FunctionArgument::ArrayVariable('a')]
             }
         );
     }
 
     #[test]
-    fn test_parse_register_compound_assignment() {
-        let expr = parse_expr("scale += 10\n");
+    fn test_parse_prefix_increment() {
+        let expr = parse_expr("++a\n");
         assert_eq!(
             expr,
-            ExprInstruction::SetRegister {
-                register: Register::Scale,
-                value: Box::new(ExprInstruction::Add(
-                    Box::new(ExprInstruction::GetRegister(Register::Scale)),
-                    Box::new(ExprInstruction::Number("10".to_string()))
-                ))
-            }
-        );
-        let expr = parse_expr("ibase -= 16\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::SetRegister {
-                register: Register::IBase,
-                value: Box::new(ExprInstruction::Sub(
-                    Box::new(ExprInstruction::GetRegister(Register::IBase)),
-                    Box::new(ExprInstruction::Number("16".to_string()))
-                ))
-            }
-        );
-        let expr = parse_expr("obase *= 2\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::SetRegister {
-                register: Register::OBase,
-                value: Box::new(ExprInstruction::Mul(
-                    Box::new(ExprInstruction::GetRegister(Register::OBase)),
-                    Box::new(ExprInstruction::Number("2".to_string()))
-                ))
-            }
+            ExprInstruction::PreIncrement(NamedExpr::VariableNumber('a'))
         );
     }
 
     #[test]
-    fn test_parse_simple_variable_assignment() {
-        let expr = parse_expr("a = 1\n");
+    fn test_parse_prefix_decrement() {
+        let expr = parse_expr("--a\n");
         assert_eq!(
             expr,
-            (ExprInstruction::Assignment {
-                named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Number("1".to_string()))
-            })
+            ExprInstruction::PreDecrement(NamedExpr::VariableNumber('a'))
         );
     }
 
     #[test]
-    fn test_parse_assign_to_array_element() {
-        let expr = parse_expr("a[20] = 1\n");
+    fn test_parse_postfix_increment() {
+        let expr = parse_expr("a++\n");
         assert_eq!(
             expr,
-            (ExprInstruction::Assignment {
-                named: NamedExpr::ArrayItem {
-                    name: 'a',
-                    index: Box::new(ExprInstruction::Number("20".to_string())),
-                },
-                value: Box::new(ExprInstruction::Number("1".to_string()))
-            })
+            ExprInstruction::PostIncrement(NamedExpr::VariableNumber('a'))
         );
     }
 
     #[test]
-    fn test_parse_compound_variable_assignment() {
-        let expr = parse_expr("a += 1\n");
+    fn test_parse_postfix_decrement() {
+        let expr = parse_expr("a--\n");
         assert_eq!(
             expr,
-            (ExprInstruction::Assignment {
-                named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Add(
-                    Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                    Box::new(ExprInstruction::Number("1".to_string()))
-                ))
-            })
-        );
-        let expr = parse_expr("a -= 1\n");
-        assert_eq!(
-            expr,
-            (ExprInstruction::Assignment {
-                named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Sub(
-                    Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                    Box::new(ExprInstruction::Number("1".to_string()))
-                ))
-            })
-        );
-        let expr = parse_expr("a *= 1\n");
-        assert_eq!(
-            expr,
-            (ExprInstruction::Assignment {
-                named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Mul(
-                    Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                    Box::new(ExprInstruction::Number("1".to_string()))
-                ))
-            })
-        );
-        let expr = parse_expr("a /= 1\n");
-        assert_eq!(
-            expr,
-            (ExprInstruction::Assignment {
-                named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Div(
-                    Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                    Box::new(ExprInstruction::Number("1".to_string()))
-                ))
-            })
-        );
-        let expr = parse_expr("a %= 1\n");
-        assert_eq!(
-            expr,
-            (ExprInstruction::Assignment {
-                named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Mod(
-                    Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                    Box::new(ExprInstruction::Number("1".to_string()))
-                ))
-            })
-        );
-        let expr = parse_expr("a ^= 1\n");
-        assert_eq!(
-            expr,
-            (ExprInstruction::Assignment {
-                named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Pow(
-                    Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                    Box::new(ExprInstruction::Number("1".to_string()))
-                ))
-            })
+            ExprInstruction::PostDecrement(NamedExpr::VariableNumber('a'))
         );
     }
 
@@ -977,22 +1030,54 @@ mod test {
     }
 
     #[test]
-    fn test_parse_binary_op() {
+    fn test_parse_binary_operators() {
         let expr = parse_expr("1 + 2\n");
         assert_eq!(
             expr,
-            (ExprInstruction::Add(
+            ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("2".to_string()))
-            ))
+            )
+        );
+        let expr = parse_expr("1 - 2\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Sub(
+                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::Number("2".to_string()))
+            )
+        );
+        let expr = parse_expr("1 * 2\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Mul(
+                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::Number("2".to_string()))
+            )
+        );
+        let expr = parse_expr("1 / 2\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Div(
+                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::Number("2".to_string()))
+            )
+        );
+        let expr = parse_expr("1 % 2\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Mod(
+                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::Number("2".to_string()))
+            )
         );
         let expr = parse_expr("1 ^ 2\n");
         assert_eq!(
             expr,
-            (ExprInstruction::Pow(
+            ExprInstruction::Pow(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("2".to_string()))
-            ))
+            )
         );
     }
 
@@ -1009,28 +1094,8 @@ mod test {
                 ))
             )
         );
-        let expr = parse_expr("1 * 2 + 3\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::Add(
-                Box::new(ExprInstruction::Mul(
-                    Box::new(ExprInstruction::Number("1".to_string())),
-                    Box::new(ExprInstruction::Number("2".to_string()))
-                )),
-                Box::new(ExprInstruction::Number("3".to_string()))
-            )
-        );
-        let expr = parse_expr("1 * 2 ^ 3\n");
-        assert_eq!(
-            expr,
-            ExprInstruction::Mul(
-                Box::new(ExprInstruction::Number("1".to_string())),
-                Box::new(ExprInstruction::Pow(
-                    Box::new(ExprInstruction::Number("2".to_string())),
-                    Box::new(ExprInstruction::Number("3".to_string()))
-                ))
-            )
-        );
+        // Unary minus binds tighter than '^' (POSIX Table 3-3), so this is
+        // (-1)^2, not -(1^2).
         let expr = parse_expr("-1 ^ 2\n");
         assert_eq!(
             expr,
@@ -1045,26 +1110,103 @@ mod test {
 
     #[test]
     fn test_pow_is_right_associative() {
-        let expr = parse_expr("1 ^ 2 ^ 3\n");
+        let expr = parse_expr("2 ^ 3 ^ 2\n");
         assert_eq!(
             expr,
             ExprInstruction::Pow(
-                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::Number("2".to_string())),
                 Box::new(ExprInstruction::Pow(
-                    Box::new(ExprInstruction::Number("2".to_string())),
-                    Box::new(ExprInstruction::Number("3".to_string()))
+                    Box::new(ExprInstruction::Number("3".to_string())),
+                    Box::new(ExprInstruction::Number("2".to_string()))
                 ))
             )
         );
     }
 
     #[test]
-    fn test_parse_break() {
-        let stmt = parse_stmt("while(0) break\n");
+    fn test_parse_assignment() {
+        let expr = parse_expr("a = 1\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Assignment {
+                named: NamedExpr::VariableNumber('a'),
+                value: Box::new(ExprInstruction::Number("1".to_string()))
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_compound_assignment() {
+        let expr = parse_expr("a += 1\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Assignment {
+                named: NamedExpr::VariableNumber('a'),
+                value: Box::new(ExprInstruction::Add(
+                    Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                    Box::new(ExprInstruction::Number("1".to_string()))
+                ))
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_register_assignment() {
+        let expr = parse_expr("scale = 1\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::SetRegister {
+                register: Register::Scale,
+                value: Box::new(ExprInstruction::Number("1".to_string()))
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_compound_register_assignment() {
+        let expr = parse_expr("scale += 1\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::SetRegister {
+                register: Register::Scale,
+                value: Box::new(ExprInstruction::Add(
+                    Box::new(ExprInstruction::GetRegister(Register::Scale)),
+                    Box::new(ExprInstruction::Number("1".to_string()))
+                ))
+            }
+        );
+    }
+
+    #[test]
+    fn test_assignment_is_right_associative() {
+        let expr = parse_expr("a = b = 3\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Assignment {
+                named: NamedExpr::VariableNumber('a'),
+                value: Box::new(ExprInstruction::Assignment {
+                    named: NamedExpr::VariableNumber('b'),
+                    value: Box::new(ExprInstruction::Number("3".to_string()))
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_string_statement() {
+        let stmt = parse_stmt("\"hello\"\n");
+        assert_eq!(stmt, StmtInstruction::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_parse_break_and_quit() {
+        let stmt = parse_stmt("quit\n");
+        assert_eq!(stmt, StmtInstruction::Quit);
+        let stmt = parse_stmt("while (1) break\n");
         assert_eq!(
             stmt,
             StmtInstruction::While {
-                condition: ConditionInstruction::Expr(ExprInstruction::Number("0".to_string())),
+                condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
                 instruction_count: 1,
                 body: vec![StmtInstruction::Break]
             }
@@ -1072,171 +1214,95 @@ mod test {
     }
 
     #[test]
-    fn test_parse_quit() {
-        let stmt = parse_stmt("quit\n");
-        assert_eq!(stmt, StmtInstruction::Quit);
-    }
-
-    #[test]
-    fn test_parse_empty_return() {
-        let stmt = parse_stmt("define f() {\nreturn\n}\n");
-        assert_eq!(
-            stmt,
-            StmtInstruction::DefineFunction {
-                name: 'f',
-                function: Function {
-                    name: 'f',
-                    body: [StmtInstruction::Return].into(),
-                    source_locations: [2].into(),
-                    ..Default::default()
-                }
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_return_expr() {
-        let stmt = parse_stmt("define f() {\nreturn(1)\n}\n");
-        assert_eq!(
-            stmt,
-            StmtInstruction::DefineFunction {
-                name: 'f',
-                function: Function {
-                    name: 'f',
-                    source_locations: [2].into(),
-                    body: [StmtInstruction::ReturnExpr(ExprInstruction::Number(
-                        "1".to_string()
-                    ))]
-                    .into(),
-                    ..Default::default()
-                }
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_empty_if() {
-        let stmt = parse_stmt("if (x <= z) {}\n");
-        assert_eq!(
-            stmt,
-            StmtInstruction::If {
-                condition: ConditionInstruction::Leq(
-                    ExprInstruction::Named(NamedExpr::VariableNumber('x')),
-                    ExprInstruction::Named(NamedExpr::VariableNumber('z'))
-                ),
-                instruction_count: 0,
-                body: vec![]
-            }
-        );
-    }
-
-    #[test]
     fn test_parse_if() {
-        let stmt = parse_stmt("if (x <= z) {\n a = 2 \n b = 3\n c = 3 \n}\n");
+        let stmt = parse_stmt("if (1 < 2) 3\n");
         assert_eq!(
             stmt,
             StmtInstruction::If {
-                condition: ConditionInstruction::Leq(
-                    ExprInstruction::Named(NamedExpr::VariableNumber('x')),
-                    ExprInstruction::Named(NamedExpr::VariableNumber('z'))
+                condition: ConditionInstruction::Lt(
+                    ExprInstruction::Number("1".to_string()),
+                    ExprInstruction::Number("2".to_string())
                 ),
-                instruction_count: 3,
-                body: vec![
-                    StmtInstruction::Expr(ExprInstruction::Assignment {
-                        named: NamedExpr::VariableNumber('a'),
-                        value: Box::new(ExprInstruction::Number("2".to_string()))
-                    }),
-                    StmtInstruction::Expr(ExprInstruction::Assignment {
-                        named: NamedExpr::VariableNumber('b'),
-                        value: Box::new(ExprInstruction::Number("3".to_string()))
-                    }),
-                    StmtInstruction::Expr(ExprInstruction::Assignment {
-                        named: NamedExpr::VariableNumber('c'),
-                        value: Box::new(ExprInstruction::Number("3".to_string()))
-                    })
-                ]
+                instruction_count: 1,
+                body: vec![StmtInstruction::Expr(ExprInstruction::Number(
+                    "3".to_string()
+                ))]
             }
         );
     }
 
     #[test]
-    fn test_parse_empty_while() {
-        let stmt = parse_stmt("while (x + 2 != 2 + y) {}\n");
-        assert_eq!(
-            stmt,
-            StmtInstruction::While {
-                condition: ConditionInstruction::Ne(
-                    ExprInstruction::Add(
-                        Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('x'))),
-                        Box::new(ExprInstruction::Number("2".to_string()))
-                    ),
-                    ExprInstruction::Add(
-                        Box::new(ExprInstruction::Number("2".to_string())),
-                        Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('y')))
-                    )
+    fn test_parse_all_relational_operators() {
+        for (text, expected) in [
+            (
+                "if (1 == 2) 3\n",
+                ConditionInstruction::Eq(
+                    ExprInstruction::Number("1".to_string()),
+                    ExprInstruction::Number("2".to_string()),
                 ),
-                instruction_count: 0,
-                body: vec![]
+            ),
+            (
+                "if (1 != 2) 3\n",
+                ConditionInstruction::Ne(
+                    ExprInstruction::Number("1".to_string()),
+                    ExprInstruction::Number("2".to_string()),
+                ),
+            ),
+            (
+                "if (1 < 2) 3\n",
+                ConditionInstruction::Lt(
+                    ExprInstruction::Number("1".to_string()),
+                    ExprInstruction::Number("2".to_string()),
+                ),
+            ),
+            (
+                "if (1 <= 2) 3\n",
+                ConditionInstruction::Leq(
+                    ExprInstruction::Number("1".to_string()),
+                    ExprInstruction::Number("2".to_string()),
+                ),
+            ),
+            (
+                "if (1 > 2) 3\n",
+                ConditionInstruction::Gt(
+                    ExprInstruction::Number("1".to_string()),
+                    ExprInstruction::Number("2".to_string()),
+                ),
+            ),
+            (
+                "if (1 >= 2) 3\n",
+                ConditionInstruction::Geq(
+                    ExprInstruction::Number("1".to_string()),
+                    ExprInstruction::Number("2".to_string()),
+                ),
+            ),
+        ] {
+            let stmt = parse_stmt(text);
+            match stmt {
+                StmtInstruction::If { condition, .. } => assert_eq!(condition, expected),
+                _ => panic!("expected an if statement"),
             }
-        );
+        }
     }
 
     #[test]
     fn test_parse_while() {
-        let stmt = parse_stmt("while (x <= z) {\n 1 + 2\n x += y / 2\n u \n}\n");
+        let stmt = parse_stmt("while (1) 2\n");
         assert_eq!(
             stmt,
             StmtInstruction::While {
-                condition: ConditionInstruction::Leq(
-                    ExprInstruction::Named(NamedExpr::VariableNumber('x')),
-                    ExprInstruction::Named(NamedExpr::VariableNumber('z'))
-                ),
-                instruction_count: 3,
-                body: vec![
-                    StmtInstruction::Expr(ExprInstruction::Add(
-                        Box::new(ExprInstruction::Number("1".to_string())),
-                        Box::new(ExprInstruction::Number("2".to_string()))
-                    )),
-                    StmtInstruction::Expr(ExprInstruction::Assignment {
-                        named: NamedExpr::VariableNumber('x'),
-                        value: Box::new(ExprInstruction::Add(
-                            Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('x'))),
-                            Box::new(ExprInstruction::Div(
-                                Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('y'))),
-                                Box::new(ExprInstruction::Number("2".to_string()))
-                            ))
-                        ))
-                    }),
-                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('u')))
-                ]
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_empty_for() {
-        let stmt = parse_stmt("for (i = 0; i < 10; i++) {}\n");
-        assert_eq!(
-            stmt,
-            StmtInstruction::For {
-                init: ExprInstruction::Assignment {
-                    named: NamedExpr::VariableNumber('i'),
-                    value: Box::new(ExprInstruction::Number("0".to_string()))
-                },
-                condition: ConditionInstruction::Lt(
-                    ExprInstruction::Named(NamedExpr::VariableNumber('i')),
-                    ExprInstruction::Number("10".to_string())
-                ),
-                update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('i')),
-                instruction_count: 0,
-                body: vec![]
+                condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                instruction_count: 1,
+                body: vec![StmtInstruction::Expr(ExprInstruction::Number(
+                    "2".to_string()
+                ))]
             }
         );
     }
 
     #[test]
     fn test_parse_for() {
-        let stmt = parse_stmt("for (i = 0; i < 10; i++) a = 2\n");
+        let stmt = parse_stmt("for (i = 0; i < 5; i++) 2\n");
         assert_eq!(
             stmt,
             StmtInstruction::For {
@@ -1246,287 +1312,76 @@ mod test {
                 },
                 condition: ConditionInstruction::Lt(
                     ExprInstruction::Named(NamedExpr::VariableNumber('i')),
-                    ExprInstruction::Number("10".to_string())
+                    ExprInstruction::Number("5".to_string())
                 ),
                 update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('i')),
                 instruction_count: 1,
-                body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::VariableNumber('a'),
-                    value: Box::new(ExprInstruction::Number("2".to_string()))
-                })]
+                body: vec![StmtInstruction::Expr(ExprInstruction::Number(
+                    "2".to_string()
+                ))]
             }
         );
-    }
-
-    #[test]
-    fn test_parse_empty_braced_statement_list() {
-        let program =
-            parse_program("{ }\n", None).expect("error parsing empty braced statement list");
-        assert_eq!(program.instructions.len(), 0);
-        let program =
-            parse_program("{\n}\n", None).expect("error parsing empty braced statement list");
-        assert_eq!(program.instructions.len(), 0);
-        let program =
-            parse_program("{\n\n}\n", None).expect("error parsing empty braced statement list");
-        assert_eq!(program.instructions.len(), 0);
-        let program =
-            parse_program("{;\n;;}\n", None).expect("error parsing empty braced statement list");
-        assert_eq!(program.instructions.len(), 0);
     }
 
     #[test]
     fn test_parse_braced_statement_list() {
-        let program = parse_program("{ 1 + 2; 3 + 4; \"string\" }\n", None)
-            .expect("error parsing braced statement list");
-        assert_eq!(program.instructions.len(), 3);
+        let program = parse_program("{1; 2}\n", None).expect("error parsing program");
         assert_eq!(
-            program.instructions[0],
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("1".to_string())),
-                Box::new(ExprInstruction::Number("2".to_string()))
-            ))
-        );
-        assert_eq!(
-            program.instructions[1],
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("3".to_string())),
-                Box::new(ExprInstruction::Number("4".to_string()))
-            ))
-        );
-        assert_eq!(
-            program.instructions[2],
-            StmtInstruction::String("string".to_string())
+            program.instructions,
+            vec![
+                StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                StmtInstruction::Expr(ExprInstruction::Number("2".to_string()))
+            ]
         );
     }
 
     #[test]
-    fn test_parse_string() {
-        let stmt = parse_stmt("\"hello\"\n");
-        assert_eq!(stmt, StmtInstruction::String("hello".to_string()));
+    fn test_parse_empty_function() {
+        let f = parse_function("define f() {\n}\n");
+        assert_eq!(f.name, 'f');
+        assert!(f.parameters.is_empty());
+        assert!(f.locals.is_empty());
+        assert!(f.body.is_empty());
     }
 
     #[test]
-    fn test_parse_multiline_string() {
-        let stmt = parse_stmt("\"hello\nworld\"\n");
-        assert_eq!(stmt, StmtInstruction::String("hello\nworld".to_string()));
-    }
-
-    #[test]
-    fn test_parse_expression() {
-        let stmt = parse_stmt("1 + 2\n");
+    fn test_parse_function_with_parameters() {
+        let f = parse_function("define f(a, b[]) {\n}\n");
         assert_eq!(
-            stmt,
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("1".to_string())),
-                Box::new(ExprInstruction::Number("2".to_string()))
-            ))
-        );
-    }
-
-    #[test]
-    fn test_parse_multiple_statements_on_single_line() {
-        let program = parse_program("1 + 2; 3 + 4; \"string\"\n", None)
-            .expect("error parsing multiple statements");
-        assert_eq!(program.instructions.len(), 3);
-        assert_eq!(
-            program.instructions[0],
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("1".to_string())),
-                Box::new(ExprInstruction::Number("2".to_string()))
-            ))
-        );
-        assert_eq!(
-            program.instructions[1],
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("3".to_string())),
-                Box::new(ExprInstruction::Number("4".to_string()))
-            ))
-        );
-        assert_eq!(
-            program.instructions[2],
-            StmtInstruction::String("string".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_semicolon_list() {
-        let program = parse_program(";; ; 1 + 3 ; ;; \"string\"\n", None)
-            .expect("error parsing semicolon list");
-        assert_eq!(program.instructions.len(), 2);
-        assert_eq!(
-            program.instructions[0],
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("1".to_string())),
-                Box::new(ExprInstruction::Number("3".to_string()))
-            ))
-        );
-        assert_eq!(
-            program.instructions[1],
-            StmtInstruction::String("string".to_string())
-        );
-        let program = parse_program("a + 2;;;;;;\n", None).expect("error parsing semicolon list");
-        assert_eq!(program.instructions.len(), 1);
-        assert_eq!(
-            program.instructions[0],
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                Box::new(ExprInstruction::Number("2".to_string()))
-            ))
-        );
-    }
-
-    #[test]
-    fn test_parse_function_empty_no_parameters() {
-        let func = parse_function("define f() {\n }\n");
-        assert_eq!(
-            func,
-            Function {
-                name: 'f',
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_function_empty_with_parameters() {
-        let func = parse_function("define f(a[], b, c, d[]) {\n }\n");
-        assert_eq!(
-            func,
-            Function {
-                name: 'f',
-                parameters: [
-                    Variable::Array('a'),
-                    Variable::Number('b'),
-                    Variable::Number('c'),
-                    Variable::Array('d')
-                ]
-                .into(),
-                ..Default::default()
-            }
+            f.parameters.as_ref(),
+            [Variable::Number('a'), Variable::Array('b')]
         );
     }
 
     #[test]
     fn test_parse_function_with_locals() {
-        let func = parse_function("define f() {\n auto a[], b, c, d[]\n}\n");
+        let f = parse_function("define f() {\nauto a, b[]\n}\n");
         assert_eq!(
-            func,
-            Function {
-                name: 'f',
-                locals: [
-                    Variable::Array('a'),
-                    Variable::Number('b'),
-                    Variable::Number('c'),
-                    Variable::Array('d')
-                ]
-                .into(),
-                ..Default::default()
-            }
+            f.locals.as_ref(),
+            [Variable::Number('a'), Variable::Array('b')]
         );
+        let f = parse_function("define f() {\nauto a;\n}\n");
+        assert_eq!(f.locals.as_ref(), [Variable::Number('a')]);
     }
 
     #[test]
-    fn test_parse_function_with_statements() {
-        let func = parse_function("define f() {\n 1 + 2\n}\n");
+    fn test_parse_function_body() {
+        let f = parse_function("define f(a) {\nreturn(a)\n}\n");
         assert_eq!(
-            func,
-            Function {
-                name: 'f',
-                source_locations: [2].into(),
-                body: [StmtInstruction::Expr(ExprInstruction::Add(
-                    Box::new(ExprInstruction::Number("1".to_string())),
-                    Box::new(ExprInstruction::Number("2".to_string()))
-                ))]
-                .into(),
-                ..Default::default()
-            }
+            f.body.as_ref(),
+            [StmtInstruction::ReturnExpr(ExprInstruction::Named(
+                NamedExpr::VariableNumber('a')
+            ))]
         );
+        let f = parse_function("define f() {\nreturn\n}\n");
+        assert_eq!(f.body.as_ref(), [StmtInstruction::Return]);
+        let f = parse_function("define f() {\nreturn()\n}\n");
+        assert_eq!(f.body.as_ref(), [StmtInstruction::Return]);
     }
 
     #[test]
     fn test_ignore_comments() {
-        let program = parse_program(
-            "/*line comment*/\n1 + 2; \n/*multiline\ncomment*/\n3 + 4\n",
-            None,
-        )
-        .expect("error parsing multiple statements with comments");
-        assert_eq!(program.instructions.len(), 2);
-        assert_eq!(
-            program.instructions[0],
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("1".to_string())),
-                Box::new(ExprInstruction::Number("2".to_string()))
-            ))
-        );
-        assert_eq!(
-            program.instructions[1],
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("3".to_string())),
-                Box::new(ExprInstruction::Number("4".to_string()))
-            ))
-        );
-    }
-
-    #[test]
-    fn test_ignore_backslash_newline() {
-        let stmt = parse_stmt("1 + \\\n2\n");
-        assert_eq!(
-            stmt,
-            StmtInstruction::Expr(ExprInstruction::Add(
-                Box::new(ExprInstruction::Number("1".to_string())),
-                Box::new(ExprInstruction::Number("2".to_string()))
-            ))
-        );
-    }
-
-    #[test]
-    fn test_break_outside_of_loop_is_an_error() {
-        let result = parse_program("break\n", None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_return_outside_of_function_is_an_error() {
-        let result = parse_program("return\n", None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_partial_comment_is_incomplete() {
-        assert!(program_err("/* this is the start of a comment\n").is_incomplete);
-        assert!(program_err("a + /* this is the start of a comment\n").is_incomplete);
-        assert!(program_err("1 + 2;/* this is the start of a comment\n").is_incomplete);
-    }
-
-    #[test]
-    fn test_partial_string_is_incomplete() {
-        assert!(program_err("\"this is the start of a string\n").is_incomplete);
-        assert!(program_err("1 + 2;\"this is the start of a string\n").is_incomplete);
-    }
-
-    #[test]
-    fn test_partial_function_requires_is_incomplete() {
-        assert!(program_err("define f() {\n").is_incomplete);
-        assert!(program_err("define f() {\n auto a[], b, c, d[]\n").is_incomplete);
-        assert!(program_err("define f() {\n 1 + 2\n").is_incomplete);
-        assert!(program_err("define f() {\n auto a, b, c[];\n1 + 2;\n").is_incomplete);
-    }
-
-    #[test]
-    fn test_unclosed_braced_statement_list_is_incomplete() {
-        assert!(program_err("{\n").is_incomplete);
-        assert!(program_err("{ 1 + 2; 3 + 4; \"string\"\n").is_incomplete);
-    }
-
-    #[test]
-    fn test_statements_ending_with_a_backslash_newline_are_incomplete() {
-        assert!(program_err("1 + 2 + \\\n").is_incomplete);
-        assert!(program_err("1 + 2\\\n\\\n").is_incomplete);
-    }
-
-    #[test]
-    fn test_parse_parenthesized_expression() {
-        let expr = parse_expr("(1 + 2)\n");
+        let expr = parse_expr("1 /* comment */ + 2\n");
         assert_eq!(
             expr,
             ExprInstruction::Add(
@@ -1534,6 +1389,167 @@ mod test {
                 Box::new(ExprInstruction::Number("2".to_string()))
             )
         );
+    }
+
+    #[test]
+    fn test_ignore_backslash_newline() {
+        let expr = parse_expr("1 + \\\n2\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Add(
+                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::Number("2".to_string()))
+            )
+        );
+    }
+
+    #[test]
+    fn test_break_outside_of_loop_is_an_error() {
+        assert!(parse_program("break\n", None).is_err());
+        assert!(parse_program("if (1) break\n", None).is_err());
+        assert!(parse_program("define f() {\nbreak\n}\n", None).is_err());
+    }
+
+    #[test]
+    fn test_return_outside_of_function_is_an_error() {
+        assert!(parse_program("return\n", None).is_err());
+        assert!(parse_program("return(1)\n", None).is_err());
+    }
+
+    #[test]
+    fn test_partial_comment_is_incomplete() {
+        assert!(program_err("/* comment").is_incomplete);
+        assert!(program_err("1 + /* comment").is_incomplete);
+        assert!(program_err("1 + 2;/* comment").is_incomplete);
+    }
+
+    #[test]
+    fn test_partial_string_is_incomplete() {
+        assert!(program_err("\"string").is_incomplete);
+        assert!(program_err("1 + 2;\"string").is_incomplete);
+    }
+
+    #[test]
+    fn test_partial_function_requires_is_incomplete() {
+        assert!(program_err("define").is_incomplete);
+        assert!(program_err("define f").is_incomplete);
+        assert!(program_err("define f()").is_incomplete);
+        assert!(program_err("define f() {\n").is_incomplete);
+    }
+
+    #[test]
+    fn test_unclosed_braced_statement_list_is_incomplete() {
+        assert!(program_err("{").is_incomplete);
+        assert!(program_err("{1;").is_incomplete);
+    }
+
+    #[test]
+    fn test_statements_ending_with_a_backslash_newline_are_incomplete() {
+        assert!(program_err("1 + 2 *\\\n").is_incomplete);
+        assert!(program_err("1 +\\\n").is_incomplete);
+    }
+
+    #[test]
+    fn test_incomplete_conditions_are_incomplete() {
+        assert!(program_err("if (c) {\n").is_incomplete);
+        assert!(program_err("while (c) {\n").is_incomplete);
+    }
+
+    /// A complete but invalid line must be reported, not treated as needing
+    /// more input; otherwise the REPL swallows every later line.
+    #[test]
+    fn test_complete_but_invalid_input_is_not_incomplete() {
+        assert!(!program_err("1 \"abc\"\n").is_incomplete);
+        assert!(!program_err("x=1 \"abc\"\n").is_incomplete);
+        assert!(!program_err("\"a\" \"b\"\n").is_incomplete);
+        assert!(!program_err("1 2\n").is_incomplete);
+        assert!(!program_err("1 +\n").is_incomplete);
+    }
+
+    /// POSIX requires a separator between statements. Without it, `auto` and
+    /// the keywords silently decompose into single-letter variables.
+    #[test]
+    fn test_juxtaposed_statements_are_an_error() {
+        assert!(parse_program("{1 2 3}\n", None).is_err());
+        assert!(parse_program("{foo}\n", None).is_err());
+        assert!(parse_program("{length}\n", None).is_err());
+        assert!(parse_program("{auto}\n", None).is_err());
+        assert!(parse_program("{define}\n", None).is_err());
+    }
+
+    /// `auto` is a keyword everywhere, so a misplaced auto list is a syntax
+    /// error rather than a sequence of variable references.
+    #[test]
+    fn test_misplaced_auto_is_an_error() {
+        assert!(parse_program("define f() {\n\nauto x\nx = 7\nreturn(x)\n}\n", None).is_err());
+        assert!(parse_program("define f() {\n1\nauto x\n}\n", None).is_err());
+    }
+
+    /// POSIX has only `return` and `return ( expression )`.
+    #[test]
+    fn test_return_without_parentheses_is_an_error() {
+        assert!(parse_program("define f() {\nreturn 5\n}\n", None).is_err());
+    }
+
+    /// POSIX lexical rule 15 makes `--` a single token.
+    #[test]
+    fn test_double_minus_is_not_two_negations() {
+        assert!(parse_program("1--1\n", None).is_err());
+        assert!(parse_program("1---1\n", None).is_err());
+        // A blank separates them, and then it is subtraction of a negation.
+        let expr = parse_expr("1 - -1\n");
+        assert_eq!(
+            expr,
+            ExprInstruction::Sub(
+                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::UnaryMinus(Box::new(
+                    ExprInstruction::Number("1".to_string())
+                )))
+            )
+        );
+    }
+
+    /// Relational operators appear only in conditions.
+    #[test]
+    fn test_relational_operators_outside_conditions_are_an_error() {
+        assert!(parse_program("1 < 2\n", None).is_err());
+        assert!(parse_program("a = 1 < 2\n", None).is_err());
+        assert!(parse_program("if (1 < 2 < 3) 1\n", None).is_err());
+    }
+
+    /// A one-line definition is rejected: POSIX requires a newline after '{'.
+    #[test]
+    fn test_function_requires_newline_after_brace() {
+        assert!(parse_program("define f(a) { return(a) }\n", None).is_err());
+    }
+
+    #[test]
+    fn test_missing_newline_at_end_of_input_is_an_error() {
+        assert!(parse_program("1 + 1", None).is_err());
+    }
+
+    /// Deep nesting must produce a diagnostic instead of exhausting the stack.
+    #[test]
+    fn test_deep_nesting_is_bounded() {
+        let deep = format!("{}1{}\n", "(".repeat(50_000), ")".repeat(50_000));
+        let err = program_err(&deep);
+        assert!(
+            err.to_string().contains("nested more than"),
+            "expected a depth diagnostic, got: {}",
+            err
+        );
+    }
+
+    /// A column past what the diagnostic position can hold is clamped, not
+    /// wrapped: reporting column 4467 for column 70003 points at a place the
+    /// error is not.
+    #[test]
+    fn test_diagnostic_column_is_clamped_not_wrapped() {
+        let long_line = format!("{}1+*\n", " ".repeat(70_000));
+        let err = program_err(&long_line);
+        let (line, col, _) = err.diagnostics().next().expect("one diagnostic");
+        assert_eq!(line, 1);
+        assert_eq!(col, u16::MAX);
     }
 
     #[test]
@@ -1558,5 +1574,23 @@ mod test {
         let program = parse_program("for(1; 2; 3) {\n1\n 2\n\n\n 3\n}\n", None)
             .expect("error parsing program");
         assert_eq!(program.source_locations, [1, 2, 3, 6]);
+    }
+
+    /// A compound statement counts itself as well as its body, so a nested
+    /// compound does not desynchronise the source-location index.
+    #[test]
+    fn test_nested_compound_statement_counts_itself() {
+        let program =
+            parse_program("x=1\nif (1) if (1) x\n1/0\n", None).expect("error parsing program");
+        // x=1; outer if; inner if; the inner body; 1/0.
+        assert_eq!(program.source_locations, [1, 2, 2, 2, 3]);
+        let StmtInstruction::If {
+            instruction_count, ..
+        } = &program.instructions[1]
+        else {
+            panic!("expected an if statement")
+        };
+        // The inner `if` contributes itself plus its one-statement body.
+        assert_eq!(*instruction_count, 2);
     }
 }

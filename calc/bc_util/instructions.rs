@@ -94,6 +94,17 @@ pub enum ExprInstruction {
         register: Register,
         value: Box<ExprInstruction>,
     },
+    /// `scale++` and friends. POSIX makes the registers named expressions, so
+    /// they may be incremented, but unlike a variable a register holds an
+    /// integer and has its own bounds, so it needs its own instruction.
+    IncrementRegister {
+        register: Register,
+        prefix: bool,
+    },
+    DecrementRegister {
+        register: Register,
+        prefix: bool,
+    },
     UnaryMinus(Box<ExprInstruction>),
     Add(Box<ExprInstruction>, Box<ExprInstruction>),
     Sub(Box<ExprInstruction>, Box<ExprInstruction>),

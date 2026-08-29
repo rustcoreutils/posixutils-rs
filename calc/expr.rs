@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use plib::diag;
 use plib::regex::Regex;
+use std::io::Write;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
@@ -28,8 +29,13 @@ enum Token {
     OpAnd,
     OpOr,
     OpMatch,
-    Integer(i128),
-    Str(String),
+    /// An operand, exactly as it appeared in argv.
+    ///
+    /// POSIX operands are byte strings and need not be text. An operand is
+    /// treated as an integer only where the operator requires it, so what is
+    /// kept here is the argument's own spelling, not a parsed value: `007`
+    /// must still print as `007` and match as three characters.
+    Operand(Vec<u8>),
 }
 
 // comparison operators
@@ -53,175 +59,150 @@ enum IntOp {
     Rem,
 }
 
-// convert an lval to a string
-fn token_display(t: &Token) -> String {
+// the bytes of an operand
+fn operand_bytes(t: &Token) -> Result<&[u8], &'static str> {
     match t {
-        Token::Integer(val) => val.to_string(),
-        Token::Str(val) => String::from(val),
-        _ => {
-            panic!("BUG: not an lval");
-        }
+        Token::Operand(bytes) => Ok(bytes),
+        _ => Err("syntax error: not a string"),
     }
 }
 
 // is token an lval?
 fn token_is_lval(t: &Token) -> bool {
-    matches!(t, Token::Integer(_) | Token::Str(_))
+    matches!(t, Token::Operand(_))
 }
 
-// Does the token count as "null or zero"?
+fn bool_token(value: bool) -> Token {
+    Token::Operand(if value { b"1".to_vec() } else { b"0".to_vec() })
+}
+
+// Does this operand satisfy the POSIX integer production?
+//
+// XCU expr: "integer: An argument consisting only of an (optional) unary minus
+// followed by digits." A leading plus does not qualify, so `+5` is a string,
+// and neither do surrounding blanks.
+fn is_integer_text(bytes: &[u8]) -> bool {
+    let digits = match bytes.first() {
+        Some(b'-') => &bytes[1..],
+        _ => bytes,
+    };
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+
+// The integer value of an operand.
+//
+// Distinguishes an argument that is not an integer at all from one that is an
+// integer this implementation cannot represent; reporting the second as a
+// "non-integer argument" says something untrue about the input.
+fn integer_value(bytes: &[u8]) -> Result<i128, &'static str> {
+    if !is_integer_text(bytes) {
+        return Err("non-integer argument");
+    }
+    // ASCII by construction, so the conversion cannot fail.
+    std::str::from_utf8(bytes)
+        .map_err(|_| "non-integer argument")?
+        .parse::<i128>()
+        .map_err(|_| "integer out of range")
+}
+
+// Does the operand count as "null or zero"?
 //
 // Used both for the POSIX EXIT STATUS rule (exit 1 when the result is null or
-// zero) and for the `&`/`|` operators, whose operands are treated as integers
-// when they consist of an optional sign followed by digits. The empty string
-// is null; a string naming the integer zero (e.g. "0", "00", "-0") is zero;
-// a non-integer string such as "0.0" or "abc" is neither.
+// zero) and for the `&`/`|` operators. The empty string is null; an operand
+// naming the integer zero (`0`, `00`, `-0`) is zero; anything else, including
+// `0.0` and `+0`, is neither.
+fn is_null_or_zero(bytes: &[u8]) -> bool {
+    bytes.is_empty() || matches!(integer_value(bytes), Ok(0))
+}
+
 fn token_is_null_or_zero(t: &Token) -> bool {
     match t {
-        Token::Integer(val) => *val == 0,
-        Token::Str(s) => s.is_empty() || matches!(s.parse::<i128>(), Ok(0)),
+        Token::Operand(bytes) => is_null_or_zero(bytes),
         _ => false,
     }
 }
 
-// convert token to string
-fn token_to_string(t: &Token) -> Result<String, &'static str> {
-    match t {
-        Token::Integer(val) => Ok(val.to_string()),
-        Token::Str(val) => Ok(String::from(val)),
-        _ => Err("syntax error: not a string"),
-    }
-}
-
-// convert token to integer
-fn token_to_int(t: &Token) -> Option<i128> {
-    match t {
-        Token::Integer(val) => Some(*val),
-        _ => None,
-    }
-}
-
-// convert token to integer, returning an error if not an integer
-fn token_to_int_req(t: &Token) -> Result<i128, &'static str> {
-    match token_to_int(t) {
-        Some(val) => Ok(val),
-        None => Err("non-integer argument"),
-    }
-}
-
-// parse a single token
-fn parse_token(s: &str) -> Token {
-    match s {
-        "(" => Token::LParen,
-        ")" => Token::RParen,
-        "*" => Token::OpMul,
-        "/" => Token::OpDiv,
-        "%" => Token::OpRem,
-        "+" => Token::OpAdd,
-        "-" => Token::OpSub,
-        "=" => Token::OpEq,
-        ">" => Token::OpGT,
-        "<" => Token::OpLT,
-        ">=" => Token::OpGE,
-        "<=" => Token::OpLE,
-        "!=" => Token::OpNE,
-        "&" => Token::OpAnd,
-        "|" => Token::OpOr,
-        ":" => Token::OpMatch,
-        _ => match s.parse::<i128>() {
-            Ok(n) => Token::Integer(n),
-            Err(_) => Token::Str(String::from(s)),
-        },
+// parse a single argument into a token
+//
+// POSIX APPLICATION USAGE: expr "is not required to be able to tell the
+// difference between an operator and an operand except by the value", citing
+// `expr = = =`. A word that spells an operator is therefore that operator;
+// this is conformant, not a defect to be fixed with lookahead.
+fn parse_token(arg: Vec<u8>) -> Token {
+    match arg.as_slice() {
+        b"(" => Token::LParen,
+        b")" => Token::RParen,
+        b"*" => Token::OpMul,
+        b"/" => Token::OpDiv,
+        b"%" => Token::OpRem,
+        b"+" => Token::OpAdd,
+        b"-" => Token::OpSub,
+        b"=" => Token::OpEq,
+        b">" => Token::OpGT,
+        b"<" => Token::OpLT,
+        b">=" => Token::OpGE,
+        b"<=" => Token::OpLE,
+        b"!=" => Token::OpNE,
+        b"&" => Token::OpAnd,
+        b"|" => Token::OpOr,
+        b":" => Token::OpMatch,
+        _ => Token::Operand(arg),
     }
 }
 
 // tokenize the command line arguments, all in a single pass
 fn tokenize() -> Vec<Token> {
-    // collect program's command line args
-    let mut args: Vec<String> = std::env::args().collect();
-    args.remove(0); // remove 1st value, the unnecessary program name
+    use std::os::unix::ffi::OsStrExt;
+
+    // POSIX operands are byte strings: a pathname or a compared string need
+    // not be text, and decoding argv as UTF-8 aborts on one that is not.
+    let mut args: Vec<Vec<u8>> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.as_bytes().to_vec())
+        .collect();
 
     // POSIX / XBD 12.2 Guideline 10: a leading "--" delimits the end of
     // options. expr has no options, so a single leading "--" is consumed to
     // protect operands that begin with '-'.
-    if args.first().map(String::as_str) == Some("--") {
+    if args.first().map(Vec::as_slice) == Some(b"--".as_slice()) {
         args.remove(0);
     }
 
-    // parse each arg into a Token
-    let mut tokens = Vec::new();
-    for arg in &args {
-        tokens.push(parse_token(arg));
-    }
-
-    tokens
-}
-
-// compare two integers
-fn cmpint(lhs: i128, rhs: i128, op: CmpOp) -> Token {
-    let result: bool = match op {
-        CmpOp::EQ => lhs == rhs,
-        CmpOp::NE => lhs != rhs,
-        CmpOp::GT => lhs > rhs,
-        CmpOp::LT => lhs < rhs,
-        CmpOp::GE => lhs >= rhs,
-        CmpOp::LE => lhs <= rhs,
-    };
-
-    Token::Integer(result as i128)
-}
-
-// compare two strings
-//
-// POSIX 94588-94590 requires the relational operators to compare strings using
-// "the collating sequence of the current locale", so this must go through
-// `strcoll(3)` rather than Rust's byte-wise `Ord`. Every operator is affected,
-// not just `<`/`>`: in locales where two distinct strings collate equal, `=`
-// must report equality.
-fn cmpstr(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
-    let lhs = token_to_string(lhs)?;
-    let rhs = token_to_string(rhs)?;
-
-    let ord = plib::locale::strcoll(&lhs, &rhs);
-    let result: bool = match op {
-        CmpOp::EQ => ord.is_eq(),
-        CmpOp::NE => ord.is_ne(),
-        CmpOp::GT => ord.is_gt(),
-        CmpOp::LT => ord.is_lt(),
-        CmpOp::GE => ord.is_ge(),
-        CmpOp::LE => ord.is_le(),
-    };
-
-    Ok(Token::Integer(result as i128))
+    args.into_iter().map(parse_token).collect()
 }
 
 // perform a comparison operation
+//
+// POSIX: "returns the result of a decimal integer comparison if both arguments
+// are integers; otherwise, returns the result of a string comparison using the
+// locale-specific collation sequence".
 fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
-    let lhs_int = token_to_int(lhs);
-    let rhs_int = token_to_int(rhs);
+    let lhs = operand_bytes(lhs)?;
+    let rhs = operand_bytes(rhs)?;
 
-    match (lhs_int, rhs_int) {
-        (Some(lhs), Some(rhs)) => {
-            // if both are integers, perform int comparison
-            Ok(cmpint(lhs, rhs, op))
-        }
-        // otherwise, convert int to string, and perform string compare
-        (Some(lhs), _) => {
-            let tmp = Token::Str(lhs.to_string());
-            cmpstr(&tmp, rhs, op)
-        }
-        (_, Some(rhs)) => {
-            let tmp = Token::Str(rhs.to_string());
-            cmpstr(lhs, &tmp, op)
-        }
-        _ => cmpstr(lhs, rhs, op),
-    }
+    let ordering = match (integer_value(lhs), integer_value(rhs)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        // Compare the operands as written; canonicalizing an integer first
+        // would compare something the caller never passed.
+        _ => plib::locale::strcoll_bytes(lhs, rhs),
+    };
+
+    let result = match op {
+        CmpOp::EQ => ordering.is_eq(),
+        CmpOp::NE => ordering.is_ne(),
+        CmpOp::GT => ordering.is_gt(),
+        CmpOp::LT => ordering.is_lt(),
+        CmpOp::GE => ordering.is_ge(),
+        CmpOp::LE => ordering.is_le(),
+    };
+
+    Ok(bool_token(result))
 }
 
 // perform an integer math operation
 fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
-    let i1 = token_to_int_req(lhs)?;
-    let i2 = token_to_int_req(rhs)?;
+    let i1 = integer_value(operand_bytes(lhs)?)?;
+    let i2 = integer_value(operand_bytes(rhs)?)?;
 
     let result = match op {
         IntOp::Add => i1.checked_add(i2),
@@ -237,11 +218,23 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
             if i2 == 0 {
                 return Err("division by zero");
             }
-            i1.checked_rem(i2)
+            // x % -1 is zero for every x; checked_rem refuses it only because
+            // the corresponding division overflows.
+            if i2 == -1 {
+                Some(0)
+            } else {
+                i1.checked_rem(i2)
+            }
         }
     };
 
-    result.map(Token::Integer).ok_or("integer overflow")
+    result
+        .map(|value| Token::Operand(value.to_string().into_bytes()))
+        .ok_or("integer overflow")
+}
+
+fn token_is_null(t: &Token) -> bool {
+    matches!(t, Token::Operand(bytes) if bytes.is_empty())
 }
 
 // logical and/or operation
@@ -254,30 +247,83 @@ fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
         if !lhs_zero && !rhs_zero {
             lhs.clone()
         } else {
-            Token::Integer(0)
+            bool_token(false)
         }
     } else if !lhs_zero {
-        // expr1 | expr2: return expr1 if it is neither null nor zero,
-        // otherwise return expr2 (regardless of expr2's value).
         lhs.clone()
-    } else {
+    } else if !token_is_null(rhs) {
+        // POSIX: "returns the evaluation of expr1 if it is neither null nor
+        // zero; otherwise, returns the evaluation of expr2 if it is not null;
+        // otherwise, zero." expr2 is returned even when it is zero, but a null
+        // expr2 yields zero rather than the null string.
         rhs.clone()
+    } else {
+        bool_token(false)
     }
 }
 
-// Does the BRE pattern contain at least one subexpression "\(...\)"?
-// A backslash that is itself escaped ("\\") does not begin one.
-fn has_subexpr(pattern: &str) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-                return true;
+// Index just past the bracket expression that starts at `open`.
+//
+// XBD 9.3.5: inside a bracket expression a backslash is an ordinary character,
+// and a ']' is literal when it is the first character after the optional '^'.
+// A character class, collating symbol or equivalence class may itself contain
+// a ']', so those are skipped whole.
+fn skip_bracket_expression(pattern: &[u8], open: usize) -> usize {
+    let mut i = open + 1;
+    if pattern.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    if pattern.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < pattern.len() {
+        if pattern[i] == b'[' {
+            if let Some(&kind) = pattern.get(i + 1) {
+                if matches!(kind, b':' | b'.' | b'=') {
+                    if let Some(end) = find_class_end(pattern, i + 2, kind) {
+                        i = end;
+                        continue;
+                    }
+                }
             }
-            i += 2; // skip the escaped character
-        } else {
-            i += 1;
+        }
+        if pattern[i] == b']' {
+            return i + 1;
+        }
+        i += 1;
+    }
+    // Unterminated; regcomp will reject the pattern anyway.
+    pattern.len()
+}
+
+// Index just past a "[:class:]", "[.symbol.]" or "[=equiv=]" opened at `from`.
+fn find_class_end(pattern: &[u8], from: usize, kind: u8) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < pattern.len() {
+        if pattern[i] == kind && pattern[i + 1] == b']' {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+// Does the BRE pattern contain at least one subexpression "\(...\)"?
+//
+// A backslash that is itself escaped ("\\") does not begin one, and neither
+// does one inside a bracket expression, where a backslash is ordinary.
+fn has_subexpr(pattern: &[u8]) -> bool {
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            b'\\' => {
+                if pattern.get(i + 1) == Some(&b'(') {
+                    return true;
+                }
+                i += 2; // skip the escaped character
+            }
+            b'[' => i = skip_bracket_expression(pattern, i),
+            _ => i += 1,
         }
     }
     false
@@ -291,11 +337,11 @@ fn has_subexpr(pattern: &str) -> bool {
 // did not match); otherwise the number of characters matched is returned (0
 // on failure).
 fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
-    let lhs = token_to_string(lhs)?;
-    let rhs = token_to_string(rhs)?;
+    let subject = operand_bytes(lhs)?;
+    let pattern = operand_bytes(rhs)?;
 
-    let re = Regex::bre(&rhs).map_err(|_| "invalid regex")?;
-    let captures = re.captures(&lhs);
+    let re = Regex::bre_bytes(pattern).map_err(|_| "invalid regex")?;
+    let captures = re.captures_bytes(subject);
 
     // The match must be anchored at the start of the string.
     let anchored = captures
@@ -303,22 +349,24 @@ fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
         .map(|caps| caps[0].start == 0)
         .unwrap_or(false);
 
-    if has_subexpr(&rhs) {
+    if has_subexpr(pattern) {
         // Return the substring captured by "\1", or the null string.
         if anchored {
             let caps = captures.unwrap();
-            let group1 = caps.get(1).copied().unwrap_or_default();
-            Ok(Token::Str(String::from(group1.as_str(&lhs))))
+            Ok(Token::Operand(caps[1].as_bytes(subject).to_vec()))
         } else {
-            Ok(Token::Str(String::new()))
+            Ok(Token::Operand(Vec::new()))
         }
     } else if anchored {
-        // Return the number of characters (not bytes) matched.
+        // Return the number of characters matched. LC_CTYPE decides what a
+        // character is, so in the C locale that is the number of bytes; the
+        // match offsets are byte offsets either way.
         let caps = captures.unwrap();
-        let matched = &lhs[..caps[0].end];
-        Ok(Token::Integer(matched.chars().count() as i128))
+        let matched = &subject[..caps[0].end];
+        let count = plib::locale::mb_char_slices(matched).len();
+        Ok(Token::Operand(count.to_string().into_bytes()))
     } else {
-        Ok(Token::Integer(0))
+        Ok(bool_token(false))
     }
 }
 
@@ -329,11 +377,24 @@ fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
+
+/// Maximum depth of nested parentheses.
+///
+/// The evaluator recurses on the machine stack, so without a limit a deeply
+/// nested expression aborts the process instead of reporting an error. POSIX
+/// requires only `{EXPR_NEST_MAX}`, whose minimum is 32; this is far above any
+/// real use and below where the stack would run out in an unoptimized build.
+const MAX_NEST_DEPTH: usize = 512;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -434,11 +495,20 @@ impl Parser {
         Ok(lhs)
     }
 
-    // primary: ( expr ) | integer | string
+    // primary: ( expr ) | operand
     fn parse_primary(&mut self) -> Result<Token, &'static str> {
         match self.advance() {
             Some(Token::LParen) => {
-                let val = self.parse_or()?;
+                self.depth += 1;
+                if self.depth > MAX_NEST_DEPTH {
+                    self.depth -= 1;
+                    return Err("expression nested too deeply");
+                }
+                let val = self.parse_or();
+                self.depth -= 1;
+                // Propagate before looking for the ')', so a failure inside the
+                // group is not reported as a missing parenthesis.
+                let val = val?;
                 match self.advance() {
                     Some(Token::RParen) => Ok(val),
                     _ => Err("syntax error: expected ')'"),
@@ -461,27 +531,47 @@ fn eval_expression(tokens: Vec<Token>) -> Result<Token, &'static str> {
     Ok(result)
 }
 
+/// Write the result and flush, so a failed write is seen here rather than
+/// discarded at exit.
+fn write_result(bytes: &[u8]) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(bytes)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
+}
+
 fn main() {
-    setlocale(LocaleCategory::LcAll, "");
-    let _ = textdomain("posixutils-rs");
-    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+    // Before anything opens a file, including the message catalog.
+    plib::io::ensure_std_fds_open();
+    // A closed pipe should kill this process the way it kills the historical
+    // utilities, rather than being reported as a write failure.
+    plib::io::restore_sigpipe();
+    diag::init_locale("expr");
 
     // tokenize and evaluate the expression
     let arg_tokens = tokenize();
-    match eval_expression(arg_tokens) {
-        Ok(final_val) => {
-            // display the result, then return exit status per POSIX:
-            // 0 if the result is neither null nor zero, otherwise 1.
-            println!("{}", token_display(&final_val));
-            std::process::exit(if token_is_null_or_zero(&final_val) {
-                1
-            } else {
-                0
-            });
+    match eval_expression(arg_tokens).and_then(|value| {
+        let bytes = operand_bytes(&value)?.to_vec();
+        Ok((bytes, token_is_null_or_zero(&value)))
+    }) {
+        Ok((bytes, null_or_zero)) => {
+            // POSIX EXIT STATUS: 0 means the expression evaluates to neither
+            // null nor zero *and* the result was successfully written, so a
+            // failed write is an error in its own right (">2 An error
+            // occurred"), not a silent success.
+            if let Err(e) = write_result(&bytes) {
+                diag::error(&format!(
+                    "{}: {}",
+                    gettextrs::gettext("write error"),
+                    diag::io_error_text(&e)
+                ));
+                std::process::exit(3);
+            }
+            std::process::exit(if null_or_zero { 1 } else { 0 });
         }
         Err(msg) => {
             // invalid expression: diagnostic to stderr, exit status 2.
-            eprintln!("expr: {}", msg);
+            diag::error(msg);
             std::process::exit(2);
         }
     }

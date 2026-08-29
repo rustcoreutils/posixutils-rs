@@ -271,6 +271,7 @@ coverage while asserting nothing.
 
 Crates with open items today:
 
+- [`calc/audit.md`](calc/audit.md) — `expr`, `bc`
 - [`cc/audit.md`](cc/audit.md) — `c17`, `cflow`, `ctags`, `cxref`
 - [`cron/audit.md`](cron/audit.md) — `crontab`, `at`, `batch`, `crond`
 - [`dev/audit.md`](dev/audit.md) — `yacc`, `lex`, `ar`, `nm`, `strings`, `strip`
@@ -279,7 +280,7 @@ Crates with open items today:
 - [`sys/audit.md`](sys/audit.md) — `getconf`, `ipcrm`, `ipcs`, `ps`, `uname`, `who`
 - [`tree/audit.md`](tree/audit.md) — the 16 `tree/` utilities + the `ftw/` crate
 
-Audited with nothing open, so no file: `awk`, `calc`, `datetime`, `display`,
+Audited with nothing open, so no file: `awk`, `datetime`, `display`,
 `editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `man`, `misc`, `pathnames`,
 `pax`, `print`, `process`, `sccs`, `screen`, `text`, `users`, `uucp`, `xform`.
 

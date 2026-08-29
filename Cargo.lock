@@ -950,8 +950,6 @@ dependencies = [
  "bigdecimal",
  "clap",
  "gettext-rs",
- "pest",
- "pest_derive",
  "plib",
  "rustyline",
 ]

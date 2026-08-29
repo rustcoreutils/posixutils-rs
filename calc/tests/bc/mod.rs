@@ -54,8 +54,10 @@ fn test_bc_add() {
     test_bc!(add)
 }
 
-// Diagnostics go to stderr, not stdout (audit #B2). A runtime error in the
-// REPL is recovered from, so the session still exits 0 after quit.
+// Diagnostics go to stderr, not stdout (audit #B2), prefixed with the utility
+// name. Standard input here is a pipe, not a terminal, so the run is not
+// interactive and the failure is reported in the exit status -- the same way a
+// file operand reports it.
 #[test]
 fn test_bc_error_to_stderr() {
     run_test(TestPlan {
@@ -63,8 +65,8 @@ fn test_bc_error_to_stderr() {
         args: vec![],
         stdin_data: String::from("1/0\nquit\n"),
         expected_out: String::new(),
-        expected_err: String::from("runtime error (line 1): division by zero\n"),
-        expected_exit_code: 0,
+        expected_err: String::from("bc: runtime error (line 1): division by zero\n"),
+        expected_exit_code: 1,
     });
 }
 
@@ -77,21 +79,33 @@ fn test_bc_missing_file() {
         args: vec!["/nonexistent-bc-file.bc".to_string()],
         stdin_data: String::new(),
         expected_out: String::new(),
-        expected_err: String::from("bc: cannot read file: /nonexistent-bc-file.bc\n"),
+        expected_err: String::from("bc: /nonexistent-bc-file.bc: No such file or directory\n"),
         expected_exit_code: 1,
     });
 }
 
 // POSIX limit maxima are enforced so pathological inputs cannot drive
 // unbounded allocation (audit #B3 scale, #B4 obase, #B5 array index).
+/// Assert that the program fails with a diagnostic containing `needle`.
+fn bc_runtime_error_contains(program: &str, needle: &str) {
+    let output = plib::testing::run_test_base("bc", &[], format!("{}\nquit\n", program).as_bytes());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(needle),
+        "expected stderr to contain {:?}, got {:?}",
+        needle,
+        stderr
+    );
+}
+
 fn bc_runtime_error(program: &str, expected_err: &str) {
     run_test(TestPlan {
         cmd: String::from("bc"),
         args: vec![],
         stdin_data: format!("{program}\nquit\n"),
         expected_out: String::new(),
-        expected_err: format!("{expected_err}\n"),
-        expected_exit_code: 0,
+        expected_err: format!("bc: {expected_err}\n"),
+        expected_exit_code: 1,
     });
 }
 
@@ -113,10 +127,243 @@ fn test_bc_obase_too_large() {
 
 #[test]
 fn test_bc_array_index_out_of_bounds() {
+    // POSIX: an array holds up to {BC_DIM_MAX} elements and is indexed from 0
+    // to {BC_DIM_MAX}-1, so the last valid subscript is one below the limit.
+    test_bc("a[16777215]=1\nquit\n", "");
     bc_runtime_error(
-        "a[16777215]=1",
+        "a[16777216]=1",
         "runtime error (line 1): array index out of bounds",
     );
+    bc_runtime_error(
+        "a[-1]=1",
+        "runtime error (line 1): array index cannot be negative",
+    );
+}
+
+/// POSIX: "references to any of these names from other functions that are
+/// called from this function also refer to the new value". A callee saw the
+/// global instead of the caller's parameter or auto.
+#[test]
+fn test_bc_dynamic_scoping() {
+    test_bc(
+        "define g(){\nreturn(a)\n}\ndefine f(a){\nreturn(g())\n}\na=1\nf(9)\nquit\n",
+        "9\n",
+    );
+    test_bc(
+        "define g(){\nreturn(x)\n}\ndefine f(){\nauto x\nx=5\nreturn(g())\n}\nx=1\nf()\nquit\n",
+        "5\n",
+    );
+    // The caller's value must come back afterwards.
+    test_bc("define f(a){\nreturn(a)\n}\na=1\nf(9)\na\nquit\n", "9\n1\n");
+}
+
+/// An array argument was always read from the global of that name, so passing
+/// a local array on to another function passed the wrong array.
+#[test]
+fn test_bc_array_argument_uses_the_active_binding() {
+    test_bc(
+        "define g(x[]){\nreturn(x[0])\n}\ndefine f(x[]){\nreturn(g(x[]))\n}\nx[0]=99\nq[0]=7\nf(q[])\nquit\n",
+        "7\n",
+    );
+    test_bc(
+        "define g(x[]){\nreturn(x[0])\n}\ndefine f(){\nauto y[]\ny[0]=42\nreturn(g(y[]))\n}\nf()\nquit\n",
+        "42\n",
+    );
+}
+
+/// A mismatch used to bind the missing parameter to the global of the same
+/// name, and silently drop extra arguments without evaluating them.
+#[test]
+fn test_bc_argument_count_mismatch_is_an_error() {
+    bc_runtime_error(
+        "define f(a,b){\nreturn(b)\n}\nb=5\nf(1)",
+        "runtime error (line 1): wrong number of arguments",
+    );
+    bc_runtime_error(
+        "define f(a){\nreturn(a)\n}\nf(1,2)",
+        "runtime error (line 1): wrong number of arguments",
+    );
+}
+
+/// POSIX makes scale, ibase and obase named expressions, so they increment.
+#[test]
+fn test_bc_register_increment() {
+    // Postfix yields the old value, prefix the new one.
+    test_bc("scale=1\nscale++\nscale\nquit\n", "1\n2\n");
+    test_bc("scale=1\n++scale\nscale\nquit\n", "2\n2\n");
+    test_bc("ibase=9\nibase--\nibase\nquit\n", "9\n8\n");
+    // Stepping obase changes the base the result is then printed in: the old
+    // value 16 and the new value 15 are both rendered in base 15. Verified
+    // against GNU bc.
+    test_bc("obase=16\nobase--\nobase\nquit\n", "11\n10\n");
+    // The bounds still apply. The REPL executes one line at a time, so the
+    // failing line is line 1 of its own program.
+    bc_runtime_error(
+        "ibase=16\nibase++",
+        "runtime error (line 1): ibase must be between 2 and 16",
+    );
+    bc_runtime_error(
+        "obase=2\nobase--",
+        "runtime error (line 1): obase must be greater than 1",
+    );
+}
+
+/// A negative value is out of range in the other direction; reporting it as
+/// "too large" was simply wrong.
+#[test]
+fn test_bc_negative_register_diagnostics() {
+    bc_runtime_error(
+        "scale=-1",
+        "runtime error (line 1): scale cannot be negative",
+    );
+    bc_runtime_error(
+        "obase=-5",
+        "runtime error (line 1): obase must be greater than 1",
+    );
+}
+
+/// Recursion must report a limit rather than abort on a guard page.
+#[test]
+fn test_bc_runaway_recursion_is_diagnosed() {
+    bc_runtime_error_contains(
+        "define f(x){\nreturn(f(x))\n}\nf(1)",
+        "evaluation nested too deeply",
+    );
+}
+
+/// A sparse write must not allocate every element below it.
+#[test]
+fn test_bc_sparse_array() {
+    test_bc("a[16777215]=7\na[16777215]\na[5]\nquit\n", "7\n0\n");
+}
+
+/// A file that exists but is not text is not an access failure.
+#[test]
+fn test_bc_non_text_file() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("bc-nontext")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("binary.bc");
+    std::fs::write(&path, b"1+1\n\xff\xfe\n").unwrap();
+    let output = plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not a text file"),
+        "expected a text-file diagnostic, got {stderr:?}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// Input that stops in the middle of a construct must say so rather than exit
+/// as though it had run.
+#[test]
+fn test_bc_incomplete_input_at_eof() {
+    for program in ["define f(x) {\n", "\"abc\n", "/* abc\n", "{\n"] {
+        let output = plib::testing::run_test_base("bc", &[], program.as_bytes());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.is_empty(),
+            "truncated input {program:?} produced no diagnostic"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "truncated input {program:?} exited 0"
+        );
+    }
+    // Complete input is still fine.
+    let output = plib::testing::run_test_base("bc", &[], b"1+1\n");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// The same error reported the same way whether the program arrives as a file
+/// operand or on standard input.
+#[test]
+fn test_bc_exit_status_is_consistent() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("bc-status")
+        .tempdir()
+        .unwrap();
+    for program in ["1/0\n", "1+\n"] {
+        let path = dir.path().join("program.bc");
+        std::fs::write(&path, program).unwrap();
+        let as_file =
+            plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
+        let as_stdin = plib::testing::run_test_base("bc", &[], program.as_bytes());
+        assert_eq!(
+            as_file.status.code(),
+            as_stdin.status.code(),
+            "{program:?} gave different statuses as a file and on stdin"
+        );
+        assert_eq!(as_file.status.code(), Some(1));
+    }
+}
+
+/// A failed write is reported, not ignored and not a panic. Writing to
+/// /dev/full always fails with ENOSPC.
+#[test]
+fn test_bc_write_error_is_reported() {
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return, // no /dev/full on this host
+    };
+    let dir = plib::tmp::Builder::new()
+        .prefix("bc-write")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("program.bc");
+    // Enough output to leave the buffer and reach the device.
+    std::fs::write(&path, "for(i=0;i<5000;++i) i\n").unwrap();
+
+    let output = std::process::Command::new(plib::testing::get_binary_path("bc"))
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(full))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|child| child.wait_with_output())
+        .expect("failed to run bc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "bc panicked on a write failure: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected a failure status, got {:?} ({stderr})",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains("No space left on device"),
+        "expected the write failure to be named, got {stderr:?}"
+    );
+}
+
+/// The math library carries guard digits through its argument reductions, so
+/// results are correct to the scale asked for. Without them e() and l() were
+/// wrong in their leading digits for a large argument: e(10) at scale 2 gave
+/// 19656.33 against a true 22026.46. Every value here matches GNU bc.
+#[test]
+fn test_bc_math_library_accuracy() {
+    let cases = [
+        ("scale=20\ne(1)\n", "2.71828182845904523536\n"),
+        ("scale=20\nl(2)\n", "0.69314718055994530941\n"),
+        ("scale=20\ns(1)\n", "0.84147098480789650665\n"),
+        ("scale=20\ne(-2)\n", "0.13533528323661269189\n"),
+        // 4*a(1) multiplies the truncated a(1), as bc arithmetic requires.
+        ("scale=20\n4*a(1)\n", "3.14159265358979323844\n"),
+        // The cases that used to be wrong in their leading digits.
+        ("scale=2\ne(10)\n", "22026.46\n"),
+        ("scale=5\ne(10)\n", "22026.46579\n"),
+        ("scale=5\nl(100)\n", "4.60517\n"),
+    ];
+    for (program, expected) in cases {
+        test_bc_with_math_library(&format!("{program}quit\n"), expected);
+    }
 }
 
 // x^0 is 1 with scale 0, regardless of the scale register (audit #B8).

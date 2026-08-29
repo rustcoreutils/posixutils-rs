@@ -7,17 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser};
+use flate2::read::MultiGzDecoder;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use man_util::config::{parse_config_file, ManConfig};
 use man_util::formatter::MdocFormatter;
 use man_util::man7;
+use man_util::parse::mdoc::NestingTooDeep;
 use man_util::parser::{MdocDocument, MdocParser};
-use std::ffi::OsStr;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::num::ParseIntError;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::string::FromUtf8Error;
 use thiserror::Error;
@@ -43,10 +44,11 @@ const MAN_SECTIONS: [Section; 10] = [
 ];
 
 /// Possible default config file paths to check if `-C` is not provided.
-const MAN_CONFS: [&str; 3] = [
-    "/etc/man.conf",
-    "/etc/examples/man.conf",
-    "/etc/manpath.config",
+const MAN_CONFS: [&str; 4] = [
+    "/etc/man.conf",          // BSD, mandoc
+    "/etc/examples/man.conf", // OpenBSD sample
+    "/etc/man_db.conf",       // Fedora, RHEL, Arch, openSUSE (man-db)
+    "/etc/manpath.config",    // Debian, Ubuntu (man-db)
 ];
 
 #[derive(Parser, Debug, Default)]
@@ -114,9 +116,13 @@ struct Args {
     )]
     subsection: Option<String>,
 
+    // Not a ValueEnum: its derived value names are the variant names, so the
+    // accepted spellings were `s1`..`s9`, and `man -s 1 ls` -- the POSIX and
+    // universal spelling -- was rejected outright. The hand-written FromStr
+    // below already mapped the right names and was dead code.
     #[arg(
         short = 's',
-        value_enum,
+        value_parser = Section::from_str,
         help = gettext("Only select manuals from the specified section")
     )]
     section: Option<Section>,
@@ -177,6 +183,9 @@ enum ManError {
 
     /// The page produced no renderable content (e.g. an unsupported format).
     EmptyPage,
+
+    /// The page is compressed with a format this implementation cannot read.
+    UnsupportedCompression(String),
 }
 
 impl std::fmt::Display for ManError {
@@ -214,6 +223,11 @@ impl std::fmt::Display for ManError {
                 gettext("file: {} was not found").replace("{}", &path.display().to_string())
             ),
             ManError::EmptyPage => write!(f, "{}", gettext("no renderable content in page")),
+            ManError::UnsupportedCompression(format) => write!(
+                f,
+                "{}",
+                gettext("page is {}-compressed, which is not supported").replace("{}", format)
+            ),
         }
     }
 }
@@ -232,6 +246,12 @@ impl From<ParseError> for ManError {
     }
 }
 
+impl From<NestingTooDeep> for ManError {
+    fn from(err: NestingTooDeep) -> Self {
+        ManError::ParseError(err.into())
+    }
+}
+
 /// Parsing error types
 #[derive(Error, Debug)]
 enum ParseError {
@@ -240,10 +260,13 @@ enum ParseError {
 
     #[error("{0}")]
     FromUtf8Error(#[from] FromUtf8Error),
+
+    #[error("{0}")]
+    NestingTooDeep(#[from] NestingTooDeep),
 }
 
 /// Manual type
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Section {
     /// General commands (tools and utilities)
     S1,
@@ -282,7 +305,7 @@ impl FromStr for Section {
             "7" => Ok(Section::S7),
             "8" => Ok(Section::S8),
             "9" => Ok(Section::S9),
-            _ => Err(format!("Invalid section: {}", s)),
+            _ => Err(gettext("invalid section: {}").replace("{}", s)),
         }
     }
 }
@@ -334,79 +357,38 @@ impl Default for FormattingSettings {
 // ──────────────────────────────────────────────────────────────────────────────
 //
 
+/// Manual roots named by the MANPATH environment variable, empty components
+/// dropped.
+fn env_manpath() -> Vec<PathBuf> {
+    std::env::var("MANPATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// Try to locate the configuration file:
 /// - If `path` is Some, check if it exists; error if not.
 /// - If `path` is None, try each of MAN_CONFS; return an error if none exist.
-fn get_config_file_path(path: &Option<PathBuf>) -> Result<PathBuf, ManError> {
+fn get_config_file_path(path: &Option<PathBuf>) -> Result<Option<PathBuf>, ManError> {
     if let Some(user_path) = path {
-        if user_path.exists() {
-            Ok(user_path.clone())
+        // An explicit -C naming a file that does not exist is an error: the
+        // user asked for that file.
+        return if user_path.exists() {
+            Ok(Some(user_path.clone()))
         } else {
             Err(ManError::ConfigFileNotFound(
                 user_path.display().to_string(),
             ))
-        }
-    } else {
-        // No -C provided, so check defaults:
-        for default in MAN_CONFS {
-            let p = PathBuf::from(default);
-            if p.exists() {
-                return Ok(p);
-            }
-        }
-        Err(ManError::ConfigFileNotFound(
-            "No valid man.conf found".to_string(),
-        ))
-    }
-}
-
-/// Spawns process with arguments and STDIN if present.
-///
-/// # Arguments
-///
-/// `name` - [str] name of process.
-/// `args` - [IntoIterator<Item = AsRef<OsStr>>] arguments of process.
-/// `stdin` - [Option<&[u8]>] STDIN content of process.
-///
-/// # Returns
-///
-/// [Output] of spawned process.
-///
-/// # Errors
-///
-/// [ManError] if process spawn failed or failed to get its output.
-fn spawn<I, S>(name: &str, args: I, stdin: Option<&[u8]>, stdout: Stdio) -> Result<Output, ManError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let mut process = Command::new(name)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(stdout)
-        .spawn()
-        .map_err(|err| match err.kind() {
-            io::ErrorKind::NotFound => ManError::CommandNotFound(name.to_string()),
-            _ => ManError::Io(err),
-        })?;
-
-    if let Some(stdin) = stdin {
-        if let Some(mut process_stdin) = process.stdin.take() {
-            process_stdin.write_all(stdin)?;
-        } else {
-            Err(io::Error::other(format!("failed to open stdin for {name}")))?;
-        }
+        };
     }
 
-    let output = process
-        .wait_with_output()
-        .map_err(|_| io::Error::other(format!("failed to get {name} stdout")))?;
-
-    if !output.status.success() {
-        Err(io::Error::other(format!("{name} failed")))?
-    } else {
-        Ok(output)
-    }
+    // No -C: use the first default that exists. Finding none is not an error.
+    // A minimal container ships none of these, and the built-in manual roots
+    // are a complete fallback -- refusing to run `man ls` because
+    // /etc/man.conf is absent made the utility unusable on such a system.
+    Ok(MAN_CONFS.iter().map(PathBuf::from).find(|p| p.exists()))
 }
 
 /// Gets page width.
@@ -494,17 +476,55 @@ fn apply_terminal_width(settings: &mut FormattingSettings, cols: usize) {
     }
 }
 
+/// Decode a page image, transparently gunzipping it.
+///
+/// Detection is by gzip magic rather than by a `.gz` suffix: the previous
+/// implementation chose `zcat` or `cat` from the file extension, so a
+/// compressed page stored under any other name was written to the terminal as
+/// binary. At most `limit` decoded bytes are produced, which also bounds a
+/// decompression bomb.
+fn decode_page(raw: Vec<u8>, limit: u64) -> Result<Vec<u8>, ManError> {
+    // Compressed formats we do not implement. Installed pages are gzip
+    // everywhere this runs; recognising the others names the reason instead of
+    // writing binary to the terminal.
+    for (magic, name) in [
+        (b"BZh".as_slice(), "bzip2"),
+        (b"\xfd7zXZ".as_slice(), "xz"),
+        (b"\x28\xb5\x2f\xfd".as_slice(), "zstd"),
+    ] {
+        if raw.starts_with(magic) {
+            return Err(ManError::UnsupportedCompression(name.to_string()));
+        }
+    }
+
+    if !raw.starts_with(&[0x1f, 0x8b]) {
+        return Ok(raw);
+    }
+
+    // MultiGzDecoder, not GzDecoder: a gzip file may hold several concatenated
+    // members, and GzDecoder stops after the first, silently truncating such a
+    // page. zcat, which this replaced, decodes all of them.
+    let mut out = Vec::new();
+    MultiGzDecoder::new(raw.as_slice())
+        .take(limit)
+        .read_to_end(&mut out)?;
+    Ok(out)
+}
+
 /// Read a local man page file (possibly .gz), uncompress if needed, and return
 /// the raw content.
-fn get_man_page_from_path(path: &PathBuf) -> Result<Vec<u8>, ManError> {
-    let ext = path.extension().and_then(|ext| ext.to_str());
-    let cat_cmd = match ext {
-        Some("gz") => "zcat",
-        _ => "cat",
-    };
+fn get_man_page_from_path(path: &Path) -> Result<Vec<u8>, ManError> {
+    decode_page(std::fs::read(path)?, u64::MAX)
+}
 
-    let output = spawn(cat_cmd, [path], None, Stdio::piped())?;
-    Ok(output.stdout)
+/// Decoded bytes read from a page when only its NAME section is wanted, which
+/// is always near the top. The keyword scan visits every installed page, and
+/// decoding each one in full is the bulk of its cost.
+const PAGE_HEAD_BYTES: u64 = 64 << 10;
+
+/// Read at most [`PAGE_HEAD_BYTES`] of a page, for the keyword scan.
+fn read_page_head(path: &Path) -> Option<Vec<u8>> {
+    decode_page(std::fs::read(path).ok()?, PAGE_HEAD_BYTES).ok()
 }
 
 /// Whether a roff `.so` target is safe to resolve.
@@ -522,17 +542,40 @@ fn is_safe_so_target(target: &str) -> bool {
             .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
 }
 
+/// The roots a page's `.so` targets resolve against: the manual root the page
+/// itself was found under (`…/man1/ls.1` gives `…`), then the search list.
+///
+/// The candidate list used to begin with the bare target, resolved against the
+/// process's working directory, so a page opened with `man -l` could read any
+/// file below it: `.so secret/notes.txt` printed that file. Hard-coding the
+/// system roots also meant a page found under `-M /custom/man` could not
+/// resolve its own alias target.
+fn so_roots(page: &Path, search_paths: &[PathBuf]) -> Vec<PathBuf> {
+    page.parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(search_paths.iter().cloned())
+        // An empty root is the working directory: `Path::new("man1/x.1")` has
+        // grandparent Some("") rather than None, and joining onto it yields a
+        // relative path again. Dropping it is what actually confines the
+        // search -- without this, `man -l man1/evil.1` containing
+        // `.so secret/notes.txt` still read that file.
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect()
+}
+
 /// Resolve a roff `.so` include target to its (decompressed) text for the roff
-/// front-end. Tries the target as given, then under each system man root, with
-/// and without a `.gz` suffix. Returns `None` if nothing readable is found.
-fn load_so(target: &str) -> Option<String> {
+/// front-end. Tries the target under each root, with and without a `.gz`
+/// suffix. Returns `None` if nothing readable is found.
+fn load_so_from(roots: &[PathBuf], target: &str) -> Option<String> {
     if !is_safe_so_target(target) {
         return None;
     }
-    let mut candidates: Vec<PathBuf> = vec![PathBuf::from(target)];
-    for root in MAN_PATHS {
-        candidates.push(PathBuf::from(root).join(target));
-    }
+    // `is_safe_so_target` rejects absolute paths and any `..` component, so
+    // `root.join(target)` provably stays under `root` (symlinks aside, which
+    // mandoc does not chase either).
+    let candidates: Vec<PathBuf> = roots.iter().map(|root| root.join(target)).collect();
     for cand in candidates {
         let gz = PathBuf::from(format!("{}.gz", cand.display()));
         for path in [cand, gz] {
@@ -565,6 +608,7 @@ fn format_man_page(
     man_bytes: Vec<u8>,
     formatting: &FormattingSettings,
     synopsis: bool,
+    so_roots: &[PathBuf],
 ) -> Result<Vec<u8>, ManError> {
     // Most pages are UTF-8; a page that is not (e.g. Latin-1) is decoded
     // byte-for-byte into the Latin-1 Unicode block rather than rejected, so it
@@ -580,24 +624,39 @@ fn format_man_page(
     // only for tbl, which must choose a fill width for `T{`…`T}` text blocks
     // before it can lay them out.
     let line_length = formatting.width.saturating_sub(formatting.indent);
-    let content = man_util::roff::preprocess_with_loader(&content, line_length, load_so);
+    let roots = so_roots.to_vec();
+    let content = man_util::roff::preprocess_with_loader(&content, line_length, move |target| {
+        load_so_from(&roots, target)
+    });
 
     // Legacy man(7) pages (`.TH`/`.SH`/…) are handled by a dedicated renderer;
-    // the mdoc engine only understands mdoc(7) and would otherwise emit an empty
-    // page. The synopsis-only mode (-h) is mdoc-specific.
-    if !synopsis && man7::is_man7(&content) {
-        return man7::format_man7(&content, formatting).ok_or(ManError::EmptyPage);
+    // the mdoc engine only understands mdoc(7) and would otherwise emit an
+    // empty page. Synopsis mode used to be routed away from this renderer into
+    // the mdoc engine, which knows none of these macros, so `-h` produced zero
+    // bytes and exit 0 for every man(7) page on the system.
+    if man7::is_man7(&content) {
+        let out = if synopsis {
+            man7::format_man7_synopsis(&content, formatting)
+        } else {
+            man7::format_man7(&content, formatting)
+        };
+        return out.ok_or(ManError::EmptyPage);
     }
 
     let mut formatter = MdocFormatter::new(*formatting);
 
-    let document = MdocParser::parse_mdoc(&content);
-    let formatted_document = match synopsis {
-        true => formatter.format_synopsis_section(document),
-        false => formatter.format_mdoc(document),
-    };
+    let document = MdocParser::parse_mdoc(&content)?;
+    if synopsis {
+        let out = formatter.format_synopsis_section(document);
+        // A page with no SYNOPSIS used to return Ok with an empty body, so -h
+        // reported success having printed nothing. Both paths now say so.
+        if out.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err(ManError::EmptyPage);
+        }
+        return Ok(out);
+    }
 
-    Ok(formatted_document)
+    Ok(formatter.format_mdoc(document))
 }
 
 /// Write formatted output to either a pager or directly to stdout if `copy = true`.
@@ -619,16 +678,64 @@ fn display_pager(man_page: Vec<u8>, copy_mode: bool) -> Result<(), ManError> {
         return Ok(());
     }
 
-    let pager = std::env::var("PAGER").unwrap_or_else(|_| "more".to_string());
-    let args = if pager.ends_with("more") {
-        vec!["-s"]
-    } else {
-        vec![]
-    };
+    let cmd = pager_command(std::env::var("PAGER").ok().as_deref());
 
-    spawn(&pager, args, Some(&man_page), Stdio::inherit())?;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| match err.kind() {
+            io::ErrorKind::NotFound => ManError::CommandNotFound("sh".to_string()),
+            _ => ManError::Io(err),
+        })?;
 
-    Ok(())
+    // The pager exits as soon as the user quits, so writing the page into it
+    // races with that exit. Rust ignores SIGPIPE, so the write returns EPIPE
+    // instead of killing us -- that is the user pressing `q`, not a failure.
+    if let Some(mut sink) = child.stdin.take() {
+        match sink.write_all(&man_page).and_then(|()| sink.flush()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                let _ = child.wait();
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        }
+        // `sink` drops here, closing the pipe so the pager sees EOF. It must
+        // drop before the wait below, or the two deadlock.
+    }
+
+    // sh's convention: 127 is "not found", 126 is "found but not executable".
+    // Any other status belongs to the pager, and a user who quits it has not
+    // made `man` fail.
+    match child.wait()?.code() {
+        Some(126) | Some(127) => Err(ManError::CommandNotFound(cmd)),
+        _ => Ok(()),
+    }
+}
+
+/// The command string to page output through.
+///
+/// POSIX: PAGER is "any string acceptable as a command_string operand to the
+/// `sh -c` command", so it is handed to the shell verbatim rather than executed
+/// as a program name -- `PAGER="less -R"` is a conforming value that used to
+/// fail with "less -R command not found". A null PAGER is spec-equivalent to an
+/// unset one; `env::var` returns Ok("") for it, which produced the empty
+/// "  command not found".
+///
+/// A whitespace-only value is treated as unset too: it is not strictly null,
+/// but `sh -c " "` discards the page and reports success, which no user means.
+fn pager_command(pager: Option<&str>) -> String {
+    match pager {
+        Some(p) if !p.trim().is_empty() => p.to_string(),
+        // `-s` belongs to the paginator we chose, not to an arbitrary user
+        // command: appending it to one would corrupt any command with its own
+        // quoting or a pipeline.
+        _ => "more -s".to_string(),
+    }
 }
 
 /// Extracts NAME section info from a parsed mdoc document.
@@ -641,21 +748,23 @@ fn extract_name_info(document: &MdocDocument) -> Option<(Vec<String>, String)> {
 
     let mut names: Vec<String> = Vec::new();
     let mut description = String::new();
-    let mut in_name_section = false;
 
-    for element in &document.elements {
-        if let Element::Macro(node) = element {
+    // `.Nm` and `.Nd` are children of the `.Sh NAME` block, not its siblings:
+    // `.Sh` opens a frame and everything up to the next section is nested
+    // inside it. Scanning only the top level found neither, which is the other
+    // half of why the native keyword search returned nothing.
+    fn collect(nodes: &[Element], names: &mut Vec<String>, description: &mut String) {
+        for element in nodes {
+            let Element::Macro(node) = element else {
+                continue;
+            };
             match &node.mdoc_macro {
-                Macro::Sh { title } => {
-                    in_name_section = title.eq_ignore_ascii_case("NAME");
-                }
-                Macro::Nm { name: Some(n) } if in_name_section => {
+                Macro::Nm { name: Some(n) } => {
                     if !n.is_empty() && !names.contains(n) {
                         names.push(n.clone());
                     }
                 }
-                Macro::Nd if in_name_section => {
-                    // Collect text from child nodes
+                Macro::Nd => {
                     for child in &node.nodes {
                         if let Element::Text(text) = child {
                             if !description.is_empty() {
@@ -665,7 +774,17 @@ fn extract_name_info(document: &MdocDocument) -> Option<(Vec<String>, String)> {
                         }
                     }
                 }
-                _ => {}
+                _ => collect(&node.nodes, names, description),
+            }
+        }
+    }
+
+    for element in &document.elements {
+        if let Element::Macro(node) = element {
+            if let Macro::Sh { title } = &node.mdoc_macro {
+                if title.eq_ignore_ascii_case("NAME") {
+                    collect(&node.nodes, &mut names, &mut description);
+                }
             }
         }
     }
@@ -697,32 +816,48 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
                 continue;
             }
 
-            let entries = match std::fs::read_dir(&section_dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            // The section directory, then its architecture subdirectories:
+            // -S searches those, so the keyword index has to cover them or a
+            // page reachable by `man -S amd64 foo` is invisible to `man -k`.
+            let mut dirs = vec![section_dir.clone()];
+            if let Ok(entries) = std::fs::read_dir(&section_dir) {
+                dirs.extend(entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            }
 
-            for entry in entries.flatten() {
+            let entries = dirs
+                .iter()
+                .filter_map(|dir| std::fs::read_dir(dir).ok())
+                .flat_map(|e| e.flatten());
+
+            for entry in entries {
                 let path = entry.path();
                 if !path.is_file() {
                     continue;
                 }
 
                 // Try to read and parse the man page
-                let raw = match get_man_page_from_path(&path) {
-                    Ok(r) => r,
-                    Err(_) => continue,
+                let Some(raw) = read_page_head(&path) else {
+                    continue;
                 };
 
-                let content = match String::from_utf8(raw) {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                // Lossy, not strict: a page that is not valid UTF-8 was skipped
+                // outright, even though the display path renders it by decoding
+                // it as Latin-1.
+                let content = String::from_utf8_lossy(&raw);
+
+                // man(7) pages carry no .Nm/.Nd, so parsing every page as mdoc
+                // meant nothing matched on a Linux system.
+                let info = if man7::is_man7(&content) {
+                    man7::extract_name(&content)
+                } else {
+                    // A single pathologically nested page must not abort the scan.
+                    match MdocParser::parse_mdoc(&content) {
+                        Ok(document) => extract_name_info(&document),
+                        Err(_) => continue,
+                    }
                 };
 
-                // The hand-written parser is total, so no panic guard is needed.
-                let document = MdocParser::parse_mdoc(&content);
-
-                if let Some((names, description)) = extract_name_info(&document) {
+                if let Some((names, description)) = info {
                     results.push(ManPageInfo {
                         names,
                         description,
@@ -739,13 +874,40 @@ fn scan_man_pages(search_paths: &[PathBuf], sections: &[Section]) -> Vec<ManPage
 /// Performs native keyword search across man pages.
 ///
 /// Returns lines in format: "command(section) - description"
-fn native_keyword_search(
-    search_paths: &[PathBuf],
-    sections: &[Section],
-    keywords: &[String],
-) -> Vec<String> {
-    let pages = scan_man_pages(search_paths, sections);
+/// How name operands are matched against the scanned pages.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum SearchMode {
+    /// `-k`: POSIX specifies the result as equivalent to `grep -Ei` over a
+    /// summary database, i.e. a case-insensitive ERE over names and
+    /// descriptions.
+    Keyword,
+    /// `-f`: whatis(1) semantics -- the operand must be a page name, whole.
+    /// POSIX deliberately omits -f ("due to implementation differences, it was
+    /// not included"), so the historical behaviour governs. Sharing the ERE
+    /// matcher with -k made `man -f cat` list every page whose description
+    /// merely mentioned concatenation.
+    Exact,
+}
+
+/// Summary lines for the pages matching a single `keyword`.
+///
+/// One keyword at a time, so the caller can tell which operands matched
+/// nothing: deciding from the aggregate hid an operand that found nothing
+/// whenever any other operand found something.
+fn native_keyword_search(pages: &[ManPageInfo], keyword: &str, mode: SearchMode) -> Vec<String> {
+    let keywords = [keyword];
     let mut results = Vec::new();
+
+    if mode == SearchMode::Exact {
+        for page in pages {
+            if let Some(name) = page.names.iter().find(|n| n.eq_ignore_ascii_case(keyword)) {
+                results.push(format!("{}({}) - {}", name, page.section, page.description));
+            }
+        }
+        results.sort();
+        results.dedup();
+        return results;
+    }
 
     // POSIX: `-k` keywords are case-insensitive extended regular expressions
     // (the spec describes the search as equivalent to `grep -Ei`). Use the
@@ -773,7 +935,7 @@ fn native_keyword_search(
         })
         .collect();
 
-    for page in &pages {
+    for page in pages {
         // Check if any keyword matches name or description (case-insensitive ERE)
         let matches = matchers
             .iter()
@@ -820,10 +982,26 @@ impl Man {
     ///
     /// [ManError] if file not found.
     fn get_man_page_paths(&self, name: &str, all: bool) -> Result<Vec<PathBuf>, ManError> {
+        // -S names an architecture subdirectory (`man4/amd64/…`), as in mandoc
+        // and the BSDs, whose semantics this option's help text already
+        // describes. It is searched ahead of the section directory itself, so
+        // it selects a page rather than filtering one out. The option used to
+        // be accepted and do nothing at all: it wrote a MACHINE environment
+        // variable that nothing in the process ever read.
+        let machine = self.args.subsection.clone();
         let mut path_iter = self.search_paths.iter().flat_map(|path| {
+            let machine = machine.clone();
             self.sections.iter().flat_map(move |section| {
-                let base_path = format!("{}/man{section}/{name}.{section}", path.display());
-                vec![format!("{base_path}.gz"), base_path]
+                let dir = format!("{}/man{section}", path.display());
+                let mut bases = Vec::new();
+                if let Some(m) = machine.as_deref() {
+                    bases.push(format!("{dir}/{m}/{name}.{section}"));
+                }
+                bases.push(format!("{dir}/{name}.{section}"));
+                bases
+                    .into_iter()
+                    .flat_map(|b| vec![format!("{b}.gz"), b])
+                    .collect::<Vec<_>>()
             })
         });
 
@@ -855,9 +1033,14 @@ impl Man {
     /// # Errors
     ///
     /// [ManError] if man page not found, or any display error happened.
-    fn display_man_page(&self, path: &PathBuf) -> Result<(), ManError> {
+    fn display_man_page(&self, path: &Path) -> Result<(), ManError> {
         let raw = get_man_page_from_path(path)?;
-        let formatted = format_man_page(raw, &self.formatting_settings, self.args.synopsis)?;
+        let formatted = format_man_page(
+            raw,
+            &self.formatting_settings,
+            self.args.synopsis,
+            &so_roots(path, &self.search_paths),
+        )?;
         display_pager(formatted, self.args.copy)
     }
 
@@ -912,8 +1095,10 @@ impl Man {
             }
         }
 
-        let config_path = get_config_file_path(&args.config_file)?;
-        let config = parse_config_file(config_path)?;
+        let config = match get_config_file_path(&args.config_file)? {
+            Some(path) => parse_config_file(path)?,
+            None => ManConfig::default(),
+        };
 
         let mut man = Self {
             args,
@@ -922,40 +1107,36 @@ impl Man {
             ..Default::default()
         };
 
-        if !man.args.override_paths.is_empty() {
-            let override_paths = man
-                .args
-                .override_paths
-                .iter()
-                .filter_map(|path| path.to_str())
-                .collect::<Vec<_>>()
-                .join(":");
+        // -M replaces the search list; -m still augments it, in front. The
+        // previous code wrote the override into the MANPATH environment
+        // variable and then concatenated every source unconditionally, so -M
+        // added directories rather than replacing them and the built-in roots
+        // were searched regardless.
+        let base = if man.args.override_paths.is_empty() {
+            [
+                env_manpath(),
+                man.config.manpaths.clone(),
+                MAN_PATHS.iter().map(PathBuf::from).collect(),
+            ]
+            .concat()
+        } else {
+            man.args.override_paths.clone()
+        };
 
-            std::env::set_var("MANPATH", OsStr::new(&override_paths));
-        }
+        man.search_paths = [man.args.augment_paths.clone(), base].concat();
+        // An unset MANPATH split on ':' yields one empty component, which used
+        // to enter the list as an empty path -- and made the check below
+        // unreachable.
+        man.search_paths.retain(|p| !p.as_os_str().is_empty());
+        // Keep the first occurrence of each root, so `-w` does not report the
+        // same page once per source that happened to name its directory.
+        let mut seen = std::collections::HashSet::new();
+        man.search_paths.retain(|p| seen.insert(p.clone()));
 
-        if man.args.subsection.is_some() {
-            std::env::set_var("MACHINE", OsStr::new(&man.args.subsection.clone().unwrap()));
-        }
-
-        let manpath = std::env::var("MANPATH")
-            .unwrap_or_default()
-            .split(":")
-            .filter_map(|s| PathBuf::from_str(s).ok())
-            .collect::<Vec<_>>();
-
-        man.search_paths = [
-            man.args.augment_paths.clone(),
-            manpath,
-            man.search_paths.clone(),
-            man.config.manpaths.clone(),
-            MAN_PATHS
-                .iter()
-                .filter_map(|s| PathBuf::from_str(s).ok())
-                .collect::<Vec<_>>(),
-        ]
-        .concat();
-
+        // Defensive: the built-in roots make this unreachable today, and clap
+        // rejects the `-M ""` and `-M ":"` spellings that would otherwise empty
+        // the list. It stays so that a future change to the sources above
+        // fails loudly rather than silently finding nothing.
         if man.search_paths.is_empty() {
             return Err(ManError::ManPaths);
         }
@@ -1005,38 +1186,25 @@ impl Man {
             }
             return Ok(no_errors);
         } else if self.args.apropos || self.args.whatis {
-            // Try external apropos/whatis first (uses pre-built database, fast)
-            // Fall back to native search if external command not available
-            let command = if self.args.apropos {
-                "apropos"
+            // Search our own manual roots rather than delegating to the
+            // system's apropos/whatis. Delegating consulted a database built
+            // from a different set of directories, so -M, -m and -s were
+            // silently ignored; the probe for it also spelled "is this command
+            // available" as `which`, which is not a POSIX utility.
+            let mode = if self.args.apropos {
+                SearchMode::Keyword
             } else {
-                "whatis"
+                SearchMode::Exact
             };
+            // Scan once, then match each operand against the result: an
+            // operand that matches nothing must still be reported when a later
+            // one matches.
+            let pages = scan_man_pages(&self.search_paths, &self.sections);
 
-            // Check if external command exists and use it
-            let external_available = Command::new("which")
-                .arg(command)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            if external_available {
-                // Use external command (fast, uses system database)
-                for keyword in &self.args.names {
-                    let status = Command::new(command).arg(keyword).spawn()?.wait()?;
-                    if !status.success() {
-                        no_errors = false;
-                    }
-                }
-            } else {
-                // Fall back to native keyword search (slower, no database)
-                let results =
-                    native_keyword_search(&self.search_paths, &self.sections, &self.args.names);
-
+            for keyword in &self.args.names {
+                let results = native_keyword_search(&pages, keyword, mode);
                 if results.is_empty() {
-                    for keyword in &self.args.names {
-                        eprintln!("{}: {}", keyword, gettext("nothing appropriate"));
-                    }
+                    eprintln!("{}: {}", keyword, gettext("nothing appropriate"));
                     no_errors = false;
                 } else {
                     for line in results {
@@ -1113,7 +1281,128 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_so_target, ManError};
+    use super::{
+        decode_page, get_config_file_path, is_safe_so_target, load_so_from, pager_command,
+        so_roots, ManError,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn so_resolves_only_under_the_manual_roots() {
+        // The candidate list began with the bare target, resolved against the
+        // process's working directory, so `man -l page.1` containing
+        // `.so secret/notes.txt` printed that file.
+        let roots = so_roots(Path::new("test_files/man1/cat.1"), &[]);
+        assert_eq!(roots, vec![PathBuf::from("test_files")]);
+
+        // A page only one directory deep has an *empty* grandparent, not none,
+        // and joining a target onto "" gives a working-directory-relative path
+        // -- so the confinement has to drop empty roots, not just refuse None.
+        assert!(so_roots(Path::new("man1/evil.1"), &[]).is_empty());
+        assert!(so_roots(Path::new("evil.1"), &[]).is_empty());
+
+        // The page's own manual root resolves its aliases...
+        assert!(load_so_from(&roots, "man1/cat.1").is_some());
+        // ...but with no root there is nothing to resolve against, however
+        // readable the target is from here.
+        assert!(load_so_from(&[], "man.test.conf").is_none());
+        // And the safety predicate still rejects escapes outright.
+        assert!(load_so_from(&roots, "/etc/passwd").is_none());
+        assert!(load_so_from(&roots, "../../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn a_missing_default_config_is_not_an_error() {
+        // With none of MAN_CONFS present, `man ls` exited 1 before ever
+        // consulting the built-in manual roots -- which is every minimal
+        // container. An explicit -C naming a missing file is still an error.
+        assert!(get_config_file_path(&None).is_ok());
+        assert!(matches!(
+            get_config_file_path(&Some(PathBuf::from("/nonexistent/man.conf"))),
+            Err(ManError::ConfigFileNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn pager_falls_back_to_more_when_unset_or_null() {
+        // POSIX: "If the PAGER variable is null or not set, the command shall
+        // be either more or another paginator." env::var returns Ok("") for a
+        // null PAGER, which produced `man:  command not found`.
+        assert_eq!(pager_command(None), "more -s");
+        assert_eq!(pager_command(Some("")), "more -s");
+        assert_eq!(pager_command(Some("   ")), "more -s");
+    }
+
+    #[test]
+    fn pager_keeps_a_command_string_intact() {
+        // "Any string acceptable as a command_string operand to the sh -c
+        // command shall be valid." This was executed as a program name, so a
+        // conforming value failed with `less -R command not found`. Note no
+        // `-s` is appended: that belongs to our chosen default, not to a user
+        // command that may carry its own quoting or a pipeline.
+        assert_eq!(pager_command(Some("less -R")), "less -R");
+        assert_eq!(
+            pager_command(Some("sed s/a/b/ | more")),
+            "sed s/a/b/ | more"
+        );
+    }
+
+    #[test]
+    fn decode_page_detects_gzip_by_magic_not_extension() {
+        // The decoder used to be chosen from the file extension, so a
+        // compressed page stored under any other name was written to the
+        // terminal as binary.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b".TH T 1\n").unwrap();
+        let gz = enc.finish().unwrap();
+
+        assert_eq!(decode_page(gz, u64::MAX).unwrap(), b".TH T 1\n");
+    }
+
+    #[test]
+    fn decode_page_passes_plain_text_through() {
+        let raw = b".TH T 1\n.SH NAME\n".to_vec();
+        assert_eq!(decode_page(raw.clone(), u64::MAX).unwrap(), raw);
+    }
+
+    #[test]
+    fn decode_page_rejects_compression_it_cannot_read() {
+        // Better a diagnostic naming the format than binary on the terminal,
+        // or a claim that the page is empty.
+        for (magic, name) in [
+            (b"BZh9".as_slice(), "bzip2"),
+            (b"\xfd7zXZ\x00".as_slice(), "xz"),
+            (b"\x28\xb5\x2f\xfd\x00".as_slice(), "zstd"),
+        ] {
+            match decode_page(magic.to_vec(), u64::MAX) {
+                Err(ManError::UnsupportedCompression(f)) => assert_eq!(f, name),
+                other => panic!("expected an unsupported-compression error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_page_reads_every_gzip_member() {
+        // A gzip file may hold several concatenated members. GzDecoder stops
+        // after the first, silently truncating the page; zcat, which this
+        // replaced, decodes all of them.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut gz = Vec::new();
+        for part in [b"first\n".as_slice(), b"second\n".as_slice()] {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(part).unwrap();
+            gz.extend(enc.finish().unwrap());
+        }
+
+        assert_eq!(decode_page(gz, u64::MAX).unwrap(), b"first\nsecond\n");
+    }
 
     /// `.so` must not be usable to read arbitrary files. A man page is
     /// untrusted input, and `.so /etc/passwd` rendered the password file to the
@@ -1154,14 +1443,20 @@ mod tests {
             ),
             (ManError::GetTerminalSize, "failed to get terminal size"),
             (
-                ManError::CommandNotFound("zcat".into()),
-                "zcat command not found",
+                // The surviving producer is the pager, via sh's 126/127; pages
+                // are no longer read by forking zcat.
+                ManError::CommandNotFound("less -R".into()),
+                "less -R command not found",
             ),
             (
                 ManError::NotFound(PathBuf::from("/tmp/x.1")),
                 "file: /tmp/x.1 was not found",
             ),
             (ManError::EmptyPage, "no renderable content in page"),
+            (
+                ManError::UnsupportedCompression("xz".into()),
+                "page is xz-compressed, which is not supported",
+            ),
         ];
 
         for (err, expected) in cases {

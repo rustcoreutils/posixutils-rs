@@ -30,17 +30,99 @@ mod tests {
     }
 
     #[test]
-    fn apropos_with_keywords() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-k", "printf", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -k printf");
-
+    fn apropos_matches_names_and_descriptions() {
+        // -k parsed every page as mdoc, so on a man(7) system nothing ever
+        // matched; and .Nm/.Nd are children of the .Sh NAME block, which the
+        // extractor never descended into, so mdoc pages produced nothing
+        // either. POSIX: the result is equivalent to `grep -Ei` over a summary
+        // database, so both names and descriptions are searched.
+        let (code, out, _) = man(&["-M", "test_files", "-k", "expand", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
         assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
+            out.contains("gzcat(1) - expand compressed files"),
+            "a man(7) page must be searchable: {out}"
         );
+
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-k",
+            "concatenate",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(
+            out.contains("cat(1) - concatenate and print files"),
+            "an mdoc page must be searchable: {out}"
+        );
+    }
+
+    #[test]
+    fn apropos_indexes_architecture_subdirectories() {
+        // -S searches man{N}/{arch}/, so the keyword index has to cover the
+        // same tree: a page reachable by `man -S amd64 cat` was invisible to
+        // `man -k`, which is supposed to index what `man` can display.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-k",
+            "amd64-specific",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("amd64-specific concatenate"), "{out}");
+    }
+
+    #[test]
+    fn apropos_reports_each_operand_that_matched_nothing() {
+        // The status and the diagnostic were computed from the aggregate
+        // result list, so an operand that matched nothing was silently dropped
+        // whenever any other operand matched -- and the exit status was 0.
+        for flag in ["-k", "-f"] {
+            let (code, out, err) = man(&[
+                "-M",
+                "test_files",
+                flag,
+                "cat",
+                "zzzznosuchpage",
+                "-C",
+                "man.test.conf",
+            ]);
+            assert!(out.contains("cat(1)"), "{flag}: stdout: {out}");
+            assert!(
+                err.contains("zzzznosuchpage: "),
+                "{flag}: the unmatched operand must be named: {err}"
+            );
+            assert_eq!(code, Some(1), "{flag}: stdout: {out} stderr: {err}");
+        }
+
+        // All operands matching is still success.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-f",
+            "cat",
+            "gzcat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+    }
+
+    #[test]
+    fn apropos_reports_nothing_appropriate() {
+        let (code, _, err) = man(&[
+            "-M",
+            "test_files",
+            "-k",
+            "zzzznotapageanywhere",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(1));
+        assert!(err.contains("nothing appropriate"), "stderr: {err}");
     }
 
     // -------------------------------------------------------------------------
@@ -62,17 +144,23 @@ mod tests {
     }
 
     #[test]
-    fn whatis_one_argument() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-f", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -f ls");
+    fn whatis_is_an_exact_name_lookup() {
+        // -f shared the substring/ERE matcher with -k, so it listed every page
+        // whose description merely mentioned the operand. POSIX omits -f
+        // deliberately, so whatis(1)'s historical behaviour governs: the
+        // operand must be a page name, whole.
+        let (code, out, _) = man(&["-M", "test_files", "-f", "zcat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "zcat(1) - expand compressed files");
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // A word from the description is not a name.
+        let (code, _, err) = man(&["-M", "test_files", "-f", "expand", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(1));
+        assert!(err.contains("nothing appropriate"), "stderr: {err}");
+
+        // Nor is a prefix of a name.
+        let (code, _, _) = man(&["-M", "test_files", "-f", "zca", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(1));
     }
 
     // -------------------------------------------------------------------------
@@ -95,16 +183,11 @@ mod tests {
 
     #[test]
     fn all_flag_with_names() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-a", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -a ls");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // -a lists every matching page rather than the first. The fixture tree
+        // has cat(1) in both the generic and the amd64 directory.
+        let (code, out, _) = man(&["-M", "test_files", "-a", "-w", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("test_files/man1/cat.1"), "{out}");
     }
 
     // -------------------------------------------------------------------------
@@ -160,15 +243,13 @@ mod tests {
 
     #[test]
     fn copy_flag_with_name() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-c", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -c ls");
-
+        // -c writes the rendered page to stdout instead of paging it.
+        let (code, out, _) = man(&["-M", "test_files", "-c", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
         assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
+            out.ends_with('\n'),
+            "a rendered page ends with a newline: {out:?}"
         );
     }
 
@@ -191,20 +272,29 @@ mod tests {
     }
 
     #[test]
-    fn synopsis_with_name() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-h", "printf", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -h printf");
-
-        println!("Output: \"{}\"", String::from_utf8(output.stdout).unwrap());
-        println!("Error: \"{}\"", String::from_utf8(output.stderr).unwrap());
-
+    fn synopsis_renders_for_both_page_formats() {
+        // -h routed man(7) pages into the mdoc engine, so it produced zero
+        // bytes and exit 0 for every one of them.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-c",
+            "-h",
+            "gzcat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("SYNOPSIS"), "man(7) synopsis: {out}");
+        assert!(out.contains("gzcat"), "man(7) synopsis: {out}");
         assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
+            !out.contains("Expand files to standard output"),
+            "the body must not be included: {out}"
         );
+
+        let (code, out, _) = man(&["-M", "test_files", "-c", "-h", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("SYNOPSIS"), "mdoc synopsis: {out}");
     }
 
     // -------------------------------------------------------------------------
@@ -227,53 +317,93 @@ mod tests {
 
     #[test]
     fn local_file_without_other_args() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-l", "test.mdoc", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -l tests/test_data.1");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // This named test.mdoc, which does not exist in the crate, so it only
+        // ever exercised the not-found path -- and passed because exit 1 was
+        // accepted. Render a file that is actually there.
+        let (code, out, _) = man(&["-c", "-l", "test_files/man1/cat.1", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
     }
 
     // -------------------------------------------------------------------------
     // -M / --override_paths
     // -------------------------------------------------------------------------
-    #[test]
-    fn override_paths_single() {
+    /// Run man with the given arguments, returning (exit code, stdout, stderr).
+    /// Tests that pass `-M test_files` never reach the host's manual tree, so
+    /// their result does not depend on what is installed.
+    fn man(args: &[&str]) -> (Option<i32>, String, String) {
         let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-M", "/tmp", "ls", "-C", "man.test.conf"])
+            .args(args)
             .output()
-            .expect("Failed to run man -M /tmp ls");
+            .expect("Failed to run man");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+    #[test]
+    fn so_alias_resolves_in_a_custom_root() {
+        // `.so` was resolved against the hard-coded system roots only, so an
+        // alias page under -M could not find its target.
+        let (code, out, _) = man(&["-M", "test_files", "-c", "catalias", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
+    }
+
+    #[test]
+    fn override_paths_replaces_the_search_list() {
+        // -M wrote its value into the MANPATH environment variable and then
+        // every source was concatenated anyway, so it augmented the list
+        // instead of replacing it and the built-in roots were always searched:
+        // `man -M /empty -w ls` still found /usr/share/man/man1/ls.1.gz.
+        let (code, out, _) = man(&["-M", "test_files", "-w", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
+
+        let (code, out, err) = man(&["-M", "/nonexistent", "-w", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(1), "stdout: {out}");
+        assert!(err.contains("not found"), "stderr: {err}");
+    }
+
+    #[test]
+    fn augment_paths_still_adds_to_the_search_list() {
+        let (code, out, _) = man(&[
+            "-M",
+            "/nonexistent",
+            "-m",
+            "test_files",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
     }
 
     #[test]
     fn override_paths_multiple() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args([
-                "-M",
-                "/tmp:/nonexistent:/usr/local/man",
-                "ls",
-                "-C",
-                "man.test.conf",
-            ])
-            .output()
-            .expect("Failed to run man -M with multiple paths ls");
+        // A ':'-separated value is split into several roots, and only those.
+        let (code, out, _) = man(&[
+            "-M",
+            "/nonexistent:test_files",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
+    }
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+    #[test]
+    fn search_paths_are_not_reported_twice() {
+        // A root named by both the config and the built-in list produced one
+        // -w line per source.
+        let (_, out, _) = man(&["-w", "cat", "-C", "man.test.conf", "-M", "test_files"]);
+        assert_eq!(out.lines().count(), 1, "stdout: {out}");
     }
 
     // -------------------------------------------------------------------------
@@ -281,16 +411,19 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn augment_paths_single() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-m", "/opt/mylocalman", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -m /opt/mylocalman ls");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // -m adds a root in front of the existing list.
+        let (code, out, _) = man(&[
+            "-M",
+            "/nonexistent",
+            "-m",
+            "test_files",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
     }
 
     #[test]
@@ -306,11 +439,20 @@ mod tests {
             .output()
             .expect("Failed to run man -m /first/path:/second/path ls");
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // A ':'-separated -m value contributes several roots.
+        let (code, out, _) = man(&[
+            "-M",
+            "/nonexistent",
+            "-m",
+            "/first/path:test_files",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
+        let _ = output;
     }
 
     // -------------------------------------------------------------------------
@@ -332,17 +474,61 @@ mod tests {
     }
 
     #[test]
-    fn subsection_flag_with_name() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-S", "amd64", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -S amd64 ls");
+    fn subsection_selects_the_architecture_page() {
+        // -S wrote a MACHINE environment variable that nothing in the process
+        // read, so the option was accepted and did nothing. It now names an
+        // architecture subdirectory, as in mandoc and the BSDs, searched ahead
+        // of the section directory.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-S",
+            "amd64",
+            "-c",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("Architecture-specific page."), "{out}");
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // Without -S, the generic page.
+        let (_, out, _) = man(&["-M", "test_files", "-c", "cat", "-C", "man.test.conf"]);
+        assert!(!out.contains("Architecture-specific page."), "{out}");
+
+        // -S names a preference, not a filter: an architecture with no page of
+        // its own still finds the generic one.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-S",
+            "sparc64",
+            "-c",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate"), "{out}");
+    }
+
+    #[test]
+    fn subsection_flag_with_name() {
+        // An architecture with no page of its own still resolves the generic
+        // one; the selecting case is covered by
+        // subsection_selects_the_architecture_page.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-S",
+            "sparc64",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
     }
 
     // -------------------------------------------------------------------------
@@ -358,23 +544,51 @@ mod tests {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("invalid value '99' for '-s <SECTION>'"),
+            stderr.contains("invalid value '99' for '-s <SECTION>'")
+                && stderr.contains("invalid section: 99"),
             "Expected 'Invalid section: 99', got:\n{stderr}"
         );
     }
 
     #[test]
-    fn section_valid() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-s", "s1", "ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -s 1 ls");
+    fn section_accepts_posix_numbers() {
+        // Section was a clap ValueEnum, whose derived value names are the
+        // variant names, so the accepted spellings were `s1`..`s9` and
+        // `man -s 1 ls` was rejected outright. This test used to pass "s1"
+        // under an .expect string claiming it ran `man -s 1 ls`.
+        let (code, out, _) = man(&[
+            "-M",
+            "test_files",
+            "-s",
+            "1",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert_eq!(out.trim(), "test_files/man1/cat.1");
 
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // And it really filters: cat is only in section 1.
+        let (code, _, _) = man(&[
+            "-M",
+            "test_files",
+            "-s",
+            "2",
+            "-w",
+            "cat",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(1));
+    }
+
+    #[test]
+    fn section_rejects_the_value_enum_spelling() {
+        // `s1` was never a section anywhere; it was an artifact of the derive.
+        let (code, _, err) = man(&["-s", "s1", "ls", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(2));
+        assert!(err.contains("invalid section: s1"), "stderr: {err}");
     }
 
     // -------------------------------------------------------------------------
@@ -382,16 +596,10 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn list_pathnames_flag_no_name() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["-w", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man -w");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // -w with no operand is an error, like every other mode.
+        let (code, _, err) = man(&["-w", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(1));
+        assert!(err.contains("no names specified"), "stderr: {err}");
     }
 
     #[test]
@@ -436,30 +644,29 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn single_name_argument() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["ls", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man ls");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        let (code, out, _) = man(&["-M", "test_files", "-c", "cat", "-C", "man.test.conf"]);
+        assert_eq!(code, Some(0), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
     }
 
     #[test]
     fn multiple_name_arguments() {
-        let output = Command::new(env!("CARGO_BIN_EXE_man"))
-            .args(["ls", "cat", "nonexistent", "-C", "man.test.conf"])
-            .output()
-            .expect("Failed to run man ls cat nonexistent");
-
-        assert!(
-            output.status.success() || output.status.code() == Some(1),
-            "Expected exit code 0 or 1, got: {:?}",
-            output.status.code()
-        );
+        // Every operand is attempted; one failure is reported but does not
+        // abort the rest, and the overall status is still non-zero.
+        let (code, out, err) = man(&[
+            "-M",
+            "test_files",
+            "-c",
+            "cat",
+            "gzcat",
+            "nonexistent",
+            "-C",
+            "man.test.conf",
+        ]);
+        assert_eq!(code, Some(1), "stdout: {out}");
+        assert!(out.contains("concatenate and print files"), "{out}");
+        assert!(out.contains("expand compressed files"), "{out}");
+        assert!(err.contains("nonexistent"), "stderr: {err}");
     }
 
     // -------------------------------------------------------------------------
@@ -499,16 +706,9 @@ mod tests {
         );
     }
 
-    // Audit #2: a single line with an absurd number of nested partial macros is
-    // rejected up front (the PEG grammar otherwise backtracks exponentially and
-    // overflows the stack). Must fail fast with a parse error, not hang/crash.
-    #[test]
-    fn deeply_nested_macros_rejected() {
-        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh D\n");
-        body.push_str(&".Aq ".repeat(20_000));
-        body.push_str("x\n");
-        let page = write_temp_page("deep", &body);
-
+    /// Run `man -c -l` on a generated page and return (exit code, stderr).
+    fn run_on_page(tag: &str, body: &str) -> (Option<i32>, String, std::time::Duration) {
+        let page = write_temp_page(tag, body);
         let start = std::time::Instant::now();
         let output = Command::new(env!("CARGO_BIN_EXE_man"))
             .args(["-c", "-l"])
@@ -518,20 +718,77 @@ mod tests {
             .expect("Failed to run man -c -l");
         let elapsed = start.elapsed();
         let _ = std::fs::remove_file(&page);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            elapsed,
+        )
+    }
 
-        // The hand-written parser has no exponential backtracking, so a
-        // pathologically nested line is handled quickly and without crashing —
-        // no panic (101) or stack overflow (134), and no need for the old
-        // nesting-limit rejection.
-        let code = output.status.code();
+    // A single line nesting partial-implicit macros past the parser's cap must
+    // be reported, not aborted. The AST is walked recursively when it is cloned,
+    // formatted and dropped, so an uncapped page overflowed the stack — which
+    // raises SIGABRT and cannot be caught.
+    //
+    // The repeated token must NOT carry a leading dot: `.Aq .Aq .Aq` tokenizes
+    // to `.Aq` tokens, which are not recognised as container macros and become
+    // plain text two levels deep. That is why the previous version of this test
+    // passed while a 10,000-deep page aborted the process.
+    #[test]
+    fn deeply_nested_inline_macros_rejected() {
+        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh D\n.");
+        body.push_str(&"Op ".repeat(10_000));
+        body.push_str("x\n");
+        let (code, stderr, elapsed) = run_on_page("deepinline", &body);
+
+        assert_eq!(
+            code,
+            Some(1),
+            "expected a diagnostic, got {code:?}: {stderr}"
+        );
         assert!(
-            matches!(code, Some(0) | Some(1)),
-            "must not crash on deep nesting, got exit {code:?}"
+            stderr.contains("nesting"),
+            "stderr must name the cause, got: {stderr}"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
-            "must handle deep nesting fast, took {elapsed:?}"
+            "must reject deep nesting fast, took {elapsed:?}"
         );
+    }
+
+    // The other depth source: one open block per line. This nests through the
+    // frame stack with no inline recursion at all, so a cap on the inline parser
+    // alone would still overflow here.
+    #[test]
+    fn deeply_nested_blocks_rejected() {
+        let mut body = String::from(".Dd x\n.Dt T 1\n.Os\n.Sh D\n");
+        body.push_str(&".Ao\n".repeat(20_000));
+        let (code, stderr, elapsed) = run_on_page("deepblock", &body);
+
+        assert_eq!(
+            code,
+            Some(1),
+            "expected a diagnostic, got {code:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("nesting"),
+            "stderr must name the cause, got: {stderr}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must reject deep nesting fast, took {elapsed:?}"
+        );
+    }
+
+    // Ordinary nesting must keep working: the cap is far above what real pages
+    // use, so a handful of levels renders normally.
+    #[test]
+    fn ordinary_nesting_still_renders() {
+        let body = String::from(
+            ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Op Op Op Op Op deep\n.Ao\n.Bo\n.Po\ntext\n.Pc\n.Bc\n.Ac\n",
+        );
+        let (code, stderr, _) = run_on_page("shallow", &body);
+        assert_eq!(code, Some(0), "expected success, got {code:?}: {stderr}");
     }
 
     // -------------------------------------------------------------------------
@@ -794,7 +1051,12 @@ mod malformed {
                 continue;
             }
             let output = Command::new(env!("CARGO_BIN_EXE_man"))
-                .args(["-l".as_ref(), path.as_os_str()])
+                .args([
+                    "-C".as_ref(),
+                    "man.test.conf".as_ref(),
+                    "-l".as_ref(),
+                    path.as_os_str(),
+                ])
                 .env("COLUMNS", "40")
                 .output()
                 .unwrap_or_else(|e| panic!("failed to run man on {}: {e}", path.display()));
@@ -818,6 +1080,6 @@ mod malformed {
             checked += 1;
         }
 
-        assert!(checked >= 20, "corpus shrank: only {checked} files");
+        assert!(checked >= 23, "corpus shrank: only {checked} files");
     }
 }

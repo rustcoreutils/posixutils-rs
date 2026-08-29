@@ -8,6 +8,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# gzip is the only compression used for installed manual pages. flate2 is
+# already in the workspace dependency graph (pax, xform), so this adds no new
+# crate -- and it replaces a fork+exec of zcat per page.
+flate2 = "1"
 clap = { workspace = true, features = ["env"] }
 gettext-rs.workspace = true
 libc.workspace = true

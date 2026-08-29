@@ -58,6 +58,46 @@ pub fn format_man7(content: &str, settings: &FormattingSettings) -> Option<Vec<u
     Man7Formatter::new(settings).render(content)
 }
 
+/// Render only the SYNOPSIS section of a man(7) page, for `-h`.
+///
+/// The section's source lines are sliced out and handed to the ordinary
+/// renderer rather than threading a mode flag through it, which keeps one
+/// rendering path. The slice carries no `.TH`, so no header or footer is set --
+/// matching the mdoc synopsis path, which sets neither.
+pub fn format_man7_synopsis(content: &str, settings: &FormattingSettings) -> Option<Vec<u8>> {
+    Man7Formatter::new(settings).render(&synopsis_source(content)?)
+}
+
+/// The source lines of the first `.SH SYNOPSIS` section, heading included.
+fn synopsis_source(content: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut in_synopsis = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed
+            .strip_prefix('.')
+            .or_else(|| trimmed.strip_prefix('\''))
+        {
+            let rest = rest.trim_start();
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if name == "SH" {
+                let title = macro_args(rest[name.len()..].trim_start()).join(" ");
+                in_synopsis = title.eq_ignore_ascii_case("SYNOPSIS");
+                if !in_synopsis && !out.is_empty() {
+                    break;
+                }
+            }
+        }
+        if in_synopsis {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
 /// Map a manual section number to its conventional volume title (used to center
 /// the page header, matching the mdoc renderer's headers).
 fn volume_title(section: &str) -> &'static str {
@@ -77,6 +117,84 @@ fn volume_title(section: &str) -> &'static str {
 
 /// Tokenize a macro line into the macro name and its arguments, honoring double
 /// quotes (so `.SH "EXIT STATUS"` is one argument).
+/// Extract `(names, description)` from a man(7) NAME section.
+///
+/// A man(7) NAME section is `.SH NAME` followed by `name[, name…] \- text`.
+/// That shape is fixed enough to read directly, and the keyword scan visits
+/// every installed page -- running the full renderer over each one to recover
+/// two strings is what made it slow. Returns None when the page has no NAME
+/// section or no name in it.
+pub fn extract_name(content: &str) -> Option<(Vec<String>, String)> {
+    let mut in_name = false;
+    let mut collected = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed
+            .strip_prefix('.')
+            .or_else(|| trimmed.strip_prefix('\''))
+        {
+            let rest = rest.trim_start();
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if name == "SH" || name == "SS" {
+                if in_name {
+                    break;
+                }
+                let title = macro_args(rest[name.len()..].trim_start()).join(" ");
+                in_name = name == "SH" && title.eq_ignore_ascii_case("NAME");
+                continue;
+            }
+            if !in_name {
+                continue;
+            }
+            // Font macros carry the text as arguments: pages do write `.B ls`.
+            if matches!(
+                name,
+                "B" | "I" | "BR" | "IR" | "RB" | "RI" | "BI" | "IB" | "SM" | "SB"
+            ) {
+                let args = macro_args(rest[name.len()..].trim_start()).join(" ");
+                if !args.is_empty() {
+                    collected.push_str(&args);
+                    collected.push(' ');
+                }
+            }
+            continue;
+        }
+        if in_name && !trimmed.is_empty() {
+            collected.push_str(trimmed);
+            collected.push(' ');
+        }
+    }
+
+    if collected.trim().is_empty() {
+        return None;
+    }
+
+    // Split names from description at the mdoc-style dash. Match the escaped
+    // form first: a name may itself contain a hyphen (git-log), so only a dash
+    // that stands as its own word can be the separator.
+    let text = collected.trim();
+    let (left, right) = if let Some(i) = text.find("\\-") {
+        (&text[..i], &text[i + 2..])
+    } else if let Some(i) = text.find(" - ") {
+        (&text[..i], &text[i + 3..])
+    } else {
+        (text, "")
+    };
+
+    let names: Vec<String> = left
+        .split(',')
+        .map(|n| replace_escapes(n.trim()).trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    if names.is_empty() {
+        return None;
+    }
+
+    Some((names, replace_escapes(right.trim()).trim().to_string()))
+}
+
 fn macro_args(rest: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut cur = String::new();
@@ -225,7 +343,7 @@ impl Man7Formatter {
                 // Relative to the paragraph margin, not to wherever the previous
                 // tag's body left the margin.
                 self.term.set_offset(self.para_base);
-                self.tp_body_indent = Some(self.para_base + extra);
+                self.tp_body_indent = Some(self.para_base.saturating_add(extra));
             }
             "IP" => self.do_ip(args),
             "HP" => self.term.blank_line(),
@@ -298,7 +416,7 @@ impl Man7Formatter {
         // As for `.TP`: relative to the paragraph margin, and filled rather than
         // emitted verbatim. pod2man writes `.IP` tags that list every option a
         // paragraph covers; openssl-s_client(1) has one 490 columns long.
-        let body_indent = self.para_base + extra;
+        let body_indent = self.para_base.saturating_add(extra);
         if let Some(tag) = tag {
             let tag = self.resolve(&tag);
             self.term.set_offset(self.para_base);
@@ -426,6 +544,111 @@ mod tests {
 
     fn render(content: &str) -> String {
         String::from_utf8(format_man7(content, &SETTINGS).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn synopsis_mode_renders_only_the_synopsis_section() {
+        // `-h` was routed away from this renderer into the mdoc engine, which
+        // knows none of these macros: every man(7) page produced zero bytes
+        // and exit 0.
+        let page = ".TH LS 1\n.SH NAME\nls \\- list\n.SH SYNOPSIS\n.B ls\n[\\fIoption\\fR]...\n.SH DESCRIPTION\nLong prose.\n";
+        let out = String::from_utf8(format_man7_synopsis(page, &SETTINGS).unwrap()).unwrap();
+        assert!(out.contains("SYNOPSIS"), "{out}");
+        assert!(out.contains("ls"), "{out}");
+        assert!(!out.contains("Long prose."), "body leaked: {out}");
+        // The slice carries no .TH, so the page is not framed.
+        assert!(!out.contains("LS(1)"), "header must be suppressed: {out}");
+    }
+
+    #[test]
+    fn synopsis_mode_reports_a_page_with_none() {
+        assert!(format_man7_synopsis(".TH T 1\n.SH NAME\nt \\- t\n", &SETTINGS).is_none());
+    }
+
+    #[test]
+    fn extract_name_reads_a_man7_name_section() {
+        // man(7) pages carry no .Nm/.Nd, so the keyword scan -- which parsed
+        // every page as mdoc -- found nothing on a Linux system.
+        let (names, desc) = extract_name(
+            ".TH GZCAT 1\n.SH NAME\ngzcat, zcat \\- expand compressed files\n.SH DESCRIPTION\nBody.\n",
+        )
+        .unwrap();
+        assert_eq!(names, vec!["gzcat", "zcat"]);
+        assert_eq!(desc, "expand compressed files");
+    }
+
+    #[test]
+    fn extract_name_reads_a_font_macro_name() {
+        // Pages do write `.B ls` inside NAME.
+        let (names, desc) =
+            extract_name(".TH LS 1\n.SH NAME\n.B ls\n\\- list directory contents\n").unwrap();
+        assert_eq!(names, vec!["ls"]);
+        assert_eq!(desc, "list directory contents");
+    }
+
+    #[test]
+    fn extract_name_keeps_hyphenated_names() {
+        // The separator is a dash standing alone; a name may contain one.
+        let (names, _) = extract_name(".TH X 1\n.SH NAME\ngit-log \\- show logs\n").unwrap();
+        assert_eq!(names, vec!["git-log"]);
+    }
+
+    #[test]
+    fn extract_name_stops_at_the_next_section() {
+        let (_, desc) =
+            extract_name(".TH X 1\n.SH NAME\nx \\- short\n.SH DESCRIPTION\nlong prose here\n")
+                .unwrap();
+        assert!(!desc.contains("long prose"), "description leaked: {desc}");
+    }
+
+    #[test]
+    fn extract_name_reports_a_page_without_one() {
+        assert!(extract_name(".TH X 1\n.SH DESCRIPTION\nno name section\n").is_none());
+    }
+
+    #[test]
+    fn an_absurd_indent_is_clamped_not_fatal() {
+        // `.RS 900000000000` reached `" ".repeat(900000000006)` in the
+        // backend's line filler: "memory allocation of 900000000006 bytes
+        // failed", which aborts the process. roff puts no upper bound on an
+        // indent, so this is a malformed page rather than an invalid one and is
+        // clamped to the right margin instead of rejected.
+        let out = render(".TH T 1\n.SH D\n.RS 900000000000\nhello\n");
+        assert!(out.contains("hello"), "{out}");
+        assert!(
+            out.lines().all(|l| l.chars().count() <= SETTINGS.width),
+            "clamped output must stay within the page width: {out}"
+        );
+    }
+
+    #[test]
+    fn chained_relative_indents_are_clamped() {
+        // push_indent accumulated with `+`, so a long chain overflowed usize in
+        // a debug build and produced an unbounded margin in release.
+        let mut src = String::from(".TH T 1\n.SH D\n");
+        for _ in 0..1000 {
+            src.push_str(".RS 1000000000\n");
+        }
+        src.push_str("hello\n");
+        let out = render(&src);
+        assert!(
+            out.lines().all(|l| l.chars().count() <= SETTINGS.width),
+            "clamped output must stay within the page width: {out}"
+        );
+    }
+
+    #[test]
+    fn tp_and_ip_indents_are_bounded() {
+        for src in [
+            ".TH T 1\n.SH D\n.TP 900000000000\ntag\nbody\n",
+            ".TH T 1\n.SH D\n.IP tag 900000000000\nbody\n",
+        ] {
+            let out = render(src);
+            assert!(
+                out.lines().all(|l| l.chars().count() <= SETTINGS.width),
+                "{src:?} produced an over-wide line: {out}"
+            );
+        }
     }
 
     #[test]

@@ -50,6 +50,17 @@ const MAX_OUTPUT_BYTES: usize = 64 << 20;
 /// Maximum `.while` iterations, on top of the global budget.
 const MAX_WHILE_ITERATIONS: usize = 100_000;
 
+/// Maximum nesting of `.while` bodies.
+///
+/// `do_while` runs its body through `process_line`, which dispatches a nested
+/// `.while` -- or a user macro containing one -- straight back into `do_while`,
+/// costing a native stack frame pair per level with nothing bounding it. A
+/// seven-line page whose `.de` body is `.while \n[i] \{ .R \}` exhausted the
+/// stack, and that aborts the process rather than unwinding, so no caller can
+/// contain it. The `steps`/`out_bytes` budgets count work rather than frames,
+/// and MAX_WHILE_ITERATIONS bounds a single loop instance, not the nesting.
+const MAX_WHILE_DEPTH: u32 = 64;
+
 /// A user-defined macro body (the lines between `.de NAME` and `..`).
 type MacroBody = Vec<String>;
 
@@ -74,8 +85,9 @@ pub struct Roff {
     ds: HashMap<String, String>,
     /// User-defined macros (`.de`/`.am`).
     de: HashMap<String, MacroBody>,
-    /// Result of the most recent `.if`/`.ie`, consumed by `.el`.
-    last_cond: bool,
+    /// Conditions of the `.ie` requests whose `.el` has not been read yet, one
+    /// per nesting level. See [`Roff::do_el`].
+    cond_stack: Vec<bool>,
     /// Emitted output lines.
     out: Vec<String>,
     /// The active output diversion, if any (`.di`/`.da`).
@@ -90,6 +102,8 @@ pub struct Roff {
     out_bytes: usize,
     /// Columns available to body text, for tbl text-block layout.
     line_length: usize,
+    /// Nesting depth of `.while` bodies. See [`MAX_WHILE_DEPTH`].
+    while_depth: u32,
 }
 
 /// Preprocess `input`, resolving `.so` targets through `loader`.
@@ -325,10 +339,13 @@ impl Roff {
         let cur = *self.nr.get(name).unwrap_or(&0);
         // A leading `+`/`-` increments/decrements the existing value by the
         // operand; otherwise the register is set to the absolute value.
+        // Saturating, like every other arithmetic site in the front end: both
+        // operands come from the page, so `.nr N 9223372036854775807` followed
+        // by `.nr N +1` panicked under overflow checks and wrapped in release.
         let new = if let Some(e) = expr.strip_prefix('+') {
-            eval_numeric(e).map(|v| cur + v)
+            eval_numeric(e).map(|v| cur.saturating_add(v))
         } else if let Some(e) = expr.strip_prefix('-') {
-            eval_numeric(e).map(|v| cur - v)
+            eval_numeric(e).map(|v| cur.saturating_sub(v))
         } else {
             eval_numeric(expr)
         };
@@ -363,13 +380,29 @@ impl Roff {
     fn do_if(&mut self, args: &str, queue: &mut Vec<String>, is_ie: bool) {
         let (cond, rest) = self.eval_condition(args);
         if is_ie {
-            self.last_cond = cond;
+            self.cond_stack.push(cond);
         }
         self.run_conditional_body(cond, rest, queue);
     }
 
+    /// `.el` runs when its matching `.ie` did not.
+    ///
+    /// The condition is popped from a stack rather than read from a single
+    /// slot. The queue is flat and `.el` is matched by position, but that is
+    /// what makes the stack correct: `run_conditional_body` either pushes an
+    /// `.ie` body to the front of the queue -- where it runs to completion
+    /// before anything that followed the `.ie`, including the `.el` line -- or
+    /// discards it, and `collect_body` removes it from the queue either way. So
+    /// the pushes and pops of a well-formed page nest exactly, and an `.el`
+    /// always pops its own `.ie`. With one shared slot an inner `.ie` overwrote
+    /// the outer result before the outer `.el` was ever read, and both branches
+    /// were emitted -- the shape every pod2man and groff preamble uses.
+    ///
+    /// A plain `.if` opens no else, and an unmatched `.el` is a page error
+    /// (groff warns "unbalanced .el request"); its body is dropped rather than
+    /// run against a stale condition.
     fn do_el(&mut self, args: &str, queue: &mut Vec<String>) {
-        let cond = !self.last_cond;
+        let cond = self.cond_stack.pop().map(|c| !c).unwrap_or(false);
         self.run_conditional_body(cond, args.to_string(), queue);
     }
 
@@ -430,7 +463,14 @@ impl Roff {
     /// loops.
     fn do_while(&mut self, args: &str, queue: &mut Vec<String>) {
         let (_, rest) = self.eval_condition(args);
+        // Consume the body first, so a loop refused for depth does not leak it
+        // back into the input stream as ordinary lines.
         let body = Self::collect_body(&rest, queue);
+
+        if self.while_depth >= MAX_WHILE_DEPTH {
+            return;
+        }
+        self.while_depth += 1;
 
         let mut iters = 0;
         while self.eval_condition(args).0 {
@@ -449,6 +489,8 @@ impl Roff {
                 self.process_line(l, &mut subq);
             }
         }
+
+        self.while_depth -= 1;
     }
 
     /// `.di NAME` / `.da NAME` start (or, with no name, end) an output diversion.

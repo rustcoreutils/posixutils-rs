@@ -96,6 +96,57 @@ fn ie_el_pair() {
 }
 
 #[test]
+fn a_nested_ie_does_not_clobber_the_pending_else() {
+    // `.ie` bodies are pushed to the front of the queue and so run before the
+    // matching `.el` line is read. With one shared `last_cond` slot the inner
+    // `.ie` overwrote the outer result and both branches were emitted. groff
+    // 1.23 prints "INNER-ELSE\ntail"; this printed
+    // "INNER-ELSE\nOUTER-ELSE\ntail". pod2man and groff preambles are full of
+    // this shape.
+    let src = ".ie 1 \\{\\\n.ie 0 INNER-THEN\n.el INNER-ELSE\n\\}\n.el OUTER-ELSE\ntail\n";
+    assert_eq!(run(src), "INNER-ELSE\ntail\n");
+}
+
+#[test]
+fn a_false_outer_conditional_skips_the_whole_nest() {
+    // The inner `.ie`/`.el` never execute, so they must not push or pop, and
+    // the outer `.el` still sees its own condition.
+    let src = ".ie 0 \\{\\\n.ie 1 INNER-THEN\n.el INNER-ELSE\n\\}\n.el OUTER-ELSE\ntail\n";
+    assert_eq!(run(src), "OUTER-ELSE\ntail\n");
+}
+
+#[test]
+fn an_el_without_an_ie_drops_its_body() {
+    // A plain `.if` opens no else. Reusing a stale condition here is how the
+    // single-slot version leaked one conditional's result into another.
+    assert_eq!(run(".if 1 yes\n.el no\ntail\n"), "yes\ntail\n");
+}
+
+#[test]
+fn register_increment_saturates() {
+    // The one non-saturating arithmetic site in the front end: this panicked
+    // under `overflow-checks` and wrapped to i64::MIN in release.
+    assert_eq!(
+        run(".nr N 9223372036854775807\n.nr N +1\n\\n(N\n"),
+        "9223372036854775807\n"
+    );
+    assert_eq!(
+        run(".nr N -9223372036854775807\n.nr N -2\n\\n(N\n"),
+        "-9223372036854775808\n"
+    );
+}
+
+#[test]
+fn nested_while_recursion_is_bounded() {
+    // A `.while` whose body calls a macro containing the same `.while` costs a
+    // native frame pair per level: this overflowed the stack, which aborts the
+    // process (rc 134) rather than unwinding. It only has to return.
+    let src = ".de R\n.nr i 1\n.while \\\\n[i] \\\\{\\\\\n.R\n\\\\}\n..\n.R\n";
+    let out = run(src);
+    assert!(out.len() <= 80 << 20, "output should stay bounded");
+}
+
+#[test]
 fn if_block_braces() {
     let input = ".if 1 \\{\\\n.ds X a\n\\*X\\}\n";
     // The block body runs; X is defined and interpolated.

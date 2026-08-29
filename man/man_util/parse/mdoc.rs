@@ -28,28 +28,64 @@ struct Frame {
     nodes: Vec<Element>,
 }
 
+/// Maximum nesting of blocks and inline enclosures before a document is
+/// rejected.
+///
+/// The AST is walked recursively when it is cloned, formatted and dropped, so
+/// its depth is bounded here rather than by a guard at each walker: a stack
+/// overflow aborts the process outright and no caller can catch it. Real pages
+/// nest well under ten levels, and the roff expression parser bounds its own
+/// recursion at 64.
+const MAX_NEST: usize = 128;
+
+/// A document nested deeper than [`MAX_NEST`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct NestingTooDeep;
+
+impl std::fmt::Display for NestingTooDeep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "macro nesting deeper than {MAX_NEST} levels")
+    }
+}
+
+impl std::error::Error for NestingTooDeep {}
+
 /// Parse an mdoc document into the AST. Coverage is being grown to parity with
 /// the pest parser; unimplemented macros currently degrade to text.
-pub fn parse_mdoc_v2(input: &str) -> MdocDocument {
+pub fn parse_mdoc_v2(input: &str) -> Result<MdocDocument, NestingTooDeep> {
     let prepared = prepare_document(input);
     let mut p = Parser {
         stack: vec![Frame {
             mac: None,
             nodes: Vec::new(),
         }],
+        inline_depth: 0,
+        too_deep: false,
     };
 
     for line in prepared.lines() {
         p.line(line);
     }
 
-    MdocDocument {
-        elements: p.finish(),
+    if p.too_deep {
+        // Return before `finish()` assembles the tree. Every frame still held
+        // by `p` is shallower than MAX_NEST, so dropping it here cannot
+        // overflow the stack either.
+        return Err(NestingTooDeep);
     }
+
+    Ok(MdocDocument {
+        elements: p.finish(),
+    })
 }
 
 struct Parser {
     stack: Vec<Frame>,
+    /// Inline-enclosure recursion depth within the line being parsed.
+    inline_depth: usize,
+    /// Set once [`MAX_NEST`] was exceeded, so the document is rejected rather
+    /// than silently truncated.
+    too_deep: bool,
 }
 
 impl Parser {
@@ -70,25 +106,58 @@ impl Parser {
         }
     }
 
-    /// Open a new implicit block, after closing the blocks it terminates.
-    fn open_block(&mut self, mac: Macro, closes: &[MacroPred]) {
+    /// Close every open block down to (but not including) the innermost frame
+    /// satisfying `stop`, or to the document root if none does.
+    ///
+    /// A section or subsection heading ends the blocks it encloses. Stopping at
+    /// the first frame that was not itself a heading left a `.Sh` nested inside
+    /// an unterminated `.Bl` or `.Bd`, so the new section and everything after
+    /// it rendered as list-item body. mandoc rewinds unconditionally here.
+    fn unwind_to(&mut self, stop: MacroPred) {
         while self.stack.len() > 1 {
-            let top_is_closable = self
+            let at_stop = self
                 .stack
                 .last()
                 .unwrap()
                 .mac
                 .as_ref()
-                .map(|m| closes.iter().any(|f| f(m)))
+                .map(stop)
                 .unwrap_or(false);
-            if !top_is_closable {
+            if at_stop {
                 break;
             }
             self.close_top();
         }
+    }
+
+    /// Whether one more level of nesting is allowed, recording the overflow so
+    /// the caller can reject the document.
+    ///
+    /// The AST depth at any moment is the open-frame count plus the inline
+    /// recursion depth, so one budget covers both sources: `.Op Op Op …` on a
+    /// single line, and `.Ao` repeated on separate lines.
+    fn nest_ok(&mut self) -> bool {
+        if self.stack.len() + self.inline_depth >= MAX_NEST {
+            self.too_deep = true;
+            return false;
+        }
+        true
+    }
+
+    /// Push a new open block. Refused past [`MAX_NEST`].
+    fn open_frame(&mut self, mac: Macro) {
+        self.open_frame_with(mac, Vec::new());
+    }
+
+    /// Push a new open block that already has children. Refused past
+    /// [`MAX_NEST`].
+    fn open_frame_with(&mut self, mac: Macro, nodes: Vec<Element>) {
+        if !self.nest_ok() {
+            return;
+        }
         self.stack.push(Frame {
             mac: Some(mac),
-            nodes: Vec::new(),
+            nodes,
         });
     }
 
@@ -102,46 +171,43 @@ impl Parser {
         self.stack.last_mut().unwrap().nodes.push(node);
     }
 
-    /// Close the nearest explicit block matching `is_match` (and any frames
-    /// nested inside it), for `.Ed`/`.Ef`/`.Ek`.
-    fn close_explicit(&mut self, is_match: MacroPred) {
-        while self.stack.len() > 1 {
-            let matched = self
-                .stack
-                .last()
-                .unwrap()
-                .mac
-                .as_ref()
-                .map(is_match)
-                .unwrap_or(false);
+    /// Index of the innermost open frame whose macro satisfies `is_match`. The
+    /// document root has `mac == None` and so never matches.
+    fn find_open(&self, is_match: MacroPred) -> Option<usize> {
+        self.stack
+            .iter()
+            .rposition(|f| f.mac.as_ref().map(is_match).unwrap_or(false))
+    }
+
+    /// Close the innermost frame satisfying `is_match`, and every frame nested
+    /// inside it, applying `tail` to that frame just before it closes.
+    ///
+    /// Returns false and changes nothing when no such frame is open, so a stray
+    /// `.Ed`/`.Ec`/`.Re`/`.Fc` is ignored the way mandoc ignores it. Searching
+    /// before unwinding is the point: closing frames while looking for the match
+    /// destroyed every enclosing block back to the document root whenever the
+    /// match did not exist, so one stray closer moved the rest of the page out
+    /// of the section it was written in.
+    fn close_matching(&mut self, is_match: MacroPred, tail: impl FnOnce(&mut Frame)) -> bool {
+        let Some(i) = self.find_open(is_match) else {
+            return false;
+        };
+        while self.stack.len() > i + 1 {
             self.close_top();
-            if matched {
-                break;
-            }
         }
+        tail(self.stack.last_mut().unwrap());
+        self.close_top();
+        true
     }
 
     /// Close a block-partial-explicit enclosure: the closer node becomes the
     /// opener's final child, then the opener frame is closed.
     fn close_partial(&mut self, closer: Element, opener_is: MacroPred) {
-        while self.stack.len() > 1 {
-            let matched = self
-                .stack
-                .last()
-                .unwrap()
-                .mac
-                .as_ref()
-                .map(opener_is)
-                .unwrap_or(false);
-            if matched {
-                break;
-            }
-            self.close_top();
-        }
-        if self.stack.len() > 1 {
-            self.stack.last_mut().unwrap().nodes.push(closer);
-            self.close_top();
+        if self.find_open(opener_is).is_some() {
+            self.close_matching(opener_is, |f| f.nodes.push(closer));
         } else {
+            // No matching opener: keep the closer's own text where it appeared
+            // rather than unwinding the stack in search of one.
             self.push(closer);
         }
     }
@@ -164,27 +230,22 @@ impl Parser {
             }),
             opener_is,
         );
-        for el in parse_inline_seq(after[j..].to_vec()) {
+        let trailing = self.inline_seq(after[j..].to_vec());
+        for el in trailing {
             self.push(el);
         }
     }
 
     /// Close the nearest `.Eo` enclosure, recording its closing delimiter.
     fn close_eo(&mut self, close: Option<char>) {
-        while self.stack.len() > 1
-            && !matches!(self.stack.last().unwrap().mac, Some(Macro::Eo { .. }))
-        {
-            self.close_top();
-        }
-        if matches!(self.stack.last().unwrap().mac, Some(Macro::Eo { .. })) {
+        self.close_matching(is_eo, |f| {
             if let Some(Macro::Eo {
                 closing_delimiter, ..
-            }) = self.stack.last_mut().unwrap().mac.as_mut()
+            }) = f.mac.as_mut()
             {
                 *closing_delimiter = close;
             }
-            self.close_top();
-        }
+        });
     }
 
     /// Close every open block and return the document elements.
@@ -215,30 +276,51 @@ impl Parser {
         self.control(name, rest);
     }
 
+    /// Whether an unfilled display is open. Derived from the frame stack rather
+    /// than tracked separately, so it cannot drift from the block structure.
+    fn in_literal(&self) -> bool {
+        self.stack.iter().any(|f| {
+            matches!(
+                f.mac,
+                Some(Macro::Bd {
+                    block_type: BdType::Literal | BdType::Unfilled,
+                    ..
+                })
+            )
+        })
+    }
+
     fn text_line(&mut self, line: &str) {
         if line.trim().is_empty() {
             return;
         }
-        self.push(Element::Text(trim_quotes(line.to_string())));
+        // Text inside an unfilled display is copied verbatim.
+        let text = if self.in_literal() {
+            line.to_string()
+        } else {
+            trim_quotes(line.to_string())
+        };
+        self.push(Element::Text(text));
     }
 
     fn control(&mut self, name: &str, rest: &str) {
         match name {
             // The Sh/Ss title is the raw remainder (trailing space trimmed).
-            "Sh" => self.open_block(
-                Macro::Sh {
+            "Sh" => {
+                self.unwind_to(|_| false);
+                self.open_frame(Macro::Sh {
                     title: rest.trim_end().to_string(),
-                },
-                &[is_sh, is_ss, is_nd],
-            ),
-            "Ss" => self.open_block(
-                Macro::Ss {
+                });
+            }
+            "Ss" => {
+                self.unwind_to(is_sh);
+                self.open_frame(Macro::Ss {
                     title: rest.trim_end().to_string(),
-                },
-                &[is_ss, is_nd],
-            ),
+                });
+            }
             "Nd" => {
-                self.open_block(Macro::Nd, &[is_nd]);
+                self.unwind_to(|m| is_sh(m) || is_ss(m));
+                self.open_frame(Macro::Nd);
                 for word in tokenize(rest) {
                     self.push(Element::Text(word));
                 }
@@ -309,9 +391,10 @@ impl Parser {
                 // arguments (pest's macro_arg exclusion), so they are handled here
                 // at the top level rather than via the inline path.
                 let mac = if name == "D1" { Macro::D1 } else { Macro::Dl };
+                let nodes = self.inline_seq(tokenize(rest));
                 self.push(Element::Macro(MacroNode {
                     mdoc_macro: mac,
-                    nodes: parse_inline_seq(tokenize(rest)),
+                    nodes,
                 }));
             }
             "St" => {
@@ -326,43 +409,34 @@ impl Parser {
                 }
             }
             // Block-full-explicit displays close on .Ed/.Ef/.Ek.
-            "Bd" => self.open_block(parse_bd(rest), &[]),
-            "Bf" => self.open_block(
-                Macro::Bf(bf_type(tokenize(rest).first().map(|s| s.as_str()))),
-                &[],
-            ),
-            "Bk" => self.open_block(Macro::Bk, &[]),
-            "Ed" => self.close_explicit(is_bd),
-            "Ef" => self.close_explicit(is_bf),
-            "Ek" => self.close_explicit(is_bk),
-            "Bl" => self.open_block(parse_bl(rest), &[]),
+            "Bd" => self.open_frame(parse_bd(rest)),
+            "Bf" => self.open_frame(Macro::Bf(bf_type(
+                tokenize(rest).first().map(|s| s.as_str()),
+            ))),
+            "Bk" => self.open_frame(Macro::Bk),
+            "Ed" => {
+                self.close_matching(is_bd, |_| {});
+            }
+            "Ef" => {
+                self.close_matching(is_bf, |_| {});
+            }
+            "Ek" => {
+                self.close_matching(is_bk, |_| {});
+            }
+            "Bl" => self.open_frame(parse_bl(rest)),
             "It" => {
                 self.close_open_items();
-                let head = parse_inline_seq(tokenize(rest));
-                self.stack.push(Frame {
-                    mac: Some(Macro::It { head }),
-                    nodes: Vec::new(),
-                });
+                let head = self.inline_seq(tokenize(rest));
+                self.open_frame(Macro::It { head });
             }
             "El" => {
                 self.close_open_items();
-                self.close_explicit(is_bl);
+                self.close_matching(is_bl, |_| {});
             }
-            "Rs" => self.stack.push(Frame {
-                mac: Some(Macro::Rs),
-                nodes: Vec::new(),
-            }),
+            "Rs" => self.open_frame(Macro::Rs),
             "Re" => {
-                while self.stack.len() > 1
-                    && !matches!(self.stack.last().unwrap().mac, Some(Macro::Rs))
-                {
-                    self.close_top();
-                }
-                if matches!(self.stack.last().unwrap().mac, Some(Macro::Rs)) {
-                    // .Rs sorts its reference submacros by a fixed order.
-                    self.stack.last_mut().unwrap().nodes.sort_by_key(rs_rank);
-                    self.close_top();
-                }
+                // .Rs sorts its reference submacros by a fixed order.
+                self.close_matching(is_rs, |f| f.nodes.sort_by_key(rs_rank));
             }
             _ if rs_submacro(name).is_some() => {
                 // A reference submacro (%A …): one Text node per word. It requires
@@ -391,14 +465,14 @@ impl Parser {
                     };
                 let ec_pos = toks[idx..].iter().position(|t| t == "Ec").map(|p| p + idx);
                 let head_end = ec_pos.unwrap_or(toks.len());
-                let head_nodes = parse_inline_seq(toks[idx..head_end].to_vec());
-                self.stack.push(Frame {
-                    mac: Some(Macro::Eo {
+                let head_nodes = self.inline_seq(toks[idx..head_end].to_vec());
+                self.open_frame_with(
+                    Macro::Eo {
                         opening_delimiter,
                         closing_delimiter: None,
-                    }),
-                    nodes: head_nodes,
-                });
+                    },
+                    head_nodes,
+                );
                 if let Some(p) = ec_pos {
                     let close = toks.get(p + 1).and_then(|s| s.chars().next());
                     self.close_eo(close);
@@ -413,25 +487,13 @@ impl Parser {
                 // head plus the body (until .Fc) are the argument nodes.
                 let toks = tokenize(rest);
                 let funcname = toks.first().cloned().unwrap_or_default();
-                let nodes = parse_inline_seq(toks.into_iter().skip(1).collect());
-                self.stack.push(Frame {
-                    mac: Some(Macro::Fo { funcname }),
-                    nodes,
-                });
+                let nodes = self.inline_seq(toks.into_iter().skip(1).collect());
+                self.open_frame_with(Macro::Fo { funcname }, nodes);
             }
             "Fc" => {
                 // .Fc closes .Fo and is not itself kept; any args flow into Fo.
-                while self.stack.len() > 1
-                    && !matches!(self.stack.last().unwrap().mac, Some(Macro::Fo { .. }))
-                {
-                    self.close_top();
-                }
-                if matches!(self.stack.last().unwrap().mac, Some(Macro::Fo { .. })) {
-                    for el in parse_inline_seq(tokenize(rest)) {
-                        self.stack.last_mut().unwrap().nodes.push(el);
-                    }
-                    self.close_top();
-                }
+                let extra = self.inline_seq(tokenize(rest));
+                self.close_matching(is_fo, move |f| f.nodes.extend(extra));
             }
             "Sm" => {
                 // Optional on/off spacing mode; the first arg is consumed either
@@ -474,10 +536,8 @@ impl Parser {
                     Some(i) => toks[..i].to_vec(),
                     None => toks.clone(),
                 };
-                self.stack.push(Frame {
-                    mac: Some(mac),
-                    nodes: parse_inline_seq(head),
-                });
+                let nodes = self.inline_seq(head);
+                self.open_frame_with(mac, nodes);
                 if let Some(i) = cut {
                     self.close_with(&toks[i], &toks[i + 1..]);
                 }
@@ -489,7 +549,8 @@ impl Parser {
             _ if is_callable(name) => {
                 let mut tokens = vec![name.to_string()];
                 tokens.extend(tokenize(rest));
-                for el in parse_inline_seq(tokens) {
+                let els = self.inline_seq(tokens);
+                for el in els {
                     self.push(el);
                 }
             }
@@ -543,128 +604,142 @@ fn simple_inline(name: &str) -> Option<Macro> {
     })
 }
 
-/// Parse a sequence of inline elements from a token stream (a control line's
-/// words). A *leaf* macro (Fl/Ar/Xr/Nm/…) consumes following text words as its
-/// arguments until the next callable token; a *container* partial-implicit macro
-/// (Op/Aq/Bq/…) greedily wraps the rest of the line as its children. Bare words
-/// become Text nodes.
-fn parse_inline_seq(tokens: Vec<String>) -> Vec<Element> {
-    let mut out = Vec::new();
-    let mut toks = tokens.into_iter().peekable();
-    while let Some(tok) = toks.next() {
-        if tok == "Ta" {
-            // Column separator (its own macro node).
-            out.push(Element::Macro(MacroNode {
-                mdoc_macro: Macro::Ta,
-                nodes: Vec::new(),
-            }));
-            continue;
+impl Parser {
+    /// Depth-guarded entry point for [`Parser::inline_seq_inner`], covering
+    /// both its `Fn` and container-macro self-recursion with one check.
+    fn inline_seq(&mut self, tokens: Vec<String>) -> Vec<Element> {
+        if !self.nest_ok() {
+            return Vec::new();
         }
-        if tok == "An" {
-            // .An -split / -nosplit consume only the flag; otherwise the rest of
-            // the line is the author name.
-            match toks.peek().map(|s| s.as_str()) {
-                Some("-split") => {
-                    toks.next();
-                    out.push(an_node(AnType::Split, Vec::new()));
-                }
-                Some("-nosplit") => {
-                    toks.next();
-                    out.push(an_node(AnType::NoSplit, Vec::new()));
-                }
-                _ => {
-                    // The author name is the following text words only; a
-                    // subsequent macro is a sibling, not a child.
-                    let mut args = Vec::new();
-                    while let Some(t) = toks.peek() {
-                        if is_callable(t) {
-                            break;
-                        }
-                        args.push(Element::Text(toks.next().unwrap()));
-                    }
-                    out.push(an_node(AnType::Name, args));
-                }
-            }
-            continue;
-        }
-        if tok == "Fn" {
-            // .Fn [(|[] funcname [args…] — a leading opening delimiter is
-            // prepended to the funcname; the rest are argument nodes.
-            let mut funcname = toks.next().unwrap_or_default();
-            if is_opening_delim(&funcname) {
-                if let Some(next) = toks.next() {
-                    funcname.push_str(&next);
-                }
-            }
-            let rest: Vec<String> = toks.by_ref().collect();
-            out.push(Element::Macro(MacroNode {
-                mdoc_macro: Macro::Fn { funcname },
-                nodes: parse_inline_seq(rest),
-            }));
-            return out;
-        }
-        if tok == "Es" {
-            // Obsolete: end-of-sentence delimiters as two single chars; takes no
-            // child nodes (following content is sibling).
-            let opening_delimiter = toks.next().and_then(|s| s.chars().next()).unwrap_or(' ');
-            let closing_delimiter = toks.next().and_then(|s| s.chars().next()).unwrap_or(' ');
-            out.push(Element::Macro(MacroNode {
-                mdoc_macro: Macro::Es {
-                    opening_delimiter,
-                    closing_delimiter,
-                },
-                nodes: Vec::new(),
-            }));
-            continue;
-        }
-        if tok == "Pf" {
-            // .Pf takes only the prefix word; following content is sibling.
-            let prefix = toks.next().unwrap_or_default();
-            out.push(Element::Macro(MacroNode {
-                mdoc_macro: Macro::Pf { prefix },
-                nodes: Vec::new(),
-            }));
-            continue;
-        }
-        if is_text_prod(&tok) {
-            // Text-production macros (BSD family) consume following non-callable
-            // words as their argument run, then apply the delimiter+format rules.
-            let mut args = Vec::new();
-            while let Some(t) = toks.peek() {
-                if is_callable(t) {
-                    break;
-                }
-                args.push(toks.next().unwrap());
-            }
-            out.push(text_production_node(&tok, args));
-            continue;
-        }
-        if let Some(mac) = container_macro(&tok) {
-            let rest: Vec<String> = toks.collect();
-            out.push(Element::Macro(MacroNode {
-                mdoc_macro: mac,
-                nodes: parse_inline_seq(rest),
-            }));
-            return out;
-        } else if is_leaf(&tok) {
-            let mut args = Vec::new();
-            while let Some(t) = toks.peek() {
-                if is_callable(t) {
-                    break;
-                }
-                args.push(toks.next().unwrap());
-            }
-            // A macro that grammatically requires an argument but has none is a
-            // parse failure in pest (it produces nothing); drop it.
-            if args.is_empty() && requires_args(&tok) {
+        self.inline_depth += 1;
+        let out = self.inline_seq_inner(tokens);
+        self.inline_depth -= 1;
+        out
+    }
+
+    /// Parse a sequence of inline elements from a token stream (a control line's
+    /// words). A *leaf* macro (Fl/Ar/Xr/Nm/…) consumes following text words as its
+    /// arguments until the next callable token; a *container* partial-implicit macro
+    /// (Op/Aq/Bq/…) greedily wraps the rest of the line as its children. Bare words
+    /// become Text nodes.
+    fn inline_seq_inner(&mut self, tokens: Vec<String>) -> Vec<Element> {
+        let mut out = Vec::new();
+        let mut toks = tokens.into_iter().peekable();
+        while let Some(tok) = toks.next() {
+            if tok == "Ta" {
+                // Column separator (its own macro node).
+                out.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Ta,
+                    nodes: Vec::new(),
+                }));
                 continue;
             }
-            out.push(make_leaf(&tok, args));
-        } else {
-            out.push(Element::Text(tok));
+            if tok == "An" {
+                // .An -split / -nosplit consume only the flag; otherwise the rest of
+                // the line is the author name.
+                match toks.peek().map(|s| s.as_str()) {
+                    Some("-split") => {
+                        toks.next();
+                        out.push(an_node(AnType::Split, Vec::new()));
+                    }
+                    Some("-nosplit") => {
+                        toks.next();
+                        out.push(an_node(AnType::NoSplit, Vec::new()));
+                    }
+                    _ => {
+                        // The author name is the following text words only; a
+                        // subsequent macro is a sibling, not a child.
+                        let mut args = Vec::new();
+                        while let Some(t) = toks.peek() {
+                            if is_callable(t) {
+                                break;
+                            }
+                            args.push(Element::Text(toks.next().unwrap()));
+                        }
+                        out.push(an_node(AnType::Name, args));
+                    }
+                }
+                continue;
+            }
+            if tok == "Fn" {
+                // .Fn [(|[] funcname [args…] — a leading opening delimiter is
+                // prepended to the funcname; the rest are argument nodes.
+                let mut funcname = toks.next().unwrap_or_default();
+                if is_opening_delim(&funcname) {
+                    if let Some(next) = toks.next() {
+                        funcname.push_str(&next);
+                    }
+                }
+                let rest: Vec<String> = toks.by_ref().collect();
+                out.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Fn { funcname },
+                    nodes: self.inline_seq(rest),
+                }));
+                return out;
+            }
+            if tok == "Es" {
+                // Obsolete: end-of-sentence delimiters as two single chars; takes no
+                // child nodes (following content is sibling).
+                let opening_delimiter = toks.next().and_then(|s| s.chars().next()).unwrap_or(' ');
+                let closing_delimiter = toks.next().and_then(|s| s.chars().next()).unwrap_or(' ');
+                out.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Es {
+                        opening_delimiter,
+                        closing_delimiter,
+                    },
+                    nodes: Vec::new(),
+                }));
+                continue;
+            }
+            if tok == "Pf" {
+                // .Pf takes only the prefix word; following content is sibling.
+                let prefix = toks.next().unwrap_or_default();
+                out.push(Element::Macro(MacroNode {
+                    mdoc_macro: Macro::Pf { prefix },
+                    nodes: Vec::new(),
+                }));
+                continue;
+            }
+            if is_text_prod(&tok) {
+                // Text-production macros (BSD family) consume following non-callable
+                // words as their argument run, then apply the delimiter+format rules.
+                let mut args = Vec::new();
+                while let Some(t) = toks.peek() {
+                    if is_callable(t) {
+                        break;
+                    }
+                    args.push(toks.next().unwrap());
+                }
+                out.push(text_production_node(&tok, args));
+                continue;
+            }
+            if let Some(mac) = container_macro(&tok) {
+                let rest: Vec<String> = toks.collect();
+                out.push(Element::Macro(MacroNode {
+                    mdoc_macro: mac,
+                    nodes: self.inline_seq(rest),
+                }));
+                return out;
+            } else if is_leaf(&tok) {
+                let mut args = Vec::new();
+                while let Some(t) = toks.peek() {
+                    if is_callable(t) {
+                        break;
+                    }
+                    args.push(toks.next().unwrap());
+                }
+                // A macro that grammatically requires an argument but has none is a
+                // parse failure in pest (it produces nothing); drop it.
+                if args.is_empty() && requires_args(&tok) {
+                    continue;
+                }
+                out.push(make_leaf(&tok, args));
+            } else {
+                out.push(Element::Text(tok));
+            }
         }
+        out
     }
-    out
 }
 
 /// Build a leaf inline macro node (simple text-arg macro, or Xr/Nm).
@@ -707,12 +782,16 @@ fn make_leaf(name: &str, args: Vec<String>) -> Element {
             nodes: it.map(Element::Text).collect(),
         }
     } else {
-        // Nm: first arg is the name if purely alphanumeric, else a text node.
+        // Nm: the first argument is the utility name unless it is a bare
+        // delimiter. mandoc applies no character class here, and requiring the
+        // name to be alphanumeric rejected every real name containing `-`, `_`
+        // or `.` (ssh-keygen, a.out, systemd-run), leaving `name` None so that
+        // every later bare `.Nm` expanded to nothing.
         let mut nm_name = None;
         let mut nodes = Vec::new();
         let mut it = args.into_iter();
         if let Some(first) = it.next() {
-            if first.chars().all(|c| c.is_alphanumeric()) {
+            if is_name_token(&first) {
                 nm_name = Some(first);
             } else {
                 nodes.push(Element::Text(first));
@@ -815,6 +894,15 @@ fn is_bf(m: &Macro) -> bool {
 fn is_bk(m: &Macro) -> bool {
     matches!(m, Macro::Bk)
 }
+fn is_eo(m: &Macro) -> bool {
+    matches!(m, Macro::Eo { .. })
+}
+fn is_rs(m: &Macro) -> bool {
+    matches!(m, Macro::Rs)
+}
+fn is_fo(m: &Macro) -> bool {
+    matches!(m, Macro::Fo { .. })
+}
 
 /// Partial-implicit container macros: each wraps the remainder of the line.
 fn container_macro(name: &str) -> Option<Macro> {
@@ -838,6 +926,13 @@ fn container_macro(name: &str) -> Option<Macro> {
 /// An mdoc opening delimiter (attaches to the following content).
 fn is_opening_delim(s: &str) -> bool {
     s == "(" || s == "["
+}
+
+/// Whether a `.Nm` argument can serve as the utility name: any non-empty token
+/// that is not a bare delimiter. A macro name cannot reach here, because the
+/// caller stops collecting arguments at the first callable token.
+fn is_name_token(s: &str) -> bool {
+    !s.is_empty() && !is_opening_delim(s) && !is_closing_delim(s)
 }
 
 /// An mdoc closing delimiter (attaches to the preceding content).
@@ -1196,9 +1291,6 @@ fn is_sh(m: &Macro) -> bool {
 fn is_ss(m: &Macro) -> bool {
     matches!(m, Macro::Ss { .. })
 }
-fn is_nd(m: &Macro) -> bool {
-    matches!(m, Macro::Nd)
-}
 
 /// Truncate `line` at an unescaped `\"` comment.
 fn strip_comment(line: &str) -> &str {
@@ -1263,19 +1355,142 @@ fn tokenize(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_mdoc_v2;
+    use super::{Element, Macro};
 
     /// Smoke test: the hand-written parser must not panic on this input and must
     /// produce a deterministic AST. (Rendering correctness is covered by the
     /// byte-identical formatter snapshot tests in `formatter.rs`.)
     fn parity(input: &str) {
-        let a = parse_mdoc_v2(input);
-        let b = parse_mdoc_v2(input);
+        let a = parse_mdoc_v2(input).expect("input is not pathologically nested");
+        let b = parse_mdoc_v2(input).expect("input is not pathologically nested");
         assert_eq!(a.elements, b.elements, "input: {input:?}");
     }
 
     #[test]
     fn sh_without_body() {
         parity(".Sh SECTION");
+    }
+
+    #[test]
+    fn inline_nesting_is_capped() {
+        // One line, one container macro per token. Uncapped, the recursion in
+        // inline_seq_inner overflowed the stack and aborted the process.
+        let deep = format!(".{}x\n", "Op ".repeat(super::MAX_NEST + 10));
+        assert_eq!(parse_mdoc_v2(&deep), Err(super::NestingTooDeep));
+
+        let shallow = format!(".{}x\n", "Op ".repeat(8));
+        assert!(parse_mdoc_v2(&shallow).is_ok());
+    }
+
+    #[test]
+    fn block_nesting_is_capped() {
+        // The second depth source: one open frame per line, with no inline
+        // recursion at all. A cap on inline_seq alone would miss this entirely.
+        let deep = ".Ao\n".repeat(super::MAX_NEST + 10);
+        assert_eq!(parse_mdoc_v2(&deep), Err(super::NestingTooDeep));
+
+        let shallow = ".Ao\n".repeat(8);
+        assert!(parse_mdoc_v2(&shallow).is_ok());
+    }
+
+    #[test]
+    fn nm_accepts_real_utility_names() {
+        // Requiring `is_alphanumeric` dropped the name of any utility spelled
+        // with a dash, underscore or dot.
+        for input in [
+            ".Nm ssh-keygen\n",
+            ".Nm a.out\n",
+            ".Nm systemd-run\n",
+            ".Nm my_tool\n",
+        ] {
+            let doc = parse_mdoc_v2(input).unwrap();
+            let Element::Macro(node) = &doc.elements[0] else {
+                panic!("expected a macro: {:?}", doc.elements);
+            };
+            assert!(
+                matches!(&node.mdoc_macro, Macro::Nm { name: Some(_) }),
+                "input {input:?} produced {:?}",
+                node.mdoc_macro
+            );
+        }
+    }
+
+    #[test]
+    fn nm_without_a_usable_name_records_none() {
+        // `chars().all()` was vacuously true on an empty token, so `.Nm ""`
+        // recorded Some("") and every later bare .Nm rendered as nothing.
+        for input in [".Nm\n", ".Nm \"\"\n"] {
+            let doc = parse_mdoc_v2(input).unwrap();
+            if let Some(Element::Macro(node)) = doc.elements.first() {
+                assert!(
+                    !matches!(&node.mdoc_macro, Macro::Nm { name: Some(n) } if n.is_empty()),
+                    "input {input:?} recorded an empty name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section_closes_an_unterminated_list() {
+        // The unwind stopped at the first frame that was not itself a heading,
+        // so a .Sh following an unclosed .Bl was pushed inside the list and
+        // rendered, with everything after it, as list-item body.
+        let doc = parse_mdoc_v2(".Sh A\n.Bl -bullet\n.It\nx\n.Sh B\ny\n").unwrap();
+        assert_eq!(
+            doc.elements.len(),
+            2,
+            "the second .Sh must be a sibling: {:?}",
+            doc.elements
+        );
+    }
+
+    #[test]
+    fn subsection_closes_a_display_but_stays_in_its_section() {
+        let doc = parse_mdoc_v2(".Sh A\n.Bd -literal\nx\n.Ss B\ny\n").unwrap();
+        assert_eq!(
+            doc.elements.len(),
+            1,
+            ".Ss must stay inside its .Sh: {:?}",
+            doc.elements
+        );
+    }
+
+    #[test]
+    fn stray_block_end_does_not_unwind_enclosing_blocks() {
+        // Closing frames while searching for the match destroyed every block
+        // back to the root when no match existed, so one stray `.Ed` moved the
+        // rest of the page out of the section it was written in.
+        let doc = parse_mdoc_v2(".Sh DESCRIPTION\nbefore\n.Ed\nafter\n").unwrap();
+        assert_eq!(
+            doc.elements.len(),
+            1,
+            "the stray .Ed must not close .Sh: {:?}",
+            doc.elements
+        );
+    }
+
+    #[test]
+    fn stray_closers_are_ignored() {
+        for input in [
+            ".Sh A\n.Ed\n",
+            ".Sh A\n.Ef\n",
+            ".Sh A\n.Ek\n",
+            ".Sh A\n.El\n",
+            ".Sh A\n.Ec\n",
+            ".Sh A\n.Re\n",
+            ".Sh A\n.Fc\n",
+        ] {
+            let doc = parse_mdoc_v2(input).unwrap();
+            assert_eq!(doc.elements.len(), 1, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn matched_block_ends_still_close_their_opener() {
+        // The guard against over-unwinding must not stop a real closer working.
+        parity(".Sh A\n.Bd -literal\ntext\n.Ed\nafter\n");
+        parity(".Sh A\n.Bl -bullet\n.It\nitem\n.El\nafter\n");
+        parity(".Sh A\n.Rs\n.%A Author\n.Re\n");
     }
 
     #[test]

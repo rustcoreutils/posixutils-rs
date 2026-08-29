@@ -9,7 +9,11 @@
 
 //! Hand-written mdoc/man parsers that replace the pest grammar. These produce
 //! the same `Element`/`MacroNode`/`Macro` AST without the exponential
-//! backtracking of the PEG (no per-line nesting cap needed).
+//! backtracking of the PEG.
+//!
+//! A nesting cap is still required, for a different reason than the PEG's: the
+//! AST is walked recursively when it is cloned, formatted and dropped, so an
+//! unbounded tree overflows the stack no matter how cheaply it was built.
 //!
 //! These are the only parsers: pest, its grammar and the `MAN_PARSER` switch
 //! that once selected between them are gone. Coverage is validated by the

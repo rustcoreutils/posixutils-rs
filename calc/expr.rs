@@ -233,6 +233,10 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
         .ok_or("integer overflow")
 }
 
+fn token_is_null(t: &Token) -> bool {
+    matches!(t, Token::Operand(bytes) if bytes.is_empty())
+}
+
 // logical and/or operation
 fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
     let lhs_zero = token_is_null_or_zero(lhs);
@@ -246,11 +250,15 @@ fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
             bool_token(false)
         }
     } else if !lhs_zero {
-        // expr1 | expr2: return expr1 if it is neither null nor zero,
-        // otherwise return expr2 (regardless of expr2's value).
         lhs.clone()
-    } else {
+    } else if !token_is_null(rhs) {
+        // POSIX: "returns the evaluation of expr1 if it is neither null nor
+        // zero; otherwise, returns the evaluation of expr2 if it is not null;
+        // otherwise, zero." expr2 is returned even when it is zero, but a null
+        // expr2 yields zero rather than the null string.
         rhs.clone()
+    } else {
+        bool_token(false)
     }
 }
 
@@ -369,11 +377,24 @@ fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
+
+/// Maximum depth of nested parentheses.
+///
+/// The evaluator recurses on the machine stack, so without a limit a deeply
+/// nested expression aborts the process instead of reporting an error. POSIX
+/// requires only `{EXPR_NEST_MAX}`, whose minimum is 32; this is far above any
+/// real use and below where the stack would run out in an unoptimized build.
+const MAX_NEST_DEPTH: usize = 512;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -478,7 +499,16 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Token, &'static str> {
         match self.advance() {
             Some(Token::LParen) => {
-                let val = self.parse_or()?;
+                self.depth += 1;
+                if self.depth > MAX_NEST_DEPTH {
+                    self.depth -= 1;
+                    return Err("expression nested too deeply");
+                }
+                let val = self.parse_or();
+                self.depth -= 1;
+                // Propagate before looking for the ')', so a failure inside the
+                // group is not reported as a missing parenthesis.
+                let val = val?;
                 match self.advance() {
                     Some(Token::RParen) => Ok(val),
                     _ => Err("syntax error: expected ')'"),

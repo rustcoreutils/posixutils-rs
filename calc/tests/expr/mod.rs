@@ -49,7 +49,7 @@ fn expr_logops() {
     expr_test(&["4", "&", "5", "+", "1"], "4\n");
     expr_test(&["4", "&", "0", "+", "1"], "4\n");
     expr_test(&["0", "%", "5", "+", "1"], "1\n");
-    // '|' returns expr2 when expr1 is null or zero, regardless of expr2.
+    // '|' returns expr2 when expr1 is null or zero and expr2 is not null.
     expr_test_status(&["0", "|", "0"], "0\n", "", 1);
     expr_test(&["", "|", "abc"], "abc\n");
     // A string-valued "0" (here produced by a ':' capture) is zero for '|'/'&'.
@@ -275,6 +275,32 @@ fn expr_non_utf8_operands() {
         expected_err: Vec::new(),
         expected_exit_code: 0,
     });
+}
+
+/// POSIX: "returns the evaluation of expr1 if it is neither null nor zero;
+/// otherwise, returns the evaluation of expr2 if it is not null; otherwise,
+/// zero." A null expr2 yields zero, not the null string. Verified against GNU.
+#[test]
+fn expr_or_with_a_null_right_operand() {
+    expr_test_status(&["", "|", ""], "0\n", "", 1);
+    expr_test_status(&["0", "|", ""], "0\n", "", 1);
+    expr_test_status(&["00", "|", ""], "0\n", "", 1);
+    // A zero expr2 is still returned; only a null one becomes zero.
+    expr_test_status(&["", "|", "0"], "0\n", "", 1);
+    expr_test(&["", "|", "abc"], "abc\n");
+    expr_test(&["4", "|", "5"], "4\n");
+}
+
+/// Deep nesting must report a limit rather than abort on a guard page.
+#[test]
+fn expr_deep_nesting_is_bounded() {
+    const DEPTH: usize = 5000;
+    let mut args: Vec<&str> = vec!["("; DEPTH];
+    args.push("1");
+    args.extend(std::iter::repeat_n(")", DEPTH));
+    expr_test_status(&args, "", "expr: expression nested too deeply\n", 2);
+    // Ordinary nesting still evaluates.
+    expr_test(&["(", "(", "2", "+", "3", ")", "*", "4", ")"], "20\n");
 }
 
 // Run one comparison under an explicit locale.

@@ -1106,6 +1106,7 @@ version = "0.8.0"
 dependencies = [
  "chrono",
  "clap",
+ "flate2",
  "gettext-rs",
  "libc",
  "plib",

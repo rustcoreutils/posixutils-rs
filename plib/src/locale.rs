@@ -802,6 +802,14 @@ mod tests {
         let Some(loc) = crate::testing::utf8_locale() else {
             return;
         };
+        // This mutates the process-global locale, so it takes the lock like
+        // every other test that does -- otherwise the lock excludes nothing and
+        // a byte-oriented test running beside it sees UTF-8.
+        let _guard = crate::locale_test_lock();
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+
         // Set the process locale, then ask about U+00E9 (e-acute), which is a
         // letter in any UTF-8 locale but not in C.
         unsafe {
@@ -812,10 +820,11 @@ mod tests {
         assert!(islower('\u{e9}'));
         assert!(isupper('\u{c9}'));
         assert!(isprint('\u{e9}'));
-        // Restore the C locale for any test that runs after this one.
-        unsafe {
-            let c = std::ffi::CString::new("C").unwrap();
-            libc::setlocale(libc::LC_ALL, c.as_ptr());
+
+        // Restore what was actually there. Restoring a hard-coded "C" would
+        // undo a caller's locale rather than this test's.
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
         }
     }
 }

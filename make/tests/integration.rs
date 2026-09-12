@@ -544,16 +544,20 @@ mod parsing {
         );
     }
 
-    // #[test]
-    // #[ignore]
-    // fn suffixes_with_no_target() {
-    //     run_test_helper(
-    //         &["-f", "tests/makefiles/parsing/suffixes_with_no_targets.mk"],
-    //         "",
-    //         "make: parse error: No Targets",
-    //         ErrorCode::ParseError("no targets".into()).into(),
-    //     );
-    // }
+    // A makefile holding nothing but an inference rule parses cleanly -- it is
+    // `no_targets` in target_behavior that covers the parse-time failure -- but
+    // POSIX 105428 makes the default target the first one that is neither
+    // special nor an inference rule, and there is none here. So this fails at
+    // run time with exit 6, not at parse time with exit 4.
+    #[test]
+    fn suffixes_with_no_target() {
+        run_test_helper(
+            &["-f", "tests/makefiles/parsing/suffixes_with_no_targets.mk"],
+            "",
+            "make: no targets to execute\n",
+            ErrorCode::NoTarget { target: None }.into(),
+        );
+    }
 
     // Audit #1: a recipe line that contains '=' (a shell assignment, an
     // option like --prefix=, or a `test x = y`) must not be mistaken for a
@@ -1141,20 +1145,27 @@ mod special_targets {
         }
     }
 
-    // unspecified stderr and error type, must be refactored and improved
-    // #[test]
-    // #[ignore]
-    // fn clear_suffixes() {
-    //     run_test_helper(
-    //         &[
-    //             "-f",
-    //             "tests/makefiles/special_targets/suffixes/clear_suffixes.mk",
-    //         ],
-    //         "Converting $< to \n",
-    //         "make: Nothing be dobe for copied.out",
-    //         ErrorCode::ParseError("the inner value does not matter for now".into()).into(),
-    //     );
-    // }
+    // An empty `.SUFFIXES:` clears the suffix list, so the `.txt.out` rule the
+    // fixture goes on to define is no longer an inference rule. `copied.out`
+    // therefore cannot be inferred from `copied.txt`, and since the fixture
+    // names `copied.txt` as a prerequisite with no rule and no file on disk,
+    // make reports it rather than converting anything. The clearing is what is
+    // under test; the diagnostic is how it shows.
+    #[test]
+    fn clear_suffixes_disables_the_inference_rule() {
+        run_test_helper(
+            &[
+                "-f",
+                "tests/makefiles/special_targets/suffixes/clear_suffixes.mk",
+            ],
+            "",
+            "make: no target 'copied.txt'\n",
+            ErrorCode::NoTarget {
+                target: Some("copied.txt".to_string()),
+            }
+            .into(),
+        );
+    }
 
     mod validations {
         use super::*;

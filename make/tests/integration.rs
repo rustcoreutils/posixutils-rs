@@ -2707,6 +2707,40 @@ mod macro_sources {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // `override` exists so a makefile can beat a command-line macro. Under -e
+    // it lost to the environment instead: `settle_environment` saw an ordinary
+    // `Makefile` source, which -e ranks below `Environment`. Command-line
+    // macros are also exported into make's own environment (POSIX 105866), so
+    // the -e + command-line case went the same way.
+    #[test]
+    fn override_outranks_the_environment_and_the_command_line() {
+        let dir = "macsrc_override_probe";
+        fixture(dir, &format!("override CC = mycc\n{ECHO_CC}"));
+
+        for (args, env, what) in [
+            (vec!["-C", dir, "all"], vec![], "plain"),
+            (
+                vec!["-C", dir, "-e", "all"],
+                vec![("CC", "envcc")],
+                "-e + env",
+            ),
+            (vec!["-C", dir, "CC=cmdcc", "all"], vec![], "command line"),
+            (
+                vec!["-C", dir, "-e", "CC=cmdcc", "all"],
+                vec![("CC", "envcc")],
+                "-e + command line",
+            ),
+        ] {
+            let (stdout, stderr, code) = run_env(&args, &env);
+            assert_eq!(code, Some(0), "{what}: stderr: {stderr}");
+            assert!(
+                stdout.contains("CC=[mycc]"),
+                "override must win ({what}): {stdout}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     // `ifdef` has to consult the same precedence as expansion, or a macro can
     // expand to a value while reading as undefined.
     #[test]

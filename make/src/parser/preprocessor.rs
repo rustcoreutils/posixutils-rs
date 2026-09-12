@@ -360,6 +360,11 @@ pub enum MacroSource {
     Makefile,
     /// Source 1 (and 2): a command-line macro operand.
     CommandLine,
+    /// Not a POSIX source: a makefile's `override` assignment, whose whole
+    /// purpose is to beat a command-line macro. POSIX has no `override`, so
+    /// it has no source number; it sits above source 1 because that is what
+    /// the directive means.
+    Override,
     /// Not a POSIX source: a `foreach` loop variable or a `call` argument,
     /// in force only while that function's body is expanded. It shadows every
     /// other source, which is what makes the binding a binding.
@@ -390,7 +395,8 @@ impl MacroSource {
                 }
             }
             MacroSource::CommandLine => 3,
-            MacroSource::Local => 4,
+            MacroSource::Override => 4,
+            MacroSource::Local => 5,
         }
     }
 }
@@ -435,8 +441,11 @@ impl MacroTable {
         self.force(name, body, source);
     }
 
-    /// Assign regardless of precedence -- an `override` assignment defeating a
-    /// command-line macro, or a seed establishing one.
+    /// Assign regardless of precedence, recording `source` as given.
+    ///
+    /// Used to establish a seed, whose rank is then honoured by every later
+    /// assignment, and by `override`, which passes [`MacroSource::Override`]
+    /// so that what it establishes outranks a command-line macro.
     fn force(&mut self, name: String, body: String, source: MacroSource) {
         if !self.values.contains_key(&name) {
             self.order.push(name.clone());
@@ -1387,7 +1396,7 @@ impl Reader {
         };
         let (name, body) = parse_macro_definition(line, &self.table, &self.state)?;
         match overriding {
-            true => self.table.force(name, body, MacroSource::Makefile),
+            true => self.table.force(name, body, MacroSource::Override),
             false => self.table.set(name, body, MacroSource::Makefile),
         }
         Ok(())

@@ -143,9 +143,7 @@ fn find_type_test() {
 // happens to be. Stamp our own instead.
 #[test]
 fn find_mtime_exact_newer_and_older() {
-    let dir = std::env::temp_dir().join("posixutils_find_mtime");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("mtime");
 
     // An extra hour past each day boundary, so the spawn latency between
     // SystemTime::now() here and find's own initialization time cannot drift a
@@ -399,13 +397,30 @@ fn find_print0_with_name_filter() {
     run_test_find_print0_sorted(&args, &[&file1, &file2, &file3], 0)
 }
 
+/// An empty scratch directory of our own, named for `tag` and this process.
+///
+/// Tests that need one assert over the whole directory, so anything else
+/// writing into it breaks them. The tag separates tests within a run -- they
+/// execute on parallel threads of one process -- and the pid separates
+/// concurrent runs, which would otherwise meet on a single path inside a
+/// directory every user on the host can write to.
+///
+/// The pid is deliberately the only varying part. Something more unique per
+/// call would leave a fresh directory behind every time a test panicked before
+/// its cleanup; with the pid, a later run reuses the name and the
+/// `remove_dir_all` below clears whatever the last one left.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("posixutils_find_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 // --- fnmatch / -iname (find-A) ---
 
 /// Create a fresh temp dir with the given files; returns its path.
 fn make_fnmatch_dir(tag: &str, files: &[&str]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("posixutils_find_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir(tag);
     for f in files {
         File::create(dir.join(f)).unwrap();
     }
@@ -644,9 +659,7 @@ fn find_mount_excludes_crossing_directory() {
 // nothing was lost or duplicated.
 #[test]
 fn find_exec_plus_splits_over_arg_max() {
-    let dir = std::env::temp_dir().join("posixutils_find_argmax");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("argmax");
 
     // The file count has to be derived from the host's ARG_MAX, not fixed: a
     // count tuned to one machine's margin silently stops splitting on a host
@@ -714,9 +727,7 @@ fn find_exec_plus_splits_over_arg_max() {
 // (nor `-mtime N` for any non-negative N).
 #[test]
 fn find_mtime_future_dated_file() {
-    let dir = std::env::temp_dir().join("posixutils_find_future");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("future");
     let f = dir.join("future");
     File::create(&f).unwrap();
 

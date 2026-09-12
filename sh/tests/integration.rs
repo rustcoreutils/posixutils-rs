@@ -1802,6 +1802,67 @@ mod audit_regressions {
         });
     }
 
+    // POSIX 88722: "The following options shall be supported by the
+    // implementation", and 88723-88725 defines `-e`: with `-P` in effect, if
+    // the directory changed but the correct value of PWD cannot be determined,
+    // exit 1. Mandatory -- not XSI, not optional -- and cd rejected it.
+    #[test]
+    fn cd_accepts_the_e_option() {
+        run_successfully_and("cd -e /tmp && echo ok\n", |out| {
+            assert_eq!(out, "ok\n");
+        });
+        // -e is defined only in combination with -P, and is inert without it.
+        run_successfully_and("cd -e -P /tmp && echo ok\n", |out| {
+            assert_eq!(out, "ok\n");
+        });
+        run_successfully_and("cd -eP /tmp && pwd\n", |out| {
+            assert_eq!(out.trim(), "/tmp");
+        });
+    }
+
+    #[test]
+    fn cd_dash_e_exits_one_when_pwd_cannot_be_determined() {
+        // The directory is removed out from under the shell, so the chdir
+        // succeeds and `getcwd` then fails -- exactly the condition 88723-5
+        // names. Without -e the status stays 0.
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let v = victim.to_str().unwrap();
+
+        run_script_with_checker(
+            &format!("cd {v}\nrmdir {v}\ncd -P -e .\necho rc=$?\n"),
+            |output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Without this, the case passes vacuously: a rejected `-e`
+                // also leaves $? at 1.
+                assert!(
+                    !stderr.contains("invalid option"),
+                    "-e must be accepted, not rejected: {stderr}"
+                );
+                assert!(
+                    stdout.contains("rc=1"),
+                    "-e must report 1 when PWD cannot be determined: {stdout}"
+                );
+            },
+        );
+
+        let victim2 = dir.path().join("victim2");
+        std::fs::create_dir(&victim2).unwrap();
+        let v2 = victim2.to_str().unwrap();
+        run_script_with_checker(
+            &format!("cd {v2}\nrmdir {v2}\ncd -P .\necho rc=$?\n"),
+            |output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    stdout.contains("rc=0"),
+                    "without -e the status stays 0: {stdout}"
+                );
+            },
+        );
+    }
+
     #[test]
     fn large_io_number_is_accepted() {
         // #43: fd numbers above the old 1023 cap are allowed.

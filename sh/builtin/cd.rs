@@ -24,6 +24,9 @@ enum CdArgs<'a> {
     ChangeDir {
         directory: Option<&'a ShStr>,
         handle_dot_dot_physically: bool,
+        /// `-e`: with `-P` in effect, exit 1 if the directory changed but the
+        /// correct value of `PWD` could not be determined (POSIX 88723-88725).
+        report_undeterminable_pwd: bool,
     },
     GoBack,
 }
@@ -31,6 +34,7 @@ enum CdArgs<'a> {
 impl<'a> CdArgs<'a> {
     fn parse(args: &'a [ShString], options: &'a [&'a str]) -> Result<Self, String> {
         let mut handle_dot_dot_physically = false;
+        let mut report_undeterminable_pwd = false;
 
         let mut option_parser = OptionParser::new(options);
 
@@ -44,6 +48,9 @@ impl<'a> CdArgs<'a> {
                 }
                 'P' => {
                     handle_dot_dot_physically = true;
+                }
+                'e' => {
+                    report_undeterminable_pwd = true;
                 }
                 _ => {
                     return Err(format!("cd: invalid option -{option}"));
@@ -60,6 +67,7 @@ impl<'a> CdArgs<'a> {
         Ok(Self::ChangeDir {
             directory,
             handle_dot_dot_physically,
+            report_undeterminable_pwd,
         })
     }
 }
@@ -152,6 +160,7 @@ impl BuiltinUtility for Cd {
             CdArgs::ChangeDir {
                 directory,
                 handle_dot_dot_physically,
+                report_undeterminable_pwd,
             } => {
                 let dir = if let Some(dir) = directory {
                     dir
@@ -168,6 +177,7 @@ impl BuiltinUtility for Cd {
                 }
                 let mut curr_path = OsString::new();
                 let mut used_cdpath = false;
+                let mut undeterminable_pwd = false;
 
                 if !dir.starts_with(b"/") {
                     if !dir.starts_with(b"./")
@@ -215,9 +225,18 @@ impl BuiltinUtility for Cd {
                     // to the operand made absolute instead.
                     curr_path = match std::env::current_dir() {
                         Ok(dir) => dir.into_os_string(),
-                        Err(_) => OsString::from_vec(lexical_normalize(
-                            make_absolute(&curr_path, &old_working_dir).as_bytes(),
-                        )),
+                        Err(_) => {
+                            // POSIX 88723-88725: this is exactly the `-e`
+                            // condition -- the directory changed and the
+                            // correct PWD cannot be determined. The fallback
+                            // below still runs, because leaving PWD describing
+                            // the old location would be worse; `-e` only
+                            // changes what is reported.
+                            undeterminable_pwd = true;
+                            OsString::from_vec(lexical_normalize(
+                                make_absolute(&curr_path, &old_working_dir).as_bytes(),
+                            ))
+                        }
                     };
                 }
                 if used_cdpath {
@@ -230,6 +249,10 @@ impl BuiltinUtility for Cd {
                     "OLDPWD".to_string(),
                     old_working_dir.to_string_lossy().into_owned(),
                 )?;
+
+                if report_undeterminable_pwd && undeterminable_pwd {
+                    return Ok(1);
+                }
             }
             CdArgs::GoBack => {
                 if let Some(oldpwd) = shell
@@ -274,6 +297,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: None,
                 handle_dot_dot_physically: false,
+                report_undeterminable_pwd: false,
             },
         )
     }
@@ -285,6 +309,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: false,
+                report_undeterminable_pwd: false,
             },
         )
     }
@@ -296,6 +321,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: false,
+                report_undeterminable_pwd: false,
             },
         );
         parse_and_check_eq(
@@ -303,6 +329,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: true,
+                report_undeterminable_pwd: false,
             },
         )
     }
@@ -314,6 +341,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: true,
+                report_undeterminable_pwd: false,
             },
         );
         parse_and_check_eq(
@@ -321,6 +349,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: false,
+                report_undeterminable_pwd: false,
             },
         );
         parse_and_check_eq(
@@ -328,6 +357,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: false,
+                report_undeterminable_pwd: false,
             },
         );
         parse_and_check_eq(
@@ -335,6 +365,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("some_dir/some_other_dir")),
                 handle_dot_dot_physically: true,
+                report_undeterminable_pwd: false,
             },
         )
     }
@@ -351,6 +382,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: None,
                 handle_dot_dot_physically: false,
+                report_undeterminable_pwd: false,
             },
         );
         parse_and_check_eq(
@@ -358,6 +390,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("-L")),
                 handle_dot_dot_physically: false,
+                report_undeterminable_pwd: false,
             },
         );
         parse_and_check_eq(
@@ -365,6 +398,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("-L")),
                 handle_dot_dot_physically: false,
+                report_undeterminable_pwd: false,
             },
         );
         parse_and_check_eq(vec!["--", "-"], CdArgs::GoBack);
@@ -373,6 +407,7 @@ mod tests {
             CdArgs::ChangeDir {
                 directory: Some(ShStr::new("some_dir")),
                 handle_dot_dot_physically: true,
+                report_undeterminable_pwd: false,
             },
         );
     }

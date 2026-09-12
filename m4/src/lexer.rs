@@ -118,14 +118,8 @@ impl MacroName {
 
     pub fn parse_cmd(input: &OsStr) -> std::result::Result<Self, clap::Error> {
         let input_bytes = input.as_encoded_bytes();
-        MacroName::try_from_slice(input_bytes).map_err(|_error| {
-            let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation);
-            e.insert(
-                clap::error::ContextKind::InvalidValue,
-                clap::error::ContextValue::String(String::from_utf8_lossy(input_bytes).to_string()),
-            );
-            e
-        })
+        MacroName::try_from_slice(input_bytes)
+            .map_err(|_error| invalid_name_error("-U <name>", input_bytes))
     }
 
     /// Parse macro name from a complete slice, not including the EOF byte.
@@ -135,6 +129,23 @@ impl MacroName {
             .map_err(|e| crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string()))?;
         Ok(name)
     }
+}
+
+/// A `clap::Error` for an option-argument that is not a name token, naming
+/// both the option it came from and the value, so the rendered diagnostic
+/// reads like every other bad-option-argument message.
+pub(crate) fn invalid_name_error(arg: &str, value: &[u8]) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let mut e = clap::Error::new(ErrorKind::ValueValidation);
+    e.insert(
+        ContextKind::InvalidArg,
+        ContextValue::String(arg.to_string()),
+    );
+    e.insert(
+        ContextKind::InvalidValue,
+        ContextValue::String(String::from_utf8_lossy(value).to_string()),
+    );
+    e
 }
 
 // These classify one byte, in the locale `plib::diag::init_locale` installed.

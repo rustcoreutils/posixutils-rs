@@ -240,6 +240,19 @@ fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
         }
     };
 
+    // A zero boundary makes every write advance by zero bytes, so the loop
+    // below opens a fresh output file on each pass and never consumes the
+    // input -- one empty file per available suffix, then "suffixes exhausted".
+    // `-l` is bounded by clap's `1..`; `-b` parses its own operand, so the
+    // bound belongs here.
+    if boundary == 0 {
+        return Err(Error::other(format!(
+            "{}: {}",
+            gettext("invalid byte count"),
+            bytesplit
+        )));
+    }
+
     // open file, or stdin ("-" or no operand)
     let mut file = input_stream(&args.file, true)?;
     let mut raw_buffer = [0; BUFSZ];

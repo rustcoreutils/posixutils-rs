@@ -120,6 +120,35 @@ fn split_exhaustion_diagnostic_is_one_named_line() {
 }
 
 #[test]
+fn split_zero_byte_count_is_rejected() {
+    // A zero boundary made every write advance by zero bytes, so the loop
+    // opened a fresh output file per pass and never consumed the input: 676
+    // empty files and then "output suffixes exhausted". `-l 0` is already
+    // refused by clap's `1..` range; `-b` parses its own operand and was not.
+    let (dir, prefix) = tmp_prefix("zero_bytes");
+    run_split_stderr(&["-b", "0", "-", &prefix], "a\nb\n", 1, |stderr| {
+        assert_one_diagnostic(stderr, "byte count")
+    });
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        0,
+        "a rejected byte count must create no files"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn split_zero_byte_count_with_suffix_is_rejected() {
+    // The multiplier is applied after the parse, so `0k` is zero too.
+    let (dir, prefix) = tmp_prefix("zero_bytes_k");
+    run_split_stderr(&["-b", "0k", "-", &prefix], "a\nb\n", 1, |stderr| {
+        assert_one_diagnostic(stderr, "byte count")
+    });
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn split_name_too_long_diagnostic_is_one_named_line() {
     // This path printed the message itself *and* returned an Err that was
     // printed again, so it emitted two lines.

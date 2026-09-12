@@ -15,6 +15,7 @@
 
 use crate::error::YaccError;
 use gettextrs::gettext;
+use plib::cscan::CScanner;
 use plib::diag;
 
 /// Token types for yacc grammar files
@@ -336,100 +337,28 @@ impl<'a> Lexer<'a> {
         self.advance(); // consume '{'
         let mut action = String::new();
         let mut depth = 1;
+        // Only a brace in code closes the action: `{` and `}` inside a string
+        // literal, a character literal or a comment are ordinary characters.
+        let mut scanner = CScanner::new();
 
-        while depth > 0 {
-            match self.advance() {
-                Some('{') => {
-                    depth += 1;
-                    action.push('{');
-                }
-                Some('}') => {
-                    depth -= 1;
-                    if depth > 0 {
-                        action.push('}');
-                    }
-                }
-                Some('\'') => {
-                    // Character literal in C code
-                    action.push('\'');
-                    loop {
-                        match self.advance() {
-                            Some('\\') => {
-                                action.push('\\');
-                                if let Some(c) = self.advance() {
-                                    action.push(c);
-                                }
-                            }
-                            Some('\'') => {
-                                action.push('\'');
-                                break;
-                            }
-                            Some(c) => action.push(c),
-                            None => break,
+        while let Some(c) = self.advance() {
+            if scanner.step(c).is_code() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            // The closing brace is not part of the action text.
+                            return Ok(action);
                         }
                     }
-                }
-                Some('"') => {
-                    // String literal in C code
-                    action.push('"');
-                    loop {
-                        match self.advance() {
-                            Some('\\') => {
-                                action.push('\\');
-                                if let Some(c) = self.advance() {
-                                    action.push(c);
-                                }
-                            }
-                            Some('"') => {
-                                action.push('"');
-                                break;
-                            }
-                            Some(c) => action.push(c),
-                            None => break,
-                        }
-                    }
-                }
-                Some('/') => {
-                    action.push('/');
-                    if self.peek() == Some('*') {
-                        // C comment
-                        action.push(self.advance().unwrap());
-                        loop {
-                            match self.advance() {
-                                Some('*') => {
-                                    action.push('*');
-                                    if self.peek() == Some('/') {
-                                        action.push(self.advance().unwrap());
-                                        break;
-                                    }
-                                }
-                                Some(c) => action.push(c),
-                                None => break,
-                            }
-                        }
-                    } else if self.peek() == Some('/') {
-                        // C++ comment
-                        action.push(self.advance().unwrap());
-                        while let Some(c) = self.advance() {
-                            action.push(c);
-                            if c == '\n' {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Some(c) => action.push(c),
-                None => {
-                    return Err(self.lexical_error(
-                        start_line,
-                        start_col,
-                        gettext("unterminated action"),
-                    ))
+                    _ => {}
                 }
             }
+            action.push(c);
         }
 
-        Ok(action)
+        Err(self.lexical_error(start_line, start_col, gettext("unterminated action")))
     }
 
     fn read_code_block(&mut self) -> Result<String, YaccError> {

@@ -1143,3 +1143,63 @@ fn tr_single_byte_equivalence_class_still_works() {
     tr_test(&["-d", "[=b=]"], "abc", "ac");
     tr_test(&["-s", "[=a=]"], "aaabc", "abc");
 }
+
+// ---------------------------------------------------------------------------
+// -s combined with translation, over multi-byte characters
+// ---------------------------------------------------------------------------
+
+/// Asserts the output bytes exactly, and that they are valid UTF-8.
+///
+/// The UTF-8 check is the load-bearing half: the defect below produced an
+/// orphaned continuation byte, which a length assertion at two characters
+/// cannot see.
+fn tr_bytes(args: &[&str], stdin: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tr"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tr");
+    child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().expect("wait tr");
+    assert_eq!(out.status.code(), Some(0), "tr failed on {args:?}");
+    out.stdout
+}
+
+#[test]
+fn tr_squeeze_with_translation_keeps_multibyte_output_well_formed() {
+    // `process_current_byte_with_window` advanced the *input* index by the
+    // width of the *replacement* character on the squeeze-skip path, on top of
+    // the lookahead it had already added. For a two-byte input character that
+    // is 1 + 2 = 3 instead of 2, so the stream slipped one byte per squeezed
+    // character and the output carried orphaned UTF-8 continuation bytes:
+    // "ääää" came out as c3 b6 a4 c3 b6.
+    for input in ["ää", "äää", "ääää", "ääääää"] {
+        let got = tr_bytes(&["-s", "ä", "ö"], input.as_bytes());
+        assert_eq!(
+            got,
+            "ö".as_bytes(),
+            "input {input:?} squeezes to one ö, got {got:x?}"
+        );
+        assert!(
+            std::str::from_utf8(&got).is_ok(),
+            "output must be valid UTF-8, got {got:x?}"
+        );
+    }
+
+    // Two distinct source characters mapping to the same replacement squeeze
+    // together, which is the same path with the lookahead coming from a
+    // different member of string1.
+    let got = tr_bytes(&["-s", "äö", "öö"], "ääöö".as_bytes());
+    assert_eq!(got, "ö".as_bytes(), "got {got:x?}");
+
+    // The ASCII control, which never exercised the multi-byte lookahead.
+    assert_eq!(tr_bytes(&["-s", "a", "b"], b"aaaa"), b"b");
+
+    // Squeeze without translation, and translation without squeeze, both of
+    // which take other paths through the same function.
+    assert_eq!(tr_bytes(&["-s", "ä"], "äää".as_bytes()), "ä".as_bytes());
+    assert_eq!(tr_bytes(&["ä", "ö"], "ääää".as_bytes()), "öööö".as_bytes());
+}

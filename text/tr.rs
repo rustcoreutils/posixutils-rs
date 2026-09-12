@@ -2921,8 +2921,10 @@ mod transformation {
                         None => (byte_a, next_bytes, FullChar::new_from_u8(byte_a)),
                     };
 
-                // TODO
-                // Is this in the right place?
+                // The lookahead belongs to the *input* match, so it is charged
+                // to the input index here; the single byte under the cursor is
+                // charged once, below or in the skip path, exactly as the
+                // non-squeezed path does.
                 if let Some(se) = replacement_check_result.match_lookahead_length {
                     *index += se as usize;
                 }
@@ -2931,10 +2933,14 @@ mod transformation {
                     if la.squeeze_char {
                         let full_char = &la.char;
 
-                        // TODO
-                        // Verify
                         if full_char.fast_check(byte_a_to_use, next_bytes_to_use) {
-                            *index += full_char.number_of_bytes as usize;
+                            // `full_char` is the *replacement*, whose width has
+                            // nothing to do with how far the input advanced:
+                            // charging it here moved the cursor by 1 + 2 = 3
+                            // over a two-byte input character, so the stream
+                            // slipped a byte per squeezed character and the
+                            // output carried orphaned UTF-8 continuation bytes.
+                            *index += 1_usize;
 
                             return;
                         }

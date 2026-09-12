@@ -1,3 +1,8 @@
+Filler text for the more(1) multi-file navigation tests.  The content is
+immaterial -- only its length matters, so that `:n` and `j` have several
+screenfuls to page through.  It happens to be a 2024 snapshot of the
+project README/TODO, which is why it must not be read as documentation.
+
 # General TODO and future implementation notes
 
 ## Upstream fixes wanted

@@ -7,12 +7,22 @@ findings are in git history — `git log --grep '#A7'` finds one by number.
 
 ## Open
 
-One, a test-coverage gap rather than a defect.
+None.
 
-- [ ] **`ar`: locale-driven `-tv` date format (#A7)** — `test_ar_tv_date_uses_mtime_not_age`
-  pins `TZ` and the year (it is the #A1 regression), but nothing asserts that
-  `LC_TIME` selects the month/day rendering. `-tv` routes through
-  `plib::locale::strftime`, which honors `LC_TIME`; only the assertion is absent.
+- [x] **`ar`: locale-driven `-tv` date format (#A7)** ✓ fixed 2026-09-12 —
+  `test_ar_tv_date_uses_mtime_not_age` pinned `TZ` and the year (it is the #A1
+  regression), but nothing asserted that `LC_TIME` selects the month rendering.
+  `test_ar_tv_date_follows_lc_time` does, behind `posixutils_test_all`. It
+  takes the expected month from the system's own locale data rather than a
+  hard-coded name, because glibc falls back to C silently when a locale is
+  missing, and skips when no installed locale renders September differently
+  from C — so it cannot pass vacuously. Proven to fail by building
+  `fr_FR.UTF-8` with `localedef` into a scratch `LOCPATH` and breaking `%b`.
+
+Per `audits.md` §9 this file would now go away, its punch list being empty.
+It is kept for the residuals below, which are dispositions rather than a
+punch list and are recorded nowhere else; the next finding should be added
+here rather than reviving it.
 
 ## Documented gaps that are not open work
 
@@ -27,3 +37,11 @@ One, a test-coverage gap rather than a defect.
 - **`ar`: `TMPDIR` unconsulted.** By design — `plib::io::write_atomic` stages
   the temp file in the target's directory so the `rename(2)` stays
   intra-filesystem and atomic.
+- **`lex`: a literal character above U+007F in a pattern is refused.** The
+  generated scanner's alphabet is bytes, so such a pattern cannot match; flex
+  matches it. Accepting it silently was the defect and is fixed — the
+  diagnostic names the character and its position. `\NNN` and `\xNN` still
+  name bytes 0x80..0xff and are checked against flex. See `dev/lex/README.md`.
+- **`yacc`: a `//` comment between rules is a syntax error.** POSIX yacc
+  comments are `/* */`; bison accepts `//` as an extension. Inside an action
+  `//` is C and is handled. See `dev/yacc/README.md`.

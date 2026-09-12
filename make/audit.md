@@ -571,21 +571,34 @@ GNU Make 4.3; each fix carries a regression test.
 
 ## Still open
 
-- **Full POSIX macro source-1..4 precedence.** No macro records where its value
-  came from. Precedence is emergent: built-in defaults are seeded only where
-  the makefile is silent, the environment is consulted as a fallback (or wins
-  under `-e`), and command-line macros are locked. That answers every case
-  probed against GNU Make 4.3, and #71/#73 closed the two that were wrong, but
-  it is not the four-source model the spec describes, and a case that needs to
-  ask "which source set this?" cannot be answered today.
-- **GNU double-colon rules** (`target:: prerequisites`), where several rules
-  for one target each carry their own commands and all of them run. POSIX has
-  no such construct. As of #86 the form is recognized and rejected by name
-  rather than misparsed, so a makefile using it fails with a diagnostic that
-  says what is unsupported.
-- **XSI `~` suffix rules** (`.c~.o`, `.sh~` and friends), which build directly
-  from an SCCS history file. Separate machinery from `.SCCS_GET` retrieval
-  (#61), which is implemented.
+Nothing. The three items this section carried are checkboxes now, so the file's
+own tally says what is left rather than hiding it in prose; two are ticked and
+the third is a decision.
+
+- [x] **#88 — Full POSIX macro source-1..4 precedence.** ✓ fixed 2026-09-12.
+  No macro recorded where its value came from, so precedence was emergent:
+  built-in defaults were seeded only where the makefile was silent, the
+  environment was consulted as a fallback (or won under `-e`), and command-line
+  macros were locked. The gap between those four rules was a real defect, not just
+  an architectural one — the built-ins were seeded into the finished `Make`,
+  after the parse, so a makefile could not see them: `$(CC)` expanded to
+  nothing while `make -p` reported `CC = c17`. Each entry now carries a
+  `MacroSource`, `rank()` states the ordering once, and one `resolve()` answers
+  every site.
+- [x] **#89 — XSI `~` suffix rules** (`.c~.o`, `.sh~` and friends), which build
+  directly from an SCCS history file. ✓ fixed 2026-09-12. The `.SUFFIXES`
+  default list and `GET`/`GFLAGS` had been present and inert all along, because
+  the suffix lexer refused `~` and `.c~.o:` never became an inference target.
+  Separate machinery from `.SCCS_GET` retrieval (#61): POSIX 105941 puts the
+  history file beside the target (`s.foo.c`), 105699 puts it in `SCCS/`.
+- [ ] **#86 — GNU double-colon rules** (`target:: prerequisites`), where
+  several rules for one target each carry their own commands and all of them
+  run. **SETTLED by maintainer decision (2026-09-12) — not deferred and not
+  awaiting anything.** POSIX has no such construct, and the project's
+  non-GNU-compat rule governs. The form is recognized and rejected by name
+  rather than misparsed, so a makefile using it fails with a diagnostic saying
+  what is unsupported, which is the whole of what is wanted. Left unticked
+  because it names a thing make does not do; it is not work.
 
 ## Acceptance gate
 

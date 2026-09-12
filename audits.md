@@ -274,11 +274,18 @@ Crates with open items today:
 - [`calc/audit.md`](calc/audit.md) — `expr`, `bc`
 - [`cc/audit.md`](cc/audit.md) — `c17`, `cflow`, `ctags`, `cxref`
 - [`cron/audit.md`](cron/audit.md) — `crontab`, `at`, `batch`, `crond`
-- [`dev/audit.md`](dev/audit.md) — `yacc`, `lex`, `ar`, `nm`, `strings`, `strip`
-- [`make/audit.md`](make/audit.md) — `make`
 - [`sh/audit.md`](sh/audit.md) — `sh`
 - [`sys/audit.md`](sys/audit.md) — `getconf`, `ipcrm`, `ipcs`, `ps`, `uname`, `who`
 - [`tree/audit.md`](tree/audit.md) — the 16 `tree/` utilities + the `ftw/` crate
+
+Two files remain with nothing open, kept for content that is not a punch list:
+
+- [`dev/audit.md`](dev/audit.md) — `#A7` closed 2026-09-12; kept for its
+  dispositioned residuals, which are recorded nowhere else.
+- [`make/audit.md`](make/audit.md) — `#88` and `#89` closed 2026-09-12; the one
+  unticked box, `#86`, is a settled decision (GNU `::` rules are rejected by
+  name, deliberately) rather than pending work. Kept for the acceptance gate
+  and the re-probe record.
 
 Audited with nothing open, so no file: `awk`, `datetime`, `display`,
 `editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `man`, `misc`, `pathnames`,

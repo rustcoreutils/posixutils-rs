@@ -4063,3 +4063,42 @@ a           { printf("[a]"); REJECT; }
         );
     }
 }
+
+#[test]
+fn test_action_brace_inside_multiline_comment() {
+    // `parse_braces` scanned each action line from a fresh state, so a block
+    // comment left open at the end of one line did not hide the next. A `}`
+    // on the second line was counted as closing the action, truncating it
+    // there and leaving the rest of the C code to be parsed as lex rules.
+    let lex_input = r#"%option noinput nounput
+%%
+[a-z]+    { /* opening a comment
+             } and a brace inside it */
+            printf("WORD: %s\n", yytext); }
+[ \t\n]+  { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "hi\n").unwrap();
+    assert_eq!(result, "WORD: hi\n");
+}
+
+#[test]
+fn test_action_brace_inside_string_literal() {
+    // Same rule, the string-literal half: a `}` inside `"..."` is not a brace.
+    let lex_input = r#"%option noinput nounput
+%%
+[a-z]+    { printf("}%s{\n", yytext); }
+[ \t\n]+  { }
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed: {}", c_code);
+
+    let result = compile_and_run(&c_code, "hi\n").unwrap();
+    assert_eq!(result, "}hi{\n");
+}

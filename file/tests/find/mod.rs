@@ -411,7 +411,16 @@ fn find_print0_with_name_filter() {
 /// `remove_dir_all` below clears whatever the last one left.
 fn scratch_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("posixutils_find_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    // Anything but "it was not there" has to be reported here. `create_dir_all`
+    // is happy with a directory that already exists, so a removal that failed --
+    // a leftover owned by another user on a shared temp dir, or a symlink
+    // planted in it -- would otherwise leave stale entries in place and surface
+    // as an assertion about `-mtime` or `-name` further down.
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("could not clear scratch dir {}: {e}", dir.display()),
+    }
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

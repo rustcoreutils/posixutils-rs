@@ -35,8 +35,13 @@ impl ArgumentDefine {
     pub fn parse(value: &OsStr) -> std::result::Result<Self, clap::Error> {
         let value_bytes = value.as_encoded_bytes();
         let mut split = value_bytes.splitn(2, |b| *b == b'=');
-        let name = MacroName::try_from_slice(split.next().unwrap_or_default())
-            .map_err(|_error| crate::lexer::invalid_name_error("-D <name[=value]>", value_bytes))?;
+        let name =
+            MacroName::try_from_slice(split.next().unwrap_or_default()).map_err(|_error| {
+                crate::lexer::invalid_name_error(
+                    &format!("-D <{}>", crate::lexer::DEFINE_VALUE_NAME),
+                    value_bytes,
+                )
+            })?;
 
         let value = match split.next() {
             // TODO(performance): perhaps we should use
@@ -89,7 +94,7 @@ impl Args {
             .arg(
                 clap::Arg::new("define")
                     .short('D')
-                    .value_name("name[=value]")
+                    .value_name(crate::lexer::DEFINE_VALUE_NAME)
                     .help(gettext(
                         "Define the symbol name to have some value (or NULL)",
                     ))
@@ -99,7 +104,7 @@ impl Args {
             .arg(
                 clap::Arg::new("undefine")
                     .short('U')
-                    .value_name("name")
+                    .value_name(crate::lexer::UNDEFINE_VALUE_NAME)
                     .help(gettext("Undefine the symbol name"))
                     .num_args(1)
                     .action(clap::ArgAction::Append),

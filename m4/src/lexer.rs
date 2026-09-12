@@ -118,8 +118,9 @@ impl MacroName {
 
     pub fn parse_cmd(input: &OsStr) -> std::result::Result<Self, clap::Error> {
         let input_bytes = input.as_encoded_bytes();
-        MacroName::try_from_slice(input_bytes)
-            .map_err(|_error| invalid_name_error("-U <name>", input_bytes))
+        MacroName::try_from_slice(input_bytes).map_err(|_error| {
+            invalid_name_error(&format!("-U <{UNDEFINE_VALUE_NAME}>"), input_bytes)
+        })
     }
 
     /// Parse macro name from a complete slice, not including the EOF byte.
@@ -131,9 +132,21 @@ impl MacroName {
     }
 }
 
+/// How `-D` and `-U` spell their option-argument. These are the strings the
+/// diagnostic quotes back, so they have to agree with the `value_name` each
+/// `clap::Arg` is built with; naming them once is what keeps the two in step.
+pub(crate) const DEFINE_VALUE_NAME: &str = "name[=value]";
+pub(crate) const UNDEFINE_VALUE_NAME: &str = "name";
+
 /// A `clap::Error` for an option-argument that is not a name token, naming
 /// both the option it came from and the value, so the rendered diagnostic
 /// reads like every other bad-option-argument message.
+///
+/// Rejecting the option is a deliberate divergence: GNU m4 accepts a `-D` or
+/// `-U` whose name is not a name token and silently ignores it, so a caller
+/// asking for something m4 cannot do hears nothing back. Saying so costs a
+/// build that passes, say, a hyphenated name, which is the point -- silent
+/// acceptance is the defect, not the diagnostic.
 pub(crate) fn invalid_name_error(arg: &str, value: &[u8]) -> clap::Error {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     let mut e = clap::Error::new(ErrorKind::ValueValidation);

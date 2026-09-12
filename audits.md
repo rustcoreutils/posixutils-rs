@@ -275,21 +275,20 @@ Crates with open items today:
 - [`cc/audit.md`](cc/audit.md) — `c17`, `cflow`, `ctags`, `cxref`
 - [`cron/audit.md`](cron/audit.md) — `crontab`, `at`, `batch`, `crond`
 - [`sh/audit.md`](sh/audit.md) — `sh`
-- [`sys/audit.md`](sys/audit.md) — `getconf`, `ipcrm`, `ipcs`, `ps`, `uname`, `who`
 - [`tree/audit.md`](tree/audit.md) — the 16 `tree/` utilities + the `ftw/` crate
 
 Audited with nothing open, so no file: `awk`, `datetime`, `dev`, `display`,
 `editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `make`, `man`, `misc`,
-`pathnames`, `pax`, `print`, `process`, `sccs`, `screen`, `text`, `users`,
-`uucp`, `xform`.
+`pathnames`, `pax`, `print`, `process`, `sccs`, `screen`, `sys`, `text`,
+`users`, `uucp`, `xform`.
 
-`dev` and `make` joined that list on 2026-09-12, when their last open items
-closed (`#A7`; `#88` and `#89`). `make`'s remaining unticked box, `#86`, was a
-settled decision — GNU `::` rules are rejected by name, deliberately — and a
-decision is not a punch-list item. The dispositioned residuals both files
-carried went with them, as the rule here intends: they are findings about what
-was checked, and `git log --follow` is where findings live once nothing is
-outstanding.
+`dev`, `make` and `sys` joined that list on 2026-09-12, when their last open
+items closed (`#A7`; `#88` and `#89`; the `ps` and `who` coverage gaps).
+`make`'s remaining unticked box, `#86`, was a settled decision — GNU `::`
+rules are rejected by name, deliberately — and a decision is not a punch-list
+item. The dispositioned residuals those files carried went with them, as the
+rule here intends: they are findings about what was checked, and
+`git log --follow` is where findings live once nothing is outstanding.
 
 A crate on that list is only as good as the probes behind its ticked boxes.
 `make` was on it until a crate-wide review found 21 defects the same day — two

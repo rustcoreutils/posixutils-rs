@@ -1101,8 +1101,16 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         stdin // Use stdin as the reader.
     } else {
         // Otherwise, process each specified file.
-        for file in &args.files {
-            let mut file = File::open(file)?; // Open the file.
+        for path in &args.files {
+            // Named here: `?` on a bare io::Error loses the operand, and the
+            // diagnostic then cannot say which file failed.
+            let mut file = File::open(path).map_err(|e| {
+                io::Error::other(format!(
+                    "{}: {}",
+                    path.display(),
+                    plib::diag::io_error_text(&e)
+                ))
+            })?;
 
             if bytes_skipped < bytes_to_skip {
                 // If the cumulative bytes skipped are less than the bytes to skip, process the file for skipping.
@@ -1164,7 +1172,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = od(&args) {
         exit_code = 1;
-        eprint!("{}", err);
+        // `eprintln!`, and prefixed: this was `eprint!("{}", err)`, so the
+        // diagnostic carried no utility name and no newline, and ran into
+        // whatever printed next.
+        eprintln!("od: {}", err);
     }
 
     std::process::exit(exit_code)

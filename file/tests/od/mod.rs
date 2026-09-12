@@ -406,7 +406,9 @@ fn test_od_skip_past_eof() {
         args: vec![String::from("-j"), String::from("100")],
         stdin_data: b"ab".to_vec(),
         expected_out: Vec::new(),
-        expected_err: b"cannot skip past end of input".to_vec(),
+        // Prefixed and newline-terminated: this expectation used to encode the
+        // defect, asserting a bare message with no `od:` and no line ending.
+        expected_err: b"od: cannot skip past end of input\n".to_vec(),
         expected_exit_code: 1,
     });
 }
@@ -491,4 +493,29 @@ fn od_integer_size_suffixes_are_unchanged() {
         let (by_number, _, _) = od_raw(&["-An", "-t", number], &bytes);
         assert_eq!(by_letter, by_number, "{letter} must agree with {number}");
     }
+}
+
+// A diagnostic must name the utility and the file, and end its line.
+//
+// `main` did `eprint!("{}", err)` on a bare `io::Error` propagated by `?` from
+// `File::open`: no `od:` prefix, no filename, and no trailing newline, so the
+// message ran into whatever printed next.
+#[test]
+fn od_names_itself_and_the_file_and_ends_the_line() {
+    let (stdout, stderr, code) = od_raw(&["/nonexistent_od_probe"], b"");
+    assert_eq!(code, Some(1));
+    assert!(stdout.is_empty(), "no output on failure: {stdout:?}");
+    assert!(
+        stderr.starts_with("od: "),
+        "must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_od_probe"),
+        "must name the file: {stderr:?}"
+    );
+    assert!(
+        stderr.ends_with('\n'),
+        "must end the line, or it runs into the next output: {stderr:?}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "one line: {stderr:?}");
 }

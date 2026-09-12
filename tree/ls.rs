@@ -845,6 +845,24 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
     }
 }
 
+/// Report a command-line operand that could not be read.
+///
+/// Same shape as the directory-entry failures further down -- naming the
+/// operand is what lets the user tell which of several failed -- and routed
+/// through `io_error_text`, so the message is the system's rather than Rust's
+/// `... (os error 2)`.
+fn report_operand_error(path: &Path, e: &io::Error) {
+    let path_str = ls_from_utf8_lossy(path.as_os_str().as_bytes());
+    eprintln!(
+        "ls: {}",
+        gettext!(
+            "cannot access '{}': {}",
+            path_str,
+            plib::diag::io_error_text(e)
+        )
+    );
+}
+
 fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     let mut exit_code = 0;
 
@@ -872,7 +890,9 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
         let metadata = match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, false) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("ls: {e}");
+                // Named, like the directory-entry failures below: without the
+                // operand the user cannot tell which of several failed.
+                report_operand_error(&path, &e);
                 exit_code = exit_code.max(1);
                 continue;
             }
@@ -891,7 +911,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
             match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, true) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("ls: {e}");
+                    report_operand_error(&path, &e);
                     exit_code = exit_code.max(1);
                     continue;
                 }
@@ -922,7 +942,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
         ) {
             Ok(x) => x,
             Err(e) => {
-                eprintln!("ls: {e}");
+                report_operand_error(&path, &e);
                 exit_code = exit_code.max(1);
                 continue;
             }

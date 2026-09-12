@@ -755,8 +755,25 @@ mod parsing {
 
         let char = categorize_char(char_between_equals_signs);
 
-        // TODO
-        // Validate this char
+        // The equivalence-class machinery indexes the byte tables, so a
+        // character wider than a byte has nowhere to go. It used to be built
+        // anyway and reached three `unreachable!()` arms downstream, aborting
+        // with exit 101 and no diagnostic -- in every mode, and on input that
+        // did not itself contain the character.
+        //
+        // Refused here, where the operand is still the text the user wrote, so
+        // the diagnostic can quote it. Supporting such a class is a feature:
+        // the delete and squeeze paths have an `EquivMatcher` that asks libc
+        // and so follows LC_COLLATE, and translate would need the same.
+        if let DataTypeWithData::IsMultiByte(ch) = char {
+            // Quoted raw, like the multi-character arm above: it came from the
+            // command line, so it renders in the locale the user typed it in.
+            // `escape_default` would print Rust's own `\u{e9}` syntax.
+            return Err(format!(
+                "{ch}: equivalence class operand must be a single-byte character"
+            ));
+        }
+
         let operand = Operand::Equiv(EquivOperand { char });
 
         Ok(operand)

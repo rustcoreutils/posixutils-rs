@@ -1076,3 +1076,70 @@ fn tr_case_class_must_be_at_the_same_relative_position() {
     tr_test(&["x[:lower:]", "y[:upper:]"], "aBc", "ABC");
     tr_test(&["x[:lower:]", "y[:upper:]"], "xbc", "yBC");
 }
+
+// ---------------------------------------------------------------------------
+// Equivalence classes whose character is not a single byte
+// ---------------------------------------------------------------------------
+
+/// Run tr and return (exit code, stderr), asserting it did not panic.
+///
+/// `tr_expect_error` only checks the status is non-zero, which a Rust panic
+/// (101, with no diagnostic) satisfies — so it cannot tell a refusal from a
+/// crash. These cases used to crash.
+fn tr_status_and_stderr(args: &[&str], stdin: &[u8]) -> (Option<i32>, String) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tr"))
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tr");
+    let _ = child.stdin.as_mut().unwrap().write_all(stdin);
+    let out = child.wait_with_output().expect("wait tr");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !stderr.contains("panicked"),
+        "tr panicked instead of reporting: {stderr}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "tr exited 101 (panic): {stderr}"
+    );
+    (out.status.code(), stderr)
+}
+
+#[test]
+fn tr_multibyte_equivalence_class_is_refused_not_a_panic() {
+    // `parse_equiv` checked only that one character sat between the `=` signs,
+    // never that it was representable in the byte tables. A multi-byte one
+    // reached three `unreachable!()` arms, so every mode aborted with exit 101
+    // and no diagnostic -- on pure-ASCII input, the class alone was enough.
+    for args in [
+        vec!["[=\u{e9}=]", "Y"],
+        vec!["-d", "[=\u{e9}=]"],
+        vec!["-c", "[=\u{e9}=]", "Y"],
+        vec!["-s", "[=\u{e9}=]"],
+    ] {
+        let (code, stderr) = tr_status_and_stderr(&args, b"xyz");
+        assert_eq!(code, Some(1), "args {args:?} must exit 1: {stderr}");
+        assert!(
+            stderr.starts_with("tr: "),
+            "args {args:?} must name the utility: {stderr:?}"
+        );
+        assert!(
+            !stderr.trim().is_empty(),
+            "args {args:?} must say something: {stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn tr_single_byte_equivalence_class_still_works() {
+    // The control: the byte-sized form is unaffected by the rejection above.
+    tr_test(&["[=a=]", "Y"], "abc", "Ybc");
+    tr_test(&["-d", "[=b=]"], "abc", "ac");
+    tr_test(&["-s", "[=a=]"], "aaabc", "abc");
+}

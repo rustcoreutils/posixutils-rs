@@ -8,6 +8,7 @@
 //
 
 pub mod archive;
+pub mod cscan;
 pub mod curuser;
 pub mod diag;
 pub mod exec;

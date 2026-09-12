@@ -19,6 +19,7 @@ use crate::grammar::{Grammar, EOF_SYMBOL, ERROR_SYMBOL, UNDEF_SYMBOL};
 use crate::lalr::{Action, LALRAutomaton};
 use crate::Options;
 use gettextrs::gettext;
+use plib::cscan::{CScanner, CharContext};
 use plib::diag;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -1541,6 +1542,38 @@ fn generate_parser<W: Write>(
     Ok(())
 }
 
+/// An action's characters paired with the C lexical context each sits in.
+///
+/// `$` is a value reference only in code. Inside a string literal, a character
+/// literal or a comment it is an ordinary character that has to survive into
+/// the generated parser unchanged.
+struct ActionScan<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    scanner: CScanner,
+    /// Context of the character `next` most recently returned.
+    context: CharContext,
+}
+
+impl<'a> ActionScan<'a> {
+    fn new(action: &'a str) -> Self {
+        Self {
+            chars: action.chars().peekable(),
+            scanner: CScanner::new(),
+            context: CharContext::Code,
+        }
+    }
+
+    fn next(&mut self) -> Option<char> {
+        let c = self.chars.next()?;
+        self.context = self.scanner.step(c);
+        Some(c)
+    }
+
+    fn peek(&mut self) -> Option<&char> {
+        self.chars.peek()
+    }
+}
+
 /// Transform semantic action: replace $$ and $n with stack references
 ///
 /// POSIX defines the following pseudo-variables:
@@ -1571,13 +1604,14 @@ fn transform_action(
     let rhs_len = positions.len();
 
     let mut result = String::new();
-    let mut chars = action.chars().peekable();
+    let mut scan = ActionScan::new(action);
 
-    while let Some(c) = chars.next() {
-        if c == '$' {
-            match chars.peek() {
+    while let Some(c) = scan.next() {
+        // A `$` outside code is an ordinary character, not a value reference.
+        if c == '$' && scan.context.is_code() {
+            match scan.peek() {
                 Some('$') => {
-                    chars.next();
+                    scan.next();
                     // Use LHS type if available
                     if let Some(ref tag) = grammar.symbols[prod.lhs].tag {
                         result.push_str(&format!("({}val.{})", prefix, tag));
@@ -1600,20 +1634,20 @@ fn transform_action(
                 }
                 Some('<') => {
                     // $<tag>$ or $<tag>n - explicit type tag
-                    chars.next();
+                    scan.next();
                     let mut tag = String::new();
-                    while let Some(&tc) = chars.peek() {
+                    while let Some(&tc) = scan.peek() {
                         if tc == '>' {
-                            chars.next();
+                            scan.next();
                             break;
                         }
                         tag.push(tc);
-                        chars.next();
+                        scan.next();
                     }
                     // Now check what follows the tag
-                    match chars.peek() {
+                    match scan.peek() {
                         Some('$') => {
-                            chars.next();
+                            scan.next();
                             result.push_str(&format!("({}val.{})", prefix, tag));
                         }
                         Some(&c) if c.is_ascii_digit() || c == '-' => {
@@ -1621,12 +1655,12 @@ fn transform_action(
                             let mut num_str = String::new();
                             if c == '-' {
                                 num_str.push('-');
-                                chars.next();
+                                scan.next();
                             }
-                            while let Some(&d) = chars.peek() {
+                            while let Some(&d) = scan.peek() {
                                 if d.is_ascii_digit() {
                                     num_str.push(d);
-                                    chars.next();
+                                    scan.next();
                                 } else {
                                     break;
                                 }
@@ -1650,12 +1684,12 @@ fn transform_action(
                     let mut num_str = String::new();
                     if c == '-' {
                         num_str.push('-');
-                        chars.next();
+                        scan.next();
                     }
-                    while let Some(&d) = chars.peek() {
+                    while let Some(&d) = scan.peek() {
                         if d.is_ascii_digit() {
                             num_str.push(d);
-                            chars.next();
+                            scan.next();
                         } else {
                             break;
                         }

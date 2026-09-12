@@ -304,6 +304,41 @@ fn define_option_rejects_a_name_starting_with_a_digit() {
     });
 }
 
+// POSIX 103940 leaves an ifelse of fewer than three arguments unspecified, so
+// where to warn is a quality call, and GNU m4 draws it at exactly two: two
+// comparands with no branch warns, while one argument or none is silent. This
+// warned for all three.
+#[test]
+fn ifelse_warns_at_two_arguments_but_not_fewer() {
+    for args in ["ifelse()", "ifelse(a)"] {
+        run_test(TestPlan {
+            cmd: String::from("m4"),
+            args: vec![],
+            stdin_data: format!("{}\n", args),
+            expected_out: String::from("\n"),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("m4"),
+            args: vec![],
+            stdin_data: String::from("ifelse(a,a)\n"),
+            expected_out: String::from("\n"),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("too few arguments to builtin `ifelse'"),
+                "expected the two-argument warning, got {stderr:?}"
+            );
+        },
+    );
+}
+
 #[test]
 fn undefine_option_rejects_a_name_starting_with_a_digit() {
     run_test(TestPlan {

@@ -19,6 +19,10 @@ plib = { path = "../plib" }
 
 [dev-dependencies]
 
+[features]
+# Tests needing setup CI need not have -- here, a locale beyond C/POSIX.
+posixutils_test_all = []
+
 [lints]
 workspace = true
 

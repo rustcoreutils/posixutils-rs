@@ -78,6 +78,15 @@ impl Target {
         while let Some(c) = source.peek() {
             match c {
                 c @ ('0'..='9' | 'a'..='z' | 'A'..='Z' | '_') => from.push(*c),
+                // XSI (POSIX 105941): a trailing `~` turns a suffix into a
+                // reference to an SCCS file, as in `.c~.o`. It is only ever the
+                // last character of a suffix -- accepting it anywhere else
+                // would make `.c~.o` ambiguous.
+                '~' if !from.is_empty() => {
+                    from.push('~');
+                    source.next();
+                    break;
+                }
                 '.' => break,
                 _ => None?,
             }
@@ -102,6 +111,11 @@ impl Target {
         while let Some(c) = source.peek() {
             match c {
                 c @ ('0'..='9' | 'a'..='z' | 'A'..='Z' | '_') => to.push(*c),
+                '~' if !to.is_empty() => {
+                    to.push('~');
+                    source.next();
+                    break;
+                }
                 '.' | ' ' | '\t' | ':' => break,
                 _ => None?,
             }

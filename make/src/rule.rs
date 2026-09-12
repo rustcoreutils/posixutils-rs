@@ -223,14 +223,24 @@ impl Rule {
         // input/output pair from the target name and the rule's suffixes.
         let files = if let Some(Target::Inference { from, to, .. }) = self.targets().next() {
             let target_name = target.as_ref();
+            // `suffix_source_name` decides what a source suffix names, so an
+            // XSI `~` rule reports its SCCS history file in `$<` rather than a
+            // file that does not exist. The existence probe in
+            // `find_inference_rule` asks the same function, so a rule cannot
+            // fire on one name and then be handed another.
+            let source_suffix = format!(".{from}");
             if to.is_empty() {
                 // Single-suffix rule (`.s2:`): build `target` from `target.s2`.
-                let input = PathBuf::from(resolve(&format!("{target_name}.{from}")));
+                let input = PathBuf::from(resolve(&crate::suffix_source_name(
+                    target_name,
+                    &source_suffix,
+                )));
                 vec![(input, PathBuf::from(target_name))]
             } else {
                 let expected_suffix = format!(".{}", to);
                 if let Some(stem) = target_name.strip_suffix(&expected_suffix) {
-                    let input = PathBuf::from(resolve(&format!("{stem}.{from}")));
+                    let input =
+                        PathBuf::from(resolve(&crate::suffix_source_name(stem, &source_suffix)));
                     let output = PathBuf::from(target_name);
                     vec![(input, output)]
                 } else {

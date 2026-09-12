@@ -346,7 +346,7 @@ impl Make {
                                 && from == from_name)
                 });
                 if let Some(rule) = hit {
-                    let prereq_path = self.resolve_vpath(&format!("{stem}{source_suffix}"));
+                    let prereq_path = self.resolve_vpath(&suffix_source_name(stem, source_suffix));
                     if std::path::Path::new(&prereq_path).exists() {
                         return Some(rule);
                     }
@@ -364,7 +364,7 @@ impl Make {
                         if to.is_empty() && from == from_name)
             });
             if let Some(rule) = hit {
-                let prereq_path = self.resolve_vpath(&format!("{name}{source_suffix}"));
+                let prereq_path = self.resolve_vpath(&suffix_source_name(name, source_suffix));
                 if std::path::Path::new(&prereq_path).exists() {
                     return Some(rule);
                 }
@@ -772,20 +772,44 @@ enum Dispatch {
     Inference,
 }
 
+/// The file a source suffix names, for a given stem.
+///
+/// Ordinarily that is just the two glued together: `foo` + `.c` is `foo.c`.
+///
+/// XSI (POSIX 105941): a `~` suffix "refers to an SCCS file in the current
+/// directory", so `.c~` applied to `foo` names `s.foo.c` -- the history file --
+/// and not a file literally called `foo.c~`. The `s.` is a *prefix* where make
+/// otherwise thinks only in suffixes, which is the whole reason the `~`
+/// spelling exists.
+///
+/// Distinct from `.SCCS_GET` retrieval, which POSIX 105699 specifies against
+/// `SCCS/s.source_file`; see [`sccs_history`].
+pub(crate) fn suffix_source_name(stem: &str, source_suffix: &str) -> String {
+    let Some(base) = source_suffix.strip_suffix('~') else {
+        return format!("{stem}{source_suffix}");
+    };
+    // The `s.` attaches to the basename, so a stem with a directory keeps it.
+    let (dir, file) = match stem.rfind('/') {
+        Some(at) => (&stem[..=at], &stem[at + 1..]),
+        None => ("", stem),
+    };
+    format!("{dir}s.{file}{base}")
+}
+
 /// The file an inference rule reads to make `target`.
 ///
 /// `.c.o` applied to `foo.o` reads `foo.c`; a single-suffix `.c` applied to
-/// `foo` reads `foo.c`.
+/// `foo` reads `foo.c`; an XSI `.c~.o` applied to `foo.o` reads `s.foo.c`.
 fn inference_source(rule: &Rule, target: &Target) -> Option<String> {
     let Some(Target::Inference { from, to, .. }) = rule.targets().next() else {
         return None;
     };
     let name = target.as_ref();
     if to.is_empty() {
-        return Some(format!("{name}.{from}"));
+        return Some(suffix_source_name(name, &format!(".{from}")));
     }
     let stem = name.strip_suffix(&format!(".{to}"))?;
-    Some(format!("{stem}.{from}"))
+    Some(suffix_source_name(stem, &format!(".{from}")))
 }
 
 /// Return `name` found under one of `dirs`, if any.
@@ -831,6 +855,36 @@ const BUILTIN_RULES: &str = r#"
 	$(CC) -c $(CFLAGS) $<
 	$(AR) $(ARFLAGS) $@ $*.o
 	rm -f $*.o
+.c~:
+	$(GET) $(GFLAGS) -p $< > $*.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $*.c
+.sh~:
+	$(GET) $(GFLAGS) -p $< > $*.sh
+	cp $*.sh $@
+	chmod a+x $@
+.c~.o:
+	$(GET) $(GFLAGS) -p $< > $*.c
+	$(CC) $(CFLAGS) -c $*.c
+.y~.o:
+	$(GET) $(GFLAGS) -p $< > $*.y
+	$(YACC) $(YFLAGS) $*.y
+	$(CC) $(CFLAGS) -c y.tab.c
+	rm -f y.tab.c
+	mv y.tab.o $@
+.l~.o:
+	$(GET) $(GFLAGS) -p $< > $*.l
+	$(LEX) $(LFLAGS) $*.l
+	$(CC) $(CFLAGS) -c lex.yy.c
+	rm -f lex.yy.c
+	mv lex.yy.o $@
+.y~.c:
+	$(GET) $(GFLAGS) -p $< > $*.y
+	$(YACC) $(YFLAGS) $*.y
+	mv y.tab.c $@
+.l~.c:
+	$(GET) $(GFLAGS) -p $< > $*.l
+	$(LEX) $(LFLAGS) $*.l
+	mv lex.yy.c $@
 "#;
 
 /// The default `.SCCS_GET` recipe (POSIX 106038). `sccs` is taken from `PATH`,

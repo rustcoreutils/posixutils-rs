@@ -2435,3 +2435,133 @@ mod sccs {
         let _ = fs::remove_dir_all(dir);
     }
 }
+
+// XSI `~` suffix rules: POSIX 105941 -- "A <tilde> ('~') in the above rules
+// refers to an SCCS file in the current directory. Thus, the rule .c~.o would
+// transform an SCCS C-language source file into an object file (.o). Because
+// the s. of the SCCS files is a prefix, it is incompatible with make's suffix
+// point of view. Hence, the '~' is a way of changing any file reference into
+// an SCCS file reference."
+//
+// Distinct from `.SCCS_GET` retrieval (POSIX 105699), which POSIX specifies
+// against `SCCS/s.source_file`; here the history file sits beside the target.
+mod tilde_suffix_rules {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, String, Option<i32>) {
+        let output = Command::new(get_binary_path("make"))
+            .args(args)
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    /// A directory holding `s.<stem>.c` and a `get` stand-in, so the test
+    /// needs no SCCS installation. `GET` is a macro, so the stub is selected
+    /// on the command line (`GET=./getstub`) rather than through PATH.
+    fn fixture(dir: &str, makefile: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(format!("{dir}/Makefile"), makefile);
+        // An SCCS history file is not C; `get -p` is what turns it into the
+        // source, and the stub stands in for that.
+        let _ = fs::write(format!("{dir}/s.tilde_probe.c"), "@(#) history\n");
+
+        // `getstub -p s.tilde_probe.c` writes the checked-out source to stdout.
+        let stub = format!("{dir}/getstub");
+        let _ = fs::write(
+            &stub,
+            "#!/bin/sh\nprintf 'int tilde_probe(void){return 0;}\\n'\n",
+        );
+        let _ = fs::set_permissions(&stub, fs::Permissions::from_mode(0o755));
+    }
+
+    // The `$<` a `~` rule sees is the SCCS history file, and `$*` is the stem
+    // without the `.c`. A rule written in the makefile pins both.
+    #[test]
+    fn a_tilde_rule_reads_the_sccs_file_and_sets_the_stem() {
+        let dir = "tilde_explicit_probe";
+        fixture(
+            dir,
+            ".SUFFIXES: .o .c .c~\n\
+             .c~.o:\n\t@echo IN=$< STEM=$* TARGET=$@; : > $@\n\n\
+             all: tilde_probe.o\n\t@echo BUILT\n",
+        );
+
+        let (stdout, stderr, code) = run(&["-C", dir, "all"]);
+        assert_eq!(code, Some(0), "stdout: {stdout}stderr: {stderr}");
+        assert!(
+            stdout.contains("IN=s.tilde_probe.c"),
+            "$< must name the SCCS file: {stdout}"
+        );
+        assert!(
+            stdout.contains("STEM=tilde_probe"),
+            "$* must be the stem without the .c: {stdout}"
+        );
+        assert!(
+            stdout.contains("TARGET=tilde_probe.o"),
+            "$@ must be the target: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The built-in `.c~.o` (POSIX 106086-106088) retrieves with $(GET) and
+    // then compiles the retrieved source.
+    #[test]
+    fn the_builtin_tilde_c_to_o_rule_applies() {
+        let dir = "tilde_builtin_probe";
+        fixture(dir, "all: tilde_probe.o\n\t@echo BUILT\n");
+
+        // CFLAGS defaults to POSIX's `-O 1`, which cc does not take as one
+        // argument, so it is cleared alongside CC. GET is a `cat`-alike: the
+        // built-in rule invokes `$(GET) $(GFLAGS) -p $< > $*.c`.
+        let (stdout, stderr, code) = run(&["-C", dir, "CC=cc", "CFLAGS=", "GET=./getstub", "all"]);
+        let _ = stderr;
+        assert_eq!(code, Some(0), "stdout: {stdout}stderr: {stderr}");
+        assert!(
+            std::path::Path::new(&format!("{dir}/tilde_probe.o")).exists(),
+            "the built-in .c~.o rule did not produce the object: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `-r` clears the suffix list and the built-in rules, so nothing infers.
+    #[test]
+    fn dash_r_suppresses_the_builtin_tilde_rules() {
+        let dir = "tilde_dash_r_probe";
+        fixture(dir, "all: tilde_probe.o\n\t@echo BUILT\n");
+
+        let (stdout, _, code) = run(&["-C", dir, "-r", "CC=cc", "CFLAGS=", "all"]);
+        assert_ne!(code, Some(0), "-r must leave no rule to infer: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A `~` suffix names an SCCS file, so a file literally called
+    // `tilde_probe.c~` must NOT satisfy the rule.
+    #[test]
+    fn a_literal_tilde_suffixed_file_does_not_satisfy_the_rule() {
+        let dir = "tilde_literal_probe";
+        fixture(
+            dir,
+            ".SUFFIXES: .o .c .c~\n\
+             .c~.o:\n\t@echo IN=$<; : > $@\n\n\
+             all: tl_other.o\n\t@echo BUILT\n",
+        );
+        let _ = fs::write(format!("{dir}/tl_other.c~"), "not an SCCS file\n");
+
+        let (stdout, _, code) = run(&["-C", dir, "all"]);
+        assert_ne!(
+            code,
+            Some(0),
+            "a plain `.c~` file is not an SCCS history file: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}

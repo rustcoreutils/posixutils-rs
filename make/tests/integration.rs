@@ -2565,3 +2565,131 @@ mod tilde_suffix_rules {
         let _ = fs::remove_dir_all(dir);
     }
 }
+
+// POSIX 105837-105855 numbers the macro sources: 1 command line, 2 MAKEFLAGS,
+// 3 environment, 4 the built-in rules. "Macro definitions from these sources
+// shall not override macro definitions from a lower-numbered source", and
+// makefile definitions sit between 3 and 4 -- above the environment unless
+// `-e` is given, and never above 1 or 2.
+mod macro_sources {
+    use super::*;
+    use std::fs;
+
+    fn run_env(args: &[&str], env: &[(&str, &str)]) -> (String, String, Option<i32>) {
+        let mut cmd = Command::new(get_binary_path("make"));
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    fn fixture(dir: &str, makefile: &str) {
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(format!("{dir}/Makefile"), makefile);
+    }
+
+    const ECHO_CC: &str = "all:\n\t@echo CC=[$(CC)]\n";
+
+    // The built-in macros were seeded into the Make struct *after* the parse,
+    // so a makefile could not see them: `$(CC)` expanded to nothing while
+    // `make -p` reported `CC = c17`. The dump and the expansion disagreed.
+    #[test]
+    fn a_builtin_macro_is_visible_to_the_makefile() {
+        let dir = "macsrc_builtin_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, stderr, code) = run_env(&["-C", dir, "all"], &[]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(stdout.contains("CC=[c17]"), "stdout: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The -p dump and what the makefile expands must be the same thing.
+    #[test]
+    fn the_database_agrees_with_what_expansion_yields() {
+        let dir = "macsrc_database_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, _, _) = run_env(&["-C", dir, "-p", "all"], &[]);
+        assert!(stdout.contains("CC = c17"), "database: {stdout}");
+        assert!(stdout.contains("CC=[c17]"), "expansion: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Source 4 is the weakest: a makefile assignment beats it.
+    #[test]
+    fn a_makefile_assignment_overrides_a_builtin() {
+        let dir = "macsrc_makefile_probe";
+        fixture(dir, &format!("CC = mycc\n{ECHO_CC}"));
+        let (stdout, _, _) = run_env(&["-C", dir, "all"], &[]);
+        assert!(stdout.contains("CC=[mycc]"), "stdout: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Source 3 beats source 4 too, with no -e needed.
+    #[test]
+    fn the_environment_overrides_a_builtin() {
+        let dir = "macsrc_env_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, _, _) = run_env(&["-C", dir, "all"], &[("CC", "envcc")]);
+        assert!(stdout.contains("CC=[envcc]"), "stdout: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // ... but a makefile assignment still beats the environment without -e,
+    // and loses to it with -e. Both sit above the built-in either way.
+    #[test]
+    fn dash_e_swaps_only_the_makefile_and_the_environment() {
+        let dir = "macsrc_dash_e_probe";
+        fixture(dir, &format!("CC = mycc\n{ECHO_CC}"));
+
+        let (plain, _, _) = run_env(&["-C", dir, "all"], &[("CC", "envcc")]);
+        assert!(plain.contains("CC=[mycc]"), "without -e: {plain}");
+
+        let (with_e, _, _) = run_env(&["-C", dir, "-e", "all"], &[("CC", "envcc")]);
+        assert!(with_e.contains("CC=[envcc]"), "with -e: {with_e}");
+
+        // POSIX 105855: a makefile definition never overrides source 1, and a
+        // command-line macro is not demoted by -e either.
+        let (cmdline, _, _) = run_env(&["-C", dir, "-e", "CC=cmdcc", "all"], &[("CC", "envcc")]);
+        assert!(
+            cmdline.contains("CC=[cmdcc]"),
+            "with -e and a macro: {cmdline}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `ifdef` has to consult the same precedence as expansion, or a macro can
+    // expand to a value while reading as undefined.
+    #[test]
+    fn ifdef_sees_a_builtin_macro() {
+        let dir = "macsrc_ifdef_probe";
+        fixture(
+            dir,
+            "ifdef CC\nall:\n\t@echo SEEN=[$(CC)]\nelse\nall:\n\t@echo UNSEEN\nendif\n",
+        );
+        let (stdout, _, _) = run_env(&["-C", dir, "all"], &[]);
+        assert!(stdout.contains("SEEN=[c17]"), "stdout: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `-r` drops the built-in rules and the macros that belong to them, so
+    // nothing is left for `$(CC)` to expand to.
+    #[test]
+    fn dash_r_removes_the_builtin_macros() {
+        let dir = "macsrc_dash_r_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, _, _) = run_env(&["-C", dir, "-r", "all"], &[]);
+        assert!(stdout.contains("CC=[]"), "stdout: {stdout}");
+
+        // The environment still supplies one, since -r removes source 4 only.
+        let (with_env, _, _) = run_env(&["-C", dir, "-r", "all"], &[("CC", "envcc")]);
+        assert!(with_env.contains("CC=[envcc]"), "stdout: {with_env}");
+        let _ = fs::remove_dir_all(dir);
+    }
+}

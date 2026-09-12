@@ -337,55 +337,173 @@ fn take_till_eol(letters: &mut Peekable<impl Iterator<Item = char>>) -> String {
     content
 }
 
+/// Where a macro definition came from.
+///
+/// POSIX 105837-105847 numbers the sources -- 1 the command line, 2 MAKEFLAGS,
+/// 3 the environment, 4 the built-in rules -- and 105848 forbids a definition
+/// from overriding one from a lower-numbered (stronger) source. Recording the
+/// source is what lets one comparison answer every precedence question;
+/// without it the ordering is emergent, and every site that reaches for a
+/// macro has to re-derive it and can disagree.
+///
+/// Macros from MAKEFLAGS (source 2) arrive as command-line macros: they are
+/// merged into the argument list before parsing, and sources 1 and 2 differ
+/// only in their order relative to each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroSource {
+    /// Source 4: defined by the inference rules built into make.
+    BuiltIn,
+    /// Source 3: the environment make was started with.
+    Environment,
+    /// Defined in the makefile. POSIX 105852-105855 puts this above source 4
+    /// always, above source 3 unless `-e`, and never above source 1 or 2.
+    Makefile,
+    /// Source 1 (and 2): a command-line macro operand.
+    CommandLine,
+    /// Not a POSIX source: a `foreach` loop variable or a `call` argument,
+    /// in force only while that function's body is expanded. It shadows every
+    /// other source, which is what makes the binding a binding.
+    Local,
+}
+
+impl MacroSource {
+    /// Precedence, where higher wins.
+    ///
+    /// `-e` swaps the makefile and the environment, and *only* those two: a
+    /// command-line macro still outranks both (105855) and the built-ins still
+    /// rank below both.
+    fn rank(self, env_wins: bool) -> u8 {
+        match self {
+            MacroSource::BuiltIn => 0,
+            MacroSource::Environment => {
+                if env_wins {
+                    2
+                } else {
+                    1
+                }
+            }
+            MacroSource::Makefile => {
+                if env_wins {
+                    1
+                } else {
+                    2
+                }
+            }
+            MacroSource::CommandLine => 3,
+            MacroSource::Local => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MacroEntry {
+    value: String,
+    source: MacroSource,
+}
+
 /// A macro table that remembers first-definition order, so the macros handed
-/// to `Make` (and any future `-p` dump) are deterministic.
-#[derive(Debug, Default)]
+/// to `Make` (and the `-p` dump) are deterministic, and the source of each
+/// definition, so precedence is a comparison rather than an emergent property.
+#[derive(Debug, Default, Clone)]
 pub struct MacroTable {
-    values: HashMap<String, String>,
+    values: HashMap<String, MacroEntry>,
     order: Vec<String>,
-    /// Names a command-line operand defined. An ordinary assignment in the
-    /// makefile must not overwrite one (POSIX 105866); only `override` may.
-    locked: std::collections::HashSet<String>,
 }
 
 impl MacroTable {
-    /// The plain name→body map, for `substitute`.
-    fn values(&self) -> &HashMap<String, String> {
-        &self.values
-    }
-
-    fn set(&mut self, name: String, body: String) {
-        if self.locked.contains(&name) {
-            return;
+    /// A table pre-loaded with `macros`, all from `source`.
+    pub fn from_macros(macros: &[Macro], source: MacroSource) -> Self {
+        let mut table = Self::default();
+        for (name, body) in macros {
+            table.force(name.clone(), body.clone(), source);
         }
-        self.force(name, body);
+        table
     }
 
-    /// Assign regardless of the lock -- a command-line operand establishing it,
-    /// or an `override` assignment defeating it.
-    fn force(&mut self, name: String, body: String) {
+    /// Assign, unless a stronger source already defined `name`.
+    ///
+    /// Equal ranks assign, which is POSIX 105851: "Macro definitions from a
+    /// single source ... shall override previous macro definitions from the
+    /// same source."
+    fn set(&mut self, name: String, body: String, source: MacroSource) {
+        let env_wins = ENV_MACROS.load(Acquire);
+        if let Some(existing) = self.values.get(&name) {
+            if source.rank(env_wins) < existing.source.rank(env_wins) {
+                return;
+            }
+        }
+        self.force(name, body, source);
+    }
+
+    /// Assign regardless of precedence -- an `override` assignment defeating a
+    /// command-line macro, or a seed establishing one.
+    fn force(&mut self, name: String, body: String, source: MacroSource) {
         if !self.values.contains_key(&name) {
             self.order.push(name.clone());
         }
-        self.values.insert(name, body);
+        self.values.insert(
+            name,
+            MacroEntry {
+                value: body,
+                source,
+            },
+        );
     }
 
-    /// Seed a command-line macro, which no ordinary assignment may replace.
-    pub fn lock(&mut self, name: String, body: String) {
-        self.force(name.clone(), body);
-        self.locked.insert(name);
+    /// Seed a definition from `source` before the makefile is read.
+    pub fn seed(&mut self, name: String, body: String, source: MacroSource) {
+        self.force(name, body, source);
     }
 
-    /// Current body of `name`, used by `?=` and `+=`.
-    fn get(&self, name: &str) -> Option<&String> {
-        self.values.get(name)
+    /// Bind `name` for the duration of a `foreach` or `call` expansion,
+    /// shadowing any definition whatever its source.
+    pub(crate) fn bind_local(&mut self, name: String, value: String) {
+        self.force(name, value, MacroSource::Local);
+    }
+
+    /// The body `name` is bound to in the table itself, ignoring the
+    /// environment. Callers wanting the effective value use [`Self::resolve`].
+    pub(crate) fn value(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(|e| e.value.as_str())
+    }
+
+    /// What `name` holds, weighing the table against the environment.
+    ///
+    /// The environment is macro source 3 unconditionally -- `-e` changes which
+    /// source *wins*, not whether the environment is consulted -- so it is
+    /// compared here by rank rather than by a blanket "environment first"
+    /// switch. That distinction is the point: the environment must beat a
+    /// built-in even without `-e`, and must lose to a command-line macro even
+    /// with it.
+    ///
+    /// `None` means undefined, which is what `?=` and `ifdef` test; an
+    /// explicitly empty value is defined.
+    fn resolve(&self, name: &str, env_wins: bool) -> Option<String> {
+        let from_env = std::env::var(name).ok();
+        let Some(entry) = self.values.get(name) else {
+            return from_env;
+        };
+        match from_env {
+            Some(value)
+                if MacroSource::Environment.rank(env_wins) > entry.source.rank(env_wins) =>
+            {
+                Some(value)
+            }
+            _ => Some(entry.value.clone()),
+        }
     }
 
     pub fn into_macros(self) -> Vec<Macro> {
+        // The source is dropped here: `Make` consumes a settled table, and
+        // every precedence decision has already been made against it.
         self.order
             .into_iter()
             .map(|name| {
-                let body = self.values.get(&name).cloned().unwrap_or_default();
+                let body = self
+                    .values
+                    .get(&name)
+                    .map(|e| e.value.clone())
+                    .unwrap_or_default();
                 (name, body)
             })
             .collect()
@@ -458,11 +576,7 @@ fn parse_operator(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<Ope
 /// that re-introduces its own reference (`A = $(A)x`) never converges.
 const MAX_EXPANSION_ROUNDS: usize = 256;
 
-fn expand_to_fixpoint(
-    body: &str,
-    table: &HashMap<String, String>,
-    state: &func::Expansion,
-) -> Result<String> {
+fn expand_to_fixpoint(body: &str, table: &MacroTable, state: &func::Expansion) -> Result<String> {
     let mut body = body.to_string();
     for _ in 0..MAX_EXPANSION_ROUNDS {
         let (result, substitutions) = substitute(&body, table, state)?;
@@ -477,7 +591,7 @@ fn expand_to_fixpoint(
 /// Expand every macro reference in `source` until it stops changing.
 fn substitute_to_fixpoint(
     source: &str,
-    table: &HashMap<String, String>,
+    table: &MacroTable,
     state: &func::Expansion,
 ) -> Result<String> {
     let mut source = source.to_string();
@@ -519,9 +633,9 @@ fn apply_operator(
 ) -> Result<String> {
     match operator {
         Operator::Equals => Ok(body),
-        Operator::Colon | Operator::Colon2 => expand_to_fixpoint(&body, table.values(), state),
-        Operator::Colon3 => Ok(substitute(&body, table.values(), state)?.0),
-        Operator::Bang => shell_assign(&substitute(&body, table.values(), state)?.0),
+        Operator::Colon | Operator::Colon2 => expand_to_fixpoint(&body, table, state),
+        Operator::Colon3 => Ok(substitute(&body, table, state)?.0),
+        Operator::Bang => shell_assign(&substitute(&body, table, state)?.0),
         // `?=` and `+=` ask what the macro is *now*, and the environment is a
         // macro source (POSIX 105845) -- consulting only the table made
         // `CC ?= gcc` ignore an inherited `CC=clang`, and `CC += -Wall` drop it
@@ -552,10 +666,7 @@ fn parse_macro_name(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<S
 /// `None` means undefined, which is what `?=` tests; an explicitly empty value
 /// is defined and is left alone.
 fn existing_value(name: &str, table: &MacroTable) -> Option<String> {
-    table
-        .get(name)
-        .cloned()
-        .or_else(|| std::env::var(name).ok())
+    table.resolve(name, ENV_MACROS.load(Acquire))
 }
 
 /// Parse one macro-definition line into the name and the value its operator
@@ -586,22 +697,11 @@ pub static ENV_MACROS: AtomicBool = AtomicBool::new(false);
 /// changes which source *wins*, not whether the environment is consulted at
 /// all. POSIX 105833: "if the macro named by string1 does not exist, the final
 /// result shall be an empty string", so an undefined name is not an error.
-fn lookup_macro(name: &str, table: &HashMap<String, String>, env_wins: bool) -> String {
-    let from_env = std::env::var(name).ok();
-    let from_table = table.get(name).cloned();
-    let resolved = if env_wins {
-        from_env.or(from_table)
-    } else {
-        from_table.or(from_env)
-    };
-    resolved.unwrap_or_default()
+fn lookup_macro(name: &str, table: &MacroTable, env_wins: bool) -> String {
+    table.resolve(name, env_wins).unwrap_or_default()
 }
 
-fn substitute(
-    source: &str,
-    table: &HashMap<String, String>,
-    state: &func::Expansion,
-) -> Result<(String, u32)> {
+fn substitute(source: &str, table: &MacroTable, state: &func::Expansion) -> Result<(String, u32)> {
     let env_macros = ENV_MACROS.load(Acquire);
 
     let mut substitutions = 0;
@@ -739,7 +839,7 @@ fn substitute(
                 // The special `MAKE` macro, when not otherwise defined, is
                 // passed through to the rule stage (it expands to the make
                 // program and marks the recipe for recursive execution).
-                let defined = table.contains_key(&macro_name) || std::env::var(&macro_name).is_ok();
+                let defined = table.resolve(&macro_name, env_macros).is_some();
                 if !defined && macro_name == "MAKE" {
                     result.push('$');
                     result.push(open);
@@ -895,7 +995,7 @@ impl Reader {
             // is never evaluated -- a commented-out `$(shell rm -rf ...)`
             // must not run (audit #51).
             let code = super::scan::strip_comment(line);
-            let expanded = substitute_to_fixpoint(code, self.table.values(), &self.state)?;
+            let expanded = substitute_to_fixpoint(code, &self.table, &self.state)?;
             // Anything `$(eval ...)` queued belongs *before* this line. A rule
             // header emitted by an eval on a rule line would otherwise close
             // the enclosing rule and steal its recipe.
@@ -914,7 +1014,7 @@ impl Reader {
     /// Expand macro references in a directive's condition, using what is
     /// defined so far.
     fn expand(&self, text: &str) -> Result<String> {
-        expand_to_fixpoint(text, self.table.values(), &self.state)
+        expand_to_fixpoint(text, &self.table, &self.state)
     }
 
     fn eval_compare(&self, equal: bool, args: &str) -> Result<bool> {
@@ -931,9 +1031,8 @@ impl Reader {
         // An empty value counts as undefined, matching GNU.
         let has = self
             .table
-            .get(name)
-            .map(|v| !v.is_empty())
-            .unwrap_or_else(|| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false));
+            .resolve(name, ENV_MACROS.load(Acquire))
+            .is_some_and(|v| !v.is_empty());
         Ok(has == defined)
     }
 
@@ -1079,7 +1178,8 @@ impl Reader {
             i += 1;
         }
         if self.active() {
-            self.table.set(name.to_string(), body.join("\n"));
+            self.table
+                .set(name.to_string(), body.join("\n"), MacroSource::Makefile);
         }
         // Blank out the whole construct, header and terminator included.
         for _ in start..=i.min(lines.len() - 1) {
@@ -1262,8 +1362,8 @@ impl Reader {
         };
         let (name, body) = parse_macro_definition(line, &self.table, &self.state)?;
         match overriding {
-            true => self.table.force(name, body),
-            false => self.table.set(name, body),
+            true => self.table.force(name, body, MacroSource::Makefile),
+            false => self.table.set(name, body, MacroSource::Makefile),
         }
         Ok(())
     }
@@ -1289,7 +1389,7 @@ impl Reader {
 /// A multi-line value landing in a recipe gets each of its newlines followed by
 /// the recipe's <tab>, so every line stays a command line rather than becoming
 /// a bogus rule.
-fn expand_command_lines(text: &str, table: &HashMap<String, String>) -> Result<String> {
+fn expand_command_lines(text: &str, table: &MacroTable) -> Result<String> {
     // A command line is expanded after the reader has finished, so text
     // queued here would have no consumer: `$(eval ...)` is refused instead.
     let state = func::Expansion::without_eval();
@@ -1309,7 +1409,10 @@ fn expand_command_lines(text: &str, table: &HashMap<String, String>) -> Result<S
 /// Expand a recipe line once the rule stage has substituted its automatic
 /// variables, so a function deferred by `mentions_automatic` finally runs.
 pub fn expand_recipe(text: &str, macros: &[Macro]) -> std::result::Result<String, String> {
-    let table: HashMap<String, String> = macros.iter().cloned().collect();
+    // These macros are the settled table `Make` was handed, so every
+    // precedence question they raised has already been answered; the source
+    // recorded here only has to outrank the environment, as the makefile did.
+    let table = MacroTable::from_macros(macros, MacroSource::Makefile);
     let state = func::Expansion::without_eval();
     substitute_to_fixpoint(text, &table, &state).map_err(|e| e.to_string())
 }
@@ -1318,25 +1421,43 @@ pub fn expand_recipe(text: &str, macros: &[Macro]) -> std::result::Result<String
 /// sees and the macro definitions it must not (they are consumed here, but
 /// `Make` needs them for `SHELL` and for the recipe environment).
 pub fn preprocess(source: &str) -> Result<Preprocessed> {
-    preprocess_with(source, &[])
+    preprocess_with(source, &[], &[])
 }
 
-/// Preprocess with command-line macros already in force.
+/// Preprocess with the definitions that are in force before the makefile is
+/// read: command-line macros (POSIX source 1) and the built-ins (source 4).
 ///
-/// They are seeded before the read rather than appended after it, because a
+/// Both are seeded before the read rather than reconciled after it, because a
 /// rule header is expanded where it appears -- appending left `all: $(OBJ)`
-/// already expanded by the time the operand was seen (audit #71). The lock is
-/// what keeps a later assignment in the makefile from undoing them.
-pub fn preprocess_with(source: &str, cmdline: &[Macro]) -> Result<Preprocessed> {
+/// already expanded by the time the operand was seen (audit #71). The built-ins
+/// had the same problem and it went unnoticed for longer: seeded only into the
+/// finished `Make`, they were invisible to the makefile, so `$(CC)` expanded to
+/// nothing while `make -p` reported `CC = c17`.
+///
+/// Recorded sources are what keep a later assignment in its place: the
+/// makefile may replace a built-in but not a command-line macro, without
+/// anyone having to track that separately.
+pub fn preprocess_with(
+    source: &str,
+    cmdline: &[Macro],
+    builtins: &[Macro],
+) -> Result<Preprocessed> {
     let mut reader = Reader::new();
+    for (name, value) in builtins {
+        reader
+            .table
+            .seed(name.clone(), value.clone(), MacroSource::BuiltIn);
+    }
     for (name, value) in cmdline {
-        reader.table.lock(name.clone(), value.clone());
+        reader
+            .table
+            .seed(name.clone(), value.clone(), MacroSource::CommandLine);
     }
     reader.read(&fold_continuations(source))?;
     if !reader.branches.is_empty() {
         return Err(PreprocError::UnmatchedConditional("endif".to_string()));
     }
-    let text = expand_command_lines(&reader.out, reader.table.values())?;
+    let text = expand_command_lines(&reader.out, &reader.table)?;
     Ok(Preprocessed {
         text,
         macros: reader.table.into_macros(),

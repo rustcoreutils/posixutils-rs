@@ -268,15 +268,20 @@ impl FromStr for Makefile {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Makefile::parse_with_macros(s, &[])
+        Makefile::parse_with_macros(s, &[], &[])
     }
 }
 
 impl Makefile {
-    /// Parse `text` with command-line macros already in force.
-    pub fn parse_with_macros(text: &str, cmdline: &[Macro]) -> Result<Makefile, ParseError> {
-        let scanned =
-            preprocess_with(text, cmdline).map_err(|e| ParseError(vec![e.to_string()]))?;
+    /// Parse `text` with the definitions in force before it is read:
+    /// command-line macros (POSIX source 1) and the built-ins (source 4).
+    pub fn parse_with_macros(
+        text: &str,
+        cmdline: &[Macro],
+        builtins: &[Macro],
+    ) -> Result<Makefile, ParseError> {
+        let scanned = preprocess_with(text, cmdline, builtins)
+            .map_err(|e| ParseError(vec![e.to_string()]))?;
         parse_scanned(
             &scanned.text,
             scanned.macros,

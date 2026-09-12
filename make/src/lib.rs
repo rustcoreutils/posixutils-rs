@@ -909,6 +909,17 @@ const BUILTIN_MACROS: [(&str, &str); 12] = [
     ("SCCSGETFLAGS", "-s"),
 ];
 
+/// The macros POSIX's built-in inference rules refer to (source 4).
+///
+/// Handed to the parser before the makefile is read, so a makefile can expand
+/// them; `Make` then receives them like any other definition.
+pub fn builtin_macros() -> Vec<Macro> {
+    BUILTIN_MACROS
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
 impl TryFrom<(Makefile, Config)> for Make {
     type Error = ErrorCode;
 
@@ -954,8 +965,11 @@ impl TryFrom<(Makefile, Config)> for Make {
             config,
         };
 
-        // Seed the built-in macros the default rules refer to, without
-        // overriding anything the makefile defined.
+        // A fallback for callers that build a `Make` without going through the
+        // parser: the `make` binary seeds these before the makefile is read
+        // (see `builtin_macros`), so by here they are already present and this
+        // adds nothing. It stays because `Make` is a library type and must not
+        // depend on its caller having done that.
         if !make.config.clear {
             for (name, value) in BUILTIN_MACROS {
                 if !make.macros.iter().any(|(n, _)| n == name) {

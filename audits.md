@@ -278,23 +278,25 @@ Crates with open items today:
 - [`sys/audit.md`](sys/audit.md) — `getconf`, `ipcrm`, `ipcs`, `ps`, `uname`, `who`
 - [`tree/audit.md`](tree/audit.md) — the 16 `tree/` utilities + the `ftw/` crate
 
-Two files remain with nothing open, kept for content that is not a punch list:
+Audited with nothing open, so no file: `awk`, `datetime`, `dev`, `display`,
+`editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `make`, `man`, `misc`,
+`pathnames`, `pax`, `print`, `process`, `sccs`, `screen`, `text`, `users`,
+`uucp`, `xform`.
 
-- [`dev/audit.md`](dev/audit.md) — `#A7` closed 2026-09-12; kept for its
-  dispositioned residuals, which are recorded nowhere else.
-- [`make/audit.md`](make/audit.md) — `#88` and `#89` closed 2026-09-12; the one
-  unticked box, `#86`, is a settled decision (GNU `::` rules are rejected by
-  name, deliberately) rather than pending work. Kept for the acceptance gate
-  and the re-probe record.
-
-Audited with nothing open, so no file: `awk`, `datetime`, `display`,
-`editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `man`, `misc`, `pathnames`,
-`pax`, `print`, `process`, `sccs`, `screen`, `text`, `users`, `uucp`, `xform`.
+`dev` and `make` joined that list on 2026-09-12, when their last open items
+closed (`#A7`; `#88` and `#89`). `make`'s remaining unticked box, `#86`, was a
+settled decision — GNU `::` rules are rejected by name, deliberately — and a
+decision is not a punch-list item. The dispositioned residuals both files
+carried went with them, as the rule here intends: they are findings about what
+was checked, and `git log --follow` is where findings live once nothing is
+outstanding.
 
 A crate on that list is only as good as the probes behind its ticked boxes.
 `make` was on it until a crate-wide review found 21 defects the same day — two
 of them already ticked in the deleted file, one dispositioned in wording that
-undersold it. Before trusting a name above, re-probe rather than re-read.
+undersold it. It is on the list again as of 2026-09-12, for the second time,
+which is the point: the list records that someone looked, not that nothing is
+there. Before trusting a name above, re-probe rather than re-read.
 
 The audits themselves — every finding, every CONFORMS row, every probe — are in
 git history. `git log --follow -- text/audit.md` recovers one; `git log --grep '#A7'`

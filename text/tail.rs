@@ -598,7 +598,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if let Err(er) = tail(args.file, args.follow, args.reverse, bytes_or_lines) {
-        plib::diag::error(&format!("{er}"));
+        plib::diag::error(&plib::diag::error_text(er.as_ref()));
     }
 
     std::process::exit(plib::diag::exit_status())

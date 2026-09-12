@@ -240,7 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = touch_file(&args, &source, filename) {
             exit_code = 1;
-            eprintln!("touch: {filename}: {e}");
+            eprintln!("touch: {filename}: {}", plib::diag::io_error_text(&e));
         }
     }
 

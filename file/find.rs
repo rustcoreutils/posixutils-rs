@@ -499,9 +499,13 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
                         plib::diag::io_error_text(&e)
                     )
                 })?;
-            let mtime = metadata
-                .modified()
-                .map_err(|e| format!("cannot get mtime of '{}': {}", file, e))?;
+            let mtime = metadata.modified().map_err(|e| {
+                format!(
+                    "cannot get mtime of '{}': {}",
+                    file,
+                    plib::diag::io_error_text(&e)
+                )
+            })?;
             Ok(Expr::Primary(Primary::Newer(mtime)))
         }
         "-nouser" => Ok(Expr::Primary(Primary::NoUser)),
@@ -1038,7 +1042,11 @@ fn walk_tree(
     let (metadata, link_metadata) = match get_metadata(path, symlink_mode, is_cmdline) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("find: '{}': {}", path.display(), e);
+            eprintln!(
+                "find: '{}': {}",
+                path.display(),
+                plib::diag::io_error_text(&e)
+            );
             state.had_error = true;
             return;
         }
@@ -1239,7 +1247,11 @@ fn find(args: Vec<String>) -> Result<i32, String> {
         let root_dev = match fs::metadata(&path) {
             Ok(m) => m.dev(),
             Err(e) => {
-                eprintln!("find: '{}': {}", path.display(), e);
+                eprintln!(
+                    "find: '{}': {}",
+                    path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 state.had_error = true;
                 continue;
             }

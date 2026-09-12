@@ -148,6 +148,18 @@ fn contains_quit(stmt: &StmtInstruction) -> bool {
     }
 }
 
+/// `expr` with any layers of grouping removed.
+///
+/// For a rule about the *shape* of a value -- "is this written as a single
+/// digit" -- the parentheses around it are not part of the answer.
+fn strip_parens(expr: &ExprInstruction) -> &ExprInstruction {
+    let mut expr = expr;
+    while let ExprInstruction::Paren(inner) = expr {
+        expr = inner;
+    }
+    expr
+}
+
 fn should_print(expr: &ExprInstruction) -> bool {
     // assignments should not be printed:
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/bc.html#tag_20_09_10
@@ -509,6 +521,9 @@ impl Interpreter {
             ExprInstruction::Number(x) => {
                 Number::parse(x, self.ibase).ok_or("invalid digit for the current ibase".into())
             }
+            // Grouping changes no value; it only changes whether the statement
+            // writes one, which `should_print` reads off the outermost node.
+            ExprInstruction::Paren(inner) => self.eval_expr(inner, out),
             ExprInstruction::GetRegister(reg) => match reg {
                 Register::Scale => Ok(self.scale.into()),
                 Register::IBase => Ok(self.ibase.into()),
@@ -560,7 +575,12 @@ impl Interpreter {
             ExprInstruction::SetRegister { register, value } => {
                 // if the value is a single digit it has to be interpreted
                 // as an hexadecimal number, regardless of the value of ibase
-                let value = match value.as_ref() {
+                //
+                // Parentheses do not change that: GNU reads `obase = (A)` the
+                // same as `obase = A`, so the grouping is looked through here.
+                // It is only the *statement's* main operator that grouping
+                // affects, which is `should_print`'s business, not this.
+                let value = match strip_parens(value) {
                     ExprInstruction::Number(n) if n.len() == 1 => {
                         // this cannot fail because the parser ensures that
                         // the value is a valid hexadecimal number

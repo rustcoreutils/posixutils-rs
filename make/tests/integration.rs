@@ -1145,26 +1145,55 @@ mod special_targets {
         }
     }
 
-    // An empty `.SUFFIXES:` clears the suffix list, so the `.txt.out` rule the
-    // fixture goes on to define is no longer an inference rule. `copied.out`
-    // therefore cannot be inferred from `copied.txt`, and since the fixture
-    // names `copied.txt` as a prerequisite with no rule and no file on disk,
-    // make reports it rather than converting anything. The clearing is what is
-    // under test; the diagnostic is how it shows.
+    // An empty `.SUFFIXES:` clears the suffix list, so a `.txt.out` rule
+    // defined afterwards is not an inference rule and `copied.out` cannot be
+    // built from `copied.txt`.
+    //
+    // This needs the control to mean anything. `.txt` and `.out` are not in
+    // the default suffix list, so a fixture that merely clears and then
+    // defines `.txt.out` behaves identically whether or not the clearing line
+    // is there -- an earlier version of this test asserted exactly that, and
+    // would have stayed green if `.SUFFIXES:` stopped clearing altogether.
+    // Both fixtures therefore add the two suffixes first and differ only in
+    // the clearing line; GNU Make 4.3 splits them the same way.
     #[test]
     fn clear_suffixes_disables_the_inference_rule() {
-        run_test_helper(
+        // The control: the same makefile without the clearing line infers
+        // copied.out from copied.txt and runs the recipe.
+        run_test_helper_with_setup_and_destruct(
+            &[
+                "-f",
+                "tests/makefiles/special_targets/suffixes/suffixes_control.mk",
+            ],
+            "Converting copied.txt to copied.out\n",
+            "",
+            0,
+            setup,
+            destruct,
+        );
+
+        // With the clearing line, the rule is gone and nothing runs.
+        run_test_helper_with_setup_and_destruct(
             &[
                 "-f",
                 "tests/makefiles/special_targets/suffixes/clear_suffixes.mk",
             ],
             "",
-            "make: no target 'copied.txt'\n",
-            ErrorCode::NoTarget {
-                target: Some("copied.txt".to_string()),
-            }
-            .into(),
+            "",
+            0,
+            setup,
+            destruct,
         );
+
+        fn setup() {
+            let _ = remove_file("copied.out");
+            File::create("copied.txt").unwrap();
+        }
+
+        fn destruct() {
+            let _ = remove_file("copied.txt");
+            let _ = remove_file("copied.out");
+        }
     }
 
     mod validations {

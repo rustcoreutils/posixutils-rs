@@ -75,6 +75,74 @@ fn split_empty_input_no_files() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Runs split and hands the raw stderr to `check`.
+fn run_split_stderr(args: &[&str], stdin: &str, expected_exit: i32, check: fn(&str)) {
+    let str_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("split"),
+            args: str_args,
+            stdin_data: String::from(stdin),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: expected_exit,
+        },
+        move |_, output| {
+            assert_eq!(output.status.code(), Some(expected_exit));
+            check(&String::from_utf8_lossy(&output.stderr));
+        },
+    );
+}
+
+/// Every diagnostic is one `split: <message>` line -- not the `Debug` of a
+/// boxed error, and not the same message twice.
+fn assert_one_diagnostic(stderr: &str, needle: &str) {
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "expected exactly one line, got {stderr:?}");
+    assert!(
+        lines[0].starts_with("split: "),
+        "diagnostic must be prefixed with the utility name: {stderr:?}"
+    );
+    assert!(
+        lines[0].contains(needle),
+        "diagnostic must name the failure ({needle:?}): {stderr:?}"
+    );
+}
+
+#[test]
+fn split_exhaustion_diagnostic_is_one_named_line() {
+    let (dir, prefix) = tmp_prefix("exhausted_msg");
+    let input: String = (0..27).map(|i| format!("line{i}\n")).collect();
+    run_split_stderr(&["-l", "1", "-a", "1", "-", &prefix], &input, 1, |stderr| {
+        assert_one_diagnostic(stderr, "suffixes exhausted")
+    });
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn split_name_too_long_diagnostic_is_one_named_line() {
+    // This path printed the message itself *and* returned an Err that was
+    // printed again, so it emitted two lines.
+    let (dir, _) = tmp_prefix("namemax_msg");
+    let long_prefix = dir.join("p".repeat(260));
+    run_split_stderr(
+        &["-l", "1", "-", long_prefix.to_str().unwrap()],
+        "data\n",
+        1,
+        |stderr| assert_one_diagnostic(stderr, "too long"),
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn split_invalid_byte_count_diagnostic_is_one_named_line() {
+    let (dir, prefix) = tmp_prefix("badbytes_msg");
+    run_split_stderr(&["-b", "12x", "-", &prefix], "data\n", 1, |stderr| {
+        assert_one_diagnostic(stderr, "byte count")
+    });
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn split_uses_every_suffix_before_exhausting() {
     // The suffix odometer carried left through every 'z' and returned None

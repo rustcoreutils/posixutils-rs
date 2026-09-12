@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Error, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -237,8 +238,12 @@ fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
             .checked_mul(mul)
             .ok_or_else(|| Error::other(gettext("byte count too large")))?,
         Err(e) => {
-            eprintln!("split: {}", e);
-            return Err(Error::other(gettext("invalid byte count")));
+            return Err(Error::other(format!(
+                "{}: {}: {}",
+                gettext("invalid byte count"),
+                bytestr,
+                e
+            )));
         }
     };
 
@@ -287,13 +292,7 @@ fn split_by_lines(args: &Args, linesplit: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
-
-    let mut args = Args::parse();
-
+fn split_main(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // {NAME_MAX} check: the basename of the prefix plus the suffix length must
     // fit in a filename. If not, fail with a diagnostic before creating files.
     let base_len = Path::new(&args.prefix)
@@ -301,7 +300,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.len())
         .unwrap_or(args.prefix.len());
     if base_len as i64 + i64::from(args.suffix_len) > name_max_for(&args.prefix) {
-        eprintln!("split: {}", gettext("output filename too long"));
         return Err(Box::new(Error::other(gettext("output filename too long"))));
     }
 
@@ -316,6 +314,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn main() -> ExitCode {
+    setlocale(LocaleCategory::LcAll, "");
+    let _ = textdomain("posixutils-rs");
+    let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
+
+    // Diagnostics are written here rather than propagated out of `main`: the
+    // `Termination` impl prints the `Debug` of a boxed error, which reaches the
+    // user as `Error: Custom { kind: Other, error: "..." }`. Every failure has
+    // to read as one `split: <message>` line, so each error site returns its
+    // message and only this one prints it.
+    match split_main(Args::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("split: {}", e);
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]

@@ -410,3 +410,85 @@ fn test_od_skip_past_eof() {
         expected_exit_code: 1,
     });
 }
+
+// ---------------------------------------------------------------------------
+// -t f size suffixes (POSIX 109071-109072)
+// ---------------------------------------------------------------------------
+
+/// Run od on raw bytes and return (stdout, stderr, exit code).
+fn od_raw(args: &[&str], stdin: &[u8]) -> (String, String, Option<i32>) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_od"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn od");
+    child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().expect("wait od");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// POSIX 109071-2: "The type specification character f can be followed by an
+// optional F, D, or L indicating that the conversion should be applied to an
+// item of type float, double, or long double".
+//
+// `parse_type_bytes` had one size table, the C/S/I/L one that belongs to
+// d/o/u/x, so `D` matched nothing, fell through a failing `s.parse()`, and
+// silently took the 4-byte default: eight bytes of an IEEE double printed as
+// two floats rather than one double, with no diagnostic. `fF` was right only
+// by accident, and `fL` gave 8 where POSIX and GNU say long double.
+#[test]
+fn od_float_size_suffix_selects_the_right_width() {
+    // IEEE-754 1.0, little-endian.
+    let f64_one = 1.0f64.to_le_bytes();
+    let f32_one = 1.0f32.to_le_bytes();
+
+    // `fD` must read all eight bytes as one double, exactly as `f8` does.
+    let (by_letter, _, code) = od_raw(&["-An", "-t", "fD"], &f64_one);
+    assert_eq!(code, Some(0));
+    let (by_number, _, _) = od_raw(&["-An", "-t", "f8"], &f64_one);
+    assert_eq!(
+        by_letter.split_whitespace().count(),
+        1,
+        "fD must yield one item, got {by_letter:?}"
+    );
+    assert_eq!(by_letter, by_number, "fD must agree with f8");
+
+    // `fF` is float, and must agree with `f4`.
+    let (by_letter, _, _) = od_raw(&["-An", "-t", "fF"], &f32_one);
+    let (by_number, _, _) = od_raw(&["-An", "-t", "f4"], &f32_one);
+    assert_eq!(by_letter, by_number, "fF must agree with f4");
+    assert_eq!(by_letter.split_whitespace().count(), 1);
+}
+
+#[test]
+fn od_long_double_is_refused_rather_than_silently_narrowed() {
+    // `L` on `f` means long double, which this od does not format. It used to
+    // be read as 8 bytes -- a double wearing the wrong name. Refusing says so.
+    let sixteen = [0u8; 16];
+    let (stdout, stderr, code) = od_raw(&["-An", "-t", "fL"], &sixteen);
+    assert_ne!(code, Some(0), "fL must not silently produce doubles");
+    assert!(stdout.is_empty(), "no output on refusal: {stdout:?}");
+    assert!(
+        stderr.contains("f16") || stderr.contains("long double"),
+        "the diagnostic must name what was refused: {stderr:?}"
+    );
+}
+
+#[test]
+fn od_integer_size_suffixes_are_unchanged() {
+    // The C/S/I/L table belongs to d/o/u/x (POSIX 109073-5) and must not have
+    // moved when `f` got its own.
+    let bytes = [1u8, 0, 0, 0, 0, 0, 0, 0];
+    for (letter, number) in [("dC", "d1"), ("dS", "d2"), ("dI", "d4"), ("dL", "d8")] {
+        let (by_letter, _, _) = od_raw(&["-An", "-t", letter], &bytes);
+        let (by_number, _, _) = od_raw(&["-An", "-t", number], &bytes);
+        assert_eq!(by_letter, by_number, "{letter} must agree with {number}");
+    }
+}

@@ -271,24 +271,32 @@ coverage while asserting nothing.
 
 Crates with open items today:
 
-- [`calc/audit.md`](calc/audit.md) — `expr`, `bc`
 - [`cc/audit.md`](cc/audit.md) — `c17`, `cflow`, `ctags`, `cxref`
 - [`cron/audit.md`](cron/audit.md) — `crontab`, `at`, `batch`, `crond`
-- [`sh/audit.md`](sh/audit.md) — `sh`
 - [`tree/audit.md`](tree/audit.md) — the 16 `tree/` utilities + the `ftw/` crate
 
-Audited with nothing open, so no file: `awk`, `datetime`, `dev`, `display`,
-`editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `make`, `man`, `misc`,
-`pathnames`, `pax`, `print`, `process`, `sccs`, `screen`, `sys`, `text`,
-`users`, `uucp`, `xform`.
+Audited with nothing open, so no file: `awk`, `calc`, `datetime`, `dev`,
+`display`, `editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `make`, `man`,
+`misc`, `pathnames`, `pax`, `print`, `process`, `sccs`, `screen`, `sh`, `sys`,
+`text`, `users`, `uucp`, `xform`.
 
-`dev`, `make` and `sys` joined that list on 2026-09-12, when their last open
-items closed (`#A7`; `#88` and `#89`; the `ps` and `who` coverage gaps).
-`make`'s remaining unticked box, `#86`, was a settled decision — GNU `::`
-rules are rejected by name, deliberately — and a decision is not a punch-list
-item. The dispositioned residuals those files carried went with them, as the
-rule here intends: they are findings about what was checked, and
-`git log --follow` is where findings live once nothing is outstanding.
+Five crates joined that list on 2026-09-12, as their last open items closed:
+`dev` (`#A7`), `make` (`#88`, `#89`), `sys` (the `ps` and `who` coverage gaps),
+`calc` (`#B13`, `#B14`) and `sh` (`#57`).
+
+Three of those closures were decisions rather than code, and each is recorded
+in the commit that closed it so it is not re-raised: `make`'s `#86` (GNU `::`
+rules rejected by name), `calc`'s `#B14` (the quadratic digit extraction above
+obase 16 is real but leaves us 20–90× faster than GNU; the measurements are in
+`calc/bc_util/number.rs`), and `sh`'s `#57` (POSIX makes `{location}redir-op`
+optional *and* its behaviour implementation-defined, so there is nothing to
+conform to — what conformance does require, the §2.10 rule-3 fallback, now has
+tests). A decision is not a punch-list item.
+
+The dispositioned residuals and the "refuted, do not re-raise" lists those
+files carried went with them, as the rule here intends: they are findings about
+what was checked, and `git log --follow` is where findings live once nothing is
+outstanding.
 
 A crate on that list is only as good as the probes behind its ticked boxes.
 `make` was on it until a crate-wide review found 21 defects the same day — two

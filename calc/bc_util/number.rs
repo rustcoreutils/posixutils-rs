@@ -132,6 +132,26 @@ fn fractional_digits_for(base: u64, scale: u64) -> u64 {
 }
 
 /// Appends `value` (non-negative) in `base`, most significant digit first.
+///
+/// Above the cutoff the loop below divides once per digit, which is quadratic
+/// in the number of digits. `push_fractional_digits` has the same cutoff and
+/// the same loop. Measured on this tree, against GNU bc:
+///
+/// | `2^n`, n =         | 50 000 | 100 000 | 200 000 |
+/// |--------------------|--------|---------|---------|
+/// | `obase=16` (below) | 0.00s  | 0.00s   | 0.00s   |
+/// | `obase=17` (loop)  | 0.03s  | 0.13s   | 0.55s   |
+/// | GNU bc, `obase=17` | 2.98s  | 12.02s  | 48.56s  |
+///
+/// So the quadratic term is real -- time quadruples per doubling -- and we are
+/// still 20-90x faster than the reference implementation at every size it can
+/// be measured at. Left alone deliberately.
+///
+/// If it is ever revisited: `num_bigint`'s `to_str_radix` accepts bases 2..=36
+/// and we stop at 16, so raising the cutoff to 36 is nearly free (its output is
+/// `0-9a-z`, which has to be mapped back to the space-separated decimal groups
+/// POSIX wants above base 16). Beyond 36 there is no radix conversion to
+/// borrow, and a genuine fix needs divide-and-conquer by `base^(2^i)`.
 fn push_integer_digits(result: &mut String, value: &BigInt, base: u64) {
     if base <= 16 {
         // to_str_radix is far cheaper than extracting one digit at a time.

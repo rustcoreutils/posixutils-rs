@@ -137,20 +137,33 @@ impl MacroName {
     }
 }
 
+// These classify one byte, in the locale `plib::diag::init_locale` installed.
+// `c.into()` widens a u8 to 0..=255, which is the `unsigned char` domain
+// `isalnum` and friends are defined over, so no call below can index outside
+// the ctype table.
+//
+// Byte classification is the whole contract, not a step towards a wider one.
+// A name token is a sequence of bytes the locale calls alphanumeric, which is
+// right for every single-byte encoding -- under ISO-8859-1 `isalpha(0xe9)` is
+// true and `café` is a name -- and under a multibyte encoding it means a name
+// is ASCII, which is what GNU m4 does too. Probed against GNU m4 1.4.19 in a
+// UTF-8 locale: `define(café, ...)` is refused by both, and every expansion
+// agrees byte for byte. Decoding names through `mbrtowc`/`iswalpha` would
+// create that divergence rather than remove one.
+//
+// Character semantics belong to the built-ins that count or index characters,
+// where POSIX 103776 puts them, and they already have them: `len`, `substr`,
+// `index` and `translit` go through `plib::locale::mb_char_slices`. That is
+// where m4 is ahead of GNU, not behind it -- `len(café)` is 4 here and 5
+// there, and GNU's `substr` will hand back half a UTF-8 sequence.
 fn is_word_char_end(c: u8) -> bool {
-    // TODO(safety): check safety!
     (unsafe { libc::isalnum(c.into()) } != 0) || c == b'_'
 }
 
 fn is_word_char_start(c: u8) -> bool {
-    // TODO(safety): check safety!
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
 }
 
-//TODO(utf8): these don't handle multibyte characters!
-//
-//It seems like we might want to use https://linux.die.net/man/3/mbrtowc for UTF-8 and any other
-//multibyte encodings. Then https://linux.die.net/man/3/iswblank
 pub(crate) fn is_whitespace(c: u8) -> bool {
     (unsafe { libc::isblank(c.into()) != 0 }) || c == b'\n'
 }

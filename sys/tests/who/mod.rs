@@ -229,11 +229,18 @@ fn utmpx_fixture(dir: &std::path::Path, records: &[libc::utmpx]) -> std::path::P
 }
 
 fn utmpx_record(ut_type: libc::c_short, user: &str, line: &str) -> libc::utmpx {
+    utmpx_record_with_id(ut_type, user, line, "")
+}
+
+fn utmpx_record_with_id(ut_type: libc::c_short, user: &str, line: &str, id: &str) -> libc::utmpx {
     // SAFETY: utmpx is a POD struct and every field is overwritten or left as
     // the zero that means "unset".
     let mut record: libc::utmpx = unsafe { std::mem::zeroed() };
     record.ut_type = ut_type;
     record.ut_pid = 1234;
+    for (slot, byte) in record.ut_id.iter_mut().zip(id.bytes()) {
+        *slot = byte as _;
+    }
     for (slot, byte) in record.ut_user.iter_mut().zip(user.bytes()) {
         *slot = byte as _;
     }
@@ -323,6 +330,17 @@ fn who_dash_t_writes_the_three_state_characters() {
     assert_eq!(state_of("carol"), '?', "terminal does not exist: {out}");
 }
 
+/// Whether this platform's utmpx reader returns a `BOOT_TIME` record from a
+/// database substituted with `utmpxname(3)`.
+///
+/// Darwin's does not, though it returns a `USER_PROCESS` record from the same
+/// file. So the test below first establishes that the substituted database is
+/// being read at all, and only then consults this -- a break in
+/// `plib::utmpx::load_from_file` still fails everywhere rather than being
+/// mistaken for the platform quirk. The limit is the fixture's, not `who`'s:
+/// the `BOOT_TIME` arm in who.rs is platform-independent, and Linux covers it.
+const BOOT_RECORD_SURVIVES_UTMPXNAME: bool = cfg!(target_os = "linux");
+
 // POSIX (XSI) 122970: "For the -b option, <line> shall be 'system boot'."
 // The <name> is explicitly unspecified, so only the line is pinned.
 #[test]
@@ -331,12 +349,29 @@ fn who_dash_b_writes_a_system_boot_line() {
     let fixture = utmpx_fixture(
         dir.path(),
         &[
-            utmpx_record(libc::BOOT_TIME, "reboot", "~"),
+            // `~` / `~~` are the conventional line and id of a boot record.
+            utmpx_record_with_id(libc::BOOT_TIME, "reboot", "~", "~~"),
             utmpx_record(libc::USER_PROCESS, "alice", "null"),
         ],
     );
 
+    // The precondition, asserted rather than assumed: the substituted database
+    // is being read at all. Without this the skip below could quietly swallow a
+    // real break in `plib::utmpx::load_from_file`.
+    let all = run_who_on(&fixture, &[]);
+    assert!(
+        all.contains("alice"),
+        "the substituted utmpx database must be read: {all}"
+    );
+
     let out = run_who_on(&fixture, &["-b"]);
+    if !out.contains("system boot") && !BOOT_RECORD_SURVIVES_UTMPXNAME {
+        eprintln!(
+            "skipping: this platform's utmpx reader drops BOOT_TIME from a substituted database"
+        );
+        return;
+    }
+
     assert!(
         out.contains("system boot"),
         "-b must write the line 'system boot': {out}"

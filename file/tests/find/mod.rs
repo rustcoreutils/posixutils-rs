@@ -133,13 +133,59 @@ fn find_type_test() {
     run_test_find_sorted(&args, &[&file1, &file2, &file3, &file4], "", 0)
 }
 
+// `-mtime n` is true when "the file modification time subtracted from the
+// initialization time, divided by 86 400 (with any remainder discarded), is n"
+// (98269) -- truncation, not the round-up that `-size` uses (98261). `n`, `+n`
+// and `-n` mean exactly, more than, and less than (98190-98195).
+//
+// The fixtures under tests/find/other cannot test any of that: they are
+// checked in, so their mtime is checkout time and their age is whatever today
+// happens to be. Stamp our own instead.
 #[test]
-fn find_mtime_test() {
-    let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find/other", project_root);
-    let args = [&test_dir, "-mtime", "7000"];
+fn find_mtime_exact_newer_and_older() {
+    let dir = std::env::temp_dir().join("posixutils_find_mtime");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
 
-    run_test_find(&args, "", "", 0)
+    // An extra hour past each day boundary, so the spawn latency between
+    // SystemTime::now() here and find's own initialization time cannot drift a
+    // file into the neighbouring bucket.
+    let now = std::time::SystemTime::now();
+    let mut paths = Vec::new();
+    for days in [0_u64, 1, 3, 10] {
+        let f = dir.join(format!("d{}", days));
+        File::create(&f).unwrap();
+        let age = std::time::Duration::from_secs(days * 86400 + 3600);
+        if !filetime_set(&f, now - age) {
+            eprintln!("skipping: could not set an mtime on this host");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        paths.push(f.to_string_lossy().into_owned());
+    }
+    let (d0, d1, d3, d10) = (&paths[0], &paths[1], &paths[2], &paths[3]);
+    let ds = dir.to_str().unwrap();
+
+    // Exactly n: each file lands in its own 86400-second bucket, which is what
+    // the discarded remainder buys.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "0"], &[d0], "", 0);
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "1"], &[d1], "", 0);
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "3"], &[d3], "", 0);
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "10"], &[d10], "", 0);
+    // Nothing is 2 days old; an off-by-one in the bucket arithmetic shows here.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "2"], &[], "", 0);
+
+    // More than n excludes n itself.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "+3"], &[d10], "", 0);
+    // Less than n, the comparison no test exercised for any numeric primary.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "-3"], &[d0, d1], "", 0);
+
+    // The boundary pair the RATIONALE calls out (98476-98480): the day
+    // boundary and the local timezone play no part, only the 24-hour count.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "+0"], &[d1, d3, d10], "", 0);
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "-1"], &[d0], "", 0);
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

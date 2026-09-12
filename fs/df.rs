@@ -405,7 +405,7 @@ fn read_mount_info() -> io::Result<MountList> {
                 eprintln!(
                     "{}: {}",
                     Path::new(OsStr::from_bytes(mount.dir.to_bytes())).display(),
-                    io::Error::last_os_error()
+                    plib::diag::io_error_text(&io::Error::last_os_error())
                 );
                 continue;
             }

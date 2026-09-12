@@ -66,7 +66,8 @@ pub fn get_job_dir() -> Result<String, String> {
             if let Err(err) = fs::create_dir_all(default_path) {
                 return Err(format!(
                     "Failed to create directory {}: {}",
-                    DEFAULT_DIRECTORY, err
+                    DEFAULT_DIRECTORY,
+                    plib::diag::io_error_text(&err)
                 ));
             }
         }
@@ -81,7 +82,8 @@ pub fn get_job_dir() -> Result<String, String> {
             if let Err(err) = fs::create_dir_all(macos_path) {
                 return Err(format!(
                     "Failed to create directory {}: {}",
-                    MACOS_DIRECTORY, err
+                    MACOS_DIRECTORY,
+                    plib::diag::io_error_text(&err)
                 ));
             }
         }

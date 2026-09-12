@@ -498,7 +498,9 @@ fn f_call(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     };
     let _guard = ctx.state.enter()?;
     let name = expand(name, ctx)?.trim().to_string();
-    let Some(body) = ctx.table.value(&name).map(str::to_string) else {
+    // Resolved, not read straight out of the table: a function defined only in
+    // the environment is as callable as any other, and `$(F)` already finds it.
+    let Some(body) = ctx.table.resolve(&name, ctx.env_wins) else {
         return Ok(String::new());
     };
     let mut table = ctx.table.clone();

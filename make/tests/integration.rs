@@ -2678,6 +2678,64 @@ mod macro_sources {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // The environment is source 3 and the built-ins are source 4, so POSIX
+    // 105848 forbids a built-in from overriding the environment -- in every
+    // consumer, not just in the makefile's own expansions.
+    //
+    // `resolve` weighed the environment live but never stored it, so
+    // `into_macros` handed `Make` the built-in's value and everything
+    // downstream of it disagreed with the makefile: the built-in `.c.o` rule
+    // ran `c17` and `-p` reported `CC = c17`, while `$(CC)` in the makefile
+    // expanded to the environment's value.
+    #[test]
+    fn a_builtin_recipe_sees_an_environment_override() {
+        let dir = "macsrc_builtin_recipe_probe";
+        fixture(dir, "all: mbr_probe.o\n\t@echo done\n");
+        let _ = fs::write(format!("{dir}/mbr_probe.c"), "int probe(void){return 0;}\n");
+
+        let (stdout, stderr, code) = run_env(&["-C", dir, "-n", "all"], &[("CC", "envcc")]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stdout.contains("envcc"),
+            "the built-in .c.o recipe must use the environment's CC: {stdout}"
+        );
+        assert!(
+            !stdout.contains("c17"),
+            "the built-in default must not override the environment: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_database_reports_an_environment_override() {
+        let dir = "macsrc_db_env_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, _, _) = run_env(&["-C", dir, "-p", "all"], &[("CC", "envcc")]);
+        assert!(stdout.contains("CC = envcc"), "database: {stdout}");
+        assert!(stdout.contains("CC=[envcc]"), "expansion: {stdout}");
+        assert!(
+            !stdout.contains("CC = c17"),
+            "the database must not report the overridden built-in: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `$(call F,...)` looked the function body up straight out of the table,
+    // so a function defined only in the environment was invisible to `call`
+    // while `$(F)` found it -- two answers to the same question.
+    #[test]
+    fn call_finds_a_function_defined_in_the_environment() {
+        let dir = "macsrc_call_env_probe";
+        fixture(dir, "all:\n\t@echo \"call=[$(call F,x)] plain=[$(F)]\"\n");
+        let (stdout, stderr, code) = run_env(&["-C", dir, "all"], &[("F", "got $(1)")]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stdout.contains("call=[got x]"),
+            "call must resolve the body the same way $(F) does: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     // `-r` drops the built-in rules and the macros that belong to them, so
     // nothing is left for `$(CC)` to expand to.
     #[test]

@@ -461,12 +461,6 @@ impl MacroTable {
         self.force(name, value, MacroSource::Local);
     }
 
-    /// The body `name` is bound to in the table itself, ignoring the
-    /// environment. Callers wanting the effective value use [`Self::resolve`].
-    pub(crate) fn value(&self, name: &str) -> Option<&str> {
-        self.values.get(name).map(|e| e.value.as_str())
-    }
-
     /// What `name` holds, weighing the table against the environment.
     ///
     /// The environment is macro source 3 unconditionally -- `-e` changes which
@@ -478,7 +472,7 @@ impl MacroTable {
     ///
     /// `None` means undefined, which is what `?=` and `ifdef` test; an
     /// explicitly empty value is defined.
-    fn resolve(&self, name: &str, env_wins: bool) -> Option<String> {
+    pub(crate) fn resolve(&self, name: &str, env_wins: bool) -> Option<String> {
         let from_env = std::env::var(name).ok();
         let Some(entry) = self.values.get(name) else {
             return from_env;
@@ -493,9 +487,40 @@ impl MacroTable {
         }
     }
 
+    /// Replace every entry the environment outranks with the environment's
+    /// value, so what the table holds is the value that wins.
+    ///
+    /// [`Self::resolve`] weighs the environment live, but the environment is
+    /// never *stored*, so until this runs the table still has one precedence
+    /// question open and [`Self::into_macros`] would hand on the loser. That is
+    /// not a question `Make` can answer later: it receives values, not sources.
+    ///
+    /// Concretely, it is what made everything downstream of the parse disagree
+    /// with the makefile itself. With `CC=envcc` in the environment, `$(CC)` in
+    /// a makefile expanded to `envcc` -- `resolve` saw the environment outrank
+    /// the built-in -- while the built-in `.c.o` rule ran `c17` and `make -p`
+    /// reported `CC = c17`, both reading the stored value.
+    pub fn settle_environment(&mut self) {
+        let env_wins = ENV_MACROS.load(Acquire);
+        let env_rank = MacroSource::Environment.rank(env_wins);
+        for name in &self.order {
+            let Some(entry) = self.values.get_mut(name) else {
+                continue;
+            };
+            if env_rank <= entry.source.rank(env_wins) {
+                continue;
+            }
+            if let Ok(value) = std::env::var(name) {
+                entry.value = value;
+                entry.source = MacroSource::Environment;
+            }
+        }
+    }
+
     pub fn into_macros(self) -> Vec<Macro> {
-        // The source is dropped here: `Make` consumes a settled table, and
-        // every precedence decision has already been made against it.
+        // The source is dropped here, which is why `settle_environment` has to
+        // have run: `Make` consumes values, and every precedence decision must
+        // already have been made against them.
         self.order
             .into_iter()
             .map(|name| {
@@ -1409,9 +1434,12 @@ fn expand_command_lines(text: &str, table: &MacroTable) -> Result<String> {
 /// Expand a recipe line once the rule stage has substituted its automatic
 /// variables, so a function deferred by `mentions_automatic` finally runs.
 pub fn expand_recipe(text: &str, macros: &[Macro]) -> std::result::Result<String, String> {
-    // These macros are the settled table `Make` was handed, so every
-    // precedence question they raised has already been answered; the source
-    // recorded here only has to outrank the environment, as the makefile did.
+    // These macros are the settled table `Make` was handed: `settle_environment`
+    // has already folded in every environment value that outranked what the
+    // table held, so tagging them all `Makefile` here loses nothing. A name
+    // absent from the table is still resolved against the live environment,
+    // which is what lets a deferred function reach an ordinary environment
+    // variable.
     let table = MacroTable::from_macros(macros, MacroSource::Makefile);
     let state = func::Expansion::without_eval();
     substitute_to_fixpoint(text, &table, &state).map_err(|e| e.to_string())
@@ -1458,6 +1486,9 @@ pub fn preprocess_with(
         return Err(PreprocError::UnmatchedConditional("endif".to_string()));
     }
     let text = expand_command_lines(&reader.out, &reader.table)?;
+    // Settle the one precedence question the table still has open before the
+    // sources are dropped; see `settle_environment`.
+    reader.table.settle_environment();
     Ok(Preprocessed {
         text,
         macros: reader.table.into_macros(),

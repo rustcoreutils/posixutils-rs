@@ -2543,6 +2543,49 @@ mod tilde_suffix_rules {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // A `~` is a suffix marker only where the suffix ends: `.c~` or `.c~.o`.
+    // Accepting it anywhere renamed the target -- `.gitignore~old` parsed as
+    // the single-suffix inference rule `.gitignore~`, silently dropping the
+    // rest, so the rule was registered under a name nothing could ask for.
+    #[test]
+    fn a_tilde_inside_a_target_name_is_not_a_suffix_marker() {
+        let dir = "tilde_name_probe";
+        fixture(dir, ".gitignore~old:\n\t@echo BUILT $@\n");
+
+        let (stdout, stderr, code) = run(&["-C", dir, ".gitignore~old"]);
+        assert_eq!(code, Some(0), "stdout: {stdout}stderr: {stderr}");
+        assert!(
+            stdout.contains("BUILT .gitignore~old"),
+            "the target keeps its whole name: {stdout}"
+        );
+
+        // And the truncated name is not a target at all.
+        let (_, _, code) = run(&["-C", dir, ".gitignore~"]);
+        assert_ne!(code, Some(0), "`.gitignore~` must not name anything");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The forms that *are* suffix rules still parse: `.c~` ends the suffix,
+    // and `.c~.o` continues to a second one.
+    #[test]
+    fn a_terminal_tilde_is_still_a_suffix_marker() {
+        let dir = "tilde_terminal_probe";
+        fixture(
+            dir,
+            ".SUFFIXES: .o .c .c~\n\
+             .c~.o:\n\t@echo TWO $< $@\n\
+             all: tilde_probe.o\n\t@echo BUILT\n",
+        );
+
+        let (stdout, stderr, code) = run(&["-C", dir, "all"]);
+        assert_eq!(code, Some(0), "stdout: {stdout}stderr: {stderr}");
+        assert!(
+            stdout.contains("TWO s.tilde_probe.c tilde_probe.o"),
+            "`.c~.o` must still be an inference rule: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     // A `~` suffix names an SCCS file, so a file literally called
     // `tilde_probe.c~` must NOT satisfy the rule.
     #[test]

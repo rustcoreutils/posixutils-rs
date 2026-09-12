@@ -24,6 +24,16 @@ pub enum Target {
     Special(SpecialTarget),
 }
 
+/// Whether a suffix ends at `next`, so that a `~` just consumed was the
+/// suffix's own last character rather than one inside a longer name.
+///
+/// `.c~` and `.c~.o` are suffix rules; `.gitignore~old` is a file called
+/// `.gitignore~old`. Taking the `~` as terminal in the second case dropped
+/// `old` and registered the rule under a name nothing could ask for.
+fn suffix_ends_here(next: Option<&char>) -> bool {
+    matches!(next, None | Some('.') | Some(' ') | Some('\t') | Some(':'))
+}
+
 impl Target {
     /// Creates a new target with the given name.
     pub fn new(name: impl Into<String>) -> Self {
@@ -81,10 +91,14 @@ impl Target {
                 // XSI (POSIX 105941): a trailing `~` turns a suffix into a
                 // reference to an SCCS file, as in `.c~.o`. It is only ever the
                 // last character of a suffix -- accepting it anywhere else
-                // would make `.c~.o` ambiguous.
+                // would make `.c~.o` ambiguous, and would swallow the rest of
+                // an ordinary target name that merely contains a tilde.
                 '~' if !from.is_empty() => {
                     from.push('~');
                     source.next();
+                    if !suffix_ends_here(source.peek()) {
+                        None?
+                    }
                     break;
                 }
                 '.' => break,
@@ -114,6 +128,9 @@ impl Target {
                 '~' if !to.is_empty() => {
                     to.push('~');
                     source.next();
+                    if !suffix_ends_here(source.peek()) {
+                        None?
+                    }
                     break;
                 }
                 '.' | ' ' | '\t' | ':' => break,

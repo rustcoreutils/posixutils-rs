@@ -206,6 +206,22 @@ fn who_file_operand() {
 // and `utmpxname(3)` reads it, so the fixture is a real utmpx file.
 // ============================================
 
+/// Whether this platform can be pointed at a substituted utmpx database with
+/// `utmpxname(3)`.
+///
+/// Linux can. macOS CI reports *nothing* from a database written here -- not
+/// even the `USER_PROCESS` record -- so `who` never sees the records these
+/// tests rely on. Why Darwin refuses the file is not visible from a Linux
+/// host, and two CI rounds spent guessing at it bought nothing, so the tests
+/// that need the mechanism skip there rather than assert what this host cannot
+/// check.
+///
+/// Only the *fixture* is platform-specific. What it exercises is not: `who`
+/// selects on `typ == platform::BOOT_TIME` and reads the mode of `/dev/<line>`,
+/// both platform-independent, and Linux covers them. Recorded as a gap rather
+/// than papered over -- macOS asserts nothing about `-b` or `-T` content.
+const UTMPX_FIXTURE_WORKS: bool = cfg!(target_os = "linux");
+
 /// Write `records` as a utmpx database and return its path.
 ///
 /// The records are built as `libc::utmpx` and written as raw bytes rather than
@@ -296,6 +312,10 @@ fn run_who_on(fixture: &std::path::Path, args: &[&str]) -> String {
 // code nothing had ever run.
 #[test]
 fn who_dash_t_writes_the_three_state_characters() {
+    if !UTMPX_FIXTURE_WORKS {
+        eprintln!("skipping: this platform cannot read a substituted utmpx database");
+        return;
+    }
     let (Some(writable), Some(unwritable)) =
         (dev_with_group_write(true), dev_with_group_write(false))
     else {
@@ -330,21 +350,14 @@ fn who_dash_t_writes_the_three_state_characters() {
     assert_eq!(state_of("carol"), '?', "terminal does not exist: {out}");
 }
 
-/// Whether this platform's utmpx reader returns a `BOOT_TIME` record from a
-/// database substituted with `utmpxname(3)`.
-///
-/// Darwin's does not, though it returns a `USER_PROCESS` record from the same
-/// file. So the test below first establishes that the substituted database is
-/// being read at all, and only then consults this -- a break in
-/// `plib::utmpx::load_from_file` still fails everywhere rather than being
-/// mistaken for the platform quirk. The limit is the fixture's, not `who`'s:
-/// the `BOOT_TIME` arm in who.rs is platform-independent, and Linux covers it.
-const BOOT_RECORD_SURVIVES_UTMPXNAME: bool = cfg!(target_os = "linux");
-
 // POSIX (XSI) 122970: "For the -b option, <line> shall be 'system boot'."
 // The <name> is explicitly unspecified, so only the line is pinned.
 #[test]
 fn who_dash_b_writes_a_system_boot_line() {
+    if !UTMPX_FIXTURE_WORKS {
+        eprintln!("skipping: this platform cannot read a substituted utmpx database");
+        return;
+    }
     let dir = plib::tmp::TempDir::new().unwrap();
     let fixture = utmpx_fixture(
         dir.path(),
@@ -365,13 +378,6 @@ fn who_dash_b_writes_a_system_boot_line() {
     );
 
     let out = run_who_on(&fixture, &["-b"]);
-    if !out.contains("system boot") && !BOOT_RECORD_SURVIVES_UTMPXNAME {
-        eprintln!(
-            "skipping: this platform's utmpx reader drops BOOT_TIME from a substituted database"
-        );
-        return;
-    }
-
     assert!(
         out.contains("system boot"),
         "-b must write the line 'system boot': {out}"

@@ -2123,12 +2123,24 @@ fn test_trigraph_in_code_block_warns() {
 
 #[test]
 fn test_clean_program_no_pattern_warnings() {
-    // A clean program triggers neither the NUL nor the trigraph warning.
-    let source = "%{\nint x = 1;\n%}\n%%\n[a-z]+    printf(\"W\\n\");\n%%\n";
+    // A clean program triggers none of the pattern diagnostics: NUL, trigraph,
+    // or non-ASCII. The high-byte escapes are here because they are the
+    // false-positive risk for the non-ASCII check -- they name bytes 0x80..0xff
+    // and are legal.
+    let source = concat!(
+        "%{\nint x = 1;\n%}\n%%\n",
+        "[a-z]+    printf(\"W\\n\");\n",
+        "\\377      printf(\"H\\n\");\n",
+        "\\xff      printf(\"I\\n\");\n",
+        "\\x80      printf(\"J\\n\");\n",
+        "%%\n"
+    );
     let (combined, ok) = run_lex_capture(&[], source);
-    assert!(ok, "lex should succeed");
+    assert!(ok, "lex should succeed: {combined}");
     assert!(
-        !combined.contains("NUL") && !combined.contains("trigraph"),
+        !combined.contains("NUL")
+            && !combined.contains("trigraph")
+            && !combined.contains("non-ASCII"),
         "clean program must not emit pattern warnings: {}",
         combined
     );
@@ -3229,49 +3241,55 @@ int main() {
 // Pattern scanning: byte offsets and bracket-expression context
 // ---------------------------------------------------------------------------
 
+// These three began as regression tests for a char-index/byte-offset defect:
+// find_ere_end() counted characters while parse_rule() sliced bytes, so any
+// non-ASCII byte in a pattern split the rule at a non-char-boundary, panicking
+// or emitting the rest of the rule line into lex.yy.c as C. A non-ASCII pattern
+// is now refused outright, since the byte-alphabet scanner could never match one
+// -- but the refusal happens *after* find_ere_end() and the byte slice, so a
+// return of that defect still shows up here as a panic rather than a diagnostic.
+
 #[test]
-fn test_multibyte_pattern_does_not_panic() {
-    // find_ere_end() counted characters while parse_rule() sliced bytes, so any
-    // non-ASCII byte in a pattern split the rule at a non-char-boundary.
+fn test_multibyte_pattern_is_refused_cleanly() {
     let lex_input = "%option noinput nounput\n%%\n\u{e9}  { printf(\"E\"); }\n.|\\n  { }\n%%\n";
 
-    let (c_code, success) = run_lex(lex_input);
-    assert!(success, "lex rejected a multibyte pattern: {}", c_code);
-    assert!(c_code.contains("printf(\"E\")"), "action was lost");
+    let (combined, success) = run_lex_capture(&[], lex_input);
+    assert!(!success, "a non-ASCII pattern must be refused: {combined}");
+    assert!(
+        combined.contains("non-ASCII"),
+        "the refusal must name the problem, not fail on a byte boundary: {combined}"
+    );
 }
 
 #[test]
-fn test_multibyte_quoted_pattern_splits_at_action() {
-    // The same off-by-bytes split silently mangled quoted patterns, emitting the
-    // remainder of the rule line into lex.yy.c as C.
+fn test_multibyte_quoted_pattern_is_refused_cleanly() {
     let lex_input =
         "%option noinput nounput\n%%\n\"caf\u{e9}\"  { printf(\"C\"); }\n.|\\n  { }\n%%\n";
 
-    let (c_code, success) = run_lex(lex_input);
+    let (combined, success) = run_lex_capture(&[], lex_input);
     assert!(
-        success,
-        "lex rejected a quoted multibyte pattern: {}",
-        c_code
+        !success,
+        "a quoted non-ASCII pattern must be refused: {combined}"
     );
     assert!(
-        c_code.contains("printf(\"C\");"),
-        "action did not survive the pattern/action split"
+        combined.contains("non-ASCII"),
+        "the refusal must name the problem: {combined}"
     );
-    // The stray fragment used to land in the generated C as a bare string
-    // expression, which -Werror rejects; prove the output still compiles.
-    compile_and_run(&c_code, "x\n").expect("generated scanner must compile");
 }
 
 #[test]
-fn test_multibyte_before_trailing_context_slash() {
+fn test_multibyte_before_trailing_context_slash_is_refused_cleanly() {
     // find_trailing_context_slash() had the same char-index/byte-index defect.
     let lex_input = "%option noinput nounput\n%%\n\u{e9}/x  { printf(\"T\"); }\n.|\\n  { }\n%%\n";
 
-    let (c_code, success) = run_lex(lex_input);
+    let (combined, success) = run_lex_capture(&[], lex_input);
     assert!(
-        success,
-        "lex rejected multibyte before a trailing-context slash: {}",
-        c_code
+        !success,
+        "non-ASCII before a trailing-context slash must be refused: {combined}"
+    );
+    assert!(
+        combined.contains("non-ASCII"),
+        "the refusal must name the problem: {combined}"
     );
 }
 
@@ -4101,4 +4119,110 @@ fn test_action_brace_inside_string_literal() {
 
     let result = compile_and_run(&c_code, "hi\n").unwrap();
     assert_eq!(result, "}hi{\n");
+}
+
+/// Compile `c_code` and feed it raw bytes, so a test can drive the scanner
+/// with input that is not valid UTF-8.
+fn compile_and_run_raw(c_code: &str, input: &[u8]) -> Result<String, String> {
+    let temp_dir = TempDir::new().unwrap();
+    let c_file = temp_dir.path().join("lexer.c");
+    let exe_file = temp_dir.path().join("lexer");
+    let input_file = temp_dir.path().join("input.bin");
+
+    fs::write(&c_file, c_code).unwrap();
+    fs::write(&input_file, input).unwrap();
+
+    let compile = Command::new("cc")
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe_file.to_str().unwrap(),
+            c_file.to_str().unwrap(),
+            "-lm",
+        ])
+        .output()
+        .expect("Failed to compile");
+    if !compile.status.success() {
+        return Err(format!(
+            "Compilation failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
+
+    let run = Command::new(exe_file)
+        .stdin(fs::File::open(&input_file).unwrap())
+        .output()
+        .expect("Failed to run lexer");
+    Ok(String::from_utf8_lossy(&run.stdout).to_string())
+}
+
+#[test]
+fn test_non_ascii_pattern_character_is_rejected() {
+    // The scanner's alphabet is bytes. A source character above U+007F was
+    // accepted silently and produced a rule that could never fire: above
+    // U+00FF the transition contributed no bytes at all, and U+0080..=U+00FF
+    // was mapped to the *Latin-1* byte, which never appears in the UTF-8 input
+    // the .l file is itself written in. Both compiled clean and matched
+    // nothing. Silence is the defect; refuse the pattern instead.
+    for pattern in [
+        "\u{e9}+",       // bare character, U+0080..U+00FF
+        "\u{4e2d}+",     // bare character, above U+00FF
+        "\"caf\u{e9}\"", // inside a quoted string
+        "[\u{e9}a]+",    // inside a bracket expression
+    ] {
+        let source = format!("%%\n{}    printf(\"X\\n\");\n%%\n", pattern);
+        let (combined, ok) = run_lex_capture(&[], &source);
+        assert!(
+            !ok,
+            "pattern {:?} must be refused, not silently accepted: {}",
+            pattern, combined
+        );
+        assert!(
+            combined.contains("non-ASCII"),
+            "the diagnostic must name the problem for {:?}: {}",
+            pattern,
+            combined
+        );
+    }
+}
+
+#[test]
+fn test_non_ascii_in_definition_body_is_rejected() {
+    // A definition body is stored raw and expanded into the pattern later, so
+    // it needs the same check or the character arrives by the back door.
+    let source = "ACCENT    \u{e9}\n%%\n{ACCENT}+    printf(\"X\\n\");\n%%\n";
+    let (combined, ok) = run_lex_capture(&[], source);
+    assert!(
+        !ok,
+        "a non-ASCII definition body must be refused: {combined}"
+    );
+    assert!(
+        combined.contains("non-ASCII"),
+        "the diagnostic must name the problem: {combined}"
+    );
+}
+
+#[test]
+fn test_high_byte_escapes_still_compile_and_match() {
+    // The false-positive guard, and the reason the check cannot live in the
+    // NFA or the DFA: `\377`, `\xff` and `\x80` legitimately name high bytes,
+    // and by the time a transition exists a correct `\377` is indistinguishable
+    // from an erroneous literal 'ÿ'. Each of these must still match its byte.
+    for (pattern, byte) in [("\\377", 0xffu8), ("\\xff", 0xff), ("\\x80", 0x80)] {
+        let source = format!(
+            "%option noinput nounput\n%%\n{}    printf(\"HIT\\n\");\n.|\\n    {{ }}\n%%\n",
+            pattern
+        );
+        let (c_code, ok) = run_lex(&source);
+        assert!(ok, "pattern {:?} must still compile: {}", pattern, c_code);
+
+        let result = compile_and_run_raw(&c_code, &[byte]).unwrap();
+        assert_eq!(
+            result, "HIT\n",
+            "pattern {:?} must still match byte {:#04x}",
+            pattern, byte
+        );
+    }
 }

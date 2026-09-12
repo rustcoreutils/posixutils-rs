@@ -16,7 +16,7 @@
 //! - `%option nounput` - suppress `unput()` function generation
 
 use crate::pattern_escape::{
-    expand_posix_bracket_constructs, has_nul_escape, translate_escape_sequences,
+    expand_posix_bracket_constructs, first_non_ascii, has_nul_escape, translate_escape_sequences,
 };
 use crate::pattern_validate::{
     find_posix_bracket_end, parse_anchoring_and_trailing_context, validate_pattern_restrictions,
@@ -336,6 +336,9 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     } else if let Some(caps) = state.sub_re.captures(line_to_parse) {
         let name = caps.get(1).unwrap().as_str();
         let value = caps.get(2).unwrap().as_str();
+        // A definition is expanded into a pattern later, so it needs the same
+        // check or a non-ASCII character arrives by the back door.
+        reject_non_ascii(state, &gettext("definition"), value)?;
         state.subs.insert(String::from(name), String::from(value));
     } else if !line_to_parse.trim().is_empty() {
         return Err(state.error(&format!(
@@ -345,6 +348,24 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
         )));
     }
     Ok(())
+}
+
+/// Refuse `text` if it contains a literal character above U+007F.
+///
+/// `what` names the construct for the diagnostic ("pattern", "definition").
+fn reject_non_ascii(state: &ParseState, what: &str, text: &str) -> Result<(), String> {
+    let Some((pos, ch)) = first_non_ascii(text) else {
+        return Ok(());
+    };
+    Err(state.error(&format!(
+        "{} {} {} {}: {:?} (U+{:04X})",
+        gettext("non-ASCII character in"),
+        what,
+        gettext("at position"),
+        pos,
+        ch,
+        ch as u32
+    )))
 }
 
 /// Count the braces of an action line that are actually braces.
@@ -827,6 +848,11 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
 
     let pos = find_ere_end(remaining).map_err(|e| state.error(&e))?;
     let ere_raw = String::from(&remaining[..pos]);
+
+    // The scanner matches bytes, so a literal character above U+007F can never
+    // be matched. Checked on the raw source, where `\377` and `\xff` are still
+    // plain ASCII and stay legal.
+    reject_non_ascii(state, &gettext("pattern"), &ere_raw)?;
 
     // POSIX 101898-900: a NUL character in a pattern is undefined behavior.
     if has_nul_escape(&ere_raw) {

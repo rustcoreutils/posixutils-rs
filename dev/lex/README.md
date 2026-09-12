@@ -159,8 +159,14 @@ start conditions, REJECT, and both kinds of trailing context.
 
 ## Known Limitations
 
-- The alphabet is bytes. A pattern containing a character above U+00FF compiles
-  but cannot match, since the scanner reads bytes and classes cover 0..=255.
+- The alphabet is bytes, so a pattern cannot contain a literal character above
+  U+007F. Such a pattern is refused with a diagnostic naming the character and
+  its position. The boundary is U+0080, not U+00FF: a character in
+  U+0080..=U+00FF used to be mapped to its Latin-1 byte, which never appears in
+  the UTF-8 input a `.l` file written in UTF-8 describes, so it matched nothing
+  while looking as though it should.
+- The `\NNN` and `\xNN` escapes still name bytes 0x80..0xff and are unaffected;
+  they are checked against flex in the matching differential.
 
 ## Inspiration
 

@@ -203,7 +203,7 @@ fn run(opts: &Options) -> Result<(), YaccError> {
             "{} '{}': {}",
             gettext("cannot read"),
             opts.grammar_file,
-            e
+            plib::diag::io_error_text(&e)
         ))
     })?;
 

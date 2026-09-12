@@ -119,12 +119,7 @@ impl MacroName {
     pub fn parse_cmd(input: &OsStr) -> std::result::Result<Self, clap::Error> {
         let input_bytes = input.as_encoded_bytes();
         MacroName::try_from_slice(input_bytes).map_err(|_error| {
-            let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation);
-            e.insert(
-                clap::error::ContextKind::InvalidValue,
-                clap::error::ContextValue::String(String::from_utf8_lossy(input_bytes).to_string()),
-            );
-            e
+            invalid_name_error(&format!("-U <{UNDEFINE_VALUE_NAME}>"), input_bytes)
         })
     }
 
@@ -137,20 +132,62 @@ impl MacroName {
     }
 }
 
+/// How `-D` and `-U` spell their option-argument. These are the strings the
+/// diagnostic quotes back, so they have to agree with the `value_name` each
+/// `clap::Arg` is built with; naming them once is what keeps the two in step.
+pub(crate) const DEFINE_VALUE_NAME: &str = "name[=value]";
+pub(crate) const UNDEFINE_VALUE_NAME: &str = "name";
+
+/// A `clap::Error` for an option-argument that is not a name token, naming
+/// both the option it came from and the value, so the rendered diagnostic
+/// reads like every other bad-option-argument message.
+///
+/// Rejecting the option is a deliberate divergence: GNU m4 accepts a `-D` or
+/// `-U` whose name is not a name token and silently ignores it, so a caller
+/// asking for something m4 cannot do hears nothing back. Saying so costs a
+/// build that passes, say, a hyphenated name, which is the point -- silent
+/// acceptance is the defect, not the diagnostic.
+pub(crate) fn invalid_name_error(arg: &str, value: &[u8]) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let mut e = clap::Error::new(ErrorKind::ValueValidation);
+    e.insert(
+        ContextKind::InvalidArg,
+        ContextValue::String(arg.to_string()),
+    );
+    e.insert(
+        ContextKind::InvalidValue,
+        ContextValue::String(String::from_utf8_lossy(value).to_string()),
+    );
+    e
+}
+
+// These classify one byte, in the locale `plib::diag::init_locale` installed.
+// `c.into()` widens a u8 to 0..=255, which is the `unsigned char` domain
+// `isalnum` and friends are defined over, so no call below can index outside
+// the ctype table.
+//
+// Byte classification is the whole contract, not a step towards a wider one.
+// A name token is a sequence of bytes the locale calls alphanumeric, which is
+// right for every single-byte encoding -- under ISO-8859-1 `isalpha(0xe9)` is
+// true and `café` is a name -- and under a multibyte encoding it means a name
+// is ASCII, which is what GNU m4 does too. Probed against GNU m4 1.4.19 in a
+// UTF-8 locale: `define(café, ...)` is refused by both, and every expansion
+// agrees byte for byte. Decoding names through `mbrtowc`/`iswalpha` would
+// create that divergence rather than remove one.
+//
+// Character semantics belong to the built-ins that count or index characters,
+// where POSIX 103776 puts them, and they already have them: `len`, `substr`,
+// `index` and `translit` go through `plib::locale::mb_char_slices`. That is
+// where m4 is ahead of GNU, not behind it -- `len(café)` is 4 here and 5
+// there, and GNU's `substr` will hand back half a UTF-8 sequence.
 fn is_word_char_end(c: u8) -> bool {
-    // TODO(safety): check safety!
     (unsafe { libc::isalnum(c.into()) } != 0) || c == b'_'
 }
 
 fn is_word_char_start(c: u8) -> bool {
-    // TODO(safety): check safety!
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
 }
 
-//TODO(utf8): these don't handle multibyte characters!
-//
-//It seems like we might want to use https://linux.die.net/man/3/mbrtowc for UTF-8 and any other
-//multibyte encodings. Then https://linux.die.net/man/3/iswblank
 pub(crate) fn is_whitespace(c: u8) -> bool {
     (unsafe { libc::isblank(c.into()) != 0 }) || c == b'\n'
 }

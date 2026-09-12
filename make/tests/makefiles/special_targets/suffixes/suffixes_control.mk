@@ -1,9 +1,8 @@
 # .txt and .out are not in the default .SUFFIXES list, so they have to be added
 # before an empty .SUFFIXES: can be shown to take them away again. Without the
 # clearing line this builds copied.out through .txt.out; with it, nothing does.
-# suffixes_control.mk is that control, and must stay identical but for the line.
+# clear_suffixes.mk is the same makefile with the clearing line restored.
 .SUFFIXES: .txt .out
-.SUFFIXES:
 
 .txt.out:
 	@echo "Converting $< to $@"

@@ -617,7 +617,10 @@ fails on two real defects (`phony`/noop, `synthetic`/diff) and exits nonzero.
 All 25 old findings were ticked. #13 and #24 were refuted by the crate review
 (they are #40 and #43 above). The remaining 23 were re-probed against
 `target/release/make`, with GNU Make 4.3 as the reference wherever POSIX leaves
-room. **Eighteen hold, three are refuted, two are partial.**
+room. **Eighteen hold, three are refuted, two are partial.** (Re-probed again
+2026-09-12: every defect the non-holding rows named has since been fixed, so
+four of those five rows now hold. Each row below says so, and carries the
+probe. Only #23 is still partial.)
 
 Recorded so the next reader does not repeat the work. A row here is a claim
 about the binary as of 2026-08-27, not about the source.
@@ -630,22 +633,22 @@ about the binary as of 2026-08-27, not about the source.
 | #4 | `-k` exits 0 when everything succeeds | holds |
 | #5 | command-line `macro=value`, taking precedence | holds — overrides the makefile's own value |
 | #6 | `$(SRC:.c=.o)` substitution | holds — `a.c b.c` → `a.o b.o` |
-| #7 | continuation folds to a single space | **refuted** — folds to two; see #48 |
+| #7 | continuation folds to a single space | holds again — #48 fixed it; re-probed 2026-09-12, `a b` matches GNU |
 | #8 | single-suffix inference rules | holds — `.c:` applied to `foo` |
 | #9 | `-j`, `.WAIT`, `.NOTPARALLEL` | holds — and `.WAIT` genuinely orders under `-j4` |
 | #10 | multiple `-f`, concatenated in order | holds |
 | #11 | shell `-e` for non-ignored recipes | holds — `false; echo …` does not leak; `-` prefix still ignores |
-| #12 | recipe shell from the `SHELL` macro | **refuted** — runs under `/bin/sh`; see #36 |
+| #12 | recipe shell from the `SHELL` macro | holds again — #36 fixed it; re-probed 2026-09-12, `SHELL=/bin/echo` runs the recipe through it |
 | #14 | `$?` is newer-only | holds — one of two prerequisites listed |
 | #15 | `$^`, `$+`, `$(@D)`, `$(@F)` | holds — byte-identical to GNU |
-| #16 | `.SUFFIXES` order authoritative | **partial** — membership and clear work, order does not; see #47 |
-| #17 | signal registration correctly gated | **refuted** — overrides an inherited `SIG_IGN`; see #41 |
+| #16 | `.SUFFIXES` order authoritative | holds — #47 fixed the order half; re-probed 2026-09-12, both rule orderings pick `.sh`, and reversing the `.SUFFIXES` list flips it to `.c` |
+| #17 | signal registration correctly gated | holds again — #41 fixed it; re-probed 2026-09-12, an inherited `SIG_IGN` survives and make exits 0 |
 | #18 | bare `.PRECIOUS` protects every target | holds — verified against a control where a plain target *is* deleted |
 | #19 | `-include` implemented; `includedir=` not mistaken for it | holds |
 | #20 | handler resets to `SIG_DFL` and re-raises | holds — `WIFSIGNALED`, signal 2, not `exit(130)` |
 | #21 | cleanup honors `.PHONY` | holds — same control as #18 |
 | #22 | special targets additive across occurrences | holds — two `.PHONY:` lines both take effect |
-| #23 | diagnostics internationalized | **partial, as its own text admits** — 34 `gettext` sites, 10 raw `eprintln!` remain, mostly `main.rs` error paths |
+| #23 | diagnostics internationalized | **still partial** — re-counted 2026-09-12: 30 `gettext` sites, 7 raw `eprintln!` remain, 6 of them `main.rs` error paths |
 | #25 | every error path exits >1 | holds — 2 / 4 / 6 for recipe / parse / no-target, and `-q` correctly exits 1 |
 
 Three probes were confounded on the first pass and needed a second: #15 failed

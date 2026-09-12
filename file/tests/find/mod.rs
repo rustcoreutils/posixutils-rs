@@ -133,13 +133,57 @@ fn find_type_test() {
     run_test_find_sorted(&args, &[&file1, &file2, &file3, &file4], "", 0)
 }
 
+// `-mtime n` is true when "the file modification time subtracted from the
+// initialization time, divided by 86 400 (with any remainder discarded), is n"
+// (98269) -- truncation, not the round-up that `-size` uses (98261). `n`, `+n`
+// and `-n` mean exactly, more than, and less than (98190-98195).
+//
+// The fixtures under tests/find/other cannot test any of that: they are
+// checked in, so their mtime is checkout time and their age is whatever today
+// happens to be. Stamp our own instead.
 #[test]
-fn find_mtime_test() {
-    let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find/other", project_root);
-    let args = [&test_dir, "-mtime", "7000"];
+fn find_mtime_exact_newer_and_older() {
+    let dir = scratch_dir("mtime");
 
-    run_test_find(&args, "", "", 0)
+    // An extra hour past each day boundary, so the spawn latency between
+    // SystemTime::now() here and find's own initialization time cannot drift a
+    // file into the neighbouring bucket.
+    let now = std::time::SystemTime::now();
+    let mut paths = Vec::new();
+    for days in [0_u64, 1, 3, 10] {
+        let f = dir.join(format!("d{}", days));
+        File::create(&f).unwrap();
+        let age = std::time::Duration::from_secs(days * 86400 + 3600);
+        if !filetime_set(&f, now - age) {
+            eprintln!("skipping: could not set an mtime on this host");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        paths.push(f.to_string_lossy().into_owned());
+    }
+    let (d0, d1, d3, d10) = (&paths[0], &paths[1], &paths[2], &paths[3]);
+    let ds = dir.to_str().unwrap();
+
+    // Exactly n: each file lands in its own 86400-second bucket, which is what
+    // the discarded remainder buys.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "0"], &[d0], "", 0);
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "1"], &[d1], "", 0);
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "3"], &[d3], "", 0);
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "10"], &[d10], "", 0);
+    // Nothing is 2 days old; an off-by-one in the bucket arithmetic shows here.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "2"], &[], "", 0);
+
+    // More than n excludes n itself.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "+3"], &[d10], "", 0);
+    // Less than n, the comparison no test exercised for any numeric primary.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "-3"], &[d0, d1], "", 0);
+
+    // The boundary pair the RATIONALE calls out (98476-98480): the day
+    // boundary and the local timezone play no part, only the 24-hour count.
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "+0"], &[d1, d3, d10], "", 0);
+    run_test_find_sorted(&[ds, "-type", "f", "-mtime", "-1"], &[d0], "", 0);
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -353,13 +397,39 @@ fn find_print0_with_name_filter() {
     run_test_find_print0_sorted(&args, &[&file1, &file2, &file3], 0)
 }
 
+/// An empty scratch directory of our own, named for `tag` and this process.
+///
+/// Tests that need one assert over the whole directory, so anything else
+/// writing into it breaks them. The tag separates tests within a run -- they
+/// execute on parallel threads of one process -- and the pid separates
+/// concurrent runs, which would otherwise meet on a single path inside a
+/// directory every user on the host can write to.
+///
+/// The pid is deliberately the only varying part. Something more unique per
+/// call would leave a fresh directory behind every time a test panicked before
+/// its cleanup; with the pid, a later run reuses the name and the
+/// `remove_dir_all` below clears whatever the last one left.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("posixutils_find_{tag}_{}", std::process::id()));
+    // Anything but "it was not there" has to be reported here. `create_dir_all`
+    // is happy with a directory that already exists, so a removal that failed --
+    // a leftover owned by another user on a shared temp dir, or a symlink
+    // planted in it -- would otherwise leave stale entries in place and surface
+    // as an assertion about `-mtime` or `-name` further down.
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("could not clear scratch dir {}: {e}", dir.display()),
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 // --- fnmatch / -iname (find-A) ---
 
 /// Create a fresh temp dir with the given files; returns its path.
 fn make_fnmatch_dir(tag: &str, files: &[&str]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("posixutils_find_{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir(tag);
     for f in files {
         File::create(dir.join(f)).unwrap();
     }
@@ -598,9 +668,7 @@ fn find_mount_excludes_crossing_directory() {
 // nothing was lost or duplicated.
 #[test]
 fn find_exec_plus_splits_over_arg_max() {
-    let dir = std::env::temp_dir().join("posixutils_find_argmax");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("argmax");
 
     // The file count has to be derived from the host's ARG_MAX, not fixed: a
     // count tuned to one machine's margin silently stops splitting on a host
@@ -668,9 +736,7 @@ fn find_exec_plus_splits_over_arg_max() {
 // (nor `-mtime N` for any non-negative N).
 #[test]
 fn find_mtime_future_dated_file() {
-    let dir = std::env::temp_dir().join("posixutils_find_future");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("future");
     let f = dir.join("future");
     File::create(&f).unwrap();
 

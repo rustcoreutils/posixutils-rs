@@ -138,19 +138,23 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
+/// The answer codes this daemon sends.
+///
+/// Each carries its wire value explicitly, so the set may be trimmed to what
+/// is reachable without renumbering the rest.  The protocol also defines
+/// MACHINE_UNKNOWN (3), BAD_ADDR (7) and BAD_CTL_ADDR (8); none is reachable
+/// in a local-only daemon, which never resolves a remote host and never
+/// validates an address it did not receive over a Unix-domain socket.  The
+/// `talk` client still decodes all three.
 #[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(u8)]
-#[allow(dead_code)] // Protocol completeness - not all variants used yet
 enum Answer {
     Success = 0,
     NotHere = 1,
     Failed = 2,
-    MachineUnknown = 3,
     PermissionDenied = 4,
     UnknownRequest = 5,
     BadVersion = 6,
-    BadAddr = 7,
-    BadCtlAddr = 8,
 }
 
 #[derive(Default, Debug, PartialEq, Clone)]
@@ -214,7 +218,6 @@ struct CtlMsg {
     r#type: u8,
     id_num: u32,
     addr: Osockaddr,
-    ctl_addr: Osockaddr,
     l_name: [i8; 12],
     r_name: [i8; 12],
     r_tty: [i8; 16],
@@ -236,15 +239,17 @@ impl CtlMsg {
             std::array::from_fn(|i| bytes[i] as i8)
         }
 
-        // Bytes 2, 3 and 40..44 are the request's answer, pad and pid fields.
-        // They are part of the 84-byte layout but carry nothing the daemon
-        // acts on, so they are stepped over rather than stored.
+        // Bytes 2, 3, 24..40 and 40..44 are the request's answer, pad,
+        // ctl_addr and pid fields.  They are part of the 84-byte layout but
+        // carry nothing the daemon acts on -- a local-only daemon rendezvouses
+        // over msg.addr and never dials the caller's control address -- so
+        // they are stepped over rather than stored.  Every field below indexes
+        // an explicit range, so skipping one does not shift the others.
         Ok(CtlMsg {
             vers: bytes[0],
             r#type: bytes[1],
             id_num: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             addr: Osockaddr::read_from(bytes[8..24].try_into().expect("16 bytes")),
-            ctl_addr: Osockaddr::read_from(bytes[24..40].try_into().expect("16 bytes")),
             l_name: name(&bytes[44..56]),
             r_name: name(&bytes[56..68]),
             r_tty: std::array::from_fn(|i| bytes[68 + i] as i8),
@@ -325,16 +330,19 @@ fn c_array_to_string_16(arr: &[i8; 16]) -> String {
 // Invitation Registry
 // ============================================================================
 
+/// A pending invitation, held in memory only.
+///
+/// Not a wire structure: the protocol's own layouts are `CtlMsg` and
+/// `CtlRes`, which encode themselves byte by byte.  This record keeps just
+/// what the daemon reads back -- matching a LOOK_UP against an outstanding
+/// ANNOUNCE, handing the caller's rendezvous address to the callee, and
+/// expiring the entry.
 #[derive(Clone)]
-#[allow(dead_code)] // Some fields needed for protocol but not used in local mode
 struct Invitation {
     id: u32,
     caller: String,
     callee: String,
-    caller_tty: String,
-    callee_tty: String,
     tcp_addr: Osockaddr,
-    ctl_addr: Osockaddr,
     timestamp: Instant,
 }
 
@@ -535,10 +543,7 @@ fn handle_announce(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
         id: 0, // Will be set by insert
         caller,
         callee,
-        caller_tty: String::new(),
-        callee_tty,
         tcp_addr: msg.addr.clone(),
-        ctl_addr: msg.ctl_addr.clone(),
         timestamp: Instant::now(),
     };
 
@@ -561,7 +566,6 @@ fn handle_announce(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
 fn handle_leave_invite(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRes {
     let caller = msg.local_name();
     let callee = msg.remote_name();
-    let callee_tty = msg.remote_tty();
 
     // If an invitation for this (callee, caller) pair already exists, refresh
     // its address + timestamp rather than returning a stale entry (#TD11).
@@ -578,10 +582,7 @@ fn handle_leave_invite(registry: &mut InvitationRegistry, msg: &CtlMsg) -> CtlRe
         id: 0,
         caller,
         callee,
-        caller_tty: String::new(),
-        callee_tty,
         tcp_addr: msg.addr.clone(),
-        ctl_addr: msg.ctl_addr.clone(),
         timestamp: Instant::now(),
     };
 
@@ -1014,10 +1015,7 @@ mod tests {
             id: 0,
             caller: "alice".to_string(),
             callee: "bob".to_string(),
-            caller_tty: "pts/0".to_string(),
-            callee_tty: "pts/1".to_string(),
             tcp_addr: Osockaddr::default(),
-            ctl_addr: Osockaddr::default(),
             timestamp: Instant::now(),
         };
 
@@ -1035,10 +1033,7 @@ mod tests {
             id: 0,
             caller: "alice".to_string(),
             callee: "bob".to_string(),
-            caller_tty: String::new(),
-            callee_tty: String::new(),
             tcp_addr: Osockaddr::default(),
-            ctl_addr: Osockaddr::default(),
             timestamp: Instant::now(),
         };
 
@@ -1069,10 +1064,7 @@ mod tests {
             id: 0,
             caller: caller.to_string(),
             callee: callee.to_string(),
-            caller_tty: String::new(),
-            callee_tty: String::new(),
             tcp_addr: Osockaddr::default(),
-            ctl_addr: Osockaddr::default(),
             timestamp: Instant::now(),
         }
     }
@@ -1163,10 +1155,7 @@ mod tests {
             id: 0,
             caller: "alice".to_string(),
             callee: callee.to_string(),
-            caller_tty: String::new(),
-            callee_tty: String::new(),
             tcp_addr: Osockaddr::default(),
-            ctl_addr: Osockaddr::default(),
             timestamp: Instant::now(),
         };
 

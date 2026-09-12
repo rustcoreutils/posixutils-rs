@@ -578,18 +578,31 @@ impl MacroImplementation for IfelseMacro {
     fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let mut args_len = frame.args.len();
         if args_len < 3 {
-            state.emit_warning(
-                stderr,
-                format_args!("{}", gettext("too few arguments to builtin `ifelse'")),
-            )?;
+            // POSIX 103940 says ifelse "takes three or more arguments" and
+            // leaves fewer unspecified, so the warning is a quality question
+            // rather than a conformance one -- and GNU m4 draws the line at
+            // exactly two. Two comparands with no branch is a call that meant
+            // to do something and cannot; one argument, or none, reads as a
+            // placeholder and expands to nothing in silence.
+            if args_len == 2 {
+                state.emit_warning(
+                    stderr,
+                    format_args!("{}", gettext("too few arguments to builtin `ifelse'")),
+                )?;
+            }
             return Ok(state);
         }
 
         let mut args = frame.args.into_iter();
         let mut i = 0;
         loop {
-            // TODO: there's a bug here, when we originally parsed this as a set of macro args we
-            // didn't evaluate it as we parsed it.
+            // Both comparands arrive already expanded: collecting an argument
+            // and expanding a macro are the same pass. `main_loop` pushes a
+            // `StackFrame` on seeing `name(`, which reroutes `Output::write_all`
+            // into the current argument buffer, so a nested call expands through
+            // the ordinary path and its result lands in the argument. A quoted
+            // argument skips that by construction. So comparing the strings here
+            // is comparing expansions, which is what POSIX and GNU both specify.
             let arg_0 = args.next().expect("at least 3 args");
             let arg_1 = args.next().expect("at least 3 args");
             if arg_0 == arg_1 {

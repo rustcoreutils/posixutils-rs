@@ -37,14 +37,10 @@ impl ArgumentDefine {
         let mut split = value_bytes.splitn(2, |b| *b == b'=');
         let name =
             MacroName::try_from_slice(split.next().unwrap_or_default()).map_err(|_error| {
-                let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation);
-                e.insert(
-                    clap::error::ContextKind::InvalidValue,
-                    clap::error::ContextValue::String(
-                        String::from_utf8_lossy(value_bytes).to_string(),
-                    ),
-                );
-                e
+                crate::lexer::invalid_name_error(
+                    &format!("-D <{}>", crate::lexer::DEFINE_VALUE_NAME),
+                    value_bytes,
+                )
             })?;
 
         let value = match split.next() {
@@ -98,7 +94,7 @@ impl Args {
             .arg(
                 clap::Arg::new("define")
                     .short('D')
-                    .value_name("name[=value]")
+                    .value_name(crate::lexer::DEFINE_VALUE_NAME)
                     .help(gettext(
                         "Define the symbol name to have some value (or NULL)",
                     ))
@@ -108,7 +104,7 @@ impl Args {
             .arg(
                 clap::Arg::new("undefine")
                     .short('U')
-                    .value_name("name")
+                    .value_name(crate::lexer::UNDEFINE_VALUE_NAME)
                     .help(gettext("Undefine the symbol name"))
                     .num_args(1)
                     .action(clap::ArgAction::Append),
@@ -122,14 +118,18 @@ impl Args {
         // position, then process them in that order. The relative order of -D
         // and -U is significant, and options may be interspersed with operands.
         let mut items: Vec<(usize, InputItem)> = Vec::new();
+        // A name that is not a name token is a usage error, so let clap render
+        // and exit the way it does for any other bad option-argument. These
+        // used to `.expect()`, which printed the Debug spelling of a
+        // clap::Error -- every style field and all -- and aborted with 101.
         let defines = matches.get_raw("define").unwrap_or_default();
         for (value, index) in defines.zip(matches.indices_of("define").unwrap_or_default()) {
-            let value = ArgumentDefine::parse(value).expect("Invalid -D argument definition");
+            let value = ArgumentDefine::parse(value).unwrap_or_else(|e| e.exit());
             items.push((index, InputItem::Define(value)));
         }
         let undefines = matches.get_raw("undefine").unwrap_or_default();
         for (value, index) in undefines.zip(matches.indices_of("undefine").unwrap_or_default()) {
-            let value = MacroName::parse_cmd(value).expect("Invalid -U argument undefine");
+            let value = MacroName::parse_cmd(value).unwrap_or_else(|e| e.exit());
             items.push((index, InputItem::Undefine(value)));
         }
         let files = matches.get_raw("file").unwrap_or_default();

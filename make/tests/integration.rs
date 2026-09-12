@@ -544,16 +544,20 @@ mod parsing {
         );
     }
 
-    // #[test]
-    // #[ignore]
-    // fn suffixes_with_no_target() {
-    //     run_test_helper(
-    //         &["-f", "tests/makefiles/parsing/suffixes_with_no_targets.mk"],
-    //         "",
-    //         "make: parse error: No Targets",
-    //         ErrorCode::ParseError("no targets".into()).into(),
-    //     );
-    // }
+    // A makefile holding nothing but an inference rule parses cleanly -- it is
+    // `no_targets` in target_behavior that covers the parse-time failure -- but
+    // POSIX 105428 makes the default target the first one that is neither
+    // special nor an inference rule, and there is none here. So this fails at
+    // run time with exit 6, not at parse time with exit 4.
+    #[test]
+    fn suffixes_with_no_target() {
+        run_test_helper(
+            &["-f", "tests/makefiles/parsing/suffixes_with_no_targets.mk"],
+            "",
+            "make: no targets to execute\n",
+            ErrorCode::NoTarget { target: None }.into(),
+        );
+    }
 
     // Audit #1: a recipe line that contains '=' (a shell assignment, an
     // option like --prefix=, or a `test x = y`) must not be mistaken for a
@@ -1141,20 +1145,56 @@ mod special_targets {
         }
     }
 
-    // unspecified stderr and error type, must be refactored and improved
-    // #[test]
-    // #[ignore]
-    // fn clear_suffixes() {
-    //     run_test_helper(
-    //         &[
-    //             "-f",
-    //             "tests/makefiles/special_targets/suffixes/clear_suffixes.mk",
-    //         ],
-    //         "Converting $< to \n",
-    //         "make: Nothing be dobe for copied.out",
-    //         ErrorCode::ParseError("the inner value does not matter for now".into()).into(),
-    //     );
-    // }
+    // An empty `.SUFFIXES:` clears the suffix list, so a `.txt.out` rule
+    // defined afterwards is not an inference rule and `copied.out` cannot be
+    // built from `copied.txt`.
+    //
+    // This needs the control to mean anything. `.txt` and `.out` are not in
+    // the default suffix list, so a fixture that merely clears and then
+    // defines `.txt.out` behaves identically whether or not the clearing line
+    // is there -- an earlier version of this test asserted exactly that, and
+    // would have stayed green if `.SUFFIXES:` stopped clearing altogether.
+    // Both fixtures therefore add the two suffixes first and differ only in
+    // the clearing line; GNU Make 4.3 splits them the same way.
+    #[test]
+    fn clear_suffixes_disables_the_inference_rule() {
+        // The control: the same makefile without the clearing line infers
+        // copied.out from copied.txt and runs the recipe.
+        run_test_helper_with_setup_and_destruct(
+            &[
+                "-f",
+                "tests/makefiles/special_targets/suffixes/suffixes_control.mk",
+            ],
+            "Converting copied.txt to copied.out\n",
+            "",
+            0,
+            setup,
+            destruct,
+        );
+
+        // With the clearing line, the rule is gone and nothing runs.
+        run_test_helper_with_setup_and_destruct(
+            &[
+                "-f",
+                "tests/makefiles/special_targets/suffixes/clear_suffixes.mk",
+            ],
+            "",
+            "",
+            0,
+            setup,
+            destruct,
+        );
+
+        fn setup() {
+            let _ = remove_file("copied.out");
+            File::create("copied.txt").unwrap();
+        }
+
+        fn destruct() {
+            let _ = remove_file("copied.txt");
+            let _ = remove_file("copied.out");
+        }
+    }
 
     mod validations {
         use super::*;

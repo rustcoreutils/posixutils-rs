@@ -152,7 +152,7 @@ fn realpath_args_canonicalization() {
     realpath_test(
         &["-e", "foobar"],
         "",
-        "realpath: foobar: No such file or directory (os error 2)\n",
+        "realpath: foobar: No such file or directory\n",
         1,
     );
 
@@ -161,7 +161,7 @@ fn realpath_args_canonicalization() {
     realpath_test(
         &["-E", "-e", "foobar"],
         "",
-        "realpath: foobar: No such file or directory (os error 2)\n",
+        "realpath: foobar: No such file or directory\n",
         1,
     );
 }

@@ -257,7 +257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = unexpand(&args) {
         exit_code = 1;
-        plib::diag::error(&err.to_string());
+        plib::diag::error(&plib::diag::error_text(err.as_ref()));
     }
 
     std::process::exit(exit_code)

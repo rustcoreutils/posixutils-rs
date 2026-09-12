@@ -46,7 +46,7 @@ fn unlink_remove_non_existing_file() {
         stdin_data: String::new(),
         expected_out: String::new(),
         expected_err: format!(
-            "unlink: {}: No such file or directory (os error 2)\n",
+            "unlink: {}: No such file or directory\n",
             file_path.to_str().unwrap()
         ),
         expected_exit_code: 1, // We expect failure

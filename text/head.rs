@@ -182,7 +182,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for filename in files {
         if let Err(e) = head_file(&count_type, filename, first, want_header, &mut stdout_lock) {
-            plib::diag::error(&format!("{}: {}", filename.display(), e));
+            plib::diag::error(&format!(
+                "{}: {}",
+                filename.display(),
+                plib::diag::error_text(e.as_ref())
+            ));
         }
 
         first = false;

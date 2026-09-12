@@ -162,7 +162,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Prefixed with the utility name like every other diagnostic in the
             // tree; this printed only "<file>: <error>", so a fold failure in a
             // pipeline was not attributable to fold.
-            plib::diag::error(&format!("{}: {}", filename.display(), e));
+            plib::diag::error(&format!(
+                "{}: {}",
+                filename.display(),
+                plib::diag::io_error_text(&e)
+            ));
         }
     }
 

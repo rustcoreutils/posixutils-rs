@@ -254,7 +254,11 @@ fn main() {
     let args = Args::parse();
 
     if let Err(e) = decode_file(&args) {
-        diag::error(&format!("{}: {}", pathname_display(&args.file), e));
+        diag::error(&format!(
+            "{}: {}",
+            pathname_display(&args.file),
+            diag::io_error_text(&e)
+        ));
     }
 
     std::process::exit(diag::exit_status())

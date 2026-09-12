@@ -138,7 +138,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for filename in &args.files {
         if let Err(e) = asa_file(filename) {
-            plib::diag::error(&format!("{}: {}", filename.display(), e));
+            plib::diag::error(&format!(
+                "{}: {}",
+                filename.display(),
+                plib::diag::io_error_text(&e)
+            ));
         }
     }
 

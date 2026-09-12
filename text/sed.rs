@@ -2349,7 +2349,7 @@ impl Sed {
                     format!(
                         "can't find '{}': {}",
                         wfile.display(),
-                        err.to_string().to_lowercase()
+                        plib::diag::io_error_text(&err).to_lowercase()
                     ),
                 )));
             }

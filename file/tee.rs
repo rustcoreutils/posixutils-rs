@@ -56,7 +56,7 @@ fn open_outputs(args: &Args, info: &mut TeeInfo) -> bool {
 
         match f_res {
             Err(e) => {
-                eprintln!("tee: {}: {}", filename, e);
+                eprintln!("tee: {}: {}", filename, plib::diag::io_error_text(&e));
                 had_error = true;
             }
             Ok(f) => {
@@ -107,7 +107,11 @@ fn tee_stdin(info: &mut TeeInfo) -> bool {
                 continue;
             }
             if let Err(e) = output.f.write_all(bufslice) {
-                eprintln!("tee: {}: {}", output.filename, e);
+                eprintln!(
+                    "tee: {}: {}",
+                    output.filename,
+                    plib::diag::io_error_text(&e)
+                );
                 output.ok = false;
                 had_error = true;
             }

@@ -639,7 +639,7 @@ fn main() -> ExitCode {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
                 if !params.no_file_warnings {
-                    plib::diag::error(&e.to_string());
+                    plib::diag::error(&plib::diag::error_text(&e));
                 }
                 ExitCode::FAILURE
             }
@@ -649,7 +649,7 @@ fn main() -> ExitCode {
         for file in args.file() {
             if let Err(e) = pr_serial(file, &params) {
                 if !params.no_file_warnings {
-                    plib::diag::error(&e.to_string());
+                    plib::diag::error(&plib::diag::error_text(&e));
                 }
                 success = false;
             }

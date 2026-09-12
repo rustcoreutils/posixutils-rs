@@ -591,7 +591,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes_or_lines = match args.get_bytes_or_lines() {
         Ok(by) => by,
         Err(bo) => {
-            plib::diag::error(&format!("{bo}"));
+            plib::diag::error(&plib::diag::error_text(bo.as_ref()));
 
             std::process::exit(1_i32)
         }

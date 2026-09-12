@@ -349,7 +349,7 @@ fn paste_files_serial(
                 )?;
             }
             Ok(None) => plib::diag::error("file operand is an empty string, skipping"),
-            Err(e) => plib::diag::error(&format!("{e}")),
+            Err(e) => plib::diag::error(&plib::diag::error_text(e.as_ref())),
         }
     }
 
@@ -445,16 +445,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if serial {
         if let Err(e) = paste_files_serial(&files, delimiter_state) {
-            plib::diag::error(&format!("{e}"));
+            plib::diag::error(&plib::diag::error_text(e.as_ref()));
         }
     } else {
         match open_inputs(files) {
             Ok(paste_info) => {
                 if let Err(e) = paste_files(paste_info, delimiter_state) {
-                    plib::diag::error(&format!("{e}"));
+                    plib::diag::error(&plib::diag::error_text(e.as_ref()));
                 }
             }
-            Err(e) => plib::diag::error(&format!("{e}")),
+            Err(e) => plib::diag::error(&plib::diag::error_text(e.as_ref())),
         }
     }
 

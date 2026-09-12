@@ -143,10 +143,10 @@ fn nl_main(args: &Args) -> io::Result<()> {
             // Name the file in the diagnostic, as the other text utilities do;
             // a bare "No such file or directory" does not say which operand
             // failed.
-            Box::new(
-                fs::File::open(path)
-                    .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path.display(), e)))?,
-            )
+            Box::new(fs::File::open(path).map_err(|e| {
+                let text = plib::diag::io_error_text(&e);
+                io::Error::new(e.kind(), format!("{}: {}", path.display(), text))
+            })?)
         }
     } else {
         Box::new(io::stdin().lock())

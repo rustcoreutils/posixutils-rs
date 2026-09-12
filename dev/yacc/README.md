@@ -143,10 +143,9 @@ PackedTables:
 ## Known Limitations
 
 - No reachability check on non-terminals (see Grammar Validation).
-- `$` substitution in actions runs over the raw text, so `$1` inside a C string
-  literal or comment is rewritten too: `printf("costs $1")` becomes
-  `printf("costs (yyvsp[0])")`. The lexer tracks string/comment state in
-  `read_action`; `transform_action` does not.
+- Grammar-level comments are `/* */` only, as POSIX specifies. A `//` comment
+  between rules is a syntax error, where bison accepts it. Inside an action a
+  `//` comment is C and is handled.
 
 ## Differential testing
 

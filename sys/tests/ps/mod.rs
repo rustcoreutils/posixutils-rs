@@ -202,6 +202,85 @@ fn ps_empty_header() {
     run_ps_test(vec!["-A", "-o", "pid=,comm="], 0, check_exit_success);
 }
 
+/// The first line of `stdout`, or "" when there is none.
+fn first_line(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+// POSIX -o: "If all the header strings are null, the header line shall not be
+// written." Only the exit status was checked here, so nothing pinned whether
+// the header was actually absent -- or, in the mixed case below, present.
+#[test]
+fn ps_all_null_headers_suppress_the_header_line() {
+    run_ps_test(vec!["-A", "-o", "pid=,comm="], 0, |_, output| {
+        let line = first_line(output);
+        assert!(
+            !line.contains("PID") && !line.contains("COMMAND"),
+            "every header string is null, so no header line may be written: {line:?}"
+        );
+        // The data is still there -- suppressing the header is not suppressing
+        // the report.
+        assert!(
+            line.split_whitespace()
+                .next()
+                .is_some_and(|f| f.chars().all(|c| c.is_ascii_digit())),
+            "the first line must be a process row starting with a pid: {line:?}"
+        );
+    });
+}
+
+// The other side of the same clause: with one header string non-null the
+// header line *is* written, and the null column's heading is blank. This is
+// where an implementation that keys off "any null" rather than "all null"
+// goes wrong, and nothing exercised it.
+#[test]
+fn ps_one_non_null_header_keeps_the_header_line() {
+    run_ps_test(vec!["-A", "-o", "pid=,comm"], 0, |_, output| {
+        let line = first_line(output);
+        assert!(
+            line.contains("COMMAND"),
+            "a non-null header string means the header line is written: {line:?}"
+        );
+        assert!(
+            !line.contains("PID"),
+            "the null column's heading must be blank: {line:?}"
+        );
+    });
+}
+
+// The control: with no `=` at all both headings appear.
+#[test]
+fn ps_no_null_headers_names_every_column() {
+    run_ps_test(vec!["-A", "-o", "pid,comm"], 0, |_, output| {
+        let line = first_line(output);
+        assert!(
+            line.contains("PID") && line.contains("COMMAND"),
+            "both headings must appear: {line:?}"
+        );
+    });
+}
+
+// A renamed heading is written instead of the default, which is the third
+// thing `=` does and was equally unasserted.
+#[test]
+fn ps_renamed_header_replaces_the_default() {
+    run_ps_test(vec!["-A", "-o", "pid=PROCNUM"], 0, |_, output| {
+        let line = first_line(output);
+        assert!(
+            line.contains("PROCNUM"),
+            "the supplied heading must be used: {line:?}"
+        );
+        assert!(
+            !line.contains("PID"),
+            "the default heading must not also appear: {line:?}"
+        );
+    });
+}
+
 // ============================================
 // Filter option tests
 // ============================================

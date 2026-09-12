@@ -155,6 +155,28 @@ pub fn has_nul_escape(input: &str) -> bool {
     false
 }
 
+/// The first character of `input` that is not ASCII, as a 1-based character
+/// position and the character itself.
+///
+/// The generated scanner's alphabet is bytes, so a source character above
+/// U+007F cannot be matched: above U+00FF it contributes no byte at all, and
+/// U+0080..=U+00FF becomes the Latin-1 byte, which never appears in the UTF-8
+/// input a `.l` file written in UTF-8 describes. Callers refuse such a pattern
+/// rather than emitting a rule that can never fire.
+///
+/// This has to run on *source* text, before escapes are translated. `\377`,
+/// `\xff` and `\x80` legitimately name high bytes, and once they have been
+/// folded into characters a correct `\377` is indistinguishable from an
+/// erroneous literal high character. In source they are plain ASCII and pass
+/// here untouched.
+pub fn first_non_ascii(input: &str) -> Option<(usize, char)> {
+    input
+        .chars()
+        .enumerate()
+        .find(|(_, c)| !c.is_ascii())
+        .map(|(i, c)| (i + 1, c))
+}
+
 /// Expand POSIX bracket expression constructs to standard regex form.
 ///
 /// In the POSIX locale (which we assume):
@@ -281,6 +303,22 @@ fn find_posix_construct_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_non_ascii_finds_the_position() {
+        assert_eq!(first_non_ascii("abc"), None);
+        assert_eq!(first_non_ascii("ab\u{e9}c"), Some((3, '\u{e9}')));
+        assert_eq!(first_non_ascii("\u{4e2d}"), Some((1, '\u{4e2d}')));
+    }
+
+    #[test]
+    fn first_non_ascii_ignores_high_byte_escapes() {
+        // These name bytes 0x80..0xff and are correct; only a literal source
+        // character above U+007F is the error.
+        for pattern in [r"\377", r"\xff", r"\x80", r"\200"] {
+            assert_eq!(first_non_ascii(pattern), None, "{pattern} must be accepted");
+        }
+    }
 
     #[test]
     fn test_translate_octal_basic() {

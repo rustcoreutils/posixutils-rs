@@ -16,12 +16,13 @@
 //! - `%option nounput` - suppress `unput()` function generation
 
 use crate::pattern_escape::{
-    expand_posix_bracket_constructs, has_nul_escape, translate_escape_sequences,
+    expand_posix_bracket_constructs, first_non_ascii, has_nul_escape, translate_escape_sequences,
 };
 use crate::pattern_validate::{
     find_posix_bracket_end, parse_anchoring_and_trailing_context, validate_pattern_restrictions,
 };
 use gettextrs::gettext;
+use plib::cscan::CScanner;
 use plib::diag;
 use regex::Regex;
 use std::collections::HashMap;
@@ -121,6 +122,9 @@ enum LexSection {
 struct ParseState {
     section: LexSection,
     open_braces: u32,
+    /// C lexical state of the action being continued across lines, valid
+    /// while `open_braces > 0`.
+    action_scanner: CScanner,
     in_def: bool,
     /// True when inside a C-style /* ... */ comment
     in_comment: bool,
@@ -147,6 +151,7 @@ impl ParseState {
         ParseState {
             section: LexSection::Definitions,
             open_braces: 0,
+            action_scanner: CScanner::new(),
             in_def: false,
             in_comment: false,
             external_def: Vec::new(),
@@ -331,6 +336,9 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     } else if let Some(caps) = state.sub_re.captures(line_to_parse) {
         let name = caps.get(1).unwrap().as_str();
         let value = caps.get(2).unwrap().as_str();
+        // A definition is expanded into a pattern later, so it needs the same
+        // check or a non-ASCII character arrives by the back door.
+        reject_non_ascii(state, &gettext("definition"), value)?;
         state.subs.insert(String::from(name), String::from(value));
     } else if !line_to_parse.trim().is_empty() {
         return Err(state.error(&format!(
@@ -342,69 +350,37 @@ fn parse_def_line(state: &mut ParseState, line: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse continued action line, counting braces while handling
-/// character literals, string literals, and comments.
-fn parse_braces(open_braces: u32, line: &str) -> Result<u32, String> {
+/// Refuse `text` if it contains a literal character above U+007F.
+///
+/// `what` names the construct for the diagnostic ("pattern", "definition").
+fn reject_non_ascii(state: &ParseState, what: &str, text: &str) -> Result<(), String> {
+    let Some((pos, ch)) = first_non_ascii(text) else {
+        return Ok(());
+    };
+    Err(state.error(&format!(
+        "{} {} {} {}: {:?} (U+{:04X})",
+        gettext("non-ASCII character in"),
+        what,
+        gettext("at position"),
+        pos,
+        ch,
+        ch as u32
+    )))
+}
+
+/// Count the braces of an action line that are actually braces.
+///
+/// `scanner` carries C lexical state, so an action spanning several lines is
+/// scanned as one region: a `/* */` comment or a string literal opened on one
+/// line still hides a `{` or `}` on the next. The caller keeps the scanner for
+/// as long as the action continues.
+fn parse_braces(scanner: &mut CScanner, open_braces: u32, line: &str) -> Result<u32, String> {
     let mut open_braces = open_braces;
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
 
-    while i < chars.len() {
-        let c = chars[i];
-
-        // Skip character literals 'x' (including escape sequences like '\'' or '\\')
-        if c == '\'' {
-            i += 1;
-            if i < chars.len() && chars[i] == '\\' {
-                // Escaped character - skip backslash and next char
-                i += 2;
-            } else if i < chars.len() {
-                // Regular character
-                i += 1;
-            }
-            // Skip closing quote if present
-            if i < chars.len() && chars[i] == '\'' {
-                i += 1;
-            }
+    for c in line.chars() {
+        if !scanner.step(c).is_code() {
             continue;
         }
-
-        // Skip string literals "..."
-        if c == '"' {
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\\' && i + 1 < chars.len() {
-                    // Skip escaped character
-                    i += 2;
-                } else if chars[i] == '"' {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-
-        // Skip line comments //...
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
-            // Rest of line is comment
-            break;
-        }
-
-        // Skip block comments /* ... */ (partial - may span multiple lines)
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < chars.len() {
-                if chars[i] == '*' && chars[i + 1] == '/' {
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-
         if c == '{' {
             open_braces += 1;
         } else if c == '}' {
@@ -413,7 +389,6 @@ fn parse_braces(open_braces: u32, line: &str) -> Result<u32, String> {
             }
             open_braces -= 1;
         }
-        i += 1;
     }
     Ok(open_braces)
 }
@@ -829,7 +804,7 @@ struct ParsedRuleInfo {
 
 /// Build a parsed `<<EOF>>` rule (optionally start-condition scoped).
 fn build_eof_rule(
-    state: &ParseState,
+    state: &mut ParseState,
     start_conditions: Vec<String>,
     action_ws: &str,
 ) -> Result<ParsedRuleInfo, String> {
@@ -837,7 +812,9 @@ fn build_eof_rule(
     if action.is_empty() {
         return Err(state.error(&gettext("missing action for <<EOF>> rule")));
     }
-    let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
+    state.action_scanner = CScanner::new();
+    let open_braces =
+        parse_braces(&mut state.action_scanner, 0, action).map_err(|e| state.error(&e))?;
     Ok(ParsedRuleInfo {
         ere: String::new(),
         compiled_ere: String::new(),
@@ -871,6 +848,11 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
 
     let pos = find_ere_end(remaining).map_err(|e| state.error(&e))?;
     let ere_raw = String::from(&remaining[..pos]);
+
+    // The scanner matches bytes, so a literal character above U+007F can never
+    // be matched. Checked on the raw source, where `\377` and `\xff` are still
+    // plain ASCII and stay legal.
+    reject_non_ascii(state, &gettext("pattern"), &ere_raw)?;
 
     // POSIX 101898-900: a NUL character in a pattern is undefined behavior.
     if has_nul_escape(&ere_raw) {
@@ -910,7 +892,9 @@ fn parse_rule(state: &mut ParseState, line: &str) -> Result<ParsedRuleInfo, Stri
         )));
     }
 
-    let open_braces = parse_braces(0, action).map_err(|e| state.error(&e))?;
+    state.action_scanner = CScanner::new();
+    let open_braces =
+        parse_braces(&mut state.action_scanner, 0, action).map_err(|e| state.error(&e))?;
 
     Ok(ParsedRuleInfo {
         ere,
@@ -960,7 +944,10 @@ fn parse_rule_line(state: &mut ParseState, line: &str) -> Result<(), String> {
         }
     } else if state.open_braces > 0 {
         state.tmp_rule.action.push_str(line);
-        state.open_braces = parse_braces(state.open_braces, line).map_err(|e| state.error(&e))?;
+        let mut scanner = std::mem::replace(&mut state.action_scanner, CScanner::new());
+        let counted = parse_braces(&mut scanner, state.open_braces, line);
+        state.action_scanner = scanner;
+        state.open_braces = counted.map_err(|e| state.error(&e))?;
         if state.open_braces == 0 {
             let rule = std::mem::replace(&mut state.tmp_rule, LexRule::new());
             state.push_rule(rule);

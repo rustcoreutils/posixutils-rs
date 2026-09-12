@@ -18,8 +18,8 @@
 //! three that need their arguments *unexpanded* (`if`, `foreach`, `call`) are
 //! handled separately, before argument expansion.
 
+use crate::parser::preprocessor::MacroTable;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 /// How deep the expansion cycle may recurse before we call it non-terminating.
 ///
@@ -111,7 +111,7 @@ impl Drop for DepthGuard<'_> {
 
 /// What a function needs to expand text of its own.
 pub(crate) struct Ctx<'a> {
-    pub table: &'a HashMap<String, String>,
+    pub table: &'a MacroTable,
     pub env_wins: bool,
     /// Shared across every nested `Ctx`, so recursion is bounded end to end.
     pub state: &'a Expansion,
@@ -479,7 +479,7 @@ fn f_foreach(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     let mut results = Vec::new();
     for word in words(&list) {
         let mut table = ctx.table.clone();
-        table.insert(var.clone(), word.to_string());
+        table.bind_local(var.clone(), word.to_string());
         let inner = Ctx {
             table: &table,
             env_wins: ctx.env_wins,
@@ -498,13 +498,15 @@ fn f_call(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     };
     let _guard = ctx.state.enter()?;
     let name = expand(name, ctx)?.trim().to_string();
-    let Some(body) = ctx.table.get(&name).cloned() else {
+    // Resolved, not read straight out of the table: a function defined only in
+    // the environment is as callable as any other, and `$(F)` already finds it.
+    let Some(body) = ctx.table.resolve(&name, ctx.env_wins) else {
         return Ok(String::new());
     };
     let mut table = ctx.table.clone();
-    table.insert("0".to_string(), name);
+    table.bind_local("0".to_string(), name);
     for (i, arg) in args.iter().skip(1).enumerate() {
-        table.insert((i + 1).to_string(), expand(arg, ctx)?);
+        table.bind_local((i + 1).to_string(), expand(arg, ctx)?);
     }
     let inner = Ctx {
         table: &table,
@@ -580,8 +582,8 @@ pub(crate) fn call(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Result<S
 mod tests {
     use super::*;
 
-    fn ctx_table() -> HashMap<String, String> {
-        HashMap::new()
+    fn ctx_table() -> MacroTable {
+        MacroTable::default()
     }
 
     fn plain(text: &str, _ctx: &Ctx) -> Result<String, String> {

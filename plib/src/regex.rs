@@ -609,6 +609,11 @@ mod tests {
     #[test]
     fn byte_patterns_and_subjects() {
         // POSIX operands are byte strings, and need not be valid text.
+        //
+        // `.` matches an invalid-UTF-8 byte only in the C locale, so this holds
+        // the locale lock: a `locale` test running in parallel would otherwise
+        // have the process in UTF-8 and `\xff` would match nothing.
+        let _guard = crate::locale_test_lock();
         let re = Regex::bre_bytes(b"a.b").expect("valid");
         let subject = b"xa\xffb";
         let caps = re.captures_bytes(subject).expect("should match");
@@ -630,6 +635,10 @@ mod tests {
     fn match_offsets_are_bytes_not_characters() {
         // The offsets come from regexec and are byte offsets; a caller holding
         // text has to slice with as_bytes or check boundaries.
+        //
+        // Locale-dependent for the same reason: in UTF-8 the two bytes of "é"
+        // are one character, so `..` would need a second one.
+        let _guard = crate::locale_test_lock();
         let re = Regex::bre("..").expect("valid");
         let subject = "é".as_bytes(); // two bytes, one character
         let m = re.find_bytes(subject).expect("matches two bytes");

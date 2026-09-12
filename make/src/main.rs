@@ -238,7 +238,11 @@ fn append_part(contents: &mut String, part: &str) {
 /// given (POSIX); with none, the first default makefile found is used.
 /// Command-line `macro=value` operands are appended last so they take
 /// precedence over definitions in the makefile(s).
-fn parse_makefile(paths: &[PathBuf], cmdline_macros: &[String]) -> Result<Makefile, ErrorCode> {
+fn parse_makefile(
+    paths: &[PathBuf],
+    cmdline_macros: &[String],
+    builtins: &[(String, String)],
+) -> Result<Makefile, ErrorCode> {
     let mut contents = String::new();
 
     if paths.is_empty() {
@@ -267,7 +271,7 @@ fn parse_makefile(paths: &[PathBuf], cmdline_macros: &[String]) -> Result<Makefi
         .filter(|(name, _)| !name.is_empty())
         .collect();
 
-    match Makefile::parse_with_macros(&contents, &seeded) {
+    match Makefile::parse_with_macros(&contents, &seeded, builtins) {
         Ok(makefile) => Ok(makefile),
         Err(err) => Err(ErrorCode::ParserError { constraint: err }),
     }
@@ -372,7 +376,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var(name, value);
     }
 
-    let parsed = match parse_makefile(&makefile, &cmdline_macros) {
+    // POSIX source 4: the macros the built-in inference rules refer to. They
+    // are in force before the makefile is read, so the makefile can see them --
+    // `$(CC)` used to expand to nothing because they were only added to the
+    // finished `Make`. `-r` drops the built-in rules, and these with them.
+    let builtins: Vec<(String, String)> = match clear {
+        true => Vec::new(),
+        false => posixutils_make::builtin_macros(),
+    };
+
+    let parsed = match parse_makefile(&makefile, &cmdline_macros, &builtins) {
         Ok(parsed) => parsed,
         Err(err) => {
             // -p with no usable makefile still has a database to show: the

@@ -4403,11 +4403,138 @@ e : e '<' e | NUM ;
 }
 
 // ---------------------------------------------------------------------------
+// `$` substitution respects C lexical context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_dollar_in_string_literal_is_not_substituted() {
+    // `transform_action` scanned the raw action text with no lexical state, so
+    // every `$` was a candidate wherever it sat: `printf("costs $1")` came out
+    // as `printf("costs (yyvsp[0])")`. bison leaves both a string literal and a
+    // comment alone. The `$1` outside them must still be substituted.
+    let grammar = r#"
+%token A
+%%
+s : A { printf("costs $1 and $$\n"); /* $1 */ x = $1; }
+  ;
+"#;
+
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains(r#"printf("costs $1 and $$\n");"#),
+        "a `$` inside a string literal must be copied through: {:?}",
+        code.lines().find(|l| l.contains("costs"))
+    );
+    assert!(
+        code.contains("/* $1 */"),
+        "a `$` inside a comment must be copied through: {:?}",
+        code.lines().find(|l| l.contains("costs"))
+    );
+    assert!(
+        code.contains("x = (yyvsp[0]);"),
+        "a `$` in code must still be substituted: {:?}",
+        code.lines().find(|l| l.contains("costs"))
+    );
+}
+
+#[test]
+fn test_dollar_in_line_comment_and_char_literal_is_not_substituted() {
+    let grammar = r#"
+%token A
+%%
+s : A { c = '$'; // $1 in a line comment
+        y = $1; }
+  ;
+"#;
+
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains("c = '$';"),
+        "a `$` char literal must be copied through: {:?}",
+        code.lines().find(|l| l.contains("c = "))
+    );
+    assert!(
+        code.contains("// $1 in a line comment"),
+        "a `$` in a `//` comment must be copied through: {:?}",
+        code.lines().find(|l| l.contains("line comment"))
+    );
+    assert!(
+        code.contains("y = (yyvsp[0]);"),
+        "a `$` in code after a line comment must still be substituted: {:?}",
+        code.lines().find(|l| l.contains("y = "))
+    );
+}
+
+#[test]
+fn test_dollar_in_string_survives_to_runtime() {
+    // The generated parser must actually print the literal text, so this fails
+    // at run time rather than only in a text comparison.
+    let grammar = r#"
+%{
+#include <stdio.h>
+#include <string.h>
+int yylex(void);
+void yyerror(const char *s);
+static char seen[64];
+static int value;
+%}
+
+%token A
+
+%%
+s : A { snprintf(seen, sizeof seen, "costs $1"); value = $1; }
+  ;
+%%
+
+static int done;
+int yylex(void) { if (done) return 0; done = 1; yylval = 7; return A; }
+void yyerror(const char *s) { (void)s; }
+
+int main(void)
+{
+    if (yyparse() != 0)
+        return 1;
+    if (strcmp(seen, "costs $1") != 0)
+        return 2;
+    if (value != 7)
+        return 3;
+    return 0;
+}
+"#;
+
+    run_end_to_end_both_modes(grammar, "dollar_in_string");
+}
+
+#[test]
+fn test_escaped_quote_does_not_end_the_string() {
+    // A `\"` inside a string literal must not be read as closing it, or the
+    // `$1` after it falls back into code context and gets rewritten.
+    let grammar = r#"
+%token A
+%%
+s : A { printf("a\" $1 b"); z = $1; }
+  ;
+"#;
+
+    let code = gen_and_read(&[], grammar, "y.tab.c");
+
+    assert!(
+        code.contains(r#"printf("a\" $1 b");"#),
+        "an escaped quote must not end the string: {:?}",
+        code.lines().find(|l| l.contains("printf"))
+    );
+    assert!(
+        code.contains("z = (yyvsp[0]);"),
+        "code after the string must still be substituted: {:?}",
+        code.lines().find(|l| l.contains("z = "))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Semantic value of a reduction
 // ---------------------------------------------------------------------------
-//
-// NOTE: these grammars deliberately keep `$1`/`$$` out of C string literals --
-// transform_action rewrites them there too, which is a separate known defect.
 
 #[test]
 fn test_default_value_applies_to_rules_that_have_an_action() {

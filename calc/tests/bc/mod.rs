@@ -513,6 +513,22 @@ fn test_bc_output_base_6() {
     test_bc!(output_base_6)
 }
 
+// POSIX 87479: a statement that is an expression writes its value "unless the
+// main operator is an assignment". The formal grammar (87208-87223) makes
+// `'(' expression ')'` a production distinct from
+// `named_expression ASSIGN_OP expression`, so a parenthesized assignment's
+// main operator is *not* an assignment and its value is written. Both .out
+// files are GNU bc's own output.
+#[test]
+fn test_bc_parenthesized_assignment_prints() {
+    test_bc!(parenthesized_assignment_prints)
+}
+
+#[test]
+fn test_bc_parenthesized_base_register_assignment() {
+    test_bc!(parenthesized_base_register_assignment)
+}
+
 #[test]
 fn test_bc_postfix_decrement() {
     test_bc!(postfix_decrement)

@@ -2435,3 +2435,396 @@ mod sccs {
         let _ = fs::remove_dir_all(dir);
     }
 }
+
+// XSI `~` suffix rules: POSIX 105941 -- "A <tilde> ('~') in the above rules
+// refers to an SCCS file in the current directory. Thus, the rule .c~.o would
+// transform an SCCS C-language source file into an object file (.o). Because
+// the s. of the SCCS files is a prefix, it is incompatible with make's suffix
+// point of view. Hence, the '~' is a way of changing any file reference into
+// an SCCS file reference."
+//
+// Distinct from `.SCCS_GET` retrieval (POSIX 105699), which POSIX specifies
+// against `SCCS/s.source_file`; here the history file sits beside the target.
+mod tilde_suffix_rules {
+    use super::*;
+    use std::fs;
+
+    fn run(args: &[&str]) -> (String, String, Option<i32>) {
+        let output = Command::new(get_binary_path("make"))
+            .args(args)
+            .output()
+            .expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    /// A directory holding `s.<stem>.c` and a `get` stand-in, so the test
+    /// needs no SCCS installation. `GET` is a macro, so the stub is selected
+    /// on the command line (`GET=./getstub`) rather than through PATH.
+    fn fixture(dir: &str, makefile: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(format!("{dir}/Makefile"), makefile);
+        // An SCCS history file is not C; `get -p` is what turns it into the
+        // source, and the stub stands in for that.
+        let _ = fs::write(format!("{dir}/s.tilde_probe.c"), "@(#) history\n");
+
+        // `getstub -p s.tilde_probe.c` writes the checked-out source to stdout.
+        let stub = format!("{dir}/getstub");
+        let _ = fs::write(
+            &stub,
+            "#!/bin/sh\nprintf 'int tilde_probe(void){return 0;}\\n'\n",
+        );
+        let _ = fs::set_permissions(&stub, fs::Permissions::from_mode(0o755));
+    }
+
+    // The `$<` a `~` rule sees is the SCCS history file, and `$*` is the stem
+    // without the `.c`. A rule written in the makefile pins both.
+    #[test]
+    fn a_tilde_rule_reads_the_sccs_file_and_sets_the_stem() {
+        let dir = "tilde_explicit_probe";
+        fixture(
+            dir,
+            ".SUFFIXES: .o .c .c~\n\
+             .c~.o:\n\t@echo IN=$< STEM=$* TARGET=$@; : > $@\n\n\
+             all: tilde_probe.o\n\t@echo BUILT\n",
+        );
+
+        let (stdout, stderr, code) = run(&["-C", dir, "all"]);
+        assert_eq!(code, Some(0), "stdout: {stdout}stderr: {stderr}");
+        assert!(
+            stdout.contains("IN=s.tilde_probe.c"),
+            "$< must name the SCCS file: {stdout}"
+        );
+        assert!(
+            stdout.contains("STEM=tilde_probe"),
+            "$* must be the stem without the .c: {stdout}"
+        );
+        assert!(
+            stdout.contains("TARGET=tilde_probe.o"),
+            "$@ must be the target: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The built-in `.c~.o` (POSIX 106086-106088) retrieves with $(GET) and
+    // then compiles the retrieved source.
+    #[test]
+    fn the_builtin_tilde_c_to_o_rule_applies() {
+        let dir = "tilde_builtin_probe";
+        fixture(dir, "all: tilde_probe.o\n\t@echo BUILT\n");
+
+        // CFLAGS defaults to POSIX's `-O 1`, which cc does not take as one
+        // argument, so it is cleared alongside CC. GET is a `cat`-alike: the
+        // built-in rule invokes `$(GET) $(GFLAGS) -p $< > $*.c`.
+        let (stdout, stderr, code) = run(&["-C", dir, "CC=cc", "CFLAGS=", "GET=./getstub", "all"]);
+        let _ = stderr;
+        assert_eq!(code, Some(0), "stdout: {stdout}stderr: {stderr}");
+        assert!(
+            std::path::Path::new(&format!("{dir}/tilde_probe.o")).exists(),
+            "the built-in .c~.o rule did not produce the object: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `-r` clears the suffix list and the built-in rules, so nothing infers.
+    #[test]
+    fn dash_r_suppresses_the_builtin_tilde_rules() {
+        let dir = "tilde_dash_r_probe";
+        fixture(dir, "all: tilde_probe.o\n\t@echo BUILT\n");
+
+        let (stdout, _, code) = run(&["-C", dir, "-r", "CC=cc", "CFLAGS=", "all"]);
+        assert_ne!(code, Some(0), "-r must leave no rule to infer: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A `~` is a suffix marker only where the suffix ends: `.c~` or `.c~.o`.
+    // Accepting it anywhere renamed the target -- `.gitignore~old` parsed as
+    // the single-suffix inference rule `.gitignore~`, silently dropping the
+    // rest, so the rule was registered under a name nothing could ask for.
+    #[test]
+    fn a_tilde_inside_a_target_name_is_not_a_suffix_marker() {
+        let dir = "tilde_name_probe";
+        fixture(dir, ".gitignore~old:\n\t@echo BUILT $@\n");
+
+        let (stdout, stderr, code) = run(&["-C", dir, ".gitignore~old"]);
+        assert_eq!(code, Some(0), "stdout: {stdout}stderr: {stderr}");
+        assert!(
+            stdout.contains("BUILT .gitignore~old"),
+            "the target keeps its whole name: {stdout}"
+        );
+
+        // And the truncated name is not a target at all.
+        let (_, _, code) = run(&["-C", dir, ".gitignore~"]);
+        assert_ne!(code, Some(0), "`.gitignore~` must not name anything");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The forms that *are* suffix rules still parse: `.c~` ends the suffix,
+    // and `.c~.o` continues to a second one.
+    #[test]
+    fn a_terminal_tilde_is_still_a_suffix_marker() {
+        let dir = "tilde_terminal_probe";
+        fixture(
+            dir,
+            ".SUFFIXES: .o .c .c~\n\
+             .c~.o:\n\t@echo TWO $< $@\n\
+             all: tilde_probe.o\n\t@echo BUILT\n",
+        );
+
+        let (stdout, stderr, code) = run(&["-C", dir, "all"]);
+        assert_eq!(code, Some(0), "stdout: {stdout}stderr: {stderr}");
+        assert!(
+            stdout.contains("TWO s.tilde_probe.c tilde_probe.o"),
+            "`.c~.o` must still be an inference rule: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // A `~` suffix names an SCCS file, so a file literally called
+    // `tilde_probe.c~` must NOT satisfy the rule.
+    #[test]
+    fn a_literal_tilde_suffixed_file_does_not_satisfy_the_rule() {
+        let dir = "tilde_literal_probe";
+        fixture(
+            dir,
+            ".SUFFIXES: .o .c .c~\n\
+             .c~.o:\n\t@echo IN=$<; : > $@\n\n\
+             all: tl_other.o\n\t@echo BUILT\n",
+        );
+        let _ = fs::write(format!("{dir}/tl_other.c~"), "not an SCCS file\n");
+
+        let (stdout, _, code) = run(&["-C", dir, "all"]);
+        assert_ne!(
+            code,
+            Some(0),
+            "a plain `.c~` file is not an SCCS history file: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+// POSIX 105837-105855 numbers the macro sources: 1 command line, 2 MAKEFLAGS,
+// 3 environment, 4 the built-in rules. "Macro definitions from these sources
+// shall not override macro definitions from a lower-numbered source", and
+// makefile definitions sit between 3 and 4 -- above the environment unless
+// `-e` is given, and never above 1 or 2.
+mod macro_sources {
+    use super::*;
+    use std::fs;
+
+    fn run_env(args: &[&str], env: &[(&str, &str)]) -> (String, String, Option<i32>) {
+        let mut cmd = Command::new(get_binary_path("make"));
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+        )
+    }
+
+    fn fixture(dir: &str, makefile: &str) {
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(format!("{dir}/Makefile"), makefile);
+    }
+
+    const ECHO_CC: &str = "all:\n\t@echo CC=[$(CC)]\n";
+
+    // The built-in macros were seeded into the Make struct *after* the parse,
+    // so a makefile could not see them: `$(CC)` expanded to nothing while
+    // `make -p` reported `CC = c17`. The dump and the expansion disagreed.
+    #[test]
+    fn a_builtin_macro_is_visible_to_the_makefile() {
+        let dir = "macsrc_builtin_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, stderr, code) = run_env(&["-C", dir, "all"], &[]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(stdout.contains("CC=[c17]"), "stdout: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The -p dump and what the makefile expands must be the same thing.
+    #[test]
+    fn the_database_agrees_with_what_expansion_yields() {
+        let dir = "macsrc_database_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, _, _) = run_env(&["-C", dir, "-p", "all"], &[]);
+        assert!(stdout.contains("CC = c17"), "database: {stdout}");
+        assert!(stdout.contains("CC=[c17]"), "expansion: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Source 4 is the weakest: a makefile assignment beats it.
+    #[test]
+    fn a_makefile_assignment_overrides_a_builtin() {
+        let dir = "macsrc_makefile_probe";
+        fixture(dir, &format!("CC = mycc\n{ECHO_CC}"));
+        let (stdout, _, _) = run_env(&["-C", dir, "all"], &[]);
+        assert!(stdout.contains("CC=[mycc]"), "stdout: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Source 3 beats source 4 too, with no -e needed.
+    #[test]
+    fn the_environment_overrides_a_builtin() {
+        let dir = "macsrc_env_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, _, _) = run_env(&["-C", dir, "all"], &[("CC", "envcc")]);
+        assert!(stdout.contains("CC=[envcc]"), "stdout: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // ... but a makefile assignment still beats the environment without -e,
+    // and loses to it with -e. Both sit above the built-in either way.
+    #[test]
+    fn dash_e_swaps_only_the_makefile_and_the_environment() {
+        let dir = "macsrc_dash_e_probe";
+        fixture(dir, &format!("CC = mycc\n{ECHO_CC}"));
+
+        let (plain, _, _) = run_env(&["-C", dir, "all"], &[("CC", "envcc")]);
+        assert!(plain.contains("CC=[mycc]"), "without -e: {plain}");
+
+        let (with_e, _, _) = run_env(&["-C", dir, "-e", "all"], &[("CC", "envcc")]);
+        assert!(with_e.contains("CC=[envcc]"), "with -e: {with_e}");
+
+        // POSIX 105855: a makefile definition never overrides source 1, and a
+        // command-line macro is not demoted by -e either.
+        let (cmdline, _, _) = run_env(&["-C", dir, "-e", "CC=cmdcc", "all"], &[("CC", "envcc")]);
+        assert!(
+            cmdline.contains("CC=[cmdcc]"),
+            "with -e and a macro: {cmdline}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `override` exists so a makefile can beat a command-line macro. Under -e
+    // it lost to the environment instead: `settle_environment` saw an ordinary
+    // `Makefile` source, which -e ranks below `Environment`. Command-line
+    // macros are also exported into make's own environment (POSIX 105866), so
+    // the -e + command-line case went the same way.
+    #[test]
+    fn override_outranks_the_environment_and_the_command_line() {
+        let dir = "macsrc_override_probe";
+        fixture(dir, &format!("override CC = mycc\n{ECHO_CC}"));
+
+        for (args, env, what) in [
+            (vec!["-C", dir, "all"], vec![], "plain"),
+            (
+                vec!["-C", dir, "-e", "all"],
+                vec![("CC", "envcc")],
+                "-e + env",
+            ),
+            (vec!["-C", dir, "CC=cmdcc", "all"], vec![], "command line"),
+            (
+                vec!["-C", dir, "-e", "CC=cmdcc", "all"],
+                vec![("CC", "envcc")],
+                "-e + command line",
+            ),
+        ] {
+            let (stdout, stderr, code) = run_env(&args, &env);
+            assert_eq!(code, Some(0), "{what}: stderr: {stderr}");
+            assert!(
+                stdout.contains("CC=[mycc]"),
+                "override must win ({what}): {stdout}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `ifdef` has to consult the same precedence as expansion, or a macro can
+    // expand to a value while reading as undefined.
+    #[test]
+    fn ifdef_sees_a_builtin_macro() {
+        let dir = "macsrc_ifdef_probe";
+        fixture(
+            dir,
+            "ifdef CC\nall:\n\t@echo SEEN=[$(CC)]\nelse\nall:\n\t@echo UNSEEN\nendif\n",
+        );
+        let (stdout, _, _) = run_env(&["-C", dir, "all"], &[]);
+        assert!(stdout.contains("SEEN=[c17]"), "stdout: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // The environment is source 3 and the built-ins are source 4, so POSIX
+    // 105848 forbids a built-in from overriding the environment -- in every
+    // consumer, not just in the makefile's own expansions.
+    //
+    // `resolve` weighed the environment live but never stored it, so
+    // `into_macros` handed `Make` the built-in's value and everything
+    // downstream of it disagreed with the makefile: the built-in `.c.o` rule
+    // ran `c17` and `-p` reported `CC = c17`, while `$(CC)` in the makefile
+    // expanded to the environment's value.
+    #[test]
+    fn a_builtin_recipe_sees_an_environment_override() {
+        let dir = "macsrc_builtin_recipe_probe";
+        fixture(dir, "all: mbr_probe.o\n\t@echo done\n");
+        let _ = fs::write(format!("{dir}/mbr_probe.c"), "int probe(void){return 0;}\n");
+
+        let (stdout, stderr, code) = run_env(&["-C", dir, "-n", "all"], &[("CC", "envcc")]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stdout.contains("envcc"),
+            "the built-in .c.o recipe must use the environment's CC: {stdout}"
+        );
+        assert!(
+            !stdout.contains("c17"),
+            "the built-in default must not override the environment: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_database_reports_an_environment_override() {
+        let dir = "macsrc_db_env_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, _, _) = run_env(&["-C", dir, "-p", "all"], &[("CC", "envcc")]);
+        assert!(stdout.contains("CC = envcc"), "database: {stdout}");
+        assert!(stdout.contains("CC=[envcc]"), "expansion: {stdout}");
+        assert!(
+            !stdout.contains("CC = c17"),
+            "the database must not report the overridden built-in: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `$(call F,...)` looked the function body up straight out of the table,
+    // so a function defined only in the environment was invisible to `call`
+    // while `$(F)` found it -- two answers to the same question.
+    #[test]
+    fn call_finds_a_function_defined_in_the_environment() {
+        let dir = "macsrc_call_env_probe";
+        fixture(dir, "all:\n\t@echo \"call=[$(call F,x)] plain=[$(F)]\"\n");
+        let (stdout, stderr, code) = run_env(&["-C", dir, "all"], &[("F", "got $(1)")]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stdout.contains("call=[got x]"),
+            "call must resolve the body the same way $(F) does: {stdout}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // `-r` drops the built-in rules and the macros that belong to them, so
+    // nothing is left for `$(CC)` to expand to.
+    #[test]
+    fn dash_r_removes_the_builtin_macros() {
+        let dir = "macsrc_dash_r_probe";
+        fixture(dir, ECHO_CC);
+        let (stdout, _, _) = run_env(&["-C", dir, "-r", "all"], &[]);
+        assert!(stdout.contains("CC=[]"), "stdout: {stdout}");
+
+        // The environment still supplies one, since -r removes source 4 only.
+        let (with_env, _, _) = run_env(&["-C", dir, "-r", "all"], &[("CC", "envcc")]);
+        assert!(with_env.contains("CC=[envcc]"), "stdout: {with_env}");
+        let _ = fs::remove_dir_all(dir);
+    }
+}

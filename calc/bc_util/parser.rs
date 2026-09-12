@@ -397,7 +397,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let e = self.parse_expr()?;
                 self.expect(Token::RParen, "')'")?;
-                Ok(e)
+                // Kept rather than folded away: the grouping is what decides
+                // whether a statement writes its value. See ExprInstruction::Paren.
+                Ok(ExprInstruction::Paren(Box::new(e)))
             }
             Some(Token::Length) => self.parse_builtin(BuiltinFunction::Length),
             Some(Token::Sqrt) => self.parse_builtin(BuiltinFunction::Sqrt),

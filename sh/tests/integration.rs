@@ -1810,6 +1810,69 @@ mod audit_regressions {
         });
     }
 
+    // #57: `{varname}<file` (IO_LOCATION) is not implemented, deliberately.
+    //
+    // POSIX 80982-80986: "The shell *may* support an additional format used
+    // for redirection: {location}redir-op word ... If this format is supported
+    // its behavior is implementation-defined." Optional, and unconstrained if
+    // taken up -- so implementing it means adopting ksh93/bash semantics
+    // wholesale, which is an extension rather than conformance.
+    //
+    // What conformance *does* require is the fallback. §2.10 rule 3: when the
+    // result is not IO_LOCATION, "the token identifier TOKEN shall result",
+    // i.e. `{var}` is an ordinary word. That is what these pin, so the correct
+    // behaviour we have is asserted rather than accidental. `dash`, which also
+    // does not implement the extension, agrees on every case; bash differs
+    // only because it consumes `{var}` as a location.
+    #[test]
+    fn brace_word_before_a_redirection_is_an_ordinary_word() {
+        run_successfully_and(
+            "cd $TEST_WRITE_DIR\necho {var}> b57_word.txt\ncat b57_word.txt\nrm b57_word.txt\n",
+            |out| assert_eq!(out, "{var}\n"),
+        );
+    }
+
+    #[test]
+    fn a_brace_word_is_not_consumed_as_a_redirection_location() {
+        // Were `{fd}` taken as a location, this would redirect and run nothing;
+        // per rule 3 it is the command word, so the shell reports not-found and
+        // leaves the variable unset.
+        set_env_vars();
+        run_test_with_checker(
+            TestPlan {
+                cmd: "sh".to_string(),
+                args: vec!["-s".to_string()],
+                stdin_data: "cd $TEST_READ_DIR\n{fd}< file1.txt\necho \"fd=[${fd-unset}]\"\n"
+                    .to_string(),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_, output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("{fd}"),
+                    "`{{fd}}` must be reported as a command, not swallowed: {stderr}"
+                );
+                assert_eq!(
+                    stdout, "fd=[unset]\n",
+                    "no variable may be assigned by a redirection"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_real_fd_redirection_beside_a_brace_word_still_works() {
+        // The control: rule 3 applies to the brace word only. The `3>` beside
+        // it is a genuine IO_NUMBER and must still redirect.
+        run_successfully_and(
+            "cd $TEST_WRITE_DIR\necho {v} 3> b57_ctl.txt >&3\ncat b57_ctl.txt\nrm b57_ctl.txt\n",
+            |out| assert_eq!(out, "{v}\n"),
+        );
+    }
+
     #[test]
     fn noclobber_blocks_overwrite() {
         // #44

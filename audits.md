@@ -271,23 +271,39 @@ coverage while asserting nothing.
 
 Crates with open items today:
 
-- [`calc/audit.md`](calc/audit.md) — `expr`, `bc`
 - [`cc/audit.md`](cc/audit.md) — `c17`, `cflow`, `ctags`, `cxref`
 - [`cron/audit.md`](cron/audit.md) — `crontab`, `at`, `batch`, `crond`
-- [`dev/audit.md`](dev/audit.md) — `yacc`, `lex`, `ar`, `nm`, `strings`, `strip`
-- [`make/audit.md`](make/audit.md) — `make`
-- [`sh/audit.md`](sh/audit.md) — `sh`
-- [`sys/audit.md`](sys/audit.md) — `getconf`, `ipcrm`, `ipcs`, `ps`, `uname`, `who`
 - [`tree/audit.md`](tree/audit.md) — the 16 `tree/` utilities + the `ftw/` crate
 
-Audited with nothing open, so no file: `awk`, `datetime`, `display`,
-`editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `man`, `misc`, `pathnames`,
-`pax`, `print`, `process`, `sccs`, `screen`, `text`, `users`, `uucp`, `xform`.
+Audited with nothing open, so no file: `awk`, `calc`, `datetime`, `dev`,
+`display`, `editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `make`, `man`,
+`misc`, `pathnames`, `pax`, `print`, `process`, `sccs`, `screen`, `sh`, `sys`,
+`text`, `users`, `uucp`, `xform`.
+
+Five crates joined that list on 2026-09-12, as their last open items closed:
+`dev` (`#A7`), `make` (`#88`, `#89`), `sys` (the `ps` and `who` coverage gaps),
+`calc` (`#B13`, `#B14`) and `sh` (`#57`).
+
+Three of those closures were decisions rather than code, and each is recorded
+in the commit that closed it so it is not re-raised: `make`'s `#86` (GNU `::`
+rules rejected by name), `calc`'s `#B14` (the quadratic digit extraction above
+obase 16 is real but leaves us 20–90× faster than GNU; the measurements are in
+`calc/bc_util/number.rs`), and `sh`'s `#57` (POSIX makes `{location}redir-op`
+optional *and* its behaviour implementation-defined, so there is nothing to
+conform to — what conformance does require, the §2.10 rule-3 fallback, now has
+tests). A decision is not a punch-list item.
+
+The dispositioned residuals and the "refuted, do not re-raise" lists those
+files carried went with them, as the rule here intends: they are findings about
+what was checked, and `git log --follow` is where findings live once nothing is
+outstanding.
 
 A crate on that list is only as good as the probes behind its ticked boxes.
 `make` was on it until a crate-wide review found 21 defects the same day — two
 of them already ticked in the deleted file, one dispositioned in wording that
-undersold it. Before trusting a name above, re-probe rather than re-read.
+undersold it. It is on the list again as of 2026-09-12, for the second time,
+which is the point: the list records that someone looked, not that nothing is
+there. Before trusting a name above, re-probe rather than re-read.
 
 The audits themselves — every finding, every CONFORMS row, every probe — are in
 git history. `git log --follow -- text/audit.md` recovers one; `git log --grep '#A7'`

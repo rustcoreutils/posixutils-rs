@@ -73,6 +73,15 @@ pub enum FunctionArgument {
 pub enum ExprInstruction {
     Number(String),
     Named(NamedExpr),
+    /// A parenthesized expression, `( expr )`.
+    ///
+    /// Grouping changes no value, so this exists only to record that it
+    /// happened. POSIX 87479 writes a statement's value "unless the main
+    /// operator is an assignment", and the grammar (87208-87223) makes
+    /// `'(' expression ')'` a production distinct from
+    /// `named_expression ASSIGN_OP expression` -- so `(a=5)` writes its value
+    /// where `a=5` does not, and only a node here can tell them apart.
+    Paren(Box<ExprInstruction>),
     GetRegister(Register),
     Builtin {
         function: BuiltinFunction,

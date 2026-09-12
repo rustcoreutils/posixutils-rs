@@ -1082,6 +1082,107 @@ fn test_ar_tv_date_uses_mtime_not_age() {
     );
 }
 
+/// The abbreviated month names in force under `LC_ALL=locale`, from the
+/// system's own locale data.
+///
+/// glibc falls back to the C locale, silently and with a zero exit status,
+/// when a locale is not installed -- so this cannot answer "is it installed",
+/// only "what does it render". The caller compares against C, which is the
+/// question that matters: a locale rendering a month the way C does can prove
+/// nothing about LC_TIME either way.
+fn abbreviated_months(locale: &str) -> Option<Vec<String>> {
+    let out = std::process::Command::new("locale")
+        .arg("abmon")
+        .env("LC_ALL", locale)
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let months: Vec<String> = line.split(';').map(str::to_string).collect();
+    (months.len() == 12).then_some(months)
+}
+
+// #A7: `ar -tv` renders the member date through `plib::locale::strftime` with
+// "%b %e %H:%M %Y". `%b` is the one locale-sensitive conversion in that format,
+// so LC_TIME selects the month name. `test_ar_tv_date_uses_mtime_not_age` pins
+// TZ and the year but no LC_*, which is the gap this closes.
+//
+// Behind `posixutils_test_all`: it needs a locale beyond the C/POSIX pair,
+// which a stripped-down CI image need not have.
+#[test]
+#[cfg_attr(not(feature = "posixutils_test_all"), ignore)]
+fn test_ar_tv_date_follows_lc_time() {
+    use std::io::Write;
+    use std::time::{Duration, SystemTime};
+
+    // 1_600_000_000 is 2020-09-13 UTC, so the month is September.
+    const MTIME: u64 = 1_600_000_000;
+    const SEPTEMBER: usize = 8;
+
+    let c_months = abbreviated_months("C").expect("the C locale always resolves");
+    let candidates = ["fr_FR.UTF-8", "fr_FR.utf8", "de_DE.UTF-8", "de_DE.utf8"];
+    let Some((locale, months)) = candidates
+        .into_iter()
+        .filter_map(|name| abbreviated_months(name).map(|m| (name, m)))
+        .find(|(_, m)| m[SEPTEMBER] != c_months[SEPTEMBER])
+    else {
+        eprintln!("skipping: no installed locale renders September differently from C");
+        return;
+    };
+
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let f = dir.path().join("member.txt");
+    {
+        let mut file = fs::File::create(&f).unwrap();
+        file.write_all(b"payload").unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(MTIME))
+            .unwrap();
+    }
+    let arc = dir.path().join("a.a");
+    let create = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-r", "-c", arc.to_str().unwrap(), f.to_str().unwrap()])
+        .output()
+        .expect("run ar -r");
+    assert!(
+        create.status.success(),
+        "ar -r failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let list = |lc: &str| -> String {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+            .args(["-t", "-v", arc.to_str().unwrap()])
+            .env("TZ", "UTC")
+            .env("LC_ALL", lc)
+            .env("LC_TIME", lc)
+            .output()
+            .expect("run ar -t -v");
+        assert!(
+            out.status.success(),
+            "ar -t -v failed under {lc}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let in_c = list("C");
+    let localized = list(locale);
+
+    assert!(
+        in_c.contains(&c_months[SEPTEMBER]),
+        "under C the month must render as {:?}: {in_c}",
+        c_months[SEPTEMBER]
+    );
+    assert!(
+        localized.contains(&months[SEPTEMBER]),
+        "under {locale} the month must render as {:?}: {localized}",
+        months[SEPTEMBER]
+    );
+    assert_ne!(
+        in_c, localized,
+        "LC_TIME must change the rendering, not just be accepted"
+    );
+}
+
 #[test]
 fn test_ar_delete_matches_basename() {
     // #A2: a file operand is matched to a member by its last pathname

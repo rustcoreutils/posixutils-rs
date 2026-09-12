@@ -619,16 +619,9 @@ mod tests {
         assert_eq!(mb_char_slices(b"").len(), 0);
     }
 
-    // Serializes tests that mutate the process-global locale via setlocale, so
-    // they cannot interleave with each other when the test harness runs in
-    // parallel.
-    static LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn mb_char_slices_utf8_after_setlocale() {
-        // Recover from a poisoned lock (a prior test panicked while holding it):
-        // the guarded data is just (), so the lock is still usable.
-        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::locale_test_lock();
 
         // Save the exact current locale so it can be restored afterwards
         // (setlocale(_, NULL) returns it; the string must be copied immediately
@@ -714,8 +707,7 @@ mod tests {
 
     #[test]
     fn wcwidth_wide_after_setlocale() {
-        // Recover from a poisoned lock (guarded data is just ()).
-        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::locale_test_lock();
 
         let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
         let saved =
@@ -747,7 +739,7 @@ mod tests {
         // A 2-byte character (é = 0xC3 0xA9) split across two chunks must be
         // counted once. Each byte is fed exactly once; the decoder's state
         // carries the partial sequence.
-        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::locale_test_lock();
         let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
         let saved =
             (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
@@ -810,6 +802,14 @@ mod tests {
         let Some(loc) = crate::testing::utf8_locale() else {
             return;
         };
+        // This mutates the process-global locale, so it takes the lock like
+        // every other test that does -- otherwise the lock excludes nothing and
+        // a byte-oriented test running beside it sees UTF-8.
+        let _guard = crate::locale_test_lock();
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+
         // Set the process locale, then ask about U+00E9 (e-acute), which is a
         // letter in any UTF-8 locale but not in C.
         unsafe {
@@ -820,10 +820,11 @@ mod tests {
         assert!(islower('\u{e9}'));
         assert!(isupper('\u{c9}'));
         assert!(isprint('\u{e9}'));
-        // Restore the C locale for any test that runs after this one.
-        unsafe {
-            let c = std::ffi::CString::new("C").unwrap();
-            libc::setlocale(libc::LC_ALL, c.as_ptr());
+
+        // Restore what was actually there. Restoring a hard-coded "C" would
+        // undo a caller's locale rather than this test's.
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
         }
     }
 }

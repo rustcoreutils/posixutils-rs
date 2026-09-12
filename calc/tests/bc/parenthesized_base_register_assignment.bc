@@ -1,0 +1,10 @@
+(obase = A)
+100
+obase = 10
+(scale = 3)
+scale = 0
+ibase = (A)
+10
+obase = (A)
+255
+quit

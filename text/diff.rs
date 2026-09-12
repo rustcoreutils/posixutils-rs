@@ -6,11 +6,6 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - Just a start with the core algorithm; -C and -U both need context output
-// - Implement -r (recurse)
-// - Research and implement -f alternate output format properly
-//
 
 mod diff_util;
 

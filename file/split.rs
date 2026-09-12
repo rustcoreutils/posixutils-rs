@@ -129,30 +129,33 @@ impl OutputState {
         }
     }
 
-    fn open_output(&mut self) -> io::Result<()> {
-        if self.outf.is_some() {
-            return Ok(());
-        }
-
-        let suffix = match self.suffix.next() {
-            Some(s) => s,
-            None => {
+    /// The file the next write goes to, opening the next output file if the
+    /// current one has been closed.
+    ///
+    /// Handing back the file is what keeps "a write needs an open file" a fact
+    /// about the type rather than an ordering the callers have to remember.
+    fn open_output(&mut self) -> io::Result<&mut File> {
+        if self.outf.is_none() {
+            let Some(suffix) = self.suffix.next() else {
                 return Err(Error::other(gettext(
                     "too many files: output suffixes exhausted",
                 )));
-            }
-        };
+            };
 
-        let out_fn = format!("{}{}", self.prefix, suffix);
-        let f = OpenOptions::new()
-            .read(false)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&out_fn)?;
-        self.outf = Some(f);
+            let out_fn = format!("{}{}", self.prefix, suffix);
+            let f = OpenOptions::new()
+                .read(false)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&out_fn)?;
+            self.outf = Some(f);
+        }
 
-        Ok(())
+        Ok(self
+            .outf
+            .as_mut()
+            .expect("the branch above leaves outf populated"))
     }
 
     fn close_output(&mut self) {
@@ -171,24 +174,14 @@ impl OutputState {
         }
     }
 
-    fn write(&mut self, buf: &[u8]) -> io::Result<()> {
-        match &mut self.outf {
-            Some(ref mut f) => f.write_all(buf),
-            // TODO:
-            None => panic!("unreachable"),
-        }
-    }
-
     fn output_bytes(&mut self, buf: &[u8]) -> io::Result<()> {
         let mut consumed: usize = 0;
         while consumed < buf.len() {
-            self.open_output()?;
-
             let remainder = buf.len() - consumed;
             let dist = self.boundary - self.count;
             let wlen = cmp::min(dist as usize, remainder);
             let slice = &buf[consumed..consumed + wlen];
-            self.write(slice)?;
+            self.open_output()?.write_all(slice)?;
 
             consumed += wlen;
 
@@ -282,9 +275,7 @@ fn split_by_lines(args: &Args, linesplit: u64) -> io::Result<()> {
             break;
         }
 
-        state.open_output()?;
-
-        state.write(buffer.as_ref())?;
+        state.open_output()?.write_all(buffer.as_ref())?;
 
         state.incr_output(1);
     }

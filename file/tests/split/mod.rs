@@ -76,6 +76,50 @@ fn split_empty_input_no_files() {
 }
 
 #[test]
+fn split_uses_every_suffix_before_exhausting() {
+    // The suffix odometer carried left through every 'z' and returned None
+    // without ever yielding the all-'z' value, so `-a 1` stopped at `y` and
+    // produced 25 files where 26 are available.
+    let (dir, prefix) = tmp_prefix("suffix_last");
+    let input: String = (0..26).map(|i| format!("line{i}\n")).collect();
+    run_split(&["-l", "1", "-a", "1", "-", &prefix], &input, 0);
+
+    for (i, ch) in ('a'..='z').enumerate() {
+        let path = dir.join(format!("seg_{ch}"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap_or_default(),
+            format!("line{i}\n"),
+            "suffix '{ch}' must be used: {}",
+            path.display()
+        );
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn split_suffixes_exhausted_errors() {
+    // One line past the last suffix: the 26 files still get written, and the
+    // 27th is the error. The iterator must stay exhausted rather than wrapping
+    // back to the first suffix and overwriting `seg_a`.
+    let (dir, prefix) = tmp_prefix("suffix_exhausted");
+    let input: String = (0..27).map(|i| format!("line{i}\n")).collect();
+    run_split(&["-l", "1", "-a", "1", "-", &prefix], &input, 1);
+
+    assert_eq!(
+        fs::read_to_string(dir.join("seg_a")).unwrap(),
+        "line0\n",
+        "the first output file must not be overwritten by a wrapped suffix"
+    );
+    assert_eq!(fs::read_to_string(dir.join("seg_z")).unwrap(), "line25\n");
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        26,
+        "exactly the 26 available suffixes are used"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn split_name_too_long_errors() {
     let (dir, _) = tmp_prefix("namemax");
     let long_prefix = dir.join("p".repeat(260));

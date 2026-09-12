@@ -60,14 +60,21 @@ struct Args {
 }
 
 pub struct Suffix {
-    suffix: String,
+    /// The suffix the next call yields, or `None` once every suffix of this
+    /// length has been handed out.
+    ///
+    /// Holding the pending value rather than incrementing after the yield is
+    /// what makes the final all-`z` suffix reachable: the carry running off
+    /// the left latches exhaustion instead of discarding a value that was
+    /// never returned.
+    next: Option<String>,
 }
 
 impl Suffix {
     pub fn new(len: usize) -> Self {
         debug_assert!(len > 0);
         Self {
-            suffix: "a".repeat(len),
+            next: Some("a".repeat(len)),
         }
     }
 
@@ -75,32 +82,29 @@ impl Suffix {
         debug_assert!(('a'..='y').contains(&ch));
         ((ch as u8) + 1) as char
     }
+
+    /// The suffix following `current`, or `None` when `current` is the last
+    /// one of its length (all `'z'`).
+    fn successor(current: &str) -> Option<String> {
+        let mut chars: Vec<char> = current.chars().collect();
+        for i in (0..chars.len()).rev() {
+            if chars[i] != 'z' {
+                chars[i] = Self::inc_char(chars[i]);
+                return Some(chars.into_iter().collect());
+            }
+            chars[i] = 'a';
+        }
+        None
+    }
 }
 
 impl Iterator for Suffix {
     type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current = self.suffix.clone();
-
-        let mut i = self.suffix.len() - 1;
-        loop {
-            let ch = self.suffix.chars().nth(i).unwrap();
-            if ch != 'z' {
-                self.suffix
-                    .replace_range(i..i + 1, Self::inc_char(ch).to_string().as_str());
-                return Some(current);
-            }
-
-            self.suffix
-                .replace_range(i..i + 1, 'a'.to_string().as_str());
-
-            if i == 0 {
-                break;
-            }
-            i -= 1;
-        }
-        None
+        let current = self.next.take()?;
+        self.next = Self::successor(&current);
+        Some(current)
     }
 }
 
@@ -325,7 +329,6 @@ mod tests {
         assert_eq!(Suffix::inc_char('y'), 'z');
     }
 
-    #[ignore]
     #[test]
     fn test_suffix_iterable() {
         let suffix = Suffix::new(1);

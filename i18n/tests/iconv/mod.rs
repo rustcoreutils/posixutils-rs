@@ -130,8 +130,11 @@ fn iconv_explicit_utf16le_output_has_no_bom() {
     );
 }
 
+// IC-7: with neither -f nor -t, both codesets come from the locale --
+// "If this option is omitted, the codeset of the current locale shall be
+// used" (100502 for -f, 100515 for -t) -- so the conversion is the identity
+// and the input reaches stdout unchanged.
 #[test]
-#[ignore]
 fn iconv_no_flag_data_input() {
     let input = "Hello world".as_bytes().to_vec();
     iconv_test(&[], input.clone(), input.clone(), Vec::new());

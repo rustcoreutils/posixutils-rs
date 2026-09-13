@@ -900,7 +900,7 @@ fn main() -> std::process::ExitCode {
     match run(&args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("stty: {}", e);
+            eprintln!("stty: {}", plib::diag::io_error_text(&e));
             std::process::ExitCode::FAILURE
         }
     }

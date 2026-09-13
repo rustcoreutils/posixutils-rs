@@ -181,7 +181,11 @@ fn process_files(files: &[OsString], opts: OutputOptions) {
         if let Err(err) = print_file(file, opts) {
             // Log and continue with subsequent files; exit status will
             // reflect the error via plib::diag::exit_status().
-            diag::error(&format!("{}: {}", file.to_string_lossy(), err));
+            diag::error(&format!(
+                "{}: {}",
+                file.to_string_lossy(),
+                diag::error_text(err.as_ref())
+            ));
         }
     }
 }
@@ -194,7 +198,11 @@ fn main() {
         let mut bytes = Vec::new();
         match std::io::stdin().read_to_end(&mut bytes) {
             Ok(_) => print_strings(&bytes, 0, args.output_options),
-            Err(err) => diag::error(&format!("{}: {}", gettext("standard input"), err)),
+            Err(err) => diag::error(&format!(
+                "{}: {}",
+                gettext("standard input"),
+                diag::io_error_text(&err)
+            )),
         }
     } else {
         process_files(&args.input_files, args.output_options);

@@ -85,7 +85,7 @@ fn main() {
             } else {
                 filename.display().to_string()
             };
-            diag::error(&format!("{}: {}", name, e));
+            diag::error(&format!("{}: {}", name, diag::io_error_text(&e)));
         }
     }
 

@@ -123,7 +123,11 @@ fn main() {
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("msgfmt: {}: {}", path.display(), e);
+                eprintln!(
+                    "msgfmt: {}: {}",
+                    path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = 1;
                 continue;
             }

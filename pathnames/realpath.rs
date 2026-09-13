@@ -114,7 +114,11 @@ fn write_path(path: &Path) -> bool {
 
     let mut out = io::stdout().lock();
     if let Err(e) = out.write_all(bytes).and_then(|_| out.write_all(b"\n")) {
-        diag::error(&format!("{}: {}", gettext("write error"), e));
+        diag::error(&format!(
+            "{}: {}",
+            gettext("write error"),
+            diag::io_error_text(&e)
+        ));
         return false;
     }
     true
@@ -143,7 +147,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 had_error = true;
                 if !args.quiet {
-                    diag::error(&format!("{}: {}", path.to_string_lossy(), e));
+                    diag::error(&format!(
+                        "{}: {}",
+                        path.to_string_lossy(),
+                        diag::io_error_text(&e)
+                    ));
                 }
             }
         }

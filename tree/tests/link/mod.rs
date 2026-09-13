@@ -116,10 +116,7 @@ fn link_already_exists() {
             args,
             stdin_data: String::new(),
             expected_out: String::new(),
-            expected_err: format!(
-                "link: {}: File exists (os error 17)\n",
-                target_path.to_str().unwrap()
-            ),
+            expected_err: format!("link: {}: File exists\n", target_path.to_str().unwrap()),
             expected_exit_code: 1,
         },
         |_, output| {

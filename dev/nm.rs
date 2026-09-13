@@ -276,7 +276,7 @@ fn process_input(args: &Args, path: &str, radix: OutputType, multiple: bool) -> 
                 "{}: {}: {}",
                 path,
                 gettext("failed to open file"),
-                err
+                diag::io_error_text(&err)
             ));
             return Err(());
         }

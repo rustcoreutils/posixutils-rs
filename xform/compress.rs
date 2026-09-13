@@ -753,7 +753,7 @@ fn main() {
                 } else {
                     filename.display().to_string()
                 };
-                diag::error(&format!("{}: {}", display_name, e));
+                diag::error(&format!("{}: {}", display_name, diag::io_error_text(&e)));
             }
         }
     }

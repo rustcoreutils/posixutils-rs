@@ -38,7 +38,11 @@ fn cat_file(pathname: &Path) -> bool {
     let mut file = match input_stream(pathname, true) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("cat: {}: {}", pathname.display(), e);
+            eprintln!(
+                "cat: {}: {}",
+                pathname.display(),
+                plib::diag::io_error_text(&e)
+            );
             return true;
         }
     };
@@ -51,13 +55,21 @@ fn cat_file(pathname: &Path) -> bool {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                eprintln!("cat: {}: {}", pathname.display(), e);
+                eprintln!(
+                    "cat: {}: {}",
+                    pathname.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 return true;
             }
         };
 
         if let Err(e) = handle.write_all(&buffer[0..n_read]) {
-            eprintln!("cat: {}: {}", gettext("standard output"), e);
+            eprintln!(
+                "cat: {}: {}",
+                gettext("standard output"),
+                plib::diag::io_error_text(&e)
+            );
             return true;
         }
     }

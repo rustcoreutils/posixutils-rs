@@ -405,7 +405,7 @@ fn read_mount_info() -> io::Result<MountList> {
                 eprintln!(
                     "{}: {}",
                     Path::new(OsStr::from_bytes(mount.dir.to_bytes())).display(),
-                    io::Error::last_os_error()
+                    plib::diag::io_error_text(&io::Error::last_os_error())
                 );
                 continue;
             }
@@ -428,7 +428,7 @@ fn mask_fs_by_file(info: &mut MountList, path: &Path) -> io::Result<()> {
     let stat = match stat(&c_filename) {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("{}: {}", path.display(), e);
+            eprintln!("{}: {}", path.display(), plib::diag::io_error_text(&e));
             return Err(e);
         }
     };

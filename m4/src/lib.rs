@@ -225,7 +225,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                         Err(error) => {
                             let msg = gettext("cannot open `{}': {}")
                                 .replacen("{}", &path.display().to_string(), 1)
-                                .replacen("{}", &error.to_string(), 1);
+                                .replacen("{}", &plib::diag::io_error_text(&error), 1);
                             writeln!(stderr, "m4: {msg}")?;
                             state.exit_error = true;
                         }

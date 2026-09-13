@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for dirname in &args.dirs {
         if let Err(e) = do_mkdir(dirname, &mode, args.parents, explicit_mode) {
             exit_code = 1;
-            eprintln!("mkdir: {}: {}", dirname, e);
+            eprintln!("mkdir: {}: {}", dirname, plib::diag::io_error_text(&e));
         }
     }
 

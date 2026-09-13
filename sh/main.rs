@@ -419,7 +419,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             ExecutionMode::ReadFromFile(file) => match read_command_file(&file) {
                 Ok(file_contents) => execute_string(&file_contents, &mut shell),
                 Err((err, status)) => {
-                    eprintln!("sh: {}: {err}", file.display());
+                    eprintln!(
+                        "sh: {}: {}",
+                        file.display(),
+                        plib::diag::io_error_text(&err)
+                    );
                     std::process::exit(status);
                 }
             },

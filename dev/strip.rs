@@ -268,7 +268,7 @@ fn strip_file(file: &OsStr) {
                 "{}: {}: {}",
                 file.to_string_lossy(),
                 gettext("error reading"),
-                err
+                diag::io_error_text(&err)
             ));
             return;
         }
@@ -305,7 +305,11 @@ fn strip_file(file: &OsStr) {
             }
         }
         Err(err) => {
-            diag::error(&format!("{}: {}", file.to_string_lossy(), err));
+            diag::error(&format!(
+                "{}: {}",
+                file.to_string_lossy(),
+                diag::error_text(err.as_ref())
+            ));
         }
     }
 }

@@ -3042,10 +3042,18 @@ impl Editor {
                 self.goto_tag(&tag)?;
                 Ok(ExResult::Continue)
             }
-            _ => {
-                // Other commands not yet implemented
-                Ok(ExResult::Continue)
-            }
+            // Parsed but not implemented. These returned `Continue` through the
+            // wildcard below, so the editor accepted `:map x dd` in silence and
+            // the user had no way to learn the mapping was never made.
+            ExCommand::Map { .. } => Err(ViError::NotImplemented("map")),
+            ExCommand::Unmap { .. } => Err(ViError::NotImplemented("unmap")),
+            ExCommand::Abbreviate { .. } => Err(ViError::NotImplemented("abbreviate")),
+            ExCommand::Unabbreviate { .. } => Err(ViError::NotImplemented("unabbreviate")),
+            ExCommand::Pop => Err(ViError::NotImplemented("pop")),
+            ExCommand::Tags => Err(ViError::NotImplemented("tags")),
+            // No wildcard: with the six above named, the match is exhaustive,
+            // so a new ExCommand variant is a compile error rather than another
+            // command that silently does nothing.
         }
     }
 

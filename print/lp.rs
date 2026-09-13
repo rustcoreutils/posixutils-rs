@@ -415,7 +415,12 @@ fn do_lp(mut args: Args) -> Result<bool, String> {
         let data = match read_input(file) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("lp: {} '{}': {}", gettext("cannot open"), file.display(), e);
+                eprintln!(
+                    "lp: {} '{}': {}",
+                    gettext("cannot open"),
+                    file.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 had_error = true;
                 continue;
             }

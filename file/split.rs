@@ -333,7 +333,7 @@ fn main() -> ExitCode {
     match split_main(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("split: {}", e);
+            eprintln!("split: {}", plib::diag::error_text(e.as_ref()));
             ExitCode::FAILURE
         }
     }

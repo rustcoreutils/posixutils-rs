@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = do_mkfifo(filename, &mode, explicit_mode) {
             exit_code = 1;
-            eprintln!("mkfifo: {}: {}", filename, e);
+            eprintln!("mkfifo: {}: {}", filename, plib::diag::io_error_text(&e));
         }
     }
 

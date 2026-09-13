@@ -396,7 +396,7 @@ fn print_data<R: Read>(
                     'f' => 4,                   // Default to 4 bytes for floats
                     _ => 1,                     // Default to 1 byte for unknown types
                 };
-                let num_bytes = parse_type_bytes(chars.as_str(), default_bytes);
+                let num_bytes = parse_type_bytes(type_char, chars.as_str(), default_bytes);
 
                 let chunks = local_buf.chunks(num_bytes);
                 match type_char {
@@ -895,17 +895,37 @@ struct AFormatter;
 struct CFormatter;
 struct DefaultFormatter;
 
-/// Parse the size suffix of a `-t` integer/float type: a `C`/`S`/`I`/`L`
-/// letter (char/short/int/long) or an explicit byte count, defaulting when
-/// absent or unrecognized.
-fn parse_type_bytes(size_str: &str, default_bytes: usize) -> usize {
-    match size_str {
-        "" => default_bytes,
-        "C" => 1,
-        "S" => 2,
-        "I" => 4,
-        "L" => 8,
-        s => s.parse().unwrap_or(default_bytes),
+/// Parse the size suffix of a `-t` type: a letter naming a C type, or an
+/// explicit byte count, defaulting when absent or unrecognized.
+///
+/// The letters differ by type character, which is why `type_char` is needed.
+/// POSIX 109071-2 gives `f` the letters `F`/`D`/`L` -- float, double, long
+/// double -- while 109073-5 gives `d`/`o`/`u`/`x` the letters `C`/`S`/`I`/`L`
+/// -- char, short, int, long. Sharing one table let `-t fD` match nothing,
+/// fall through `s.parse()`, and silently take the 4-byte float default, so a
+/// double printed as two floats; and it read `fL` as 8, a double wearing long
+/// double's name.
+fn parse_type_bytes(type_char: char, size_str: &str, default_bytes: usize) -> usize {
+    let by_letter = match type_char {
+        'f' => match size_str {
+            "F" => Some(4),
+            "D" => Some(8),
+            "L" => Some(16),
+            _ => None,
+        },
+        _ => match size_str {
+            "C" => Some(1),
+            "S" => Some(2),
+            "I" => Some(4),
+            "L" => Some(8),
+            _ => None,
+        },
+    };
+
+    match (size_str, by_letter) {
+        ("", _) => default_bytes,
+        (_, Some(bytes)) => bytes,
+        (s, None) => s.parse().unwrap_or(default_bytes),
     }
 }
 
@@ -1081,8 +1101,16 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         stdin // Use stdin as the reader.
     } else {
         // Otherwise, process each specified file.
-        for file in &args.files {
-            let mut file = File::open(file)?; // Open the file.
+        for path in &args.files {
+            // Named here: `?` on a bare io::Error loses the operand, and the
+            // diagnostic then cannot say which file failed.
+            let mut file = File::open(path).map_err(|e| {
+                io::Error::other(format!(
+                    "{}: {}",
+                    path.display(),
+                    plib::diag::io_error_text(&e)
+                ))
+            })?;
 
             if bytes_skipped < bytes_to_skip {
                 // If the cumulative bytes skipped are less than the bytes to skip, process the file for skipping.
@@ -1144,7 +1172,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = od(&args) {
         exit_code = 1;
-        eprint!("{}", err);
+        // `eprintln!`, and prefixed: this was `eprint!("{}", err)`, so the
+        // diagnostic carried no utility name and no newline, and ran into
+        // whatever printed next.
+        eprintln!("od: {}", err);
     }
 
     std::process::exit(exit_code)

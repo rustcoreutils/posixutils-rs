@@ -492,10 +492,20 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
             // when the referenced file does not exist).
             let metadata = fs::metadata(file)
                 .or_else(|_| fs::symlink_metadata(file))
-                .map_err(|e| format!("cannot access '{}': {}", file, e))?;
-            let mtime = metadata
-                .modified()
-                .map_err(|e| format!("cannot get mtime of '{}': {}", file, e))?;
+                .map_err(|e| {
+                    format!(
+                        "cannot access '{}': {}",
+                        file,
+                        plib::diag::io_error_text(&e)
+                    )
+                })?;
+            let mtime = metadata.modified().map_err(|e| {
+                format!(
+                    "cannot get mtime of '{}': {}",
+                    file,
+                    plib::diag::io_error_text(&e)
+                )
+            })?;
             Ok(Expr::Primary(Primary::Newer(mtime)))
         }
         "-nouser" => Ok(Expr::Primary(Primary::NoUser)),
@@ -899,7 +909,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                     match Command::new(utility).args(&expanded_args).status() {
                         Ok(status) => EvalResult::new(status.success()),
                         Err(e) => {
-                            eprintln!("find: '{}': {}", utility, e);
+                            eprintln!("find: '{}': {}", utility, plib::diag::io_error_text(&e));
                             state.had_error = true;
                             EvalResult::new(false)
                         }
@@ -943,7 +953,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             match Command::new(utility).args(&expanded_args).status() {
                 Ok(status) => EvalResult::new(status.success()),
                 Err(e) => {
-                    eprintln!("find: '{}': {}", utility, e);
+                    eprintln!("find: '{}': {}", utility, plib::diag::io_error_text(&e));
                     state.had_error = true;
                     EvalResult::new(false)
                 }
@@ -1032,7 +1042,11 @@ fn walk_tree(
     let (metadata, link_metadata) = match get_metadata(path, symlink_mode, is_cmdline) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("find: '{}': {}", path.display(), e);
+            eprintln!(
+                "find: '{}': {}",
+                path.display(),
+                plib::diag::io_error_text(&e)
+            );
             state.had_error = true;
             return;
         }
@@ -1151,7 +1165,7 @@ fn run_exec_command(utility: &str, args_before: &[String], files: &[PathBuf]) ->
     match cmd.status() {
         Ok(status) => status.success(),
         Err(e) => {
-            eprintln!("find: '{}': {}", utility, e);
+            eprintln!("find: '{}': {}", utility, plib::diag::io_error_text(&e));
             false
         }
     }
@@ -1233,7 +1247,11 @@ fn find(args: Vec<String>) -> Result<i32, String> {
         let root_dev = match fs::metadata(&path) {
             Ok(m) => m.dev(),
             Err(e) => {
-                eprintln!("find: '{}': {}", path.display(), e);
+                eprintln!(
+                    "find: '{}': {}",
+                    path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 state.had_error = true;
                 continue;
             }

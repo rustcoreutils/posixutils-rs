@@ -119,7 +119,7 @@ fn test_inexisting_file_pattern() {
         &["-f", BAD_INPUT_FILE],
         "",
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory\n",
         2,
     );
 }
@@ -198,7 +198,7 @@ fn test_basic_regexp_quiet_with_error_02() {
         &["-q", BRE, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory\n",
         0,
     );
 }
@@ -209,7 +209,7 @@ fn test_basic_regexp_quiet_with_error_03() {
         &["-q", BRE, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory\n",
         2,
     );
 }
@@ -422,7 +422,7 @@ fn test_extended_regexp_quiet_with_error_02() {
         &["-E", "-q", ERE, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory\n",
         0,
     );
 }
@@ -433,7 +433,7 @@ fn test_extended_regexp_quiet_with_error_03() {
         &["-E", "-q", ERE, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory\n",
         2,
     );
 }
@@ -668,7 +668,7 @@ fn test_fixed_strings_quiet_with_error_02() {
         &["-F", "-q", FIXED, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory\n",
         0,
     );
 }
@@ -679,7 +679,7 @@ fn test_fixed_strings_quiet_with_error_03() {
         &["-F", "-q", FIXED, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory (os error 2)\n",
+        "grep: tests/grep/inexisting_file: No such file or directory\n",
         2,
     );
 }

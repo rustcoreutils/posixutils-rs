@@ -3270,3 +3270,45 @@ fn test_pipe_column_inside_a_tab_lands_on_the_tab() {
         "column 5 is the tab, at byte 1"
     );
 }
+
+// ============================================================================
+// Commands that are parsed but not implemented
+// ============================================================================
+
+// `:map`, `:unmap`, `:ab`, `:una`, `:pop` and `:tags` are all POSIX ex
+// commands, and all six were parsed and then dropped into a `_ =>` arm that
+// returned success. The user typed `:map x dd`, saw no error, and had no way
+// to learn the mapping was never made.
+//
+// They are still unimplemented -- what changed is that they say so.
+#[test]
+fn unimplemented_ex_commands_report_themselves() {
+    for (keys, name) in [
+        (":map x dd\n", "map"),
+        (":unmap x\n", "unmap"),
+        (":ab foo bar\n", "abbreviate"),
+        (":una foo\n", "unabbreviate"),
+        (":pop\n", "pop"),
+        (":tags\n", "tags"),
+    ] {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text("alpha\nbravo\n");
+        // The keystrokes are accepted; the editor reports the command rather
+        // than pretending it worked.
+        editor
+            .execute_keys(keys)
+            .expect("an unimplemented command must not unwind out of the editor");
+        assert!(
+            editor.is_error_message(),
+            "{keys:?} must report on the status line, got {:?}",
+            editor.get_message()
+        );
+        let msg = editor.get_message().unwrap_or_default().to_string();
+        assert!(
+            msg.contains(name) && msg.contains("not implemented"),
+            "{keys:?} must name {name:?}, got {msg:?}"
+        );
+        // And it must not have silently altered the buffer.
+        assert_eq!(editor.get_buffer_text(), "alpha\nbravo\n");
+    }
+}

@@ -787,7 +787,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut new_files = vec![];
     if let Err(err) = csplit_file(&args, ctx, &mut new_files) {
         exit_code = 1;
-        eprintln!("{}: {}", args.filename.display(), err);
+        eprintln!(
+            "{}: {}",
+            args.filename.display(),
+            plib::diag::io_error_text(&err)
+        );
         if !args.keep {
             for file_name in new_files.iter() {
                 // Tolerate an already-absent file: unlinking is best effort, and

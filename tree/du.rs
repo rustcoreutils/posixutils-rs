@@ -172,7 +172,7 @@ fn du_impl(args: &Args, filename: &str, seen: &RefCell<HashSet<(u64, u64)>>) -> 
         },
         |_entry, error| {
             *had_error.borrow_mut() = true;
-            eprintln!("du: {}", error.inner());
+            eprintln!("du: {}", plib::diag::io_error_text(&error.inner()));
         },
         ftw::TraverseDirectoryOpts {
             follow_symlinks_on_args: args.follow_cli,

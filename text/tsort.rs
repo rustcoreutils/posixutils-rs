@@ -251,7 +251,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(plib::diag::exit_status());
         }
         Err(e) => {
-            plib::diag::error(&format!("{}: {}", pathname_display(&args.file), e));
+            plib::diag::error(&format!(
+                "{}: {}",
+                pathname_display(&args.file),
+                plib::diag::io_error_text(&e)
+            ));
             std::process::exit(1);
         }
     }

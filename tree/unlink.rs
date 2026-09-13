@@ -41,7 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = do_unlink(&args.pathname) {
         exit_code = 1;
-        eprintln!("unlink: {}", gettext!("{}: {}", args.pathname, e));
+        eprintln!(
+            "unlink: {}",
+            gettext!("{}: {}", args.pathname, plib::diag::io_error_text(&e))
+        );
     }
 
     std::process::exit(exit_code)

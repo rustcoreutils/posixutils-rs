@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = uniq(&args) {
         exit_code = 1;
-        eprintln!("{}", err);
+        eprintln!("{}", plib::diag::error_text(err.as_ref()));
     }
 
     std::process::exit(exit_code)

@@ -173,7 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = expand_file(&tablist, filename) {
             exit_code = 1;
-            eprintln!("{}: {}", filename.display(), e);
+            eprintln!("{}: {}", filename.display(), plib::diag::io_error_text(&e));
         }
     }
 

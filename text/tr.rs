@@ -755,8 +755,25 @@ mod parsing {
 
         let char = categorize_char(char_between_equals_signs);
 
-        // TODO
-        // Validate this char
+        // The equivalence-class machinery indexes the byte tables, so a
+        // character wider than a byte has nowhere to go. It used to be built
+        // anyway and reached three `unreachable!()` arms downstream, aborting
+        // with exit 101 and no diagnostic -- in every mode, and on input that
+        // did not itself contain the character.
+        //
+        // Refused here, where the operand is still the text the user wrote, so
+        // the diagnostic can quote it. Supporting such a class is a feature:
+        // the delete and squeeze paths have an `EquivMatcher` that asks libc
+        // and so follows LC_COLLATE, and translate would need the same.
+        if let DataTypeWithData::IsMultiByte(ch) = char {
+            // Quoted raw, like the multi-character arm above: it came from the
+            // command line, so it renders in the locale the user typed it in.
+            // `escape_default` would print Rust's own `\u{e9}` syntax.
+            return Err(format!(
+                "{ch}: equivalence class operand must be a single-byte character"
+            ));
+        }
+
         let operand = Operand::Equiv(EquivOperand { char });
 
         Ok(operand)
@@ -2904,8 +2921,10 @@ mod transformation {
                         None => (byte_a, next_bytes, FullChar::new_from_u8(byte_a)),
                     };
 
-                // TODO
-                // Is this in the right place?
+                // The lookahead belongs to the *input* match, so it is charged
+                // to the input index here; the single byte under the cursor is
+                // charged once, below or in the skip path, exactly as the
+                // non-squeezed path does.
                 if let Some(se) = replacement_check_result.match_lookahead_length {
                     *index += se as usize;
                 }
@@ -2914,10 +2933,14 @@ mod transformation {
                     if la.squeeze_char {
                         let full_char = &la.char;
 
-                        // TODO
-                        // Verify
                         if full_char.fast_check(byte_a_to_use, next_bytes_to_use) {
-                            *index += full_char.number_of_bytes as usize;
+                            // `full_char` is the *replacement*, whose width has
+                            // nothing to do with how far the input advanced:
+                            // charging it here moved the cursor by 1 + 2 = 3
+                            // over a two-byte input character, so the stream
+                            // slipped a byte per squeezed character and the
+                            // output carried orphaned UTF-8 continuation bytes.
+                            *index += 1_usize;
 
                             return;
                         }

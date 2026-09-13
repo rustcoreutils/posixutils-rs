@@ -196,7 +196,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     exit_code = 1;
-                    eprintln!("wc: {}: {}", filename.display(), e);
+                    eprintln!(
+                        "wc: {}: {}",
+                        filename.display(),
+                        plib::diag::io_error_text(&e)
+                    );
                 }
             }
         }

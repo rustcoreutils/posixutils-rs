@@ -143,6 +143,10 @@ fn test_ls_dangle() {
     let dir_sub = &format!("{test_dir}/dir/sub");
     let slink_to_dir = &format!("{test_dir}/slink-to-dir");
 
+    // Removed first: the test creates with `unwrap()` and only cleans up on
+    // success, so one failure left the directory behind and every later run
+    // died on "File exists" instead of reporting the real problem.
+    let _ = fs::remove_dir_all(test_dir);
     fs::create_dir(test_dir).unwrap();
     fs::create_dir(dir).unwrap();
     fs::create_dir(dir_sub).unwrap();
@@ -159,13 +163,13 @@ fn test_ls_dangle() {
     ls_test(
         &["-L", dangle],
         "",
-        "ls: No such file or directory (os error 2)\n",
+        &format!("ls: cannot access '{dangle}': No such file or directory\n"),
         1,
     );
     ls_test(
         &["-H", dangle],
         "",
-        "ls: No such file or directory (os error 2)\n",
+        &format!("ls: cannot access '{dangle}': No such file or directory\n"),
         1,
     );
 
@@ -851,4 +855,43 @@ fn test_ls_s_kib_default() {
         assert_eq!(first, expected_kib, "expected 1024-byte units: {stdout}");
     });
     fs::remove_dir_all(test_dir).unwrap();
+}
+
+// A diagnostic must name the file it is about. `main` printed `ls: {e}` on an
+// error that never carried the operand, so with several operands the user
+// could not tell which one failed.
+#[test]
+fn ls_names_the_file_it_could_not_read() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ls"))
+        .arg("/nonexistent_ls_probe")
+        .output()
+        .expect("run ls");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(stderr.starts_with("ls: "), "must name ls: {stderr:?}");
+    assert!(
+        stderr.contains("/nonexistent_ls_probe"),
+        "must name the file: {stderr:?}"
+    );
+}
+
+#[test]
+fn ls_reports_a_bad_operand_and_still_lists_the_good_one() {
+    let dir = plib::tmp::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("present.txt"), b"x").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ls"))
+        .arg("/nonexistent_ls_probe")
+        .arg(dir.path())
+        .output()
+        .expect("run ls");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stderr.contains("/nonexistent_ls_probe"),
+        "the failing operand must be named: {stderr:?}"
+    );
+    assert!(
+        stdout.contains("present.txt"),
+        "the good operand must still be listed: {stdout:?}"
+    );
 }

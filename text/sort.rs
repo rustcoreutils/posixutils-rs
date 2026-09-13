@@ -592,7 +592,8 @@ fn read_inputs(args: &Args) -> Result<Vec<(String, Vec<String>)>, String> {
         } else {
             f.display().to_string()
         };
-        let reader = input_stream_dashed(&f).map_err(|e| format!("cannot read: {name}: {e}"))?;
+        let reader = input_stream_dashed(&f)
+            .map_err(|e| format!("cannot read: {name}: {}", plib::diag::io_error_text(&e)))?;
         let br = io::BufReader::new(reader);
         let mut lines = Vec::new();
         for line in br.lines() {

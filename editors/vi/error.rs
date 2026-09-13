@@ -84,6 +84,13 @@ pub enum ViError {
     ShellError(String),
     /// No previous shell command.
     NoPreviousCommand,
+    /// A command this editor parses but does not implement.
+    ///
+    /// Distinct from `InvalidCommand`: these are valid POSIX ex commands, and
+    /// saying "invalid" would send the user looking for a typo. They used to
+    /// fall into a `_ =>` arm that returned success, so `:map x dd` looked as
+    /// though it had taken effect.
+    NotImplemented(&'static str),
 }
 
 impl fmt::Display for ViError {
@@ -91,6 +98,7 @@ impl fmt::Display for ViError {
         match self {
             ViError::Io(e) => write!(f, "{}", e),
             ViError::InvalidCommand(s) => write!(f, "Invalid command: {}", s),
+            ViError::NotImplemented(s) => write!(f, "{}: command not implemented", s),
             ViError::MotionFailed(s) => write!(f, "{}", s),
             ViError::NoPreviousSearch => write!(f, "No previous search pattern"),
             ViError::PatternNotFound(p) => write!(f, "Pattern not found: {}", p),

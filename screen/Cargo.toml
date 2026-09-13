@@ -13,9 +13,9 @@ gettext-rs.workspace = true
 terminfo = "0.9"
 termios = "0.3"
 libc.workspace = true
+plib = { path = "../plib" }
 
 [dev-dependencies]
-plib = { path = "../plib" }
 portable-pty = "0.9"
 
 [lints]

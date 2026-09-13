@@ -158,7 +158,8 @@ fn time_source(args: &Args) -> Result<(libc::timespec, libc::timespec), String> 
         let ts = parse_posix_time(t)?;
         Ok((ts, ts))
     } else if let Some(rf) = &args.ref_file {
-        let md = std::fs::metadata(rf).map_err(|e| format!("{rf}: {e}"))?;
+        let md = std::fs::metadata(rf)
+            .map_err(|e| format!("{rf}: {}", plib::diag::io_error_text(&e)))?;
         let atime = md
             .accessed()
             .map(systemtime_to_ts)
@@ -239,7 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = touch_file(&args, &source, filename) {
             exit_code = 1;
-            eprintln!("touch: {filename}: {e}");
+            eprintln!("touch: {filename}: {}", plib::diag::io_error_text(&e));
         }
     }
 

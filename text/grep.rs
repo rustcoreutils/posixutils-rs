@@ -106,7 +106,11 @@ impl Args {
                 Err(err) => {
                     self.any_errors = true;
                     if !self.no_messages {
-                        plib::diag::error(&format!("{}: {}", path_buf.display(), err));
+                        plib::diag::error(&format!(
+                            "{}: {}",
+                            path_buf.display(),
+                            plib::diag::io_error_text(&err)
+                        ));
                     }
                 }
             }
@@ -332,7 +336,11 @@ impl GrepModel {
                     Err(err) => {
                         self.any_errors = true;
                         if !self.no_messages {
-                            plib::diag::error(&format!("{}: {}", input_name, err));
+                            plib::diag::error(&format!(
+                                "{}: {}",
+                                input_name,
+                                plib::diag::io_error_text(&err)
+                            ));
                         }
                     }
                 }

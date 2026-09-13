@@ -48,7 +48,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Route the (interpolated) diagnostic through gettext for translation (#LK1).
         eprintln!(
             "link: {}",
-            gettext!("{} -> {}: {}", args.file1, args.file2, e)
+            gettext!(
+                "{} -> {}: {}",
+                args.file1,
+                args.file2,
+                plib::diag::io_error_text(&e)
+            )
         );
     }
 

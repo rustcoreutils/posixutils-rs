@@ -188,6 +188,25 @@ pub fn io_error_text(e: &io::Error) -> String {
     }
 }
 
+/// Render any error the way a system utility reports one.
+///
+/// [`io_error_text`] needs an `io::Error`, but a utility whose `main` returns
+/// `Result<_, Box<dyn Error>>` holds the same `io::Error` inside a box, and
+/// formatting *that* leaks `" (os error 2)"` exactly as formatting the error
+/// itself would. Downcasting recovers the errno, so such a caller gets the
+/// system's message and the locale's; anything else falls back to the text
+/// with the parenthetical stripped.
+pub fn error_text(e: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(io_err) = e.downcast_ref::<io::Error>() {
+        return io_error_text(io_err);
+    }
+    let s = e.to_string();
+    match s.find(" (os error ") {
+        Some(idx) => s[..idx].to_string(),
+        None => s,
+    }
+}
+
 /// Emit an error diagnostic with no source-position information.
 /// Output format: `"<util>: <msg>"`.
 pub fn error(msg: &str) {

@@ -69,7 +69,11 @@ fn concat_input_files(files: &[String]) -> io::Result<Vec<String>> {
                     input.push(line);
                 }
                 Err(e) => {
-                    eprintln!("{}: {}", gettext("Error reading file"), e);
+                    eprintln!(
+                        "{}: {}",
+                        gettext("Error reading file"),
+                        diag::io_error_text(&e)
+                    );
                     return Err(e);
                 }
             }
@@ -310,7 +314,7 @@ fn write_stats<W: Write + ?Sized>(
 fn main() {
     diag::init_locale("lex");
     if let Err(err) = run() {
-        diag::error(&format!("{}", err));
+        diag::error(&diag::error_text(err.as_ref()));
     }
     std::process::exit(diag::exit_status());
 }

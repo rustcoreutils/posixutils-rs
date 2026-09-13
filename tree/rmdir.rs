@@ -30,7 +30,11 @@ fn remove_dir(operand: &str, rm_parents: bool) -> bool {
     let mut path = PathBuf::from(operand);
     loop {
         if let Err(e) = fs::remove_dir(&path) {
-            eprintln!("rmdir: {}: {}", path.display(), e);
+            eprintln!(
+                "rmdir: {}: {}",
+                path.display(),
+                plib::diag::io_error_text(&e)
+            );
             return false;
         }
 

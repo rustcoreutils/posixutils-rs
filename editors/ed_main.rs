@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => {
-                eprintln!("{}: {}", path, e);
+                eprintln!("{}: {}", path, plib::diag::error_text(&e));
                 editor.error_occurred = true;
             }
         }
@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run the editor loop
     if let Err(e) = editor.run() {
-        eprintln!("ed: {}", e);
+        eprintln!("ed: {}", plib::diag::io_error_text(&e));
         std::process::exit(1);
     }
 

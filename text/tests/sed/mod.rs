@@ -1911,19 +1911,19 @@ mod tests {
                 "w ./dir/newfile".to_string(),
                 "abc\ncdf\n",
                 "",
-                "sed: read stdin: can't find './dir/newfile': no such file or directory (os error 2)\n".to_string(),
+                "sed: read stdin: can't find './dir/newfile': no such file or directory\n".to_string(),
             ),
             (
                 "w./tests/s\x04ed/assets/abc".to_string(),
                 "a\n",
                 "",
-                "sed: read stdin: can't find './tests/s\u{4}ed/assets/abc': no such file or directory (os error 2)\n".to_string(),
+                "sed: read stdin: can't find './tests/s\u{4}ed/assets/abc': no such file or directory\n".to_string(),
             ),
             (
                 "w./tests/ard/assets/abc".to_string(),
                 "a\n",
                 "",
-                "sed: read stdin: can't find './tests/ard/assets/abc': no such file or directory (os error 2)\n".to_string(),
+                "sed: read stdin: can't find './tests/ard/assets/abc': no such file or directory\n".to_string(),
             ),
         ];
 

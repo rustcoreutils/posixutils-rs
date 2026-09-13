@@ -1219,12 +1219,19 @@ fn tr_in_locale(locale: &str, args: &[&str], stdin: &[u8]) -> (Vec<u8>, i32) {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn tr");
-    match child.stdin.as_mut().unwrap().write_all(stdin) {
+    // Write on another thread: with more than a pipe buffer of input, writing
+    // it all before reading any output deadlocks -- the child blocks writing
+    // stdout while this side blocks writing stdin.
+    let mut sink = child.stdin.take().expect("stdin");
+    let payload = stdin.to_vec();
+    let writer = std::thread::spawn(move || match sink.write_all(&payload) {
         Ok(()) => {}
+        // tr rejects a bad operand before it reads, which is a result.
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
         Err(e) => panic!("writing tr's stdin: {e}"),
-    }
+    });
     let out = child.wait_with_output().expect("wait tr");
+    writer.join().expect("stdin writer");
     (out.stdout, out.status.code().unwrap_or(-1))
 }
 
@@ -1379,4 +1386,39 @@ fn tr_complement_replacement_is_the_fill_when_there_is_one() {
     // With no fill, the last character stands, as before.
     tr_test(&["-c", "a", "xy"], "abc", "ayy");
     tr_test(&["-c", "a", "x"], "abc", "axx");
+}
+
+// A class in string1 whose members mostly map to one character must not put
+// every member in the byte tables.
+//
+// When string2 is not uniform over the class, the members were enumerated and
+// one entry per member pushed into a per-lead-byte vector that is scanned
+// linearly for every input byte. With a locale-correct class that is tens of
+// thousands of entries: 900 KB of CJK through `tr '[:alpha:]' '[a*]b'` took
+// 0.61s, against 0.00s for the same input when string2 *is* uniform. Only the
+// members that need a distinct replacement belong in the tables; the rest are
+// the class rule.
+#[test]
+fn tr_class_spread_over_string2_does_not_fill_the_tables() {
+    if !utf8_locale_available() {
+        return;
+    }
+    // Sized so the unfixed code takes seconds: it was ~0.6s per 900 KB, and
+    // this is roughly 4 MB. The fix runs it in hundredths.
+    let cjk = "漢字テスト".repeat(280_000);
+
+    let started = std::time::Instant::now();
+    let (out, code) = tr_in_locale("en_US.UTF-8", &["[:alpha:]", "[a*]b"], cjk.as_bytes());
+    let elapsed = started.elapsed();
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.len(),
+        cjk.chars().count(),
+        "one byte out per character in"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "a class spread over string2 must not be enumerated into the tables; took {elapsed:?}"
+    );
 }

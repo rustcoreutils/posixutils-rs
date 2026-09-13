@@ -1412,6 +1412,11 @@ mod setup {
     struct Replacements {
         /// `(element, length)`. A `None` length is the unbounded `[c*]` fill.
         runs: Vec<(DataTypeWithData, Option<usize>)>,
+        /// Which run is the `[c*]` fill, recorded at build time. `size_fill`
+        /// replaces its `None` with a number, so it cannot be found by looking
+        /// for one afterwards -- and it is still the run that absorbs the
+        /// slack, which is what makes it the answer to both questions below.
+        fill: Option<usize>,
     }
 
     impl Replacements {
@@ -1460,14 +1465,15 @@ mod setup {
                 }
             }
 
-            Ok(Replacements { runs })
+            let fill = runs.iter().position(|(_, len)| len.is_none());
+            Ok(Replacements { runs, fill })
         }
 
         /// Is there an unbounded `[c*]` fill with elements after it? Only then
         /// does anything need string1's total length: the fill has to be sized
         /// to push those trailing elements to the end.
         fn fill_needs_string1_length(&self) -> bool {
-            match self.runs.iter().position(|(_, len)| len.is_none()) {
+            match self.fill {
                 Some(index) => index + 1_usize < self.runs.len(),
                 None => false,
             }
@@ -1475,7 +1481,7 @@ mod setup {
 
         /// Resolve the unbounded fill now that string1's length is known.
         fn size_fill(&mut self, string1_len: usize) {
-            let Some(index) = self.runs.iter().position(|(_, len)| len.is_none()) else {
+            let Some(index) = self.fill else {
                 return;
             };
             let explicit: usize = self.runs.iter().filter_map(|&(_, len)| len).sum();
@@ -1500,6 +1506,14 @@ mod setup {
             }
         }
 
+        /// The element that covers the bulk of a long span: the `[c*]` fill,
+        /// which is sized to absorb whatever string1 has left over, or else
+        /// the final element, which repeats once string2 runs short. Either
+        /// way it is the one a large character class mostly maps to.
+        fn bulk(&self) -> DataTypeWithData {
+            self.slack_absorber()
+        }
+
         /// The single character a complement maps every non-member to.
         ///
         /// `[c*]` is the construct that means "as many as needed", so when
@@ -1507,9 +1521,14 @@ mod setup {
         /// replaces with `x`, not with the `y` that merely happens to be
         /// written last. Without a fill, the last character stands.
         fn complement_replacement(&self) -> DataTypeWithData {
-            self.runs
-                .iter()
-                .find(|(_, len)| len.is_none())
+            self.slack_absorber()
+        }
+
+        /// The element that stands in for however much string1 has left over:
+        /// the `[c*]` fill, or the final element when there is none.
+        fn slack_absorber(&self) -> DataTypeWithData {
+            self.fill
+                .and_then(|index| self.runs.get(index))
                 .or_else(|| self.runs.last())
                 .map_or(DataTypeWithData::Is7Bit(0_u8), |(element, _)| {
                     element.clone()
@@ -1732,19 +1751,39 @@ mod setup {
                             replacement: constant.convert_to_replacement(),
                         });
                     } else {
-                        // string2 spreads distinct characters across the class,
-                        // so the members have to be paired one by one. POSIX
-                        // leaves the order unspecified (118133-4); ascending is
-                        // as good as any, and matches what ASCII enumeration
-                        // used to give.
+                        // string2 spreads distinct characters across part of
+                        // the class, so those members have to be paired one by
+                        // one. POSIX leaves the order unspecified (118133-4);
+                        // ascending is as good as any, and matches what the old
+                        // ASCII enumeration gave.
+                        //
+                        // Most members map to whichever element absorbs the
+                        // slack -- the `[c*]` fill, or the trailing element --
+                        // so that one becomes the class rule and only the
+                        // members that differ go in the byte tables, where they
+                        // take priority over it.
+                        //
+                        // Enumerating all of them instead put tens of thousands
+                        // of entries behind a single lead byte, each scanned
+                        // linearly for every input byte: 0.6s per 900 KB of
+                        // CJK, against nothing at all when the class is a rule.
                         let members = name.members();
+                        let bulk = replacements.bulk().convert_to_replacement();
                         for (offset, member) in members.iter().enumerate() {
-                            let replacement = replacements.at(position + offset);
+                            let replacement =
+                                replacements.at(position + offset).convert_to_replacement();
+                            if replacement.same_char(&bulk) {
+                                continue;
+                            }
                             add_normal_char_with_replacement(
                                 crate::parsing::categorize_char(*member),
-                                replacement.convert_to_replacement(),
+                                replacement,
                             );
                         }
+                        class_rules.push(ClassRule {
+                            name: *name,
+                            replacement: bulk,
+                        });
                         position = position.saturating_add(members.len());
                     }
                 }
@@ -1833,6 +1872,14 @@ mod setup {
     }
 
     impl FullChar {
+        /// Do these spell the same character? Compared over the used bytes
+        /// only, since the payload beyond `number_of_bytes` is padding.
+        pub fn same_char(&self, other: &FullChar) -> bool {
+            let width = self.number_of_bytes as usize;
+            width == other.number_of_bytes as usize
+                && self.payload[..width] == other.payload[..width]
+        }
+
         pub fn write_full_char(&self, to: &mut [u8]) -> usize {
             let to_write = self.number_of_bytes as usize;
 

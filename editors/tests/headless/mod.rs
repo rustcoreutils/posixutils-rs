@@ -4139,20 +4139,32 @@ fn test_ctrl_t_pops_the_tag_stack() {
 /// interruptible". The escape is therefore a signal, not a depth cap -- a cap
 /// would refuse a mapping the spec says must work.
 ///
-/// What this pins is that the drain polls SIGINT at all and abandons the
-/// expansion when it is set. It cannot deliver the signal mid-loop from one
+/// What this pins is that the drain polls the interrupt at all and abandons
+/// the expansion when it is set. It cannot deliver the signal mid-loop from one
 /// thread, so it arms the flag first; an interactive interrupt sets the same
 /// flag asynchronously and reaches the same poll. Removing the poll makes this
 /// test hang rather than fail, which is the honest shape of the bug.
+///
+/// The editor is given its own interrupt flag rather than the process-wide
+/// SIGINT one. The drain consumes the flag with a `swap(false)`, and every
+/// test in this binary drains on every keystroke, so arming the global raced
+/// the whole suite for it -- this test failed about one run in seven, and
+/// always with the expansion having run because some other test's keystroke
+/// read the flag first.
 #[test]
 fn test_sigint_abandons_a_map_expansion() {
-    use vi_rs::signals::SIGINT_RECEIVED;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Leaked so it is `&'static` like the real signal flag, and private to
+    // this editor so no other test can consume it.
+    let interrupt: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
 
     let mut editor = Editor::new_headless();
+    editor.set_interrupt_source(interrupt);
     editor.set_buffer_text("alpha\nbravo\n");
     editor.execute_keys(":map q dd\n").unwrap();
 
-    SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+    interrupt.store(true, Ordering::SeqCst);
     editor.execute_keys("q").unwrap();
     assert_eq!(
         editor.get_buffer_text(),
@@ -4161,7 +4173,18 @@ fn test_sigint_abandons_a_map_expansion() {
     );
 
     // The flag is consumed, so the editor works normally again.
-    assert!(!SIGINT_RECEIVED.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!interrupt.load(Ordering::SeqCst));
     editor.execute_keys("q").unwrap();
     assert_eq!(editor.get_buffer_text(), "bravo\n");
+}
+
+/// An editor watches the process SIGINT flag unless told otherwise, so the
+/// indirection above cannot quietly disconnect a real vi from its signal.
+#[test]
+fn test_editor_watches_the_process_sigint_flag_by_default() {
+    let editor = Editor::new_headless();
+    assert!(
+        std::ptr::eq(editor.interrupt_source(), &vi_rs::signals::SIGINT_RECEIVED),
+        "the default interrupt source must be the flag the signal handler writes"
+    );
 }

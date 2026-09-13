@@ -65,6 +65,33 @@ fn test_stty_negation_operand_applied() {
     );
 }
 
+// The no-operand form. It had no test at all, which is how a "TODO: stty
+// get-short display" survived in the source long after `stty_show_short` was
+// written and wired up.
+//
+// Only two things here are POSIX requirements. The speed line's wording is
+// fixed -- "speed %d baud;" when the two speeds agree (116339-116344) -- and
+// the rest is "an unspecified subset of the information written for the -a
+// option" (116337-116338). So the second half asserts that a non-default shows
+// up at all, not which ones do; pinning the selection would freeze our own
+// choice as though the spec demanded it.
+#[test]
+fn test_stty_short_output() {
+    let (code, out) = pty!(run(STTY, &[]));
+    assert_eq!(code, 0, "bare stty should exit 0, got {code}");
+    assert!(
+        out.contains("baud"),
+        "bare stty should print a speed line; got:\n{out}"
+    );
+
+    let (code, out) = pty!(run_sh(&format!("'{STTY}' -echo && '{STTY}'")));
+    assert_eq!(code, 0, "stty -echo && stty should exit 0, got {code}");
+    assert!(
+        out.split_whitespace().any(|t| t == "-echo"),
+        "bare stty should report a setting that differs from the default; got:\n{out}"
+    );
+}
+
 // `stty -a` produces the speed line and flag groups.
 #[test]
 fn test_stty_all_output() {

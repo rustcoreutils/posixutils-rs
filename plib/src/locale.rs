@@ -428,6 +428,20 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
     result
 }
 
+/// What [`MbDecoder::next_char`] found at the front of a byte slice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MbChar {
+    /// One complete character occupying `width` bytes of the input. `ch` is
+    /// `None` for a byte that does not decode, which still counts as one
+    /// character so that a cursor always advances.
+    Char { ch: Option<char>, width: usize },
+    /// The bytes are a valid but unfinished prefix of a character. The decoder
+    /// has *not* consumed them: supply more input and ask again.
+    Incomplete,
+    /// There were no bytes.
+    Empty,
+}
+
 /// Stateful incremental multibyte decoder for streaming input.
 ///
 /// Feed successive byte chunks to [`MbDecoder::decode`]: complete characters are
@@ -464,6 +478,60 @@ impl MbDecoder {
     /// invalid-byte convention).
     pub fn pending(&self) -> usize {
         self.pending
+    }
+
+    /// Decode one character from the front of `bytes`, reporting how many bytes
+    /// it occupied.
+    ///
+    /// The width is what [`decode`](Self::decode) throws away: `mbrtowc`
+    /// computes it and the return value is discarded, and a caller that must
+    /// echo the original bytes or advance a cursor over them cannot recover it
+    /// afterwards.
+    ///
+    /// Unlike `decode`, an unfinished trailing sequence is **not** absorbed into
+    /// the decoder's state — it is reported as [`MbChar::Incomplete`] and the
+    /// same bytes may be presented again once more input is available. That
+    /// suits a caller holding a buffer it intends to re-read from; `decode`
+    /// suits one feeding each byte exactly once.
+    pub fn next_char(&mut self, bytes: &[u8]) -> MbChar {
+        if bytes.is_empty() {
+            return MbChar::Empty;
+        }
+
+        let mut wc: libc::wchar_t = 0;
+        // Decode against a copy, so an incomplete prefix leaves `self.state`
+        // untouched and the caller can present those bytes again.
+        let mut scratch = self.state;
+        // SAFETY: the pointer/length describe a valid slice and `scratch` is a
+        // live mbstate_t owned by this frame.
+        let n = unsafe {
+            mbrtowc(
+                &mut wc,
+                bytes.as_ptr() as *const libc::c_char,
+                bytes.len() as libc::size_t,
+                &mut scratch,
+            )
+        };
+
+        if n == usize::MAX - 1 {
+            // (size_t)-2: a valid but unfinished prefix. `scratch` is discarded.
+            return MbChar::Incomplete;
+        }
+
+        if n == usize::MAX {
+            // (size_t)-1: invalid sequence. Consume one byte and reset, so a
+            // cursor advances rather than stalling on it.
+            self.state = MbStateT::zeroed();
+            return MbChar::Char { ch: None, width: 1 };
+        }
+
+        self.state = scratch;
+        // n == 0 is a NUL wide character, which occupies one byte.
+        let width = if n == 0 { 1 } else { n };
+        MbChar::Char {
+            ch: char::from_u32(wc as u32),
+            width,
+        }
     }
 
     /// Decode every complete character in `bytes`, returning each as the decoded
@@ -647,6 +715,88 @@ mod tests {
                 matched,
                 "expected é to be one 2-byte character, got {slices:?}"
             );
+        }
+    }
+
+    // `next_char` reports how many bytes each character occupied, which
+    // `decode` throws away — `mbrtowc` computes it and the return value is
+    // discarded. A caller that has to echo the original bytes, or advance a
+    // cursor over them, cannot reconstruct it afterwards.
+    #[test]
+    fn next_char_reports_the_width_it_consumed() {
+        let mut d = MbDecoder::new();
+        // ASCII is one byte per character in every locale.
+        assert_eq!(
+            d.next_char(b"abc"),
+            MbChar::Char {
+                ch: Some('a'),
+                width: 1
+            }
+        );
+        assert_eq!(
+            d.next_char(b"bc"),
+            MbChar::Char {
+                ch: Some('b'),
+                width: 1
+            }
+        );
+        // A NUL is a character, not a terminator.
+        assert_eq!(
+            d.next_char(b"\0x"),
+            MbChar::Char {
+                ch: Some('\0'),
+                width: 1
+            }
+        );
+        // Nothing to decode.
+        assert_eq!(d.next_char(b""), MbChar::Empty);
+    }
+
+    #[test]
+    fn next_char_reports_an_unfinished_sequence_without_consuming_it() {
+        let _guard = crate::locale_test_lock();
+
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+        let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
+        let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
+
+        let mut d = MbDecoder::new();
+        // "é" is U+00E9 = 0xC3 0xA9. The lead byte alone is a valid prefix.
+        let partial = d.next_char(&[0xC3]);
+        // Crucially the decoder did *not* absorb it: asking again with the whole
+        // character still yields the whole character. That is what lets a caller
+        // keep the bytes and retry, rather than having to feed each byte once.
+        let whole = d.next_char(&[0xC3, 0xA9]);
+        let two_byte = d.next_char(&[0xC3, 0xA9, b'x']);
+        // An invalid sequence is one character wide, so a cursor always advances.
+        let invalid = d.next_char(&[0xFF, b'a']);
+
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
+        }
+        if !ok.is_null() {
+            assert_eq!(
+                partial,
+                MbChar::Incomplete,
+                "a valid prefix is not a character"
+            );
+            assert_eq!(
+                whole,
+                MbChar::Char {
+                    ch: Some('é'),
+                    width: 2
+                }
+            );
+            assert_eq!(
+                two_byte,
+                MbChar::Char {
+                    ch: Some('é'),
+                    width: 2
+                }
+            );
+            assert_eq!(invalid, MbChar::Char { ch: None, width: 1 });
         }
     }
 

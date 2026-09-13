@@ -592,6 +592,81 @@ fn od_default_type_sizes_are_the_basic_c_types() {
     }
 }
 
+// POSIX 109193-109195: "If, as a result of the specification of the -N option
+// or end-of-file being reached on the last input file, input data only
+// partially satisfies an output type, the input shall be extended sufficiently
+// with null bytes to write the last byte of the input."
+//
+// Every formatter zero-extended a short final chunk at the wrong end for the
+// lengths that needed a wider array -- 3, 5, 6 and 7. `arr[3..]` then
+// `arr.reverse()` puts the padding in the *low* bytes, so a 5-byte tail under
+// `-t x8` came out as the correct value shifted left by 24 bits.
+//
+// Asserted as the equivalence the clause itself states: a short final chunk
+// must render exactly as those same bytes followed by explicit NULs. That
+// compares the short-chunk path against the full-chunk path, needs no
+// reference implementation, and holds on either byte order.
+#[test]
+fn od_short_final_chunk_is_extended_with_null_bytes() {
+    for (spec, width) in [
+        ("x8", 8),
+        ("u8", 8),
+        ("d8", 8),
+        ("o8", 8),
+        ("x4", 4),
+        ("u4", 4),
+        ("d4", 4),
+        ("o4", 4),
+        ("x2", 2),
+        ("u2", 2),
+        ("d2", 2),
+        ("o2", 2),
+    ] {
+        for tail in 1..width {
+            // High bytes throughout, so sign extension and high-order padding
+            // are both exercised rather than reading as small positives.
+            let data: Vec<u8> = (0..width + tail)
+                .map(|i| 0x80u8 | ((i as u8).wrapping_mul(29) & 0x7f))
+                .collect();
+            let mut padded = data.clone();
+            padded.resize(2 * width, 0);
+
+            let (short, _, code) = od_raw(&["-An", "-t", spec], &data);
+            assert_eq!(code, Some(0), "-t {spec} with a {tail}-byte tail");
+            let (full, _, _) = od_raw(&["-An", "-t", spec], &padded);
+            assert_eq!(
+                short.split_whitespace().collect::<Vec<_>>(),
+                full.split_whitespace().collect::<Vec<_>>(),
+                "-t {spec}: a {tail}-byte tail must render as those bytes plus NULs"
+            );
+        }
+    }
+}
+
+// The extension is by null bytes, so the *declared* width decides the sign, not
+// the number of bytes actually present. `-t d4` with a one-byte tail of 0xc7
+// read it as an i8 and printed -57; extended to four bytes it is a positive
+// i32 on a little-endian host, and a large negative one on a big-endian host
+// where 0xc7 lands in the most significant byte.
+#[test]
+fn od_short_chunk_sign_follows_the_declared_width() {
+    let data = [0x41u8, 0x42, 0x43, 0x44, 0xc7];
+    let (stdout, _, code) = od_raw(&["-An", "-t", "d4"], &data);
+    assert_eq!(code, Some(0));
+
+    let want = if cfg!(target_endian = "little") {
+        "199"
+    } else {
+        "-956301312"
+    };
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
+    assert_eq!(
+        fields.last().copied(),
+        Some(want),
+        "0xc7 extended to four bytes: {stdout:?}"
+    );
+}
+
 #[test]
 fn od_integer_size_suffixes_are_unchanged() {
     // The C/S/I/L table belongs to d/o/u/x (POSIX 109073-5) and must not have

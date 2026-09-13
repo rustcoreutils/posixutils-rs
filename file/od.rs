@@ -535,80 +535,79 @@ trait FormatterChunks {
     fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String;
 }
 
+/// Lay a chunk out as `num_bytes` bytes of memory, extending a short final
+/// chunk with null bytes.
+///
+/// POSIX 109193-109195: "If, as a result of the specification of the -N option
+/// or end-of-file being reached on the last input file, input data only
+/// partially satisfies an output type, the input shall be extended
+/// sufficiently with null bytes to write the last byte of the input."
+///
+/// The nulls are appended *after* the input in memory, and that is what makes
+/// one implementation right on either byte order: on a little-endian host they
+/// become the high-order bytes of the value, on a big-endian host the
+/// low-order ones. The POSIX example at 109240-109245 is from a big-endian
+/// system and shows the padding at the opposite end for exactly this reason.
+///
+/// The callers then read the result with `from_ne_bytes`, as 109149-109151
+/// requires -- the byte order "shall correspond to the order in which a
+/// constant of the corresponding type is stored in memory on the system".
+fn extend_chunk(chunk: &[u8], num_bytes: usize) -> [u8; 8] {
+    let mut buf = [0_u8; 8];
+    let n = chunk.len().min(num_bytes).min(buf.len());
+    buf[..n].copy_from_slice(&chunk[..n]);
+    buf
+}
+
+/// Read an extended chunk as an unsigned value of the *declared* width.
+///
+/// Reading at the chunk's own length instead is what made a short tail wrong:
+/// the value came out of a narrower type and then had to be widened, which is
+/// a different number.
+fn chunk_to_u64(chunk: &[u8], num_bytes: usize) -> u64 {
+    let buf = extend_chunk(chunk, num_bytes);
+    match num_bytes {
+        1 => buf[0] as u64,
+        2 => u16::from_ne_bytes(buf[..2].try_into().unwrap()) as u64,
+        4 => u32::from_ne_bytes(buf[..4].try_into().unwrap()) as u64,
+        8 => u64::from_ne_bytes(buf),
+        // `parse_type_string` admits no other width.
+        _ => unreachable!("unsupported integer width {num_bytes}"),
+    }
+}
+
+/// Read an extended chunk as a signed value of the *declared* width.
+///
+/// The width decides the sign, not the bytes present: a one-byte tail of 0xc7
+/// under `-t d4` is a positive `i32` on a little-endian host, where the three
+/// null bytes it is extended with are the high-order ones. Read as an `i8` it
+/// was -57.
+fn chunk_to_i64(chunk: &[u8], num_bytes: usize) -> i64 {
+    let buf = extend_chunk(chunk, num_bytes);
+    match num_bytes {
+        1 => buf[0] as i8 as i64,
+        2 => i16::from_ne_bytes(buf[..2].try_into().unwrap()) as i64,
+        4 => i32::from_ne_bytes(buf[..4].try_into().unwrap()) as i64,
+        8 => i64::from_ne_bytes(buf),
+        _ => unreachable!("unsupported integer width {num_bytes}"),
+    }
+}
+
 struct UFormatter;
 
 impl FormatterChunks for UFormatter {
     fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
+        // Widest decimal the width can hold: u8 255, u16 65535, u32 and u64
+        // likewise at 10 and 20 digits.
         let pad_to = match num_bytes {
-            1 => {
-                // u8::MAX is 255 (3 digits)
-                3_usize
-            }
-            2 => {
-                // u16::MAX is 65535 (5 digits)
-                5_usize
-            }
-            4 => {
-                // u32::MAX is 4294967295 (10 digits)
-                10_usize
-            }
-            8 => {
-                // u64::MAX is 18446744073709551615 (20 digits)
-                20_usize
-            }
-            _ => {
-                // TODO
-                // Should be unreachable
-                debug_assert!(false);
-
-                0
-            }
+            1 => 3_usize,
+            2 => 5_usize,
+            4 => 10_usize,
+            8 => 20_usize,
+            _ => unreachable!("unsupported integer width {num_bytes}"),
         };
 
-        let value = match chunk.len() {
-            1 => u8::from_be_bytes(chunk.try_into().unwrap()) as u64,
-            2 => {
-                let mut arr: [u8; 2] = chunk.try_into().unwrap();
-                arr.reverse();
-                u16::from_be_bytes(arr) as u64
-            }
-            3 => {
-                let mut arr = [0u8; 4];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                u32::from_be_bytes(arr) as u64
-            }
-            4 => {
-                let mut arr: [u8; 4] = chunk.try_into().unwrap();
-                arr.reverse();
-                u32::from_be_bytes(arr) as u64
-            }
-            5 => {
-                let mut arr = [0u8; 8];
-                arr[3..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            6 => {
-                let mut arr = [0u8; 8];
-                arr[2..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            7 => {
-                let mut arr = [0u8; 8];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            8 => {
-                let mut arr: [u8; 8] = chunk.try_into().unwrap();
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            _ => 0,
-        };
-
+        let value = chunk_to_u64(chunk, num_bytes);
         format!(" {value: >width$}", width = pad_to)
     }
 }
@@ -617,76 +616,17 @@ struct DFormatter;
 
 impl FormatterChunks for DFormatter {
     fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
+        // Widest signed decimal the width can hold, sign included: i8 -128,
+        // i16 -32768, i32 -2147483648, i64 -9223372036854775808.
         let pad_to = match num_bytes {
-            1 => {
-                // i8::MIN is -128 (4 digits)
-                4_usize
-            }
-            2 => {
-                // i16::MIN is -32768 (6 digits)
-                6_usize
-            }
-            4 => {
-                // i32::MIN is -2147483648 (11 digits)
-                11_usize
-            }
-            8 => {
-                // i64::MIN is -9223372036854775808 (20 digits)
-                20_usize
-            }
-            _ => {
-                // TODO
-                // Should be unreachable
-                debug_assert!(false);
-
-                0
-            }
+            1 => 4_usize,
+            2 => 6_usize,
+            4 => 11_usize,
+            8 => 20_usize,
+            _ => unreachable!("unsupported integer width {num_bytes}"),
         };
 
-        let value = match chunk.len() {
-            1 => i8::from_be_bytes(chunk.try_into().unwrap()) as i64,
-            2 => {
-                let mut arr: [u8; 2] = chunk.try_into().unwrap();
-                arr.reverse();
-                i16::from_be_bytes(arr) as i64
-            }
-            3 => {
-                let mut arr = [0u8; 4];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                i32::from_be_bytes(arr) as i64
-            }
-            4 => {
-                let mut arr: [u8; 4] = chunk.try_into().unwrap();
-                arr.reverse();
-                i32::from_be_bytes(arr) as i64
-            }
-            5 => {
-                let mut arr = [0u8; 8];
-                arr[3..].copy_from_slice(chunk);
-                arr.reverse();
-                i64::from_be_bytes(arr)
-            }
-            6 => {
-                let mut arr = [0u8; 8];
-                arr[2..].copy_from_slice(chunk);
-                arr.reverse();
-                i64::from_be_bytes(arr)
-            }
-            7 => {
-                let mut arr = [0u8; 8];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                i64::from_be_bytes(arr)
-            }
-            8 => {
-                let mut arr: [u8; 8] = chunk.try_into().unwrap();
-                arr.reverse();
-                i64::from_be_bytes(arr)
-            }
-            _ => 0,
-        };
-
+        let value = chunk_to_i64(chunk, num_bytes);
         format!(" {value: >width$}", width = pad_to)
     }
 }
@@ -695,51 +635,8 @@ struct XFormatter;
 
 impl FormatterChunks for XFormatter {
     fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
-        let value = match chunk.len() {
-            1 => u8::from_be_bytes(chunk.try_into().unwrap()) as u64,
-            2 => {
-                let mut arr: [u8; 2] = chunk.try_into().unwrap();
-                arr.reverse();
-                u16::from_be_bytes(arr) as u64
-            }
-            3 => {
-                let mut arr = [0u8; 4];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                u32::from_be_bytes(arr) as u64
-            }
-            4 => {
-                let mut arr: [u8; 4] = chunk.try_into().unwrap();
-                arr.reverse();
-                u32::from_be_bytes(arr) as u64
-            }
-            5 => {
-                let mut arr = [0u8; 8];
-                arr[3..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            6 => {
-                let mut arr = [0u8; 8];
-                arr[2..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            7 => {
-                let mut arr = [0u8; 8];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            8 => {
-                let mut arr: [u8; 8] = chunk.try_into().unwrap();
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            _ => 0,
-        };
-
-        // It takes exactly two hexadecimal digits to represent a byte (2^8 = 256 and 16^2 = 256)
+        let value = chunk_to_u64(chunk, num_bytes);
+        // Two hex digits per byte, exactly.
         format!(" {value:0width$x}", width = num_bytes * 2)
     }
 }
@@ -748,50 +645,7 @@ struct OFormatter;
 
 impl FormatterChunks for OFormatter {
     fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
-        let value = match chunk.len() {
-            1 => u8::from_be_bytes(chunk.try_into().unwrap()) as u64,
-            2 => {
-                let mut arr: [u8; 2] = chunk.try_into().unwrap();
-                arr.reverse();
-                u16::from_be_bytes(arr) as u64
-            }
-            3 => {
-                let mut arr = [0u8; 4];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                u32::from_be_bytes(arr) as u64
-            }
-            4 => {
-                let mut arr: [u8; 4] = chunk.try_into().unwrap();
-                arr.reverse();
-                u32::from_be_bytes(arr) as u64
-            }
-            5 => {
-                let mut arr = [0u8; 8];
-                arr[3..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            6 => {
-                let mut arr = [0u8; 8];
-                arr[2..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            7 => {
-                let mut arr = [0u8; 8];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            8 => {
-                let mut arr: [u8; 8] = chunk.try_into().unwrap();
-                arr.reverse();
-                u64::from_be_bytes(arr)
-            }
-            _ => 0,
-        };
-
+        let value = chunk_to_u64(chunk, num_bytes);
         // It takes three octal digits to represent a byte (2^8 = 256 and 8^3 = 512)
         format!(" {value:0width$o}", width = num_bytes * 3)
     }
@@ -1290,6 +1144,48 @@ mod tests {
         assert_eq!(parse_offset("777b"), Ok(0o777 * 512));
         assert_eq!(parse_offset("777."), Ok(777));
         assert_eq!(parse_offset("777"), Ok(0o777));
+    }
+
+    // POSIX 109193-5 extends a short final chunk "with null bytes", appending
+    // them after the input *in memory*. Asserted on the byte array rather than
+    // on the integer it decodes to, because that is the one form of the claim
+    // that says nothing about byte order -- and so is checkable here, on a
+    // little-endian host, for the big-endian case as well.
+    #[test]
+    fn extend_chunk_appends_nulls_after_the_input() {
+        assert_eq!(
+            extend_chunk(&[0xaa, 0xbb, 0xcc], 8),
+            [0xaa, 0xbb, 0xcc, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            extend_chunk(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee], 8),
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0, 0, 0]
+        );
+        assert_eq!(extend_chunk(&[0xaa], 2), [0xaa, 0, 0, 0, 0, 0, 0, 0]);
+
+        // A full chunk is copied through untouched.
+        assert_eq!(
+            extend_chunk(&[1, 2, 3, 4, 5, 6, 7, 8], 8),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+
+        // Never read beyond the declared width, even if the caller hands over
+        // a longer slice.
+        assert_eq!(extend_chunk(&[1, 2, 3, 4], 2), [1, 2, 0, 0, 0, 0, 0, 0]);
+    }
+
+    // The declared width decides the sign, not the bytes present.
+    #[test]
+    fn a_short_chunk_is_signed_at_the_declared_width() {
+        // 0xc7 alone is negative as an i8 and positive as a little-endian i32.
+        assert_eq!(chunk_to_i64(&[0xc7], 1), -57);
+        let want = if cfg!(target_endian = "little") {
+            199
+        } else {
+            -956301312
+        };
+        assert_eq!(chunk_to_i64(&[0xc7], 4), want);
+        assert_eq!(chunk_to_u64(&[0xc7], 1), 199);
     }
 
     #[test]

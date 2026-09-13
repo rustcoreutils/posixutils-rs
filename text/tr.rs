@@ -1443,8 +1443,19 @@ mod setup {
                                 .to_owned(),
                         ));
                     }
-                    Operand::Class(_) => {
-                        unreachable!("case-conversion classes are removed, others rejected")
+                    Operand::Class(name) => {
+                        // POSIX 118122-5 allows a class in string2 only as the
+                        // case-conversion counterpart of its converse at the
+                        // same relative position in string1. The pass that
+                        // extracts those pairs gives up when the two operand
+                        // lists differ in length, and is not attempted at all
+                        // under `-c`/`-C`, so an unpaired class arrives here.
+                        return Err(Box::from(format!(
+                            "character class '[:{}:]' is valid in string2 only as the \
+                             case conversion counterpart of '[:{}:]' in string1",
+                            name.as_str(),
+                            name.case_converse().map_or("upper", ClassName::as_str),
+                        )));
                     }
                 }
             }
@@ -1487,6 +1498,22 @@ mod setup {
                 // An empty string2 is rejected before here.
                 None => (0_usize, DataTypeWithData::Is7Bit(0_u8)),
             }
+        }
+
+        /// The single character a complement maps every non-member to.
+        ///
+        /// `[c*]` is the construct that means "as many as needed", so when
+        /// string2 has one it covers the complement -- `tr -c a '[x*]y'`
+        /// replaces with `x`, not with the `y` that merely happens to be
+        /// written last. Without a fill, the last character stands.
+        fn complement_replacement(&self) -> DataTypeWithData {
+            self.runs
+                .iter()
+                .find(|(_, len)| len.is_none())
+                .or_else(|| self.runs.last())
+                .map_or(DataTypeWithData::Is7Bit(0_u8), |(element, _)| {
+                    element.clone()
+                })
         }
 
         /// The element at `index`.
@@ -1557,7 +1584,17 @@ mod setup {
             let mut set = Set::default();
             for op in &string1_operands {
                 match op {
-                    Operand::Char(CharOperand { char, .. }) => set.push_element(char),
+                    Operand::Char(CharOperand {
+                        char,
+                        char_repetition,
+                    }) => {
+                        if matches!(char_repetition, CharRepetition::AsManyAsNeeded) {
+                            return Err(Box::from(
+                                "the [c*] repeat construct may not appear in string1".to_owned(),
+                            ));
+                        }
+                        set.push_element(char);
+                    }
                     Operand::Equiv(EquivOperand { char }) => {
                         set.push_element(char);
                         if let Some(c) = char.as_char() {
@@ -1569,7 +1606,7 @@ mod setup {
             }
 
             let replacements = Replacements::build(&string2_owned)?;
-            let (_, last) = replacements.constant_from();
+            let last = replacements.complement_replacement();
 
             return Ok(ForTranslation::Complemented(Box::new(
                 ComplementedTranslation {

@@ -1325,3 +1325,58 @@ fn tr_class_membership_is_the_same_for_every_operation() {
         "AÉB".as_bytes()
     );
 }
+
+// A `[:class:]` in string2 is valid only as the case-conversion counterpart of
+// its converse in string1, at the same relative position (POSIX 118122-118125).
+// When that pairing does not hold, it is an error -- not a panic.
+//
+// `Replacements::build` asserted the case-conversion pass had removed every
+// class before it, but that pass gives up when the two operand lists differ in
+// length, and is not attempted at all under `-c`/`-C`. Both routes reached the
+// assertion and aborted with exit 101.
+#[test]
+fn tr_unpaired_class_in_string2_is_an_error_not_a_panic() {
+    for args in [
+        // Lengths differ, so the case-conversion pairing is never extracted.
+        vec!["[:lower:]x", "[:upper:]"],
+        // Complement disables case conversion outright.
+        vec!["-c", "[:lower:]", "[:upper:]"],
+        vec!["-c", "[:upper:]", "[:lower:]"],
+        vec!["-cs", "[:lower:]", "[:upper:]"],
+    ] {
+        let (out, code) = tr_in_locale("C", &args, b"abc");
+        assert_eq!(code, 1, "tr {args:?} must fail cleanly, got {code}");
+        assert!(out.is_empty(), "tr {args:?} wrote output: {out:x?}");
+    }
+}
+
+// `[c*]` may not appear in string1 (it maps many characters to one, which only
+// makes sense on the replacement side). The complement branch matched the
+// character and discarded its repeat count, so `-c` accepted what plain `tr`
+// rejects.
+#[test]
+fn tr_repeat_construct_in_string1_is_rejected_under_complement_too() {
+    for args in [
+        vec!["[a*]", "x"],
+        vec!["-c", "[a*]", "x"],
+        vec!["-C", "[a*]", "x"],
+        vec!["-cs", "[a*]", "x"],
+    ] {
+        let (_, code) = tr_in_locale("C", &args, b"abc");
+        assert_eq!(code, 1, "tr {args:?} must reject [c*] in string1");
+    }
+}
+
+// Under a complement every non-member maps to *one* character, and when
+// string2 has a `[c*]` fill that character is the fill -- not whatever happens
+// to be written last. The fill is the construct that means "as many as needed",
+// so it is the one that covers the complement.
+#[test]
+fn tr_complement_replacement_is_the_fill_when_there_is_one() {
+    tr_test(&["-c", "a", "[x*]y"], "abc", "axx");
+    tr_test(&["-c", "a", "[x*0]y"], "abc", "axx");
+    tr_test(&["-cs", "a-e", "[y*0]z"], "abcxyz", "abcy");
+    // With no fill, the last character stands, as before.
+    tr_test(&["-c", "a", "xy"], "abc", "ayy");
+    tr_test(&["-c", "a", "x"], "abc", "axx");
+}

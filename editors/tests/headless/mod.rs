@@ -3275,48 +3275,120 @@ fn test_pipe_column_inside_a_tab_lands_on_the_tab() {
 }
 
 // ============================================================================
-// Commands that are parsed but not implemented
+// :map / :ab definitions -- storage and listing
 // ============================================================================
 
-// These four are POSIX ex commands. They were parsed and then dropped into a
-// `_ =>` arm that returned success, so the user typed `:map x dd`, saw no
-// error, and had no way to learn the mapping was never made.
-//
-// They are still unimplemented -- what changed is that they say so.
-//
-// `:pop` and `:tags` used to be on this list too, on the strength of a claim
-// that all six were POSIX. They are not: "pop" appears nowhere in the ex or vi
-// specs, and the `tags` POSIX defines (95941) is the `:set tags=` edit option
-// naming the files `:tag` searches, not a command that lists anything. Both are
-// extensions, both are implemented, and NONPOSIX.md records them.
+/// `:map` and `:ab` define; `:unmap` and `:una` remove; the no-argument forms
+/// list (95080-95083, 94864). Expansion is not wired up yet, so what is
+/// observable here is that a definition is stored and comes back.
 #[test]
-fn unimplemented_ex_commands_report_themselves() {
-    for (keys, name) in [
-        (":map x dd\n", "map"),
-        (":unmap x\n", "unmap"),
-        (":ab foo bar\n", "abbreviate"),
-        (":una foo\n", "unabbreviate"),
-    ] {
-        let mut editor = Editor::new_headless();
-        editor.set_buffer_text("alpha\nbravo\n");
-        // The keystrokes are accepted; the editor reports the command rather
-        // than pretending it worked.
-        editor
-            .execute_keys(keys)
-            .expect("an unimplemented command must not unwind out of the editor");
-        assert!(
-            editor.is_error_message(),
-            "{keys:?} must report on the status line, got {:?}",
-            editor.get_message()
-        );
-        let msg = editor.get_message().unwrap_or_default().to_string();
-        assert!(
-            msg.contains(name) && msg.contains("not implemented"),
-            "{keys:?} must name {name:?}, got {msg:?}"
-        );
-        // And it must not have silently altered the buffer.
-        assert_eq!(editor.get_buffer_text(), "alpha\nbravo\n");
-    }
+fn test_map_and_ab_define_and_list() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+
+    editor.execute_keys(":map q dd\n").unwrap();
+    assert!(!editor.is_error_message(), "{:?}", editor.get_message());
+
+    editor.execute_keys(":map\n").unwrap();
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(msg.contains('q') && msg.contains("dd"), "got {msg:?}");
+
+    editor.execute_keys(":ab teh the\n").unwrap();
+    editor.execute_keys(":ab\n").unwrap();
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(msg.contains("teh") && msg.contains("the"), "got {msg:?}");
+}
+
+/// 95089-95092: the `!` form is a separate list, so one lhs can hold two
+/// definitions at once, and `:map` must not show the `:map!` one.
+#[test]
+fn test_map_bang_is_a_separate_list() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+    editor.execute_keys(":map q dd\n").unwrap();
+    editor.execute_keys(":map! q xyz\n").unwrap();
+
+    editor.execute_keys(":map\n").unwrap();
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(msg.contains("dd") && !msg.contains("xyz"), "got {msg:?}");
+
+    editor.execute_keys(":map!\n").unwrap();
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(msg.contains("xyz") && !msg.contains("dd"), "got {msg:?}");
+
+    // Removing from one list leaves the other alone.
+    editor.execute_keys(":unmap q\n").unwrap();
+    assert!(!editor.is_error_message(), "{:?}", editor.get_message());
+    editor.execute_keys(":map!\n").unwrap();
+    assert!(editor.get_message().unwrap_or_default().contains("xyz"));
+}
+
+/// Removing something that is not there is an error for both commands
+/// (95457-95462 for `unmap`, 95436-95437 for `una`), and `:unmap!` addresses
+/// only the text input list.
+#[test]
+fn test_unmap_and_una_report_a_missing_entry() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+
+    editor.execute_keys(":unmap nosuch\n").unwrap();
+    assert!(editor.is_error_message(), "{:?}", editor.get_message());
+    editor.execute_keys(":una nosuch\n").unwrap();
+    assert!(editor.is_error_message(), "{:?}", editor.get_message());
+
+    // Defined in the command list only, so the `!` form must still fail.
+    editor.execute_keys(":map q dd\n").unwrap();
+    editor.execute_keys(":unmap! q\n").unwrap();
+    assert!(
+        editor.is_error_message(),
+        "unmap! addresses the text input list; got {:?}",
+        editor.get_message()
+    );
+    editor.execute_keys(":unmap q\n").unwrap();
+    assert!(!editor.is_error_message(), "{:?}", editor.get_message());
+}
+
+/// `is_error` describes `message`, so clearing one has to clear the other.
+/// Four sites assigned `message = None` on its own, so the flag outlived the
+/// message it described and the next command that succeeded still read as
+/// having failed. Surfaced by the `:unmap` test above, which does exactly this
+/// sequence.
+#[test]
+fn test_the_error_flag_does_not_outlive_its_message() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+
+    editor.execute_keys(":unmap nosuch\n").unwrap();
+    assert!(editor.is_error_message(), "the failure is reported");
+
+    // Any subsequent keystroke discards the message; the flag must go with it.
+    editor.execute_keys("j").unwrap();
+    assert!(editor.get_message().is_none(), "the message is gone");
+    assert!(
+        !editor.is_error_message(),
+        "and so is the flag that described it"
+    );
+}
+
+/// The `^V` quoting proved at the ex-command-line level in
+/// `test_ctrl_v_on_the_ex_line_quotes_the_next_key` now has somewhere to land:
+/// `:map Q :wq^V^M` must store a carriage return, which the listing shows as
+/// `^M` rather than ending the line.
+#[test]
+fn test_ctrl_v_quoted_cr_survives_into_the_stored_map() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+    // The quoted Enter is a CR in the replacement; a second Enter submits.
+    editor.execute_keys(":map Q :wq\x16\n").unwrap();
+    editor.execute_keys("\n").unwrap();
+    assert!(!editor.is_error_message(), "{:?}", editor.get_message());
+
+    editor.execute_keys(":map\n").unwrap();
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(
+        msg.contains(":wq^M"),
+        "the CR must be stored and shown in caret notation; got {msg:?}"
+    );
 }
 
 // ============================================================================
@@ -3554,11 +3626,11 @@ fn test_ctrl_v_on_the_ex_line_quotes_the_next_key() {
         editor.get_message()
     );
 
-    // An unquoted Enter does submit it.
+    // An unquoted Enter does submit it, and the definition takes.
     editor.execute_keys("\n").unwrap();
     assert_eq!(editor.get_mode(), Mode::Command);
     assert!(
-        editor.get_message().unwrap_or_default().contains("map"),
+        !editor.is_error_message(),
         "the line should have parsed as a map definition; got {:?}",
         editor.get_message()
     );
@@ -3575,9 +3647,17 @@ fn test_backspace_erases_a_quoted_pair_on_the_ex_line() {
     // `x` and the diagnostic would name something else.
     editor.execute_keys(":ab x \x16 \x7f").unwrap();
     editor.execute_keys("y\n").unwrap();
-    let msg = editor.get_message().unwrap_or_default().to_string();
     assert!(
-        msg.contains("abbreviate"),
-        "should have parsed as an abbreviation; got {msg:?}"
+        !editor.is_error_message(),
+        "should have parsed as an abbreviation; got {:?}",
+        editor.get_message()
+    );
+    // And the lhs really is `x`: removing exactly `x` succeeds, which it could
+    // not if the erase had left the stray ^V attached to it.
+    editor.execute_keys(":una x\n").unwrap();
+    assert!(
+        !editor.is_error_message(),
+        "the lhs should be exactly `x`; got {:?}",
+        editor.get_message()
     );
 }

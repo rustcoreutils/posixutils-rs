@@ -17,10 +17,11 @@ mod executor;
 use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
 use crate::command::CommandParser;
 use crate::error::{Result, ViError};
-use crate::ex::command::{SubstituteFlags, CTRL_V};
+use crate::ex::command::{MapMode, SubstituteFlags, CTRL_V};
 use crate::ex::{parse_ex_command, AddressRange, ExCommand, ExResult};
 use crate::file::{read_file, write_file, write_range, FileManager};
 use crate::input::{InputReader, Key};
+use crate::maps::keys_from_text;
 use crate::mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
 use crate::options::Options;
 use crate::register::{RegisterContent, Registers};
@@ -174,6 +175,8 @@ pub struct Editor {
     is_error: bool,
     /// Marks (a-z for user, other for special).
     marks: [Option<Position>; 26],
+    /// `:map`, `:map!` and `:ab` definitions.
+    maps: crate::maps::Maps,
     /// A `^V` on the ex command line is pending, so the next key is quoted.
     ///
     /// Only the four commands POSIX gives `<control>-V` escaping to
@@ -276,6 +279,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            maps: crate::maps::Maps::default(),
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -322,6 +326,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            maps: crate::maps::Maps::default(),
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -371,6 +376,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            maps: crate::maps::Maps::default(),
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -634,14 +640,14 @@ impl Editor {
                                 println!("{}", msg);
                             }
                         }
-                        self.message = None;
+                        self.clear_message();
                     }
                     Ok(false) => {}
                     Err(e) => {
                         if !self.silent_mode {
                             eprintln!("{}", e);
                         }
-                        self.message = None;
+                        self.clear_message();
                     }
                 }
                 continue;
@@ -721,7 +727,7 @@ impl Editor {
                     }
                 }
             }
-            self.message = None;
+            self.clear_message();
         }
 
         Ok(self.exit_code)
@@ -848,7 +854,7 @@ impl Editor {
     fn handle_key(&mut self, key: Key) -> Result<()> {
         // Clear any previous message
         if !matches!(key, Key::Char(':')) {
-            self.message = None;
+            self.clear_message();
         }
 
         match &self.mode {
@@ -3084,12 +3090,41 @@ impl Editor {
             // Parsed but not implemented. These returned `Continue` through the
             // wildcard below, so the editor accepted `:map x dd` in silence and
             // the user had no way to learn the mapping was never made.
-            ExCommand::Map { .. } => Err(ViError::NotImplemented("map")),
-            ExCommand::MapList { .. } => Err(ViError::NotImplemented("map")),
-            ExCommand::Unmap { .. } => Err(ViError::NotImplemented("unmap")),
-            ExCommand::Abbreviate { .. } => Err(ViError::NotImplemented("abbreviate")),
-            ExCommand::AbbrevList => Err(ViError::NotImplemented("abbreviate")),
-            ExCommand::Unabbreviate { .. } => Err(ViError::NotImplemented("unabbreviate")),
+            ExCommand::Map { lhs, rhs, mode } => {
+                self.maps
+                    .table_mut(mode)
+                    .set(keys_from_text(&lhs), keys_from_text(&rhs));
+                Ok(ExResult::Continue)
+            }
+            // 95080-95083: with no arguments, write the list for this mode and
+            // do nothing more.
+            ExCommand::MapList { mode } => {
+                Ok(ExResult::CommandOutput(self.maps.table(mode).list()))
+            }
+            ExCommand::Unmap { lhs, mode } => {
+                if self.maps.table_mut(mode).remove(&keys_from_text(&lhs)) {
+                    Ok(ExResult::Continue)
+                } else {
+                    // 95457-95462: removing something that is not in that
+                    // mode's list "shall be an error".
+                    Err(ViError::NoSuchMap(lhs, mode == MapMode::Insert))
+                }
+            }
+            ExCommand::Abbreviate { lhs, rhs } => {
+                self.maps.abbrev.set(lhs, keys_from_text(&rhs));
+                Ok(ExResult::Continue)
+            }
+            // 94864: with no arguments, write the list and do nothing more.
+            ExCommand::AbbrevList => Ok(ExResult::CommandOutput(self.maps.abbrev.list())),
+            ExCommand::Unabbreviate { lhs } => {
+                if self.maps.abbrev.remove(&lhs) {
+                    Ok(ExResult::Continue)
+                } else {
+                    // 95436-95437: "If lhs is not an entry in the current list
+                    // of abbreviations ... it shall be an error."
+                    Err(ViError::NoSuchAbbreviation(lhs))
+                }
+            }
             ExCommand::Pop => {
                 self.pop_tag()?;
                 Ok(ExResult::Continue)
@@ -4401,6 +4436,17 @@ impl Editor {
     fn set_error(&mut self, msg: &str) {
         self.message = Some(msg.to_string());
         self.is_error = true;
+    }
+
+    /// Discard the current message.
+    ///
+    /// `is_error` describes `message`, so the two have to be cleared together.
+    /// Four sites used to assign `self.message = None` on its own, leaving the
+    /// flag set from a message that no longer existed — after which a command
+    /// that succeeded silently still read as having failed.
+    fn clear_message(&mut self) {
+        self.message = None;
+        self.is_error = false;
     }
 
     /// Page up (Ctrl-B).

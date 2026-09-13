@@ -78,6 +78,11 @@ pub enum ViError {
     NoTagsFile,
     /// `:pop` or `^T` with nothing left to return to.
     TagStackEmpty,
+    /// `:unmap` naming something that is not in that mode's map list
+    /// (95457-95462). Carries the `lhs` and whether `!` was given.
+    NoSuchMap(String, bool),
+    /// `:una` naming something that is not an abbreviation (95436-95437).
+    NoSuchAbbreviation(String),
     /// Invalid line number.
     InvalidLine(usize),
     /// Invalid pattern.
@@ -131,6 +136,11 @@ impl fmt::Display for ViError {
             ViError::TagNotFound(s) => write!(f, "Tag not found: {}", s),
             ViError::NoTagsFile => write!(f, "No tags file"),
             ViError::TagStackEmpty => write!(f, "tag stack empty"),
+            ViError::NoSuchMap(lhs, bang) => {
+                let list = if *bang { "text input" } else { "command" };
+                write!(f, "no {} mode map for: {}", list, lhs)
+            }
+            ViError::NoSuchAbbreviation(lhs) => write!(f, "no such abbreviation: {}", lhs),
             ViError::InvalidLine(n) => write!(f, "Invalid line: {}", n),
             ViError::InvalidPattern(s) => write!(f, "Invalid pattern: {}", s),
             ViError::ShellError(s) => write!(f, "Shell error: {}", s),

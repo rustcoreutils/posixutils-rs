@@ -533,3 +533,102 @@ fn test_du_error_names_the_operand() {
     );
     assert_ne!(out.status.code(), Some(0));
 }
+
+// ============================================================================
+// `-x` device boundary
+// ============================================================================
+
+/// Find a directory that contains a subdirectory on a *different* device.
+///
+/// `tree/audit.md` recorded `-x` as untestable because it "needs a real mount
+/// point, so CI cannot exercise it". That is not so: a device boundary needs
+/// no root and no setup, only a host that already has one. `/dev` (devtmpfs)
+/// containing `/dev/shm` (tmpfs) is the usual one on Linux.
+///
+/// The probe is a *runtime* check, not `cfg!(target_os = ...)`, because the
+/// question is not which OS this is but whether this particular host offers a
+/// boundary -- a container may mount neither. Returns the parent, the child,
+/// and the child's final path component, which is what the output is searched
+/// for. Recorded as a gap rather than papered over when nothing qualifies.
+fn crossing_boundary() -> Option<(&'static str, &'static str, &'static str)> {
+    const CANDIDATES: &[(&str, &str, &str)] = &[
+        ("/dev", "/dev/shm", "shm"),
+        ("/dev", "/dev/pts", "pts"),
+        ("/run", "/run/user", "user"),
+    ];
+
+    CANDIDATES.iter().copied().find(|(parent, child, _)| {
+        let (Ok(p), Ok(c)) = (fs::metadata(parent), fs::metadata(child)) else {
+            return false;
+        };
+        // Both readable, and genuinely on different filesystems.
+        p.dev() != c.dev() && fs::read_dir(parent).is_ok()
+    })
+}
+
+/// `du -x` must not descend into a subdirectory on another filesystem, and
+/// plain `du` must.
+///
+/// Asserting both halves is what makes this a test of `-x` rather than a test
+/// that some path is absent: the same command without the option has to report
+/// the very entry that `-x` suppresses, or the fixture proves nothing.
+#[test]
+fn test_du_x_stops_at_a_device_boundary() {
+    let Some((parent, child, leaf)) = crossing_boundary() else {
+        eprintln!(
+            "skipping: this host offers no readable directory containing a \
+             subdirectory on another device, so there is no boundary to cross"
+        );
+        return;
+    };
+
+    let lists_child = |args: &[&str]| -> bool {
+        let out = std::process::Command::new(plib::testing::get_binary_path("du"))
+            .args(args)
+            .output()
+            .expect("spawn du");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().nth(1).is_some_and(|p| p == child))
+    };
+
+    assert!(
+        lists_child(&[parent]),
+        "without -x, du must report {child} when walking {parent}; \
+         if it does not, this fixture cannot show -x doing anything"
+    );
+    assert!(
+        !lists_child(&["-x", parent]),
+        "du -x must not descend into {child}, which is on another device \
+         from {parent} (leaf {leaf})"
+    );
+}
+
+/// `-x` is about the device, not about depth: entries on the *same* device as
+/// the operand must still be reported. Without this, an `-x` that simply
+/// refused to descend at all would pass the test above.
+#[test]
+fn test_du_x_still_descends_within_one_filesystem() {
+    let test_dir = &format!("{}/test_du_x_same_fs", env!("CARGO_TARGET_TMPDIR"));
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(format!("{}/sub/deeper", test_dir)).unwrap();
+    let mut f = fs::File::create(format!("{}/sub/deeper/file.txt", test_dir)).unwrap();
+    f.write_all(b"some bytes\n").unwrap();
+    drop(f);
+
+    let out = std::process::Command::new(plib::testing::get_binary_path("du"))
+        .args(["-x", test_dir])
+        .output()
+        .expect("spawn du");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    for expected in ["sub/deeper", "sub"] {
+        assert!(
+            stdout.contains(expected),
+            "-x must still descend within one filesystem; {expected} missing from {stdout:?}"
+        );
+    }
+    assert_eq!(out.status.code(), Some(0));
+
+    let _ = fs::remove_dir_all(test_dir);
+}

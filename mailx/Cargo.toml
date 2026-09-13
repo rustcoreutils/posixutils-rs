@@ -12,6 +12,7 @@ chrono.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 plib = { path = "../plib" }
+terminfo = "0.9"
 
 
 [lints]

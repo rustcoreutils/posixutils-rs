@@ -1088,6 +1088,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "terminfo",
 ]
 
 [[package]]

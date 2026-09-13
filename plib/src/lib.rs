@@ -20,6 +20,7 @@ pub mod lzw;
 pub mod modestr;
 pub mod platform;
 pub mod priority;
+pub mod projectdir;
 pub mod regex;
 pub mod sccsfile;
 pub mod syslog;

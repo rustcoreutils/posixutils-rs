@@ -501,9 +501,20 @@ mod parsing {
         /// characters of string2 — a case POSIX calls out as having undefined
         /// order (118159-118162) and discourages. Set membership and case
         /// conversion use [`ClassName::contains`] instead and never enumerate.
-        pub fn ascii_members(self) -> Vec<char> {
-            (0_u8..=127_u8)
-                .map(char::from)
+        /// The class's members, in ascending order.
+        ///
+        /// Only a translation that spreads distinct replacements across a class
+        /// needs these; the common many-to-one case keeps the class a
+        /// predicate. POSIX leaves the order unspecified (118133-4).
+        ///
+        /// The scan stops at the Basic Multilingual Plane. `LC_CTYPE` can put
+        /// members above it, but a translation that pairs them positionally
+        /// would have to enumerate a million code points to find a handful, and
+        /// the construct POSIX defines for that case -- mapping the class to
+        /// one character -- never reaches here.
+        pub fn members(self) -> Vec<char> {
+            (0_u32..=0xFFFF_u32)
+                .filter_map(char::from_u32)
                 .filter(|&c| self.contains(c))
                 .collect()
         }
@@ -1173,71 +1184,6 @@ mod setup {
     };
     use std::error::Error;
 
-    fn add_normal_char(
-        data_type_with_data: DataTypeWithData,
-        seven_bit: &mut [bool; 128_usize],
-        eight_bit: &mut [bool; 128_usize],
-        multi_byte: &mut [Option<Vec<Search>>; 128_usize],
-    ) {
-        match data_type_with_data {
-            DataTypeWithData::Is7Bit(ue) => {
-                let index = usize::from(ue);
-
-                seven_bit[index] = true;
-            }
-            DataTypeWithData::Is8Bit(ue) => {
-                let adjusted = ue - 128_u8;
-
-                let index = usize::from(adjusted);
-
-                eight_bit[index] = true;
-            }
-            DataTypeWithData::IsMultiByte(ch) => {
-                let mut encoding_buffer = [0_u8; 4_usize];
-
-                let st = ch.encode_utf8(&mut encoding_buffer);
-
-                let &[ue, ref rest @ ..] = st.as_bytes() else {
-                    unreachable!();
-                };
-
-                let adjusted = ue - 128_u8;
-
-                let index = usize::from(adjusted);
-
-                // TODO
-                if multi_byte[index].is_none() {
-                    multi_byte[index] = Some(Vec::<Search>::new())
-                }
-
-                // TODO
-                let vec = multi_byte.get_mut(index).unwrap().as_mut().unwrap();
-
-                let search = match *rest {
-                    [a] => Search {
-                        number_of_bytes: SearchNumberOfBytes::One,
-                        payload: [a, 0_u8, 0_u8],
-                    },
-                    [a, b] => Search {
-                        number_of_bytes: SearchNumberOfBytes::Two,
-                        payload: [a, b, 0_u8],
-                    },
-                    [a, b, c] => Search {
-                        number_of_bytes: SearchNumberOfBytes::Three,
-                        payload: [a, b, c],
-                    },
-                    _ => {
-                        unreachable!();
-                    }
-                };
-
-                // TODO
-                // Order?
-                vec.push(search);
-            }
-        };
-    }
-
     /// One `[=c=]`, answered by libc.
     ///
     /// POSIX defines the equivalence class by `LC_COLLATE` (118137-118138), and
@@ -1427,42 +1373,6 @@ mod setup {
         st.chars().next().map(|c| (c, extra))
     }
 
-    /// Flatten symbolic `[:class:]` operands into their ASCII members.
-    ///
-    /// A transitional shim: it reproduces exactly what parsing used to do, so
-    /// the set builders below are unchanged while provenance becomes available
-    /// upstream. Later phases consume `Operand::Class` directly — as a
-    /// predicate for membership, and as the case-conversion signal — and this
-    /// is applied only on the paths that still need concrete characters.
-    fn flatten_classes(operands: Vec<Operand>) -> Vec<Operand> {
-        let mut out = Vec::with_capacity(operands.len());
-        for op in operands {
-            match op {
-                Operand::Class(name) => out.extend(name.ascii_members().into_iter().map(|ch| {
-                    Operand::Char(CharOperand {
-                        char: crate::parsing::categorize_char(ch),
-                        char_repetition: CharRepetition::N(1_usize),
-                    })
-                })),
-                other => out.push(other),
-            }
-        }
-        out
-    }
-
-    /// How many *additional* bytes the character starting at `lead` occupies,
-    /// for a `-C` complement miss: the whole character is replaced once, not
-    /// once per byte. `None` when the bytes are not a complete character, in
-    /// which case the byte-wise advance still applies.
-    fn char_wise_lookahead(lead: u8, next_bytes: &[u8]) -> Option<SearchNumberOfBytes> {
-        match decode_char(lead, next_bytes) {
-            Some((_, 1_usize)) => Some(SearchNumberOfBytes::One),
-            Some((_, 2_usize)) => Some(SearchNumberOfBytes::Two),
-            Some((_, 3_usize)) => Some(SearchNumberOfBytes::Three),
-            _ => None,
-        }
-    }
-
     /// Split out `[:lower:]`↔`[:upper:]` pairings that sit at the same relative
     /// position in the two operand lists (POSIX 118123-118130).
     ///
@@ -1507,6 +1417,140 @@ mod setup {
         Some((folds, keep(string1), keep(string2)))
     }
 
+    /// What string2 supplies at each position of the translation, without
+    /// materialising any of it.
+    ///
+    /// POSIX describes string2 as an array padded out to string1's length, but
+    /// the padding is always *one repeating element* — the `[c*]` fill, or the
+    /// last element when string2 simply runs short. So the array is a handful
+    /// of runs, and a position is answered by walking them. `[x*4294967296]`
+    /// costs one run rather than four billion elements.
+    struct Replacements {
+        /// `(element, length)`. A `None` length is the unbounded `[c*]` fill.
+        runs: Vec<(DataTypeWithData, Option<usize>)>,
+    }
+
+    impl Replacements {
+        fn build(operands: &[Operand]) -> Result<Self, Box<dyn Error>> {
+            let mut runs = Vec::<(DataTypeWithData, Option<usize>)>::new();
+            let mut fills = 0_usize;
+
+            for op in operands {
+                match op {
+                    Operand::Char(CharOperand {
+                        char,
+                        char_repetition,
+                    }) => match char_repetition {
+                        CharRepetition::AsManyAsNeeded => {
+                            fills += 1_usize;
+                            if fills > 1_usize {
+                                return Err(Box::from(
+                                    "only one [c*] repeat construct may appear in string2"
+                                        .to_owned(),
+                                ));
+                            }
+                            runs.push((char.clone(), None));
+                        }
+                        CharRepetition::N(n) => runs.push((char.clone(), Some(*n))),
+                    },
+                    Operand::Equiv(_) => {
+                        return Err(Box::from(
+                            "[=c=] expressions may not appear in string2 when translating"
+                                .to_owned(),
+                        ));
+                    }
+                    Operand::Class(_) => {
+                        unreachable!("case-conversion classes are removed, others rejected")
+                    }
+                }
+            }
+
+            Ok(Replacements { runs })
+        }
+
+        /// Is there an unbounded `[c*]` fill with elements after it? Only then
+        /// does anything need string1's total length: the fill has to be sized
+        /// to push those trailing elements to the end.
+        fn fill_needs_string1_length(&self) -> bool {
+            match self.runs.iter().position(|(_, len)| len.is_none()) {
+                Some(index) => index + 1_usize < self.runs.len(),
+                None => false,
+            }
+        }
+
+        /// Resolve the unbounded fill now that string1's length is known.
+        fn size_fill(&mut self, string1_len: usize) {
+            let Some(index) = self.runs.iter().position(|(_, len)| len.is_none()) else {
+                return;
+            };
+            let explicit: usize = self.runs.iter().filter_map(|&(_, len)| len).sum();
+            self.runs[index].1 = Some(string1_len.saturating_sub(explicit));
+        }
+
+        /// The position from which every element is the same, and that element.
+        ///
+        /// The final run extends forever — either it is the fill, or it is the
+        /// last element and string2 pads with it — so this is the total length
+        /// of everything before it. Once string1 reaches this position, no
+        /// later position can differ, which is what lets a character class be
+        /// mapped without enumerating it.
+        fn constant_from(&self) -> (usize, DataTypeWithData) {
+            match self.runs.split_last() {
+                Some(((element, _), rest)) => {
+                    let before = rest.iter().map(|&(_, len)| len.unwrap_or(0_usize)).sum();
+                    (before, element.clone())
+                }
+                // An empty string2 is rejected before here.
+                None => (0_usize, DataTypeWithData::Is7Bit(0_u8)),
+            }
+        }
+
+        /// The element at `index`.
+        fn at(&self, index: usize) -> DataTypeWithData {
+            let mut seen = 0_usize;
+            for (element, len) in &self.runs {
+                match len {
+                    // The fill, or the final run: everything from here on.
+                    None => return element.clone(),
+                    Some(n) => {
+                        if index < seen + n {
+                            return element.clone();
+                        }
+                        seen += n;
+                    }
+                }
+            }
+            // Past the end: string2 pads with its last element.
+            self.runs
+                .last()
+                .map_or(DataTypeWithData::Is7Bit(0_u8), |(element, _)| {
+                    element.clone()
+                })
+        }
+    }
+
+    /// How many positions of the translation array each string1 operand fills.
+    ///
+    /// A character's repeat count is a number, an equivalence class is one
+    /// position — the question `// Take up one position?` used to leave open,
+    /// and whose absence from the old length counter made every padded string2
+    /// fail with "Indexing failed". A class is as many positions as `LC_CTYPE`
+    /// gives it, which is the one answer that costs something to compute.
+    fn string1_span(op: &Operand) -> Result<usize, Box<dyn Error>> {
+        match op {
+            Operand::Char(CharOperand {
+                char_repetition, ..
+            }) => match char_repetition {
+                CharRepetition::AsManyAsNeeded => Err(Box::from(
+                    "the [c*] repeat construct may not appear in string1".to_owned(),
+                )),
+                CharRepetition::N(n) => Ok(*n),
+            },
+            Operand::Equiv(_) => Ok(1_usize),
+            Operand::Class(name) => Ok(name.members().len()),
+        }
+    }
+
     pub fn generate_for_translation(
         complement: bool,
         complement_chars: bool,
@@ -1523,357 +1567,179 @@ mod setup {
             None => (Vec::new(), string1_operands, string2_operands.to_vec()),
         };
 
-        let string1_operands = flatten_classes(string1_operands);
-        let string2_flattened_classes = flatten_classes(string2_owned);
-        let string2_operands = string2_flattened_classes.as_slice();
-
-        let mut char_repeating_total = 0_usize;
-
-        let mut string1_operands_flattened = Vec::<Operand>::new();
-
-        for op in string1_operands {
-            match op {
-                Operand::Char(CharOperand {
-                    char_repetition,
-                    char,
-                }) => match char_repetition {
-                    CharRepetition::AsManyAsNeeded => {
-                        return Err(Box::from(
-                            "the [c*] repeat construct may not appear in string1".to_owned(),
-                        ));
-                    }
-                    CharRepetition::N(n) => {
-                        char_repeating_total = char_repeating_total
-                            .checked_add(n)
-                            .ok_or("Arithmetic overflow")?;
-
-                        let new_char = Operand::Char(CharOperand {
-                            char,
-                            char_repetition: CharRepetition::N(1_usize),
-                        });
-
-                        for _ in 0_usize..n {
-                            string1_operands_flattened.push(new_char.clone());
+        // The complemented forms map every *non*-member to one character, so
+        // they need membership and a single replacement — never an array.
+        if complement {
+            let mut set = Set::default();
+            for op in &string1_operands {
+                match op {
+                    Operand::Char(CharOperand { char, .. }) => set.push_element(char),
+                    Operand::Equiv(EquivOperand { char }) => {
+                        set.push_element(char);
+                        if let Some(c) = char.as_char() {
+                            set.push_equivalence(c);
                         }
                     }
-                },
-                op @ Operand::Equiv(_) => {
-                    // Take up one position?
-                    string1_operands_flattened.push(op);
+                    Operand::Class(name) => set.push_class(*name),
                 }
-                // `flatten_classes` above replaced every class with its members.
-                Operand::Class(_) => unreachable!("classes are flattened on entry"),
             }
+
+            let replacements = Replacements::build(&string2_owned)?;
+            let (_, last) = replacements.constant_from();
+
+            return Ok(ForTranslation::Complemented(Box::new(
+                ComplementedTranslation {
+                    set,
+                    char_wise: complement_chars,
+                    replacement: last.convert_to_replacement(),
+                },
+            )));
         }
 
-        // TODO
-        // Indexing is a workaround for the borrow checker
-        let mut as_many_as_needed_index = Option::<usize>::None;
+        let mut replacements = Replacements::build(&string2_owned)?;
+        if replacements.fill_needs_string1_length() {
+            // The one shape that has to know: `[x*]` with elements after it.
+            let mut total = 0_usize;
+            for op in &string1_operands {
+                total = total
+                    .checked_add(string1_span(op)?)
+                    .ok_or("Arithmetic overflow")?;
+            }
+            replacements.size_fill(total);
+        }
+        let (constant_from, constant) = replacements.constant_from();
 
-        let mut replacement_char_repeating_total = 0_usize;
+        let mut equiv = Vec::<(DataTypeWithData, FullChar)>::new();
+        let mut class_rules = Vec::<ClassRule>::new();
 
-        for (us, op) in string2_operands.iter().enumerate() {
+        let mut seven_bit = [const { Option::<FullChar>::None }; 128_usize];
+        let mut eight_bit = [const { Option::<FullChar>::None }; 256_usize];
+        let mut multi_byte = [const { Option::<Vec<SearchAndReplace>>::None }; 256_usize];
+
+        let mut encoding_buffer = [0_u8; 4_usize];
+
+        let mut add_normal_char_with_replacement =
+            |da: DataTypeWithData, replacement_char: FullChar| match da {
+                DataTypeWithData::Is7Bit(ue) => {
+                    seven_bit[usize::from(ue)] = Some(replacement_char);
+                }
+                DataTypeWithData::Is8Bit(ue) => {
+                    eight_bit[usize::from(ue - 128_u8)] = Some(replacement_char);
+                }
+                DataTypeWithData::IsMultiByte(ch) => {
+                    let st = ch.encode_utf8(&mut encoding_buffer);
+                    let &[ue, ref rest @ ..] = st.as_bytes() else {
+                        unreachable!();
+                    };
+                    let index = usize::from(ue - 128_u8);
+                    let vec = multi_byte[index].get_or_insert_with(Vec::new);
+                    let number_of_bytes = match rest.len() {
+                        1_usize => SearchNumberOfBytes::One,
+                        2_usize => SearchNumberOfBytes::Two,
+                        _ => SearchNumberOfBytes::Three,
+                    };
+                    let mut payload = [0_u8; 3_usize];
+                    payload[..rest.len()].copy_from_slice(rest);
+                    vec.push(SearchAndReplace {
+                        replacement: replacement_char,
+                        number_of_bytes,
+                        payload,
+                    });
+                }
+            };
+
+        // Walk string1 by position. Once past `constant_from`, every remaining
+        // position holds the same replacement, so positions stop mattering --
+        // and a class reached there needs no enumeration.
+        let mut position = 0_usize;
+
+        for op in &string1_operands {
+            let uniform = position >= constant_from;
+
             match op {
                 Operand::Char(CharOperand {
-                    char_repetition, ..
-                }) => match char_repetition {
-                    CharRepetition::AsManyAsNeeded => {
-                        if as_many_as_needed_index.is_some() {
-                            // TODO
-                            // Do this validation earlier?
+                    char,
+                    char_repetition,
+                }) => {
+                    let n = match char_repetition {
+                        CharRepetition::AsManyAsNeeded => {
                             return Err(Box::from(
-                                "only one [c*] repeat construct may appear in string2".to_owned(),
+                                "the [c*] repeat construct may not appear in string1".to_owned(),
                             ));
                         }
-
-                        as_many_as_needed_index = Some(us);
+                        CharRepetition::N(n) => *n,
+                    };
+                    if uniform {
+                        add_normal_char_with_replacement(
+                            char.clone(),
+                            constant.convert_to_replacement(),
+                        );
+                    } else {
+                        // A character repeated in string1 is unspecified
+                        // (118151-2); the last position wins, as before.
+                        for offset in 0_usize..n {
+                            let replacement = replacements.at(position + offset);
+                            add_normal_char_with_replacement(
+                                char.clone(),
+                                replacement.convert_to_replacement(),
+                            );
+                        }
                     }
-                    CharRepetition::N(n) => {
-                        replacement_char_repeating_total = replacement_char_repeating_total
-                            .checked_add(*n)
-                            .ok_or("Arithmetic overflow")?;
-                    }
-                },
-                Operand::Equiv { .. } => {
-                    // TODO
-                    // Do this validation earlier?
-                    return Err(Box::from(
-                        "[=c=] expressions may not appear in string2 when translating".to_owned(),
-                    ));
+                    position = position.saturating_add(n);
                 }
-                // `flatten_classes` replaced every class before this point.
-                Operand::Class(_) => unreachable!("classes are flattened on entry"),
+                Operand::Equiv(EquivOperand { char }) => {
+                    // One position -- the question the old counter left open.
+                    let replacement = if uniform {
+                        constant.convert_to_replacement()
+                    } else {
+                        replacements.at(position).convert_to_replacement()
+                    };
+                    equiv.push((char.clone(), replacement));
+                    // The literal itself also maps, so an explicit character
+                    // beside its own equivalence class keeps priority.
+                    add_normal_char_with_replacement(char.clone(), replacement);
+                    position += 1_usize;
+                }
+                Operand::Class(name) => {
+                    if uniform {
+                        // Every member maps to the same character, so the class
+                        // stays a predicate: membership follows LC_CTYPE and
+                        // nothing is enumerated. This is the case POSIX blesses
+                        // (118159-62, "map several characters into one").
+                        class_rules.push(ClassRule {
+                            name: *name,
+                            replacement: constant.convert_to_replacement(),
+                        });
+                    } else {
+                        // string2 spreads distinct characters across the class,
+                        // so the members have to be paired one by one. POSIX
+                        // leaves the order unspecified (118133-4); ascending is
+                        // as good as any, and matches what ASCII enumeration
+                        // used to give.
+                        let members = name.members();
+                        for (offset, member) in members.iter().enumerate() {
+                            let replacement = replacements.at(position + offset);
+                            add_normal_char_with_replacement(
+                                crate::parsing::categorize_char(*member),
+                                replacement.convert_to_replacement(),
+                            );
+                        }
+                        position = position.saturating_add(members.len());
+                    }
+                }
             }
         }
 
-        let translation = if complement {
-            // Replacement is: the only repeat construct, or the last character. No equiv is allowed.
-            let replacement = match as_many_as_needed_index {
-                Some(us) => {
-                    let Some(Operand::Char(CharOperand {
-                        char_repetition: CharRepetition::AsManyAsNeeded,
-                        char,
-                    })) = string2_operands.get(us)
-                    else {
-                        unreachable!();
-                    };
-
-                    char.convert_to_replacement()
-                }
-                None => {
-                    let Some(Operand::Char(CharOperand {
-                        char_repetition: CharRepetition::N(_),
-                        char,
-                    })) = string2_operands.iter().next_back()
-                    else {
-                        // TODO
-                        unreachable!();
-                    };
-
-                    char.convert_to_replacement()
-                }
-            };
-
-            let mut equiv = Vec::<DataTypeWithData>::new();
-
-            let mut seven_bit = [false; 128_usize];
-            let mut eight_bit = [false; 128_usize];
-            let mut multi_byte = [const { Option::<Vec<Search>>::None }; 128_usize];
-
-            {
-                for op in string1_operands_flattened.into_iter() {
-                    match op {
-                        Operand::Char(CharOperand {
-                            char,
-                            char_repetition,
-                        }) => {
-                            // TODO
-                            // Enforce with types
-                            assert!(matches!(char_repetition, CharRepetition::N(1_usize)));
-
-                            add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
-                        }
-                        Operand::Equiv(EquivOperand { char }) => {
-                            equiv.push(char.clone());
-
-                            // TODO
-                            // Fix for `tr_equivalence_class_low_priority`
-                            add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
-                        }
-                        // `flatten_classes` replaced every class before this point.
-                        Operand::Class(_) => unreachable!("classes are flattened on entry"),
-                    }
-                }
-            }
-
-            ForTranslation::Complemented(Box::new(ComplementedTranslation {
-                char_wise: complement_chars,
-                replacement,
-                seven_bit,
-                eight_bit,
-                multi_byte,
-                equiv,
-            }))
-        } else {
-            // Hoist for lifetime
-            let string2_operands_with_leftover;
-
-            let string2_operands_to_use = if replacement_char_repeating_total < char_repeating_total
-            {
-                let leftover = char_repeating_total
-                    .checked_sub(replacement_char_repeating_total)
-                    .ok_or("Arithmetic overflow")?;
-
-                // TODO
-                // to_vec
-                let mut vec = string2_operands.to_vec();
-
-                match as_many_as_needed_index {
-                    Some(us) => {
-                        let op = vec.get_mut(us).ok_or("Indexing failed")?;
-
-                        match op {
-                            Operand::Char(CharOperand {
-                                ref mut char_repetition,
-                                ..
-                            }) => {
-                                *char_repetition = CharRepetition::N(leftover);
-                            }
-                            Operand::Equiv(_) => {
-                                unreachable!();
-                            }
-                            // `flatten_classes` replaced every class before this point.
-                            Operand::Class(_) => unreachable!("classes are flattened on entry"),
-                        }
-                    }
-                    None => {
-                        let mut n_updated = false;
-
-                        for op in vec.iter_mut().rev() {
-                            if let Operand::Char(CharOperand {
-                                char_repetition: CharRepetition::N(ref mut n),
-                                ..
-                            }) = op
-                            {
-                                let n_plus_leftover =
-                                    n.checked_add(leftover).ok_or("Arithmetic overflow")?;
-
-                                *n = n_plus_leftover;
-
-                                n_updated = true;
-
-                                break;
-                            }
-                        }
-
-                        assert!(n_updated);
-                    }
-                }
-
-                string2_operands_with_leftover = vec;
-
-                &string2_operands_with_leftover
-            } else {
-                string2_operands
-            };
-
-            // TODO
-            // Capacity
-            let mut string2_operands_to_use_flattened = Vec::<DataTypeWithData>::new();
-
-            for op in string2_operands_to_use {
-                match op {
-                    Operand::Char(CharOperand {
-                        char_repetition,
-                        char,
-                    }) => match char_repetition {
-                        CharRepetition::N(n) => {
-                            for _ in 0_usize..(*n) {
-                                string2_operands_to_use_flattened.push(char.to_owned());
-                            }
-                        }
-                        CharRepetition::AsManyAsNeeded => {
-                            // The "[c*]" construct was not needed, ignore it
-                        }
-                    },
-                    Operand::Equiv(_) => {
-                        unreachable!();
-                    }
-                    // `flatten_classes` replaced every class before this point.
-                    Operand::Class(_) => unreachable!("classes are flattened on entry"),
-                }
-            }
-
-            let mut equiv = Vec::<(DataTypeWithData, FullChar)>::new();
-
-            let mut seven_bit = [const { Option::<FullChar>::None }; 128_usize];
-            let mut eight_bit = [const { Option::<FullChar>::None }; 256_usize];
-            let mut multi_byte = [const { Option::<Vec<SearchAndReplace>>::None }; 256_usize];
-
-            let mut encoding_buffer = [0_u8; 4_usize];
-
-            let mut add_normal_char_with_replacement =
-                |da: DataTypeWithData, replacement_char: FullChar| {
-                    match da {
-                        DataTypeWithData::Is7Bit(ue) => {
-                            let index = usize::from(ue);
-
-                            seven_bit[index] = Some(replacement_char);
-                        }
-                        DataTypeWithData::Is8Bit(ue) => {
-                            let adjusted = ue - 128_u8;
-
-                            let index = usize::from(adjusted);
-
-                            eight_bit[index] = Some(replacement_char);
-                        }
-                        DataTypeWithData::IsMultiByte(ch) => {
-                            let st = ch.encode_utf8(&mut encoding_buffer);
-
-                            let &[ue, ref rest @ ..] = st.as_bytes() else {
-                                unreachable!();
-                            };
-
-                            let adjusted = ue - 128_u8;
-
-                            let index = usize::from(adjusted);
-
-                            // TODO
-                            if multi_byte[index].is_none() {
-                                multi_byte[index] = Some(Vec::<SearchAndReplace>::new())
-                            }
-
-                            // TODO
-                            let vec = multi_byte.get_mut(index).unwrap().as_mut().unwrap();
-
-                            let search_and_replace = match *rest {
-                                [a] => SearchAndReplace {
-                                    replacement: replacement_char,
-                                    number_of_bytes: SearchNumberOfBytes::One,
-                                    payload: [a, 0_u8, 0_u8],
-                                },
-                                [a, b] => SearchAndReplace {
-                                    replacement: replacement_char,
-                                    number_of_bytes: SearchNumberOfBytes::Two,
-                                    payload: [a, b, 0_u8],
-                                },
-                                [a, b, c] => SearchAndReplace {
-                                    replacement: replacement_char,
-                                    number_of_bytes: SearchNumberOfBytes::Three,
-                                    payload: [a, b, c],
-                                },
-                                _ => {
-                                    unreachable!();
-                                }
-                            };
-
-                            // TODO
-                            // Order?
-                            vec.push(search_and_replace);
-                        }
-                    }
-                };
-
-            for (us, op) in string1_operands_flattened.into_iter().enumerate() {
-                let da = string2_operands_to_use_flattened
-                    .get(us)
-                    .ok_or("Indexing failed")?;
-
-                let replacement = da.convert_to_replacement();
-
-                match op {
-                    Operand::Char(CharOperand {
-                        char,
-                        char_repetition,
-                    }) => {
-                        // TODO
-                        // Enforce with types
-                        assert!(matches!(char_repetition, CharRepetition::N(1_usize)));
-
-                        add_normal_char_with_replacement(char, replacement);
-                    }
-                    Operand::Equiv(EquivOperand { char }) => {
-                        equiv.push((char.clone(), replacement));
-
-                        // TODO
-                        // Fix for `tr_equivalence_class_low_priority`
-                        add_normal_char_with_replacement(char, replacement);
-                    }
-                    // `flatten_classes` replaced every class before this point.
-                    Operand::Class(_) => unreachable!("classes are flattened on entry"),
-                }
-            }
-
-            ForTranslation::NotComplemented(Box::new(NotComplementedTranslation {
+        Ok(ForTranslation::NotComplemented(Box::new(
+            NotComplementedTranslation {
                 seven_bit,
                 eight_bit,
                 multi_byte,
                 equiv,
                 case_folds,
-            }))
-        };
-
-        Ok(translation)
+                class_rules,
+            },
+        )))
     }
 
     pub fn generate_for_removal(
@@ -2057,6 +1923,10 @@ mod setup {
             &self.case_folds
         }
 
+        fn class_rules(&self) -> &[ClassRule] {
+            &self.class_rules
+        }
+
         #[inline]
         fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
             let index = usize::from(ue);
@@ -2142,145 +2012,53 @@ mod setup {
         }
     }
 
-    impl ComplementedTranslation {
-        /// Under `-C` a non-member character is consumed whole; under `-c` the
-        /// advance stays one byte, which is what makes `-c` replace each byte
-        /// of a multi-byte character separately.
-        #[inline]
-        fn miss_lookahead(
-            &self,
-            offset_lead: u8,
-            next_bytes: &[u8],
-        ) -> Option<SearchNumberOfBytes> {
-            if self.char_wise {
-                // `get_eight_bit_replacement` receives the lead byte already
-                // offset by 128 for table indexing.
-                char_wise_lookahead(offset_lead + 128_u8, next_bytes)
-            } else {
-                None
-            }
-        }
-    }
+    impl ComplementedTranslation {}
 
     impl Translation for ComplementedTranslation {
-        /// The complemented path decides "in the set" or "not in the set", and
-        /// the equivalence step is where a miss finally becomes a replacement.
-        /// Overridden so `-C` can consume the whole non-member character there:
-        /// the default `check` would rebuild the result and drop the lookahead.
+        /// A complement maps every *non*-member to one character, so it needs
+        /// membership and a replacement -- never an array. Asking the same
+        /// `Set` the removal paths ask is what makes `-c '[:alpha:]'` agree
+        /// with `-d '[:alpha:]'` about whether `é` is a letter.
+        ///
+        /// `found_match: true` here means "in the set, leave it alone"; a miss
+        /// is the result, not the absence of one.
         #[inline]
         fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
-            let first_check = if ue < 128_u8 {
-                self.get_seven_bit_replacement(ue)
-            } else {
-                self.get_eight_bit_replacement(ue - 128_u8, next_bytes)
-            };
-
-            if first_check.found_match {
-                return first_check;
-            }
-
-            let equiv_check = self.get_equiv_result(ue);
-            if equiv_check.found_match {
-                return equiv_check;
-            }
-
-            // Not in the set: substitute. Under `-C` the whole character goes.
-            ReplacementCheckResult {
-                match_lookahead_length: if self.char_wise {
-                    char_wise_lookahead(ue, next_bytes)
-                } else {
-                    None
-                },
-                ..equiv_check
-            }
-        }
-
-        #[inline]
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
-            let index = usize::from(ue);
-
-            let value_is_true = self.seven_bit[index];
-
-            ReplacementCheckResult {
-                replacement: if value_is_true {
-                    None
-                } else {
-                    Some(self.replacement)
-                },
-                match_lookahead_length: None,
-                found_match: value_is_true,
-            }
-        }
-
-        #[inline]
-        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
-            let index = usize::from(ue);
-
-            if self.eight_bit[index] {
-                ReplacementCheckResult {
+            match self.set.matches_at(ue, next_bytes) {
+                Some(width) => ReplacementCheckResult {
                     replacement: None,
-                    match_lookahead_length: None,
+                    match_lookahead_length: SearchNumberOfBytes::from_extra(width - 1_usize),
                     found_match: true,
-                }
-            } else {
-                match &self.multi_byte[index] {
-                    Some(ve) => {
-                        // TODO
-                        // Order
-                        for se in ve {
-                            let number_of_bytes = se.number_of_bytes;
-
-                            let test =
-                                next_bytes.starts_with(&se.payload[..(number_of_bytes as usize)]);
-
-                            if test {
-                                return ReplacementCheckResult {
-                                    replacement: None,
-                                    match_lookahead_length: Some(number_of_bytes),
-                                    found_match: true,
-                                };
-                            }
-                        }
-
-                        ReplacementCheckResult {
-                            replacement: Some(self.replacement),
-                            match_lookahead_length: self.miss_lookahead(ue, next_bytes),
-                            found_match: false,
-                        }
-                    }
-                    None => ReplacementCheckResult {
+                },
+                None => {
+                    // `-C` consumes the whole non-member character; `-c`
+                    // replaces it one byte at a time. That is the entire
+                    // difference between the two options.
+                    let lookahead = if self.char_wise {
+                        let width = self.set.element_width(ue, next_bytes);
+                        SearchNumberOfBytes::from_extra(width - 1_usize)
+                    } else {
+                        None
+                    };
+                    ReplacementCheckResult {
                         replacement: Some(self.replacement),
-                        match_lookahead_length: self.miss_lookahead(ue, next_bytes),
+                        match_lookahead_length: lookahead,
                         found_match: false,
-                    },
+                    }
                 }
             }
         }
 
-        #[inline]
-        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult {
-            for da in &self.equiv {
-                match da {
-                    DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
-                        if ue == *uei {
-                            return ReplacementCheckResult {
-                                replacement: None,
-                                match_lookahead_length: None,
-                                found_match: true,
-                            };
-                        }
-                    }
-                    DataTypeWithData::IsMultiByte(_) => {
-                        unreachable!();
-                    }
-                }
-            }
+        fn get_seven_bit_replacement(&self, _ue: u8) -> ReplacementCheckResult {
+            unreachable!("ComplementedTranslation overrides check")
+        }
 
-            ReplacementCheckResult {
-                replacement: Some(self.replacement),
-                match_lookahead_length: None,
-                found_match: false,
-            }
+        fn get_eight_bit_replacement(&self, _ue: u8, _next: &[u8]) -> ReplacementCheckResult {
+            unreachable!("ComplementedTranslation overrides check")
+        }
+
+        fn get_equiv_result(&self, _ue: u8) -> ReplacementCheckResult {
+            unreachable!("ComplementedTranslation overrides check")
         }
     }
 
@@ -2305,6 +2083,13 @@ mod setup {
                 let fold_check = self.get_case_fold_result(ue, next_bytes);
                 if fold_check.found_match {
                     return fold_check;
+                }
+            }
+
+            if !self.class_rules().is_empty() {
+                let class_check = self.get_class_rule_result(ue, next_bytes);
+                if class_check.found_match {
+                    return class_check;
                 }
             }
 
@@ -2343,6 +2128,38 @@ mod setup {
         }
 
         fn case_folds(&self) -> &[CaseFold] {
+            &[]
+        }
+
+        /// A whole class mapped to one character, asked of the *decoded*
+        /// character so membership follows `LC_CTYPE`. Enumerating the class
+        /// into the byte tables instead is what stopped `tr '[:alpha:]' X` at
+        /// ASCII while `tr -d '[:alpha:]'` went by the locale.
+        fn get_class_rule_result(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+            let rules = self.class_rules();
+            if !rules.is_empty() {
+                if let Some((c, width)) = decode_one(ue, next_bytes) {
+                    for rule in rules {
+                        if rule.name.contains(c) {
+                            return ReplacementCheckResult {
+                                replacement: Some(rule.replacement),
+                                match_lookahead_length: SearchNumberOfBytes::from_extra(
+                                    width - 1_usize,
+                                ),
+                                found_match: true,
+                            };
+                        }
+                    }
+                }
+            }
+            ReplacementCheckResult {
+                replacement: None,
+                match_lookahead_length: None,
+                found_match: false,
+            }
+        }
+
+        fn class_rules(&self) -> &[ClassRule] {
             &[]
         }
 
@@ -2391,6 +2208,21 @@ mod setup {
         pub equiv: Vec<(DataTypeWithData, FullChar)>,
         /// Case-conversion pairings, consulted after the tables miss.
         pub case_folds: Vec<CaseFold>,
+        /// Whole classes mapped to one character. Membership follows LC_CTYPE,
+        /// so `é` is translated by `[:alpha:]` exactly as it is deleted by it.
+        pub class_rules: Vec<ClassRule>,
+    }
+
+    /// A `[:class:]` in string1 whose every member maps to the same character.
+    ///
+    /// The common shape -- `tr '[:space:]' ' '`, `tr -cs '[:alpha:]' '[\n*]'`
+    /// -- and the only one POSIX defines a meaning for (118159-62). Keeping it
+    /// a predicate is what makes class membership follow the locale instead of
+    /// stopping at ASCII.
+    #[derive(Clone, Copy)]
+    pub struct ClassRule {
+        pub name: ClassName,
+        pub replacement: FullChar,
     }
 
     pub struct ComplementedTranslation {
@@ -2398,15 +2230,7 @@ mod setup {
         /// non-member multi-byte character is consumed and replaced whole.
         pub char_wise: bool,
         pub replacement: FullChar,
-        pub seven_bit: [bool; 128_usize],
-        pub eight_bit: [bool; 128_usize],
-        pub multi_byte: [Option<Vec<Search>>; 128_usize],
-        pub equiv: Vec<DataTypeWithData>,
-    }
-
-    pub struct Search {
-        number_of_bytes: SearchNumberOfBytes,
-        payload: [u8; 3_usize],
+        pub set: Set,
     }
 
     pub struct RemovalShared {

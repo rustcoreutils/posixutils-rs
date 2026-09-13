@@ -1203,3 +1203,125 @@ fn tr_squeeze_with_translation_keeps_multibyte_output_well_formed() {
     assert_eq!(tr_bytes(&["-s", "ä"], "äää".as_bytes()), "ä".as_bytes());
     assert_eq!(tr_bytes(&["ä", "ö"], "ääää".as_bytes()), "öööö".as_bytes());
 }
+
+/// Run `tr` under a specific locale, returning stdout, stderr and the status.
+///
+/// The shared harness forces `LC_ALL=C`, which is the right default but hides
+/// every question about `LC_CTYPE`. A locale that is not installed makes libc
+/// fall back to C, so these callers assert only what holds either way, or skip.
+fn tr_in_locale(locale: &str, args: &[&str], stdin: &[u8]) -> (Vec<u8>, i32) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tr"))
+        .args(args)
+        .env("LC_ALL", locale)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tr");
+    match child.stdin.as_mut().unwrap().write_all(stdin) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing tr's stdin: {e}"),
+    }
+    let out = child.wait_with_output().expect("wait tr");
+    (out.stdout, out.status.code().unwrap_or(-1))
+}
+
+/// Is this locale actually installed? If libc fell back to C, `é` is not a
+/// letter and there is nothing to assert.
+fn utf8_locale_available() -> bool {
+    let (out, code) = tr_in_locale("en_US.UTF-8", &["-d", "[:alpha:]"], "é".as_bytes());
+    code == 0 && out.is_empty()
+}
+
+// POSIX EXAMPLES item 3: `tr "[=e=]" "[e*]"` strips diacritical marks.
+//
+// It exited 1 with "tr: Indexing failed" -- an equivalence class occupied a
+// position in string1's array but was not counted in the length the string2
+// padding was sized against, so the pairing walked off the end. Every padded
+// string2 failed the same way, not just this one.
+#[test]
+fn tr_equivalence_class_does_not_break_string2_padding() {
+    // The spec's own example. In a locale where `[=e=]` is a singleton this is
+    // the identity, which is exactly what it must be -- not an error.
+    tr_test(&["[=e=]", "[e*]"], "tree", "tree");
+
+    // Every padding shape against an equivalence class.
+    tr_test(&["ab[=c=]", "XY"], "abcde", "XYYde");
+    tr_test(&["[=c=]ab", "XY"], "abcde", "YYXde");
+    tr_test(&["ab[=c=]", "[X*]"], "abcde", "XXXde");
+    tr_test(&["ab[=c=]", "X"], "abcde", "XXXde");
+    // And with string2 long enough that no padding is needed, which worked.
+    tr_test(&["ab[=c=]", "XYZ"], "abcde", "XYZde");
+}
+
+// A repeat count is a number, not that many elements.
+//
+// This pins a *cost*, not an answer: the old code printed `xxx` correctly, it
+// just materialised four billion elements to do it -- 10.5 seconds and 33 GB
+// for three characters. So the assertion is on elapsed time, with a bound
+// three orders of magnitude above what the fix takes (0.01s) and below what
+// materialising takes. A regression fails here in seconds rather than by
+// exhausting the machine.
+#[test]
+fn tr_large_repeat_count_is_not_materialised() {
+    let started = std::time::Instant::now();
+    tr_test(&["abc", "[x*4294967296]"], "abc", "xxx");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "a repeat count must not be materialised; took {elapsed:?}"
+    );
+
+    // Counts no machine could hold are answered from the run, not allocated.
+    tr_test(&["abc", "[x*18446744073709551615]"], "abc", "xxx");
+    tr_test(&["abc", "[x*999999999]"], "abcd", "xxxd");
+    // The ordinary counts still place characters where they belong.
+    tr_test(&["abcdef", "[x*2]yz"], "abcdef", "xxyzzz");
+    tr_test(&["abcdef", "[x*]yz"], "abcdef", "xxxxyz");
+    tr_test(&["abcdef", "y[x*]z"], "abcdef", "yxxxxz");
+}
+
+// One character class means one thing, whichever operation asks.
+//
+// `-d`, `-s` and case conversion decoded a character and asked `LC_CTYPE`;
+// translation flattened the class into its ASCII members first, so `é` was a
+// letter to three of them and not to the fourth.
+#[test]
+fn tr_class_membership_is_the_same_for_every_operation() {
+    if !utf8_locale_available() {
+        return;
+    }
+    const L: &str = "en_US.UTF-8";
+
+    // `é` is alphabetic, so every operation must act on it.
+    assert_eq!(
+        tr_in_locale(L, &["-d", "[:alpha:]"], "abéc1".as_bytes()).0,
+        b"1"
+    );
+    assert_eq!(
+        tr_in_locale(L, &["[:alpha:]", "X"], "abéc1".as_bytes()).0,
+        b"XXXX1"
+    );
+    assert_eq!(
+        tr_in_locale(L, &["[:alpha:]", "[x*]"], "abéc1".as_bytes()).0,
+        b"xxxx1"
+    );
+    assert_eq!(
+        tr_in_locale(L, &["-s", "[:alpha:]"], "aaéébb".as_bytes()).0,
+        "aéb".as_bytes()
+    );
+
+    // And the complement must agree that it is a letter, so `-C` leaves it.
+    assert_eq!(
+        tr_in_locale(L, &["-C", "[:alpha:]", "X"], "abéc1".as_bytes()).0,
+        "abécX".as_bytes()
+    );
+
+    // Case conversion already followed the locale and must keep doing so.
+    assert_eq!(
+        tr_in_locale(L, &["[:lower:]", "[:upper:]"], "aéb".as_bytes()).0,
+        "AÉB".as_bytes()
+    );
+}

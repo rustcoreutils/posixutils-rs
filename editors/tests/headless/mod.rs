@@ -3527,3 +3527,57 @@ fn test_tags_on_an_empty_stack_is_not_an_error() {
         .unwrap_or_default()
         .contains("tag stack empty"));
 }
+
+/// A `^V` typed on the colon line quotes the next key, which is the only way to
+/// get a CR into a map's replacement -- `:map Q :wq^V^M` is the commonest
+/// mapping there is. `Key::Ctrl('v')` used to fall into `handle_ex_key`'s
+/// catch-all and vanish, so the sequence could not be entered at all.
+///
+/// The observable half of that is here: a quoted Enter is a character in the
+/// command line, not the end of it. That the quoting survives all the way into
+/// the stored replacement is asserted once `:map` is implemented.
+#[test]
+fn test_ctrl_v_on_the_ex_line_quotes_the_next_key() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+
+    // :map Q :wq^V<Enter> -- the ^V makes the Enter a quoted CR.
+    editor.execute_keys(":map Q :wq\x16\n").unwrap();
+    assert_eq!(
+        editor.get_mode(),
+        Mode::Ex,
+        "a quoted Enter must not submit the command line"
+    );
+    assert!(
+        editor.get_message().is_none(),
+        "nothing should have run yet; got {:?}",
+        editor.get_message()
+    );
+
+    // An unquoted Enter does submit it.
+    editor.execute_keys("\n").unwrap();
+    assert_eq!(editor.get_mode(), Mode::Command);
+    assert!(
+        editor.get_message().unwrap_or_default().contains("map"),
+        "the line should have parsed as a map definition; got {:?}",
+        editor.get_message()
+    );
+}
+
+/// Erasing a quoted character removes the whole pair: two chars in the buffer,
+/// but one keystroke to the user.
+#[test]
+fn test_backspace_erases_a_quoted_pair_on_the_ex_line() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+    // Type `:ab x ` then a quoted space, erase it, then finish with a real
+    // replacement. If the erase left the stray ^V behind, the lhs would not be
+    // `x` and the diagnostic would name something else.
+    editor.execute_keys(":ab x \x16 \x7f").unwrap();
+    editor.execute_keys("y\n").unwrap();
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("abbreviate"),
+        "should have parsed as an abbreviation; got {msg:?}"
+    );
+}

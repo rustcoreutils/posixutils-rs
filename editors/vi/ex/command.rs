@@ -11,6 +11,15 @@
 
 use super::address::{Address, AddressRange};
 
+/// `<control>-V`, which quotes the next character in a `map`, `unmap`,
+/// `abbreviate` or `unabbreviate` argument (94657-94659).
+///
+/// One definition because two sides have to agree on it: `handle_ex_key` writes
+/// the marker into the command line when the user types `^V`, and the parser
+/// reads it to tell an escaped <blank> from a delimiting one before discarding
+/// it (95086-95088).
+pub const CTRL_V: char = '\x16';
+
 /// Parsed ex command.
 #[derive(Debug)]
 pub enum ExCommand {

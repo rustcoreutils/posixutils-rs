@@ -10,7 +10,7 @@
 //! Ex command parser.
 
 use super::address::{parse_address_range, parse_address_with_offset, Address, AddressRange};
-use super::command::{ExCommand, MapMode, SubstituteFlags};
+use super::command::{ExCommand, MapMode, SubstituteFlags, CTRL_V};
 use crate::error::{Result, ViError};
 
 /// Parse an ex command string.
@@ -541,10 +541,6 @@ fn accepts_force(cmd: &str) -> bool {
             | "z"
     )
 }
-
-/// `<control>-V`, which quotes the next character in a map or abbreviation
-/// argument.
-const CTRL_V: char = '\x16';
 
 /// Drop trailing whitespace that is not `<control>-V`-escaped.
 ///

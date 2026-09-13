@@ -17,7 +17,7 @@ mod executor;
 use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
 use crate::command::CommandParser;
 use crate::error::{Result, ViError};
-use crate::ex::command::SubstituteFlags;
+use crate::ex::command::{SubstituteFlags, CTRL_V};
 use crate::ex::{parse_ex_command, AddressRange, ExCommand, ExResult};
 use crate::file::{read_file, write_file, write_range, FileManager};
 use crate::input::{InputReader, Key};
@@ -174,6 +174,13 @@ pub struct Editor {
     is_error: bool,
     /// Marks (a-z for user, other for special).
     marks: [Option<Position>; 26],
+    /// A `^V` on the ex command line is pending, so the next key is quoted.
+    ///
+    /// Only the four commands POSIX gives `<control>-V` escaping to
+    /// (94657-94659) make use of it, but the colon line cannot know which
+    /// command is being typed until Enter, so it quotes for all of them and
+    /// lets the parser decide.
+    ex_pending_literal: bool,
     /// Where each outstanding `:tag` / `^]` jump started, oldest first.
     ///
     /// Pushed by `goto_tag`, so both entry points get it; walked by `:pop` and
@@ -269,6 +276,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
@@ -314,6 +322,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
@@ -362,6 +371,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
@@ -1116,7 +1126,29 @@ impl Editor {
             return self.handle_ex_insert_key(key);
         }
 
+        // A pending ^V quotes this key, whatever it is. Both the marker and the
+        // quoted character go into `ex_input`: the ex parser needs the marker
+        // to tell an escaped <blank> from a delimiting one (94657-94659), and
+        // discards it once it has (95086-95088).
+        //
+        // Without this there was no way to type a ^V on the colon line at all.
+        // `Key::Ctrl('v')` fell into the `_ => {}` arm below and vanished, so
+        // `:map Q :wq^V^M` -- the most common mapping there is -- could not be
+        // entered. In ex standalone mode the 0x16 byte is already in the line
+        // read from stdin, so both paths reach the parser in the same shape.
+        if self.ex_pending_literal {
+            self.ex_pending_literal = false;
+            if let Some(c) = key.literal_char() {
+                self.ex_input.push(CTRL_V);
+                self.ex_input.push(c);
+            }
+            return Ok(());
+        }
+
         match key {
+            Key::Ctrl('v') | Key::Ctrl('q') => {
+                self.ex_pending_literal = true;
+            }
             Key::Enter => {
                 let input = std::mem::take(&mut self.ex_input);
                 self.mode = Mode::Command;
@@ -1131,13 +1163,19 @@ impl Editor {
             }
             Key::Escape => {
                 self.ex_input.clear();
+                self.ex_pending_literal = false;
                 self.mode = Mode::Command;
             }
             Key::Backspace | Key::Delete => {
                 if self.ex_input.is_empty() {
                     self.mode = Mode::Command;
                 } else {
+                    // A quoted character is two chars in the buffer but one
+                    // keystroke to the user, so erase both.
                     self.ex_input.pop();
+                    if self.ex_input.ends_with(CTRL_V) {
+                        self.ex_input.pop();
+                    }
                 }
             }
             Key::Char(c) => {

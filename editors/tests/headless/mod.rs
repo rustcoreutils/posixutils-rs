@@ -4103,3 +4103,33 @@ fn test_a_mapped_change_command_undoes_as_one_command() {
         "one u must reverse the whole expansion, not just its last command"
     );
 }
+
+/// `^T` returns to where the last tag jump started, the companion to `^]`.
+///
+/// Not POSIX -- the only non-POSIX command-mode key in the editor. vi.md
+/// 121838-121840 gives `^T` a meaning in *text input* mode only, where it
+/// shifts the autoindent; that is untouched, and
+/// `test_ctrl_t_indents_at_cursor_to_shiftwidth_boundary` and
+/// `test_ctrl_t_is_recorded_in_the_insert_session` fail if it stops being.
+#[test]
+fn test_ctrl_t_pops_the_tag_stack() {
+    let (dir, a, _b) = tag_fixture();
+    let mut editor = Editor::new_headless();
+    set_tags_option(&mut editor, dir.path());
+    editor.open(&a).unwrap();
+    editor.execute_keys("2G").unwrap();
+
+    editor.execute_keys(":tag local\n").unwrap();
+    assert_eq!(editor.get_cursor().line, 3);
+
+    editor.execute_keys("\x14").unwrap(); // ^T
+    assert_eq!(editor.get_cursor().line, 2, "^T returned to the origin");
+
+    // On an empty stack it reports rather than doing nothing silently.
+    editor.execute_keys("\x14").unwrap();
+    assert!(editor.is_error_message());
+    assert!(editor
+        .get_message()
+        .unwrap_or_default()
+        .contains("tag stack empty"));
+}

@@ -1252,6 +1252,20 @@ impl Editor {
                 }
                 return Ok(());
             }
+            Key::Ctrl('t') => {
+                // ^T: return to where the last tag jump started, the companion
+                // to ^] above.
+                //
+                // Not POSIX, and the only non-POSIX command-mode key here:
+                // vi.md 121838-121840 gives ^T a meaning in *text input* mode
+                // only, where it shifts the autoindent and `mode::insert`
+                // implements it. This arm is reached in command mode alone, so
+                // the two do not collide. See NONPOSIX.md.
+                if let Err(e) = self.pop_tag() {
+                    self.set_error(&e.to_string());
+                }
+                return Ok(());
+            }
             Key::Ctrl('^') => {
                 // Edit the alternate file. This discards the buffer, so it
                 // needs the same warning `:e` gives -- it used to open

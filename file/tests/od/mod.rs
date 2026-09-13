@@ -822,6 +822,45 @@ fn od_float_fields_are_column_aligned() {
     );
 }
 
+// The octal field is as wide as the widest value the type can hold, which is
+// ceil(bits/3) digits -- 3, 6, 11 and 22 for one, two, four and eight bytes.
+//
+// The width was `num_bytes * 3`, which is right only for one and two bytes.
+// A 4-byte octal was printed 12 digits wide when u32::MAX is 37777777777, 11
+// digits, so a leading zero was always present and never meaningful; an
+// 8-byte one was 24 wide against a 22-digit maximum.
+//
+// All-ones and all-zero inputs, so this says nothing about byte order.
+#[test]
+fn od_octal_field_is_as_wide_as_the_type() {
+    // The maximum of each width, which must fill the field exactly -- no
+    // leading zero, and nothing truncated.
+    for (spec, bytes, max) in [
+        ("o1", 1, "377"),
+        ("o2", 2, "177777"),
+        ("o4", 4, "37777777777"),
+        ("o8", 8, "1777777777777777777777"),
+    ] {
+        let ones = vec![0xffu8; bytes];
+        let (stdout, _, code) = od_raw(&["-An", "-t", spec], &ones);
+        assert_eq!(code, Some(0), "-t {spec}");
+        assert_eq!(
+            stdout.trim_end_matches('\n'),
+            format!(" {max}"),
+            "-t {spec}: the maximum must fill the field exactly"
+        );
+
+        // Zero is the same width, zero-padded.
+        let zeros = vec![0u8; bytes];
+        let (stdout, _, _) = od_raw(&["-An", "-t", spec], &zeros);
+        assert_eq!(
+            stdout.trim_end_matches('\n'),
+            format!(" {}", "0".repeat(max.len())),
+            "-t {spec}: zero is padded to the same width"
+        );
+    }
+}
+
 #[test]
 fn od_integer_size_suffixes_are_unchanged() {
     // The C/S/I/L table belongs to d/o/u/x (POSIX 109073-5) and must not have

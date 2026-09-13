@@ -746,8 +746,12 @@ struct OFormatter;
 impl FormatterChunks for OFormatter {
     fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
         let value = chunk_to_u64(chunk, num_bytes);
-        // It takes three octal digits to represent a byte (2^8 = 256 and 8^3 = 512)
-        format!(" {value:0width$o}", width = num_bytes * 3)
+        // As many digits as the widest value of this width needs, which is
+        // ceil(bits/3): 3, 6, 11, 22. Three digits *per byte* is right only up
+        // to two bytes -- u32::MAX is 37777777777, eleven digits, not twelve,
+        // so a fourth byte bought a leading zero that could never be anything
+        // else.
+        format!(" {value:0width$o}", width = (num_bytes * 8).div_ceil(3))
     }
 }
 

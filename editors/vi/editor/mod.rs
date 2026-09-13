@@ -3468,9 +3468,11 @@ impl Editor {
             ExCommand::Tags => Ok(ExResult::CommandOutput(crate::tags::format_stack(
                 &self.tag_stack,
             ))),
-            // No wildcard: with the six above named, the match is exhaustive,
-            // so a new ExCommand variant is a compile error rather than another
-            // command that silently does nothing.
+            // No wildcard, deliberately: every variant is named, so a new
+            // `ExCommand` is a compile error rather than another command that
+            // silently does nothing. A `_ =>` arm here is what let `:map`,
+            // `:unmap`, `:ab`, `:una`, `:pop` and `:tags` all return success
+            // while doing nothing, for as long as they did.
         }
     }
 

@@ -1282,10 +1282,13 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or_else(|| io::Error::other("No files to chain"))?
         // Handle error if no files to chain.
         } else {
-            // If only one file, use it as the reader.
+            // If only one file, use it as the reader. Every operand having
+            // been consumed by the skip leaves none, and that is an empty
+            // input rather than a reason to return: od still writes the
+            // trailing offset, as it does for the same skip on stdin.
             match all_files.pop() {
-                None => return Ok(()), // Return Ok if no files.
-                Some(f) => f,          // Use the single file as the reader.
+                None => Box::new(io::empty()) as Box<dyn Read>,
+                Some(f) => f, // Use the single file as the reader.
             }
         }
     };

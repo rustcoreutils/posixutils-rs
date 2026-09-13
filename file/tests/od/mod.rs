@@ -512,20 +512,34 @@ fn od_float_size_suffix_selects_the_right_width() {
 // `double` on Apple's aarch64 -- matching the table in `cc/arch/mod.rs`.
 #[test]
 fn od_long_double_is_converted() {
-    // A 16-byte long double, little-endian: `lo` is the low eight bytes and
-    // `hi` the next two, with the remaining six bytes padding.
-    fn slot(lo: u64, hi: u16) -> Vec<u8> {
+    // The two formats are laid out differently, so they get different
+    // constructors rather than one helper that is right for only one of them.
+
+    // x87 80-bit occupies the first ten bytes of its slot *by memory
+    // position*: an explicit 64-bit significand, then sign and exponent. Only
+    // x86 has this format and x86 is little-endian, so the positions are the
+    // little-endian ones.
+    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    fn slot(significand: u64, sign_exp: u16) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(16);
-        if cfg!(target_endian = "little") {
-            bytes.extend(lo.to_le_bytes());
-            bytes.extend(hi.to_le_bytes());
-            bytes.extend([0u8; 6]);
-        } else {
-            bytes.extend([0u8; 6]);
-            bytes.extend(hi.to_be_bytes());
-            bytes.extend(lo.to_be_bytes());
-        }
+        bytes.extend(significand.to_le_bytes());
+        bytes.extend(sign_exp.to_le_bytes());
+        bytes.extend([0u8; 6]);
         bytes
+    }
+
+    // binary128 is a single 128-bit field, so it is built as one integer and
+    // laid out in the host's order. `hi` is its top 16 bits -- sign and
+    // exponent -- which is bytes 14-15 on a little-endian host and bytes 0-1
+    // on a big-endian one; `to_ne_bytes` puts them wherever they belong
+    // without the test having to say which.
+    #[cfg(not(any(
+        all(target_arch = "x86_64", not(target_os = "macos")),
+        all(target_arch = "aarch64", target_os = "macos")
+    )))]
+    fn slot(fraction_low: u64, hi: u16) -> Vec<u8> {
+        let bits = ((hi as u128) << 112) | fraction_low as u128;
+        bits.to_ne_bytes().to_vec()
     }
 
     #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
@@ -1030,6 +1044,34 @@ fn od_count_is_a_length_not_an_end_offset() {
     // Without a skip, nothing changes.
     let (stdout, _, _) = od_raw(&["-N", "9", "-t", "x1"], data);
     assert_eq!(stdout, "0000000 41 42 43 44 45 46 47 48 49\n0000011\n");
+}
+
+// Skipping exactly the whole input is not an error, and still prints the
+// trailing offset. The file path returned early when the skip consumed every
+// operand, leaving `all_files` empty, so it printed nothing at all -- while
+// the stdin path printed the offset, so the two disagreed with each other.
+#[test]
+fn od_skip_of_exactly_the_whole_input_prints_the_offset() {
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join(format!("od_skip_all_{}", std::process::id()));
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(b"12345")
+        .unwrap();
+
+    let (from_file, stderr, code) = od_raw(&["-j", "5", "-t", "x1", path.to_str().unwrap()], b"");
+    std::fs::remove_file(&path).ok();
+    assert_eq!(
+        code,
+        Some(0),
+        "skipping the whole file is not an error: {stderr:?}"
+    );
+    assert_eq!(from_file, "0000005\n");
+
+    // And it agrees with the same skip taken on stdin.
+    let (from_stdin, _, _) = od_raw(&["-j", "5", "-t", "x1"], b"12345");
+    assert_eq!(from_file, from_stdin, "the file and stdin paths must agree");
 }
 
 // POSIX 109196-109199: "Unless -A n is specified, the *first* output line

@@ -4133,3 +4133,35 @@ fn test_ctrl_t_pops_the_tag_stack() {
         .unwrap_or_default()
         .contains("tag stack empty"));
 }
+
+/// ex.md 96616-96617: a map defined in terms of itself loops, and POSIX
+/// "requires conformance to historical practice, and that such loops be
+/// interruptible". The escape is therefore a signal, not a depth cap -- a cap
+/// would refuse a mapping the spec says must work.
+///
+/// What this pins is that the drain polls SIGINT at all and abandons the
+/// expansion when it is set. It cannot deliver the signal mid-loop from one
+/// thread, so it arms the flag first; an interactive interrupt sets the same
+/// flag asynchronously and reaches the same poll. Removing the poll makes this
+/// test hang rather than fail, which is the honest shape of the bug.
+#[test]
+fn test_sigint_abandons_a_map_expansion() {
+    use vi_rs::signals::SIGINT_RECEIVED;
+
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\nbravo\n");
+    editor.execute_keys(":map q dd\n").unwrap();
+
+    SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+    editor.execute_keys("q").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "alpha\nbravo\n",
+        "an armed interrupt must abandon the expansion before it runs"
+    );
+
+    // The flag is consumed, so the editor works normally again.
+    assert!(!SIGINT_RECEIVED.load(std::sync::atomic::Ordering::SeqCst));
+    editor.execute_keys("q").unwrap();
+    assert_eq!(editor.get_buffer_text(), "bravo\n");
+}

@@ -708,6 +708,41 @@ fn test_ex_tag_pop_and_tags() {
     );
 }
 
+/// A `.exrc` is where `map Q :wq^V^M` actually gets written, and it has to
+/// survive being read from a file. `str::lines` strips a trailing `\r` along
+/// with the `\n`, which ate the quoted carriage return before any parser saw
+/// it -- turning the commonest mapping there is into one that does nothing.
+#[test]
+fn test_source_keeps_a_quoted_carriage_return() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("f.txt");
+    fs::write(&path, "one\n").unwrap();
+    // Written as bytes: ^V then CR then the newline that ends the line.
+    fs::write(dir.path().join("script.ex"), b"map Q :wq\x16\r\n").unwrap();
+
+    let bin = get_binary_path("ex");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg(&path)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"source script.ex\nmap\nq!\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.contains(":wq^M"),
+        "the sourced map must keep its carriage return; got {out:?}"
+    );
+}
+
 /// Abbreviations belong to "open and visual text input mode" (94870). Ex text
 /// input mode -- what `:a`, `:i` and `:c` enter -- is neither, so text typed
 /// there is not abbreviated. It is a separate code path today; this pins it, so

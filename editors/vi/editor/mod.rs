@@ -17,7 +17,7 @@ mod executor;
 use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
 use crate::command::{CommandParser, ParserState};
 use crate::error::{Result, ViError};
-use crate::ex::command::{MapMode, SubstituteFlags, CTRL_V};
+use crate::ex::command::{strip_line_terminator, MapMode, SubstituteFlags, CTRL_V};
 use crate::ex::{parse_ex_command, AddressRange, ExCommand, ExResult};
 use crate::file::{read_file, write_file, write_range, FileManager};
 use crate::input::{InputQueue, InputReader, Key, KeySource, QueuedKey};
@@ -696,8 +696,9 @@ impl Editor {
                 }
             }
 
-            // Remove trailing newline
-            let mut line = line.trim_end_matches(['\n', '\r']).to_string();
+            // Remove the line terminator -- but not a <control>-V-escaped one,
+            // which is an argument character (`map Q :wq^V^M`).
+            let mut line = strip_line_terminator(&line).to_string();
 
             // A <backslash><newline> continues the command onto the next input
             // line, with the pair standing for a literal newline. This is how
@@ -3594,10 +3595,17 @@ impl Editor {
         use std::io::{BufRead, BufReader};
 
         let file = File::open(file).map_err(ViError::Io)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
 
-        for line in reader.lines() {
-            let line = line.map_err(ViError::Io)?;
+        // Read to the `\n` and strip the terminator ourselves. `BufRead::lines`
+        // removes a trailing `\r` as well, which would eat the quoted carriage
+        // return in a sourced `map Q :wq^V^M`.
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).map_err(ViError::Io)? == 0 {
+                break;
+            }
             self.execute_source_line(&line)?;
         }
 
@@ -3606,7 +3614,10 @@ impl Editor {
 
     /// Execute ex commands from a string (already-read file content).
     fn execute_source_content(&mut self, content: &str) -> Result<()> {
-        for line in content.lines() {
+        // Split on `\n` alone rather than using `str::lines`, which also strips
+        // a trailing `\r` -- and so would eat the quoted carriage return in a
+        // `.exrc` line like `map Q :wq^V^M` before anything could see it.
+        for line in content.split('\n') {
             self.execute_source_line(line)?;
         }
         Ok(())
@@ -3614,7 +3625,10 @@ impl Editor {
 
     /// Execute a single line from a source file.
     fn execute_source_line(&mut self, line: &str) -> Result<()> {
-        let line = line.trim();
+        // Leading <blank>s go unconditionally; the trailing ones belong to
+        // `parse_ex_command`, which strips them by the rule the command
+        // follows and so can keep a quoted one.
+        let line = strip_line_terminator(line).trim_start();
         // Skip empty lines and comments
         if line.is_empty() || line.starts_with('"') {
             return Ok(());

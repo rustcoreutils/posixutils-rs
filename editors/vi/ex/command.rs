@@ -20,6 +20,36 @@ use super::address::{Address, AddressRange};
 /// it (95086-95088).
 pub const CTRL_V: char = '\x16';
 
+/// Strip the line terminator from a command line read from a file or stdin,
+/// keeping a `<control>-V`-escaped one.
+///
+/// `map Q :wq^V^M` ends in a quoted carriage return that is part of the
+/// replacement, immediately followed by the real terminator. Anything that
+/// trims `\r` and `\n` off the end blindly — `str::lines`, `BufRead::lines`,
+/// `trim_end_matches` — eats the quoted one too, which silently turns the
+/// commonest mapping there is into one that does nothing.
+///
+/// Only the terminator is removed; other trailing <blank>s are left for
+/// `parse_ex_command`, which decides what to do with them by command
+/// (94655-94659).
+pub fn strip_line_terminator(line: &str) -> &str {
+    let mut end = 0;
+    let mut chars = line.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == CTRL_V {
+            // The quoted character is kept whatever it is, and so is the
+            // marker, which the argument parser needs.
+            match chars.next() {
+                Some((j, quoted)) => end = j + quoted.len_utf8(),
+                None => end = i + c.len_utf8(),
+            }
+        } else if c != '\n' && c != '\r' {
+            end = i + c.len_utf8();
+        }
+    }
+    &line[..end]
+}
+
 /// Parsed ex command.
 #[derive(Debug)]
 pub enum ExCommand {
@@ -390,5 +420,31 @@ mod tests {
         assert!(flags.global);
         assert!(flags.confirm);
         assert!(!flags.print);
+    }
+
+    /// The terminator goes; a `^V`-escaped carriage return stays, because it is
+    /// part of the argument. `map Q :wq^V^M` is the case that matters, and
+    /// every blind `\r`/`\n` trim -- `str::lines`, `BufRead::lines`,
+    /// `trim_end_matches` -- gets it wrong.
+    #[test]
+    fn test_strip_line_terminator() {
+        assert_eq!(strip_line_terminator("map q dd\n"), "map q dd");
+        assert_eq!(strip_line_terminator("map q dd\r\n"), "map q dd");
+        assert_eq!(strip_line_terminator("map q dd"), "map q dd");
+
+        assert_eq!(
+            strip_line_terminator("map Q :wq\x16\r\n"),
+            "map Q :wq\x16\r",
+            "a quoted CR survives, marker and all"
+        );
+        assert_eq!(strip_line_terminator("map Q :wq\x16\r"), "map Q :wq\x16\r");
+
+        // Other trailing blanks are left alone: `parse_ex_command` strips those
+        // by the rule the command follows.
+        assert_eq!(strip_line_terminator("set number  \n"), "set number  ");
+
+        // A `^V` quoting the terminator itself, with nothing after it.
+        assert_eq!(strip_line_terminator("x\x16"), "x\x16");
+        assert_eq!(strip_line_terminator(""), "");
     }
 }

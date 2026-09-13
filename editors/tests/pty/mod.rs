@@ -16,6 +16,7 @@ use plib::tmp::{tempdir, TempDir};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -61,6 +62,13 @@ struct ViPtySession {
 impl ViPtySession {
     /// Spawn vi with the given file in a PTY of the specified size.
     fn new(file_path: &Path, rows: u16, cols: u16) -> Self {
+        Self::with_home(file_path, rows, cols, None)
+    }
+
+    /// As [`ViPtySession::new`], with `HOME` overridden so a test can supply a
+    /// `.exrc`. Startup configuration is read only when vi is *not* in silent
+    /// mode, so a PTY session is the only place it can be exercised.
+    fn with_home(file_path: &Path, rows: u16, cols: u16, home: Option<&Path>) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -74,6 +82,12 @@ impl ViPtySession {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vi"));
         cmd.arg(file_path);
         cmd.env("TERM", "vt100");
+        if let Some(home) = home {
+            cmd.env("HOME", home);
+            // EXINIT wins over $HOME/.exrc, so it must not leak in from the
+            // environment the test runner was started with.
+            cmd.env_remove("EXINIT");
+        }
 
         let child = pair.slave.spawn_command(cmd).unwrap();
         drop(pair.slave);
@@ -916,5 +930,37 @@ fn test_pty_vi_tag_and_pop() {
         written.trim(),
         "four",
         "^T must have returned to the line the jump started from"
+    );
+}
+
+/// A `.exrc` is where `map Q :wq^V^M` actually gets written. Reading it must
+/// keep the quoted carriage return: `str::lines` and `BufRead::lines` both
+/// strip a trailing `\r` along with the `\n`, which ate it before any parser
+/// saw it and turned the commonest mapping there is into one that does nothing.
+///
+/// This needs a PTY because startup configuration is skipped in silent mode,
+/// so `ex -s` cannot reach it.
+#[test]
+fn test_pty_vi_exrc_map_with_a_quoted_carriage_return() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("test.txt");
+    std::fs::write(&file_path, "before\n").unwrap();
+    let exrc = td.path().join(".exrc");
+    std::fs::write(&exrc, b"map Q :wq\x16\r\n").unwrap();
+    // `read_safe_exrc` refuses a file writable by group or others.
+    std::fs::set_permissions(&exrc, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut vi = ViPtySession::with_home(&file_path, 25, 80, Some(td.path()));
+    vi.sleep_ms(500);
+    vi.keys("ochanged\x1b");
+    vi.sleep_ms(100);
+    // Q comes from the .exrc and must write and quit on its own.
+    vi.keys("Q");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents, "before\nchanged\n",
+        "the .exrc mapping must have kept its carriage return"
     );
 }

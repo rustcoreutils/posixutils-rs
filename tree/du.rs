@@ -170,9 +170,16 @@ fn du_impl(args: &Args, filename: &str, seen: &RefCell<HashSet<(u64, u64)>>) -> 
             }
             Ok(())
         },
-        |_entry, error| {
+        |entry, error| {
             *had_error.borrow_mut() = true;
-            eprintln!("du: {}", plib::diag::io_error_text(&error.inner()));
+            // Name the operand: with several on the command line, an errno
+            // alone does not say which one failed. The entry was bound as
+            // `_entry` and discarded, though `Entry::path()` was right here.
+            eprintln!(
+                "du: {}: {}",
+                entry.path(),
+                plib::diag::io_error_text(&error.inner())
+            );
         },
         ftw::TraverseDirectoryOpts {
             follow_symlinks_on_args: args.follow_cli,

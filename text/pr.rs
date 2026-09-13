@@ -504,7 +504,11 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 
     let mut page_iterators = Vec::with_capacity(paths.len());
     for p in paths {
-        let stream = input_stream(p, true)?;
+        // Name the operand here: `pr_merged` takes the whole slice, so main's
+        // diagnostic cannot say which of them failed.
+        let stream = input_stream(p, true).map_err(|e| {
+            io::Error::other(format!("{}: {}", p.display(), plib::diag::error_text(&e)))
+        })?;
         let it = PageIterator::new(stream, params.body_lines_per_page);
         page_iterators.push(it);
     }
@@ -649,7 +653,13 @@ fn main() -> ExitCode {
         for file in args.file() {
             if let Err(e) = pr_serial(file, &params) {
                 if !params.no_file_warnings {
-                    plib::diag::error(&plib::diag::error_text(&e));
+                    // The operand is the loop variable; reporting the errno
+                    // alone left the user to guess which file failed.
+                    plib::diag::error(&format!(
+                        "{}: {}",
+                        file.display(),
+                        plib::diag::error_text(&e)
+                    ));
                 }
                 success = false;
             }

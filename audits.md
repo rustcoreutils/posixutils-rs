@@ -273,16 +273,17 @@ Crates with open items today:
 
 - [`cc/audit.md`](cc/audit.md) — `c17`, `cflow`, `ctags`, `cxref`
 - [`cron/audit.md`](cron/audit.md) — `crontab`, `at`, `batch`, `crond`
-- [`tree/audit.md`](tree/audit.md) — the 16 `tree/` utilities + the `ftw/` crate
 
 Audited with nothing open, so no file: `awk`, `calc`, `datetime`, `dev`,
 `display`, `editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `make`, `man`,
 `misc`, `pathnames`, `pax`, `print`, `process`, `sccs`, `screen`, `sh`, `sys`,
-`text`, `users`, `uucp`, `xform`.
+`text`, `tree`, `users`, `uucp`, `xform`.
 
 Five crates joined that list on 2026-09-12, as their last open items closed:
 `dev` (`#A7`), `make` (`#88`, `#89`), `sys` (the `ps` and `who` coverage gaps),
-`calc` (`#B13`, `#B14`) and `sh` (`#57`).
+`calc` (`#B13`, `#B14`) and `sh` (`#57`). `tree` joined on 2026-09-13, when its
+one remaining row — a `du -x` coverage gap — turned out to rest on a false
+premise and was closed with a test rather than deferred again.
 
 Three of those closures were decisions rather than code, and each is recorded
 in the commit that closed it so it is not re-raised: `make`'s `#86` (GNU `::`

@@ -543,7 +543,15 @@ fn tail(
             if pa.as_os_str() == "-" {
                 get_stdin()
             } else {
-                let fi = File::open(pa.as_path())?;
+                // Name the file here: `args.file` is moved into `tail()`
+                // before main's diagnostic runs, so main has nothing to name.
+                let fi = File::open(pa.as_path()).map_err(|e| {
+                    io::Error::other(format!(
+                        "{}: {}",
+                        pa.display(),
+                        plib::diag::io_error_text(&e)
+                    ))
+                })?;
 
                 FileOrStdin::File(pa, BufReader::new(fi))
             }

@@ -1191,3 +1191,56 @@ fn iconv_UTF16BE_to_UTF8_conversion_without_c_flag() {
         Vec::new(),
     );
 }
+
+/// A failure must read as one `iconv: <file>: <message>` line.
+///
+/// `main` returned `Result<(), Box<dyn Error>>`, so Rust's `Termination` impl
+/// printed the `Debug` of the boxed error -- `Error: Os { code: 2, kind:
+/// NotFound, message: "..." }`. GNU iconv says
+/// `iconv: cannot open input file '...': No such file or directory`.
+#[test]
+fn iconv_missing_input_file_names_utility_and_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("iconv"))
+        .args(["-f", "UTF-8", "-t", "UTF-8", "/nonexistent_iconv_probe_zz"])
+        .output()
+        .expect("spawn iconv");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !stderr.contains("Os {") && !stderr.starts_with("Error: "),
+        "Rust's Debug form must not reach the user: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("iconv: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_iconv_probe_zz"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}
+
+/// An unreadable `-f` charmap is the other way into the same `Debug` dump.
+#[test]
+fn iconv_missing_charmap_names_utility_and_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("iconv"))
+        .args(["-f", "/nonexistent_charmap_zz", "-t", "UTF-8"])
+        .output()
+        .expect("spawn iconv");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !stderr.contains("Os {") && !stderr.starts_with("Error: "),
+        "Rust's Debug form must not reach the user: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("iconv: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

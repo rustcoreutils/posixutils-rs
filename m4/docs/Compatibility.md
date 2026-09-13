@@ -55,64 +55,87 @@ GNU m4 specific builtin macros likely to be necessary (there are probably more) 
 
 - [x] Checked generating default configuration.
 
-### Notes
+### Argument expansion order
 
-Currently it's incompatible due to problems with the way this m4 works.
+This section used to record a plan to rewrite the evaluation engine, on the
+grounds that argument expansion was breadth-first where BSD and GNU m4 are
+depth-first. **That is no longer the case, and the plan was carried out.** The
+note is kept, rewritten, because "we are incompatible with sendmail" is the
+kind of claim that gets repeated for years after it stops being true.
 
-The BSD implementation of m4, when calling macros their arguments are already fully expanded[1][1]
-It actually makes them very simple to test and reason about, and that's something I'd like to aim for with this implementation.
+The engine is a pushback/rescan design, the classic m4 shape:
 
-`pbstr` in their impelementation is used push argument strings onto the input stack to be evaluated[2][2][3][3]. The implementation of this stack growth seems very similar to Rust's `Vec`[4][4].
+* `main_loop::process` reads one byte at a time, from a pushback buffer before
+  the input file.
+* Seeing `name(` pushes a `StackFrame`, which reroutes `Output::write_all` into
+  the frame's current argument buffer. So **collecting an argument and
+  expanding it are the same pass** — a nested call encountered while gathering
+  an outer call's arguments is applied as soon as its `)` is seen, before the
+  outer macro runs.
+* Every macro's result is pushed back onto the *input* (`pushback_string`), not
+  written to the output, so it is re-lexed by the same loop and lands in the
+  enclosing frame's argument buffer.
 
-There are some notes about how the macro call stack works [5][here], it can be seen in action [6][here] and [7][here]
+That is depth-first by construction. No code anywhere expands arguments in a
+separate pass; there is no "for each argument, expand it" loop to find.
 
-The main question here is how can we mix our parsing implementation with this without completely rewriting it?
+The remark about `dnl` is also inverted now: the builtin consumes raw input
+directly, including the pushback buffer, rather than working at the parsing
+level. The nested-divert test the note was waiting on passes, with four
+committed fixtures.
 
-Okay something I learned is that the input keeps track of its line number, has a name [8][8].
+### What backs that up
 
-Output is controlled by [active](https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/main.c#L86) file pointer. outfile[] is used for diverts.
+`gnu_m4_differential` in `tests/integration.rs` runs every stdin-driven
+fixture through both this m4 and the system's GNU m4 and requires the stdout to
+agree. At the time of writing that is **80 of 80 fixtures, byte for byte**,
+against GNU M4 1.4.19.
 
-Summary of the main loop (not 100 percent precise, but close enough):
+It checks that the reference *is* GNU m4, and is at least 1.4.19, by reading
+its `--version`; otherwise it skips loudly and compares nothing. That check is
+not ceremony. macOS's `/usr/bin/m4` is a different implementation, and it
+disagrees with GNU M4 1.4.19 — on `eval`'s `!` and `~`, on quote handling in
+`define_hanging_quotes`, and on `define_nested_first_arg` — while this m4's
+output is byte-identical on both platforms. An earlier version of the gate took
+whatever sat at that path and called it GNU m4, which said nothing about this
+implementation and turned macOS CI red for an environment difference. The
+version floor is there for the same reason: these fixtures encode one
+reference's answers, and GNU m4 has changed some of them between releases.
 
-First get the next character (either from pushback buffer or current input file).
+Before that gate existed, the committed `.out` files were frozen snapshots of
+what *this* implementation produced — they could not have caught the
+documentation drifting away from the code, and did not.
 
-Next do one of the following:
+`maketemp`/`mkstemp` are excluded: they generate random filenames by design, so
+no two runs agree. Only stdout is compared; diagnostic wording is deliberately
+ours.
 
-* Unwrap Quotes if requred
-  a) If we're at the top level output to the currently active output.
-  b) Otherwise output onto the stack?
-* If we're at the top level of the stack and this is a comment, output the comment to currently active output.
-* Parse as macro
-  a) If it's not a current macro name or there are no arguments when the macro requires it, then continue.
-  b) Otherwise create a stack for the macro invocation, and push the first argument (name of macro). If it's macro without arguments then evaluate it.
-* Do some stuff if it's end of file.
-* If we're not in a macro, put the character in active output.
-* If the character is left parenthesis, increase the `PARLEV`, put in active output.
-* If the character is right parenthesis, decrease the `PARLEV`
-  a) If `PARLEV > 0` Put the char to output.
-  b) If the `PARLEV <= 0` we are at the end of argument list, evaluate macro.
-* If the char is a comma
-  a) If we're at `PARLEV == 1` (inside the first level of a macro invocation), skip all the spaces, then push the character onto the macro argument stack?
-  b) ?
-* If it's a comment, consume input until end comment and put on macro stack.
-* Put the character on the macro stack.
+### Known intentional divergence
 
-To evaluate the macro:
+`m4wrap` is FIFO here and LIFO in GNU m4 1.4.x:
 
-1. If it's a recursive definition, exit with error?
-2. Trace the macro if required.
-3. Check if macro is user defined, and expand the macro (different implementation for builtin or user defined).
-4. Finish tracing.
+```
+m4wrap(`W1 ')m4wrap(`W2 ')body
+  ours:  body / W1 W2
+  GNU:   body / W2 W1
+```
 
-To evaluate user defined macro:
+POSIX says the wrapped text is "processed in the order in which the `m4wrap`
+macros were processed", which is FIFO. GNU 2.0 changed to match. This one is
+deliberate and is not a sendmail-compatibility question.
 
-Go through the definition characters, if we find a match to replacement characters, then push the replacement to the input stack, otherwise just push definition character to the input stack.
+### Unverified
 
-Their builtin dnl macro actually just consumes input directly until newline, no external configuration! In contrast to ours which works on the parsing level.
+Whether sendmail's own `cf/` macro set builds correctly has **not** been
+re-checked since the engine was reworked. The original "currently it's
+incompatible" note gave argument expansion order as the reason, and that reason
+is gone — but the absence of a cause is not evidence of success. Anyone with a
+sendmail source tree to hand should run it and replace this paragraph with a
+result.
 
-So in the end I think we get a functionality that iteratively, depth-first evaluates macro arguments.
+### FreeBSD m4 reference links
 
-To make our approach similar I think we should probably go back to a stack based approach. Previously when I went with a stack approach I ended up doing it breadth first by mistake. But first I'll check exactly why our divert nested test is failing and see if there can't be some short term workaround.
+Kept because they are useful reading for anyone working on the engine.
 
 - [1]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/eval.c#L123
 - [2]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/eval.c#L207-L217
@@ -123,4 +146,3 @@ To make our approach similar I think we should probably go back to a stack based
 - [7]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/main.c#L480
 - [8]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/misc.c#L406-L413
 - [9]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/main.c#L341
-

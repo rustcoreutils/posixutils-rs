@@ -92,12 +92,17 @@ impl Variables {
     /// caller to remember it: `screen` comes from the user, and every one of
     /// the three sites that divides by it used to divide by zero on
     /// `set screen=0`.
+    ///
+    /// When the user has not set `screen`, the spec does not leave the default
+    /// to the implementation's taste: "If `screen` is not specified, a value
+    /// based on the terminal type identified by the TERM environment variable,
+    /// the window size, the baud rate, or some combination of these shall be
+    /// used" (104664-66). It was a hard-coded 20.
     pub fn screen_lines(&self) -> NonZeroUsize {
-        const DEFAULT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
         self.get_number("screen")
             .and_then(|n| usize::try_from(n).ok())
             .and_then(NonZeroUsize::new)
-            .unwrap_or(DEFAULT)
+            .unwrap_or_else(|| screenful_from(terminal_rows(), std::env::var("TERM").ok()))
     }
 
     /// Set a boolean variable
@@ -313,4 +318,83 @@ pub fn split_args(line: &str) -> Vec<String> {
         words.push(word);
     }
     words
+}
+
+/// Rows the terminal reports, or `None` when standard output is not one.
+///
+/// The window size is the most specific of the three sources the spec names,
+/// and the only one that tracks a resized window, so it is asked first.
+fn terminal_rows() -> Option<u16> {
+    // SAFETY: `ws` is a live, correctly sized struct; the ioctl either fills
+    // it or fails, and the return value is checked.
+    let ws = unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == -1 {
+            return None;
+        }
+        ws
+    };
+    (ws.ws_row > 0).then_some(ws.ws_row)
+}
+
+/// Rows the terminfo entry for `term` claims, if any.
+fn terminfo_rows(term: &str) -> Option<u16> {
+    use terminfo::capability as cap;
+    let db = terminfo::Database::from_name(term).ok()?;
+    let cap::Lines(n) = db.get::<cap::Lines>()?;
+    u16::try_from(n).ok().filter(|n| *n > 0)
+}
+
+/// The default screenful, given a window size and a terminal type.
+///
+/// Split out from `screen_lines` so the rule can be asserted directly: a test
+/// with no controlling terminal cannot otherwise say what the fallback did.
+/// Window size first, then the terminfo entry for `TERM`, then 20 -- which is
+/// what this was unconditionally before.
+///
+/// One row is held back for the command prompt, so a 24-row terminal lists 23
+/// summaries rather than scrolling the first one away as it prompts.
+fn screenful_from(rows: Option<u16>, term: Option<String>) -> NonZeroUsize {
+    const DEFAULT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
+    let rows = rows.or_else(|| terminfo_rows(term.as_deref()?));
+    rows.map(usize::from)
+        .map(|r| r.saturating_sub(1))
+        .and_then(NonZeroUsize::new)
+        .unwrap_or(DEFAULT)
+}
+
+#[cfg(test)]
+mod screenful_tests {
+    use super::*;
+
+    #[test]
+    fn the_window_size_wins_when_there_is_one() {
+        // 24-row window -> 23 summaries plus the prompt line.
+        assert_eq!(screenful_from(Some(24), Some("dumb".into())).get(), 23);
+        assert_eq!(screenful_from(Some(50), None).get(), 49);
+    }
+
+    #[test]
+    fn a_degenerate_window_falls_back_rather_than_returning_zero() {
+        // A one-row window would leave no summaries at all; three call sites
+        // divide by this value, so it must never reach zero.
+        assert_eq!(screenful_from(Some(1), None).get(), 20);
+    }
+
+    #[test]
+    fn term_is_consulted_when_there_is_no_window_size() {
+        // vt100 is 24 lines in every terminfo database that has it at all.
+        if terminfo_rows("vt100") == Some(24) {
+            assert_eq!(screenful_from(None, Some("vt100".into())).get(), 23);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_absent_term_falls_back_to_twenty() {
+        assert_eq!(screenful_from(None, None).get(), 20);
+        assert_eq!(
+            screenful_from(None, Some("zz_no_such_terminal_zz".into())).get(),
+            20
+        );
+    }
 }

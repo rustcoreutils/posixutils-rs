@@ -92,8 +92,12 @@ pub fn get_job_dir() -> Result<String, String> {
     }
 }
 
+/// Report `err` as `<util>: <message>` and exit.
+///
+/// Was a bare `eprintln!`, so the one diagnostic `at` and `batch` emit on a
+/// failed submission carried no utility name at all.
 pub fn print_err_and_exit(exit_code: i32, err: impl std::fmt::Display) -> ! {
-    eprintln!("{}", err);
+    plib::diag::error(&err.to_string());
     process::exit(exit_code)
 }
 
@@ -125,7 +129,7 @@ pub fn at(
 
     let mut file = file_opt
         .open(&file_path)
-        .map_err(|e| format!("{}: {e}", gettext("Failed to create file with job")))?;
+        .map_err(|e| format!("{}: {}", file_path.display(), plib::diag::io_error_text(&e)))?;
 
     // Own the job file to the submitting (real) user. crond resolves an at-job's
     // run-as identity from the file's owner, so a set-uid-root `at` must not
@@ -133,7 +137,12 @@ pub fn at(
     // SAFETY: fchown on our just-created fd; getuid/getgid never fail.
     unsafe {
         if libc::fchown(file.as_raw_fd(), libc::getuid(), libc::getgid()) != 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(format!(
+                "{}: {}",
+                file_path.display(),
+                plib::diag::io_error_text(&std::io::Error::last_os_error())
+            )
+            .into());
         }
     }
 
@@ -311,16 +320,28 @@ pub fn job_file_name(next_job: u32, queue: Option<char>, time: &DateTime<Utc>) -
 
 #[derive(Debug)]
 pub enum NextJobError {
-    Io(std::io::Error),
-    FromStr(std::num::ParseIntError),
+    /// The sequence file and what went wrong with it. The path is carried
+    /// because the caller is `main`, which has no idea which file this was.
+    Io { path: String, err: std::io::Error },
+    FromStr {
+        path: String,
+        err: std::num::ParseIntError,
+    },
 }
 
 impl std::fmt::Display for NextJobError {
+    /// `write!`, not `writeln!`: a `Display` that ends the line makes every
+    /// caller adding its own newline emit a blank one. `io_error_text` rather
+    /// than `{err}`, because `io::Error`'s Display appends " (os error 13)",
+    /// which no other utility on the system says.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Error reading id of next job. Reason: ")?;
         match self {
-            NextJobError::Io(err) => writeln!(f, "{err}"),
-            NextJobError::FromStr(err) => writeln!(f, "invalid number - {err}"),
+            NextJobError::Io { path, err } => {
+                write!(f, "{path}: {}", plib::diag::io_error_text(err))
+            }
+            NextJobError::FromStr { path, err } => {
+                write!(f, "{path}: {}: {err}", gettext("invalid job number"))
+            }
         }
     }
 }
@@ -329,6 +350,13 @@ impl std::error::Error for NextJobError {}
 
 pub fn next_job_id() -> Result<u32, Box<dyn std::error::Error>> {
     let job_file_number = format!("{}.SEQ", get_job_dir()?);
+    // Every failure below is about this one file, and the caller is `main`,
+    // which cannot name it. Bind the constructor once rather than repeating
+    // the path at eight sites.
+    let io_err = |err| NextJobError::Io {
+        path: job_file_number.clone(),
+        err,
+    };
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -336,7 +364,7 @@ pub fn next_job_id() -> Result<u32, Box<dyn std::error::Error>> {
         .create(true)
         .truncate(false)
         .open(&job_file_number)
-        .map_err(NextJobError::Io)?;
+        .map_err(io_err)?;
 
     // Hold an exclusive lock across the read-modify-write so concurrent `at`
     // invocations cannot hand out the same job id (audit #A11). The lock is
@@ -344,24 +372,27 @@ pub fn next_job_id() -> Result<u32, Box<dyn std::error::Error>> {
     // SAFETY: the fd is valid for the lifetime of `file`; flock with LOCK_EX is
     // a blocking exclusive lock and we check the return value.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(NextJobError::Io(io::Error::last_os_error()).into());
+        return Err(io_err(io::Error::last_os_error()).into());
     }
 
     let mut buf = String::new();
-    file.read_to_string(&mut buf).map_err(NextJobError::Io)?;
+    file.read_to_string(&mut buf).map_err(io_err)?;
 
     let prev = match buf.trim() {
         "" => 0,
-        s => u32::from_str_radix(s, 16).map_err(NextJobError::FromStr)?,
+        s => u32::from_str_radix(s, 16).map_err(|err| NextJobError::FromStr {
+            path: job_file_number.clone(),
+            err,
+        })?,
     };
 
     // Limit range of jobs to 2^20 jobs
     let next_job_id = (1 + prev) % 0xfffff;
 
-    file.rewind().map_err(NextJobError::Io)?;
-    file.set_len(0).map_err(NextJobError::Io)?;
+    file.rewind().map_err(io_err)?;
+    file.set_len(0).map_err(io_err)?;
     file.write_all(format!("{next_job_id:05x}").as_bytes())
-        .map_err(NextJobError::Io)?;
+        .map_err(io_err)?;
 
     Ok(next_job_id)
 }

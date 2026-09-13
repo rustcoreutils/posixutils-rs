@@ -14,7 +14,7 @@ mod mntent;
 use crate::mntent::MountTable;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::ffi::{CString, OsStr, OsString};
@@ -397,16 +397,14 @@ fn read_mount_info() -> io::Result<MountList> {
             if rc < 0 {
                 // A mount we cannot statfs during the automatic "all
                 // filesystems" enumeration (e.g. an inaccessible bind/overlay
-                // mount) is skipped with a diagnostic but does NOT make df
-                // fail: it was never requested by the user. This matches GNU
-                // coreutils df, which exits 0 in the same situation. Only a
-                // user-supplied `file` operand that fails sets a non-zero exit
-                // status (see mask_fs_by_file). Audit #12.
-                eprintln!(
-                    "{}: {}",
-                    Path::new(OsStr::from_bytes(mount.dir.to_bytes())).display(),
-                    plib::diag::io_error_text(&io::Error::last_os_error())
-                );
+                // mount) is skipped silently: it was never requested by the
+                // user and it does not appear in the output either, so a
+                // diagnostic about it is pure noise -- five lines of it on
+                // every invocation on a host running docker, including
+                // `df /tmp`. GNU coreutils skips the same mounts without a
+                // word and lists exactly the same rows. It does NOT make df
+                // fail; only a user-supplied `file` operand that fails sets a
+                // non-zero exit status (see mask_fs_by_file). Audit #12.
                 continue;
             }
 
@@ -421,14 +419,22 @@ fn mask_fs_by_file(info: &mut MountList, path: &Path) -> io::Result<()> {
     let c_filename = match CString::new(path.as_os_str().as_bytes()) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("{}: {}", path.display(), gettext("invalid pathname"));
+            plib::diag::error(&format!(
+                "{}: {}",
+                path.display(),
+                gettext("invalid pathname")
+            ));
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
     };
     let stat = match stat(&c_filename) {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("{}: {}", path.display(), plib::diag::io_error_text(&e));
+            plib::diag::error(&format!(
+                "{}: {}",
+                path.display(),
+                plib::diag::io_error_text(&e)
+            ));
             return Err(e);
         }
     };
@@ -443,9 +449,9 @@ fn mask_fs_by_file(info: &mut MountList, path: &Path) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    // Registers the utility name as well as setting the locale: df's
+    // diagnostics were bare `eprintln!`s and carried no `df: ` prefix.
+    plib::diag::init_locale("df");
 
     let args = Args::parse();
 
@@ -483,11 +489,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // containing a <newline> (a separator in the output format) as an
             // error rather than emitting a corrupt, unparsable line.
             if mount.devname.as_bytes().contains(&b'\n') || mount.dir.as_bytes().contains(&b'\n') {
-                eprintln!(
+                plib::diag::error(&format!(
                     "{}: {}",
                     mount.dir.to_string_lossy(),
                     gettext("pathname contains newline; skipping")
-                );
+                ));
                 exit_code = 1;
                 continue;
             }

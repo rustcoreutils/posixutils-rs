@@ -207,3 +207,36 @@ fn test_xgettext_c_file() {
         "tests/xgettext/test_c.pot",
     );
 }
+
+/// A failure must read as one `xgettext: <file>: <message>` line.
+///
+/// `main` returned `Result<(), Box<dyn Error>>`, so Rust's `Termination` impl
+/// printed the `Debug` of the boxed error -- `Error: Os { code: 2, kind:
+/// NotFound, message: "..." }` -- with no utility name and no filename, even
+/// though the path was in scope at every one of the six bare `?`s in `main`.
+#[test]
+fn xgettext_missing_input_file_names_utility_and_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("xgettext"))
+        .arg("/nonexistent_xgettext_probe_zz.c")
+        .output()
+        .expect("spawn xgettext");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !stderr.contains("Os {") && !stderr.starts_with("Error: "),
+        "Rust's Debug form must not reach the user: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("xgettext: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_xgettext_probe_zz.c"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

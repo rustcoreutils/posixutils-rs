@@ -11,6 +11,7 @@ use plib::testing::{run_test_with_checker, TestPlan};
 use plib::tmp::TempDir;
 use std::fs::File;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 /// Create a minimal locale source file
@@ -404,4 +405,151 @@ fn localedef_creation_unsupported_applies_with_c_too() {
 
     assert_eq!(output.status.code(), Some(3), "-c with warnings -> 3");
     assert!(!out.exists(), "nothing may be written");
+}
+
+// ============================================================================
+// `-u code_set_name`
+// ============================================================================
+
+/// Write a minimal charmap declaring `codeset`, plus a trivial locale source.
+/// Returns (charmap path, source path).
+fn u_fixture(dir: &Path, codeset: &str) -> (PathBuf, PathBuf) {
+    let charmap = dir.join("cm.charmap");
+    let mut f = File::create(&charmap).unwrap();
+    write!(
+        f,
+        "<code_set_name> {codeset}\n<mb_cur_min> 1\n<mb_cur_max> 1\n\nCHARMAP\n<U0041> /x41\nEND CHARMAP\n"
+    )
+    .unwrap();
+
+    let src = dir.join("ok.locale");
+    let mut f = File::create(&src).unwrap();
+    write!(f, "LC_NUMERIC\ndecimal_point \".\"\nEND LC_NUMERIC\n").unwrap();
+    (charmap, src)
+}
+
+fn run_localedef(args: &[&str]) -> Output {
+    std::process::Command::new(plib::testing::get_binary_path("localedef"))
+        .args(args)
+        .output()
+        .expect("spawn localedef")
+}
+
+/// `-u` disagreeing with the charmap's own `<code_set_name>` must be
+/// diagnosed, not silently accepted.
+///
+/// The option was parsed into a field that nothing in the repo ever read, so a
+/// mismatched `-u` produced exactly the same result as a matching one.
+#[test]
+fn test_localedef_u_mismatching_the_charmap_is_rejected() {
+    let temp_dir = TempDir::new().unwrap();
+    let (charmap, src) = u_fixture(temp_dir.path(), "UTF-8");
+
+    let out = run_localedef(&[
+        "-u",
+        "ISO-8859-1",
+        "-f",
+        charmap.to_str().unwrap(),
+        "-i",
+        src.to_str().unwrap(),
+        "zz_probe",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.contains("ISO-8859-1"),
+        "the requested codeset must be named: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("UTF-8"),
+        "the charmap's own codeset must be named, so the user can see the \
+         disagreement: {stderr:?}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a coded character set that is not available is exit 2"
+    );
+}
+
+/// A `-u` that agrees must be silent, and must not change the outcome.
+///
+/// Without this, rejecting every `-u` would pass the test above.
+#[test]
+fn test_localedef_u_matching_the_charmap_is_accepted() {
+    let temp_dir = TempDir::new().unwrap();
+    let (charmap, src) = u_fixture(temp_dir.path(), "UTF-8");
+
+    let with_u = run_localedef(&[
+        "-u",
+        "UTF-8",
+        "-f",
+        charmap.to_str().unwrap(),
+        "-i",
+        src.to_str().unwrap(),
+        "zz_probe",
+    ]);
+    let without_u = run_localedef(&[
+        "-f",
+        charmap.to_str().unwrap(),
+        "-i",
+        src.to_str().unwrap(),
+        "zz_probe",
+    ]);
+
+    assert_eq!(
+        with_u.status.code(),
+        without_u.status.code(),
+        "a matching -u must not change the exit status"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&with_u.stderr),
+        String::from_utf8_lossy(&without_u.stderr),
+        "a matching -u must not add a diagnostic"
+    );
+}
+
+/// Codeset names differ in punctuation and case between systems; `utf8`,
+/// `UTF-8` and `UTF_8` are one codeset, and treating them as three would turn
+/// the new check into a source of spurious rejections.
+#[test]
+fn test_localedef_u_codeset_names_compare_loosely() {
+    let temp_dir = TempDir::new().unwrap();
+    let (charmap, src) = u_fixture(temp_dir.path(), "UTF-8");
+
+    for spelling in ["utf8", "UTF_8", "utf-8", "UTF-8"] {
+        let out = run_localedef(&[
+            "-u",
+            spelling,
+            "-f",
+            charmap.to_str().unwrap(),
+            "-i",
+            src.to_str().unwrap(),
+            "zz_probe",
+        ]);
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "{spelling} names the same codeset as UTF-8: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `-u` with no charmap has nothing to be checked against, and cannot be
+/// honoured without one. Saying so beats accepting it in silence.
+#[test]
+fn test_localedef_u_without_a_charmap_says_so() {
+    let temp_dir = TempDir::new().unwrap();
+    let (_charmap, src) = u_fixture(temp_dir.path(), "UTF-8");
+
+    let out = run_localedef(&["-u", "UTF-8", "-i", src.to_str().unwrap(), "zz_probe"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.contains("-u"),
+        "the option that had no effect must be named: {stderr:?}"
+    );
+    // Not an error: POSIX does not require -u to be given with -f.
+    assert_ne!(out.status.code(), Some(2));
 }

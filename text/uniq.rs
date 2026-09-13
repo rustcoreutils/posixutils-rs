@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use plib::locale::isblank;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -76,7 +76,12 @@ fn uniq(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             if file.as_os_str() == "-" {
                 Box::new(BufReader::new(io::stdin()))
             } else {
-                Box::new(BufReader::new(File::open(file)?))
+                // Name the operand at the origin: uniq takes both an input
+                // and an output file, and the errno alone cannot say which
+                // of the two failed.
+                Box::new(BufReader::new(File::open(file).map_err(|e| {
+                    format!("{}: {}", file.display(), plib::diag::io_error_text(&e))
+                })?))
             }
         }
         None => Box::new(BufReader::new(io::stdin())),
@@ -85,7 +90,10 @@ fn uniq(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // A "-" output_file operand means standard output (POSIX), not a file
     // literally named "-".
     let mut output: Box<dyn Write> = match &args.output_file {
-        Some(file) if file.as_os_str() != "-" => Box::new(File::create(file)?),
+        Some(file) if file.as_os_str() != "-" => Box::new(
+            File::create(file)
+                .map_err(|e| format!("{}: {}", file.display(), plib::diag::io_error_text(&e)))?,
+        ),
         _ => Box::new(io::stdout()),
     };
 
@@ -208,9 +216,9 @@ fn output_result<W: Write>(
 ///
 /// Returns an error if there is an issue with the arguments or the uniq function.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    // Registers the utility name as well as setting the locale. uniq was the
+    // one utility here whose diagnostics carried no `uniq: ` prefix at all.
+    plib::diag::init_locale("uniq");
 
     let args = Args::parse();
 
@@ -220,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = uniq(&args) {
         exit_code = 1;
-        eprintln!("{}", plib::diag::error_text(err.as_ref()));
+        plib::diag::error(&plib::diag::error_text(err.as_ref()));
     }
 
     std::process::exit(exit_code)

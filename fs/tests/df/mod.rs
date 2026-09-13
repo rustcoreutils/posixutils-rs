@@ -335,3 +335,62 @@ fn test_df_non_utf8_operand_does_not_panic() {
         "no filesystem rows should be printed, got {stdout:?}"
     );
 }
+
+/// `df` must name itself in its diagnostics.
+///
+/// It used raw `setlocale`/`textdomain` and bare `eprintln!`, so every line it
+/// wrote to stderr was unattributed: `/nonexistent: No such file or directory`
+/// where GNU says `df: /nonexistent: No such file or directory`.
+#[test]
+fn test_df_error_names_the_utility() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("df"))
+        .arg("/nonexistent_df_probe_zz")
+        .output()
+        .expect("spawn df");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("df: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_df_probe_zz"),
+        "the diagnostic must name the operand: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}
+
+/// `df` must not report mounts the user never asked about.
+///
+/// Enumerating "all filesystems" hits mounts the caller cannot `statfs` --
+/// docker overlays, netns bind mounts. Those are skipped, and correctly do not
+/// affect the exit status, but each one also printed a `<path>: Permission
+/// denied` line, on *every* invocation including `df /tmp`. GNU coreutils
+/// skips them silently and lists exactly the same rows; five lines of noise
+/// about filesystems that do not appear in the output help nobody.
+#[test]
+fn test_df_does_not_report_unrequested_mounts() {
+    for args in [vec![], vec!["/tmp"]] {
+        let out = std::process::Command::new(plib::testing::get_binary_path("df"))
+            .args(&args)
+            .output()
+            .expect("spawn df");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+        assert_eq!(
+            stderr, "",
+            "df {args:?} must not write to stderr when every operand resolved: {stderr:?}"
+        );
+        assert_eq!(out.status.code(), Some(0), "df {args:?} must succeed");
+        // The table itself must be unchanged: a header plus at least one row.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.lines().count() >= 2,
+            "df {args:?} must still print a header and at least one row: {stdout:?}"
+        );
+    }
+}

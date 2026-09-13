@@ -2350,10 +2350,18 @@ mod sccs {
     use std::os::unix::fs::PermissionsExt;
 
     fn run(args: &[&str]) -> (String, Option<i32>) {
-        let output = Command::new(get_binary_path("make"))
-            .args(args)
-            .output()
-            .expect("failed to run make");
+        run_env(args, &[])
+    }
+
+    /// `run`, with environment variables set on the child -- `PROJECTDIR` is
+    /// read from the environment, so there is no other way to exercise it.
+    fn run_env(args: &[&str], env: &[(&str, &str)]) -> (String, Option<i32>) {
+        let mut cmd = Command::new(get_binary_path("make"));
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to run make");
         (
             String::from_utf8_lossy(&output.stdout).to_string(),
             output.status.code(),
@@ -2825,6 +2833,130 @@ mod macro_sources {
         // The environment still supplies one, since -r removes source 4 only.
         let (with_env, _, _) = run_env(&["-C", dir, "-r", "all"], &[("CC", "envcc")]);
         assert!(with_env.contains("CC=[envcc]"), "stdout: {with_env}");
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+// XSI PROJECTDIR (spec 105471-82): a directory to search for SCCS files "not
+// found in the current directory".
+mod projectdir {
+    use super::*;
+    use std::fs;
+
+    fn run_env(args: &[&str], env: &[(&str, &str)]) -> (String, Option<i32>) {
+        let mut cmd = Command::new(get_binary_path("make"));
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to run make");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            output.status.code(),
+        )
+    }
+
+    /// A working directory with no `SCCS/` of its own, and a separate project
+    /// directory that has one. Returns the absolute project path.
+    fn fixture(dir: &str) -> String {
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::create_dir_all(format!("{dir}/work"));
+        let _ = fs::create_dir_all(format!("{dir}/proj/SCCS"));
+        let _ = fs::write(
+            format!("{dir}/work/Makefile"),
+            ".SCCS_GET:\n\t@echo RETRIEVED $@; echo from-sccs > $@\n\nall: pd_probe.c\n\t@cat pd_probe.c\n",
+        );
+        let _ = fs::write(format!("{dir}/proj/SCCS/s.pd_probe.c"), "history\n");
+        fs::canonicalize(format!("{dir}/proj"))
+            .expect("project dir")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// Without PROJECTDIR there is nothing to find: this is the precondition
+    /// that makes every assertion below mean something.
+    #[test]
+    fn without_projectdir_the_target_is_simply_missing() {
+        let dir = "pd_absent_probe";
+        let _ = fixture(dir);
+        let (stdout, code) = run_env(&["-C", &format!("{dir}/work"), "all"], &[]);
+        assert!(
+            !stdout.contains("RETRIEVED"),
+            "nothing may be retrieved without PROJECTDIR: {stdout}"
+        );
+        assert_ne!(code, Some(0), "the target does not exist: {stdout}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// "If the value of PROJECTDIR begins with a <slash>, it shall be
+    /// considered an absolute pathname" (105474-75), and the search is made
+    /// "in the directory SCCS in the identified directory" (105473-74).
+    #[test]
+    fn an_absolute_projectdir_is_searched() {
+        let dir = "pd_absolute_probe";
+        let proj = fixture(dir);
+        let (stdout, code) = run_env(
+            &["-C", &format!("{dir}/work"), "all"],
+            &[("PROJECTDIR", &proj)],
+        );
+        assert!(stdout.contains("RETRIEVED pd_probe.c"), "stdout: {stdout}");
+        assert!(stdout.contains("from-sccs"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// "Otherwise, the value is used as a relative pathname" (105478) -- the
+    /// branch sccs had dropped, reached here because the value names no user.
+    #[test]
+    fn a_relative_projectdir_is_searched() {
+        let dir = "pd_relative_probe";
+        let _ = fixture(dir);
+        // Relative to make's working directory, which -C has moved into work/.
+        let (stdout, code) = run_env(
+            &["-C", &format!("{dir}/work"), "all"],
+            &[("PROJECTDIR", "../proj")],
+        );
+        assert!(stdout.contains("RETRIEVED pd_probe.c"), "stdout: {stdout}");
+        assert_eq!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// "If PROJECTDIR is not set or has a null value, the search for SCCS
+    /// files shall be made in the directory SCCS in the current directory"
+    /// (105479-80). A null value must not be treated as a relative pathname.
+    #[test]
+    fn a_null_projectdir_means_the_current_directory() {
+        let dir = "pd_null_probe";
+        let _ = fixture(dir);
+        let (stdout, code) = run_env(
+            &["-C", &format!("{dir}/work"), "all"],
+            &[("PROJECTDIR", "")],
+        );
+        assert!(!stdout.contains("RETRIEVED"), "stdout: {stdout}");
+        assert_ne!(code, Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// PROJECTDIR is a *fallback*: it names a directory to search for SCCS
+    /// files "not found in the current directory" (105472-73). A local
+    /// SCCS/s.file must still win.
+    #[test]
+    fn a_local_sccs_directory_takes_precedence() {
+        let dir = "pd_precedence_probe";
+        let proj = fixture(dir);
+        let _ = fs::create_dir_all(format!("{dir}/work/SCCS"));
+        let _ = fs::write(format!("{dir}/work/SCCS/s.pd_probe.c"), "local history\n");
+        let _ = fs::write(
+            format!("{dir}/work/Makefile"),
+            ".SCCS_GET:\n\t@echo RETRIEVED $@; echo local > $@\n\nall: pd_probe.c\n\t@cat pd_probe.c\n",
+        );
+
+        let (stdout, code) = run_env(
+            &["-C", &format!("{dir}/work"), "all"],
+            &[("PROJECTDIR", &proj)],
+        );
+        assert!(stdout.contains("local"), "the local history wins: {stdout}");
+        assert_eq!(code, Some(0));
         let _ = fs::remove_dir_all(dir);
     }
 }

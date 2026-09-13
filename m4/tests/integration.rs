@@ -7,24 +7,34 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
 use std::fs;
 use std::path::Path;
-use std::process::Output;
+use std::process::{Command, Output, Stdio};
 
 /// Unescape newlines from .out file format
 fn unescape_newlines(input: &str) -> String {
     input.replace("\\n", "\n")
 }
 
-/// Parse the .out file format (key=value lines)
-fn parse_out_file(content: &str) -> (String, String, i32, bool, bool, Option<String>) {
+/// Parse the .out file format (key=value lines).
+///
+/// Returns only what a test actually compares. The format grew under the
+/// `m4/test-manager` crate, which generated these files and read keys back out
+/// of them; that crate was deleted when the suite moved to `TestPlan`, and the
+/// keys it alone consumed were left parsed into values nothing read.
+///
+/// `expect_error` and `stdout_regex` survive as recognised keys because they
+/// still document a fixture's intent, but the behaviour they once selected is
+/// now chosen by *which macro* registers the test -- `m4_test_expect_error!`
+/// or `m4_test_regex!`. An unrecognised key is a hard error rather than a
+/// shrug: `ignore=true` sat in four of these files claiming those tests were
+/// skipped, when the field had no reader and all four had been running, and
+/// passing, the whole time.
+fn parse_out_file(content: &str) -> (String, String, i32) {
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut status = 0i32;
-    let mut ignore = false;
-    let mut expect_error = false;
-    let mut stdout_regex: Option<String> = None;
 
     for line in content.lines() {
         if line.is_empty() || line.starts_with('#') {
@@ -35,16 +45,19 @@ fn parse_out_file(content: &str) -> (String, String, i32, bool, bool, Option<Str
                 "stdout" => stdout = unescape_newlines(value),
                 "stderr" => stderr = unescape_newlines(value),
                 "status" => status = value.parse().unwrap_or(0),
-                "ignore" => ignore = value == "true",
-                "expect_error" => expect_error = value == "true",
-                "stdout_regex" => stdout_regex = Some(unescape_newlines(value)),
-                "skip_update" => {} // Not needed at runtime
-                _ => {}
+                // Recognised, and deliberately not acted on here: the macro
+                // that registers the test selects the checker.
+                "expect_error" | "stdout_regex" => {}
+                other => panic!(
+                    "unknown key {other:?} in a .out fixture; \
+                     add it to parse_out_file or delete it, do not leave it \
+                     to be silently ignored"
+                ),
             }
         }
     }
 
-    (stdout, stderr, status, ignore, expect_error, stdout_regex)
+    (stdout, stderr, status)
 }
 
 /// Load a fixture and create a TestPlan
@@ -58,7 +71,7 @@ fn load_fixture(name: &str) -> TestPlan {
 
     let out_content = fs::read_to_string(&out_path)
         .unwrap_or_else(|_| panic!("Failed to read {}", out_path.display()));
-    let (expected_out, expected_err, expected_exit_code, _, _, _) = parse_out_file(&out_content);
+    let (expected_out, expected_err, expected_exit_code) = parse_out_file(&out_content);
 
     if args_path.exists() {
         // CLI args test - args are in the file content
@@ -349,4 +362,185 @@ fn undefine_option_rejects_a_name_starting_with_a_digit() {
         expected_err: String::from("error: invalid value '9bad' for '-U <name>'\n"),
         expected_exit_code: 2,
     });
+}
+
+// ============================================================================
+// GNU m4 differential gate
+// ============================================================================
+
+/// The oldest GNU m4 this gate's expectations have been checked against.
+const MIN_GNU_VERSION: (u32, u32, u32) = (1, 4, 19);
+
+/// The reference's self-reported version, if it is a GNU m4 at least
+/// [`MIN_GNU_VERSION`].
+///
+/// The gate used to take any executable at `/usr/bin/m4` and call it GNU m4.
+/// That premise is false on macOS, whose `/usr/bin/m4` is a different
+/// implementation: it disagrees with us -- and with GNU M4 1.4.19 -- on
+/// `eval`'s `!` and `~`, on quote handling in `define_hanging_quotes`, and on
+/// `define_nested_first_arg`, while *our* output is byte-identical on both
+/// platforms. Comparing against it said nothing about this m4's correctness
+/// and turned macOS CI red for an environment difference.
+///
+/// The version floor matters as much as the name. These fixtures encode one
+/// reference implementation's answers, and GNU m4 has changed some of them
+/// between releases (`m4wrap` ordering, for one). A gate that silently
+/// compared against a different version would report a difference that is not
+/// a regression.
+fn gnu_m4_version(bin: &std::ffi::OsStr) -> Option<String> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let first = text.lines().next()?.trim().to_string();
+    parse_gnu_m4_version(&first)
+        .is_some_and(|v| v >= MIN_GNU_VERSION)
+        .then_some(first)
+}
+
+/// Parse `m4 (GNU M4) 1.4.19` into `(1, 4, 19)`.
+///
+/// Returns `None` for anything that does not announce itself as GNU M4, which
+/// is what a BSD m4 -- or a `--version` it does not understand -- yields.
+fn parse_gnu_m4_version(line: &str) -> Option<(u32, u32, u32)> {
+    let rest = line.split("GNU M4").nth(1)?;
+    // "m4 (GNU M4) 1.4.19" leaves ") 1.4.19": the version is the first run of
+    // digits and dots, not the first whitespace-separated token, which is ")".
+    let rest = rest.trim_start_matches(|c: char| !c.is_ascii_digit());
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if token.is_empty() {
+        return None;
+    }
+    let mut parts = token.split('.').map(|p| p.parse::<u32>());
+    let major = parts.next()?.ok()?;
+    let minor = parts.next().unwrap_or(Ok(0)).ok()?;
+    let patch = parts.next().unwrap_or(Ok(0)).ok()?;
+    Some((major, minor, patch))
+}
+
+#[test]
+fn gnu_m4_version_identifies_the_reference() {
+    // What GNU m4 actually prints.
+    assert_eq!(parse_gnu_m4_version("m4 (GNU M4) 1.4.19"), Some((1, 4, 19)));
+    assert_eq!(parse_gnu_m4_version("m4 (GNU M4) 1.4.6"), Some((1, 4, 6)));
+    assert_eq!(parse_gnu_m4_version("m4 (GNU M4) 2.0"), Some((2, 0, 0)));
+
+    // Anything that is not GNU m4 -- macOS's BSD m4 prints no such line, and
+    // does not accept --version at all.
+    assert_eq!(parse_gnu_m4_version(""), None);
+    assert_eq!(parse_gnu_m4_version("m4: illegal option -- -"), None);
+    assert_eq!(parse_gnu_m4_version("usage: m4 [-gPs] ..."), None);
+    assert_eq!(parse_gnu_m4_version("m4 (BSD m4) 1.0"), None);
+
+    // The floor is what keeps a different GNU release from reporting its own
+    // changed behaviour as our regression.
+    assert!(parse_gnu_m4_version("m4 (GNU M4) 1.4.6").unwrap() < MIN_GNU_VERSION);
+    assert!(parse_gnu_m4_version("m4 (GNU M4) 1.4.19").unwrap() >= MIN_GNU_VERSION);
+}
+
+#[test]
+fn gnu_m4_version_rejects_a_reference_that_is_not_gnu_m4() {
+    // A real executable that is not m4 at all must be refused, not compared
+    // against: this is the macOS failure in miniature.
+    assert_eq!(gnu_m4_version("/bin/cat".as_ref()), None);
+    assert_eq!(gnu_m4_version("/nonexistent_m4_zz".as_ref()), None);
+}
+
+/// Run every stdin-driven fixture through both this m4 and the system's GNU
+/// m4, and require the stdout to agree.
+///
+/// The 85 committed `.out` files are frozen snapshots: they say what this
+/// implementation produced when they were written, not what m4 is supposed to
+/// produce. Nothing in the crate had ever compared against a reference, which
+/// is how `m4/docs/Compatibility.md` came to assert a breadth-first
+/// argument-expansion incompatibility that had stopped being true.
+///
+/// Skipped, loudly, when GNU m4 is not installed -- CI must stay green without
+/// it, but a silent skip would make this gate exactly the kind of claim it
+/// exists to check.
+///
+/// stdout only. stderr wording is deliberately ours (the utility name, and the
+/// diagnostics reworded over the last several commits), and diverging there is
+/// not a semantic difference. Fixtures whose output is not a function of the
+/// input alone are named and excluded.
+#[test]
+fn gnu_m4_differential() {
+    const GNU: &str = "/usr/bin/m4";
+
+    // maketemp/mkstemp generate random filenames by design, so no two runs of
+    // any implementation agree, let alone two implementations.
+    const NONDETERMINISTIC: &[&str] = &["maketemp", "mkstemp"];
+
+    let Some(version) = gnu_m4_version(GNU.as_ref()) else {
+        eprintln!(
+            "skipping gnu_m4_differential: {GNU} is absent, or is not a GNU m4 \
+             new enough to compare against (this gate's expectations were \
+             validated against GNU M4 {MIN_GNU_VERSION:?} and later)"
+        );
+        return;
+    };
+
+    let base = Path::new("fixtures/integration_tests");
+    let mut compared = 0usize;
+    let mut differing: Vec<String> = Vec::new();
+
+    let mut entries: Vec<_> = fs::read_dir(base)
+        .expect("fixture directory")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "m4"))
+        .collect();
+    entries.sort();
+
+    for path in entries {
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        if NONDETERMINISTIC.iter().any(|n| name.contains(n)) {
+            continue;
+        }
+        // `.args` fixtures drive the CLI, not stdin; their argv lives in a
+        // separate file and several reference paths relative to the crate.
+        if base.join(format!("{name}.args")).exists() {
+            continue;
+        }
+        let Ok(input) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        let run = |bin: &std::ffi::OsStr| -> Option<String> {
+            let mut child = Command::new(bin)
+                .current_dir(base)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+            use std::io::Write;
+            let _ = child.stdin.as_mut()?.write_all(input.as_bytes());
+            let out = child.wait_with_output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+
+        let (Some(ours), Some(theirs)) =
+            (run(get_binary_path("m4").as_os_str()), run(GNU.as_ref()))
+        else {
+            continue;
+        };
+        compared += 1;
+        if ours != theirs {
+            differing.push(format!("{name}:\n  ours: {ours:?}\n  gnu : {theirs:?}"));
+        }
+    }
+
+    eprintln!("gnu_m4_differential: compared {compared} fixtures against {version:?}");
+    assert!(
+        compared >= 50,
+        "the gate compared only {compared} fixtures; it is not exercising the suite"
+    );
+    assert!(
+        differing.is_empty(),
+        "{} of {compared} fixtures disagree with GNU m4:\n{}",
+        differing.len(),
+        differing.join("\n")
+    );
 }

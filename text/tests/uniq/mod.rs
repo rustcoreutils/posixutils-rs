@@ -273,3 +273,58 @@ fn uniq_empty_and_single_line_input() {
     // A single line with no trailing <newline>.
     uniq_test(&[], "only", "only\n");
 }
+
+/// `uniq` must name itself and the file it could not open.
+///
+/// It was the only utility in the tree whose diagnostic carried no `uniq: `
+/// prefix at all -- `main` used `eprintln!("{}", ...)` and never called
+/// `plib::diag::init_locale` -- and it named neither the input nor the output
+/// operand, so with both given the user could not tell which had failed.
+#[test]
+fn test_uniq_error_names_utility_and_input_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("uniq"))
+        .arg("/nonexistent_uniq_probe_zz")
+        .output()
+        .expect("spawn uniq");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("uniq: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_uniq_probe_zz"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}
+
+/// An unwritable *output* operand must be distinguishable from an unreadable
+/// input one -- the whole point of naming the file.
+#[test]
+fn test_uniq_error_distinguishes_output_file_from_input() {
+    let dir = plib::tmp::tempdir().expect("tempdir");
+    let input = dir.path().join("in.txt");
+    std::fs::write(&input, "a\na\nb\n").unwrap();
+
+    let out = std::process::Command::new(plib::testing::get_binary_path("uniq"))
+        .arg(&input)
+        .arg("/nonexistent_dir_uniq_zz/out.txt")
+        .output()
+        .expect("spawn uniq");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.contains("/nonexistent_dir_uniq_zz/out.txt"),
+        "the failing operand is the output file, so that is what must be named: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(input.to_str().unwrap()),
+        "the readable input must not be blamed: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

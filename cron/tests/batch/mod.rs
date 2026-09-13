@@ -225,3 +225,64 @@ fn test_batch_respects_the_allow_file() {
         "no job may be filed for a denied user"
     );
 }
+
+/// A spool `batch` cannot write must be reported as one `batch: <path>:
+/// <message>` line.
+///
+/// The message came from `NextJobError`'s Display, which carried no path,
+/// rendered the `io::Error` with `{err}` so Rust's " (os error 13)" reached
+/// the user, and used `writeln!` inside `Display` -- so the caller's own
+/// newline produced a stray blank line. `print_err_and_exit` then wrote it
+/// with no utility prefix at all.
+#[test]
+fn test_batch_unwritable_spool_names_utility_path_and_reason() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = plib::tmp::tempdir().expect("tempdir");
+    let spool = dir.path().join("spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    let allow = dir.path().join("at.allow");
+    std::fs::write(&allow, format!("{}\n", whoami())).unwrap();
+    // Read+execute but not write: the job-id sequence file cannot be created.
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let out = {
+        use std::io::Write;
+        let mut child = std::process::Command::new(plib::testing::get_binary_path("batch"))
+            .env("AT_JOB_DIR", &spool)
+            .env("AT_ALLOW", &allow)
+            .env("LC_ALL", "C")
+            .env_remove("AT_DENY")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn batch");
+        child.stdin.as_mut().unwrap().write_all(b"true\n").unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    // Restore write permission so the tempdir can be cleaned up.
+    let _ = std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o700));
+
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("batch: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(spool.to_str().unwrap()),
+        "the diagnostic must name the file it could not create: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_eq!(
+        stderr.lines().filter(|l| l.trim().is_empty()).count(),
+        0,
+        "a Display impl that ends the line makes the caller emit a blank one: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

@@ -457,3 +457,217 @@ fn test_at_tz_determines_the_absolute_execution_time() {
     );
     assert_eq!(utc - tokyo, 9 * 60, "Asia/Tokyo must be UTC+9");
 }
+
+// ============================================================================
+// Diagnostic surface and exit status
+// ============================================================================
+
+/// Run `at` with a private spool and a permissive allow-list, returning the
+/// raw `Output` so a test can assert on a *failure* -- which is what
+/// `submit_and_read_script` cannot do, since it asserts success.
+fn at_command(args: &[&str], stdin_data: &str) -> std::process::Output {
+    use std::io::Write;
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().expect("tempdir");
+    let spool = dir.path().join("spool");
+    fs::create_dir_all(&spool).unwrap();
+    let allow = dir.path().join("at.allow");
+    fs::write(&allow, format!("{}\n", whoami())).unwrap();
+
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("at"))
+        .args(args)
+        .env("AT_JOB_DIR", &spool)
+        .env("AT_ALLOW", &allow)
+        .env("TZ", "UTC")
+        .env("LC_ALL", "C")
+        .env_remove("AT_DENY")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn at");
+    // `at` validates the timespec before reading stdin, so for the failure
+    // cases here the child may already be gone: EPIPE is expected, not a bug.
+    let _ = child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_data.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+/// A failure must read as one `at: <message>` line.
+///
+/// `main` returned `Result<(), Box<dyn Error>>`, so Rust's `Termination` impl
+/// printed the `Debug` of the boxed error: `Error: TimespecPatternNotFound
+/// ("not-a-time")` -- Rust struct syntax, an internal variant name, and no
+/// utility prefix. The same shape was fixed in `split` first.
+#[test]
+fn test_at_bad_timespec_diagnostic_is_not_a_debug_dump() {
+    let output = at_command(&["not-a-time"], "echo hi\n");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !stderr.contains("TimespecPatternNotFound"),
+        "the diagnostic must not leak a Rust enum variant name: {stderr:?}"
+    );
+    assert!(
+        !stderr.starts_with("Error: "),
+        "the diagnostic must not be Rust's Debug form: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("at: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert_eq!(output.status.code(), Some(1), "a rejected timespec exits 1");
+}
+
+/// `TimespecParsingError`'s `Display` printed "Failed to parse token in str"
+/// for *every* variant, which is why the `Debug` form was the informative one.
+/// Two differently-malformed timespecs must not report the same sentence.
+#[test]
+fn test_at_timespec_diagnostics_distinguish_their_causes() {
+    let gibberish = at_command(&["not-a-time"], "echo hi\n");
+    let bad_increment = at_command(&["now", "+", "3", "fortnights"], "echo hi\n");
+
+    let a = String::from_utf8_lossy(&gibberish.stderr).to_string();
+    let b = String::from_utf8_lossy(&bad_increment.stderr).to_string();
+
+    for text in [&a, &b] {
+        assert!(
+            !text.contains("Failed to parse token in str"),
+            "the placeholder Display text must be gone: {text:?}"
+        );
+        assert!(
+            text.starts_with("at: "),
+            "every diagnostic must name the utility: {text:?}"
+        );
+    }
+    assert_ne!(
+        a, b,
+        "a bad timespec and a bad increment must not report the same sentence"
+    );
+}
+
+/// An unreadable `-f` command file must name the file and carry no Rust
+/// artifacts -- neither the `Debug` quoting of a boxed `String` nor the
+/// `(os error N)` that `io::Error`'s `Display` appends.
+#[test]
+fn test_at_missing_command_file_names_it_without_rust_artifacts() {
+    let output = at_command(&["-f", "/nonexistent_at_probe_zz", "noon"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("at: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_at_probe_zz"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('"'),
+        "the Debug quoting of a boxed String must not reach the user: {stderr:?}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `at -l at_job_id` must say so when the id is not in the spool, and must
+/// not exit 0 after saying it.
+///
+/// Two bugs stacked here. `main` returned `Ok(())` without consulting
+/// `plib::diag::exit_status()`, so the "no such job" diagnostic did not reach
+/// the status -- and an `if list.is_empty() { return Ok(()) }` fired *before*
+/// the id was ever looked up, so against an empty spool there was no
+/// diagnostic at all: silence and exit 0.
+#[test]
+fn test_at_list_reports_a_job_id_that_is_not_there() {
+    // Empty spool: the early return used to swallow the lookup entirely.
+    let empty = at_command(&["-l", "99999"], "");
+    let stderr = String::from_utf8_lossy(&empty.stderr).to_string();
+    assert!(
+        stderr.contains("99999"),
+        "an absent job id must be reported even when the spool is empty: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("at: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert_ne!(
+        empty.status.code(),
+        Some(0),
+        "at must not exit 0 after diagnosing an absent job id"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&empty.stdout),
+        "",
+        "nothing is listed when nothing matched"
+    );
+}
+
+/// The same, with a real job in the spool -- so the failure cannot be blamed
+/// on the spool being empty, and so the listing of a *present* id is shown
+/// still to work alongside it.
+#[test]
+fn test_at_list_mixes_a_present_and_an_absent_job_id() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().expect("tempdir");
+    let spool = dir.path().join("spool");
+    fs::create_dir_all(&spool).unwrap();
+    let allow = dir.path().join("at.allow");
+    fs::write(&allow, format!("{}\n", whoami())).unwrap();
+
+    let at = |args: &[&str], stdin: &str| -> std::process::Output {
+        use std::io::Write;
+        let mut child = std::process::Command::new(plib::testing::get_binary_path("at"))
+            .args(args)
+            .env("AT_JOB_DIR", &spool)
+            .env("AT_ALLOW", &allow)
+            .env("TZ", "UTC")
+            .env("LC_ALL", "C")
+            .env_remove("AT_DENY")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn at");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let submitted = at(&["-t", "210001011200.00"], "true\n");
+    assert!(
+        submitted.status.success(),
+        "submission must succeed: {}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+
+    // Job 1 exists; 99999 does not. The present one is listed, the absent one
+    // is diagnosed, and the status reflects the diagnostic.
+    let out = at(&["-l", "1", "99999"], "");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stdout.contains('1'),
+        "the job that is present must still be listed: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("99999"),
+        "the job that is absent must be diagnosed: {stderr:?}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "at must not exit 0 after diagnosing an absent job id"
+    );
+}

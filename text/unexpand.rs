@@ -107,7 +107,15 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stdout = io::stdout().lock();
     for source in &sources {
-        let mut reader = io::BufReader::new(input_stream_dashed(source)?);
+        // Name the operand at the origin: the diagnostic runs in main after
+        // this loop, where the source that failed is no longer known.
+        let mut reader = io::BufReader::new(input_stream_dashed(source).map_err(|e| {
+            io::Error::other(format!(
+                "{}: {}",
+                source.display(),
+                plib::diag::io_error_text(&e)
+            ))
+        })?);
         // Read raw bytes per line to preserve exact line endings and any
         // non-UTF-8 bytes; multibyte characters are segmented by LC_CTYPE.
         let mut buf: Vec<u8> = Vec::new();

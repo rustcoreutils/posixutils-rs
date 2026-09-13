@@ -1088,6 +1088,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "terminfo",
 ]
 
 [[package]]
@@ -1257,6 +1258,7 @@ dependencies = [
  "plib",
  "portable-pty",
  "regex",
+ "terminfo",
  "thiserror 2.0.19",
 ]
 

@@ -115,22 +115,6 @@ fn sibling(cmd: &str) -> PathBuf {
     PathBuf::from(cmd)
 }
 
-/// Look up a user's home directory from the passwd database (for the
-/// `PROJECTDIR=<username>` form, where that user's home is examined for a
-/// `src`/`source` directory).
-fn user_home_dir(name: &str) -> Option<PathBuf> {
-    use std::ffi::{CStr, CString};
-    let cname = CString::new(name).ok()?;
-    unsafe {
-        let pw = libc::getpwnam(cname.as_ptr());
-        if pw.is_null() || (*pw).pw_dir.is_null() {
-            return None;
-        }
-        let dir = CStr::from_ptr((*pw).pw_dir).to_str().ok()?;
-        Some(PathBuf::from(dir))
-    }
-}
-
 /// Drop elevated privileges by resetting the effective user/group ids to the
 /// real ones.  This is a no-op when sccs is not installed setuid/setgid, and
 /// the correct behavior for `sccs -r` when it is.
@@ -400,22 +384,14 @@ fn main() -> ExitCode {
         }
     }
 
-    // Check PROJECTDIR if -d not specified and root_dir is still default
+    // Check PROJECTDIR if -d not specified and root_dir is still default.
+    // The resolution lives in plib because `make` needs the same rule; this
+    // copy also dropped the spec's final branch (113899, "Otherwise, the value
+    // shall be used as a relative pathname"), so a value that was neither
+    // absolute nor a user with src/source silently resolved to nothing.
     if root_dir == Path::new(".") {
-        if let Ok(projectdir) = env::var("PROJECTDIR") {
-            if projectdir.starts_with('/') {
-                root_dir = PathBuf::from(projectdir);
-            } else if let Some(home) = user_home_dir(&projectdir) {
-                // Treat as a user name: examine that user's home directory for a
-                // `src` or `source` subdirectory.
-                let src = home.join("src");
-                let source = home.join("source");
-                if src.is_dir() {
-                    root_dir = src;
-                } else if source.is_dir() {
-                    root_dir = source;
-                }
-            }
+        if let Some(dir) = plib::projectdir::from_env() {
+            root_dir = dir;
         }
     }
 

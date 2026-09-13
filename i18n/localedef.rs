@@ -175,16 +175,58 @@ fn main() {
     // LD-2: a `-f charmap` operand is opened and validated up front. A charmap
     // that cannot be read means the coded character set is not available, so —
     // per the exit-status table — exit 2 and create no locale.
-    let charmap_symbols = match &args.charmap {
-        Some(path) => match parse_charmap_symbols(path) {
-            Ok(symbols) => Some(symbols),
+    let (charmap_codeset, charmap_symbols) = match &args.charmap {
+        Some(path) => match parse_charmap(path) {
+            Ok((codeset, symbols)) => (codeset, Some(symbols)),
             Err(e) => {
                 eprintln!("localedef: {}", e);
                 exit(2);
             }
         },
-        None => None,
+        None => (None, None),
     };
+
+    // `-u code_set_name` names "a codeset used as the target mapping of
+    // character symbols and collating element symbols whose encoding values
+    // are defined in terms of the ISO/IEC 10646-1:2000 standard position
+    // constant values". Performing that mapping is part of compiling a locale,
+    // which this implementation does not do -- but the option was parsed and
+    // then never read by anything, which is worse than declining it: a
+    // mismatched `-u` silently produced the same result as a matching one.
+    //
+    // What can be checked here is the one thing the inputs make checkable:
+    // whether the codeset named agrees with the charmap's own
+    // `<code_set_name>`. A disagreement means the request cannot be honoured
+    // as stated, and per the exit-status table that is the same "coded
+    // character set not available" condition as an unreadable charmap.
+    if let Some(requested) = &args.code_set {
+        match (&charmap_codeset, &args.charmap) {
+            (Some(declared), _) if !same_codeset(requested, declared) => {
+                eprintln!(
+                    "localedef: {}: {} ({} <code_set_name> {})",
+                    requested,
+                    gettext("codeset does not match the charmap"),
+                    gettext("charmap declares"),
+                    declared
+                );
+                exit(2);
+            }
+            (Some(_), _) => {}
+            (None, Some(path)) => {
+                eprintln!(
+                    "localedef: {}: {}",
+                    path.display(),
+                    gettext("charmap declares no <code_set_name>, so -u cannot be checked")
+                );
+            }
+            (None, None) => {
+                eprintln!(
+                    "localedef: {}",
+                    gettext("-u has no effect without a -f charmap to check it against")
+                );
+            }
+        }
+    }
 
     // Parse the locale definition.
     let base_dir = args
@@ -485,14 +527,27 @@ fn parse_category_line(
         .insert(keyword.to_string(), value.to_string());
 }
 
-/// Parse the symbolic names defined in a charmap file (LD-2). Returns an error
-/// if the file cannot be read.
-fn parse_charmap_symbols(path: &Path) -> Result<HashSet<String>, String> {
+/// The charmap's declared codeset and its `<symbolic>` names (LD-2). Returns
+/// an error if the file cannot be read.
+///
+/// `<code_set_name>` is the charmap's own statement of which coded character
+/// set it describes (it heads every charmap in /usr/share/i18n/charmaps). It
+/// is what `-u` can be checked against; nothing read it before.
+fn parse_charmap(path: &Path) -> Result<(Option<String>, HashSet<String>), String> {
     let content = read_source(path)?;
     let mut symbols = HashSet::new();
+    let mut code_set_name = None;
     let mut in_charmap = false;
     for line in content.lines() {
         let line = line.trim();
+        if !in_charmap && code_set_name.is_none() {
+            if let Some(rest) = line.strip_prefix("<code_set_name>") {
+                let name = rest.trim();
+                if !name.is_empty() {
+                    code_set_name = Some(name.to_string());
+                }
+            }
+        }
         if line == "CHARMAP" {
             in_charmap = true;
             continue;
@@ -510,7 +565,23 @@ fn parse_charmap_symbols(path: &Path) -> Result<HashSet<String>, String> {
             }
         }
     }
-    Ok(symbols)
+    Ok((code_set_name, symbols))
+}
+
+/// Whether two codeset names denote the same coded character set.
+///
+/// Codeset names are compared without case, and ignoring the punctuation that
+/// separates their parts, so `UTF-8`, `utf8` and `UTF_8` are one codeset --
+/// the comparison every locale implementation makes, and the only one that
+/// does not turn `-u utf8` into a spurious diagnostic.
+fn same_codeset(a: &str, b: &str) -> bool {
+    let key = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    };
+    key(a) == key(b)
 }
 
 /// Extract `<symbolic>` names referenced in a line.

@@ -148,7 +148,8 @@ impl OutputState {
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&out_fn)?;
+                .open(&out_fn)
+                .map_err(|e| named(Path::new(&out_fn), e))?;
             self.outf = Some(f);
         }
 
@@ -210,6 +211,19 @@ fn name_max_for(prefix: &str) -> i64 {
     }
 }
 
+/// Render an `io::Error` as `<path>: <message>`.
+///
+/// split has two distinct failure surfaces -- the input operand and each
+/// generated output file -- and `main` can name neither, so the name is
+/// captured here at each origin.
+fn named(path: &Path, e: io::Error) -> Error {
+    Error::other(format!(
+        "{}: {}",
+        path.display(),
+        plib::diag::io_error_text(&e)
+    ))
+}
+
 fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
     let mul: u64 = {
         if bytesplit.ends_with("k") {
@@ -254,7 +268,7 @@ fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
     }
 
     // open file, or stdin ("-" or no operand)
-    let mut file = input_stream(&args.file, true)?;
+    let mut file = input_stream(&args.file, true).map_err(|e| named(&args.file, e))?;
     let mut raw_buffer = [0; BUFSZ];
     let mut state = OutputState::new(&args.prefix, boundary, args.suffix_len);
 
@@ -278,7 +292,7 @@ fn split_by_lines(args: &Args, linesplit: u64) -> io::Result<()> {
     assert!(linesplit > 0);
 
     // open file, or stdin ("-" or no operand)
-    let mut reader = input_reader(&args.file, true)?;
+    let mut reader = input_reader(&args.file, true).map_err(|e| named(&args.file, e))?;
     let mut state = OutputState::new(&args.prefix, linesplit, args.suffix_len);
 
     loop {

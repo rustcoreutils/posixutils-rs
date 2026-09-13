@@ -58,7 +58,16 @@ impl MountTable {
     pub fn open_system() -> Result<Self, io::Error> {
         match Self::open(_PATH_PROC_MOUNTS, c"r") {
             Ok(table) => Ok(table),
-            Err(_) => Self::open(_PATH_MOUNTED, c"r"),
+            // Name the file in the fallback's failure. The caller is `main`,
+            // which cannot know which path was tried, so a bare errno arrived
+            // as "No such file or directory" with nothing to act on.
+            Err(_) => Self::open(_PATH_MOUNTED, c"r").map_err(|e| {
+                io::Error::other(format!(
+                    "{}: {}",
+                    _PATH_MOUNTED.to_string_lossy(),
+                    plib::diag::io_error_text(&e)
+                ))
+            }),
         }
     }
 

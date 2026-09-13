@@ -1073,13 +1073,32 @@ fn expand_builtin_recipe(line: &str, macros: &[Macro]) -> Result<String, ErrorCo
 ///
 /// POSIX names it `SCCS/s.source_file`, beside the target rather than beside
 /// the makefile, so a target with a directory part looks in that directory.
+///
+/// When that finds nothing, the XSI `PROJECTDIR` (105471-82) names "a
+/// directory to be used to search for SCCS files **not found in the current
+/// directory**" -- a fallback, not a replacement, which is why it is tried
+/// second and why a local `SCCS/s.file` still wins. The search there is made
+/// "in the directory SCCS in the identified directory", singular, so the
+/// target's own directory part does not reappear under it.
+///
+/// This does not touch the `~`-suffix rules' `s.foo.c` form in
+/// `suffix_source_name`: 105481-82 scopes `PROJECTDIR` to "files with a
+/// component named SCCS", and that form has none.
 fn sccs_history(name: &str) -> Option<String> {
     let (dir, file) = match name.rfind('/') {
         Some(at) => (&name[..=at], &name[at + 1..]),
         None => ("", name),
     };
     let path = format!("{dir}SCCS/s.{file}");
-    fs::metadata(&path).is_ok().then_some(path)
+    if fs::metadata(&path).is_ok() {
+        return Some(path);
+    }
+
+    let project = plib::projectdir::from_env()?;
+    let path = plib::projectdir::sccs_dir(&project).join(format!("s.{file}"));
+    fs::metadata(&path)
+        .is_ok()
+        .then(|| path.to_string_lossy().into_owned())
 }
 
 /// Whether `target` should be retrieved from its SCCS history.

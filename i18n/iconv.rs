@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use iconv_lib::{
     ascii,
     utf_16::{self, UTF16Variant},
@@ -121,7 +121,7 @@ impl<R: Read> Iterator for CircularBufferIterator<R> {
                 Ok(()) if self.buffer.length == 0 => return None, // EOF reached
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    plib::diag::error(&plib::diag::io_error_text(&e));
                     exit(1);
                 }
             }
@@ -213,7 +213,11 @@ impl Encodings {
         match Encodings::from_str(Self::canonical_name(cleaned_encoding)) {
             Ok(encoding) => encoding,
             Err(_) => {
-                eprintln!("Error: Unknown encoding: {}", cleaned_encoding);
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    gettext("unknown encoding"),
+                    cleaned_encoding
+                ));
                 exit(1);
             }
         }
@@ -327,7 +331,8 @@ fn parse_encoding(
 }
 
 fn parse_charmap(path: &Path) -> Result<Charmap, Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
+    let file = File::open(path)
+        .map_err(|e| format!("{}: {}", path.display(), plib::diag::io_error_text(&e)))?;
     let reader = BufReader::new(file);
     let mut charmap = Charmap {
         header: CharmapHeader::default(),
@@ -583,10 +588,10 @@ fn charmap_conversion(
                     .find(|e| e.symbolic_name == entry.symbolic_name)
                 {
                     if let Err(e) = stdout.write_all(&to_entry.encoding) {
-                        eprintln!("Error writing to stdout: {}", e);
+                        plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
                     }
                     if let Err(e) = stdout.flush() {
-                        eprintln!("Error flushing stdout: {}", e);
+                        plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
                     }
                     buffer.clear();
                     found = true;
@@ -600,13 +605,13 @@ fn charmap_conversion(
             } else {
                 had_error.set(true);
                 if !suppress_error {
-                    eprintln!("{}", gettext("Error: Invalid or unmapped character"));
+                    plib::diag::error(&gettext("invalid or unmapped character"));
                 }
                 if let Err(e) = stdout.write_all(&[buffer[0]]) {
-                    eprintln!("Error writing to stdout: {}", e);
+                    plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
                 }
                 if let Err(e) = stdout.flush() {
-                    eprintln!("Error flushing stdout: {}", e);
+                    plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
                 }
                 buffer.remove(0);
             }
@@ -617,28 +622,38 @@ fn charmap_conversion(
         if !omit_invalid {
             had_error.set(true);
             if let Err(e) = stdout.write_all(&[byte]) {
-                eprintln!("Error writing to stdout: {}", e);
+                plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
             }
             if let Err(e) = stdout.flush() {
-                eprintln!("Error flushing stdout: {}", e);
+                plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
             }
             if !suppress_error {
-                eprintln!(
-                    "{}",
-                    gettext("Error: Invalid or unmapped character at end of input")
-                );
+                plib::diag::error(&gettext("invalid or unmapped character at end of input"));
             }
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Switch libc's global locale to the environment locale so that
-    // `nl_langinfo(CODESET)` (used for the default codeset) reflects it.
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() -> std::process::ExitCode {
+    // `init_locale` switches libc's global locale to the environment locale so
+    // that `nl_langinfo(CODESET)` (used for the default codeset) reflects it,
+    // and registers the utility name so every `diag::error` is prefixed.
+    plib::diag::init_locale("iconv");
 
+    // Returning `Result` from `main` makes Rust's `Termination` impl print the
+    // `Debug` of the boxed error -- `Error: Os { code: 2, kind: NotFound, .. }`
+    // -- with no utility name and no filename. Every failure has to read as one
+    // `iconv: <message>` line instead.
+    match iconv_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            plib::diag::error(&plib::diag::error_text(e.as_ref()));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn iconv_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if args.list_codesets {
@@ -655,7 +670,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inputs: Vec<Box<dyn Read>> = match args.files {
         Some(files) => files
             .into_iter()
-            .map(|file| input_stream(&file, true))
+            .map(|file| {
+                // The name is in scope only here; a bare `?` would report the
+                // errno alone and leave the user guessing which operand failed.
+                input_stream(&file, true)
+                    .map_err(|e| format!("{}: {}", file.display(), plib::diag::io_error_text(&e)))
+            })
             .collect::<Result<Vec<_>, _>>()?,
         None => vec![Box::new(io::stdin().lock())],
     };
@@ -690,9 +710,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             _ => {
-                eprintln!(
-                    "Error: Both codesets must be of the same type (either Encoding or Charmap)"
-                );
+                plib::diag::error(&gettext(
+                    "both codesets must be of the same type (either encoding or charmap)",
+                ));
                 exit(1);
             }
         }

@@ -1135,9 +1135,24 @@ mod linux {
         device_list: &mut DeviceList,
         need_check_map: &mut bool,
     ) -> Result<(), std::io::Error> {
-        names.filename = expand_path(&names.filename)?;
+        // Name the operand in anything that escapes from here. Both calls
+        // below fail with a bare errno, and the caller is `main`, which has no
+        // idea which of several operands was being resolved.
+        let named = |e: std::io::Error, path: &std::path::Path| {
+            std::io::Error::other(format!(
+                "{}: {}",
+                path.display(),
+                plib::diag::io_error_text(&e)
+            ))
+        };
 
-        let st = timeout(&names.filename.to_string_lossy(), 5)?;
+        names.filename = {
+            let requested = names.filename.clone();
+            expand_path(&requested).map_err(|e| named(e, &requested))?
+        };
+
+        let st =
+            timeout(&names.filename.to_string_lossy(), 5).map_err(|e| named(e, &names.filename))?;
         read_proc_mounts(mount_list)?;
 
         // POSIX: For block special devices, all processes using any file on
@@ -1526,18 +1541,34 @@ fn timeout(path: &str, seconds: u32) -> Result<Metadata, io::Error> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
     diag::init_locale("fuser");
 
+    // Returning `Result` from `main` makes Rust's `Termination` impl print the
+    // `Debug` of the boxed error -- `Error: Os { code: 2, kind: NotFound, .. }`
+    // -- with no utility name and no operand. Every failure has to read as one
+    // `fuser: <message>` line instead.
+    match fuser_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            diag::error(&diag::error_text(e.as_ref()));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn fuser_main() -> Result<(), Box<dyn std::error::Error>> {
     let Args {
         mount,
         named_files,
         user,
         file,
     } = Args::try_parse().unwrap_or_else(|err| match err.kind() {
+        // `--help` and `--version` are a successful request for information,
+        // not an error: clap writes the text itself and the status is 0.
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
             print!("{err}");
-            std::process::exit(1);
+            std::process::exit(0);
         }
         _ => {
             let mut stdout = std::io::stdout();

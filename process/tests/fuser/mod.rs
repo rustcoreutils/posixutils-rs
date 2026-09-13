@@ -90,3 +90,62 @@ pub fn fuser_test(
         checker,
     );
 }
+
+/// A failure must read as one `fuser: <file>: <message>` line.
+///
+/// `main` returned `Result<(), Box<dyn Error>>`, so Rust's `Termination` impl
+/// printed the `Debug` of the boxed error -- `Error: Os { code: 2, kind:
+/// NotFound, message: "..." }` -- Rust struct syntax with no utility name and
+/// no operand. GNU says which file it could not find.
+#[test]
+fn fuser_missing_operand_diagnostic_names_utility_and_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("fuser"))
+        .arg("/nonexistent_fuser_probe_zz")
+        .output()
+        .expect("spawn fuser");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !stderr.contains("Os {"),
+        "Rust's Debug form must not reach the user: {stderr:?}"
+    );
+    assert!(
+        !stderr.starts_with("Error: "),
+        "Rust's Debug form must not reach the user: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("fuser: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_fuser_probe_zz"),
+        "the diagnostic must name the operand it could not resolve: {stderr:?}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a failed lookup must not exit 0"
+    );
+}
+
+/// `--help` and `--version` are a successful request for information, not an
+/// error. Every other utility here exits 0; `fuser` exited 1.
+#[test]
+fn fuser_help_and_version_exit_zero() {
+    for flag in ["--help", "--version"] {
+        let out = std::process::Command::new(plib::testing::get_binary_path("fuser"))
+            .arg(flag)
+            .output()
+            .expect("spawn fuser");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "fuser {flag} must exit 0, got {:?}",
+            out.status.code()
+        );
+    }
+}

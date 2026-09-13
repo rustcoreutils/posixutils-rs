@@ -457,3 +457,120 @@ fn test_at_tz_determines_the_absolute_execution_time() {
     );
     assert_eq!(utc - tokyo, 9 * 60, "Asia/Tokyo must be UTC+9");
 }
+
+// ============================================================================
+// Diagnostic surface and exit status
+// ============================================================================
+
+/// Run `at` with a private spool and a permissive allow-list, returning the
+/// raw `Output` so a test can assert on a *failure* -- which is what
+/// `submit_and_read_script` cannot do, since it asserts success.
+fn at_command(args: &[&str], stdin_data: &str) -> std::process::Output {
+    use std::io::Write;
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().expect("tempdir");
+    let spool = dir.path().join("spool");
+    fs::create_dir_all(&spool).unwrap();
+    let allow = dir.path().join("at.allow");
+    fs::write(&allow, format!("{}\n", whoami())).unwrap();
+
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("at"))
+        .args(args)
+        .env("AT_JOB_DIR", &spool)
+        .env("AT_ALLOW", &allow)
+        .env("TZ", "UTC")
+        .env("LC_ALL", "C")
+        .env_remove("AT_DENY")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn at");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_data.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// A failure must read as one `at: <message>` line.
+///
+/// `main` returned `Result<(), Box<dyn Error>>`, so Rust's `Termination` impl
+/// printed the `Debug` of the boxed error: `Error: TimespecPatternNotFound
+/// ("not-a-time")` -- Rust struct syntax, an internal variant name, and no
+/// utility prefix. The same shape was fixed in `split` first.
+#[test]
+fn test_at_bad_timespec_diagnostic_is_not_a_debug_dump() {
+    let output = at_command(&["not-a-time"], "echo hi\n");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !stderr.contains("TimespecPatternNotFound"),
+        "the diagnostic must not leak a Rust enum variant name: {stderr:?}"
+    );
+    assert!(
+        !stderr.starts_with("Error: "),
+        "the diagnostic must not be Rust's Debug form: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("at: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert_eq!(output.status.code(), Some(1), "a rejected timespec exits 1");
+}
+
+/// `TimespecParsingError`'s `Display` printed "Failed to parse token in str"
+/// for *every* variant, which is why the `Debug` form was the informative one.
+/// Two differently-malformed timespecs must not report the same sentence.
+#[test]
+fn test_at_timespec_diagnostics_distinguish_their_causes() {
+    let gibberish = at_command(&["not-a-time"], "echo hi\n");
+    let bad_increment = at_command(&["now", "+", "3", "fortnights"], "echo hi\n");
+
+    let a = String::from_utf8_lossy(&gibberish.stderr).to_string();
+    let b = String::from_utf8_lossy(&bad_increment.stderr).to_string();
+
+    for text in [&a, &b] {
+        assert!(
+            !text.contains("Failed to parse token in str"),
+            "the placeholder Display text must be gone: {text:?}"
+        );
+        assert!(
+            text.starts_with("at: "),
+            "every diagnostic must name the utility: {text:?}"
+        );
+    }
+    assert_ne!(
+        a, b,
+        "a bad timespec and a bad increment must not report the same sentence"
+    );
+}
+
+/// An unreadable `-f` command file must name the file and carry no Rust
+/// artifacts -- neither the `Debug` quoting of a boxed `String` nor the
+/// `(os error N)` that `io::Error`'s `Display` appends.
+#[test]
+fn test_at_missing_command_file_names_it_without_rust_artifacts() {
+    let output = at_command(&["-f", "/nonexistent_at_probe_zz", "noon"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("at: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_at_probe_zz"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('"'),
+        "the Debug quoting of a boxed String must not reach the user: {stderr:?}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}

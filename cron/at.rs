@@ -77,11 +77,28 @@ fn parse_job_ids(operands: &[String]) -> Result<Vec<u32>, String> {
         .collect()
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
     // Initialize the locale before clap parses, so the gettext-decorated help and
     // diagnostics are localized (audit #A12).
     plib::diag::init_locale("at");
 
+    // Returning `Result` from `main` makes Rust's `Termination` impl print the
+    // `Debug` of the boxed error -- `Error: TimespecPatternNotFound("...")`,
+    // with Rust struct syntax, an internal variant name and no utility prefix.
+    // Every failure has to read as one `at: <message>` line instead. The
+    // counter is consulted too, because a diagnostic emitted mid-run (the `-l`
+    // "no such job" path) must still decide the status.
+    if let Err(e) = at_main() {
+        plib::diag::error(&plib::diag::error_text(e.as_ref()));
+    }
+    if plib::diag::has_errors() {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+fn at_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::try_parse().unwrap_or_else(|err| {
         eprintln!("{}", err);
         std::process::exit(1);
@@ -181,12 +198,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::env::current_dir().ok().unwrap_or_default().join(path)
             };
 
-            let mut file = File::open(path)
-                .map_err(|e| format!("{}: {e}", gettext("Failed to open command file")))?;
+            // Name the file, and render the errno through `io_error_text`:
+            // `io::Error`'s own Display appends " (os error 2)", which no
+            // other utility on the system says.
+            let mut file = File::open(&path)
+                .map_err(|e| format!("{}: {}", path.display(), plib::diag::io_error_text(&e)))?;
 
             let mut buf = String::new();
             file.read_to_string(&mut buf)
-                .map_err(|e| format!("{}: {e}", gettext("Failed to read command file")))?;
+                .map_err(|e| format!("{}: {}", path.display(), plib::diag::io_error_text(&e)))?;
 
             buf
         }
@@ -410,6 +430,7 @@ mod time {
 }
 
 mod timespec {
+    use gettextrs::gettext;
     use std::str::FromStr;
 
     use chrono::{
@@ -439,8 +460,45 @@ mod timespec {
     }
 
     impl std::fmt::Display for TimespecParsingError {
+        /// Every variant used to render as "Failed to parse token in str",
+        /// which is why the `Debug` form was the only informative one -- and
+        /// why it was what a user saw. Each variant now names what it was
+        /// reading and the text it choked on. Note `write!`, not `writeln!`:
+        /// a `Display` impl that ends the line makes every caller that adds
+        /// its own newline emit a blank one.
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            writeln!(f, "Failed to parse token in str")
+            match self {
+                Self::IncPeriodPatternNotFound(s) => {
+                    write!(f, "{}: '{s}'", gettext("not an increment period"))
+                }
+                Self::IncrementParsing { err, input } => {
+                    write!(f, "{}: '{input}': {err}", gettext("invalid increment"))
+                }
+                Self::IncrementPatternNotFound(s) => {
+                    write!(f, "{}: '{s}'", gettext("not an increment"))
+                }
+                Self::DateTokenParsing(err) => {
+                    write!(f, "{}: {err}", gettext("invalid date"))
+                }
+                Self::DatePatternNotFound(s) => {
+                    write!(f, "{}: '{s}'", gettext("not a date"))
+                }
+                Self::TimeTokenParsing(err) => {
+                    write!(f, "{}: {err}", gettext("invalid time"))
+                }
+                Self::TimePatternNotFound(s) => {
+                    write!(f, "{}: '{s}'", gettext("not a time"))
+                }
+                Self::NowspecParsing(s) => {
+                    write!(f, "{}: '{s}'", gettext("invalid 'now' specification"))
+                }
+                Self::NowspecPatternNotFound(s) => {
+                    write!(f, "{}: '{s}'", gettext("not a 'now' specification"))
+                }
+                Self::TimespecPatternNotFound(s) => {
+                    write!(f, "{}: '{s}'", gettext("not a timespec"))
+                }
+            }
         }
     }
 
@@ -1685,55 +1743,55 @@ mod tokens {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 TokenParsingError::H24HourParsing { err: _, input } => {
-                    writeln!(f, "Failed to parse `hr24clock_hour` token in `{input}`")
+                    write!(f, "Failed to parse `hr24clock_hour` token in `{input}`")
                 }
-                TokenParsingError::H24HourOverflow(who) => writeln!(
+                TokenParsingError::H24HourOverflow(who) => write!(
                     f,
                     "Failed to parse `hr24clock_hour` token due overflow in `{who}`"
                 ),
                 TokenParsingError::H24HourPatternNotFound(input) => {
-                    writeln!(f, "Failed to find `hr24clock_hour` token in `{input}`")
+                    write!(f, "Failed to find `hr24clock_hour` token in `{input}`")
                 }
                 TokenParsingError::WallClockParsing { err: _, input } => {
-                    writeln!(f, "Failed to parse `wallclock_hour` token in `{input}`")
+                    write!(f, "Failed to parse `wallclock_hour` token in `{input}`")
                 }
-                TokenParsingError::WallClockOverflow(who) => writeln!(
+                TokenParsingError::WallClockOverflow(who) => write!(
                     f,
                     "Failed to parse `wallclock_hour` token due overflow in `{who}`"
                 ),
                 TokenParsingError::WallClockPatternNotFound(input) => {
-                    writeln!(f, "Failed to find `wallclock_hour` token in `{input}`")
+                    write!(f, "Failed to find `wallclock_hour` token in `{input}`")
                 }
                 TokenParsingError::MinuteParsing { err: _, input } => {
-                    writeln!(f, "Failed to parse `minute` token in `{input}`")
+                    write!(f, "Failed to parse `minute` token in `{input}`")
                 }
                 TokenParsingError::MinuteOverflow => {
-                    writeln!(f, "Failed to parse `minute` token due overflow")
+                    write!(f, "Failed to parse `minute` token due overflow")
                 }
                 TokenParsingError::DayNumberParsing { err: _, input } => {
-                    writeln!(f, "Failed to parse `day_number` token in `{input}`")
+                    write!(f, "Failed to parse `day_number` token in `{input}`")
                 }
                 TokenParsingError::DayNumberOverflow => {
-                    writeln!(f, "Failed to parse `day_number` token due overflow")
+                    write!(f, "Failed to parse `day_number` token due overflow")
                 }
                 TokenParsingError::YearNumberParsing { err: _, input } => {
-                    writeln!(f, "Failed to parse `year_number` token in `{input}`")
+                    write!(f, "Failed to parse `year_number` token in `{input}`")
                 }
-                TokenParsingError::YearNumberInvalid => writeln!(
+                TokenParsingError::YearNumberInvalid => write!(
                     f,
                     "Failed to parse `year_number` token. Year should be 4 digit number"
                 ),
                 TokenParsingError::TimezonePatternNotFound(input) => {
-                    writeln!(f, "Failed to find `timezone_name` token in `{input}`")
+                    write!(f, "Failed to find `timezone_name` token in `{input}`")
                 }
                 TokenParsingError::MonthPatternNotFound(input) => {
-                    writeln!(f, "Failed to find `month_name` token in `{input}`")
+                    write!(f, "Failed to find `month_name` token in `{input}`")
                 }
                 TokenParsingError::DayOfWeekPatternNotFound(input) => {
-                    writeln!(f, "Failed to find `day_of_week` token in `{input}`")
+                    write!(f, "Failed to find `day_of_week` token in `{input}`")
                 }
                 TokenParsingError::AmPmPatternNotFound(input) => {
-                    writeln!(f, "Failed to find `am_pm` token in `{input}`")
+                    write!(f, "Failed to find `am_pm` token in `{input}`")
                 }
             }
         }

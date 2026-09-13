@@ -18,7 +18,7 @@ use std::process::exit;
 use clap::Parser;
 #[cfg(debug_assertions)]
 use gettextrs::bindtextdomain;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::gettext;
 use posixutils_cc::parse::ast::{BlockItem, ExprKind, ExternalDecl, ForInit, Stmt};
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
@@ -1160,23 +1160,47 @@ fn parse_existing_keys(content: &str) -> std::collections::HashSet<MessageKey> {
     keys
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
+fn main() -> std::process::ExitCode {
+    plib::diag::init_locale("xgettext");
     #[cfg(debug_assertions)]
-    bindtextdomain("posixutils-rs", "locale")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+    let _ = bindtextdomain("posixutils-rs", "locale");
 
+    // Returning `Result` from `main` makes Rust's `Termination` impl print the
+    // `Debug` of the boxed error -- `Error: Os { code: 2, kind: NotFound, .. }`
+    // -- with no utility name and no filename, even though the path was in
+    // scope at every one of the bare `?`s below. Every failure has to read as
+    // one `xgettext: <message>` line instead.
+    match xgettext_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            plib::diag::error(&plib::diag::error_text(e.as_ref()));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Render an `io::Error` as `<path>: <message>`, the shape every other utility
+/// on the system uses. `io::Error`'s own `Display` appends " (os error N)".
+fn named(path: impl std::fmt::Display, e: std::io::Error) -> String {
+    format!("{}: {}", path, plib::diag::io_error_text(&e))
+}
+
+fn xgettext_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if args.files.is_empty() {
-        eprintln!("xgettext: {}", gettext("no input file given"));
-        exit(1);
+        return Err(gettext("no input file given").into());
     }
 
     // Parse exclude file if specified
     let exclude_msgids = if let Some(ref exclude_path) = args.exclude_file {
-        parse_exclude_file(exclude_path)?
+        parse_exclude_file(exclude_path).map_err(|e| {
+            format!(
+                "{}: {}",
+                exclude_path.display(),
+                plib::diag::error_text(e.as_ref())
+            )
+        })?
     } else {
         Vec::new()
     };
@@ -1197,7 +1221,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Handle stdin
         if path_str == "-" {
             let mut content = Vec::new();
-            io::stdin().read_to_end(&mut content)?;
+            io::stdin()
+                .read_to_end(&mut content)
+                .map_err(|e| named("<stdin>", e))?;
             // Default to C for stdin (POSIX spec)
             if let Err(e) = walker.process_c_file(&content, "<stdin>".to_string(), &mut streams) {
                 eprintln!("xgettext: {}", e);
@@ -1212,13 +1238,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // with no extension — is treated as C source, since the spec restricts
         // operands by content, not by file-name extension.
         if path.extension().and_then(OsStr::to_str) == Some("rs") {
-            let content = read_to_string(path)?;
+            let content = read_to_string(path).map_err(|e| named(path.display(), e))?;
             walker.process_rust_file(content, path_str)?;
         } else {
-            let file = File::open(path)?;
+            let file = File::open(path).map_err(|e| named(path.display(), e))?;
             let mut reader = BufReader::new(file);
             let mut content = Vec::new();
-            reader.read_to_end(&mut content)?;
+            reader
+                .read_to_end(&mut content)
+                .map_err(|e| named(path.display(), e))?;
             if let Err(e) = walker.process_c_file(&content, path_str, &mut streams) {
                 eprintln!("xgettext: {}", e);
                 exit(1);
@@ -1237,7 +1265,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle -j (join): keep the existing file's content and drop any newly
     // extracted msgid that already appears there (duplicates are omitted).
     let existing_content = if args.join {
-        parse_existing_pot(&output_path)?
+        parse_existing_pot(&output_path).map_err(|e| {
+            format!(
+                "{}: {}",
+                output_path.display(),
+                plib::diag::error_text(e.as_ref())
+            )
+        })?
     } else {
         String::new()
     };
@@ -1255,10 +1289,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         new_content
     };
 
-    let mut output = File::create(output_path)?;
-    write!(output, "{}", final_content)?;
+    let mut output = File::create(&output_path).map_err(|e| named(output_path.display(), e))?;
+    write!(output, "{}", final_content).map_err(|e| named(output_path.display(), e))?;
 
-    exit(0)
+    Ok(())
 }
 
 #[cfg(test)]

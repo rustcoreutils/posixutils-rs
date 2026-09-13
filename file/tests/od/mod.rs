@@ -518,8 +518,10 @@ fn od_long_double_is_converted() {
     // x87 80-bit occupies the first ten bytes of its slot *by memory
     // position*: an explicit 64-bit significand, then sign and exponent. Only
     // x86 has this format and x86 is little-endian, so the positions are the
-    // little-endian ones.
-    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    // little-endian ones. Every x86_64 target uses it, Apple's included --
+    // it is aarch64 that makes `long double` a `double` on macOS, not the
+    // operating system on its own.
+    #[cfg(target_arch = "x86_64")]
     fn slot(significand: u64, sign_exp: u16) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(16);
         bytes.extend(significand.to_le_bytes());
@@ -534,7 +536,7 @@ fn od_long_double_is_converted() {
     // on a big-endian one; `to_ne_bytes` puts them wherever they belong
     // without the test having to say which.
     #[cfg(not(any(
-        all(target_arch = "x86_64", not(target_os = "macos")),
+        target_arch = "x86_64",
         all(target_arch = "aarch64", target_os = "macos")
     )))]
     fn slot(fraction_low: u64, hi: u16) -> Vec<u8> {
@@ -542,7 +544,7 @@ fn od_long_double_is_converted() {
         bits.to_ne_bytes().to_vec()
     }
 
-    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    #[cfg(target_arch = "x86_64")]
     let cases: Vec<(Vec<u8>, &str)> = {
         // x87 80-bit: an *explicit* 64-bit significand -- the leading one is
         // stored, unlike every IEEE format -- then sign and a 15-bit exponent
@@ -560,7 +562,7 @@ fn od_long_double_is_converted() {
     };
 
     #[cfg(not(any(
-        all(target_arch = "x86_64", not(target_os = "macos")),
+        target_arch = "x86_64",
         all(target_arch = "aarch64", target_os = "macos")
     )))]
     let cases: Vec<(Vec<u8>, &str)> = {
@@ -597,7 +599,7 @@ fn od_long_double_is_converted() {
     // nor an f128. This is a deliberate, documented deviation (NONPOSIX.md,
     // "od"), pinned here so that implementing arbitrary-precision conversion
     // later trips this test and the documentation gets updated with it.
-    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    #[cfg(target_arch = "x86_64")]
     {
         // The smallest x87 subnormal, 2^-16445, which another od shows as
         // roughly 3.6e-4951.

@@ -84,7 +84,8 @@ pub struct Options {
     // Tags
     /// Tags file name (tags).
     pub tags: String,
-    /// Tag stack limit (taglength).
+    /// Number of characters that are significant when comparing a tag name
+    /// (taglength); `0` means the whole name. Used by [`crate::tags::lookup`].
     pub taglength: usize,
 
     // Timeout

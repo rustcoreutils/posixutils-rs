@@ -20,5 +20,5 @@ pub mod insert;
 #[allow(clippy::module_inception)]
 pub mod mode;
 
-pub use insert::{enter_insert_mode, process_insert_key, InsertState};
+pub use insert::{enter_insert_mode, erase_input, process_insert_key, InsertState};
 pub use mode::{InsertKind, Mode};

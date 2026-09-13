@@ -10,12 +10,16 @@
 //! Ex command parser.
 
 use super::address::{parse_address_range, parse_address_with_offset, Address, AddressRange};
-use super::command::{ExCommand, MapMode, SubstituteFlags};
+use super::command::{ExCommand, MapMode, SubstituteFlags, CTRL_V};
 use crate::error::{Result, ViError};
 
 /// Parse an ex command string.
 pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
-    let input = input.trim();
+    // Only the leading <blank>s go unconditionally. Trailing ones depend on the
+    // command: `map`, `unmap`, `abbreviate` and `unabbreviate` can have a
+    // <control>-V-escaped <blank> at the very end, and trimming here would eat
+    // the CR in `:map Q :wq^V^M` before the argument parser ever saw it.
+    let input = input.trim_start();
     if input.is_empty() {
         return Ok(ExCommand::Nop);
     }
@@ -50,8 +54,18 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
 
     // Parse the command name
     let (cmd_name, force, raw_args) = split_command(rest);
-    let args = raw_args.trim_start();
     let cmd_name = cmd_name.to_lowercase();
+    // Now the trailing <blank>s, by the rule this command follows. POSIX
+    // 94657-94659 gives <control>-V escaping to these four commands and
+    // <backslash> escaping to every other, so only these four may keep a
+    // trailing <blank> -- and only a quoted one.
+    let args = raw_args.trim_start();
+    let args = match cmd_name.as_str() {
+        "map" | "unm" | "unmap" | "ab" | "abbreviate" | "una" | "unabbreviate" => {
+            trim_end_unquoted(args)
+        }
+        _ => args.trim_end(),
+    };
 
     if force && !accepts_force(&cmd_name) {
         return Err(ViError::InvalidCommand(format!("{cmd_name}!")));
@@ -259,22 +273,39 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // Mapping commands. Here `!` selects text input mode rather than
         // forcing anything (95090-95092).
         "map" => parse_map(args, MapMode::for_bang(force)),
-        "unm" | "unmap" => Ok(ExCommand::Unmap {
-            lhs: args.split_whitespace().next().unwrap_or("").to_string(),
-            mode: MapMode::for_bang(force),
-        }),
-
-        // Abbreviations
-        "ab" | "abbreviate" => {
-            let (lhs, rhs) = split_first_word(args);
-            Ok(ExCommand::Abbreviate {
-                lhs: lhs.to_string(),
-                rhs: rhs.to_string(),
+        "unm" | "unmap" => {
+            let (lhs, _) = take_ctrlv_field(args);
+            if lhs.is_empty() {
+                // 95456: `unm[ap][!] lhs` -- the operand is not optional.
+                return Err(ViError::InvalidCommand("unmap: missing lhs".to_string()));
+            }
+            Ok(ExCommand::Unmap {
+                lhs,
+                mode: MapMode::for_bang(force),
             })
         }
-        "una" | "unabbreviate" => Ok(ExCommand::Unabbreviate {
-            lhs: args.split_whitespace().next().unwrap_or("").to_string(),
-        }),
+
+        // Abbreviations
+        "ab" | "abbreviate" => match split_ctrlv_pair(args) {
+            // 94864: "If lhs and rhs are not specified, write the current list
+            // of abbreviations and do nothing more."
+            None => Ok(ExCommand::AbbrevList),
+            Some((lhs, rhs)) if rhs.is_empty() => Err(ViError::InvalidCommand(format!(
+                "abbreviate: no replacement for {}",
+                lhs
+            ))),
+            Some((lhs, rhs)) => Ok(ExCommand::Abbreviate { lhs, rhs }),
+        },
+        "una" | "unabbreviate" => {
+            let (lhs, _) = take_ctrlv_field(args);
+            if lhs.is_empty() {
+                // 95435: `una[bbrev] lhs` -- the operand is not optional.
+                return Err(ViError::InvalidCommand(
+                    "unabbreviate: missing lhs".to_string(),
+                ));
+            }
+            Ok(ExCommand::Unabbreviate { lhs })
+        }
 
         // Tag commands
         "ta" | "tag" => Ok(ExCommand::Tag {
@@ -511,16 +542,85 @@ fn accepts_force(cmd: &str) -> bool {
     )
 }
 
-/// Split first word from rest.
-fn split_first_word(input: &str) -> (&str, &str) {
-    let input = input.trim_start();
-    let end = input
-        .char_indices()
-        .find(|(_, c)| c.is_whitespace())
-        .map(|(i, _)| i)
-        .unwrap_or(input.len());
+/// Drop trailing whitespace that is not `<control>-V`-escaped.
+///
+/// For the four commands where `^V` quotes (94657-94659). A quoted trailing
+/// <blank> or CR is an argument character and has to survive — `:map Q :wq^V^M`
+/// is the whole reason the map command is useful — while genuine trailing
+/// whitespace still goes.
+fn trim_end_unquoted(input: &str) -> &str {
+    let mut end = 0;
+    let mut chars = input.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == CTRL_V {
+            // Whatever follows is quoted, so both it and the `^V` are kept.
+            match chars.next() {
+                Some((j, quoted)) => end = j + quoted.len_utf8(),
+                None => end = i + c.len_utf8(),
+            }
+        } else if !c.is_whitespace() {
+            end = i + c.len_utf8();
+        }
+    }
+    &input[..end]
+}
 
-    (&input[..end], input[end..].trim_start())
+/// Take one `<control>-V`-quoted field, and return it with whatever follows.
+///
+/// "In both lhs and rhs, any character may be escaped with a <control>-V, in
+/// which case the character shall not be used to delimit lhs from rhs, and the
+/// escaping <control>-V shall be discarded" (95086-95088, 94868-94869). So a
+/// quoted <blank> is part of the field, and the `^V` itself never is.
+///
+/// `split_whitespace` cannot express this: it would cut `^V<space>` in half and
+/// leave the `^V` in the result.
+fn take_ctrlv_field(input: &str) -> (String, &str) {
+    let input = input.trim_start();
+    let mut field = String::new();
+    let mut chars = input.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == CTRL_V {
+            // The quoted character joins the field whatever it is. A trailing
+            // `^V` with nothing after it quotes nothing and is simply dropped.
+            if let Some((_, quoted)) = chars.next() {
+                field.push(quoted);
+            }
+            continue;
+        }
+        if c.is_whitespace() {
+            return (field, input[i..].trim_start());
+        }
+        field.push(c);
+    }
+    (field, "")
+}
+
+/// Split a `[lhs rhs]` argument for `:map` and `:ab`, honoring `^V` quoting.
+///
+/// `None` when there are no arguments at all, which is the listing form —
+/// `:map` writes the current map list (95080-95083) and `:ab` the abbreviation
+/// list (94864). Without this distinction an empty argument and a request to
+/// list are the same parse.
+fn split_ctrlv_pair(args: &str) -> Option<(String, String)> {
+    let args = args.trim_start();
+    if args.is_empty() {
+        return None;
+    }
+    let (lhs, rest) = take_ctrlv_field(args);
+    // The right-hand side runs to end of line, but its own `^V` quoting still
+    // has to be undone — `:map Q :wq^V^M` must store a CR, not `^V` then CR.
+    let mut rhs = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        if c == CTRL_V {
+            if let Some(quoted) = chars.next() {
+                rhs.push(quoted);
+            }
+            continue;
+        }
+        rhs.push(c);
+    }
+    Some((lhs, rhs))
 }
 
 /// Parse write command.
@@ -668,12 +768,16 @@ fn parse_global(range: AddressRange, args: &str, invert: bool) -> Result<ExComma
 
 /// Parse map command.
 fn parse_map(args: &str, mode: MapMode) -> Result<ExCommand> {
-    let (lhs, rhs) = split_first_word(args);
-    Ok(ExCommand::Map {
-        lhs: lhs.to_string(),
-        rhs: rhs.to_string(),
-        mode,
-    })
+    match split_ctrlv_pair(args) {
+        // 95080-95083: with no lhs and rhs, `map!` writes the text input mode
+        // list and `map` the command mode one, and does nothing more.
+        None => Ok(ExCommand::MapList { mode }),
+        Some((lhs, rhs)) if rhs.is_empty() => Err(ViError::InvalidCommand(format!(
+            "map: no replacement for {}",
+            lhs
+        ))),
+        Some((lhs, rhs)) => Ok(ExCommand::Map { lhs, rhs, mode }),
+    }
 }
 
 /// Parse register and count from args.
@@ -951,6 +1055,132 @@ mod tests {
         } else {
             panic!("Expected Set command");
         }
+    }
+
+    // ========================================================================
+    // :map / :ab argument parsing
+    // ========================================================================
+
+    /// 95080-95083 and 94864: with no arguments these list, and "do nothing
+    /// more". They used to parse to a `Map`/`Abbreviate` with an empty lhs,
+    /// which is indistinguishable from a malformed definition.
+    #[test]
+    fn test_map_and_ab_with_no_arguments_are_the_listing_form() {
+        assert!(matches!(
+            parse_ex_command("map").unwrap(),
+            ExCommand::MapList {
+                mode: MapMode::Command
+            }
+        ));
+        assert!(matches!(
+            parse_ex_command("map!").unwrap(),
+            ExCommand::MapList {
+                mode: MapMode::Insert
+            }
+        ));
+        assert!(matches!(
+            parse_ex_command("ab").unwrap(),
+            ExCommand::AbbrevList
+        ));
+        assert!(matches!(
+            parse_ex_command("abbreviate   ").unwrap(),
+            ExCommand::AbbrevList
+        ));
+    }
+
+    /// `!` selects the text input mode list rather than forcing anything
+    /// (95089-95092).
+    #[test]
+    fn test_map_bang_selects_the_text_input_table() {
+        let ExCommand::Map { mode, .. } = parse_ex_command("map! jk x").unwrap() else {
+            panic!("expected Map")
+        };
+        assert_eq!(mode, MapMode::Insert);
+        let ExCommand::Map { mode, .. } = parse_ex_command("map jk x").unwrap() else {
+            panic!("expected Map")
+        };
+        assert_eq!(mode, MapMode::Command);
+        let ExCommand::Unmap { mode, .. } = parse_ex_command("unmap! jk").unwrap() else {
+            panic!("expected Unmap")
+        };
+        assert_eq!(mode, MapMode::Insert);
+    }
+
+    /// 95086-95088: "any character may be escaped with a <control>-V, in which
+    /// case the character shall not be used to delimit lhs from rhs, and the
+    /// escaping <control>-V shall be discarded".
+    #[test]
+    fn test_ctrl_v_quotes_a_blank_in_the_lhs() {
+        let ExCommand::Map { lhs, rhs, .. } = parse_ex_command("map \x16  x").unwrap() else {
+            panic!("expected Map")
+        };
+        assert_eq!(lhs, " ", "the quoted blank is the lhs, and the ^V is gone");
+        assert_eq!(rhs, "x");
+    }
+
+    /// The `^V` is discarded in the rhs too, which is what makes
+    /// `:map Q :wq^V^M` store a carriage return rather than three characters.
+    #[test]
+    fn test_ctrl_v_is_discarded_in_the_rhs() {
+        let ExCommand::Map { lhs, rhs, .. } = parse_ex_command("map Q :wq\x16\r").unwrap() else {
+            panic!("expected Map")
+        };
+        assert_eq!(lhs, "Q");
+        assert_eq!(rhs, ":wq\r");
+    }
+
+    /// A `^V`-quoted `^V` is a literal one.
+    #[test]
+    fn test_ctrl_v_quotes_itself() {
+        let ExCommand::Abbreviate { lhs, rhs } = parse_ex_command("ab \x16\x16 X").unwrap() else {
+            panic!("expected Abbreviate")
+        };
+        assert_eq!(lhs, "\x16");
+        assert_eq!(rhs, "X");
+    }
+
+    /// 94657-94659 gives <control>-V escaping to these four commands and
+    /// <backslash> escaping to every other, so the trailing-blank rule differs
+    /// by command. An unquoted trailing blank still goes; a quoted one stays.
+    #[test]
+    fn test_trailing_blanks_follow_the_per_command_escape_rule() {
+        // Unquoted trailing whitespace is dropped, as everywhere else.
+        let ExCommand::Map { rhs, .. } = parse_ex_command("map q dd   ").unwrap() else {
+            panic!("expected Map")
+        };
+        assert_eq!(rhs, "dd");
+
+        // A quoted trailing blank is an argument character and survives.
+        let ExCommand::Map { rhs, .. } = parse_ex_command("map q dd\x16 ").unwrap() else {
+            panic!("expected Map")
+        };
+        assert_eq!(rhs, "dd ");
+
+        // Commands outside the four are untouched by ^V and still trim.
+        let ExCommand::Set { args } = parse_ex_command("set number   ").unwrap() else {
+            panic!("expected Set")
+        };
+        assert_eq!(args, "number");
+    }
+
+    /// `:ab` takes no `!` (its synopsis has none), and the operands that POSIX
+    /// does not make optional are required: `unm[ap][!] lhs` (95456) and
+    /// `una[bbrev] lhs` (95435). A definition with no replacement is not the
+    /// listing form either.
+    #[test]
+    fn test_map_and_ab_argument_errors() {
+        assert!(parse_ex_command("ab!").is_err(), "ab takes no bang");
+        assert!(parse_ex_command("una!").is_err(), "una takes no bang");
+        assert!(parse_ex_command("unmap").is_err(), "unmap needs an lhs");
+        assert!(parse_ex_command("una").is_err(), "una needs an lhs");
+        assert!(
+            parse_ex_command("map q").is_err(),
+            "map needs a replacement"
+        );
+        assert!(
+            parse_ex_command("ab foo").is_err(),
+            "ab needs a replacement"
+        );
     }
 
     /// `g` may be delimited by any character, including a multi-byte one.

@@ -15,12 +15,13 @@
 mod executor;
 
 use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
-use crate::command::CommandParser;
+use crate::command::{CommandParser, ParserState};
 use crate::error::{Result, ViError};
-use crate::ex::command::SubstituteFlags;
+use crate::ex::command::{strip_line_terminator, MapMode, SubstituteFlags, CTRL_V};
 use crate::ex::{parse_ex_command, AddressRange, ExCommand, ExResult};
 use crate::file::{read_file, write_file, write_range, FileManager};
-use crate::input::{InputReader, Key};
+use crate::input::{InputQueue, InputReader, Key, KeySource, QueuedKey};
+use crate::maps::{keys_from_text, MapMatch};
 use crate::mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
 use crate::options::Options;
 use crate::register::{RegisterContent, Registers};
@@ -174,6 +175,30 @@ pub struct Editor {
     is_error: bool,
     /// Marks (a-z for user, other for special).
     marks: [Option<Position>; 26],
+    /// `:map`, `:map!` and `:ab` definitions.
+    maps: crate::maps::Maps,
+    /// Keys waiting to be acted on: typed, expanded, or from an `@` buffer.
+    input: InputQueue,
+    /// An undo group is open around the expansion currently being consumed.
+    ///
+    /// POSIX 95443-95445: "commands resulting from buffer executions and mapped
+    /// character expansions, are considered single commands" for undo, so one
+    /// `u` reverses the whole of what a map did.
+    expansion_group: bool,
+    /// A `^V` on the ex command line is pending, so the next key is quoted.
+    ///
+    /// Only the four commands POSIX gives `<control>-V` escaping to
+    /// (94657-94659) make use of it, but the colon line cannot know which
+    /// command is being typed until Enter, so it quotes for all of them and
+    /// lets the parser decide.
+    ex_pending_literal: bool,
+    /// Where each outstanding `:tag` / `^]` jump started, oldest first.
+    ///
+    /// Pushed by `goto_tag`, so both entry points get it; walked by `:pop` and
+    /// listed by `:tags`. Entries are never invalidated when `:e` or `:n`
+    /// changes the file — every way one can go stale is handled at pop time
+    /// instead, which is why the file is kept as a name rather than a handle.
+    tag_stack: Vec<crate::tags::TagStackEntry>,
     /// Whether editor should quit.
     should_quit: bool,
     /// Exit code.
@@ -262,6 +287,11 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            maps: crate::maps::Maps::default(),
+            input: InputQueue::default(),
+            expansion_group: false,
+            ex_pending_literal: false,
+            tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
             shell,
@@ -306,6 +336,11 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            maps: crate::maps::Maps::default(),
+            input: InputQueue::default(),
+            expansion_group: false,
+            ex_pending_literal: false,
+            tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
             shell,
@@ -353,6 +388,11 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            maps: crate::maps::Maps::default(),
+            input: InputQueue::default(),
+            expansion_group: false,
+            ex_pending_literal: false,
+            tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
             shell,
@@ -461,22 +501,10 @@ impl Editor {
     /// Special characters: \x1b = Escape, \n = Enter
     pub fn execute_keys(&mut self, keys: &str) -> Result<()> {
         for c in keys.chars() {
-            let key = match c {
-                '\x1b' => Key::Escape,
-                '\n' | '\r' => Key::Enter,
-                '\x7f' => Key::Backspace,
-                // Must mirror `Key::from_byte` exactly, or headless tests
-                // agree with each other while disagreeing with real input —
-                // which is how #V22 (TAB discarded) survived.
-                '\t' => Key::Tab,
-                c if c.is_ascii_control() => {
-                    // Convert control characters (Ctrl-A = 0x01, etc.)
-                    let ctrl_char = (c as u8 + b'@') as char;
-                    Key::Ctrl(ctrl_char.to_ascii_lowercase())
-                }
-                c => Key::Char(c),
-            };
-            self.handle_key(key)?;
+            // `Key::from_map_char` is the one translation from text to
+            // keystrokes; open-coding it here is how this copy came to disagree
+            // with `Key::from_byte` about TAB (#V22) and DEL.
+            self.handle_key(Key::from_map_char(c))?;
         }
         Ok(())
     }
@@ -626,14 +654,14 @@ impl Editor {
                                 println!("{}", msg);
                             }
                         }
-                        self.message = None;
+                        self.clear_message();
                     }
                     Ok(false) => {}
                     Err(e) => {
                         if !self.silent_mode {
                             eprintln!("{}", e);
                         }
-                        self.message = None;
+                        self.clear_message();
                     }
                 }
                 continue;
@@ -668,8 +696,9 @@ impl Editor {
                 }
             }
 
-            // Remove trailing newline
-            let mut line = line.trim_end_matches(['\n', '\r']).to_string();
+            // Remove the line terminator -- but not a <control>-V-escaped one,
+            // which is an argument character (`map Q :wq^V^M`).
+            let mut line = strip_line_terminator(&line).to_string();
 
             // A <backslash><newline> continues the command onto the next input
             // line, with the pair standing for a literal newline. This is how
@@ -713,7 +742,7 @@ impl Editor {
                     }
                 }
             }
-            self.message = None;
+            self.clear_message();
         }
 
         Ok(self.exit_code)
@@ -836,17 +865,312 @@ impl Editor {
         }
     }
 
-    /// Handle a key press.
+    /// Accept one key and run the editor until nothing is left to do.
+    ///
+    /// The key does not necessarily act at once: a `:map` whose left-hand side
+    /// is more than one key long holds it back until the match resolves, and a
+    /// map that fires puts its replacement in front of whatever was waiting.
+    /// Draining here rather than in the read loop is what makes the headless
+    /// harness and the real editor take the same path.
     fn handle_key(&mut self, key: Key) -> Result<()> {
-        // Clear any previous message
-        if !matches!(key, Key::Char(':')) {
-            self.message = None;
+        self.input.push_typed(key);
+        self.drain_input()
+    }
+
+    /// Dispatch queued keys until the queue empties or a match needs more input.
+    fn drain_input(&mut self) -> Result<()> {
+        loop {
+            // ex.md 96616-96617: a map defined in terms of itself loops, POSIX
+            // "requires conformance to historical practice, and that such loops
+            // be interruptible". So the escape is a signal, not a depth cap --
+            // a cap would refuse a mapping the spec says must work.
+            if crate::signals::take(&crate::signals::SIGINT_RECEIVED) {
+                self.abort_expansion();
+                return Ok(());
+            }
+
+            let Some(q) = self.next_input_key() else {
+                self.input.set_current(KeySource::Typed);
+                self.close_expansion_group();
+                return Ok(());
+            };
+            self.input.set_current(q.source);
+
+            // 95443-95445: everything one expansion produces is one command for
+            // `u`. Opened on the first expansion key and closed when the queue
+            // drains, so nested groups an inner command opens (a change
+            // operator and its insert session, say) nest rather than closing
+            // this one early.
+            if q.source.is_expansion() && !self.expansion_group {
+                self.undo.begin_group();
+                self.expansion_group = true;
+            }
+
+            // An abbreviation fires *before* its trigger is inserted, so the
+            // check goes here rather than inside `process_insert_key`.
+            if self.expand_abbreviation(&q)? {
+                continue;
+            }
+
+            // Clear any previous message
+            if !matches!(q.key, Key::Char(':')) {
+                self.clear_message();
+            }
+
+            let result = match &self.mode {
+                Mode::Command => self.handle_command_key(q.key),
+                Mode::Insert(_) | Mode::Replace | Mode::Open => self.handle_insert_key(q.key),
+                Mode::Ex => self.handle_ex_key(q.key),
+            };
+
+            // vi.md 120619-120627. `self.is_error` has to be consulted as well
+            // as the `Result`: most of `execute_command` reports through
+            // `set_error` rather than returning `Err`, so testing the `Result`
+            // alone would miss the majority of vi command errors.
+            if result.is_err() || self.is_error {
+                self.abort_expansion();
+            }
+            if result.is_err() {
+                self.close_expansion_group();
+            }
+            result?;
+        }
+    }
+
+    /// Which `:map` table applies right now, or `None` where no map does.
+    ///
+    /// POSIX scopes both tables to "open or visual" mode (95090-95092): command
+    /// mode takes `:map`, text input mode takes `:map!`. Two contexts are
+    /// deliberately absent. The colon line is one — 96496-96509 permits not
+    /// expanding there and forbids the two behaviours that expanding the first
+    /// argument of `:ab`/`:una` historically caused, so not expanding is both
+    /// the safe reading and the simple one. Ex text input mode (`:a`, `:i`,
+    /// `:c`) is the other: it is neither open nor visual, and it does not reach
+    /// this function at all, since `handle_ex_key` owns it.
+    fn active_map_mode(&self) -> Option<MapMode> {
+        match self.mode {
+            Mode::Command => Some(MapMode::Command),
+            Mode::Insert(_) | Mode::Replace | Mode::Open => Some(MapMode::Insert),
+            Mode::Ex => None,
+        }
+    }
+
+    /// Whether a left-hand side may be matched at this point in a command.
+    ///
+    /// 95094-95095 says a command-mode map fires when its lhs is entered "as
+    /// any part of a vi command (but not as part of the arguments to the
+    /// command)", and 96598-96600 gives the case that pins it: with `x` mapped
+    /// to `y`, "the command fx searched for the 'x' character, not the 'y'
+    /// character. POSIX.1-2024 requires this behavior."
+    ///
+    /// `CommandParser` already knows when it is waiting for an argument, so
+    /// this is a question about its state and needs no bookkeeping of its own.
+    /// A count is *not* an argument: 96607-96608 requires that a digit lhs
+    /// work, so `Count` and `Operator` stay eligible.
+    fn in_argument_position(&self) -> bool {
+        matches!(
+            self.parser.state(),
+            ParserState::Register | ParserState::WaitingChar | ParserState::MotionWaitingChar
+        )
+    }
+
+    /// The next key to act on, expanding maps along the way.
+    ///
+    /// `None` means the keys in hand are a strict prefix of some left-hand side
+    /// and the match cannot be resolved without more input (95116-95118, where
+    /// the wait is explicitly unspecified). Under shortest-match that can only
+    /// happen when nothing has matched exactly, so waiting for the next
+    /// keystroke resolves it and no timer is needed.
+    fn next_input_key(&mut self) -> Option<QueuedKey> {
+        loop {
+            let Some(q) = self.input.pop() else {
+                // Nothing more is coming from an expansion, so a held prefix
+                // will never complete. Give it up.
+                return self.input.release_partial();
+            };
+
+            // A key that cannot begin a match goes straight through -- but not
+            // past keys already held, or it would overtake them.
+            let literal = self.input.take_literal_next();
+            let Some(mode) = self.active_map_mode() else {
+                return Some(self.flush_before(q));
+            };
+            // 95110-95111: in text input mode too, "if any character in the
+            // input text is escaped using a <control>-V character, that
+            // character shall not be part of a match to an lhs".
+            // `process_insert_key` owns that flag and consumes it on the very
+            // next key, which is the one in hand here.
+            let insert_literal = self
+                .insert_state
+                .as_ref()
+                .is_some_and(|s| s.pending_literal);
+            if literal || insert_literal || !q.remappable || self.in_argument_position() {
+                return Some(self.flush_before(q));
+            }
+
+            // A command-mode `^V` means the next key matches no lhs
+            // (95097-95098, permitted for the first character by 96600-96603).
+            if mode == MapMode::Command
+                && matches!(q.key, Key::Ctrl('v') | Key::Ctrl('q'))
+                && self.input.partial().is_empty()
+            {
+                self.input.set_literal_next();
+                continue;
+            }
+
+            self.input.hold(q);
+            let keys: Vec<Key> = self.input.partial().iter().map(|k| k.key).collect();
+            match self.maps.table(mode).probe(&keys) {
+                MapMatch::Full(i) => {
+                    self.expand_map(mode, i);
+                    self.input.clear_partial();
+                }
+                // More lookahead is already available, so keep consuming it;
+                // otherwise hold and wait for the user.
+                MapMatch::Partial if self.input.has_queued() => continue,
+                MapMatch::Partial => return None,
+                MapMatch::NoMatch => return self.input.release_partial(),
+            }
+        }
+    }
+
+    /// Release any held keys before `q`, which cannot join a match.
+    fn flush_before(&mut self, q: QueuedKey) -> QueuedKey {
+        if self.input.partial().is_empty() {
+            return q;
+        }
+        self.input.push_front(std::iter::once(q));
+        self.input
+            .release_partial()
+            .expect("partial was just checked non-empty")
+    }
+
+    /// Expand an abbreviation if this key triggers one.
+    ///
+    /// POSIX 94870-94873: "In open and visual text input mode, if a non-word or
+    /// <ESC> character that is not escaped by a <control>-V character is
+    /// entered after a word character, a check shall be made for a set of
+    /// characters matching lhs, in the text input entered during this command.
+    /// If it is found, the effect shall be as if rhs was entered instead of
+    /// lhs."
+    ///
+    /// Returns `true` when it fired, in which case the caller must not dispatch
+    /// the trigger: it has been requeued behind the replacement.
+    fn expand_abbreviation(&mut self, q: &QueuedKey) -> Result<bool> {
+        if !q.abbrevable || !matches!(self.mode, Mode::Insert(_) | Mode::Replace | Mode::Open) {
+            return Ok(false);
+        }
+        // A key consumed after `^V` is text, not a trigger (94870-94871).
+        let Some(state) = self.insert_state.as_ref() else {
+            return Ok(false);
+        };
+        if state.pending_literal {
+            return Ok(false);
         }
 
-        match &self.mode {
-            Mode::Command => self.handle_command_key(key),
-            Mode::Insert(_) | Mode::Replace | Mode::Open => self.handle_insert_key(key),
-            Mode::Ex => self.handle_ex_key(key),
+        // Only keys that actually enter text, plus <ESC>. The erase and kill
+        // commands are non-word characters by a literal reading of 94870, but
+        // they are editing commands rather than entered text, and historical
+        // vi does not check on them.
+        let triggers = match q.key {
+            Key::Escape | Key::Ctrl('[') => true,
+            Key::Char(c) => !crate::command::is_word_char(c),
+            Key::Tab | Key::Enter | Key::Ctrl('j') => true,
+            _ => false,
+        };
+        if !triggers {
+            return Ok(false);
+        }
+
+        let Some(word) = crate::maps::abbrev_candidate(&state.input_log) else {
+            return Ok(false);
+        };
+        let Some(entry) = self.maps.abbrev.lookup(&word) else {
+            return Ok(false);
+        };
+        let rhs = entry.rhs.clone();
+        let exempt = entry.no_reabbrev;
+
+        // Take the matched word back out of the buffer and the session record
+        // together, so `.` repeat and the insert-session undo entry both see
+        // the replacement rather than the trigger word.
+        let n = word.chars().count();
+        let mut state = self.insert_state.take().expect("checked above");
+        crate::mode::erase_input(&mut self.buffer, &mut state, n);
+        self.insert_state = Some(state);
+
+        // 96473-96476: the replacement is "logically pushed onto the terminal
+        // input queue", not substituted -- so it is itself subject to maps and
+        // to further abbreviation. The trigger goes back behind it, to be
+        // entered after the replacement as POSIX describes.
+        let mut keys: Vec<QueuedKey> = rhs
+            .iter()
+            .enumerate()
+            .map(|(i, &key)| QueuedKey {
+                key,
+                remappable: true,
+                // The leading run that repeats the lhs is exempt, or `:ab foo
+                // foo` would re-trigger on its own replacement.
+                abbrevable: i >= exempt,
+                source: KeySource::MapExpansion,
+            })
+            .collect();
+        keys.push(QueuedKey {
+            key: q.key,
+            remappable: q.remappable,
+            abbrevable: false,
+            source: q.source,
+        });
+        self.input.push_front(keys.into_iter());
+        Ok(true)
+    }
+
+    /// Put a matched map's replacement at the front of the queue.
+    fn expand_map(&mut self, mode: MapMode, index: usize) {
+        let entry = self.maps.table(mode).entry(index);
+        // 95119-95121: the replacement is itself remapped, "except that if the
+        // characters in lhs occur as prefix characters in rhs, those characters
+        // shall not be remapped". With `remap` unset the whole replacement is
+        // exempt, which is 95874-95875's "only a one-step translation".
+        let exempt = if self.options.remap {
+            entry.no_remap_prefix
+        } else {
+            entry.rhs.len()
+        };
+        let keys: Vec<QueuedKey> = entry
+            .rhs
+            .iter()
+            .enumerate()
+            .map(|(i, &key)| QueuedKey {
+                key,
+                remappable: i >= exempt,
+                abbrevable: true,
+                source: KeySource::MapExpansion,
+            })
+            .collect();
+        self.input.push_front(keys.into_iter());
+    }
+
+    /// Discard everything an erroring command should not have led to.
+    ///
+    /// vi.md 120619-120627 in one place: alert the terminal, drop any partially
+    /// entered command, drop the rest of a map expansion, and stop a buffer
+    /// execution. The queue holds all three kinds of pending key, so one
+    /// `discard` covers the last two.
+    fn abort_expansion(&mut self) {
+        if self.input.is_expanding() {
+            let _ = self.terminal.bell();
+        }
+        self.input.discard();
+        self.parser.reset();
+        self.close_expansion_group();
+    }
+
+    /// Close the undo group opened around an expansion, if one is open.
+    fn close_expansion_group(&mut self) {
+        if self.expansion_group {
+            self.expansion_group = false;
+            self.undo.end_group();
         }
     }
 
@@ -914,9 +1238,32 @@ impl Editor {
                 return Ok(());
             }
             Key::Ctrl(']') => {
-                // Tag jump - get word under cursor and jump to tag
+                // Tag jump - get word under cursor and jump to tag.
+                //
+                // The error must be reported, not discarded: `goto_tag`
+                // returns `Err(FileModified)` when the tag lives in another
+                // file and this one has unsaved changes, and swallowing it
+                // made `^]` do nothing at all, silently. It must also not
+                // escape -- an `Err` out of `handle_key` unwinds to
+                // `run_editor`, which prints and exits the editor.
                 if let Some(tag) = self.word_under_cursor() {
-                    let _ = self.goto_tag(&tag);
+                    if let Err(e) = self.goto_tag(&tag) {
+                        self.set_error(&e.to_string());
+                    }
+                }
+                return Ok(());
+            }
+            Key::Ctrl('t') => {
+                // ^T: return to where the last tag jump started, the companion
+                // to ^] above.
+                //
+                // Not POSIX, and the only non-POSIX command-mode key here:
+                // vi.md 121838-121840 gives ^T a meaning in *text input* mode
+                // only, where it shifts the autoindent and `mode::insert`
+                // implements it. This arm is reached in command mode alone, so
+                // the two do not collide. See NONPOSIX.md.
+                if let Err(e) = self.pop_tag() {
+                    self.set_error(&e.to_string());
                 }
                 return Ok(());
             }
@@ -1059,8 +1406,8 @@ impl Editor {
     /// Handle a key in insert mode.
     fn handle_insert_key(&mut self, key: Key) -> Result<()> {
         // See `handle_command_key` — these two are the complete set of entry
-        // points, since `handle_key` and `execute_keys_from_string` both funnel
-        // through them.
+        // points, since every key reaches the editor through `drain_input`,
+        // which dispatches to one of them.
         self.undo.sync_line_original(&self.buffer);
 
         if let Some(mut state) = self.insert_state.take() {
@@ -1109,7 +1456,29 @@ impl Editor {
             return self.handle_ex_insert_key(key);
         }
 
+        // A pending ^V quotes this key, whatever it is. Both the marker and the
+        // quoted character go into `ex_input`: the ex parser needs the marker
+        // to tell an escaped <blank> from a delimiting one (94657-94659), and
+        // discards it once it has (95086-95088).
+        //
+        // Without this there was no way to type a ^V on the colon line at all.
+        // `Key::Ctrl('v')` fell into the `_ => {}` arm below and vanished, so
+        // `:map Q :wq^V^M` -- the most common mapping there is -- could not be
+        // entered. In ex standalone mode the 0x16 byte is already in the line
+        // read from stdin, so both paths reach the parser in the same shape.
+        if self.ex_pending_literal {
+            self.ex_pending_literal = false;
+            if let Some(c) = key.literal_char() {
+                self.ex_input.push(CTRL_V);
+                self.ex_input.push(c);
+            }
+            return Ok(());
+        }
+
         match key {
+            Key::Ctrl('v') | Key::Ctrl('q') => {
+                self.ex_pending_literal = true;
+            }
             Key::Enter => {
                 let input = std::mem::take(&mut self.ex_input);
                 self.mode = Mode::Command;
@@ -1124,13 +1493,19 @@ impl Editor {
             }
             Key::Escape => {
                 self.ex_input.clear();
+                self.ex_pending_literal = false;
                 self.mode = Mode::Command;
             }
             Key::Backspace | Key::Delete => {
                 if self.ex_input.is_empty() {
                     self.mode = Mode::Command;
                 } else {
+                    // A quoted character is two chars in the buffer but one
+                    // keystroke to the user, so erase both.
                     self.ex_input.pop();
+                    if self.ex_input.ends_with(CTRL_V) {
+                        self.ex_input.pop();
+                    }
                 }
             }
             Key::Char(c) => {
@@ -1769,8 +2144,17 @@ impl Editor {
     }
 
     /// Save the last command for dot repeat.
+    ///
+    /// vi.md 121022-121024: "Commands (other than commands that enter text
+    /// input mode) executed as a result of map expansions, shall not change the
+    /// value of the last repeatable command." So `.` after a map that deleted a
+    /// line repeats whatever the user last did by hand, not the map's `dd`.
+    ///
+    /// The exception is not needed here: every command that enters text input
+    /// mode records through `LastCommand::Insert` when the session ends, which
+    /// is a different path.
     fn save_last_command(&mut self, cmd: &crate::command::ParsedCommand) {
-        if Self::is_repeatable_command(cmd) {
+        if Self::is_repeatable_command(cmd) && !self.input.is_expanding() {
             self.last_command = Some(LastCommand::Parsed(cmd.clone()));
         }
     }
@@ -1871,8 +2255,8 @@ impl Editor {
         };
 
         // Get register contents
-        let content = match self.registers.get(register) {
-            Some(c) => c.text.clone(),
+        let (content, linewise) = match self.registers.get(register) {
+            Some(c) => (c.text.clone(), c.linewise),
             None => {
                 self.set_error(&format!("Register {} is empty", register));
                 return Ok(());
@@ -1882,42 +2266,52 @@ impl Editor {
         // Save as last macro register
         self.last_macro_register = Some(register);
 
-        // Execute the macro `count` times
-        for _ in 0..count {
-            // Parse and execute each character as a command
-            self.execute_keys_from_string(&content)?;
-        }
-
-        Ok(())
-    }
-
-    /// Execute a string of characters as if typed by the user.
-    fn execute_keys_from_string(&mut self, keys: &str) -> Result<()> {
-        // Reset parser state before executing keys to avoid interference
-        // from any previously parsed command (e.g., @a calling this function)
-        self.parser.reset();
-
-        for c in keys.chars() {
-            let key = if c == '\x1b' {
-                Key::Escape
-            } else if c == '\n' || c == '\r' {
-                Key::Enter
-            } else if c.is_ascii_control() {
-                // Convert control characters
-                let ctrl_char = (c as u8 + b'@') as char;
-                Key::Ctrl(ctrl_char.to_ascii_lowercase())
-            } else {
-                Key::Char(c)
-            };
-
-            // Process the key based on current mode
-            match self.mode {
-                Mode::Command => self.handle_command_key(key)?,
-                Mode::Insert(_) | Mode::Replace => self.handle_insert_key(key)?,
-                Mode::Ex => self.handle_ex_key(key)?,
-                Mode::Open => {}
+        // 121171-121173: "Behave as if the contents of the named buffer were
+        // entered as standard input. After each line of a line-mode buffer, and
+        // all but the last line of a character mode buffer, behave as if a
+        // <newline> were entered as standard input."
+        let mut text = content.clone();
+        if linewise {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        } else {
+            // A character-mode buffer separates its lines but does not end with
+            // one; `content` already carries the interior newlines, so the only
+            // correction is to drop a trailing one if it is there.
+            while text.ends_with('\n') {
+                text.pop();
             }
         }
+
+        // 121176-121177: "If a count is specified, behave as if that count were
+        // entered as user input *before* the characters from the @ buffer were
+        // entered." Running the buffer `count` times is a different thing --
+        // `3@a` with `a` holding `dw` means `3dw`, one command over three
+        // words, not three separate `dw`s.
+        let mut keys: Vec<QueuedKey> = Vec::new();
+        if count > 1 {
+            for c in count.to_string().chars() {
+                keys.push(QueuedKey {
+                    key: Key::from_map_char(c),
+                    remappable: true,
+                    abbrevable: true,
+                    source: KeySource::BufferExecution,
+                });
+            }
+        }
+        keys.extend(text.chars().map(|c| QueuedKey {
+            key: Key::from_map_char(c),
+            remappable: true,
+            abbrevable: true,
+            source: KeySource::BufferExecution,
+        }));
+
+        // Queued rather than executed: 121171's "as if ... entered as standard
+        // input" is what makes buffer contents subject to maps, and what makes
+        // 121174-121175 ("no more characters resulting from the execution of
+        // this command shall be processed") the same rule as a map expansion's.
+        self.input.push_front(keys.into_iter());
         Ok(())
     }
 
@@ -3045,15 +3439,55 @@ impl Editor {
             // Parsed but not implemented. These returned `Continue` through the
             // wildcard below, so the editor accepted `:map x dd` in silence and
             // the user had no way to learn the mapping was never made.
-            ExCommand::Map { .. } => Err(ViError::NotImplemented("map")),
-            ExCommand::Unmap { .. } => Err(ViError::NotImplemented("unmap")),
-            ExCommand::Abbreviate { .. } => Err(ViError::NotImplemented("abbreviate")),
-            ExCommand::Unabbreviate { .. } => Err(ViError::NotImplemented("unabbreviate")),
-            ExCommand::Pop => Err(ViError::NotImplemented("pop")),
-            ExCommand::Tags => Err(ViError::NotImplemented("tags")),
-            // No wildcard: with the six above named, the match is exhaustive,
-            // so a new ExCommand variant is a compile error rather than another
-            // command that silently does nothing.
+            ExCommand::Map { lhs, rhs, mode } => {
+                self.maps
+                    .table_mut(mode)
+                    .set(keys_from_text(&lhs), keys_from_text(&rhs));
+                Ok(ExResult::Continue)
+            }
+            // 95080-95083: with no arguments, write the list for this mode and
+            // do nothing more.
+            ExCommand::MapList { mode } => {
+                Ok(ExResult::CommandOutput(self.maps.table(mode).list()))
+            }
+            ExCommand::Unmap { lhs, mode } => {
+                if self.maps.table_mut(mode).remove(&keys_from_text(&lhs)) {
+                    Ok(ExResult::Continue)
+                } else {
+                    // 95457-95462: removing something that is not in that
+                    // mode's list "shall be an error".
+                    Err(ViError::NoSuchMap(lhs, mode == MapMode::Insert))
+                }
+            }
+            ExCommand::Abbreviate { lhs, rhs } => {
+                self.maps.abbrev.set(lhs, keys_from_text(&rhs));
+                Ok(ExResult::Continue)
+            }
+            // 94864: with no arguments, write the list and do nothing more.
+            ExCommand::AbbrevList => Ok(ExResult::CommandOutput(self.maps.abbrev.list())),
+            ExCommand::Unabbreviate { lhs } => {
+                if self.maps.abbrev.remove(&lhs) {
+                    Ok(ExResult::Continue)
+                } else {
+                    // 95436-95437: "If lhs is not an entry in the current list
+                    // of abbreviations ... it shall be an error."
+                    Err(ViError::NoSuchAbbreviation(lhs))
+                }
+            }
+            ExCommand::Pop => {
+                self.pop_tag()?;
+                Ok(ExResult::Continue)
+            }
+            // Listing an empty stack is not a failure, so this never errors --
+            // which keeps `:tags` usable from a script running under `-s`.
+            ExCommand::Tags => Ok(ExResult::CommandOutput(crate::tags::format_stack(
+                &self.tag_stack,
+            ))),
+            // No wildcard, deliberately: every variant is named, so a new
+            // `ExCommand` is a compile error rather than another command that
+            // silently does nothing. A `_ =>` arm here is what let `:map`,
+            // `:unmap`, `:ab`, `:una`, `:pop` and `:tags` all return success
+            // while doing nothing, for as long as they did.
         }
     }
 
@@ -3161,10 +3595,17 @@ impl Editor {
         use std::io::{BufRead, BufReader};
 
         let file = File::open(file).map_err(ViError::Io)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
 
-        for line in reader.lines() {
-            let line = line.map_err(ViError::Io)?;
+        // Read to the `\n` and strip the terminator ourselves. `BufRead::lines`
+        // removes a trailing `\r` as well, which would eat the quoted carriage
+        // return in a sourced `map Q :wq^V^M`.
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).map_err(ViError::Io)? == 0 {
+                break;
+            }
             self.execute_source_line(&line)?;
         }
 
@@ -3173,7 +3614,10 @@ impl Editor {
 
     /// Execute ex commands from a string (already-read file content).
     fn execute_source_content(&mut self, content: &str) -> Result<()> {
-        for line in content.lines() {
+        // Split on `\n` alone rather than using `str::lines`, which also strips
+        // a trailing `\r` -- and so would eat the quoted carriage return in a
+        // `.exrc` line like `map Q :wq^V^M` before anything could see it.
+        for line in content.split('\n') {
             self.execute_source_line(line)?;
         }
         Ok(())
@@ -3181,7 +3625,10 @@ impl Editor {
 
     /// Execute a single line from a source file.
     fn execute_source_line(&mut self, line: &str) -> Result<()> {
-        let line = line.trim();
+        // Leading <blank>s go unconditionally; the trailing ones belong to
+        // `parse_ex_command`, which strips them by the rule the command
+        // follows and so can keep a quoted one.
+        let line = strip_line_terminator(line).trim_start();
         // Skip empty lines and comments
         if line.is_empty() || line.starts_with('"') {
             return Ok(());
@@ -4355,6 +4802,17 @@ impl Editor {
         self.is_error = true;
     }
 
+    /// Discard the current message.
+    ///
+    /// `is_error` describes `message`, so the two have to be cleared together.
+    /// Four sites used to assign `self.message = None` on its own, leaving the
+    /// flag set from a message that no longer existed — after which a command
+    /// that succeeded silently still read as having failed.
+    fn clear_message(&mut self) {
+        self.message = None;
+        self.is_error = false;
+    }
+
     /// Page up (Ctrl-B).
     fn page_up(&mut self) -> Result<()> {
         let window = self.options.window.max(3);
@@ -4631,11 +5089,20 @@ impl Editor {
             return Ok(());
         };
 
-        // Switch to the tag's file unless it is already the current file.
-        let already_open = self
+        // Where we are now, read before open() can replace the buffer. `None`
+        // means no file is current yet -- the `-t` startup option arrives here
+        // before anything is open -- and there is no position to return to, so
+        // nothing is pushed. Gating on this rather than on the caller is what
+        // keeps `:tag` and `^]` from each needing to know about the stack.
+        let origin = self
             .files
             .current_file()
-            .map(|p| p.to_string_lossy() == m.file.as_str())
+            .map(|p| (p.to_string_lossy().into_owned(), self.buffer.cursor()));
+
+        // Switch to the tag's file unless it is already the current file.
+        let already_open = origin
+            .as_ref()
+            .map(|(path, _)| path.as_str() == m.file.as_str())
             .unwrap_or(false);
         if !already_open {
             // Match :edit/:next: refuse to abandon a modified buffer (open()
@@ -4644,6 +5111,21 @@ impl Editor {
                 return Err(ViError::FileModified);
             }
             self.open(&m.file)?;
+        }
+
+        // Past both ways out that leave the cursor where it was, so the jump is
+        // now certain to have moved us -- including the case where the file
+        // opened but the pattern below is not found, which still changed the
+        // buffer and so still needs a way back.
+        if let Some((file, pos)) = origin {
+            if self.tag_stack.len() == crate::tags::TAG_STACK_MAX {
+                self.tag_stack.remove(0);
+            }
+            self.tag_stack.push(crate::tags::TagStackEntry {
+                tag: tag.to_string(),
+                file,
+                pos,
+            });
         }
 
         // Move to the definition.
@@ -4673,6 +5155,43 @@ impl Editor {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Return to where the most recent `:tag` or `^]` jump started.
+    ///
+    /// Behind both `:pop` and `^T`. Not POSIX -- see NONPOSIX.md.
+    fn pop_tag(&mut self) -> Result<()> {
+        let Some(top) = self.tag_stack.last() else {
+            return Err(ViError::TagStackEmpty);
+        };
+        let file = top.file.clone();
+        let pos = top.pos;
+
+        let same_file = self
+            .files
+            .current_file()
+            .map(|p| p.to_string_lossy() == file.as_str())
+            .unwrap_or(false);
+
+        // Refuse before popping, so `:w` and a second `:pop` still work. This
+        // is the one failure the user can recover from; every other one below
+        // discards the entry.
+        if !same_file && self.buffer.is_modified() {
+            return Err(ViError::FileModified);
+        }
+
+        // Pop before opening. If the file has been deleted since the jump, the
+        // user gets one diagnostic and the entry is gone, rather than a
+        // top-of-stack that can never be popped.
+        self.tag_stack.pop();
+        if !same_file {
+            self.open(&file)?;
+        }
+        // set_cursor clamps the line to the buffer and then the column to the
+        // line, so an entry pointing past the end of a file that has since
+        // shrunk lands on the nearest valid position instead of failing.
+        self.buffer.set_cursor(pos);
         Ok(())
     }
 

@@ -72,10 +72,13 @@ pub enum ViError {
     LineTooLong,
     /// Count out of range.
     CountOutOfRange,
-    /// Tag not found.
-    TagNotFound(String),
-    /// No tags file.
-    NoTagsFile,
+    /// `:pop` or `^T` with nothing left to return to.
+    TagStackEmpty,
+    /// `:unmap` naming something that is not in that mode's map list
+    /// (95457-95462). Carries the `lhs` and whether `!` was given.
+    NoSuchMap(String, bool),
+    /// `:una` naming something that is not an abbreviation (95436-95437).
+    NoSuchAbbreviation(String),
     /// Invalid line number.
     InvalidLine(usize),
     /// Invalid pattern.
@@ -84,13 +87,6 @@ pub enum ViError {
     ShellError(String),
     /// No previous shell command.
     NoPreviousCommand,
-    /// A command this editor parses but does not implement.
-    ///
-    /// Distinct from `InvalidCommand`: these are valid POSIX ex commands, and
-    /// saying "invalid" would send the user looking for a typo. They used to
-    /// fall into a `_ =>` arm that returned success, so `:map x dd` looked as
-    /// though it had taken effect.
-    NotImplemented(&'static str),
 }
 
 impl fmt::Display for ViError {
@@ -98,7 +94,6 @@ impl fmt::Display for ViError {
         match self {
             ViError::Io(e) => write!(f, "{}", e),
             ViError::InvalidCommand(s) => write!(f, "Invalid command: {}", s),
-            ViError::NotImplemented(s) => write!(f, "{}: command not implemented", s),
             ViError::MotionFailed(s) => write!(f, "{}", s),
             ViError::NoPreviousSearch => write!(f, "No previous search pattern"),
             ViError::PatternNotFound(p) => write!(f, "Pattern not found: {}", p),
@@ -126,8 +121,12 @@ impl fmt::Display for ViError {
             ViError::BufferEmpty(c) => write!(f, "Buffer \"{}\" is empty", c),
             ViError::LineTooLong => write!(f, "Line too long"),
             ViError::CountOutOfRange => write!(f, "Count out of range"),
-            ViError::TagNotFound(s) => write!(f, "Tag not found: {}", s),
-            ViError::NoTagsFile => write!(f, "No tags file"),
+            ViError::TagStackEmpty => write!(f, "tag stack empty"),
+            ViError::NoSuchMap(lhs, bang) => {
+                let list = if *bang { "text input" } else { "command" };
+                write!(f, "no {} mode map for: {}", list, lhs)
+            }
+            ViError::NoSuchAbbreviation(lhs) => write!(f, "no such abbreviation: {}", lhs),
             ViError::InvalidLine(n) => write!(f, "Invalid line: {}", n),
             ViError::InvalidPattern(s) => write!(f, "Invalid pattern: {}", s),
             ViError::ShellError(s) => write!(f, "Shell error: {}", s),

@@ -6,9 +6,6 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - stty get-short display
-//
 
 mod osdata;
 
@@ -97,7 +94,16 @@ fn ti_baud_str(revspeed: &HashMap<speed_t, &'static str>, ti: &Termios) -> Strin
     }
 }
 
-// display short-form stty values (abbreviated, non-defaults)
+/// Display the no-operand form: the baud rate, then the settings that differ
+/// from the usual defaults.
+///
+/// POSIX fixes only the speed line here -- "If no options or operands are
+/// specified, an *unspecified subset* of the information written for the -a
+/// option shall be written" (116337-116344), and the utility "shall report the
+/// settings of certain characteristics, usually those that differ from
+/// implementation-defined defaults" (116050-116051). Which settings those are
+/// is our choice, not a requirement, so the selection below can change without
+/// affecting conformance -- and a test must not pin it.
 fn stty_show_short(ti: Termios) -> io::Result<()> {
     let speedmap = osdata::load_speeds();
     let revspeed = osdata::load_speeds_rev(&speedmap);

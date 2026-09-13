@@ -656,6 +656,135 @@ fn test_ex_tag_lookup() {
     );
 }
 
+/// The tag stack through the real binary under `-s`. `:tags` returns its
+/// listing as `CommandOutput`, which ex mode prints to stdout and `-s` does
+/// *not* suppress -- unlike a status message. That difference is only
+/// observable here, not in the headless harness.
+///
+/// `:pop` and `:tags` are extensions; POSIX has `:tag` and `^]` and no way
+/// back. See NONPOSIX.md.
+#[test]
+fn test_ex_tag_pop_and_tags() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("src.c"),
+        "int helper() { }\nint main() { }\nlast line\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("tags"), "helper\tsrc.c\t1\n").unwrap();
+
+    let bin = get_binary_path("ex");
+    let run = |script: &[u8]| {
+        let mut cmd = Command::new(&bin);
+        cmd.arg("-s")
+            .arg("src.c")
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(script).unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Move to line 3, jump to the tag on line 1, pop, and print: the current
+    // line must be the one we left from.
+    let out = run(b"3\ntag helper\npop\np\nq!\n");
+    assert_eq!(out.trim(), "last line", "pop must restore the origin line");
+
+    // :tags names the tag and the position pop would return to.
+    let out = run(b"3\ntag helper\ntags\nq!\n");
+    assert!(
+        out.contains("helper") && out.contains("src.c") && out.contains("line 3"),
+        "tags listing must reach stdout under -s; got {out:?}"
+    );
+
+    // With nothing pushed, :tags still prints rather than failing.
+    let out = run(b"tags\nq!\n");
+    assert!(
+        out.contains("tag stack empty"),
+        "an empty stack lists, it does not error; got {out:?}"
+    );
+}
+
+/// A `.exrc` is where `map Q :wq^V^M` actually gets written, and it has to
+/// survive being read from a file. `str::lines` strips a trailing `\r` along
+/// with the `\n`, which ate the quoted carriage return before any parser saw
+/// it -- turning the commonest mapping there is into one that does nothing.
+#[test]
+fn test_source_keeps_a_quoted_carriage_return() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("f.txt");
+    fs::write(&path, "one\n").unwrap();
+    // Written as bytes: ^V then CR then the newline that ends the line.
+    fs::write(dir.path().join("script.ex"), b"map Q :wq\x16\r\n").unwrap();
+
+    let bin = get_binary_path("ex");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg(&path)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"source script.ex\nmap\nq!\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.contains(":wq^M"),
+        "the sourced map must keep its carriage return; got {out:?}"
+    );
+}
+
+/// Abbreviations belong to "open and visual text input mode" (94870). Ex text
+/// input mode -- what `:a`, `:i` and `:c` enter -- is neither, so text typed
+/// there is not abbreviated. It is a separate code path today; this pins it, so
+/// a later refactor that unified the two could not start expanding here by
+/// accident.
+///
+/// The colon line itself is not expanded either, which 96498-96499 permits and
+/// 96500-96509 makes the safe choice: expanding the first argument of `:ab` or
+/// `:una` produces two behaviours POSIX forbids outright.
+#[test]
+fn test_ex_input_mode_does_not_abbreviate() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("f.txt");
+    fs::write(&path, "one\n").unwrap();
+
+    let bin = get_binary_path("ex");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg(&path)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"ab teh the\na\nteh x\n.\n%p\nq!\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.contains("teh x"),
+        "ex text input mode must not abbreviate; got {out:?}"
+    );
+    assert!(
+        !out.contains("the x"),
+        "the abbreviation must not have fired; got {out:?}"
+    );
+}
+
 // ============================================================================
 // Address fidelity (audit #X4 trailing delimiter, #X9 offsets)
 // ============================================================================

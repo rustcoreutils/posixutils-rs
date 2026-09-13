@@ -66,8 +66,11 @@ utility below:
 ### bc
 
  * Interactive line editing and command history.
- * Numbers are 128-bit fixed-width integers, and overflow is an error.  POSIX
-   requires arbitrary precision.
+ * A single operation may not build more than one million decimal digits;
+   beyond that it fails with `number too large` or `exponent is too large`.
+   POSIX calls bc an arbitrary precision calculator, and the limits it does
+   grant by name — `{BC_SCALE_MAX}`, `{BC_BASE_MAX}`, `{BC_DIM_MAX}`,
+   `{BC_STRING_MAX}` — do not include a ceiling on a value's digit count.
 
 ### c17
 
@@ -407,8 +410,14 @@ No `uucp`, `uux` or `uustat` *options* are extensions.
  * `+command` — an initial ex command.
  * `-s` and `-v` are accepted by `vi`; POSIX defines them for `ex` only.
  * `set expandtab` / `et`, and `set backup`.
- * The ex commands `:pwd`, `:prev` / `:previous`, `:red` / `:redo`,
-   `:po` / `:pop`, `:tags`, and `:h` / `:help`.
+ * The ex commands `:pwd`, `:prev` / `:previous`, `:red` / `:redo`, and
+   `:h` / `:help`.
+ * A tag stack.  `:ta` / `:tag` and `^]` record the position they left;
+   `:po` / `:pop` and `^T` in command mode return to it, and `:tags` lists what
+   is outstanding.  POSIX specifies `:tag` and `^]` but nothing that goes back,
+   and the `tags` it defines is the `:set tags=` edit option naming the files
+   `:tag` searches, not a command.  POSIX gives `^T` a meaning in text input
+   mode only, where it shifts the autoindent; that is unaffected.
  * `COLUMNS`, `LINES` and `TMPDIR` are consulted.  POSIX names `EXINIT`,
    `HOME`, `SHELL` and `TERM`.
 

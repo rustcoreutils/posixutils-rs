@@ -32,7 +32,18 @@ pub struct InsertState {
     /// Column to return to on escape (for append operations).
     pub return_column: Option<usize>,
     /// Text inserted in this session (for repeat with '.').
+    ///
+    /// Mutate only through [`push_input`], [`pop_input`] and [`clear_input`],
+    /// which keep [`InsertState::input_log`] in step with it.
     pub inserted_text: String,
+    /// One entry per character of `inserted_text`: the character, and whether
+    /// it was entered literally after a `^V`.
+    ///
+    /// Abbreviation matching needs both. POSIX scopes the check to "the text
+    /// input entered during this command" (94872-94873), which `inserted_text`
+    /// already is, and excludes characters escaped by a `^V` (94870-94871),
+    /// which it does not record.
+    pub input_log: Vec<(char, bool)>,
     /// Count for repeating insert.
     pub count: usize,
     /// The terminal's `stty erase` character, when it differs from `^H` (#V12).
@@ -80,6 +91,7 @@ impl InsertState {
             start_pos,
             return_column: None,
             inserted_text: String::new(),
+            input_log: Vec::new(),
             count,
             erase_char: None,
             kill_char: None,
@@ -211,9 +223,11 @@ pub fn process_insert_key(
             return Ok(false);
         }
         // Route through insert_char so `inserted_text` records the literal and
-        // both '.' repeat and the insert-session undo entry pick it up.
+        // both '.' repeat and the insert-session undo entry pick it up. The
+        // `escaped` flag is what keeps it out of an abbreviation match
+        // (94870-94871).
         if let Some(c) = key.literal_char() {
-            insert_char(buffer, c, state);
+            insert_char_escaped(buffer, c, state, true);
         }
         return Ok(false);
     }
@@ -333,10 +347,48 @@ fn current_autoindent(buffer: &Buffer, state: &InsertState) -> String {
         .unwrap_or_default()
 }
 
+/// Record one character of this session's text input.
+///
+/// `inserted_text` and `input_log` describe the same characters, so they are
+/// only ever changed together -- through this, [`pop_input`] or [`clear_input`].
+fn push_input(state: &mut InsertState, c: char, escaped: bool) {
+    state.inserted_text.push(c);
+    state.input_log.push((c, escaped));
+    debug_assert_eq!(state.inserted_text.chars().count(), state.input_log.len());
+}
+
+/// Undo the last [`push_input`], for the erase commands.
+fn pop_input(state: &mut InsertState) {
+    state.inserted_text.pop();
+    state.input_log.pop();
+    debug_assert_eq!(state.inserted_text.chars().count(), state.input_log.len());
+}
+
+/// Forget this session's text input entirely.
+fn clear_input(state: &mut InsertState) {
+    state.inserted_text.clear();
+    state.input_log.clear();
+}
+
+/// Erase `n` characters of text input from the buffer and the session record.
+///
+/// Used by abbreviation expansion to take back the word that triggered it.
+pub fn erase_input(buffer: &mut Buffer, state: &mut InsertState, n: usize) {
+    for _ in 0..n {
+        buffer.delete_char_before();
+        pop_input(state);
+    }
+}
+
 /// Insert a character at cursor.
 fn insert_char(buffer: &mut Buffer, c: char, state: &mut InsertState) {
+    insert_char_escaped(buffer, c, state, false)
+}
+
+/// Insert a character, recording whether it was entered literally after a `^V`.
+fn insert_char_escaped(buffer: &mut Buffer, c: char, state: &mut InsertState, escaped: bool) {
     buffer.insert_char(c);
-    state.inserted_text.push(c);
+    push_input(state, c, escaped);
     state.last_input_char = Some(c);
 }
 
@@ -362,7 +414,7 @@ fn delete_char_before(buffer: &mut Buffer, state: &mut InsertState) -> Result<()
 
             // Record in inserted text
             if !state.inserted_text.is_empty() {
-                state.inserted_text.pop();
+                pop_input(state);
             }
         }
     } else {
@@ -370,7 +422,7 @@ fn delete_char_before(buffer: &mut Buffer, state: &mut InsertState) -> Result<()
 
         // Update inserted text
         if !state.inserted_text.is_empty() {
-            state.inserted_text.pop();
+            pop_input(state);
         }
     }
 
@@ -434,7 +486,7 @@ fn delete_word_before(buffer: &mut Buffer, state: &mut InsertState) {
     // Update inserted text
     for _ in 0..delete_count {
         if !state.inserted_text.is_empty() {
-            state.inserted_text.pop();
+            pop_input(state);
         }
     }
 }
@@ -472,7 +524,7 @@ fn delete_to_line_start(buffer: &mut Buffer, state: &mut InsertState) {
     }
 
     // Clear inserted text
-    state.inserted_text.clear();
+    clear_input(state);
 }
 
 /// Insert a newline, carrying the autoindent onto the new line.
@@ -503,7 +555,7 @@ fn insert_newline(buffer: &mut Buffer, state: &mut InsertState, opts: &Options) 
     };
 
     buffer.insert_newline();
-    state.inserted_text.push('\n');
+    push_input(state, '\n', false);
     state.last_input_char = None;
 
     // 121826-121827: the new line gets an autoindent prefix.
@@ -599,7 +651,7 @@ fn erase_autoindent(buffer: &mut Buffer, state: &mut InsertState, opts: &Options
     // tail and it reappeared after the erased indent.
     if marker {
         buffer.delete_char_before();
-        state.inserted_text.pop();
+        pop_input(state);
     }
     let content = buffer
         .line(pos.line)
@@ -693,6 +745,14 @@ fn finalize_insert(buffer: &mut Buffer, state: &mut InsertState) {
 
 #[cfg(test)]
 mod tests {
+    /// Seed a session's text-input record, keeping both halves in step -- the
+    /// `debug_assert` in `pop_input` catches a fixture that sets only one.
+    fn seed_input(state: &mut super::InsertState, text: &str) {
+        for c in text.chars() {
+            super::push_input(state, c, false);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -761,7 +821,7 @@ mod tests {
         let mut buf = Buffer::from_text("hello");
         buf.set_column(3);
         let mut state = InsertState::new(InsertKind::Insert, buf.cursor(), 1);
-        state.inserted_text = "lo".to_string();
+        seed_input(&mut state, "lo");
 
         delete_char_before(&mut buf, &mut state).unwrap();
         assert_eq!(buf.to_string(), "helo\n");
@@ -784,7 +844,7 @@ mod tests {
         let mut buf = Buffer::from_text("hello");
         buf.set_column(3);
         let mut state = InsertState::new(InsertKind::Insert, Position::new(1, 0), 1);
-        state.inserted_text = "abc".to_string();
+        seed_input(&mut state, "abc");
 
         finalize_insert(&mut buf, &mut state);
         assert_eq!(buf.cursor().column, 2); // Moved back one
@@ -797,7 +857,7 @@ mod tests {
         let mut buf = Buffer::from_text("hello");
         buf.set_column_for_insert(5); // Position after 'o' (past end)
         let mut state = InsertState::new(InsertKind::AppendEol, Position::new(1, 0), 1);
-        state.inserted_text = "".to_string();
+        seed_input(&mut state, "");
 
         finalize_insert(&mut buf, &mut state);
         assert_eq!(buf.cursor().column, 4); // On 'o', the last character
@@ -808,7 +868,7 @@ mod tests {
         let mut buf = Buffer::from_text("hello");
         buf.set_column(0);
         let mut state = InsertState::new(InsertKind::Insert, buf.cursor(), 3);
-        state.inserted_text = "X".to_string();
+        seed_input(&mut state, "X");
         buf.insert_char('X'); // Simulate first insert
 
         finalize_insert(&mut buf, &mut state);

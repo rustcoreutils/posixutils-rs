@@ -11,6 +11,45 @@
 
 use super::address::{Address, AddressRange};
 
+/// `<control>-V`, which quotes the next character in a `map`, `unmap`,
+/// `abbreviate` or `unabbreviate` argument (94657-94659).
+///
+/// One definition because two sides have to agree on it: `handle_ex_key` writes
+/// the marker into the command line when the user types `^V`, and the parser
+/// reads it to tell an escaped <blank> from a delimiting one before discarding
+/// it (95086-95088).
+pub const CTRL_V: char = '\x16';
+
+/// Strip the line terminator from a command line read from a file or stdin,
+/// keeping a `<control>-V`-escaped one.
+///
+/// `map Q :wq^V^M` ends in a quoted carriage return that is part of the
+/// replacement, immediately followed by the real terminator. Anything that
+/// trims `\r` and `\n` off the end blindly — `str::lines`, `BufRead::lines`,
+/// `trim_end_matches` — eats the quoted one too, which silently turns the
+/// commonest mapping there is into one that does nothing.
+///
+/// Only the terminator is removed; other trailing <blank>s are left for
+/// `parse_ex_command`, which decides what to do with them by command
+/// (94655-94659).
+pub fn strip_line_terminator(line: &str) -> &str {
+    let mut end = 0;
+    let mut chars = line.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == CTRL_V {
+            // The quoted character is kept whatever it is, and so is the
+            // marker, which the argument parser needs.
+            match chars.next() {
+                Some((j, quoted)) => end = j + quoted.len_utf8(),
+                None => end = i + c.len_utf8(),
+            }
+        } else if c != '\n' && c != '\r' {
+            end = i + c.len_utf8();
+        }
+    }
+    &line[..end]
+}
+
 /// Parsed ex command.
 #[derive(Debug)]
 pub enum ExCommand {
@@ -164,10 +203,18 @@ pub enum ExCommand {
         rhs: String,
         mode: MapMode,
     },
+    /// Write the current map list (`:map` / `:map!` with no arguments).
+    ///
+    /// A separate variant rather than an empty `lhs`, because 95080-95083 makes
+    /// the no-argument form a different command: it lists and "does nothing
+    /// more". The two were indistinguishable while both parsed to `Map`.
+    MapList { mode: MapMode },
     /// Unmap key sequence (:unmap).
     Unmap { lhs: String, mode: MapMode },
     /// Abbreviation (:ab, :abbreviate).
     Abbreviate { lhs: String, rhs: String },
+    /// Write the current abbreviation list (`:ab` with no arguments, 94864).
+    AbbrevList,
     /// Remove abbreviation (:una, :unabbreviate).
     Unabbreviate { lhs: String },
     /// Open tag (:ta, :tag).
@@ -176,9 +223,12 @@ pub enum ExCommand {
         /// `ta[g]!` discards changes rather than refusing (95408).
         force: bool,
     },
-    /// Pop tag stack (:po, :pop).
+    /// Pop the tag stack (:po, :pop). Custom, not in POSIX: the spec gives
+    /// `:tag` and `^]` but no way back.
     Pop,
-    /// Display tags (:tags).
+    /// List the tag stack (:tags). Custom, not in POSIX -- the `tags` the spec
+    /// defines (95941) is the `:set tags=` edit option naming the files `:tag`
+    /// searches, not a command.
     Tags,
     /// Version (:ve, :version).
     Version,
@@ -331,26 +381,9 @@ impl SubstituteFlags {
     }
 }
 
-/// Mode for key mappings.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MapMode {
-    /// Command mode.
-    Command,
-    /// Insert mode.
-    Insert,
-}
-
-impl MapMode {
-    /// `map!` / `unmap!` address the text input mode map list (95090-95092);
-    /// without the bang they address the command mode list.
-    pub fn for_bang(bang: bool) -> Self {
-        if bang {
-            MapMode::Insert
-        } else {
-            MapMode::Command
-        }
-    }
-}
+/// Which map table a command addresses. Defined beside the tables themselves,
+/// and re-exported here so the parser keeps naming it where the commands are.
+pub use crate::maps::MapMode;
 
 /// Result of executing an ex command.
 #[derive(Debug)]
@@ -387,5 +420,31 @@ mod tests {
         assert!(flags.global);
         assert!(flags.confirm);
         assert!(!flags.print);
+    }
+
+    /// The terminator goes; a `^V`-escaped carriage return stays, because it is
+    /// part of the argument. `map Q :wq^V^M` is the case that matters, and
+    /// every blind `\r`/`\n` trim -- `str::lines`, `BufRead::lines`,
+    /// `trim_end_matches` -- gets it wrong.
+    #[test]
+    fn test_strip_line_terminator() {
+        assert_eq!(strip_line_terminator("map q dd\n"), "map q dd");
+        assert_eq!(strip_line_terminator("map q dd\r\n"), "map q dd");
+        assert_eq!(strip_line_terminator("map q dd"), "map q dd");
+
+        assert_eq!(
+            strip_line_terminator("map Q :wq\x16\r\n"),
+            "map Q :wq\x16\r",
+            "a quoted CR survives, marker and all"
+        );
+        assert_eq!(strip_line_terminator("map Q :wq\x16\r"), "map Q :wq\x16\r");
+
+        // Other trailing blanks are left alone: `parse_ex_command` strips those
+        // by the rule the command follows.
+        assert_eq!(strip_line_terminator("set number  \n"), "set number  ");
+
+        // A `^V` quoting the terminator itself, with nothing after it.
+        assert_eq!(strip_line_terminator("x\x16"), "x\x16");
+        assert_eq!(strip_line_terminator(""), "");
     }
 }

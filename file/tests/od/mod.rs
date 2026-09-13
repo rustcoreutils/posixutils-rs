@@ -1135,7 +1135,10 @@ fn od_field_widths_are_shared_across_types() {
     assert_eq!(lines[1].len(), 64, "2 fields of 32: {lines:?}");
     assert_eq!(
         lines[1],
-        "             5208208757389214273             5786930140093827657"
+        by_endian(
+            "             5208208757389214273             5786930140093827657",
+            "             4702394921427289928             5281116304131903312",
+        )
     );
 
     // A per-byte width need not be a whole number: o2 needs 7 columns for two
@@ -1308,10 +1311,11 @@ fn od_fills_a_block_across_several_files() {
         first.iter().all(|f| !f.contains("00")),
         "no NUL may be invented mid-stream: {stdout:?}"
     );
-    // Only the 7-byte tail is padded, and only at its end.
+    // Only the 7-byte tail is padded, and the nulls follow the byte order:
+    // high-order on a little-endian host, low-order on a big-endian one.
     assert_eq!(
         lines[1].split_whitespace().collect::<Vec<_>>().last(),
-        Some(&"00434343")
+        Some(&by_endian("00434343", "43434300"))
     );
     assert_eq!(lines[2], "0000027");
 }

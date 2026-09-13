@@ -7,10 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
 use std::fs;
 use std::path::Path;
-use std::process::Output;
+use std::process::{Command, Output, Stdio};
 
 /// Unescape newlines from .out file format
 fn unescape_newlines(input: &str) -> String {
@@ -349,4 +349,102 @@ fn undefine_option_rejects_a_name_starting_with_a_digit() {
         expected_err: String::from("error: invalid value '9bad' for '-U <name>'\n"),
         expected_exit_code: 2,
     });
+}
+
+// ============================================================================
+// GNU m4 differential gate
+// ============================================================================
+
+/// Run every stdin-driven fixture through both this m4 and the system's GNU
+/// m4, and require the stdout to agree.
+///
+/// The 85 committed `.out` files are frozen snapshots: they say what this
+/// implementation produced when they were written, not what m4 is supposed to
+/// produce. Nothing in the crate had ever compared against a reference, which
+/// is how `m4/docs/Compatibility.md` came to assert a breadth-first
+/// argument-expansion incompatibility that had stopped being true.
+///
+/// Skipped, loudly, when GNU m4 is not installed -- CI must stay green without
+/// it, but a silent skip would make this gate exactly the kind of claim it
+/// exists to check.
+///
+/// stdout only. stderr wording is deliberately ours (the utility name, and the
+/// diagnostics reworded over the last several commits), and diverging there is
+/// not a semantic difference. Fixtures whose output is not a function of the
+/// input alone are named and excluded.
+#[test]
+fn gnu_m4_differential() {
+    const GNU: &str = "/usr/bin/m4";
+
+    // maketemp/mkstemp generate random filenames by design, so no two runs of
+    // any implementation agree, let alone two implementations.
+    const NONDETERMINISTIC: &[&str] = &["maketemp", "mkstemp"];
+
+    if !Path::new(GNU).exists() {
+        eprintln!("skipping gnu_m4_differential: {GNU} is not installed");
+        return;
+    }
+
+    let base = Path::new("fixtures/integration_tests");
+    let mut compared = 0usize;
+    let mut differing: Vec<String> = Vec::new();
+
+    let mut entries: Vec<_> = fs::read_dir(base)
+        .expect("fixture directory")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "m4"))
+        .collect();
+    entries.sort();
+
+    for path in entries {
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        if NONDETERMINISTIC.iter().any(|n| name.contains(n)) {
+            continue;
+        }
+        // `.args` fixtures drive the CLI, not stdin; their argv lives in a
+        // separate file and several reference paths relative to the crate.
+        if base.join(format!("{name}.args")).exists() {
+            continue;
+        }
+        let Ok(input) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        let run = |bin: &std::ffi::OsStr| -> Option<String> {
+            let mut child = Command::new(bin)
+                .current_dir(base)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+            use std::io::Write;
+            let _ = child.stdin.as_mut()?.write_all(input.as_bytes());
+            let out = child.wait_with_output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+
+        let (Some(ours), Some(theirs)) =
+            (run(get_binary_path("m4").as_os_str()), run(GNU.as_ref()))
+        else {
+            continue;
+        };
+        compared += 1;
+        if ours != theirs {
+            differing.push(format!("{name}:\n  ours: {ours:?}\n  gnu : {theirs:?}"));
+        }
+    }
+
+    eprintln!("gnu_m4_differential: compared {compared} fixtures against {GNU}");
+    assert!(
+        compared >= 50,
+        "the gate compared only {compared} fixtures; it is not exercising the suite"
+    );
+    assert!(
+        differing.is_empty(),
+        "{} of {compared} fixtures disagree with GNU m4:\n{}",
+        differing.len(),
+        differing.join("\n")
+    );
 }

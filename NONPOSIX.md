@@ -289,6 +289,24 @@ POSIX specifies only `-k`.  Every other option is an addition:
  * Symbol type letters `C` (common) and `r` (read-only data), beyond the
    letters POSIX names.
 
+### od
+
+ * **`-t fL` is converted through `double`.**  POSIX 109155-109157 requires the
+   `f` conversion to support `long double`, and it does — `-t fL` selects the
+   target's `long double` (the x87 80-bit format on x86-64, IEEE binary128 on
+   aarch64, and `double` on Apple's aarch64, matching `c17`).  The *value* is
+   then converted to a `double` to be printed, because Rust has neither an
+   `f80` nor an `f128`.
+
+   Within `double`'s range and precision the output is exact.  Outside it, a
+   long double prints as `0`, `inf`, or with fewer significant digits than
+   another `od` would show: `3.3e-4949` is a representable `long double` and
+   prints here as `0`.  Printing it faithfully needs arbitrary-precision
+   decimal conversion from an 80- or 128-bit significand, which is a larger
+   undertaking than the rest of `od` put together.
+
+   `-t fF` and `-t fD` are unaffected, as are the sizes and the notation.
+
 ### patch
 
  * `-f` — force; assume answers rather than prompting.

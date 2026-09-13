@@ -14,6 +14,8 @@
 
 mod executor;
 
+use std::sync::atomic::AtomicBool;
+
 use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
 use crate::command::{CommandParser, ParserState};
 use crate::error::{Result, ViError};
@@ -199,6 +201,15 @@ pub struct Editor {
     /// changes the file — every way one can go stale is handled at pop time
     /// instead, which is why the file is kept as a name rather than a handle.
     tag_stack: Vec<crate::tags::TagStackEntry>,
+    /// The flag this editor watches for an interrupt.
+    ///
+    /// A signal handler can only write to a `static`, so the real one is
+    /// `signals::SIGINT_RECEIVED` and that is the default. Naming it here
+    /// rather than reaching for the global from inside the input drain makes
+    /// the interrupt a property of *this* editor: two editors in one process
+    /// no longer consume each other's interrupts, which is exactly what two
+    /// tests running in parallel are.
+    interrupt: &'static AtomicBool,
     /// Whether editor should quit.
     should_quit: bool,
     /// Exit code.
@@ -292,6 +303,7 @@ impl Editor {
             expansion_group: false,
             ex_pending_literal: false,
             tag_stack: Vec::new(),
+            interrupt: &crate::signals::SIGINT_RECEIVED,
             should_quit: false,
             exit_code: 0,
             shell,
@@ -341,6 +353,7 @@ impl Editor {
             expansion_group: false,
             ex_pending_literal: false,
             tag_stack: Vec::new(),
+            interrupt: &crate::signals::SIGINT_RECEIVED,
             should_quit: false,
             exit_code: 0,
             shell,
@@ -393,6 +406,7 @@ impl Editor {
             expansion_group: false,
             ex_pending_literal: false,
             tag_stack: Vec::new(),
+            interrupt: &crate::signals::SIGINT_RECEIVED,
             should_quit: false,
             exit_code: 0,
             shell,
@@ -411,6 +425,24 @@ impl Editor {
             ex_standalone_mode: false,
             silent_mode: false,
         }
+    }
+
+    /// Watch `flag` for interrupts instead of the process-wide SIGINT flag.
+    ///
+    /// The interrupt flag is global because a signal handler can only write to
+    /// a `static`, and that is right for the one editor a vi process runs. It
+    /// is wrong for a test binary, where every test shares the process: the
+    /// drain consumes the flag with a `swap(false)`, so a test that arms it
+    /// races every other test's keystrokes for it, and whichever reads first
+    /// wins. Pointing a headless editor at its own flag removes the sharing
+    /// rather than papering over it with a lock or a serialized run.
+    pub fn set_interrupt_source(&mut self, flag: &'static AtomicBool) {
+        self.interrupt = flag;
+    }
+
+    /// The flag this editor watches for interrupts.
+    pub fn interrupt_source(&self) -> &'static AtomicBool {
+        self.interrupt
     }
 
     /// Set read-only mode.
@@ -776,9 +808,7 @@ impl Editor {
     /// Service any pending asynchronous signals. Returns `true` if at least one
     /// was handled (the loop should redraw and keep running).
     fn handle_pending_signals(&mut self) -> Result<bool> {
-        use crate::signals::{
-            take, HANGUP_RECEIVED, SIGCONT_RECEIVED, SIGINT_RECEIVED, SIGWINCH_RECEIVED,
-        };
+        use crate::signals::{take, HANGUP_RECEIVED, SIGCONT_RECEIVED, SIGWINCH_RECEIVED};
 
         if take(&HANGUP_RECEIVED) {
             // Hangup/termination: preserve the buffer and exit.
@@ -802,7 +832,7 @@ impl Editor {
             self.terminal.refresh_size()?;
             handled = true;
         }
-        if take(&SIGINT_RECEIVED) {
+        if take(self.interrupt) {
             self.interrupt_command();
             handled = true;
         }
@@ -884,7 +914,7 @@ impl Editor {
             // "requires conformance to historical practice, and that such loops
             // be interruptible". So the escape is a signal, not a depth cap --
             // a cap would refuse a mapping the spec says must work.
-            if crate::signals::take(&crate::signals::SIGINT_RECEIVED) {
+            if crate::signals::take(self.interrupt) {
                 self.abort_expansion();
                 return Ok(());
             }

@@ -368,6 +368,85 @@ fn undefine_option_rejects_a_name_starting_with_a_digit() {
 // GNU m4 differential gate
 // ============================================================================
 
+/// The oldest GNU m4 this gate's expectations have been checked against.
+const MIN_GNU_VERSION: (u32, u32, u32) = (1, 4, 19);
+
+/// The reference's self-reported version, if it is a GNU m4 at least
+/// [`MIN_GNU_VERSION`].
+///
+/// The gate used to take any executable at `/usr/bin/m4` and call it GNU m4.
+/// That premise is false on macOS, whose `/usr/bin/m4` is a different
+/// implementation: it disagrees with us -- and with GNU M4 1.4.19 -- on
+/// `eval`'s `!` and `~`, on quote handling in `define_hanging_quotes`, and on
+/// `define_nested_first_arg`, while *our* output is byte-identical on both
+/// platforms. Comparing against it said nothing about this m4's correctness
+/// and turned macOS CI red for an environment difference.
+///
+/// The version floor matters as much as the name. These fixtures encode one
+/// reference implementation's answers, and GNU m4 has changed some of them
+/// between releases (`m4wrap` ordering, for one). A gate that silently
+/// compared against a different version would report a difference that is not
+/// a regression.
+fn gnu_m4_version(bin: &std::ffi::OsStr) -> Option<String> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let first = text.lines().next()?.trim().to_string();
+    parse_gnu_m4_version(&first)
+        .is_some_and(|v| v >= MIN_GNU_VERSION)
+        .then_some(first)
+}
+
+/// Parse `m4 (GNU M4) 1.4.19` into `(1, 4, 19)`.
+///
+/// Returns `None` for anything that does not announce itself as GNU M4, which
+/// is what a BSD m4 -- or a `--version` it does not understand -- yields.
+fn parse_gnu_m4_version(line: &str) -> Option<(u32, u32, u32)> {
+    let rest = line.split("GNU M4").nth(1)?;
+    // "m4 (GNU M4) 1.4.19" leaves ") 1.4.19": the version is the first run of
+    // digits and dots, not the first whitespace-separated token, which is ")".
+    let rest = rest.trim_start_matches(|c: char| !c.is_ascii_digit());
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if token.is_empty() {
+        return None;
+    }
+    let mut parts = token.split('.').map(|p| p.parse::<u32>());
+    let major = parts.next()?.ok()?;
+    let minor = parts.next().unwrap_or(Ok(0)).ok()?;
+    let patch = parts.next().unwrap_or(Ok(0)).ok()?;
+    Some((major, minor, patch))
+}
+
+#[test]
+fn gnu_m4_version_identifies_the_reference() {
+    // What GNU m4 actually prints.
+    assert_eq!(parse_gnu_m4_version("m4 (GNU M4) 1.4.19"), Some((1, 4, 19)));
+    assert_eq!(parse_gnu_m4_version("m4 (GNU M4) 1.4.6"), Some((1, 4, 6)));
+    assert_eq!(parse_gnu_m4_version("m4 (GNU M4) 2.0"), Some((2, 0, 0)));
+
+    // Anything that is not GNU m4 -- macOS's BSD m4 prints no such line, and
+    // does not accept --version at all.
+    assert_eq!(parse_gnu_m4_version(""), None);
+    assert_eq!(parse_gnu_m4_version("m4: illegal option -- -"), None);
+    assert_eq!(parse_gnu_m4_version("usage: m4 [-gPs] ..."), None);
+    assert_eq!(parse_gnu_m4_version("m4 (BSD m4) 1.0"), None);
+
+    // The floor is what keeps a different GNU release from reporting its own
+    // changed behaviour as our regression.
+    assert!(parse_gnu_m4_version("m4 (GNU M4) 1.4.6").unwrap() < MIN_GNU_VERSION);
+    assert!(parse_gnu_m4_version("m4 (GNU M4) 1.4.19").unwrap() >= MIN_GNU_VERSION);
+}
+
+#[test]
+fn gnu_m4_version_rejects_a_reference_that_is_not_gnu_m4() {
+    // A real executable that is not m4 at all must be refused, not compared
+    // against: this is the macOS failure in miniature.
+    assert_eq!(gnu_m4_version("/bin/cat".as_ref()), None);
+    assert_eq!(gnu_m4_version("/nonexistent_m4_zz".as_ref()), None);
+}
+
 /// Run every stdin-driven fixture through both this m4 and the system's GNU
 /// m4, and require the stdout to agree.
 ///
@@ -393,10 +472,14 @@ fn gnu_m4_differential() {
     // any implementation agree, let alone two implementations.
     const NONDETERMINISTIC: &[&str] = &["maketemp", "mkstemp"];
 
-    if !Path::new(GNU).exists() {
-        eprintln!("skipping gnu_m4_differential: {GNU} is not installed");
+    let Some(version) = gnu_m4_version(GNU.as_ref()) else {
+        eprintln!(
+            "skipping gnu_m4_differential: {GNU} is absent, or is not a GNU m4 \
+             new enough to compare against (this gate's expectations were \
+             validated against GNU M4 {MIN_GNU_VERSION:?} and later)"
+        );
         return;
-    }
+    };
 
     let base = Path::new("fixtures/integration_tests");
     let mut compared = 0usize;
@@ -449,7 +532,7 @@ fn gnu_m4_differential() {
         }
     }
 
-    eprintln!("gnu_m4_differential: compared {compared} fixtures against {GNU}");
+    eprintln!("gnu_m4_differential: compared {compared} fixtures against {version:?}");
     assert!(
         compared >= 50,
         "the gate compared only {compared} fixtures; it is not exercising the suite"

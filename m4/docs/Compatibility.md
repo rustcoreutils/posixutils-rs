@@ -89,8 +89,18 @@ committed fixtures.
 `gnu_m4_differential` in `tests/integration.rs` runs every stdin-driven
 fixture through both this m4 and the system's GNU m4 and requires the stdout to
 agree. At the time of writing that is **80 of 80 fixtures, byte for byte**,
-against GNU M4 1.4.19. It skips loudly when GNU m4 is not installed, so CI
-stays green without it.
+against GNU M4 1.4.19.
+
+It checks that the reference *is* GNU m4, and is at least 1.4.19, by reading
+its `--version`; otherwise it skips loudly and compares nothing. That check is
+not ceremony. macOS's `/usr/bin/m4` is a different implementation, and it
+disagrees with GNU M4 1.4.19 — on `eval`'s `!` and `~`, on quote handling in
+`define_hanging_quotes`, and on `define_nested_first_arg` — while this m4's
+output is byte-identical on both platforms. An earlier version of the gate took
+whatever sat at that path and called it GNU m4, which said nothing about this
+implementation and turned macOS CI red for an environment difference. The
+version floor is there for the same reason: these fixtures encode one
+reference's answers, and GNU m4 has changed some of them between releases.
 
 Before that gate existed, the committed `.out` files were frozen snapshots of
 what *this* implementation produced — they could not have caught the

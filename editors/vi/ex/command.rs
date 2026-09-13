@@ -164,10 +164,18 @@ pub enum ExCommand {
         rhs: String,
         mode: MapMode,
     },
+    /// Write the current map list (`:map` / `:map!` with no arguments).
+    ///
+    /// A separate variant rather than an empty `lhs`, because 95080-95083 makes
+    /// the no-argument form a different command: it lists and "does nothing
+    /// more". The two were indistinguishable while both parsed to `Map`.
+    MapList { mode: MapMode },
     /// Unmap key sequence (:unmap).
     Unmap { lhs: String, mode: MapMode },
     /// Abbreviation (:ab, :abbreviate).
     Abbreviate { lhs: String, rhs: String },
+    /// Write the current abbreviation list (`:ab` with no arguments, 94864).
+    AbbrevList,
     /// Remove abbreviation (:una, :unabbreviate).
     Unabbreviate { lhs: String },
     /// Open tag (:ta, :tag).

@@ -3047,8 +3047,10 @@ impl Editor {
             // wildcard below, so the editor accepted `:map x dd` in silence and
             // the user had no way to learn the mapping was never made.
             ExCommand::Map { .. } => Err(ViError::NotImplemented("map")),
+            ExCommand::MapList { .. } => Err(ViError::NotImplemented("map")),
             ExCommand::Unmap { .. } => Err(ViError::NotImplemented("unmap")),
             ExCommand::Abbreviate { .. } => Err(ViError::NotImplemented("abbreviate")),
+            ExCommand::AbbrevList => Err(ViError::NotImplemented("abbreviate")),
             ExCommand::Unabbreviate { .. } => Err(ViError::NotImplemented("unabbreviate")),
             ExCommand::Pop => {
                 self.pop_tag()?;

@@ -459,9 +459,9 @@ fn print_data<R: Read>(
 /// The callers then read the result with `from_ne_bytes`, as 109149-109151
 /// requires -- the byte order "shall correspond to the order in which a
 /// constant of the corresponding type is stored in memory on the system".
-fn extend_chunk(chunk: &[u8], num_bytes: usize) -> [u8; 8] {
-    let mut buf = [0_u8; 8];
-    let n = chunk.len().min(num_bytes).min(buf.len());
+fn extend_chunk<const N: usize>(chunk: &[u8], num_bytes: usize) -> [u8; N] {
+    let mut buf = [0_u8; N];
+    let n = chunk.len().min(num_bytes).min(N);
     buf[..n].copy_from_slice(&chunk[..n]);
     buf
 }
@@ -505,7 +505,135 @@ fn float_field(num_bytes: usize) -> usize {
     match num_bytes {
         4 => 16,
         8 => 25,
+        16 => 30,
         _ => unreachable!("unsupported float width {num_bytes}"),
+    }
+}
+
+/// The size of this target's `long double`, which is what `-t fL` selects.
+///
+/// POSIX 109138-109140: "If the c17 compiler is present on the system, these
+/// specifiers shall correspond to the sizes used by default in that compiler."
+/// We ship c17, so this follows its table (`cc/arch/mod.rs`): sixteen bytes
+/// everywhere except Apple's aarch64, where `long double` is a `double`.
+fn long_double_size() -> usize {
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        8
+    } else {
+        16
+    }
+}
+
+/// Scale by a power of two without losing the value to an intermediate that
+/// cannot hold it.
+///
+/// `2f64.powi(n)` is itself zero below about -1074 and infinite above 1024, so
+/// a single multiply would flush a perfectly representable result -- a long
+/// double's exponent range is far wider than a double's, and the significand
+/// carries the value back into range. Stepping keeps every factor finite.
+fn scale_by_pow2(mut value: f64, mut exponent: i32) -> f64 {
+    while exponent > 1023 {
+        value *= f64::from_bits(0x7fe0_0000_0000_0000); // 2^1023
+        if !value.is_finite() {
+            return value;
+        }
+        exponent -= 1023;
+    }
+    while exponent < -1022 {
+        value *= f64::from_bits(0x0010_0000_0000_0000); // 2^-1022
+        if value == 0.0 {
+            return value;
+        }
+        exponent += 1022;
+    }
+    value * f64::from_bits(((exponent + 1023) as u64) << 52)
+}
+
+/// Decode x86-64's `long double`, the x87 80-bit extended format.
+///
+/// The value occupies the first ten bytes of its sixteen-byte slot: a 64-bit
+/// significand whose leading one is *explicit* -- unlike every IEEE format --
+/// then a sign bit and a 15-bit exponent biased by 16383.
+fn x87_to_f64(buf: &[u8; 16]) -> f64 {
+    let significand = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+    let sign_exp = u16::from_ne_bytes(buf[8..10].try_into().unwrap());
+    let negative = sign_exp & 0x8000 != 0;
+    let exponent = i32::from(sign_exp & 0x7fff);
+
+    // Because the integer bit is explicit, x87 can encode bit patterns that
+    // are not values at all, and the classification turns on it.
+    let integer_bit = significand >> 63 != 0;
+
+    let magnitude = if exponent == 0x7fff {
+        // Infinity is the one pattern with the integer bit set and nothing
+        // below it. A clear integer bit here is a pseudo-infinity or
+        // pseudo-NaN, which no CPU since the 80387 produces and none accepts.
+        if integer_bit && significand << 1 == 0 {
+            f64::INFINITY
+        } else {
+            f64::NAN
+        }
+    } else if exponent != 0 && !integer_bit {
+        // An "unnormal": a normal exponent with the leading one missing. Also
+        // rejected since the 80387, so it names no number.
+        f64::NAN
+    } else {
+        // significand x 2^(exponent - bias - 63), the 63 undoing the
+        // significand's own scale. Exponent zero is the subnormal case and
+        // shares the minimum exponent, so it reads as 1 here.
+        let exponent = if exponent == 0 { 1 } else { exponent };
+        scale_by_pow2(significand as f64, exponent - 16383 - 63)
+    };
+
+    if negative {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Decode IEEE 754 binary128, which is `long double` on aarch64 and most
+/// targets that are neither x86 nor Apple silicon.
+///
+/// One 128-bit field, so the bit positions are read off the integer rather
+/// than off byte offsets: sign, a 15-bit exponent biased by 16383, and a
+/// 112-bit fraction with an implicit leading one.
+fn binary128_to_f64(buf: &[u8; 16]) -> f64 {
+    const FRACTION_BITS: u32 = 112;
+    let bits = u128::from_ne_bytes(*buf);
+    let negative = bits >> 127 != 0;
+    let exponent = ((bits >> FRACTION_BITS) & 0x7fff) as i32;
+    let fraction = bits & ((1 << FRACTION_BITS) - 1);
+
+    let magnitude = if exponent == 0x7fff {
+        if fraction == 0 {
+            f64::INFINITY
+        } else {
+            f64::NAN
+        }
+    } else if exponent == 0 {
+        scale_by_pow2(fraction as f64, -16382 - FRACTION_BITS as i32)
+    } else {
+        let significand = fraction | (1 << FRACTION_BITS);
+        scale_by_pow2(significand as f64, exponent - 16383 - FRACTION_BITS as i32)
+    };
+
+    if negative {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Decode this target's `long double`.
+///
+/// `cfg!` rather than `#[cfg]` so both decoders are always compiled -- the
+/// dead branch costs nothing after optimization, and neither one rots.
+fn long_double_to_f64(buf: &[u8; 16]) -> f64 {
+    if cfg!(target_arch = "x86_64") {
+        x87_to_f64(buf)
+    } else {
+        binary128_to_f64(buf)
     }
 }
 
@@ -573,30 +701,63 @@ fn render_g(exp_form: &str) -> String {
 /// one that round-trips the `f64` holding the same number, so widening would
 /// print a float with a double's worth of digits.
 fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
-    let buf = extend_chunk(chunk, num_bytes);
     match num_bytes {
         4 => {
-            let v = f32::from_ne_bytes(buf[..4].try_into().unwrap());
-            if v.is_nan() {
-                "nan".to_string()
-            } else if v.is_infinite() {
-                if v.is_sign_negative() { "-inf" } else { "inf" }.to_string()
-            } else {
-                render_g(&format!("{v:e}"))
-            }
+            let buf: [u8; 4] = extend_chunk(chunk, num_bytes);
+            let value = f32::from_ne_bytes(buf);
+            // Rendered from the f32, not from a widened f64: the shortest
+            // decimal that round-trips a float is shorter than the one that
+            // round-trips the double holding the same number.
+            float_to_text(
+                value.is_nan(),
+                value.is_infinite(),
+                value.is_sign_negative(),
+                || format!("{value:e}"),
+            )
         }
         8 => {
-            let v = f64::from_ne_bytes(buf);
-            if v.is_nan() {
-                "nan".to_string()
-            } else if v.is_infinite() {
-                if v.is_sign_negative() { "-inf" } else { "inf" }.to_string()
-            } else {
-                render_g(&format!("{v:e}"))
-            }
+            let buf: [u8; 8] = extend_chunk(chunk, num_bytes);
+            let value = f64::from_ne_bytes(buf);
+            float_to_text(
+                value.is_nan(),
+                value.is_infinite(),
+                value.is_sign_negative(),
+                || format!("{value:e}"),
+            )
+        }
+        16 => {
+            let value = long_double_to_f64(&extend_chunk(chunk, num_bytes));
+            float_to_text(
+                value.is_nan(),
+                value.is_infinite(),
+                value.is_sign_negative(),
+                || format!("{value:e}"),
+            )
         }
         // `parse_type_string` admits no other width.
         _ => unreachable!("unsupported float width {num_bytes}"),
+    }
+}
+
+/// Spell a float, given how it classifies and how to write its digits.
+///
+/// The classification is passed in rather than the value, because the digits
+/// have to come from the width the value was *read* at -- an `f32` and the
+/// `f64` holding the same number have different shortest representations.
+fn float_to_text(
+    is_nan: bool,
+    is_infinite: bool,
+    is_negative: bool,
+    exp_form: impl FnOnce() -> String,
+) -> String {
+    // A NaN carries a sign bit like any other float, and od prints it: the
+    // sign is part of the encoding the dump is showing.
+    if is_nan {
+        if is_negative { "-nan" } else { "nan" }.to_string()
+    } else if is_infinite {
+        if is_negative { "-inf" } else { "inf" }.to_string()
+    } else {
+        render_g(&exp_form())
     }
 }
 
@@ -765,7 +926,7 @@ fn size_letter(type_char: char, letter: char) -> Option<usize> {
         'f' => match letter {
             'F' => Some(4),
             'D' => Some(8),
-            'L' => Some(16),
+            'L' => Some(long_double_size()),
             _ => None,
         },
         _ => match letter {
@@ -803,7 +964,7 @@ fn default_size(type_char: char) -> usize {
 /// double` for `f`.
 fn validate_size(type_char: char, num_bytes: usize, spec: &str) -> Result<(), String> {
     let ok = match type_char {
-        'f' => matches!(num_bytes, 4 | 8),
+        'f' => num_bytes == 4 || num_bytes == 8 || num_bytes == long_double_size(),
         _ => matches!(num_bytes, 1 | 2 | 4 | 8),
     };
     if ok {

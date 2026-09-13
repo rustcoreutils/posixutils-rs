@@ -481,18 +481,112 @@ fn od_float_size_suffix_selects_the_right_width() {
     assert_eq!(by_letter.split_whitespace().count(), 1);
 }
 
+// POSIX 109155-109157: the `f` conversion "shall support values of the
+// optional number of bytes to be converted corresponding to the number of
+// bytes in the C-language types float, double, and long double", spelled `F`,
+// `D` and `L`. `-t fL` was refused outright.
+//
+// 109138-109140 ties the sizes to the system's c17: "If the c17 compiler is
+// present on the system, these specifiers shall correspond to the sizes used
+// by default in that compiler." So `long double` is whatever it is for this
+// target -- x87 80-bit on x86-64, IEEE binary128 on aarch64, and plain
+// `double` on Apple's aarch64 -- matching the table in `cc/arch/mod.rs`.
 #[test]
-fn od_long_double_is_refused_rather_than_silently_narrowed() {
-    // `L` on `f` means long double, which this od does not format. It used to
-    // be read as 8 bytes -- a double wearing the wrong name. Refusing says so.
-    let sixteen = [0u8; 16];
-    let (stdout, stderr, code) = od_raw(&["-An", "-t", "fL"], &sixteen);
-    assert_ne!(code, Some(0), "fL must not silently produce doubles");
-    assert!(stdout.is_empty(), "no output on refusal: {stdout:?}");
-    assert!(
-        stderr.contains("fL") || stderr.contains("16") || stderr.contains("long double"),
-        "the diagnostic must name what was refused: {stderr:?}"
-    );
+fn od_long_double_is_converted() {
+    // A 16-byte long double, little-endian: `lo` is the low eight bytes and
+    // `hi` the next two, with the remaining six bytes padding.
+    fn slot(lo: u64, hi: u16) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16);
+        if cfg!(target_endian = "little") {
+            bytes.extend(lo.to_le_bytes());
+            bytes.extend(hi.to_le_bytes());
+            bytes.extend([0u8; 6]);
+        } else {
+            bytes.extend([0u8; 6]);
+            bytes.extend(hi.to_be_bytes());
+            bytes.extend(lo.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    let cases: Vec<(Vec<u8>, &str)> = {
+        // x87 80-bit: an *explicit* 64-bit significand -- the leading one is
+        // stored, unlike every IEEE format -- then sign and a 15-bit exponent
+        // biased by 16383.
+        vec![
+            (slot(0x8000_0000_0000_0000, 0x3fff), "1"),
+            (slot(0x8000_0000_0000_0000, 0x4000), "2"),
+            (slot(0x8000_0000_0000_0000, 0xbfff), "-1"),
+            (slot(0, 0), "0"),
+            (slot(0xcccc_cccc_cccc_cccd, 0x3ffb), "0.1"),
+            (slot(0x8000_0000_0000_0000, 0x7fff), "inf"),
+            (slot(0x8000_0000_0000_0000, 0xffff), "-inf"),
+            (slot(0xc000_0000_0000_0000, 0x7fff), "nan"),
+        ]
+    };
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", not(target_os = "macos")),
+        all(target_arch = "aarch64", target_os = "macos")
+    )))]
+    let cases: Vec<(Vec<u8>, &str)> = {
+        // IEEE binary128: sign, a 15-bit exponent biased by 16383, and a
+        // 112-bit fraction with an implicit leading one. The high 16 bits are
+        // sign and exponent, so they land in `hi` once the low 112 are zero.
+        vec![
+            (slot(0, 0x3fff), "1"),
+            (slot(0, 0x4000), "2"),
+            (slot(0, 0xbfff), "-1"),
+            (slot(0, 0), "0"),
+            (slot(0, 0x7fff), "inf"),
+            (slot(0, 0xffff), "-inf"),
+        ]
+    };
+
+    // Apple's aarch64 makes `long double` a `double`, so `L` is eight bytes
+    // there and the 16-byte slot above does not apply.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    let cases: Vec<(Vec<u8>, &str)> = vec![(1.0f64.to_ne_bytes().to_vec(), "1")];
+
+    for (bytes, want) in cases {
+        let (stdout, stderr, code) = od_raw(&["-An", "-t", "fL"], &bytes);
+        assert_eq!(code, Some(0), "-t fL must be accepted: {stderr:?}");
+        assert_eq!(
+            stdout.split_whitespace().next(),
+            Some(want),
+            "-t fL on {bytes:02x?}: {stdout:?}"
+        );
+    }
+
+    // A long double outside a double's range prints as zero, because the value
+    // is converted through a double to be printed -- Rust has neither an f80
+    // nor an f128. This is a deliberate, documented deviation (NONPOSIX.md,
+    // "od"), pinned here so that implementing arbitrary-precision conversion
+    // later trips this test and the documentation gets updated with it.
+    #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+    {
+        // The smallest x87 subnormal, 2^-16445, which another od shows as
+        // roughly 3.6e-4951.
+        let (stdout, _, code) = od_raw(&["-An", "-t", "fL"], &slot(1, 0));
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            stdout.split_whitespace().next(),
+            Some("0"),
+            "a long double below a double's range prints as zero: {stdout:?}"
+        );
+    }
+
+    // `fL` and the explicit byte count name the same type.
+    let width = if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        "f8"
+    } else {
+        "f16"
+    };
+    let bytes = vec![0u8; 16];
+    let (by_letter, _, _) = od_raw(&["-An", "-t", "fL"], &bytes);
+    let (by_number, _, _) = od_raw(&["-An", "-t", width], &bytes);
+    assert_eq!(by_letter, by_number, "fL must agree with {width}");
 }
 
 // A malformed `-t` size must be diagnosed, never guessed at and never a panic.
@@ -762,6 +856,7 @@ fn od_float_output_is_shortest_round_trip_in_g_format() {
         (0x7f80_0000, "inf"),
         (0xff80_0000, "-inf"),
         (0x7fc0_0000, "nan"),
+        (0xffc0_0000, "-nan"),
         (0x8000_0000, "-0"),
         (0x0000_0000, "0"),
         (0xbf80_0000, "-1"),
@@ -784,6 +879,7 @@ fn od_float_output_is_shortest_round_trip_in_g_format() {
         (0x430c_6bf5_2634_0000, "1e+15"),
         (0x7ff0_0000_0000_0000, "inf"),
         (0x7ff8_0000_0000_0000, "nan"),
+        (0xfff8_0000_0000_0000, "-nan"),
     ];
     for &(bits, want) in f64_cases {
         let (stdout, _, code) = od_raw(&["-An", "-t", "f8"], &le64(bits));

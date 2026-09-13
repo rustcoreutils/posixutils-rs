@@ -3935,3 +3935,171 @@ fn test_a_map_expansion_does_not_become_the_dot_command() {
         ". must repeat the x, not the mapped dd"
     );
 }
+
+// ============================================================================
+// Abbreviations
+// ============================================================================
+
+/// 94870-94873: a non-word character entered after a word character triggers a
+/// check against the text input so far, and a match is replaced.
+#[test]
+fn test_abbreviation_expands() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\n");
+    editor.execute_keys(":ab teh the\n").unwrap();
+
+    editor.execute_keys("iteh \x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "the \n");
+}
+
+/// <ESC> triggers the check too, and the replacement is entered before the
+/// mode change takes effect.
+#[test]
+fn test_abbreviation_triggered_by_escape() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\n");
+    editor.execute_keys(":ab teh the\n").unwrap();
+
+    editor.execute_keys("iteh\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "the\n");
+    assert_eq!(editor.get_mode(), Mode::Command);
+}
+
+/// 96489-96495 works these through by name. `(p`, `p` and `((p` can fire
+/// because the rules can produce those sets; `(` and `(pp` never can.
+#[test]
+fn test_the_abbreviations_posix_says_do_and_do_not_work() {
+    for (lhs, typed, expect) in [
+        ("(p", "i(p \x1b", "REPL \n"),
+        ("p", "ip \x1b", "REPL \n"),
+        ("((p", "i((p \x1b", "REPL \n"),
+        // Cannot be produced by the rules, so must never fire.
+        ("(", "i( \x1b", "( \n"),
+        ("(pp", "i(pp \x1b", "(pp \n"),
+    ] {
+        let mut editor = Editor::new_headless();
+        editor.set_buffer_text("\n");
+        editor.execute_keys(&format!(":ab {lhs} REPL\n")).unwrap();
+        editor.execute_keys(typed).unwrap();
+        assert_eq!(
+            editor.get_buffer_text(),
+            expect,
+            "with `:ab {lhs} REPL`, typing {typed:?}"
+        );
+    }
+}
+
+/// 94870-94871: a `^V`-escaped trigger is text, not a trigger.
+#[test]
+fn test_ctrl_v_suppresses_an_abbreviation() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\n");
+    editor.execute_keys(":ab teh the\n").unwrap();
+
+    editor.execute_keys("iteh\x16 \x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "teh \n");
+}
+
+/// 96471-96476: the replacement is "logically pushed onto the terminal input
+/// queue", so it is itself subject to map expansion -- not a plain text
+/// substitution.
+#[test]
+fn test_an_abbreviation_replacement_is_itself_expanded() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\n");
+    editor.execute_keys(":ab aa b\n").unwrap();
+    editor.execute_keys(":map! b ZZ\n").unwrap();
+
+    editor.execute_keys("iaa \x1b").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "ZZ \n",
+        "the replacement `b` must then be mapped to ZZ"
+    );
+}
+
+/// An abbreviation whose replacement begins with its own left-hand side must
+/// not re-trigger on itself. POSIX does not say this; it is the map prefix rule
+/// (95120-95121) applied by analogy, and without it `:ab foo foo` hangs.
+#[test]
+fn test_a_self_referential_abbreviation_does_not_loop() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\n");
+    editor.execute_keys(":ab foo foo\n").unwrap();
+
+    editor.execute_keys("ifoo \x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "foo \n");
+}
+
+/// 96496-96509. Historical vi expanded abbreviations on the colon line, with
+/// two results POSIX calls out as "not permitted ... because they clearly
+/// violate the expectations of the user": `:ab foo bar` then `:ab foo baz`
+/// registering baz for *bar*, and `:una foo2` deleting foo1.
+#[test]
+fn test_the_colon_line_behaviours_posix_forbids() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\n");
+
+    // Redefining `foo` must redefine `foo`, not define an entry for `bar`.
+    editor.execute_keys(":ab foo bar\n").unwrap();
+    editor.execute_keys(":ab foo baz\n").unwrap();
+    editor.execute_keys("ifoo \x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "baz \n");
+
+    // `:una foo2` must delete foo2, leaving foo1 alone.
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("\n");
+    editor.execute_keys(":ab foo1 bar\n").unwrap();
+    editor.execute_keys(":ab foo2 bar\n").unwrap();
+    editor.execute_keys(":una foo2\n").unwrap();
+    assert!(!editor.is_error_message(), "{:?}", editor.get_message());
+    editor.execute_keys(":una foo1\n").unwrap();
+    assert!(
+        !editor.is_error_message(),
+        "foo1 must still exist; got {:?}",
+        editor.get_message()
+    );
+}
+
+/// 95443-95445: "commands resulting from buffer executions and mapped character
+/// expansions, are considered single commands" for undo. So one `u` reverses
+/// everything a map did, however many commands its replacement contained.
+#[test]
+fn test_a_map_expansion_undoes_as_one_command() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\nfour\n");
+    editor.execute_keys(":map q dddd\n").unwrap();
+
+    editor.execute_keys("q").unwrap();
+    assert_eq!(editor.get_buffer_text(), "three\nfour\n");
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "one\ntwo\nthree\nfour\n",
+        "one u must reverse both deletes the map performed"
+    );
+}
+
+/// The nesting case the depth counter exists for: a mapped command that opens
+/// its own undo group. A bare flag let the inner `end_group` close the outer
+/// one, leaving half the expansion outside the group.
+#[test]
+fn test_a_mapped_change_command_undoes_as_one_command() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha bravo\n");
+    // `cw` opens a group for the change and the insert session it starts; the
+    // trailing `x` is a second command inside the same expansion.
+    editor.execute_keys(":map q cwZZ\x16\x1bx\n").unwrap();
+    editor.execute_keys("\n").unwrap();
+
+    editor.execute_keys("q").unwrap();
+    assert_ne!(editor.get_buffer_text(), "alpha bravo\n", "the map ran");
+
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "alpha bravo\n",
+        "one u must reverse the whole expansion, not just its last command"
+    );
+}

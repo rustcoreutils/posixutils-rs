@@ -289,6 +289,62 @@ pub fn keys_from_text(text: &str) -> Vec<Key> {
     text.chars().map(Key::from_map_char).collect()
 }
 
+/// The set of characters to look up when an abbreviation check is triggered.
+///
+/// `log` is this insert session's text input so far, one entry per character
+/// with a flag for characters entered literally after a `^V`. The triggering
+/// character is *not* in it yet.
+///
+/// POSIX 94874-94884 defines the set in three cases, by what precedes the word
+/// character that the trigger followed:
+///
+/// 1. nothing — the set is that word character alone;
+/// 2. a word character — the set is the run of word characters ending there;
+/// 3. anything else — the set is the run of characters that are neither
+///    <blank> nor word characters, plus the trailing word character.
+///
+/// `None` when no check is due: the last input character has to be an
+/// unescaped word character, since an escaped one "shall not" take part
+/// (94870-94871).
+///
+/// The rules can only ever produce a string ending in a word character with at
+/// most one word/non-word transition in it, which is the shape 96482-96484
+/// describes — "the lhs must end with a word character, there can be no
+/// transitions from word to non-word ... other than between the last and
+/// next-to-last characters, and there can be no <blank> characters". That is
+/// why `:ab (p X` fires and `:ab (pp X` never can.
+pub fn abbrev_candidate(log: &[(char, bool)]) -> Option<String> {
+    let is_word = crate::command::is_word_char;
+
+    let (&(last, escaped), rest) = log.split_last()?;
+    if escaped || !is_word(last) {
+        return None;
+    }
+
+    // Walk back from the character before the trigger word character. A
+    // newline ends the set: it is neither a word character nor something that
+    // can sensibly join one, and an abbreviation cannot span a line.
+    let take_word = matches!(rest.last(), Some(&(c, esc)) if !esc && is_word(c));
+    let mut set: Vec<char> = Vec::new();
+    for &(c, esc) in rest.iter().rev() {
+        if esc || c == '\n' {
+            break;
+        }
+        let keep = if take_word {
+            is_word(c)
+        } else {
+            !is_word(c) && c != ' ' && c != '\t'
+        };
+        if !keep {
+            break;
+        }
+        set.push(c);
+    }
+    set.reverse();
+    set.push(last);
+    Some(set.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +474,62 @@ mod tests {
         assert!(out[0].contains(":wq^M"), "CR shown as ^M: {out:?}");
         assert!(out[1].starts_with("a "), "{out:?}");
         assert!(out[2].starts_with("z "), "{out:?}");
+    }
+
+    /// POSIX 94875-94884 defines the checked set in three cases. 96489-96495
+    /// then gives worked examples of which abbreviations can and cannot fire,
+    /// which is unusually direct test data: `:ab (p`, `:ab p` and `:ab ((p`
+    /// work, `:ab (` and `:ab (pp` never do.
+    #[test]
+    fn test_abbrev_candidate_rules() {
+        let log = |s: &str| -> Vec<(char, bool)> { s.chars().map(|c| (c, false)).collect() };
+
+        // Rule 1 (94875-94876): nothing before the word character.
+        assert_eq!(abbrev_candidate(&log("a")).as_deref(), Some("a"));
+
+        // Rule 2 (94877-94880): a word character before it, so the set is the
+        // run of word characters.
+        assert_eq!(abbrev_candidate(&log("foo")).as_deref(), Some("foo"));
+        assert_eq!(abbrev_candidate(&log("x foo")).as_deref(), Some("foo"));
+        assert_eq!(abbrev_candidate(&log("(foo")).as_deref(), Some("foo"));
+
+        // Rule 3 (94881-94884): a non-word, non-<blank> character before it, so
+        // the set is that run plus the trailing word character. This is what
+        // makes `(p` and `((p` reachable.
+        assert_eq!(abbrev_candidate(&log("(p")).as_deref(), Some("(p"));
+        assert_eq!(abbrev_candidate(&log("((p")).as_deref(), Some("((p"));
+        assert_eq!(abbrev_candidate(&log("x ((p")).as_deref(), Some("((p"));
+
+        // The shapes 96482-96484 says can never be produced, and so can never
+        // fire: a set that does not end in a word character, and one with a
+        // word/non-word transition anywhere but at the end.
+        assert_eq!(abbrev_candidate(&log("(")), None, "must end in a word char");
+        assert_ne!(abbrev_candidate(&log("(pp")).as_deref(), Some("(pp"));
+        assert_eq!(abbrev_candidate(&log("(pp")).as_deref(), Some("pp"));
+
+        // Nothing to check.
+        assert_eq!(abbrev_candidate(&[]), None);
+        assert_eq!(abbrev_candidate(&log(" ")), None);
+    }
+
+    /// 94870-94871: a character escaped by a `^V` takes no part -- neither as
+    /// the trigger's predecessor nor inside the set.
+    #[test]
+    fn test_abbrev_candidate_stops_at_an_escaped_character() {
+        // The final `o` was entered literally, so no check is due at all.
+        let escaped_last = vec![('f', false), ('o', false), ('o', true)];
+        assert_eq!(abbrev_candidate(&escaped_last), None);
+
+        // An escaped character inside the run ends the set before it.
+        let escaped_mid = vec![('f', true), ('o', false), ('o', false)];
+        assert_eq!(abbrev_candidate(&escaped_mid).as_deref(), Some("oo"));
+    }
+
+    /// An abbreviation cannot span a line.
+    #[test]
+    fn test_abbrev_candidate_stops_at_a_newline() {
+        let log = vec![('a', false), ('\n', false), ('b', false), ('c', false)];
+        assert_eq!(abbrev_candidate(&log).as_deref(), Some("bc"));
     }
 
     #[test]

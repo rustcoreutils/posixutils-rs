@@ -165,8 +165,9 @@ pub struct UndoManager {
     undo_stack: Vec<Vec<Change>>,
     /// Stack of commands available to redo.
     redo_stack: Vec<Vec<Change>>,
-    /// Whether a command group is currently open (see [`UndoManager::begin_group`]).
-    in_group: bool,
+    /// How many nested command groups are open (see
+    /// [`UndoManager::begin_group`]). Zero means none.
+    group_depth: usize,
     /// The current line as it was when the cursor arrived on it, for `U`.
     line_original: Option<LineSnapshot>,
     /// Maximum undo levels (0 = unlimited).
@@ -185,7 +186,7 @@ impl UndoManager {
         Self {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            in_group: false,
+            group_depth: 0,
             line_original: None,
             max_levels: 0, // Unlimited
             last_was_undo: false,
@@ -195,14 +196,19 @@ impl UndoManager {
     /// Begin one command's group of edits, so a single `u` reverses all of
     /// them. Used for a change operator and the insert session it opens.
     ///
-    /// Nested calls are ignored: the outermost group wins, which is what makes
-    /// it safe for `enter_insert` to open a group whether or not an operator
-    /// already did.
+    /// The outermost group wins, which is what makes it safe for
+    /// `enter_insert` to open a group whether or not an operator already did.
+    /// Nesting is *counted* rather than ignored, because a map expansion or
+    /// buffer execution opens a group around commands that open their own:
+    /// POSIX 95443-95445 makes "commands resulting from buffer executions and
+    /// mapped character expansions ... single commands" for undo, and with a
+    /// bare flag the inner `end_group` closed the outer one, so `u` after a
+    /// mapped `cwfoo<ESC>` undid only part of it.
     pub fn begin_group(&mut self) {
-        if self.in_group {
+        self.group_depth += 1;
+        if self.group_depth > 1 {
             return;
         }
-        self.in_group = true;
         self.undo_stack.push(Vec::new());
         self.redo_stack.clear();
         self.last_was_undo = false;
@@ -210,10 +216,13 @@ impl UndoManager {
 
     /// End the current command's group.
     pub fn end_group(&mut self) {
-        if !self.in_group {
+        if self.group_depth == 0 {
             return;
         }
-        self.in_group = false;
+        self.group_depth -= 1;
+        if self.group_depth > 0 {
+            return;
+        }
         // A group that recorded nothing (an insert session that typed nothing,
         // say) must not leave an entry that `u` would consume silently.
         if self.undo_stack.last().is_some_and(Vec::is_empty) {
@@ -229,7 +238,7 @@ impl UndoManager {
         self.last_was_undo = false;
 
         match self.undo_stack.last_mut() {
-            Some(group) if self.in_group => group.push(change),
+            Some(group) if self.group_depth > 0 => group.push(change),
             _ => {
                 self.undo_stack.push(vec![change]);
                 self.trim();
@@ -577,7 +586,7 @@ impl UndoManager {
     pub fn clear(&mut self) {
         self.undo_stack.clear();
         self.redo_stack.clear();
-        self.in_group = false;
+        self.group_depth = 0;
         self.line_original = None;
         self.last_was_undo = false;
     }

@@ -179,6 +179,12 @@ pub struct Editor {
     maps: crate::maps::Maps,
     /// Keys waiting to be acted on: typed, expanded, or from an `@` buffer.
     input: InputQueue,
+    /// An undo group is open around the expansion currently being consumed.
+    ///
+    /// POSIX 95443-95445: "commands resulting from buffer executions and mapped
+    /// character expansions, are considered single commands" for undo, so one
+    /// `u` reverses the whole of what a map did.
+    expansion_group: bool,
     /// A `^V` on the ex command line is pending, so the next key is quoted.
     ///
     /// Only the four commands POSIX gives `<control>-V` escaping to
@@ -283,6 +289,7 @@ impl Editor {
             marks: [None; 26],
             maps: crate::maps::Maps::default(),
             input: InputQueue::default(),
+            expansion_group: false,
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -331,6 +338,7 @@ impl Editor {
             marks: [None; 26],
             maps: crate::maps::Maps::default(),
             input: InputQueue::default(),
+            expansion_group: false,
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -382,6 +390,7 @@ impl Editor {
             marks: [None; 26],
             maps: crate::maps::Maps::default(),
             input: InputQueue::default(),
+            expansion_group: false,
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -881,9 +890,26 @@ impl Editor {
 
             let Some(q) = self.next_input_key() else {
                 self.input.set_current(KeySource::Typed);
+                self.close_expansion_group();
                 return Ok(());
             };
             self.input.set_current(q.source);
+
+            // 95443-95445: everything one expansion produces is one command for
+            // `u`. Opened on the first expansion key and closed when the queue
+            // drains, so nested groups an inner command opens (a change
+            // operator and its insert session, say) nest rather than closing
+            // this one early.
+            if q.source.is_expansion() && !self.expansion_group {
+                self.undo.begin_group();
+                self.expansion_group = true;
+            }
+
+            // An abbreviation fires *before* its trigger is inserted, so the
+            // check goes here rather than inside `process_insert_key`.
+            if self.expand_abbreviation(&q)? {
+                continue;
+            }
 
             // Clear any previous message
             if !matches!(q.key, Key::Char(':')) {
@@ -902,6 +928,9 @@ impl Editor {
             // alone would miss the majority of vi command errors.
             if result.is_err() || self.is_error {
                 self.abort_expansion();
+            }
+            if result.is_err() {
+                self.close_expansion_group();
             }
             result?;
         }
@@ -1015,6 +1044,86 @@ impl Editor {
             .expect("partial was just checked non-empty")
     }
 
+    /// Expand an abbreviation if this key triggers one.
+    ///
+    /// POSIX 94870-94873: "In open and visual text input mode, if a non-word or
+    /// <ESC> character that is not escaped by a <control>-V character is
+    /// entered after a word character, a check shall be made for a set of
+    /// characters matching lhs, in the text input entered during this command.
+    /// If it is found, the effect shall be as if rhs was entered instead of
+    /// lhs."
+    ///
+    /// Returns `true` when it fired, in which case the caller must not dispatch
+    /// the trigger: it has been requeued behind the replacement.
+    fn expand_abbreviation(&mut self, q: &QueuedKey) -> Result<bool> {
+        if !q.abbrevable || !matches!(self.mode, Mode::Insert(_) | Mode::Replace | Mode::Open) {
+            return Ok(false);
+        }
+        // A key consumed after `^V` is text, not a trigger (94870-94871).
+        let Some(state) = self.insert_state.as_ref() else {
+            return Ok(false);
+        };
+        if state.pending_literal {
+            return Ok(false);
+        }
+
+        // Only keys that actually enter text, plus <ESC>. The erase and kill
+        // commands are non-word characters by a literal reading of 94870, but
+        // they are editing commands rather than entered text, and historical
+        // vi does not check on them.
+        let triggers = match q.key {
+            Key::Escape | Key::Ctrl('[') => true,
+            Key::Char(c) => !crate::command::is_word_char(c),
+            Key::Tab | Key::Enter | Key::Ctrl('j') => true,
+            _ => false,
+        };
+        if !triggers {
+            return Ok(false);
+        }
+
+        let Some(word) = crate::maps::abbrev_candidate(&state.input_log) else {
+            return Ok(false);
+        };
+        let Some(entry) = self.maps.abbrev.lookup(&word) else {
+            return Ok(false);
+        };
+        let rhs = entry.rhs.clone();
+        let exempt = entry.no_reabbrev;
+
+        // Take the matched word back out of the buffer and the session record
+        // together, so `.` repeat and the insert-session undo entry both see
+        // the replacement rather than the trigger word.
+        let n = word.chars().count();
+        let mut state = self.insert_state.take().expect("checked above");
+        crate::mode::erase_input(&mut self.buffer, &mut state, n);
+        self.insert_state = Some(state);
+
+        // 96473-96476: the replacement is "logically pushed onto the terminal
+        // input queue", not substituted -- so it is itself subject to maps and
+        // to further abbreviation. The trigger goes back behind it, to be
+        // entered after the replacement as POSIX describes.
+        let mut keys: Vec<QueuedKey> = rhs
+            .iter()
+            .enumerate()
+            .map(|(i, &key)| QueuedKey {
+                key,
+                remappable: true,
+                // The leading run that repeats the lhs is exempt, or `:ab foo
+                // foo` would re-trigger on its own replacement.
+                abbrevable: i >= exempt,
+                source: KeySource::MapExpansion,
+            })
+            .collect();
+        keys.push(QueuedKey {
+            key: q.key,
+            remappable: q.remappable,
+            abbrevable: false,
+            source: q.source,
+        });
+        self.input.push_front(keys.into_iter());
+        Ok(true)
+    }
+
     /// Put a matched map's replacement at the front of the queue.
     fn expand_map(&mut self, mode: MapMode, index: usize) {
         let entry = self.maps.table(mode).entry(index);
@@ -1053,6 +1162,15 @@ impl Editor {
         }
         self.input.discard();
         self.parser.reset();
+        self.close_expansion_group();
+    }
+
+    /// Close the undo group opened around an expansion, if one is open.
+    fn close_expansion_group(&mut self) {
+        if self.expansion_group {
+            self.expansion_group = false;
+            self.undo.end_group();
+        }
     }
 
     /// Handle a key in command mode.

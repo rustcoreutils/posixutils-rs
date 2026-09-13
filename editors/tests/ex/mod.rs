@@ -708,6 +708,48 @@ fn test_ex_tag_pop_and_tags() {
     );
 }
 
+/// Abbreviations belong to "open and visual text input mode" (94870). Ex text
+/// input mode -- what `:a`, `:i` and `:c` enter -- is neither, so text typed
+/// there is not abbreviated. It is a separate code path today; this pins it, so
+/// a later refactor that unified the two could not start expanding here by
+/// accident.
+///
+/// The colon line itself is not expanded either, which 96498-96499 permits and
+/// 96500-96509 makes the safe choice: expanding the first argument of `:ab` or
+/// `:una` produces two behaviours POSIX forbids outright.
+#[test]
+fn test_ex_input_mode_does_not_abbreviate() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("f.txt");
+    fs::write(&path, "one\n").unwrap();
+
+    let bin = get_binary_path("ex");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-s")
+        .arg(&path)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"ab teh the\na\nteh x\n.\n%p\nq!\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.contains("teh x"),
+        "ex text input mode must not abbreviate; got {out:?}"
+    );
+    assert!(
+        !out.contains("the x"),
+        "the abbreviation must not have fired; got {out:?}"
+    );
+}
+
 // ============================================================================
 // Address fidelity (audit #X4 trailing delimiter, #X9 offsets)
 // ============================================================================

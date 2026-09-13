@@ -73,6 +73,33 @@ impl Key {
         }
     }
 
+    /// The key a `char` names, as [`Key::from_byte`] would name the same byte.
+    ///
+    /// Used wherever text has to be turned back into keystrokes — a `:map`
+    /// right-hand side, a register executed by `@`, the test harness — so that
+    /// all of them agree with what a terminal actually delivers. Doing it by
+    /// hand is how the two open-coded copies of this drifted: neither produced
+    /// [`Key::Tab`] for a TAB, which is the same defect as #V22, and one turned
+    /// DEL into a `Char` rather than [`Key::Backspace`].
+    ///
+    /// A non-ASCII `char` is its own [`Key::Char`]; `from_byte` never sees one,
+    /// since the reader decodes UTF-8 before this point.
+    ///
+    /// One deliberate difference from `from_byte`: `'\n'` is [`Key::Enter`]
+    /// here, where byte 10 stays `Ctrl('j')`. A terminal's Enter key sends CR,
+    /// so a bare LF arriving as a *byte* really is `^J` and insert mode names
+    /// it that way — but a `'\n'` written in a register, a map or a test string
+    /// means the line ended, which is the Enter key. The two spellings are
+    /// interchangeable in text input mode, where `insert_newline` takes both;
+    /// they are not in command mode, where `^J` moves the cursor down.
+    pub fn from_map_char(c: char) -> Self {
+        match c {
+            '\n' => Key::Enter,
+            c if c.is_ascii() => Key::from_byte(c as u8),
+            c => Key::Char(c),
+        }
+    }
+
     /// The character this key produces when entered literally after `^V`.
     ///
     /// POSIX 121870-121872 allows "any subsequent character" to be entered as a
@@ -222,5 +249,39 @@ mod tests {
     fn test_display() {
         assert_eq!(format!("{}", Key::Ctrl('d')), "^D");
         assert_eq!(format!("{}", Key::Escape), "<Esc>");
+    }
+
+    /// Text turned back into keystrokes must name the same keys a terminal
+    /// delivers. The two open-coded copies this replaced did not: both made a
+    /// TAB into `Ctrl('i')` rather than `Key::Tab`, which is #V22 over again,
+    /// and one left DEL as a `Char`.
+    #[test]
+    fn test_from_map_char_agrees_with_from_byte() {
+        for b in 0u8..=127 {
+            let c = b as char;
+            if c == '\n' {
+                continue; // the one deliberate difference, asserted below
+            }
+            assert_eq!(
+                Key::from_map_char(c),
+                Key::from_byte(b),
+                "byte {b:#04x} disagrees"
+            );
+        }
+        assert_eq!(Key::from_map_char('\t'), Key::Tab);
+        assert_eq!(Key::from_map_char('\x7f'), Key::Backspace);
+        assert_eq!(Key::from_map_char('\x1b'), Key::Escape);
+        assert_eq!(Key::from_map_char('\x01'), Key::Ctrl('a'));
+        assert_eq!(Key::from_map_char('é'), Key::Char('é'));
+    }
+
+    /// A `'\n'` in a register, a map or a test string means the line ended,
+    /// i.e. the Enter key -- a terminal's Enter sends CR. Byte 10 keeps its
+    /// `^J` identity, which matters in command mode where `^J` moves down.
+    #[test]
+    fn test_from_map_char_newline_is_enter() {
+        assert_eq!(Key::from_map_char('\n'), Key::Enter);
+        assert_eq!(Key::from_map_char('\r'), Key::Enter);
+        assert_eq!(Key::from_byte(10), Key::Ctrl('j'));
     }
 }

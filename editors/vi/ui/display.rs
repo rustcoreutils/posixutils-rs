@@ -82,6 +82,29 @@ pub fn truncate_to_width(s: &str, max_width: usize, tabstop: usize) -> String {
     result
 }
 
+/// Render a key sequence in caret notation: control characters as `^X`, DEL as
+/// `^?`, everything else as itself.
+///
+/// Distinct from [`expand_for_display`], which turns a TAB into spaces — right
+/// for a buffer line, wrong here, where a TAB *is* the key being described and
+/// has to stay visible. Distinct too from `ex`'s `:list` form, which POSIX
+/// pins to octal escapes and a trailing `$` (95237-95244) for that command
+/// only.
+pub fn caret_notation(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '\x7f' => out.push_str("^?"),
+            c if c.is_control() => {
+                out.push('^');
+                out.push((c as u8 ^ 0x40) as char);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Expand a line for display (tabs and control chars).
 pub fn expand_for_display(s: &str, tabstop: usize) -> String {
     let mut result = String::new();
@@ -153,5 +176,19 @@ mod tests {
     fn test_expand_for_display() {
         assert_eq!(expand_for_display("a\tb", 8), "a       b");
         assert_eq!(expand_for_display("a\x01b", 8), "a^Ab");
+    }
+
+    #[test]
+    fn test_caret_notation() {
+        assert_eq!(caret_notation("plain"), "plain");
+        assert_eq!(caret_notation("\x01"), "^A");
+        assert_eq!(caret_notation("\x1b"), "^[");
+        assert_eq!(caret_notation("\r"), "^M");
+        assert_eq!(caret_notation("\x7f"), "^?");
+        // The difference from `expand_for_display`, and the reason this exists:
+        // a TAB in a map's left-hand side is the key itself, so it has to stay
+        // visible rather than becoming indistinguishable from spaces.
+        assert_eq!(caret_notation("a\tb"), "a^Ib");
+        assert_eq!(expand_for_display("a\tb", 8), "a       b");
     }
 }

@@ -471,22 +471,10 @@ impl Editor {
     /// Special characters: \x1b = Escape, \n = Enter
     pub fn execute_keys(&mut self, keys: &str) -> Result<()> {
         for c in keys.chars() {
-            let key = match c {
-                '\x1b' => Key::Escape,
-                '\n' | '\r' => Key::Enter,
-                '\x7f' => Key::Backspace,
-                // Must mirror `Key::from_byte` exactly, or headless tests
-                // agree with each other while disagreeing with real input —
-                // which is how #V22 (TAB discarded) survived.
-                '\t' => Key::Tab,
-                c if c.is_ascii_control() => {
-                    // Convert control characters (Ctrl-A = 0x01, etc.)
-                    let ctrl_char = (c as u8 + b'@') as char;
-                    Key::Ctrl(ctrl_char.to_ascii_lowercase())
-                }
-                c => Key::Char(c),
-            };
-            self.handle_key(key)?;
+            // `Key::from_map_char` is the one translation from text to
+            // keystrokes; open-coding it here is how this copy came to disagree
+            // with `Key::from_byte` about TAB (#V22) and DEL.
+            self.handle_key(Key::from_map_char(c))?;
         }
         Ok(())
     }
@@ -1917,17 +1905,11 @@ impl Editor {
         self.parser.reset();
 
         for c in keys.chars() {
-            let key = if c == '\x1b' {
-                Key::Escape
-            } else if c == '\n' || c == '\r' {
-                Key::Enter
-            } else if c.is_ascii_control() {
-                // Convert control characters
-                let ctrl_char = (c as u8 + b'@') as char;
-                Key::Ctrl(ctrl_char.to_ascii_lowercase())
-            } else {
-                Key::Char(c)
-            };
+            // Same one translation `execute_keys` uses. This copy was the worse
+            // of the two: its `is_ascii_control` arm turned a TAB into
+            // `Ctrl('i')` and left DEL as a `Char`, so a register containing
+            // either behaved unlike the same keystrokes typed.
+            let key = Key::from_map_char(c);
 
             // Process the key based on current mode
             match self.mode {

@@ -47,8 +47,9 @@ pub use register::{RegisterContent, Registers};
 pub use search::{SearchDirection, SearchState, SubstituteConfig, Substitutor};
 pub use shell::{ShellExecutor, ShellOutput};
 pub use ui::{
-    byte_offset_to_display_col, char_width, display_col_to_byte_offset, expand_for_display,
-    string_width, truncate_to_width, Screen, StatusLine, Terminal, TerminalSize,
+    byte_offset_to_display_col, caret_notation, char_width, display_col_to_byte_offset,
+    expand_for_display, string_width, truncate_to_width, Screen, StatusLine, Terminal,
+    TerminalSize,
 };
 pub use undo::{Change, ChangeKind, UndoManager};
 

@@ -1189,6 +1189,63 @@ fn od_suppression_compares_the_input_not_the_output() {
     assert_eq!(stdout.lines().count(), 4, "three blocks plus the offset");
 }
 
+// A block is filled from the input, however many reads that takes.
+//
+// The loop called `read` exactly twice, which is not enough to cross more than
+// one boundary of a chained reader: with three operands the first block came
+// back short. That was a layout wart on its own, but combined with the null
+// extension it became a wrong-value bug -- a short block is padded with NULs,
+// so `-t x4` reported a byte that appears nowhere in the input.
+#[test]
+fn od_fills_a_block_across_several_files() {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("od_multifile_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let names: Vec<std::path::PathBuf> =
+        [("a1", &b"AAAAA"[..]), ("a2", b"BB"), ("a3", &[b'C'; 16])]
+            .iter()
+            .map(|(name, body)| {
+                let path = dir.join(name);
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .write_all(body)
+                    .unwrap();
+                path
+            })
+            .collect();
+
+    let args: Vec<&str> = std::iter::once("-t")
+        .chain(std::iter::once("x4"))
+        .chain(names.iter().map(|p| p.to_str().unwrap()))
+        .collect();
+    let (stdout, _, code) = od_raw(&args, b"");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(code, Some(0));
+    // 23 bytes: one full 16-byte block, then a 7-byte tail. No NUL may appear
+    // anywhere but in that tail's padding.
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "16 + 7 bytes is two blocks: {stdout:?}");
+    // The offset is the first token; the four 4-byte fields follow it.
+    let first: Vec<&str> = lines[0].split_whitespace().skip(1).collect();
+    assert_eq!(
+        first.len(),
+        4,
+        "the first block must be filled to 16 bytes: {stdout:?}"
+    );
+    assert!(
+        first.iter().all(|f| !f.contains("00")),
+        "no NUL may be invented mid-stream: {stdout:?}"
+    );
+    // Only the 7-byte tail is padded, and only at its end.
+    assert_eq!(
+        lines[1].split_whitespace().collect::<Vec<_>>().last(),
+        Some(&"00434343")
+    );
+    assert_eq!(lines[2], "0000027");
+}
+
 #[test]
 fn od_integer_size_suffixes_are_unchanged() {
     // The C/S/I/L table belongs to d/o/u/x (POSIX 109073-5) and must not have

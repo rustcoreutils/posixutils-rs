@@ -340,12 +340,18 @@ fn print_data<R: Read>(
     let mut written: u64 = 0; // Bytes written so far, which is what -N limits.
 
     while run {
-        let mut bytes_read = reader.read(&mut buffer)?; // Read up to 16 bytes into the buffer.
-
-        if bytes_read != 16 {
-            // If fewer than 16 bytes are read, attempt to read the remaining bytes.
-            let bytes_read_2 = reader.read(&mut buffer[bytes_read..])?;
-            bytes_read += bytes_read_2;
+        // Fill the block, however many reads that takes. A single `read` is
+        // allowed to return less than was asked for, and a chained reader
+        // returns at most one operand's worth at a time -- two reads were
+        // enough for two files and not for three, so the first block came back
+        // short. A short block is then null-extended, which turned a layout
+        // wart into a wrong value: the padding appeared *inside* the stream.
+        let mut bytes_read = 0;
+        while bytes_read < buffer.len() {
+            match reader.read(&mut buffer[bytes_read..])? {
+                0 => break, // End of all input.
+                n => bytes_read += n,
+            }
         }
         if bytes_read == 0 {
             break; // Exit loop if no more bytes can be read.

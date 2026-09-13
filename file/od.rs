@@ -588,6 +588,57 @@ fn scale_by_pow2(mut value: f64, mut exponent: i32) -> f64 {
     value * f64::from_bits(((exponent + 1023) as u64) << 52)
 }
 
+/// Convert `significand * 2^exponent` to the nearest `f64`, rounding once.
+///
+/// `significand as f64` rounds a 64- or 113-bit significand down to 53. When
+/// the scaled result is *normal* that is the only rounding and the answer is
+/// correct. When it is subnormal the scaling rounds a second time, onto the
+/// grid of multiples of 2^-1074, and two roundings are not one: the result
+/// lands a ulp from the correctly-rounded value about one time in eighty.
+///
+/// So the subnormal case rounds the wide significand straight onto that grid,
+/// half-to-even, and builds the result from its bits. A subnormal `f64`'s bit
+/// pattern *is* its multiple of 2^-1074, and a carry out of the mantissa spells
+/// the smallest normal, so the same construction covers rounding up out of the
+/// subnormal range.
+fn scaled_to_f64(significand: u128, exponent: i32) -> f64 {
+    if significand == 0 {
+        return 0.0;
+    }
+
+    let bit_length = 128 - significand.leading_zeros() as i32;
+    // The exponent of the value's leading one.
+    let value_exponent = exponent + bit_length - 1;
+
+    // Normal (or overflowing): one rounding, in the `as f64`.
+    if value_exponent >= -1022 {
+        return scale_by_pow2(significand as f64, exponent);
+    }
+
+    // Subnormal: round onto the 2^-1074 grid directly.
+    let shift = -1074 - exponent;
+    if shift >= 128 {
+        // Below half the smallest subnormal even before rounding.
+        return 0.0;
+    }
+    let grid = if shift > 0 {
+        let quotient = significand >> shift;
+        let remainder = significand & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        // Half-to-even, matching every other correctly-rounded conversion.
+        if remainder > half || (remainder == half && quotient & 1 == 1) {
+            quotient + 1
+        } else {
+            quotient
+        }
+    } else {
+        // Already a whole multiple of 2^-1074, so exact.
+        significand << -shift
+    };
+
+    f64::from_bits(grid as u64)
+}
+
 /// Decode x86-64's `long double`, the x87 80-bit extended format.
 ///
 /// The value occupies the first ten bytes of its sixteen-byte slot: a 64-bit
@@ -621,7 +672,7 @@ fn x87_to_f64(buf: &[u8; 16]) -> f64 {
         // significand's own scale. Exponent zero is the subnormal case and
         // shares the minimum exponent, so it reads as 1 here.
         let exponent = if exponent == 0 { 1 } else { exponent };
-        scale_by_pow2(significand as f64, exponent - 16383 - 63)
+        scaled_to_f64(significand as u128, exponent - 16383 - 63)
     };
 
     if negative {
@@ -651,10 +702,10 @@ fn binary128_to_f64(buf: &[u8; 16]) -> f64 {
             f64::NAN
         }
     } else if exponent == 0 {
-        scale_by_pow2(fraction as f64, -16382 - FRACTION_BITS as i32)
+        scaled_to_f64(fraction, -16382 - FRACTION_BITS as i32)
     } else {
         let significand = fraction | (1 << FRACTION_BITS);
-        scale_by_pow2(significand as f64, exponent - 16383 - FRACTION_BITS as i32)
+        scaled_to_f64(significand, exponent - 16383 - FRACTION_BITS as i32)
     };
 
     if negative {
@@ -1357,6 +1408,52 @@ mod tests {
         assert_eq!(parse_offset("777b"), Ok(0o777 * 512));
         assert_eq!(parse_offset("777."), Ok(777));
         assert_eq!(parse_offset("777"), Ok(0o777));
+    }
+
+    // A long double whose value lands in a double's subnormal range must be
+    // rounded once, not twice.
+    //
+    // `significand as f64` rounds 64 bits down to 53, and scaling that onto
+    // the subnormal grid rounds again; the two together land a ulp away from
+    // the correctly-rounded result about one time in eighty. These three were
+    // drawn from the subnormal window and checked against an exact rational
+    // conversion.
+    #[test]
+    fn a_subnormal_long_double_is_rounded_once() {
+        for (significand, sign_exp, want) in [
+            (
+                0xe776_fd34_ec65_2b9e_u64,
+                0x3c00_u16,
+                0x000e_776f_d34e_c653_u64,
+            ),
+            (0x9897_2e44_048b_d52f, 0x3c00, 0x0009_8972_e440_48bd),
+            (0xfb69_2cda_120f_b44e, 0x3c00, 0x000f_b692_cda1_20fb),
+        ] {
+            let mut slot = [0_u8; 16];
+            slot[..8].copy_from_slice(&significand.to_ne_bytes());
+            slot[8..10].copy_from_slice(&sign_exp.to_ne_bytes());
+            let got = x87_to_f64(&slot);
+            assert_eq!(
+                got.to_bits(),
+                want,
+                "0x{significand:016x}p{sign_exp:#06x}: got {got:e}, want {:e}",
+                f64::from_bits(want)
+            );
+        }
+    }
+
+    // Rounding the significand onto the subnormal grid can carry all the way
+    // out of it; the result is then the smallest normal, which the subnormal
+    // bit pattern already spells.
+    #[test]
+    fn a_subnormal_that_rounds_up_becomes_the_smallest_normal() {
+        // Just below 2^-1022, with enough set bits below the cut to round up.
+        let significand = u64::MAX;
+        let sign_exp: u16 = 15360; // value exponent -1023
+        let mut slot = [0_u8; 16];
+        slot[..8].copy_from_slice(&significand.to_ne_bytes());
+        slot[8..10].copy_from_slice(&sign_exp.to_ne_bytes());
+        assert_eq!(x87_to_f64(&slot), f64::MIN_POSITIVE);
     }
 
     // POSIX 109193-5 extends a short final chunk "with null bytes", appending

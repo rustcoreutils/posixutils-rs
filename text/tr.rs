@@ -12,14 +12,10 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use setup::{ForRemoval, ForTranslation};
 use std::error::Error;
 use std::process;
-use transformation::delete::DeleteTransformation;
-use transformation::delete_and_squeeze::{DeleteAndSqueezeState, DeleteAndSqueezeTransformation};
-use transformation::squeeze::{SqueezeState, SqueezeTransformation};
-use transformation::squeeze_and_translate::{
-    SqueezeAndTranslateState, SqueezeAndTranslateTransformation,
+use transformation::{
+    streaming_transform, DeleteAndSqueezeTransformation, DeleteTransformation, LastWritten,
+    SqueezeAndTranslateTransformation, SqueezeTransformation, TranslateTransformation,
 };
-use transformation::streaming_transform;
-use transformation::translate::TranslateTransformation;
 
 /// tr - translate or delete characters
 #[derive(Parser)]
@@ -255,9 +251,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                             let mut t = SqueezeAndTranslateTransformation {
                                 translation: *bo,
                                 squeeze: *squeeze,
-                                squeeze_and_translate_state: SqueezeAndTranslateState {
-                                    last_printed_character: None,
-                                },
+                                last: LastWritten::default(),
                             };
 
                             streaming_transform(&mut t)
@@ -266,9 +260,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                             let mut t = SqueezeAndTranslateTransformation {
                                 translation: *bo,
                                 squeeze: *squeeze,
-                                squeeze_and_translate_state: SqueezeAndTranslateState {
-                                    last_printed_character: None,
-                                },
+                                last: LastWritten::default(),
                             };
 
                             streaming_transform(&mut t)
@@ -287,9 +279,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         ForRemoval::Complemented(bo) => {
                             let mut t = SqueezeTransformation {
                                 squeeze: *bo,
-                                squeeze_state: SqueezeState {
-                                    last_printed_character: None,
-                                },
+                                last: LastWritten::default(),
                             };
 
                             streaming_transform(&mut t)
@@ -297,9 +287,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         ForRemoval::NotComplemented(bo) => {
                             let mut t = SqueezeTransformation {
                                 squeeze: *bo,
-                                squeeze_state: SqueezeState {
-                                    last_printed_character: None,
-                                },
+                                last: LastWritten::default(),
                             };
 
                             streaming_transform(&mut t)
@@ -333,9 +321,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 ForRemoval::Complemented(bo) => {
                     let mut t = DeleteAndSqueezeTransformation {
                         delete: *bo,
-                        delete_and_squeeze_state: DeleteAndSqueezeState {
-                            last_printed_character: None,
-                        },
+                        last: LastWritten::default(),
                         squeeze: *squeeze,
                     };
 
@@ -344,9 +330,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 ForRemoval::NotComplemented(bo) => {
                     let mut t = DeleteAndSqueezeTransformation {
                         delete: *bo,
-                        delete_and_squeeze_state: DeleteAndSqueezeState {
-                            last_printed_character: None,
-                        },
+                        last: LastWritten::default(),
                         squeeze: *squeeze,
                     };
 
@@ -1812,19 +1796,6 @@ mod setup {
     }
 
     impl FullChar {
-        pub fn fast_check(&self, byte_a: u8, next_bytes: &[u8]) -> bool {
-            // Fast check
-            if byte_a == self.payload[0_usize] {
-                let number_of_bytes_usize = self.number_of_bytes as usize;
-
-                let check_against = &self.payload[1_usize..number_of_bytes_usize];
-
-                return next_bytes.starts_with(check_against);
-            }
-
-            false
-        }
-
         pub fn write_full_char(&self, to: &mut [u8]) -> usize {
             let to_write = self.number_of_bytes as usize;
 
@@ -1889,14 +1860,6 @@ mod setup {
                 2_usize => Some(SearchNumberOfBytes::Two),
                 3_usize => Some(SearchNumberOfBytes::Three),
                 _ => None,
-            }
-        }
-
-        pub fn increment(&self) -> FullCharNumberOfBytes {
-            match self {
-                SearchNumberOfBytes::One => FullCharNumberOfBytes::Two,
-                SearchNumberOfBytes::Two => FullCharNumberOfBytes::Three,
-                SearchNumberOfBytes::Three => FullCharNumberOfBytes::Four,
             }
         }
     }
@@ -2320,97 +2283,130 @@ mod transformation {
     use std::error::Error;
     use std::io::{self, ErrorKind, Read, Write};
 
+    use crate::setup::{FullChar, FullCharNumberOfBytes, Removal, Translation};
+
+    /// What an operation does with the unit at the front of the input.
+    pub enum Action {
+        /// Write the consumed input bytes through unchanged.
+        Emit,
+        /// Write this character instead of them.
+        Replace(FullChar),
+        /// Write nothing.
+        Drop,
+    }
+
+    /// One operation step: what to do, and how much input it accounted for.
+    ///
+    /// `consumed` is the *input* width, and the driver advances by exactly it.
+    /// That is the whole point of this type. When each operation moved the
+    /// cursor itself, the width had to be reconstructed from whichever of three
+    /// unrelated counts was at hand -- and the squeeze paths charged the number
+    /// of bytes *written to output*, which is only the same number when nothing
+    /// is being translated. It was not, once, and the stream slipped a byte per
+    /// squeezed character.
+    pub struct Step {
+        pub consumed: usize,
+        pub action: Action,
+    }
+
+    /// How much input a check accounted for: the byte under the cursor, plus
+    /// any continuation bytes the match looked ahead over.
+    fn consumed(lookahead: Option<crate::setup::SearchNumberOfBytes>) -> usize {
+        1_usize + lookahead.map_or(0_usize, |se| se as usize)
+    }
+
+    /// One transformation, asked about the front of the input.
+    pub trait Operation {
+        fn step(&mut self, lead: u8, next_bytes: &[u8]) -> Step;
+    }
+
     pub struct TransformResult {
         pub bytes_written: usize,
         pub leftover_bytes: usize,
     }
 
-    pub trait Transformation {
-        fn process_current_byte_with_window(
-            &mut self,
-            byte_a: u8,
-            next_bytes: &[u8],
-            index: &mut usize,
-            bytes_written: &mut usize,
-            output: &mut [u8],
-        );
+    /// Drive one buffer through an operation.
+    ///
+    /// A character is at most four bytes, so the main loop stops four bytes
+    /// short and the tail is finished only on the last buffer, where no further
+    /// input can complete a sequence.
+    fn transform_buffer<T: Operation>(
+        op: &mut T,
+        input: &mut [u8],
+        output: &mut [u8],
+        last_iteration: bool,
+    ) -> TransformResult {
+        let input_len = input.len();
+        let mut bytes_written = 0_usize;
+        let mut index = 0_usize;
 
-        #[inline]
-        fn transform_buffer(
-            &mut self,
-            input: &mut [u8],
-            output: &mut [u8],
-            last_iteration: bool,
-        ) -> TransformResult {
-            let input_len = input.len();
+        let mut apply = |op: &mut T, index: &mut usize, bytes_written: &mut usize| {
+            let lead = input[*index];
+            let next_end = input_len.min(*index + 4_usize);
+            let next_bytes = &input[(*index + 1_usize)..next_end];
 
-            let mut bytes_written = 0_usize;
+            let step = op.step(lead, next_bytes);
+            debug_assert!(step.consumed >= 1_usize);
 
-            let mut index = 0_usize;
-
-            loop {
-                let option = input.get(index..(index + 4_usize));
-
-                let Some(&[byte_a, byte_b, byte_c, byte_d]) = option else {
-                    break;
-                };
-
-                self.process_current_byte_with_window(
-                    byte_a,
-                    &[byte_b, byte_c, byte_d],
-                    &mut index,
-                    &mut bytes_written,
-                    output,
-                );
-            }
-
-            debug_assert!((input_len - index) <= 4_usize);
-
-            let leftover_bytes = if last_iteration {
-                while let Some(&byte_a) = input.get(index) {
-                    let next_bytes = &input[(index + 1_usize)..];
-
-                    debug_assert!(next_bytes.len() <= 4_usize);
-
-                    self.process_current_byte_with_window(
-                        byte_a,
-                        next_bytes,
-                        &mut index,
-                        &mut bytes_written,
-                        output,
-                    );
+            match step.action {
+                Action::Drop => {}
+                Action::Emit => {
+                    // Exactly the bytes that were consumed -- so an output
+                    // width can no longer stand in for an input width.
+                    if step.consumed == 1_usize {
+                        // Overwhelmingly the common case, and a slice copy of
+                        // one byte is not free: this is the hot loop for every
+                        // byte tr passes through.
+                        output[*bytes_written] = lead;
+                        *bytes_written += 1_usize;
+                    } else {
+                        let end = input_len.min(*index + step.consumed);
+                        let taken = end - *index;
+                        output[*bytes_written..(*bytes_written + taken)]
+                            .copy_from_slice(&input[*index..end]);
+                        *bytes_written += taken;
+                    }
                 }
-
-                0_usize
-            } else {
-                let range = index..input_len;
-
-                let range_len = range.len();
-
-                input.copy_within(range, 0_usize);
-
-                range_len
-            };
-
-            TransformResult {
-                bytes_written,
-                leftover_bytes,
+                Action::Replace(full_char) => {
+                    *bytes_written += full_char.write_full_char(&mut output[*bytes_written..]);
+                }
             }
+
+            *index += step.consumed;
+        };
+
+        while index + 4_usize <= input_len {
+            apply(op, &mut index, &mut bytes_written);
+        }
+
+        let leftover_bytes = if last_iteration {
+            while index < input_len {
+                apply(op, &mut index, &mut bytes_written);
+            }
+            0_usize
+        } else {
+            let range = index..input_len;
+            let range_len = range.len();
+            input.copy_within(range, 0_usize);
+            range_len
+        };
+
+        TransformResult {
+            bytes_written,
+            leftover_bytes,
         }
     }
 
-    pub fn streaming_transform<T: Transformation>(t: &mut T) -> Result<(), Box<dyn Error>> {
+    pub fn streaming_transform<T: Operation>(t: &mut T) -> Result<(), Box<dyn Error>> {
         const SIZE: usize = 8_usize * 1_024_usize;
 
-        // Buffers
         let mut input = vec![0_u8; SIZE];
-        // Most pessimistic case is every input character is a one byte character, and is being translated to a four byte character
+        // The worst case is every one-byte input character translated to a
+        // four-byte one.
         let mut output = vec![0_u8; SIZE * 4_usize];
 
         let mut leftover_bytes = 0_usize;
 
-        // TODO
-        // Improve this
         let mut stdin_lock = io::stdin().lock();
         let mut stdout_lock = io::stdout().lock();
 
@@ -2419,27 +2415,21 @@ mod transformation {
 
             match stdin_lock.read(buf) {
                 Ok(0_usize) => {
-                    let transform_result =
-                        t.transform_buffer(&mut input[..leftover_bytes], &mut output, true);
-
-                    stdout_lock.write_all(&output[..(transform_result.bytes_written)])?;
-
+                    let result =
+                        transform_buffer(t, &mut input[..leftover_bytes], &mut output, true);
+                    stdout_lock.write_all(&output[..(result.bytes_written)])?;
                     break;
                 }
                 Ok(us) => {
                     let read_slice = &mut input[..(leftover_bytes + us)];
-
-                    let transform_result = t.transform_buffer(read_slice, &mut output, false);
-
-                    leftover_bytes = transform_result.leftover_bytes;
-
-                    stdout_lock.write_all(&output[..(transform_result.bytes_written)])?;
+                    let result = transform_buffer(t, read_slice, &mut output, false);
+                    leftover_bytes = result.leftover_bytes;
+                    stdout_lock.write_all(&output[..(result.bytes_written)])?;
                 }
                 Err(er) => {
                     if er.kind() == ErrorKind::Interrupted {
                         continue;
                     }
-
                     return Err(Box::from(er));
                 }
             }
@@ -2448,408 +2438,192 @@ mod transformation {
         Ok(())
     }
 
-    pub mod delete {
-        use super::Transformation;
-        use crate::setup::Removal;
+    /// The character last written, and whether it is one the squeeze set
+    /// collapses. One type, where each squeezing operation used to declare its
+    /// own identical copy.
+    #[derive(Default)]
+    pub struct LastWritten {
+        printed: Option<(FullChar, bool)>,
+    }
 
-        pub struct DeleteTransformation<T: Removal> {
-            pub removal: T,
+    impl LastWritten {
+        /// Would writing `candidate` repeat a squeezable character?
+        fn repeats(&self, candidate: &FullChar) -> bool {
+            match &self.printed {
+                Some((last, true)) => {
+                    last.number_of_bytes as usize == candidate.number_of_bytes as usize
+                        && last.payload[..(last.number_of_bytes as usize)]
+                            == candidate.payload[..(candidate.number_of_bytes as usize)]
+                }
+                _ => false,
+            }
         }
 
-        impl<T: Removal> Transformation for DeleteTransformation<T> {
-            #[inline]
-            fn process_current_byte_with_window(
-                &mut self,
-                byte_a: u8,
-                next_bytes: &[u8],
-                index: &mut usize,
-                bytes_written: &mut usize,
-                output: &mut [u8],
-            ) {
-                let output_slice = &mut output[(*bytes_written)..];
-
-                let removal_check_result = self.removal.check(byte_a, next_bytes);
-
-                let extra_bytes = match removal_check_result.match_lookahead_length {
-                    Some(se) => se as usize,
-                    None => 0_usize,
-                };
-
-                *index += extra_bytes + 1_usize;
-
-                if removal_check_result.matched {
-                    return;
-                }
-
-                // Not deleted. The whole character must be written: the index
-                // advanced past its continuation bytes, so writing only the
-                // lead byte silently truncated every kept multi-byte character.
-                {
-                    output_slice[0_usize] = byte_a;
-                    output_slice[1_usize..(1_usize + extra_bytes)]
-                        .copy_from_slice(&next_bytes[..extra_bytes]);
-
-                    *bytes_written += 1_usize + extra_bytes;
-                }
-            }
+        fn record(&mut self, char: FullChar, squeezable: bool) {
+            self.printed = Some((char, squeezable));
         }
     }
 
-    pub mod delete_and_squeeze {
-        use super::Transformation;
-        use crate::setup::{FullChar, FullCharNumberOfBytes, NotComplementedRemoval, Removal};
-
-        pub struct LastPrintedChar {
-            char: FullChar,
-            squeeze_char: bool,
+    /// The input unit at the cursor, as a character to compare and write.
+    fn input_char(lead: u8, next_bytes: &[u8], consumed: usize) -> FullChar {
+        let mut payload = [0_u8; 4_usize];
+        payload[0_usize] = lead;
+        let extra = consumed - 1_usize;
+        payload[1_usize..(1_usize + extra)].copy_from_slice(&next_bytes[..extra]);
+        FullChar {
+            number_of_bytes: match consumed {
+                1_usize => FullCharNumberOfBytes::One,
+                2_usize => FullCharNumberOfBytes::Two,
+                3_usize => FullCharNumberOfBytes::Three,
+                _ => FullCharNumberOfBytes::Four,
+            },
+            payload,
         }
+    }
 
-        pub struct DeleteAndSqueezeState {
-            pub last_printed_character: Option<LastPrintedChar>,
-        }
+    pub struct DeleteTransformation<T: Removal> {
+        pub removal: T,
+    }
 
-        pub struct DeleteAndSqueezeTransformation<T: Removal> {
-            pub delete_and_squeeze_state: DeleteAndSqueezeState,
-            pub delete: T,
-            pub squeeze: NotComplementedRemoval,
-        }
-
-        impl<T: Removal> Transformation for DeleteAndSqueezeTransformation<T> {
-            #[inline]
-            fn process_current_byte_with_window(
-                &mut self,
-                byte_a: u8,
-                next_bytes: &[u8],
-                index: &mut usize,
-                bytes_written: &mut usize,
-                output: &mut [u8],
-            ) {
-                let delete_removal_check_result = self.delete.check(byte_a, next_bytes);
-
-                if let Some(se) = delete_removal_check_result.match_lookahead_length {
-                    *index += se as usize;
-                }
-
-                if delete_removal_check_result.matched {
-                    *index += 1_usize;
-
-                    return;
-                }
-
-                if let Some(la) = &self.delete_and_squeeze_state.last_printed_character {
-                    if la.squeeze_char {
-                        let full_char = &la.char;
-
-                        if full_char.fast_check(byte_a, next_bytes) {
-                            *index += full_char.number_of_bytes as usize;
-
-                            return;
-                        }
-                    }
-                }
-
-                let output_slice = &mut output[(*bytes_written)..];
-
-                let squeeze_removal_check_result = self.squeeze.check(byte_a, next_bytes);
-
-                let squeeze_char = squeeze_removal_check_result.matched;
-
-                if squeeze_char {
-                    let full_char_number_of_bytes =
-                        if let Some(se) = squeeze_removal_check_result.match_lookahead_length {
-                            se.increment()
-                        } else {
-                            FullCharNumberOfBytes::One
-                        };
-
-                    let mut payload = [0_u8; 4_usize];
-
-                    // TODO
-                    for (us, &ue) in [byte_a]
-                        .iter()
-                        .chain(next_bytes)
-                        .take(full_char_number_of_bytes as usize)
-                        .enumerate()
-                    {
-                        payload[us] = ue;
-                    }
-
-                    let char = FullChar {
-                        number_of_bytes: full_char_number_of_bytes,
-                        payload,
-                    };
-
-                    let additional_bytes_written = char.write_full_char(output_slice);
-
-                    *bytes_written += additional_bytes_written;
-                    *index += additional_bytes_written;
-
-                    self.delete_and_squeeze_state = DeleteAndSqueezeState {
-                        last_printed_character: Some(LastPrintedChar { squeeze_char, char }),
-                    };
+    impl<T: Removal> Operation for DeleteTransformation<T> {
+        #[inline]
+        fn step(&mut self, lead: u8, next_bytes: &[u8]) -> Step {
+            let check = self.removal.check(lead, next_bytes);
+            Step {
+                consumed: consumed(check.match_lookahead_length),
+                action: if check.matched {
+                    Action::Drop
                 } else {
-                    output_slice[0_usize] = byte_a;
-
-                    *bytes_written += 1_usize;
-                    *index += 1_usize;
-
-                    self.delete_and_squeeze_state = DeleteAndSqueezeState {
-                        last_printed_character: Some(LastPrintedChar {
-                            char: FullChar::new_from_u8(byte_a),
-                            squeeze_char,
-                        }),
-                    };
-                }
+                    Action::Emit
+                },
             }
         }
     }
 
-    pub mod squeeze {
-        use super::Transformation;
-        use crate::setup::{FullChar, FullCharNumberOfBytes, Removal};
+    pub struct TranslateTransformation<T: Translation> {
+        pub translation: T,
+    }
 
-        pub struct LastPrintedChar {
-            char: FullChar,
-            squeeze_char: bool,
-        }
-
-        pub struct SqueezeState {
-            pub last_printed_character: Option<LastPrintedChar>,
-        }
-
-        pub struct SqueezeTransformation<T: Removal> {
-            pub squeeze_state: SqueezeState,
-            pub squeeze: T,
-        }
-
-        impl<T: Removal> Transformation for SqueezeTransformation<T> {
-            #[inline]
-            fn process_current_byte_with_window(
-                &mut self,
-                byte_a: u8,
-                next_bytes: &[u8],
-                index: &mut usize,
-                bytes_written: &mut usize,
-                output: &mut [u8],
-            ) {
-                if let Some(la) = &self.squeeze_state.last_printed_character {
-                    if la.squeeze_char {
-                        let full_char = &la.char;
-
-                        if full_char.fast_check(byte_a, next_bytes) {
-                            *index += full_char.number_of_bytes as usize;
-
-                            return;
-                        }
-                    }
-                }
-
-                let output_slice = &mut output[(*bytes_written)..];
-
-                let squeeze_removal_check_result = self.squeeze.check(byte_a, next_bytes);
-
-                let squeeze_char = squeeze_removal_check_result.matched;
-
-                if squeeze_char {
-                    let full_char_number_of_bytes =
-                        if let Some(se) = squeeze_removal_check_result.match_lookahead_length {
-                            se.increment()
-                        } else {
-                            FullCharNumberOfBytes::One
-                        };
-
-                    let mut payload = [0_u8; 4_usize];
-
-                    // TODO
-                    for (us, &ue) in [byte_a]
-                        .iter()
-                        .chain(next_bytes)
-                        .take(full_char_number_of_bytes as usize)
-                        .enumerate()
-                    {
-                        payload[us] = ue;
-                    }
-
-                    let char = FullChar {
-                        number_of_bytes: full_char_number_of_bytes,
-                        payload,
-                    };
-
-                    let additional_bytes_written = char.write_full_char(output_slice);
-
-                    *bytes_written += additional_bytes_written;
-                    *index += additional_bytes_written;
-
-                    self.squeeze_state = SqueezeState {
-                        last_printed_character: Some(LastPrintedChar { squeeze_char, char }),
-                    };
-                } else {
-                    output_slice[0_usize] = byte_a;
-
-                    *bytes_written += 1_usize;
-                    *index += 1_usize;
-
-                    self.squeeze_state = SqueezeState {
-                        last_printed_character: Some(LastPrintedChar {
-                            char: FullChar::new_from_u8(byte_a),
-                            squeeze_char,
-                        }),
-                    };
-                }
+    impl<T: Translation> Operation for TranslateTransformation<T> {
+        #[inline]
+        fn step(&mut self, lead: u8, next_bytes: &[u8]) -> Step {
+            let check = self.translation.check(lead, next_bytes);
+            Step {
+                consumed: consumed(check.match_lookahead_length),
+                action: match check.replacement {
+                    Some(full_char) => Action::Replace(full_char),
+                    None => Action::Emit,
+                },
             }
         }
     }
 
-    pub mod squeeze_and_translate {
-        use super::Transformation;
-        use crate::setup::{FullChar, NotComplementedRemoval, Removal, Translation};
+    pub struct SqueezeTransformation<T: Removal> {
+        pub squeeze: T,
+        pub last: LastWritten,
+    }
 
-        pub struct LastPrintedChar {
-            char: FullChar,
-            squeeze_char: bool,
-        }
+    impl<T: Removal> Operation for SqueezeTransformation<T> {
+        #[inline]
+        fn step(&mut self, lead: u8, next_bytes: &[u8]) -> Step {
+            let check = self.squeeze.check(lead, next_bytes);
+            let consumed = consumed(check.match_lookahead_length);
+            let candidate = input_char(lead, next_bytes, consumed);
 
-        pub struct SqueezeAndTranslateState {
-            pub last_printed_character: Option<LastPrintedChar>,
-        }
-
-        pub struct SqueezeAndTranslateTransformation<T: Translation> {
-            pub translation: T,
-            pub squeeze: NotComplementedRemoval,
-            pub squeeze_and_translate_state: SqueezeAndTranslateState,
-        }
-
-        impl<T: Translation> Transformation for SqueezeAndTranslateTransformation<T> {
-            #[inline]
-            fn process_current_byte_with_window(
-                &mut self,
-                byte_a: u8,
-                next_bytes: &[u8],
-                index: &mut usize,
-                bytes_written: &mut usize,
-                output: &mut [u8],
-            ) {
-                let replacement_check_result = self.translation.check(byte_a, next_bytes);
-
-                let fu_payload: [u8; 4];
-
-                let (byte_a_to_use, next_bytes_to_use, full_char_to_write) =
-                    match replacement_check_result.replacement {
-                        Some(fu) => {
-                            fu_payload = fu.payload;
-
-                            let [fu_byte_a, ..] = fu_payload;
-
-                            let fu_rest = &fu_payload[1_usize..(fu.number_of_bytes as usize)];
-
-                            (fu_byte_a, fu_rest, fu)
-                        }
-                        None => (byte_a, next_bytes, FullChar::new_from_u8(byte_a)),
-                    };
-
-                // The lookahead belongs to the *input* match, so it is charged
-                // to the input index here; the single byte under the cursor is
-                // charged once, below or in the skip path, exactly as the
-                // non-squeezed path does.
-                if let Some(se) = replacement_check_result.match_lookahead_length {
-                    *index += se as usize;
-                }
-
-                if let Some(la) = &self.squeeze_and_translate_state.last_printed_character {
-                    if la.squeeze_char {
-                        let full_char = &la.char;
-
-                        if full_char.fast_check(byte_a_to_use, next_bytes_to_use) {
-                            // `full_char` is the *replacement*, whose width has
-                            // nothing to do with how far the input advanced:
-                            // charging it here moved the cursor by 1 + 2 = 3
-                            // over a two-byte input character, so the stream
-                            // slipped a byte per squeezed character and the
-                            // output carried orphaned UTF-8 continuation bytes.
-                            *index += 1_usize;
-
-                            return;
-                        }
-                    }
-                }
-
-                let output_slice = &mut output[(*bytes_written)..];
-
-                let squeeze_remove_check_result =
-                    self.squeeze.check(byte_a_to_use, next_bytes_to_use);
-
-                let squeeze_char = squeeze_remove_check_result.matched;
-
-                let additional_bytes_written = full_char_to_write.write_full_char(output_slice);
-
-                *bytes_written += additional_bytes_written;
-                *index += 1_usize;
-
-                self.squeeze_and_translate_state = SqueezeAndTranslateState {
-                    last_printed_character: Some(LastPrintedChar {
-                        squeeze_char,
-                        char: full_char_to_write.to_owned(),
-                    }),
+            if check.matched && self.last.repeats(&candidate) {
+                return Step {
+                    consumed,
+                    action: Action::Drop,
                 };
             }
+
+            self.last.record(candidate, check.matched);
+            Step {
+                consumed,
+                action: Action::Emit,
+            }
         }
     }
 
-    pub mod translate {
-        use super::Transformation;
-        use crate::setup::{ReplacementCheckResult, Translation};
+    pub struct DeleteAndSqueezeTransformation<T: Removal> {
+        pub delete: T,
+        pub squeeze: crate::setup::NotComplementedRemoval,
+        pub last: LastWritten,
+    }
 
-        pub struct TranslateTransformation<T: Translation> {
-            pub translation: T,
-        }
-
-        impl<T: Translation> Transformation for TranslateTransformation<T> {
-            #[inline]
-            fn process_current_byte_with_window(
-                &mut self,
-                byte_a: u8,
-                next_bytes: &[u8],
-                index: &mut usize,
-                bytes_written: &mut usize,
-                output: &mut [u8],
-            ) {
-                let output_slice = &mut output[(*bytes_written)..];
-
-                let ReplacementCheckResult {
-                    replacement,
-                    match_lookahead_length,
-                    ..
-                } = self.translation.check(byte_a, next_bytes);
-
-                let extra_bytes_to_write = if let Some(se) = match_lookahead_length {
-                    let match_lookahead_length_usize = se as usize;
-
-                    *index += match_lookahead_length_usize;
-
-                    match_lookahead_length_usize
-                } else {
-                    0_usize
+    impl<T: Removal> Operation for DeleteAndSqueezeTransformation<T> {
+        #[inline]
+        fn step(&mut self, lead: u8, next_bytes: &[u8]) -> Step {
+            let delete_check = self.delete.check(lead, next_bytes);
+            if delete_check.matched {
+                return Step {
+                    consumed: consumed(delete_check.match_lookahead_length),
+                    action: Action::Drop,
                 };
+            }
 
-                *index += 1_usize;
+            // Survived deletion, so the squeeze set decides. Its own check
+            // supplies the width, since the two sets need not agree on how far
+            // a member reaches.
+            let squeeze_check = self.squeeze.check(lead, next_bytes);
+            let consumed = consumed(squeeze_check.match_lookahead_length)
+                .max(consumed(delete_check.match_lookahead_length));
+            let candidate = input_char(lead, next_bytes, consumed);
 
-                if let Some(fu) = replacement {
-                    let additional_bytes_written = fu.write_full_char(output_slice);
+            if squeeze_check.matched && self.last.repeats(&candidate) {
+                return Step {
+                    consumed,
+                    action: Action::Drop,
+                };
+            }
 
-                    *bytes_written += additional_bytes_written;
+            self.last.record(candidate, squeeze_check.matched);
+            Step {
+                consumed,
+                action: Action::Emit,
+            }
+        }
+    }
 
-                    return;
-                }
+    pub struct SqueezeAndTranslateTransformation<T: Translation> {
+        pub translation: T,
+        pub squeeze: crate::setup::NotComplementedRemoval,
+        pub last: LastWritten,
+    }
 
-                // No replacement was found, so write the original byte
-                {
-                    output_slice[0_usize] = byte_a;
+    impl<T: Translation> Operation for SqueezeAndTranslateTransformation<T> {
+        #[inline]
+        fn step(&mut self, lead: u8, next_bytes: &[u8]) -> Step {
+            let check = self.translation.check(lead, next_bytes);
+            // The translation's lookahead is over the *input*; what gets
+            // written may be a different width entirely, and charging that to
+            // the cursor is the defect this design removes.
+            let consumed = consumed(check.match_lookahead_length);
 
-                    output_slice[1_usize..(1_usize + extra_bytes_to_write)]
-                        .copy_from_slice(&next_bytes[..extra_bytes_to_write]);
+            let written = match check.replacement {
+                Some(full_char) => full_char,
+                None => input_char(lead, next_bytes, consumed),
+            };
 
-                    *bytes_written += 1_usize + extra_bytes_to_write;
-                }
+            // POSIX 118172-4: squeezing happens *after* translation, on the
+            // character that is about to be written.
+            let payload = written.payload;
+            let width = written.number_of_bytes as usize;
+            let squeeze_check = self
+                .squeeze
+                .check(payload[0_usize], &payload[1_usize..width]);
+
+            if squeeze_check.matched && self.last.repeats(&written) {
+                return Step {
+                    consumed,
+                    action: Action::Drop,
+                };
+            }
+
+            self.last.record(written, squeeze_check.matched);
+            Step {
+                consumed,
+                action: Action::Replace(written),
             }
         }
     }

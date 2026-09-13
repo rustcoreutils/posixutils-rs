@@ -223,6 +223,14 @@ but no daemon to run them.  Behavior follows Vixie cron:
 ### localedef
 
  * `-v` — verbose.
+ * `-u code_set_name` is accepted but only partly acted on. Its specified job
+   is to map character and collating-element symbols whose encoding values are
+   given as ISO/IEC 10646 position constants into the named codeset, which is
+   part of compiling a locale — and this implementation validates a locale
+   source rather than compiling one, so there is no such mapping to perform.
+   What it does do is check the name against the `-f` charmap's own
+   `<code_set_name>` and reject a disagreement, and say so when there is no
+   charmap to check against. Honouring it fully waits on locale creation.
 
 ### lp
 

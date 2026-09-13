@@ -145,9 +145,10 @@ fn at_main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let list = list_jobs(get_job_dir()?);
-        if list.is_empty() {
-            return Ok(());
-        }
+        // No early return on an empty spool: it used to fire *before* the
+        // requested ids were looked up, so `at -l 99999` against an empty
+        // spool said nothing at all and exited 0. An id that is not there is
+        // reported whether the spool is empty or merely lacks it.
         if let Some(queue) = args.queue {
             for job in jobs_in_queue(queue, &list) {
                 println!("{}", job);

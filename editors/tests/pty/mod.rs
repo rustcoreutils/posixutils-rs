@@ -818,3 +818,103 @@ fn test_pty_vi_survives_invalid_utf8_input() {
         saved
     );
 }
+
+/// Maps and abbreviations through the real binary in a real terminal.
+///
+/// The headless harness drives `handle_key` directly; this drives the editor
+/// the way a user does, which is the only place the whole path -- terminal
+/// read, queue, expansion, dispatch -- is exercised together.
+#[test]
+fn test_pty_vi_map_and_abbreviation() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("test.txt");
+    std::fs::write(&file_path, "one\ntwo\nthree\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    // A command-mode map, used.
+    vi.keys(":map q dd\r");
+    vi.sleep_ms(100);
+    vi.keys("q");
+    vi.sleep_ms(100);
+    // An abbreviation, typed.
+    vi.keys(":ab teh the\r");
+    vi.sleep_ms(100);
+    vi.keys("oteh end\x1b");
+    vi.sleep_ms(100);
+    vi.keys(":wq\r");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents, "two\nthe end\nthree\n",
+        "q must have deleted a line and teh must have expanded"
+    );
+}
+
+/// `:map Q :wq^V^M` end to end: the mapping people actually write, whose
+/// carriage return can only be entered with a `^V` and which used to be
+/// unenterable because `^V` never reached the command line.
+#[test]
+fn test_pty_vi_map_with_a_quoted_carriage_return() {
+    let td = tempdir().unwrap();
+    let file_path = td.path().join("test.txt");
+    std::fs::write(&file_path, "before\n").unwrap();
+
+    let mut vi = ViPtySession::new(&file_path, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys(":map Q :wq\x16\r");
+    vi.sleep_ms(100);
+    // The quoted CR did not submit the line, so submit it now.
+    vi.keys("\r");
+    vi.sleep_ms(100);
+    vi.keys("ochanged\x1b");
+    vi.sleep_ms(100);
+    // Q now runs `:wq<CR>` on its own.
+    vi.keys("Q");
+    vi.wait();
+
+    let contents = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        contents, "before\nchanged\n",
+        "Q must have written and quit"
+    );
+}
+
+/// Following a tag and popping back, through the real binary.
+#[test]
+fn test_pty_vi_tag_and_pop() {
+    let td = tempdir().unwrap();
+    let src = td.path().join("src.c");
+    let out = td.path().join("out.txt");
+    std::fs::write(&src, "one\ntwo\nint helper() { }\nfour\n").unwrap();
+    std::fs::write(
+        td.path().join("tags"),
+        format!("helper\t{}\t3\n", src.to_str().unwrap()),
+    )
+    .unwrap();
+
+    let mut vi = ViPtySession::new(&src, 25, 80);
+    vi.sleep_ms(500);
+    vi.keys(&format!(":set tags={}/tags\r", td.path().to_str().unwrap()));
+    vi.sleep_ms(100);
+    // Start on line 4, jump to the tag on line 3, come back with ^T, and
+    // write the line we land on out so the result is checkable.
+    vi.keys("4G");
+    vi.sleep_ms(100);
+    vi.keys(":tag helper\r");
+    vi.sleep_ms(100);
+    vi.keys("\x14"); // ^T
+    vi.sleep_ms(100);
+    vi.keys(&format!(":.w! {}\r", out.to_str().unwrap()));
+    vi.sleep_ms(200);
+    vi.keys(":q!\r");
+    vi.wait();
+
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(
+        written.trim(),
+        "four",
+        "^T must have returned to the line the jump started from"
+    );
+}

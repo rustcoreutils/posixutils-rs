@@ -335,6 +335,7 @@ fn print_data<R: Read>(
     };
 
     let mut run = true; // Flag to indicate if the reader should continue reading.
+    let mut written: u64 = 0; // Bytes written so far, which is what -N limits.
 
     while run {
         let mut bytes_read = reader.read(&mut buffer)?; // Read up to 16 bytes into the buffer.
@@ -350,16 +351,26 @@ fn print_data<R: Read>(
 
         let mut local_buf = &buffer[..bytes_read]; // Create a slice of the buffer up to the number of bytes read.
 
-        // Truncate the buffer to the specified count, if provided.
+        // Truncate to the `-N` count, if provided. The count is a *length*:
+        // it limits the bytes written, and says nothing about where they
+        // start. Comparing it against `offset` charged the `-j` skip against
+        // it as well, so `-j 2 -N 9` wrote seven bytes -- and underflowed when
+        // the skip was the larger of the two.
         if let Some(count) = count {
-            let all_bytes = offset + bytes_read as u64;
-            if count < all_bytes {
-                let remaining = (count - offset) as usize;
-                local_buf = &buffer[..remaining];
-                bytes_read = local_buf.len();
+            if written + bytes_read as u64 > count {
+                let remaining = (count - written) as usize;
+                local_buf = &local_buf[..remaining];
+                bytes_read = remaining;
                 run = false;
             }
         }
+
+        // A count reached exactly on a block boundary, or a zero count, leaves
+        // nothing to write: stop rather than emitting an empty field line.
+        if bytes_read == 0 {
+            break;
+        }
+        written += bytes_read as u64;
 
         let local_buf_len = local_buf.len();
 

@@ -861,6 +861,52 @@ fn od_octal_field_is_as_wide_as_the_type() {
     }
 }
 
+// `-N count` reads *count bytes*, not "up to absolute offset count". The
+// truncation compared the count against `offset`, which starts at the `-j`
+// skip, so every byte skipped was also charged against the count:
+// `-j 2 -N 9` read seven bytes instead of nine. And when the skip exceeded
+// the count, `count - offset` underflowed a u64 and the result was used to
+// index the buffer, so `-j 5 -N 4` panicked outright.
+#[test]
+fn od_count_is_a_length_not_an_end_offset() {
+    let data = b"ABCDEFGHIJKLM"; // 13 bytes
+
+    // Nine bytes from offset two, and the trailing offset is 2 + 9 = 11.
+    let (stdout, _, code) = od_raw(&["-j", "2", "-N", "9", "-t", "x1"], data);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        stdout, "0000002 43 44 45 46 47 48 49 4a 4b\n0000013\n",
+        "-j 2 -N 9 must read nine bytes"
+    );
+
+    // The skip may exceed the count without underflowing.
+    let (stdout, stderr, code) = od_raw(&["-j", "5", "-N", "4", "-t", "x1"], data);
+    assert!(
+        !stderr.contains("panicked at"),
+        "-j 5 -N 4 panicked: {stderr:?}"
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "0000005 46 47 48 49\n0000011\n");
+
+    // A zero count reads nothing and prints only the trailing offset -- no
+    // field line, and no duplicate-line asterisk for a block that never was.
+    let (stdout, _, code) = od_raw(&["-N", "0", "-t", "x1"], data);
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "0000000\n", "-N 0 prints only the offset");
+
+    let (stdout, stderr, code) = od_raw(&["-j", "2", "-N", "0", "-t", "x1"], data);
+    assert!(
+        !stderr.contains("panicked at"),
+        "-j 2 -N 0 panicked: {stderr:?}"
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "0000002\n");
+
+    // Without a skip, nothing changes.
+    let (stdout, _, _) = od_raw(&["-N", "9", "-t", "x1"], data);
+    assert_eq!(stdout, "0000000 41 42 43 44 45 46 47 48 49\n0000011\n");
+}
+
 #[test]
 fn od_integer_size_suffixes_are_unchanged() {
     // The C/S/I/L table belongs to d/o/u/x (POSIX 109073-5) and must not have

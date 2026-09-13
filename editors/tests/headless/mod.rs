@@ -661,7 +661,10 @@ fn test_replace_multiple() {
     editor.set_buffer_text("aaaa");
     editor.set_cursor(Position::new(1, 0));
 
-    // rx replaces 1 char with x (count with r not yet implemented)
+    // rx replaces one character with x. A count is honoured too --
+    // `test_replace_char_with_a_count_replaces_that_many` and
+    // `test_replace_char_past_end_of_line_changes_nothing` cover that; what is
+    // under test here is that repeated *single* replacements accumulate.
     editor.execute_keys("rx").unwrap();
     assert_eq!(editor.get_buffer_text().trim(), "xaaa");
 
@@ -3275,12 +3278,18 @@ fn test_pipe_column_inside_a_tab_lands_on_the_tab() {
 // Commands that are parsed but not implemented
 // ============================================================================
 
-// `:map`, `:unmap`, `:ab`, `:una`, `:pop` and `:tags` are all POSIX ex
-// commands, and all six were parsed and then dropped into a `_ =>` arm that
-// returned success. The user typed `:map x dd`, saw no error, and had no way
-// to learn the mapping was never made.
+// All six were parsed and then dropped into a `_ =>` arm that returned
+// success. The user typed `:map x dd`, saw no error, and had no way to learn
+// the mapping was never made.
 //
 // They are still unimplemented -- what changed is that they say so.
+//
+// Only four of them are POSIX: `:map`, `:unmap`, `:ab` and `:una`. `:pop` and
+// `:tags` are extensions, as NONPOSIX.md's `vi / ex` section already said when
+// the commit that added this test claimed otherwise. "pop" appears nowhere in
+// the ex or vi specs, and the `tags` POSIX does define (95941) is the
+// `:set tags=` edit option naming the files `:tag` searches -- not a command
+// that lists anything.
 #[test]
 fn unimplemented_ex_commands_report_themselves() {
     for (keys, name) in [

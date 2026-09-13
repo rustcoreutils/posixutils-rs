@@ -176,9 +176,12 @@ pub enum ExCommand {
         /// `ta[g]!` discards changes rather than refusing (95408).
         force: bool,
     },
-    /// Pop tag stack (:po, :pop).
+    /// Pop the tag stack (:po, :pop). Custom, not in POSIX: the spec gives
+    /// `:tag` and `^]` but no way back.
     Pop,
-    /// Display tags (:tags).
+    /// List the tag stack (:tags). Custom, not in POSIX -- the `tags` the spec
+    /// defines (95941) is the `:set tags=` edit option naming the files `:tag`
+    /// searches, not a command.
     Tags,
     /// Version (:ve, :version).
     Version,

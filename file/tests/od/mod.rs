@@ -1148,6 +1148,47 @@ fn od_duplicate_blocks_collapse_to_an_asterisk() {
     assert_eq!(stdout.lines().count(), 8, "seven blocks plus the offset");
 }
 
+// Suppression compares the input block, not the text it renders to. Two blocks
+// that print alike are not necessarily the same bytes, and od must not hide
+// bytes it was asked to dump.
+//
+// Comparing the rendered lines lost data two ways. A short final block renders
+// identically to the full block before it once the null extension pads it out,
+// so the last line of the file simply vanished. And a conversion that is not
+// one-to-one -- `-t a` masks to seven bits -- collapsed blocks that differ.
+#[test]
+fn od_suppression_compares_the_input_not_the_output() {
+    // 93 zero bytes: five full 16-byte blocks and a 13-byte tail, which under
+    // `-t u4` renders as the same four zeroes as the blocks before it.
+    let zeros = vec![0u8; 93];
+    let (stdout, _, code) = od_raw(&["-t", "u4"], &zeros);
+    assert_eq!(code, Some(0));
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "the short final block must print, not be swallowed: {stdout:?}"
+    );
+    assert!(lines[1] == "*", "{stdout:?}");
+    assert!(
+        lines[2].starts_with("0000120"),
+        "the 13-byte tail is its own line: {stdout:?}"
+    );
+    assert_eq!(lines[3], "0000135");
+
+    // `-t a` keeps only the low seven bits, so 0x41 and 0xc1 both print as
+    // `A` -- but they are different bytes and all three blocks must show.
+    let mut masked = vec![0x41u8; 16];
+    masked.extend([0xc1u8; 16]);
+    masked.extend([0x41u8; 16]);
+    let (stdout, _, _) = od_raw(&["-t", "a"], &masked);
+    assert!(
+        !stdout.contains('*'),
+        "blocks differing only above the mask are still different: {stdout:?}"
+    );
+    assert_eq!(stdout.lines().count(), 4, "three blocks plus the offset");
+}
+
 #[test]
 fn od_integer_size_suffixes_are_unchanged() {
     // The C/S/I/L table belongs to d/o/u/x (POSIX 109073-5) and must not have

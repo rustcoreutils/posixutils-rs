@@ -323,9 +323,10 @@ fn print_data<R: Read>(
     let mut offset: u64 = bytes_that_will_be_skipped; // Initialize offset for printing addresses.
 
     let mut buffer = [0; 16]; // Buffer to read data in chunks of 16 bytes.
-                              // The previous block's rendered lines, and whether a run of duplicates is
-                              // already standing in for them.
-    let mut previous_group: Option<Vec<String>> = None;
+
+    // The previous block's input bytes, and whether a run of duplicates is
+    // already standing in for them.
+    let mut previous_block: Option<Vec<u8>> = None;
     let mut suppressing = false;
 
     // Parse count limit from config, if specified.
@@ -401,10 +402,17 @@ fn print_data<R: Read>(
         // would be identical to the immediately preceding group of output
         // lines (except for the byte offsets), shall be replaced with a line
         // containing only an <asterisk>". The unit is the group, so a
-        // multi-type dump collapses all of its lines together or none of them;
-        // and the offsets are excluded by construction, since `lines` holds
-        // only the field text.
-        if !config.verbose && previous_group.as_deref() == Some(&lines[..]) {
+        // multi-type dump collapses all of its lines together or none of them.
+        //
+        // The comparison is of the *input*, not of the text it renders to.
+        // Identical output does not imply identical input, and od must not
+        // hide bytes it was asked to dump: `-t a` keeps only seven bits of a
+        // byte, so blocks differing above the mask printed alike. A short
+        // final block also renders like a full one once the null extension
+        // pads it out, and the last line of the file simply vanished.
+        // Comparing bytes compares the length too, which is what tells that
+        // final block apart.
+        if !config.verbose && previous_block.as_deref() == Some(local_buf) {
             if !suppressing {
                 println!("*");
                 suppressing = true;
@@ -420,7 +428,7 @@ fn print_data<R: Read>(
                     println!("{:width$}{line}", "", width = offset_string.len());
                 }
             }
-            previous_group = Some(lines);
+            previous_block = Some(local_buf.to_vec());
         }
 
         offset += bytes_read as u64; // Move to the next line of bytes.

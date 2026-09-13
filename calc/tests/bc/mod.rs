@@ -140,6 +140,42 @@ fn test_bc_array_index_out_of_bounds() {
     );
 }
 
+/// POSIX 87080: bc "shall implement an arbitrary precision calculator". Nothing
+/// asserted that at a size a machine word cannot hold, which let `NONPOSIX.md`
+/// spend two years claiming bc used 128-bit fixed-width integers.
+#[test]
+fn test_bc_arbitrary_precision_past_any_machine_word() {
+    test_bc(
+        "2^200\nquit\n",
+        "1606938044258990275541962092341162602522202993782792835301376\n",
+    );
+    test_bc("2^64+1\nquit\n", "18446744073709551617\n");
+}
+
+/// The one real bound on precision, and the only reason bc appears in
+/// `NONPOSIX.md` at all: a single operation may not build more than
+/// `MAX_WORKING_DIGITS` (1e6) decimal digits. POSIX names `{BC_SCALE_MAX}`,
+/// `{BC_BASE_MAX}`, `{BC_DIM_MAX}` and `{BC_STRING_MAX}` as the limits an
+/// implementation may impose; a ceiling on a value's digit count is not one of
+/// them, so this is a deviation rather than a permitted limit.
+#[test]
+fn test_bc_working_digit_cap() {
+    // The guard is `exponent * digits(base) > 1e6`, so base 10 (two digits)
+    // bites at 500000 and base 2 (one digit) at 1000000. Assert both sides of
+    // each boundary, or the test would pass against any cap at all.
+    test_bc("length(10^500000)\nquit\n", "500001\n");
+    bc_runtime_error("10^500001", "runtime error (line 1): exponent is too large");
+    test_bc("length(2^999999)\nquit\n", "301030\n");
+    bc_runtime_error("2^1000001", "runtime error (line 1): exponent is too large");
+
+    // The same cap reached through scale rather than an exponent reports the
+    // other of the two messages `NONPOSIX.md` now quotes.
+    bc_runtime_error(
+        "scale=1000001; 1/3",
+        "runtime error (line 1): number too large",
+    );
+}
+
 /// POSIX: "references to any of these names from other functions that are
 /// called from this function also refer to the new value". A callee saw the
 /// global instead of the caller's parameter or auto.

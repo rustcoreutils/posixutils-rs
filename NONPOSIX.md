@@ -66,8 +66,11 @@ utility below:
 ### bc
 
  * Interactive line editing and command history.
- * Numbers are 128-bit fixed-width integers, and overflow is an error.  POSIX
-   requires arbitrary precision.
+ * A single operation may not build more than one million decimal digits;
+   beyond that it fails with `number too large` or `exponent is too large`.
+   POSIX calls bc an arbitrary precision calculator, and the limits it does
+   grant by name — `{BC_SCALE_MAX}`, `{BC_BASE_MAX}`, `{BC_DIM_MAX}`,
+   `{BC_STRING_MAX}` — do not include a ceiling on a value's digit count.
 
 ### c17
 

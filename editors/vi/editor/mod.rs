@@ -174,6 +174,13 @@ pub struct Editor {
     is_error: bool,
     /// Marks (a-z for user, other for special).
     marks: [Option<Position>; 26],
+    /// Where each outstanding `:tag` / `^]` jump started, oldest first.
+    ///
+    /// Pushed by `goto_tag`, so both entry points get it; walked by `:pop` and
+    /// listed by `:tags`. Entries are never invalidated when `:e` or `:n`
+    /// changes the file — every way one can go stale is handled at pop time
+    /// instead, which is why the file is kept as a name rather than a handle.
+    tag_stack: Vec<crate::tags::TagStackEntry>,
     /// Whether editor should quit.
     should_quit: bool,
     /// Exit code.
@@ -262,6 +269,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
             shell,
@@ -306,6 +314,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
             shell,
@@ -353,6 +362,7 @@ impl Editor {
             message: None,
             is_error: false,
             marks: [None; 26],
+            tag_stack: Vec::new(),
             should_quit: false,
             exit_code: 0,
             shell,
@@ -914,9 +924,18 @@ impl Editor {
                 return Ok(());
             }
             Key::Ctrl(']') => {
-                // Tag jump - get word under cursor and jump to tag
+                // Tag jump - get word under cursor and jump to tag.
+                //
+                // The error must be reported, not discarded: `goto_tag`
+                // returns `Err(FileModified)` when the tag lives in another
+                // file and this one has unsaved changes, and swallowing it
+                // made `^]` do nothing at all, silently. It must also not
+                // escape -- an `Err` out of `handle_key` unwinds to
+                // `run_editor`, which prints and exits the editor.
                 if let Some(tag) = self.word_under_cursor() {
-                    let _ = self.goto_tag(&tag);
+                    if let Err(e) = self.goto_tag(&tag) {
+                        self.set_error(&e.to_string());
+                    }
                 }
                 return Ok(());
             }
@@ -3049,8 +3068,15 @@ impl Editor {
             ExCommand::Unmap { .. } => Err(ViError::NotImplemented("unmap")),
             ExCommand::Abbreviate { .. } => Err(ViError::NotImplemented("abbreviate")),
             ExCommand::Unabbreviate { .. } => Err(ViError::NotImplemented("unabbreviate")),
-            ExCommand::Pop => Err(ViError::NotImplemented("pop")),
-            ExCommand::Tags => Err(ViError::NotImplemented("tags")),
+            ExCommand::Pop => {
+                self.pop_tag()?;
+                Ok(ExResult::Continue)
+            }
+            // Listing an empty stack is not a failure, so this never errors --
+            // which keeps `:tags` usable from a script running under `-s`.
+            ExCommand::Tags => Ok(ExResult::CommandOutput(crate::tags::format_stack(
+                &self.tag_stack,
+            ))),
             // No wildcard: with the six above named, the match is exhaustive,
             // so a new ExCommand variant is a compile error rather than another
             // command that silently does nothing.
@@ -4631,11 +4657,20 @@ impl Editor {
             return Ok(());
         };
 
-        // Switch to the tag's file unless it is already the current file.
-        let already_open = self
+        // Where we are now, read before open() can replace the buffer. `None`
+        // means no file is current yet -- the `-t` startup option arrives here
+        // before anything is open -- and there is no position to return to, so
+        // nothing is pushed. Gating on this rather than on the caller is what
+        // keeps `:tag` and `^]` from each needing to know about the stack.
+        let origin = self
             .files
             .current_file()
-            .map(|p| p.to_string_lossy() == m.file.as_str())
+            .map(|p| (p.to_string_lossy().into_owned(), self.buffer.cursor()));
+
+        // Switch to the tag's file unless it is already the current file.
+        let already_open = origin
+            .as_ref()
+            .map(|(path, _)| path.as_str() == m.file.as_str())
             .unwrap_or(false);
         if !already_open {
             // Match :edit/:next: refuse to abandon a modified buffer (open()
@@ -4644,6 +4679,21 @@ impl Editor {
                 return Err(ViError::FileModified);
             }
             self.open(&m.file)?;
+        }
+
+        // Past both ways out that leave the cursor where it was, so the jump is
+        // now certain to have moved us -- including the case where the file
+        // opened but the pattern below is not found, which still changed the
+        // buffer and so still needs a way back.
+        if let Some((file, pos)) = origin {
+            if self.tag_stack.len() == crate::tags::TAG_STACK_MAX {
+                self.tag_stack.remove(0);
+            }
+            self.tag_stack.push(crate::tags::TagStackEntry {
+                tag: tag.to_string(),
+                file,
+                pos,
+            });
         }
 
         // Move to the definition.
@@ -4673,6 +4723,43 @@ impl Editor {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Return to where the most recent `:tag` or `^]` jump started.
+    ///
+    /// Behind both `:pop` and `^T`. Not POSIX -- see NONPOSIX.md.
+    fn pop_tag(&mut self) -> Result<()> {
+        let Some(top) = self.tag_stack.last() else {
+            return Err(ViError::TagStackEmpty);
+        };
+        let file = top.file.clone();
+        let pos = top.pos;
+
+        let same_file = self
+            .files
+            .current_file()
+            .map(|p| p.to_string_lossy() == file.as_str())
+            .unwrap_or(false);
+
+        // Refuse before popping, so `:w` and a second `:pop` still work. This
+        // is the one failure the user can recover from; every other one below
+        // discards the entry.
+        if !same_file && self.buffer.is_modified() {
+            return Err(ViError::FileModified);
+        }
+
+        // Pop before opening. If the file has been deleted since the jump, the
+        // user gets one diagnostic and the entry is gone, rather than a
+        // top-of-stack that can never be popped.
+        self.tag_stack.pop();
+        if !same_file {
+            self.open(&file)?;
+        }
+        // set_cursor clamps the line to the buffer and then the column to the
+        // line, so an entry pointing past the end of a file that has since
+        // shrunk lands on the nearest valid position instead of failing.
+        self.buffer.set_cursor(pos);
         Ok(())
     }
 

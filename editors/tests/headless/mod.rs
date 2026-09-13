@@ -3278,18 +3278,17 @@ fn test_pipe_column_inside_a_tab_lands_on_the_tab() {
 // Commands that are parsed but not implemented
 // ============================================================================
 
-// All six were parsed and then dropped into a `_ =>` arm that returned
-// success. The user typed `:map x dd`, saw no error, and had no way to learn
-// the mapping was never made.
+// These four are POSIX ex commands. They were parsed and then dropped into a
+// `_ =>` arm that returned success, so the user typed `:map x dd`, saw no
+// error, and had no way to learn the mapping was never made.
 //
 // They are still unimplemented -- what changed is that they say so.
 //
-// Only four of them are POSIX: `:map`, `:unmap`, `:ab` and `:una`. `:pop` and
-// `:tags` are extensions, as NONPOSIX.md's `vi / ex` section already said when
-// the commit that added this test claimed otherwise. "pop" appears nowhere in
-// the ex or vi specs, and the `tags` POSIX does define (95941) is the
-// `:set tags=` edit option naming the files `:tag` searches -- not a command
-// that lists anything.
+// `:pop` and `:tags` used to be on this list too, on the strength of a claim
+// that all six were POSIX. They are not: "pop" appears nowhere in the ex or vi
+// specs, and the `tags` POSIX defines (95941) is the `:set tags=` edit option
+// naming the files `:tag` searches, not a command that lists anything. Both are
+// extensions, both are implemented, and NONPOSIX.md records them.
 #[test]
 fn unimplemented_ex_commands_report_themselves() {
     for (keys, name) in [
@@ -3297,8 +3296,6 @@ fn unimplemented_ex_commands_report_themselves() {
         (":unmap x\n", "unmap"),
         (":ab foo bar\n", "abbreviate"),
         (":una foo\n", "unabbreviate"),
-        (":pop\n", "pop"),
-        (":tags\n", "tags"),
     ] {
         let mut editor = Editor::new_headless();
         editor.set_buffer_text("alpha\nbravo\n");
@@ -3320,4 +3317,213 @@ fn unimplemented_ex_commands_report_themselves() {
         // And it must not have silently altered the buffer.
         assert_eq!(editor.get_buffer_text(), "alpha\nbravo\n");
     }
+}
+
+// ============================================================================
+// Tag stack (:pop, :tags) -- extensions, see NONPOSIX.md
+// ============================================================================
+
+/// Build a tags file plus two sources and return (dir, a.c path, b.c path).
+///
+/// Paths written into the tags file are absolute, and the editor is opened with
+/// the same strings. `goto_tag` decides "is this file already open?" by
+/// comparing the two as written, so a relative name here and an absolute one
+/// there would silently take the reopen path and reset the cursor.
+fn tag_fixture() -> (plib::tmp::TempDir, String, String) {
+    let dir = plib::tmp::tempdir().unwrap();
+    let a = dir.path().join("a.c");
+    let b = dir.path().join("b.c");
+    std::fs::write(&a, "one\ntwo\nint local() { }\nfour\nfive\n").unwrap();
+    std::fs::write(&b, "alpha\nbravo\nint helper() { }\n").unwrap();
+    std::fs::write(
+        dir.path().join("tags"),
+        format!(
+            "local\t{}\t3\nhelper\t{}\t3\n",
+            a.to_str().unwrap(),
+            b.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let (as_, bs) = (
+        a.to_str().unwrap().to_string(),
+        b.to_str().unwrap().to_string(),
+    );
+    (dir, as_, bs)
+}
+
+fn set_tags_option(editor: &mut Editor, dir: &std::path::Path) {
+    let tags = dir.join("tags");
+    editor
+        .execute_initial_command(&format!("set tags={}", tags.to_str().unwrap()))
+        .unwrap();
+}
+
+/// `:tag` within one file, then `:pop` back. A jump that does not change the
+/// file still has to push: `^]` then a way back inside one source is the common
+/// case, and the whole point of the stack.
+#[test]
+fn test_pop_returns_within_the_same_file() {
+    let (dir, a, _b) = tag_fixture();
+    let mut editor = Editor::new_headless();
+    set_tags_option(&mut editor, dir.path());
+    editor.open(&a).unwrap();
+    editor.execute_keys("3G").unwrap();
+    editor.execute_keys("1G").unwrap();
+    assert_eq!(editor.get_cursor().line, 1);
+
+    editor.execute_keys(":tag local\n").unwrap();
+    assert_eq!(editor.get_cursor().line, 3, "jumped to the definition");
+
+    editor.execute_keys(":pop\n").unwrap();
+    assert_eq!(editor.get_cursor().line, 1, "and back to where we started");
+}
+
+/// Across files: `:pop` reopens the origin and restores the position in it.
+#[test]
+fn test_pop_returns_across_files() {
+    let (dir, a, _b) = tag_fixture();
+    let mut editor = Editor::new_headless();
+    set_tags_option(&mut editor, dir.path());
+    editor.open(&a).unwrap();
+    editor.execute_keys("4G").unwrap();
+
+    editor.execute_keys(":tag helper\n").unwrap();
+    assert!(
+        editor.get_buffer_text().contains("bravo"),
+        "should be in b.c now, got {:?}",
+        editor.get_buffer_text()
+    );
+
+    editor.execute_keys(":pop\n").unwrap();
+    assert!(
+        editor.get_buffer_text().contains("four"),
+        "should be back in a.c, got {:?}",
+        editor.get_buffer_text()
+    );
+    assert_eq!(editor.get_cursor().line, 4, "at the line we left from");
+}
+
+/// `^]` pushes exactly as `:tag` does -- the push lives in `goto_tag`, so both
+/// entry points get it without knowing about the stack.
+#[test]
+fn test_ctrl_bracket_pushes_the_tag_stack() {
+    let (dir, a, _b) = tag_fixture();
+    let mut editor = Editor::new_headless();
+    set_tags_option(&mut editor, dir.path());
+    editor.open(&a).unwrap();
+    // Put the cursor on the word `local` on line 3... start from line 1 and
+    // write the word there so `^]` has something to read.
+    editor.execute_keys("1Gcwlocal\x1b").unwrap();
+    editor.execute_keys("0").unwrap();
+
+    editor.execute_keys("\x1d").unwrap(); // ^]
+    assert_eq!(editor.get_cursor().line, 3, "^] jumped to the definition");
+
+    editor.execute_keys(":pop\n").unwrap();
+    assert_eq!(editor.get_cursor().line, 1, ":pop undid the ^] jump");
+}
+
+/// A tag that is not in the tags file moves nothing, so it must not push --
+/// otherwise a later `:pop` would "return" to a place we never left.
+#[test]
+fn test_a_failed_tag_lookup_does_not_push() {
+    let (dir, a, _b) = tag_fixture();
+    let mut editor = Editor::new_headless();
+    set_tags_option(&mut editor, dir.path());
+    editor.open(&a).unwrap();
+
+    editor.execute_keys(":tag nosuchtag\n").unwrap();
+    assert!(editor.is_error_message(), "a missing tag reports an error");
+
+    editor.execute_keys(":pop\n").unwrap();
+    assert!(
+        editor.is_error_message(),
+        "the stack must still be empty; got {:?}",
+        editor.get_message()
+    );
+    assert!(editor
+        .get_message()
+        .unwrap_or_default()
+        .contains("tag stack empty"));
+}
+
+/// `:pop` on an empty stack is an error, and says which.
+#[test]
+fn test_pop_on_an_empty_stack_reports_itself() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+    editor.execute_keys(":pop\n").unwrap();
+    assert!(editor.is_error_message());
+    assert!(
+        editor
+            .get_message()
+            .unwrap_or_default()
+            .contains("tag stack empty"),
+        "got {:?}",
+        editor.get_message()
+    );
+}
+
+/// A modified buffer refuses the cross-file return -- and keeps the entry, so
+/// the user can write and pop again. Discarding it would make the refusal
+/// unrecoverable, which is the opposite of what a guard is for.
+#[test]
+fn test_pop_refuses_a_modified_buffer_without_losing_the_entry() {
+    let (dir, a, _b) = tag_fixture();
+    let mut editor = Editor::new_headless();
+    set_tags_option(&mut editor, dir.path());
+    editor.open(&a).unwrap();
+    editor.execute_keys("2G").unwrap();
+    editor.execute_keys(":tag helper\n").unwrap();
+
+    editor.execute_keys("iEDITED\x1b").unwrap();
+    editor.execute_keys(":pop\n").unwrap();
+    assert!(editor.is_error_message(), "a modified buffer refuses");
+    assert!(
+        editor.get_buffer_text().contains("EDITED"),
+        "and the edit survives"
+    );
+
+    // The entry is still there: undo the change and the pop now works.
+    editor.execute_keys(":w\n").unwrap();
+    editor.execute_keys(":pop\n").unwrap();
+    assert!(
+        editor.get_buffer_text().contains("one"),
+        "the retry must return to a.c, so the entry was kept; got {:?}",
+        editor.get_buffer_text()
+    );
+    assert_eq!(editor.get_cursor().line, 2);
+}
+
+/// `:tags` names the tag and where it will return to.
+#[test]
+fn test_tags_lists_the_stack() {
+    let (dir, a, _b) = tag_fixture();
+    let mut editor = Editor::new_headless();
+    set_tags_option(&mut editor, dir.path());
+    editor.open(&a).unwrap();
+    editor.execute_keys("2G").unwrap();
+    editor.execute_keys(":tag helper\n").unwrap();
+
+    editor.execute_keys(":tags\n").unwrap();
+    let msg = editor.get_message().unwrap_or_default().to_string();
+    assert!(!editor.is_error_message(), "listing is not a failure");
+    assert!(
+        msg.contains("helper") && msg.contains("a.c") && msg.contains("line 2"),
+        "must name the tag and the position :pop returns to; got {msg:?}"
+    );
+}
+
+/// An empty stack lists a line rather than erroring, so `:tags` stays usable
+/// from a script running under `-s`.
+#[test]
+fn test_tags_on_an_empty_stack_is_not_an_error() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+    editor.execute_keys(":tags\n").unwrap();
+    assert!(!editor.is_error_message());
+    assert!(editor
+        .get_message()
+        .unwrap_or_default()
+        .contains("tag stack empty"));
 }

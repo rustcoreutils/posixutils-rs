@@ -410,8 +410,13 @@ No `uucp`, `uux` or `uustat` *options* are extensions.
  * `+command` — an initial ex command.
  * `-s` and `-v` are accepted by `vi`; POSIX defines them for `ex` only.
  * `set expandtab` / `et`, and `set backup`.
- * The ex commands `:pwd`, `:prev` / `:previous`, `:red` / `:redo`,
-   `:po` / `:pop`, `:tags`, and `:h` / `:help`.
+ * The ex commands `:pwd`, `:prev` / `:previous`, `:red` / `:redo`, and
+   `:h` / `:help`.
+ * A tag stack.  `:ta` / `:tag` and `^]` record the position they left;
+   `:po` / `:pop` returns to it and `:tags` lists what is outstanding.  POSIX
+   specifies `:tag` and `^]` but nothing that goes back, and the `tags` it
+   defines is the `:set tags=` edit option naming the files `:tag` searches,
+   not a command.
  * `COLUMNS`, `LINES` and `TMPDIR` are consulted.  POSIX names `EXINIT`,
    `HOME`, `SHELL` and `TERM`.
 

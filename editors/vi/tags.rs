@@ -22,6 +22,49 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
+use crate::buffer::Position;
+
+/// Most tag-stack entries kept. `^]` inside a loop would otherwise grow the
+/// stack without bound, and no edit option governs its depth.
+pub const TAG_STACK_MAX: usize = 64;
+
+/// Where a `:tag` or `^]` jump started, so `:pop` can return to it.
+///
+/// Not POSIX: the spec has `:tag` and `^]` but nothing that goes back. See
+/// NONPOSIX.md.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagStackEntry {
+    /// The tag that was jumped to, for `:tags` to name.
+    pub tag: String,
+    /// The file that was current before the jump.
+    ///
+    /// Compared as written rather than canonicalized, matching how `goto_tag`
+    /// decides whether a tag's file is already open — so `./x.c` and `x.c` are
+    /// two different files to the stack, as they are to the jump.
+    pub file: String,
+    /// The cursor position before the jump.
+    pub pos: Position,
+}
+
+/// Render the tag stack for `:tags`, most recent first — the order in which
+/// `:pop` will walk it. POSIX fixes no format; there is no `:tags` in POSIX.
+pub fn format_stack(stack: &[TagStackEntry]) -> Vec<String> {
+    if stack.is_empty() {
+        return vec!["tag stack empty".to_string()];
+    }
+    let mut out = vec![format!("{:>3}  {:<20} {}", "#", "tag", "position")];
+    for (i, e) in stack.iter().enumerate().rev() {
+        out.push(format!(
+            "{:>3}  {:<20} {}, line {}",
+            i + 1,
+            e.tag,
+            e.file,
+            e.pos.line
+        ));
+    }
+    out
+}
+
 /// Where a tag entry says the definition lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagAddress {
@@ -163,5 +206,39 @@ mod tests {
         // With taglength 4, "funcXXX" matches "function_one" on the first 4.
         assert!(lookup(&[path], "funczzzz", 4).is_some());
         assert!(lookup(&[path], "fxxx", 4).is_none());
+    }
+
+    fn entry(tag: &str, file: &str, line: usize) -> TagStackEntry {
+        TagStackEntry {
+            tag: tag.to_string(),
+            file: file.to_string(),
+            pos: Position::new(line, 0),
+        }
+    }
+
+    /// An empty stack is not an error to list, so it renders a line rather than
+    /// nothing -- `:tags` stays usable in a script run under `-s`.
+    #[test]
+    fn test_format_stack_empty() {
+        assert_eq!(format_stack(&[]), vec!["tag stack empty".to_string()]);
+    }
+
+    /// Most recent first, which is the order `:pop` walks. The header makes the
+    /// numbering readable; the numbers count up from the bottom so an entry
+    /// keeps its number as newer ones are pushed and popped above it.
+    #[test]
+    fn test_format_stack_lists_most_recent_first() {
+        let stack = [entry("main", "a.c", 17), entry("helper", "b.c", 42)];
+        let out = format_stack(&stack);
+        assert_eq!(out.len(), 3, "header plus one row per entry: {out:?}");
+        assert!(out[0].contains("tag") && out[0].contains("position"));
+        assert!(
+            out[1].contains("helper") && out[1].contains("b.c") && out[1].contains("line 42"),
+            "the most recent entry comes first: {out:?}"
+        );
+        assert!(
+            out[2].contains("main") && out[2].contains("a.c") && out[2].contains("line 17"),
+            "the oldest entry comes last: {out:?}"
+        );
     }
 }

@@ -76,6 +76,8 @@ pub enum ViError {
     TagNotFound(String),
     /// No tags file.
     NoTagsFile,
+    /// `:pop` or `^T` with nothing left to return to.
+    TagStackEmpty,
     /// Invalid line number.
     InvalidLine(usize),
     /// Invalid pattern.
@@ -128,6 +130,7 @@ impl fmt::Display for ViError {
             ViError::CountOutOfRange => write!(f, "Count out of range"),
             ViError::TagNotFound(s) => write!(f, "Tag not found: {}", s),
             ViError::NoTagsFile => write!(f, "No tags file"),
+            ViError::TagStackEmpty => write!(f, "tag stack empty"),
             ViError::InvalidLine(n) => write!(f, "Invalid line: {}", n),
             ViError::InvalidPattern(s) => write!(f, "Invalid pattern: {}", s),
             ViError::ShellError(s) => write!(f, "Shell error: {}", s),

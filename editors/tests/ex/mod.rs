@@ -656,6 +656,58 @@ fn test_ex_tag_lookup() {
     );
 }
 
+/// The tag stack through the real binary under `-s`. `:tags` returns its
+/// listing as `CommandOutput`, which ex mode prints to stdout and `-s` does
+/// *not* suppress -- unlike a status message. That difference is only
+/// observable here, not in the headless harness.
+///
+/// `:pop` and `:tags` are extensions; POSIX has `:tag` and `^]` and no way
+/// back. See NONPOSIX.md.
+#[test]
+fn test_ex_tag_pop_and_tags() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("src.c"),
+        "int helper() { }\nint main() { }\nlast line\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("tags"), "helper\tsrc.c\t1\n").unwrap();
+
+    let bin = get_binary_path("ex");
+    let run = |script: &[u8]| {
+        let mut cmd = Command::new(&bin);
+        cmd.arg("-s")
+            .arg("src.c")
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(script).unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Move to line 3, jump to the tag on line 1, pop, and print: the current
+    // line must be the one we left from.
+    let out = run(b"3\ntag helper\npop\np\nq!\n");
+    assert_eq!(out.trim(), "last line", "pop must restore the origin line");
+
+    // :tags names the tag and the position pop would return to.
+    let out = run(b"3\ntag helper\ntags\nq!\n");
+    assert!(
+        out.contains("helper") && out.contains("src.c") && out.contains("line 3"),
+        "tags listing must reach stdout under -s; got {out:?}"
+    );
+
+    // With nothing pushed, :tags still prints rather than failing.
+    let out = run(b"tags\nq!\n");
+    assert!(
+        out.contains("tag stack empty"),
+        "an empty stack lists, it does not error; got {out:?}"
+    );
+}
+
 // ============================================================================
 // Address fidelity (audit #X4 trailing delimiter, #X9 offsets)
 // ============================================================================

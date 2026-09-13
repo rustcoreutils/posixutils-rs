@@ -1430,9 +1430,12 @@ fn tr_class_spread_over_string2_does_not_fill_the_tables() {
 // outright; there is no need to, once it is not being counted out.
 #[test]
 fn tr_large_repeat_count_in_string1_terminates() {
+    // `x` fills every position but the last, so string2 -- padded with its
+    // own last character -- gives `b` for both. GNU agrees for the counts it
+    // accepts at all.
     let started = std::time::Instant::now();
-    tr_test(&["[x*18446744073709551615]y", "ab"], "xy", "ab");
-    tr_test(&["[x*4294967296]y", "ab"], "xy", "ab");
+    tr_test(&["[x*18446744073709551615]y", "ab"], "xy", "bb");
+    tr_test(&["[x*4294967296]y", "ab"], "xy", "bb");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
         "a string1 repeat count must not be counted out"

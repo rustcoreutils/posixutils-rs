@@ -896,6 +896,12 @@ fn od_float_output_is_shortest_round_trip_in_g_format() {
         (0xff80_0000, "-inf"),
         (0x7fc0_0000, "nan"),
         (0xffc0_0000, "-nan"),
+        // An exact tie in the last digit: 4088288.25 reads back the same at
+        // either spelling, and od resolves it to even, as C's %g does. Rust's
+        // own shortest representation resolves away from zero and would give
+        // -4088288.3 here.
+        (0xca79_8781, "-4088288.2"),
+        (0x4a72_2829, "3967498.2"),
         (0x8000_0000, "-0"),
         (0x0000_0000, "0"),
         (0xbf80_0000, "-1"),

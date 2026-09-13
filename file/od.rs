@@ -514,6 +514,31 @@ fn chunk_to_i64(chunk: &[u8], num_bytes: usize) -> i64 {
     }
 }
 
+/// The shortest exponent-form spelling of `value` that reads back unchanged,
+/// found the way od finds it: raise the precision until the round trip holds.
+///
+/// `{:e}` gives a shortest form directly, but it resolves an exact tie in the
+/// last digit *away from zero*, where C's `%g` -- and so every other od --
+/// resolves it to even. 4088288.25 is such a tie: `4088288.2` and `4088288.3`
+/// both read back as that float, and od prints the first. Rust's
+/// fixed-precision formatting already rounds to even, so asking for each
+/// precision in turn gets the tie right and the shortest length with it.
+///
+/// `max_precision` is one less than the digits that always round-trip the
+/// type: 9 for `f32`, 17 for `f64`.
+fn shortest_exp_form<T>(value: T, max_precision: usize) -> String
+where
+    T: std::fmt::LowerExp + std::str::FromStr + PartialEq + Copy,
+{
+    for precision in 0..max_precision {
+        let candidate = format!("{value:.*e}", precision);
+        if candidate.parse::<T>().ok() == Some(value) {
+            return candidate;
+        }
+    }
+    format!("{value:.*e}", max_precision)
+}
+
 /// The column width a float field occupies, the separating blank included.
 fn float_field(num_bytes: usize) -> usize {
     match num_bytes {
@@ -749,7 +774,7 @@ fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
                 value.is_infinite(),
                 value.is_sign_negative(),
                 decimal_precision(num_bytes),
-                || format!("{value:e}"),
+                || shortest_exp_form(value, 8),
             )
         }
         8 => {
@@ -760,7 +785,7 @@ fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
                 value.is_infinite(),
                 value.is_sign_negative(),
                 decimal_precision(num_bytes),
-                || format!("{value:e}"),
+                || shortest_exp_form(value, 16),
             )
         }
         16 => {
@@ -770,7 +795,7 @@ fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
                 value.is_infinite(),
                 value.is_sign_negative(),
                 decimal_precision(num_bytes),
-                || format!("{value:e}"),
+                || shortest_exp_form(value, 16),
             )
         }
         // `parse_type_string` admits no other width.

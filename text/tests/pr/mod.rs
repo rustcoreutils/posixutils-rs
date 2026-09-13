@@ -473,3 +473,45 @@ fn pr_header_date_follows_lc_time() {
     );
     let _ = std::fs::remove_file(f);
 }
+
+/// `pr` must name the file it could not open.
+///
+/// The serial branch had the operand as its loop variable and discarded it,
+/// so `pr /nonexistent` read `pr: No such file or directory`. GNU names it.
+#[test]
+fn test_pr_error_names_the_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("pr"))
+        .arg("/nonexistent_pr_probe_zz")
+        .output()
+        .expect("spawn pr");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("pr: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_pr_probe_zz"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}
+
+/// `-r` suppresses the "cannot open" warning; naming the file must not have
+/// made it reappear.
+#[test]
+fn test_pr_r_still_suppresses_the_named_warning() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("pr"))
+        .args(["-r", "/nonexistent_pr_probe_zz"])
+        .output()
+        .expect("spawn pr");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "",
+        "-r must suppress the file warning entirely"
+    );
+}

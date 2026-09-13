@@ -4226,3 +4226,30 @@ fn test_high_byte_escapes_still_compile_and_match() {
         );
     }
 }
+
+/// `lex` must name the file it could not open.
+///
+/// `concat_input_files` had `filename` as its loop variable and let a bare `?`
+/// discard it, so the diagnostic read `lex: No such file or directory`.
+#[test]
+fn test_lex_error_names_the_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("lex"))
+        .arg("/nonexistent_lex_probe_zz.l")
+        .output()
+        .expect("spawn lex");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("lex: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_lex_probe_zz.l"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

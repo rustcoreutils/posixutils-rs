@@ -649,7 +649,13 @@ fn main() -> ExitCode {
         for file in args.file() {
             if let Err(e) = pr_serial(file, &params) {
                 if !params.no_file_warnings {
-                    plib::diag::error(&plib::diag::error_text(&e));
+                    // The operand is the loop variable; reporting the errno
+                    // alone left the user to guess which file failed.
+                    plib::diag::error(&format!(
+                        "{}: {}",
+                        file.display(),
+                        plib::diag::error_text(&e)
+                    ));
                 }
                 success = false;
             }

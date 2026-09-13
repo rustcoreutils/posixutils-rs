@@ -56,7 +56,11 @@ fn concat_input_files(files: &[String]) -> io::Result<Vec<String>> {
         let file: Box<dyn Read> = if filename == "-" {
             Box::new(io::stdin().lock())
         } else {
-            Box::new(fs::File::open(filename)?)
+            // Name the file: a bare `?` here surfaced in main as
+            // `lex: No such file or directory`, with no operand.
+            Box::new(fs::File::open(filename).map_err(|e| {
+                io::Error::other(format!("{}: {}", filename, diag::io_error_text(&e)))
+            })?)
         };
         let mut reader = io::BufReader::new(file);
 
@@ -69,11 +73,10 @@ fn concat_input_files(files: &[String]) -> io::Result<Vec<String>> {
                     input.push(line);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "{}: {}",
-                        gettext("Error reading file"),
-                        diag::io_error_text(&e)
-                    );
+                    // Was a bare eprintln!: no `lex: ` prefix, no filename,
+                    // and no increment of the error counter that decides the
+                    // exit status.
+                    diag::error(&format!("{}: {}", filename, diag::io_error_text(&e)));
                     return Err(e);
                 }
             }

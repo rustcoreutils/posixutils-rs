@@ -502,3 +502,34 @@ fn test_du_h_l_last_wins() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// An operand `du` cannot reach must be named.
+///
+/// The `err_reporter` closure bound the entry as `_entry` and threw it away,
+/// so every failure read `du: No such file or directory` with no indication
+/// of which of several operands it was about. `ftw::Entry::path()` was there
+/// the whole time. GNU: `du: cannot access '...': No such file or directory`.
+#[test]
+fn test_du_error_names_the_operand() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("du"))
+        .args(["/nonexistent_du_probe_zz", "/also_nonexistent_du_zz"])
+        .output()
+        .expect("spawn du");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    for operand in ["/nonexistent_du_probe_zz", "/also_nonexistent_du_zz"] {
+        assert!(
+            stderr.contains(operand),
+            "each unreachable operand must be named: {stderr:?}"
+        );
+    }
+    assert!(
+        stderr.starts_with("du: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

@@ -659,7 +659,21 @@ fn long_double_to_f64(buf: &[u8; 16]) -> f64 {
 /// positive exponent, and pads it to no width. od wants positional notation
 /// unless the exponent is below -4 or has reached the number of significant
 /// digits, and a signed, two-digit-minimum exponent when it does use one.
-fn render_g(exp_form: &str) -> String {
+/// The decimal precision of a float of this width -- C's `FLT_DIG`, `DBL_DIG`
+/// and `LDBL_DIG` -- which is what decides `%g`'s positional/exponential
+/// threshold.
+fn decimal_precision(num_bytes: usize) -> i32 {
+    match num_bytes {
+        4 => 6,
+        8 => 15,
+        // x87 80-bit carries 18 decimal digits, IEEE binary128 carries 33.
+        16 if cfg!(target_arch = "x86_64") => 18,
+        16 => 33,
+        _ => unreachable!("unsupported float width {num_bytes}"),
+    }
+}
+
+fn render_g(exp_form: &str, precision: i32) -> String {
     let (mantissa, exponent) = match exp_form.split_once('e') {
         Some(parts) => parts,
         // `{:e}` always writes an exponent; nothing to rescue if it did not.
@@ -669,10 +683,18 @@ fn render_g(exp_form: &str) -> String {
 
     let negative = mantissa.starts_with('-');
     let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
-    let sig = digits.len() as i32;
 
-    // C's %g rule, with the precision being the significant digits present.
-    let body = if exponent < -4 || exponent >= sig {
+    // C's %g rule, at whichever precision od would have had to ask for: it
+    // starts at the type's decimal precision and raises it until the digits
+    // round-trip, so the threshold is the larger of the two. Neither alone is
+    // right. The type's precision by itself sends 5423149.5 (eight digits,
+    // exponent 6) to exponential form where GNU prints it positionally; the
+    // digit count by itself sends 100 (one digit, exponent 2) there too.
+    //
+    // The digits themselves stay the shortest that round-trips, which is what
+    // od shows and what `{:e}` already gave us.
+    let precision = precision.max(digits.len() as i32);
+    let body = if exponent < -4 || exponent >= precision {
         let mantissa = if digits.len() == 1 {
             digits
         } else {
@@ -726,6 +748,7 @@ fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
                 value.is_nan(),
                 value.is_infinite(),
                 value.is_sign_negative(),
+                decimal_precision(num_bytes),
                 || format!("{value:e}"),
             )
         }
@@ -736,6 +759,7 @@ fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
                 value.is_nan(),
                 value.is_infinite(),
                 value.is_sign_negative(),
+                decimal_precision(num_bytes),
                 || format!("{value:e}"),
             )
         }
@@ -745,6 +769,7 @@ fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
                 value.is_nan(),
                 value.is_infinite(),
                 value.is_sign_negative(),
+                decimal_precision(num_bytes),
                 || format!("{value:e}"),
             )
         }
@@ -762,6 +787,7 @@ fn float_to_text(
     is_nan: bool,
     is_infinite: bool,
     is_negative: bool,
+    precision: i32,
     exp_form: impl FnOnce() -> String,
 ) -> String {
     // A NaN carries a sign bit like any other float, and od prints it: the
@@ -771,7 +797,7 @@ fn float_to_text(
     } else if is_infinite {
         if is_negative { "-inf" } else { "inf" }.to_string()
     } else {
-        render_g(&exp_form())
+        render_g(&exp_form(), precision)
     }
 }
 

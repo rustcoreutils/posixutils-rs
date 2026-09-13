@@ -868,8 +868,14 @@ fn od_float_output_is_shortest_round_trip_in_g_format() {
         (0x4049_0fdb, "3.1415927"),
         (0x7f7f_ffff, "3.4028235e+38"),
         (0x0000_0001, "1e-45"),
+        // The positional/exponential threshold is the *type's* decimal
+        // precision -- FLT_DIG, 6 -- not the number of digits this particular
+        // value happens to need. 999999 is positional and 1e6 is not.
+        (0x4974_23f0, "999999"),
         (0x4974_2400, "1e+06"),
         (0x4b18_9680, "1e+07"),
+        (0x42c8_0000, "100"),
+        (0x4874_2400, "250000"),
         (0x3a83_126f, "0.001"),
         (0x3927_c5ac, "0.00016"),
         (0x7f80_0000, "inf"),
@@ -895,7 +901,11 @@ fn od_float_output_is_shortest_round_trip_in_g_format() {
         (0x3fb9_9999_9999_999a, "0.1"),
         (0x7fef_ffff_ffff_ffff, "1.7976931348623157e+308"),
         (0x0000_0000_0000_0001, "5e-324"),
+        // DBL_DIG is 15, so 1e14 is positional and 1e15 is not.
+        (0x42d6_bcc4_1e90_0000, "100000000000000"),
         (0x430c_6bf5_2634_0000, "1e+15"),
+        (0x4202_a05f_2000_0000, "10000000000"),
+        (0x41d2_6580_b480_0000, "1234567890"),
         (0x7ff0_0000_0000_0000, "inf"),
         (0x7ff8_0000_0000_0000, "nan"),
         (0xfff8_0000_0000_0000, "-nan"),

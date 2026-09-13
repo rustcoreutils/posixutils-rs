@@ -504,7 +504,11 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 
     let mut page_iterators = Vec::with_capacity(paths.len());
     for p in paths {
-        let stream = input_stream(p, true)?;
+        // Name the operand here: `pr_merged` takes the whole slice, so main's
+        // diagnostic cannot say which of them failed.
+        let stream = input_stream(p, true).map_err(|e| {
+            io::Error::other(format!("{}: {}", p.display(), plib::diag::error_text(&e)))
+        })?;
         let it = PageIterator::new(stream, params.body_lines_per_page);
         page_iterators.push(it);
     }

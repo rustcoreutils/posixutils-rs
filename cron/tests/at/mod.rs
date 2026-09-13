@@ -486,12 +486,13 @@ fn at_command(args: &[&str], stdin_data: &str) -> std::process::Output {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn at");
-    child
+    // `at` validates the timespec before reading stdin, so for the failure
+    // cases here the child may already be gone: EPIPE is expected, not a bug.
+    let _ = child
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(stdin_data.as_bytes())
-        .unwrap();
+        .write_all(stdin_data.as_bytes());
     child.wait_with_output().unwrap()
 }
 

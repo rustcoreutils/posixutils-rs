@@ -515,3 +515,36 @@ fn test_pr_r_still_suppresses_the_named_warning() {
         "-r must suppress the file warning entirely"
     );
 }
+
+/// `pr -m` must name the file it could not open.
+///
+/// `pr_merged` takes the whole operand slice, so the diagnostic in main had
+/// nothing to name; the failing path is the loop variable inside it.
+#[test]
+fn test_pr_merge_error_names_the_file() {
+    let dir = plib::tmp::tempdir().expect("tempdir");
+    let good = dir.path().join("good.txt");
+    std::fs::write(&good, "one\ntwo\n").unwrap();
+
+    let out = std::process::Command::new(plib::testing::get_binary_path("pr"))
+        .arg("-m")
+        .arg(&good)
+        .arg("/nonexistent_pr_merge_zz")
+        .output()
+        .expect("spawn pr");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("pr: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_pr_merge_zz"),
+        "the failing operand must be named: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(good.to_str().unwrap()),
+        "the readable operand must not be blamed: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

@@ -9,13 +9,23 @@
 
 use chrono::Utc;
 use cron::spool::{at, print_err_and_exit, read_commands_from_stdin};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain("posixutils-rs")?;
-    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+fn main() -> std::process::ExitCode {
+    // Registers the utility name as well as setting the locale. batch used raw
+    // gettextrs, so `print_err_and_exit` had no prefix to print and every
+    // failure arrived unattributed.
+    plib::diag::init_locale("batch");
 
+    match batch_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            plib::diag::error(&plib::diag::error_text(e.as_ref()));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn batch_main() -> Result<(), Box<dyn std::error::Error>> {
     // batch is `at now`: schedule for the current absolute instant (audit #B4).
     let time = Utc::now();
 

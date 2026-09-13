@@ -334,26 +334,9 @@ impl SubstituteFlags {
     }
 }
 
-/// Mode for key mappings.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MapMode {
-    /// Command mode.
-    Command,
-    /// Insert mode.
-    Insert,
-}
-
-impl MapMode {
-    /// `map!` / `unmap!` address the text input mode map list (95090-95092);
-    /// without the bang they address the command mode list.
-    pub fn for_bang(bang: bool) -> Self {
-        if bang {
-            MapMode::Insert
-        } else {
-            MapMode::Command
-        }
-    }
-}
+/// Which map table a command addresses. Defined beside the tables themselves,
+/// and re-exported here so the parser keeps naming it where the commands are.
+pub use crate::maps::MapMode;
 
 /// Result of executing an ex command.
 #[derive(Debug)]

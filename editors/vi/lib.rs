@@ -20,6 +20,7 @@ pub mod error;
 pub mod ex;
 pub mod file;
 pub mod input;
+pub mod maps;
 pub mod mode;
 pub mod options;
 pub mod recover;

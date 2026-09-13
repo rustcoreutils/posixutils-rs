@@ -1422,3 +1422,19 @@ fn tr_class_spread_over_string2_does_not_fill_the_tables() {
         "a class spread over string2 must not be enumerated into the tables; took {elapsed:?}"
     );
 }
+
+// A repeat count in *string1* is a number too. Only the positions before
+// string2 goes constant can differ, so the loop that pairs them is bounded by
+// that, not by the count: `tr '[x*18446744073709551615]y' 'ab'` ran the loop
+// eighteen quintillion times and never returned. GNU rejects the count
+// outright; there is no need to, once it is not being counted out.
+#[test]
+fn tr_large_repeat_count_in_string1_terminates() {
+    let started = std::time::Instant::now();
+    tr_test(&["[x*18446744073709551615]y", "ab"], "xy", "ab");
+    tr_test(&["[x*4294967296]y", "ab"], "xy", "ab");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "a string1 repeat count must not be counted out"
+    );
+}

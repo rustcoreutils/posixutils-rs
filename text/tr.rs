@@ -1335,27 +1335,6 @@ mod setup {
         let st = std::str::from_utf8(&buf[..width]).ok()?;
         st.chars().next().map(|c| (c, width))
     }
-    /// Decode the character beginning at `lead`, returning it with the number of
-    /// *additional* bytes it consumed. `None` when the bytes are not a complete
-    /// valid character, in which case the caller keeps its byte-wise behavior.
-    pub fn decode_char(lead: u8, next_bytes: &[u8]) -> Option<(char, usize)> {
-        if lead < 128_u8 {
-            return Some((char::from(lead), 0_usize));
-        }
-        let width = match lead {
-            0xC2..=0xDF => 2_usize,
-            0xE0..=0xEF => 3_usize,
-            0xF0..=0xF4 => 4_usize,
-            _ => return None,
-        };
-        let extra = width - 1_usize;
-        let tail = next_bytes.get(..extra)?;
-        let mut buf = [0_u8; 4_usize];
-        buf[0] = lead;
-        buf[1..width].copy_from_slice(tail);
-        let st = std::str::from_utf8(&buf[..width]).ok()?;
-        st.chars().next().map(|c| (c, extra))
-    }
 
     /// Split out `[:lower:]`↔`[:upper:]` pairings that sit at the same relative
     /// position in the two operand lists (POSIX 118123-118130).
@@ -1717,7 +1696,14 @@ mod setup {
                     } else {
                         // A character repeated in string1 is unspecified
                         // (118151-2); the last position wins, as before.
-                        for offset in 0_usize..n {
+                        //
+                        // Bounded by where string2 stops varying, not by the
+                        // count: every position past that maps to the same
+                        // character, and each iteration overwrites the same
+                        // table slot anyway. Counting `[x*18446744073709551615]`
+                        // out never returned.
+                        let paired = n.min(constant_from.saturating_sub(position));
+                        for offset in 0_usize..paired {
                             let replacement = replacements.at(position + offset);
                             add_normal_char_with_replacement(
                                 char.clone(),
@@ -2059,8 +2045,6 @@ mod setup {
         }
     }
 
-    impl ComplementedTranslation {}
-
     impl Translation for ComplementedTranslation {
         /// A complement maps every *non*-member to one character, so it needs
         /// membership and a replacement -- never an array. Asking the same
@@ -2149,18 +2133,14 @@ mod setup {
         fn get_case_fold_result(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
             let folds = self.case_folds();
             if !folds.is_empty() {
-                if let Some((c, extra)) = decode_char(ue, next_bytes) {
+                if let Some((c, width)) = decode_one(ue, next_bytes) {
                     for fold in folds {
                         if let Some(replacement) = fold.apply(c) {
-                            let lookahead = match extra {
-                                1_usize => Some(SearchNumberOfBytes::One),
-                                2_usize => Some(SearchNumberOfBytes::Two),
-                                3_usize => Some(SearchNumberOfBytes::Three),
-                                _ => None,
-                            };
                             return ReplacementCheckResult {
                                 replacement: Some(replacement),
-                                match_lookahead_length: lookahead,
+                                match_lookahead_length: SearchNumberOfBytes::from_extra(
+                                    width - 1_usize,
+                                ),
                                 found_match: true,
                             };
                         }

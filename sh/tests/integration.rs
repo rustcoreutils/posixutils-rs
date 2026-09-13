@@ -1815,8 +1815,19 @@ mod audit_regressions {
         run_successfully_and("cd -e -P /tmp && echo ok\n", |out| {
             assert_eq!(out, "ok\n");
         });
-        run_successfully_and("cd -eP /tmp && pwd\n", |out| {
-            assert_eq!(out.trim(), "/tmp");
+        // The bundled form parses too. Asserted against `cd -P` rather than a
+        // literal path: `-e` is inert when PWD *can* be determined, which is
+        // the whole claim, and it holds wherever /tmp is a symlink (macOS
+        // resolves it to /private/tmp, so pinning "/tmp" after asking for -P
+        // was asserting the opposite of what -P means).
+        run_successfully_and("cd -eP /tmp && pwd\ncd / && cd -P /tmp && pwd\n", |out| {
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines.len(), 2, "expected two pwd lines: {out:?}");
+            assert_eq!(
+                lines[0], lines[1],
+                "-e must not change where -P lands: {out:?}"
+            );
+            assert!(lines[0].starts_with('/'), "pwd must be absolute: {out:?}");
         });
     }
 

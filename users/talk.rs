@@ -803,6 +803,107 @@ fn spawn_input_thread(
 /// Row and column are tracked here rather than recomputed from a text buffer,
 /// which is what audit #TK16 was about: the column used to come from a snapshot
 /// of the sender's buffer that the peer thread could never see updated.
+/// The terminal control sequences `talk` needs, resolved from `TERM`.
+///
+/// The spec lists TERM in talk's ENVIRONMENT VARIABLES (116812-13): "Determine
+/// the name of the invoker's terminal type. If this variable is unset or null,
+/// an unspecified default terminal type shall be used." Every sequence here
+/// used to be a hard-coded ANSI literal, so a terminal that addresses its
+/// cursor differently got garbage.
+///
+/// Only four capabilities are needed, and the ANSI literals remain as the
+/// "unspecified default" the spec allows: an unset TERM, or one with no
+/// terminfo entry, behaves exactly as before.
+#[derive(Debug, Clone)]
+struct TermCaps {
+    /// `cup` -- absolute cursor address, already expanded per call.
+    cursor_address: Option<Vec<u8>>,
+    /// `el` -- erase to end of line.
+    clr_eol: String,
+    /// `clear` -- erase the screen and home the cursor.
+    clear_screen: String,
+    /// `cud1` -- move down one line.
+    cursor_down: String,
+}
+
+impl Default for TermCaps {
+    /// The ANSI sequences talk hard-coded before it consulted terminfo.
+    fn default() -> Self {
+        TermCaps {
+            cursor_address: None,
+            clr_eol: "\x1b[K".to_string(),
+            clear_screen: "\x1b[2J\x1b[H".to_string(),
+            cursor_down: "\x1b[1B".to_string(),
+        }
+    }
+}
+
+/// Remove terminfo padding specifications from a capability string.
+///
+/// A capability may carry a delay as `$<5>` or `$<10*/>`, which the old
+/// baud-rate-limited terminals needed as literal pause time. Nothing here
+/// honours delays, and writing the specification through would put `$<5>` on
+/// the user's screen -- vt100's own `cup` is `\E[%i%p1%d;%p2%dH$<5>`.
+fn strip_padding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("$<") {
+        out.push_str(&rest[..at]);
+        match rest[at..].find('>') {
+            Some(end) => rest = &rest[at + end + 1..],
+            // Unterminated: keep it rather than swallowing the tail.
+            None => {
+                out.push_str(&rest[at..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+impl TermCaps {
+    /// Resolve from the environment, falling back to ANSI for an unset or
+    /// unknown TERM. Reading the database once matters: these are used per
+    /// keystroke.
+    fn from_env() -> Self {
+        let mut caps = TermCaps::default();
+        let Ok(db) = terminfo::Database::from_env() else {
+            return caps;
+        };
+        use terminfo::capability as cap;
+        if let Some(v) = db.get::<cap::CursorAddress>() {
+            caps.cursor_address = Some(v.as_ref().to_vec());
+        }
+        if let Some(v) = db.get::<cap::ClrEol>() {
+            caps.clr_eol = strip_padding(&String::from_utf8_lossy(v.as_ref()));
+        }
+        if let Some(v) = db.get::<cap::ClearScreen>() {
+            caps.clear_screen = strip_padding(&String::from_utf8_lossy(v.as_ref()));
+        }
+        if let Some(v) = db.get::<cap::CursorDown>() {
+            caps.cursor_down = strip_padding(&String::from_utf8_lossy(v.as_ref()));
+        }
+        caps
+    }
+
+    /// Address the cursor at 1-based `row`, `col`.
+    ///
+    /// terminfo's `cup` is 0-based, the ANSI fallback is 1-based; the callers
+    /// all think in 1-based screen rows, so the conversion lives here rather
+    /// than at six call sites.
+    fn cup(&self, row: u16, col: u16) -> String {
+        if let Some(tmpl) = &self.cursor_address {
+            let y = u32::from(row.saturating_sub(1));
+            let x = u32::from(col.saturating_sub(1));
+            if let Ok(bytes) = terminfo::expand!(tmpl.as_slice(); y, x) {
+                return strip_padding(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        format!("\x1b[{};{}H", row, col)
+    }
+}
+
 struct Window {
     /// First terminal row this window occupies (1-based).
     origin: u16,
@@ -816,10 +917,18 @@ struct Window {
     col: u16,
     /// Characters on the current line, kept for backspace redraw.
     line: String,
+    /// Control sequences for this terminal, resolved once from TERM.
+    caps: TermCaps,
 }
 
 impl Window {
     fn new(origin: u16, height: u16, width: u16) -> Self {
+        Self::with_caps(origin, height, width, TermCaps::from_env())
+    }
+
+    /// `new`, with the capabilities supplied rather than read from TERM, so a
+    /// test can assert what each terminal type actually produces.
+    fn with_caps(origin: u16, height: u16, width: u16, caps: TermCaps) -> Self {
         Window {
             origin: origin.max(1),
             height: height.max(1),
@@ -827,6 +936,7 @@ impl Window {
             row: 0,
             col: 0,
             line: String::new(),
+            caps,
         }
     }
 
@@ -846,7 +956,12 @@ impl Window {
         // Explicit positioning rather than a bare "\n": with ICANON/ONLCR
         // cleared a newline moves down without returning to column 0
         // (audit #TK17).
-        write!(out, "\x1b[{};1H\x1b[K", self.cursor_row())?;
+        write!(
+            out,
+            "{}{}",
+            self.caps.cup(self.cursor_row(), 1),
+            self.caps.clr_eol
+        )?;
         out.flush()
     }
 
@@ -869,7 +984,13 @@ impl Window {
         self.col = self.col.saturating_sub(1);
         // Redraw the line rather than emitting a destructive backspace, so the
         // window stays consistent after a wrap.
-        write!(out, "\x1b[{};1H\x1b[K{}", self.cursor_row(), self.line)?;
+        write!(
+            out,
+            "{}{}{}",
+            self.caps.cup(self.cursor_row(), 1),
+            self.caps.clr_eol,
+            self.line
+        )?;
         out.flush()
     }
 
@@ -877,14 +998,25 @@ impl Window {
     fn kill<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
         self.line.clear();
         self.col = 0;
-        write!(out, "\x1b[{};1H\x1b[K", self.cursor_row())?;
+        write!(
+            out,
+            "{}{}",
+            self.caps.cup(self.cursor_row(), 1),
+            self.caps.clr_eol
+        )?;
         out.flush()
     }
 
     /// Repaint this window's current line, used for Ctrl-L refresh and after a
     /// resize.
     fn repaint<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
-        write!(out, "\x1b[{};1H\x1b[K{}", self.cursor_row(), self.line)?;
+        write!(
+            out,
+            "{}{}{}",
+            self.caps.cup(self.cursor_row(), 1),
+            self.caps.clr_eol,
+            self.line
+        )?;
         out.flush()
     }
 
@@ -1603,23 +1735,24 @@ fn handle_client(stream: TcpStream) -> Result<(), io::Error> {
 ///
 /// Returns an `io::Error` if there is an issue with writing to the terminal or flushing output.
 fn draw_terminal(split_row: u16, width: u16) -> io::Result<()> {
+    let caps = TermCaps::from_env();
     let stdout = io::stdout();
     let mut handle = stdout.lock();
 
     // Clear terminal screen
-    print!("\x1B[2J\x1B[H");
+    print!("{}", caps.clear_screen);
     io::stdout().flush().ok();
 
     // Display the connection message at the top of the terminal.
     write!(handle, "[Connection established]")?;
     // Move the cursor to the split row and draw the split line.
-    write!(handle, "\x1b[{};0H", split_row)?;
+    write!(handle, "{}", caps.cup(split_row, 1))?;
     // Draw the horizontal split line (─) across the width of the terminal.
     let width = usize::from(width.saturating_sub(2));
     writeln!(handle, "└{:─<width$}┘", "", width = width)?;
     // Move the cursor back to the top-left corner and then down by one line.
-    write!(handle, "\x1b[1;H")?;
-    write!(handle, "\x1B[1B")?;
+    write!(handle, "{}", caps.cup(1, 1))?;
+    write!(handle, "{}", caps.cursor_down)?;
 
     handle.flush()?;
 
@@ -2431,7 +2564,10 @@ mod tests {
     fn test_renderer_emits_cr_positioning_not_bare_newline() {
         // #TK17: with ICANON cleared a bare "\n" never returns to column 0, so
         // the renderer must position the cursor explicitly.
-        let mut win = Window::new(1, 10, 20);
+        // Pinned to the ANSI fallback rather than the host's TERM: this test
+        // is about positioning instead of a bare newline, not about which
+        // escape a particular terminfo entry uses.
+        let mut win = Window::with_caps(1, 10, 20, TermCaps::default());
         let (out, sent) = render("ab\n", &mut win);
         assert!(
             !out.contains('\n') || out.contains("\x1b["),
@@ -2563,5 +2699,77 @@ mod tests {
         let mut pending = vec![0xff, b'a'];
         assert_eq!(decode_pending(&mut pending), "\u{fffd}a");
         assert!(pending.is_empty());
+    }
+
+    // ========================================================================
+    // TERM (spec 116812-13)
+    // ========================================================================
+
+    #[test]
+    fn test_term_caps_default_is_the_ansi_talk_used_to_hardcode() {
+        // An unset TERM, or one with no terminfo entry, must behave exactly as
+        // talk did before it consulted the database -- that is the
+        // "unspecified default terminal type" the spec allows.
+        let caps = TermCaps::default();
+        assert_eq!(caps.cup(3, 1), "\x1b[3;1H");
+        assert_eq!(caps.clr_eol, "\x1b[K");
+        assert_eq!(caps.clear_screen, "\x1b[2J\x1b[H");
+        assert_eq!(caps.cursor_down, "\x1b[1B");
+    }
+
+    #[test]
+    fn test_term_caps_use_the_terminfo_entry_when_there_is_one() {
+        // vt100 addresses its cursor 0-based through `cup`; talk's callers all
+        // think in 1-based screen rows, so row 3 column 1 must come back as
+        // the vt100 spelling of row 3, not row 4.
+        let Ok(db) = terminfo::Database::from_name("vt100") else {
+            eprintln!("skipping: no vt100 terminfo entry on this host");
+            return;
+        };
+        use terminfo::capability as cap;
+        let Some(cup) = db.get::<cap::CursorAddress>() else {
+            eprintln!("skipping: vt100 entry has no cup capability");
+            return;
+        };
+        let caps = TermCaps {
+            cursor_address: Some(cup.as_ref().to_vec()),
+            ..TermCaps::default()
+        };
+        assert_eq!(caps.cup(3, 1), "\x1b[3;1H");
+        assert_eq!(caps.cup(1, 1), "\x1b[1;1H");
+    }
+
+    #[test]
+    fn test_renderer_uses_the_supplied_capabilities() {
+        // A terminal whose sequences are nothing like ANSI must get *its*
+        // sequences, not the literals that used to be compiled in.
+        let caps = TermCaps {
+            cursor_address: None,
+            clr_eol: "<EL>".to_string(),
+            clear_screen: "<CLS>".to_string(),
+            cursor_down: "<DOWN>".to_string(),
+        };
+        let mut win = Window::with_caps(1, 10, 20, caps);
+        let (out, _) = render("ab\n", &mut win);
+        assert!(
+            out.contains("<EL>"),
+            "the terminal's own clr_eol must be used: {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[K"),
+            "the hard-coded ANSI clr_eol must not appear: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_padding_specifications_never_reach_the_screen() {
+        // vt100's own cup is "\E[%i%p1%d;%p2%dH$<5>": a baud-rate delay that
+        // nothing here honours and that would otherwise be printed literally.
+        assert_eq!(strip_padding("\x1b[3;1H$<5>"), "\x1b[3;1H");
+        assert_eq!(strip_padding("\x1b[K$<3>x"), "\x1b[Kx");
+        assert_eq!(strip_padding("a$<10*/>b"), "ab");
+        assert_eq!(strip_padding("plain"), "plain");
+        // Unterminated: kept rather than swallowing the rest of the string.
+        assert_eq!(strip_padding("a$<oops"), "a$<oops");
     }
 }

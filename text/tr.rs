@@ -1695,21 +1695,18 @@ mod setup {
                         );
                     } else {
                         // A character repeated in string1 is unspecified
-                        // (118151-2); the last position wins, as before.
-                        //
-                        // Bounded by where string2 stops varying, not by the
-                        // count: every position past that maps to the same
-                        // character, and each iteration overwrites the same
-                        // table slot anyway. Counting `[x*18446744073709551615]`
-                        // out never returned.
-                        let paired = n.min(constant_from.saturating_sub(position));
-                        for offset in 0_usize..paired {
-                            let replacement = replacements.at(position + offset);
-                            add_normal_char_with_replacement(
-                                char.clone(),
-                                replacement.convert_to_replacement(),
-                            );
-                        }
+                        // (118151-2), and every repetition writes the same
+                        // table slot -- so only the last one is observable.
+                        // Pair that position directly: looping to reach it
+                        // meant `tr '[x*18446744073709551615]y' ab` never
+                        // returned, and stopping the loop early would pair the
+                        // first position instead, which is a different answer.
+                        let last = position.saturating_add(n.saturating_sub(1_usize));
+                        let replacement = replacements.at(last);
+                        add_normal_char_with_replacement(
+                            char.clone(),
+                            replacement.convert_to_replacement(),
+                        );
                     }
                     position = position.saturating_add(n);
                 }

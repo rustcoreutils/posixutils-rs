@@ -593,17 +593,101 @@ fn chunk_to_i64(chunk: &[u8], num_bytes: usize) -> i64 {
     }
 }
 
-/// Read an extended chunk as a floating-point value of the *declared* width.
+/// The column width a float field occupies, the separating blank included.
+fn float_field(num_bytes: usize) -> usize {
+    match num_bytes {
+        4 => 16,
+        8 => 25,
+        _ => unreachable!("unsupported float width {num_bytes}"),
+    }
+}
+
+/// Render the shortest round-trip decimal of a float by C's `%g` rules.
+///
+/// `exp_form` is Rust's `{:e}`, which is already the shortest decimal that
+/// reads back as the same value -- `"3.4028235e38"`, `"1e-1"`, `"-0e0"`. What
+/// it is not is `%g`: it always uses the exponent form, writes no sign on a
+/// positive exponent, and pads it to no width. od wants positional notation
+/// unless the exponent is below -4 or has reached the number of significant
+/// digits, and a signed, two-digit-minimum exponent when it does use one.
+fn render_g(exp_form: &str) -> String {
+    let (mantissa, exponent) = match exp_form.split_once('e') {
+        Some(parts) => parts,
+        // `{:e}` always writes an exponent; nothing to rescue if it did not.
+        None => return exp_form.to_string(),
+    };
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+
+    let negative = mantissa.starts_with('-');
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let sig = digits.len() as i32;
+
+    // C's %g rule, with the precision being the significant digits present.
+    let body = if exponent < -4 || exponent >= sig {
+        let mantissa = if digits.len() == 1 {
+            digits
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        format!(
+            "{}e{}{:02}",
+            mantissa,
+            if exponent < 0 { '-' } else { '+' },
+            exponent.abs()
+        )
+    } else if exponent < 0 {
+        // 0.00…digits -- exponent is at least -4 here.
+        format!("0.{}{}", "0".repeat((-exponent - 1) as usize), digits)
+    } else {
+        let whole = (exponent + 1) as usize;
+        if digits.len() > whole {
+            format!("{}.{}", &digits[..whole], &digits[whole..])
+        } else {
+            format!("{}{}", digits, "0".repeat(whole - digits.len()))
+        }
+    };
+
+    if negative {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// Read an extended chunk as a float of the *declared* width, and render it.
 ///
 /// The width comes from the type, never from what is left of the input: a
 /// four-byte tail of a `-t f8` run is the first four bytes of a double, not a
 /// float, and decoding it as a float gives an unrelated number rather than a
 /// rounded one.
-fn chunk_to_f64(chunk: &[u8], num_bytes: usize) -> f64 {
+///
+/// The value is rendered at the width it was read at, not widened to `f64`
+/// first: the shortest decimal that round-trips an `f32` is shorter than the
+/// one that round-trips the `f64` holding the same number, so widening would
+/// print a float with a double's worth of digits.
+fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
     let buf = extend_chunk(chunk, num_bytes);
     match num_bytes {
-        4 => f32::from_ne_bytes(buf[..4].try_into().unwrap()) as f64,
-        8 => f64::from_ne_bytes(buf),
+        4 => {
+            let v = f32::from_ne_bytes(buf[..4].try_into().unwrap());
+            if v.is_nan() {
+                "nan".to_string()
+            } else if v.is_infinite() {
+                if v.is_sign_negative() { "-inf" } else { "inf" }.to_string()
+            } else {
+                render_g(&format!("{v:e}"))
+            }
+        }
+        8 => {
+            let v = f64::from_ne_bytes(buf);
+            if v.is_nan() {
+                "nan".to_string()
+            } else if v.is_infinite() {
+                if v.is_sign_negative() { "-inf" } else { "inf" }.to_string()
+            } else {
+                render_g(&format!("{v:e}"))
+            }
+        }
         // `parse_type_string` admits no other width.
         _ => unreachable!("unsupported float width {num_bytes}"),
     }
@@ -671,8 +755,10 @@ struct FFormatter;
 
 impl FormatterChunks for FFormatter {
     fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
-        let value = chunk_to_f64(chunk, num_bytes);
-        format!(" {value:e}")
+        let text = chunk_to_float_text(chunk, num_bytes);
+        // One blank separates the fields, as for every other type; the rest of
+        // the column is padding, so the values line up.
+        format!(" {text:>width$}", width = float_field(num_bytes) - 1)
     }
 }
 

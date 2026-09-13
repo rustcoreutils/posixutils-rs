@@ -192,14 +192,15 @@ fn test_od_15() {
 // the denormal 0x00000021, not zero -- the `0e0` this used to assert was the
 // `_ => 0.0` arm of a ladder that had no case for a tail shorter than four
 // bytes, which is what the "does not match other implementations" comment
-// here was recording.
+// here was recording. The notation is `%g` over the shortest round-trip
+// decimal of an f32, in aligned 16-column fields.
 #[test]
 fn test_od_16() {
     od_test(
         &["-tf4"],
         "Hello, World!",
         "\
-0000000 1.1431391224375825e27 1.7611270127616e14 1.7446709643352771e22 4.624284932271896e-44
+0000000   1.1431391e+27    1.761127e+14    1.744671e+22         4.6e-44
 0000015
 ",
     );
@@ -715,6 +716,109 @@ fn od_float_conversion_is_chosen_by_the_type_not_the_tail() {
     assert!(
         field.parse::<f64>().is_ok_and(|v| v != 0.0),
         "a 1-byte tail must extend to a denormal, not zero: {tiny:?}"
+    );
+}
+
+// `-t f` prints the shortest decimal that reads back as the same value,
+// rendered by C's `%g` rules -- scientific when the decimal exponent is below
+// -4 or is not less than the number of significant digits, positional
+// otherwise -- with the exponent signed and at least two digits wide. Fields
+// are right-aligned so the columns line up.
+//
+// The old code was `format!(" {value:e}")`: Rust's exponent form, always, with
+// no field width. That prints `1e0` for 1.0 and `3.4028235e38` without the
+// exponent's sign, matches no other od, and leaves the columns ragged.
+//
+// Every expectation below is GNU od's output for the same bytes.
+#[test]
+fn od_float_output_is_shortest_round_trip_in_g_format() {
+    // Assembled little-endian and cfg-branched, since these are float *bit
+    // patterns* being fed to od, not values od computes.
+    fn le32(bits: u32) -> [u8; 4] {
+        if cfg!(target_endian = "little") {
+            bits.to_le_bytes()
+        } else {
+            bits.to_be_bytes()
+        }
+    }
+    fn le64(bits: u64) -> [u8; 8] {
+        if cfg!(target_endian = "little") {
+            bits.to_le_bytes()
+        } else {
+            bits.to_be_bytes()
+        }
+    }
+
+    let f32_cases: &[(u32, &str)] = &[
+        (0x3f80_0000, "1"),
+        (0x3dcc_cccd, "0.1"),
+        (0x4049_0fdb, "3.1415927"),
+        (0x7f7f_ffff, "3.4028235e+38"),
+        (0x0000_0001, "1e-45"),
+        (0x4974_2400, "1e+06"),
+        (0x4b18_9680, "1e+07"),
+        (0x3a83_126f, "0.001"),
+        (0x3927_c5ac, "0.00016"),
+        (0x7f80_0000, "inf"),
+        (0xff80_0000, "-inf"),
+        (0x7fc0_0000, "nan"),
+        (0x8000_0000, "-0"),
+        (0x0000_0000, "0"),
+        (0xbf80_0000, "-1"),
+    ];
+    for &(bits, want) in f32_cases {
+        let (stdout, _, code) = od_raw(&["-An", "-t", "f4"], &le32(bits));
+        assert_eq!(code, Some(0), "f4 {bits:#010x}");
+        assert_eq!(
+            stdout.split_whitespace().next(),
+            Some(want),
+            "f4 {bits:#010x}: {stdout:?}"
+        );
+    }
+
+    let f64_cases: &[(u64, &str)] = &[
+        (0x3ff0_0000_0000_0000, "1"),
+        (0x3fb9_9999_9999_999a, "0.1"),
+        (0x7fef_ffff_ffff_ffff, "1.7976931348623157e+308"),
+        (0x0000_0000_0000_0001, "5e-324"),
+        (0x430c_6bf5_2634_0000, "1e+15"),
+        (0x7ff0_0000_0000_0000, "inf"),
+        (0x7ff8_0000_0000_0000, "nan"),
+    ];
+    for &(bits, want) in f64_cases {
+        let (stdout, _, code) = od_raw(&["-An", "-t", "f8"], &le64(bits));
+        assert_eq!(code, Some(0), "f8 {bits:#018x}");
+        assert_eq!(
+            stdout.split_whitespace().next(),
+            Some(want),
+            "f8 {bits:#018x}: {stdout:?}"
+        );
+    }
+}
+
+// Float fields are a fixed width so the columns line up, as they already do
+// for every integer type. GNU uses 16 columns for a 4-byte float and 25 for an
+// 8-byte one, counting the separating blank.
+#[test]
+fn od_float_fields_are_column_aligned() {
+    let four_floats: Vec<u8> = (0..4)
+        .flat_map(|i| {
+            let bits: u32 = [0x3f80_0000, 0x3dcc_cccd, 0x4049_0fdb, 0x7f7f_ffff][i];
+            if cfg!(target_endian = "little") {
+                bits.to_le_bytes()
+            } else {
+                bits.to_be_bytes()
+            }
+        })
+        .collect();
+
+    let (stdout, _, code) = od_raw(&["-An", "-t", "f4"], &four_floats);
+    assert_eq!(code, Some(0));
+    let line = stdout.lines().next().unwrap_or("");
+    assert_eq!(line.len(), 4 * 16, "four 16-column fields: {line:?}");
+    assert_eq!(
+        line,
+        "               1             0.1       3.1415927   3.4028235e+38"
     );
 }
 

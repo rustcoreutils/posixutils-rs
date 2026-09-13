@@ -3805,3 +3805,133 @@ fn test_an_error_discards_the_rest_of_the_expansion() {
     editor.execute_keys("dd").unwrap();
     assert_eq!(editor.get_buffer_text(), "two\n");
 }
+
+// ============================================================================
+// :map! expansion, and @ through the same queue
+// ============================================================================
+
+/// 95107-95109: in text input mode the lhs is matched "as any part of text
+/// entered", and the replacement acts as if it had been entered instead. The
+/// classic use is leaving insert mode without reaching for <escape>.
+#[test]
+fn test_text_input_map_expands() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+    // jk leaves insert mode.
+    editor.execute_keys(":map! jk \x16\x1b\n").unwrap();
+    editor.execute_keys("\n").unwrap();
+
+    editor.execute_keys("ifoojk").unwrap();
+    assert_eq!(editor.get_mode(), Mode::Command, "jk must have left insert");
+    assert_eq!(editor.get_buffer_text(), "fooalpha\n");
+}
+
+/// 95089-95092: the same lhs can mean one thing in command mode and another in
+/// text input mode, and each table is consulted only in its own mode.
+#[test]
+fn test_the_two_map_tables_apply_in_their_own_modes() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys(":map q dd\n").unwrap();
+    editor.execute_keys(":map! q XY\n").unwrap();
+
+    // Command mode takes the `:map` definition.
+    editor.execute_keys("q").unwrap();
+    assert_eq!(editor.get_buffer_text(), "two\nthree\n");
+
+    // Text input mode takes the `:map!` one.
+    editor.execute_keys("iq\x1b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "XYtwo\nthree\n");
+}
+
+/// 95110-95111: "If any character in the input text is escaped using a
+/// <control>-V character, that character shall not be part of a match to an
+/// lhs."
+#[test]
+fn test_ctrl_v_suppresses_a_text_input_map() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("alpha\n");
+    editor.execute_keys(":map! q XY\n").unwrap();
+
+    editor.execute_keys("i\x16q\x1b").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "qalpha\n",
+        "the quoted q must be inserted literally"
+    );
+}
+
+/// vi.md 121171: an `@` buffer behaves "as if the contents of the named buffer
+/// were entered as standard input" -- which is what makes its characters
+/// subject to maps. They used to run through a separate path that no map could
+/// see.
+#[test]
+fn test_buffer_execution_is_subject_to_maps() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys(":map q dd\n").unwrap();
+    // Put a `q` into register a by yanking a line that holds one.
+    editor.set_buffer_text("q\none\ntwo\nthree\n");
+    editor.execute_keys("\"ayy").unwrap();
+    editor.execute_keys("dd").unwrap();
+
+    // @a enters `q`, which the map turns into `dd`.
+    editor.execute_keys("@a").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "two\nthree\n",
+        "the buffer's q must have been mapped to dd"
+    );
+}
+
+/// vi.md 121176-121177: "If a count is specified, behave as if that count were
+/// entered as user input *before* the characters from the @ buffer were
+/// entered." Running the buffer `count` times is a different thing: with `dw`
+/// in the register, `3@a` is `3dw` -- one command over three words -- not three
+/// separate `dw`s, and the two differ as soon as a count interacts.
+#[test]
+fn test_buffer_execution_count_is_entered_before_the_buffer() {
+    let mut editor = Editor::new_headless();
+    // Register a holds `x`, which deletes one character.
+    editor.set_buffer_text("x\nabcdef\n");
+    editor.execute_keys("\"ayy").unwrap();
+    editor.execute_keys("dd").unwrap();
+
+    // `3@a` must mean `3x`, deleting three characters with one command, so a
+    // single `u` puts all three back.
+    editor.execute_keys("3@a").unwrap();
+    assert_eq!(editor.get_buffer_text(), "def\n");
+    editor.execute_keys("u").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "abcdef\n",
+        "3x is one command, so one undo restores all three characters"
+    );
+}
+
+/// vi.md 121022-121024: "Commands (other than commands that enter text input
+/// mode) executed as a result of map expansions, shall not change the value of
+/// the last repeatable command." So `.` repeats what the user last did by
+/// hand, not what a map did on their behalf.
+#[test]
+fn test_a_map_expansion_does_not_become_the_dot_command() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("abcd\nefgh\nijkl\nmnop\n");
+    editor.execute_keys(":map q dd\n").unwrap();
+
+    // Do something repeatable by hand.
+    editor.execute_keys("x").unwrap();
+    assert_eq!(editor.get_buffer_text(), "bcd\nefgh\nijkl\nmnop\n");
+
+    // Now run the map, whose `dd` must not become the `.` command.
+    editor.execute_keys("q").unwrap();
+    assert_eq!(editor.get_buffer_text(), "efgh\nijkl\nmnop\n");
+
+    // `.` repeats the hand-typed `x`, not the map's `dd`.
+    editor.execute_keys(".").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "fgh\nijkl\nmnop\n",
+        ". must repeat the x, not the mapped dd"
+    );
+}

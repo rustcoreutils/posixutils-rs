@@ -79,7 +79,7 @@ impl QueuedKey {
 }
 
 /// Pending keys, plus the partially matched left-hand side.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InputQueue {
     queue: VecDeque<QueuedKey>,
     /// Keys held back because they are a strict prefix of some `:map`
@@ -87,6 +87,24 @@ pub struct InputQueue {
     partial: Vec<QueuedKey>,
     /// A command-mode `^V` is pending, so the next key matches no map.
     literal_next: bool,
+    /// Where the key currently being dispatched came from.
+    ///
+    /// Needed separately from the queue: the key in flight has already been
+    /// popped, so an expansion's *last* key would otherwise look typed —
+    /// which is precisely the key that completes the command a caller is
+    /// asking about.
+    current: KeySource,
+}
+
+impl Default for InputQueue {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            partial: Vec::new(),
+            literal_next: false,
+            current: KeySource::Typed,
+        }
+    }
 }
 
 impl InputQueue {
@@ -158,12 +176,19 @@ impl InputQueue {
         self.literal_next
     }
 
+    /// Record where the key about to be dispatched came from.
+    pub fn set_current(&mut self, source: KeySource) {
+        self.current = source;
+    }
+
     /// Whether anything in flight came from an expansion.
     ///
+    /// Covers the key being dispatched as well as everything still queued.
     /// Typed keys arrive one at a time, so anything queued behind the key in
     /// hand is expansion or buffer-execution material by construction.
     pub fn is_expanding(&self) -> bool {
-        self.queue.iter().any(|k| k.source.is_expansion())
+        self.current.is_expansion()
+            || self.queue.iter().any(|k| k.source.is_expansion())
             || self.partial.iter().any(|k| k.source.is_expansion())
     }
 
@@ -172,6 +197,7 @@ impl InputQueue {
         self.queue.clear();
         self.partial.clear();
         self.literal_next = false;
+        self.current = KeySource::Typed;
     }
 }
 

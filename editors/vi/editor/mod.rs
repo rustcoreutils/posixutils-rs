@@ -880,8 +880,10 @@ impl Editor {
             }
 
             let Some(q) = self.next_input_key() else {
+                self.input.set_current(KeySource::Typed);
                 return Ok(());
             };
+            self.input.set_current(q.source);
 
             // Clear any previous message
             if !matches!(q.key, Key::Char(':')) {
@@ -963,7 +965,16 @@ impl Editor {
             let Some(mode) = self.active_map_mode() else {
                 return Some(self.flush_before(q));
             };
-            if literal || !q.remappable || self.in_argument_position() {
+            // 95110-95111: in text input mode too, "if any character in the
+            // input text is escaped using a <control>-V character, that
+            // character shall not be part of a match to an lhs".
+            // `process_insert_key` owns that flag and consumes it on the very
+            // next key, which is the one in hand here.
+            let insert_literal = self
+                .insert_state
+                .as_ref()
+                .is_some_and(|s| s.pending_literal);
+            if literal || insert_literal || !q.remappable || self.in_argument_position() {
                 return Some(self.flush_before(q));
             }
 
@@ -1262,8 +1273,8 @@ impl Editor {
     /// Handle a key in insert mode.
     fn handle_insert_key(&mut self, key: Key) -> Result<()> {
         // See `handle_command_key` — these two are the complete set of entry
-        // points, since `handle_key` and `execute_keys_from_string` both funnel
-        // through them.
+        // points, since every key reaches the editor through `drain_input`,
+        // which dispatches to one of them.
         self.undo.sync_line_original(&self.buffer);
 
         if let Some(mut state) = self.insert_state.take() {
@@ -2000,8 +2011,17 @@ impl Editor {
     }
 
     /// Save the last command for dot repeat.
+    ///
+    /// vi.md 121022-121024: "Commands (other than commands that enter text
+    /// input mode) executed as a result of map expansions, shall not change the
+    /// value of the last repeatable command." So `.` after a map that deleted a
+    /// line repeats whatever the user last did by hand, not the map's `dd`.
+    ///
+    /// The exception is not needed here: every command that enters text input
+    /// mode records through `LastCommand::Insert` when the session ends, which
+    /// is a different path.
     fn save_last_command(&mut self, cmd: &crate::command::ParsedCommand) {
-        if Self::is_repeatable_command(cmd) {
+        if Self::is_repeatable_command(cmd) && !self.input.is_expanding() {
             self.last_command = Some(LastCommand::Parsed(cmd.clone()));
         }
     }
@@ -2102,8 +2122,8 @@ impl Editor {
         };
 
         // Get register contents
-        let content = match self.registers.get(register) {
-            Some(c) => c.text.clone(),
+        let (content, linewise) = match self.registers.get(register) {
+            Some(c) => (c.text.clone(), c.linewise),
             None => {
                 self.set_error(&format!("Register {} is empty", register));
                 return Ok(());
@@ -2113,36 +2133,52 @@ impl Editor {
         // Save as last macro register
         self.last_macro_register = Some(register);
 
-        // Execute the macro `count` times
-        for _ in 0..count {
-            // Parse and execute each character as a command
-            self.execute_keys_from_string(&content)?;
-        }
-
-        Ok(())
-    }
-
-    /// Execute a string of characters as if typed by the user.
-    fn execute_keys_from_string(&mut self, keys: &str) -> Result<()> {
-        // Reset parser state before executing keys to avoid interference
-        // from any previously parsed command (e.g., @a calling this function)
-        self.parser.reset();
-
-        for c in keys.chars() {
-            // Same one translation `execute_keys` uses. This copy was the worse
-            // of the two: its `is_ascii_control` arm turned a TAB into
-            // `Ctrl('i')` and left DEL as a `Char`, so a register containing
-            // either behaved unlike the same keystrokes typed.
-            let key = Key::from_map_char(c);
-
-            // Process the key based on current mode
-            match self.mode {
-                Mode::Command => self.handle_command_key(key)?,
-                Mode::Insert(_) | Mode::Replace => self.handle_insert_key(key)?,
-                Mode::Ex => self.handle_ex_key(key)?,
-                Mode::Open => {}
+        // 121171-121173: "Behave as if the contents of the named buffer were
+        // entered as standard input. After each line of a line-mode buffer, and
+        // all but the last line of a character mode buffer, behave as if a
+        // <newline> were entered as standard input."
+        let mut text = content.clone();
+        if linewise {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        } else {
+            // A character-mode buffer separates its lines but does not end with
+            // one; `content` already carries the interior newlines, so the only
+            // correction is to drop a trailing one if it is there.
+            while text.ends_with('\n') {
+                text.pop();
             }
         }
+
+        // 121176-121177: "If a count is specified, behave as if that count were
+        // entered as user input *before* the characters from the @ buffer were
+        // entered." Running the buffer `count` times is a different thing --
+        // `3@a` with `a` holding `dw` means `3dw`, one command over three
+        // words, not three separate `dw`s.
+        let mut keys: Vec<QueuedKey> = Vec::new();
+        if count > 1 {
+            for c in count.to_string().chars() {
+                keys.push(QueuedKey {
+                    key: Key::from_map_char(c),
+                    remappable: true,
+                    abbrevable: true,
+                    source: KeySource::BufferExecution,
+                });
+            }
+        }
+        keys.extend(text.chars().map(|c| QueuedKey {
+            key: Key::from_map_char(c),
+            remappable: true,
+            abbrevable: true,
+            source: KeySource::BufferExecution,
+        }));
+
+        // Queued rather than executed: 121171's "as if ... entered as standard
+        // input" is what makes buffer contents subject to maps, and what makes
+        // 121174-121175 ("no more characters resulting from the execution of
+        // this command shall be processed") the same rule as a map expansion's.
+        self.input.push_front(keys.into_iter());
         Ok(())
     }
 

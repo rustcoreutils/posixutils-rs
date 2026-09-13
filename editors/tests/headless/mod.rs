@@ -4155,9 +4155,10 @@ fn test_ctrl_t_pops_the_tag_stack() {
 fn test_sigint_abandons_a_map_expansion() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Leaked so it is `&'static` like the real signal flag, and private to
-    // this editor so no other test can consume it.
-    let interrupt: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    // `&'static` like the real signal flag, and named only here, so no other
+    // test can reach it to consume what this one arms.
+    static INTERRUPT: AtomicBool = AtomicBool::new(false);
+    let interrupt: &'static AtomicBool = &INTERRUPT;
 
     let mut editor = Editor::new_headless();
     editor.set_interrupt_source(interrupt);

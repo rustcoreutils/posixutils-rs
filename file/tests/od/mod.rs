@@ -907,6 +907,81 @@ fn od_count_is_a_length_not_an_end_offset() {
     assert_eq!(stdout, "0000000 41 42 43 44 45 46 47 48 49\n0000011\n");
 }
 
+// POSIX 109196-109199: "Unless -A n is specified, the *first* output line
+// produced for each input block shall be preceded by the input offset". One
+// offset per block, not one per type -- the spec's own three-type example at
+// 109240-109245 shows the continuation lines blank where the offset would be.
+//
+// The offset was printed on every type's line.
+#[test]
+fn od_offset_marks_the_first_line_of_a_block_only() {
+    let (stdout, _, code) = od_raw(&["-A", "o", "-t", "x1", "-t", "c"], b"AB");
+    assert_eq!(code, Some(0));
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "two types plus the trailing offset");
+    assert!(lines[0].starts_with("0000000"), "{stdout:?}");
+    assert!(
+        lines[1].starts_with("       "),
+        "the second type's line is blank where the offset would be: {lines:?}"
+    );
+    assert_eq!(
+        lines[1].len(),
+        lines[0].len(),
+        "and is indented to the same column: {lines:?}"
+    );
+    assert_eq!(lines[2], "0000002");
+
+    // -A n prints no offset at all, on any line.
+    let (stdout, _, _) = od_raw(&["-A", "n", "-t", "x1", "-t", "c"], b"AB");
+    for line in stdout.lines() {
+        assert!(line.starts_with(' '), "-A n: no offset column: {stdout:?}");
+    }
+}
+
+// Fields of different types line up in columns. Every type shares one
+// per-byte column width -- the largest any of them needs -- so a type
+// converting more bytes per field gets a proportionally wider field, and the
+// lines all come out the same length.
+//
+// Each type was padded to its own natural width instead, so `-t x1c` put a
+// 3-column hex field above a 4-column character one and nothing lined up.
+//
+// The expectations are GNU od's output for the same bytes.
+#[test]
+fn od_field_widths_are_shared_across_types() {
+    // x1 needs 3 columns, c needs 4, so both get 4.
+    let (stdout, _, code) = od_raw(&["-An", "-t", "x1c"], b"AB");
+    assert_eq!(code, Some(0));
+    assert_eq!(stdout, "  41  42\n   A   B\n");
+
+    // o1 needs 4 and d8 needs 21, over eight bytes -- so the shared per-byte
+    // width is o1's 4, and d8's field is 8 * 4 = 32.
+    let (stdout, _, _) = od_raw(&["-An", "-t", "o1", "-t", "d8"], b"ABCDEFGHIJKLMNOP");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0].len(), 64, "16 fields of 4: {lines:?}");
+    assert_eq!(lines[1].len(), 64, "2 fields of 32: {lines:?}");
+    assert_eq!(
+        lines[1],
+        "             5208208757389214273             5786930140093827657"
+    );
+
+    // A per-byte width need not be a whole number: o2 needs 7 columns for two
+    // bytes, so x1's one-byte fields alternate 4 and 3 to keep the byte
+    // positions aligned.
+    let (stdout, _, _) = od_raw(&["-An", "-t", "x1", "-t", "o2"], b"ABCDEFGHIJKLMNOP");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0].len(), 56, "{lines:?}");
+    assert_eq!(lines[1].len(), 56, "{lines:?}");
+    assert_eq!(
+        lines[0],
+        "  41 42  43 44  45 46  47 48  49 4a  4b 4c  4d 4e  4f 50"
+    );
+
+    // A single type is unaffected: its own natural width is the shared one.
+    let (one, _, _) = od_raw(&["-An", "-t", "x1"], b"AB");
+    assert_eq!(one, " 41 42\n");
+}
+
 #[test]
 fn od_integer_size_suffixes_are_unchanged() {
     // The C/S/I/L table belongs to d/o/u/x (POSIX 109073-5) and must not have

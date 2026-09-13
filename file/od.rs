@@ -11,7 +11,6 @@ use std::fs::File;
 use std::io::{self, BufReader, Error, Read, Seek, SeekFrom};
 use std::num::ParseIntError;
 use std::path::PathBuf;
-use std::slice::Chunks;
 use std::str::FromStr;
 
 use clap::Parser;
@@ -372,8 +371,6 @@ fn print_data<R: Read>(
         }
         written += bytes_read as u64;
 
-        let local_buf_len = local_buf.len();
-
         // Print the address in the specified base format.
         let offset_string = if let Some(base) = config.address_base {
             match base {
@@ -387,119 +384,30 @@ fn print_data<R: Read>(
             format!("{:07o}", offset) // Default to octal if no base is specified.
         };
 
-        // Process and print the buffer based on configuration.
-        if config.type_strings.is_empty() {
-            // Process the buffer in chunks of 2 bytes.
-            let chunks = local_buf.chunks(2);
-            let res = process_chunks_formatter(&OFormatter, chunks, 2, local_buf_len);
+        // Render every type's line for this block, then print them as one
+        // group. POSIX 109196-109199 puts the input offset on "the first
+        // output line produced for each input block" -- one per block, not one
+        // per type -- and the three-type example at 109240-109245 shows the
+        // continuation lines blank where the offset would be.
+        let scale = column_scale(specs);
+        let lines: Vec<String> = specs
+            .iter()
+            .map(|spec| render_line(spec, local_buf, scale))
+            .collect();
+
+        for (index, line) in lines.iter().enumerate() {
+            let prefix = if index == 0 {
+                offset_string.clone()
+            } else {
+                " ".repeat(offset_string.len())
+            };
             process_res_string(
-                &offset_string,
+                &prefix,
                 &mut previous_offset_string,
                 &mut previous_asterisk,
-                &res,
+                line,
                 config.verbose,
             );
-        } else {
-            // Process the buffer according to the resolved output types. These
-            // were parsed and validated once before the first read, so
-            // `num_bytes` is known good here -- `chunks(0)` used to be reached
-            // before the size was checked at all, and panicked.
-            for spec in specs {
-                let TypeSpec {
-                    type_char,
-                    num_bytes,
-                } = *spec;
-
-                let chunks = local_buf.chunks(num_bytes);
-                match type_char {
-                    'a' => {
-                        let res = process_formatter(&AFormatter, local_buf, local_buf_len);
-                        process_res_string(
-                            &offset_string,
-                            &mut previous_offset_string,
-                            &mut previous_asterisk,
-                            &res,
-                            config.verbose,
-                        );
-                    }
-                    'c' => {
-                        let res = process_formatter(&CFormatter, local_buf, local_buf_len);
-                        process_res_string(
-                            &offset_string,
-                            &mut previous_offset_string,
-                            &mut previous_asterisk,
-                            &res,
-                            config.verbose,
-                        );
-                    }
-                    'u' => {
-                        let res =
-                            process_chunks_formatter(&UFormatter, chunks, num_bytes, local_buf_len);
-                        process_res_string(
-                            &offset_string,
-                            &mut previous_offset_string,
-                            &mut previous_asterisk,
-                            &res,
-                            config.verbose,
-                        );
-                    }
-                    'd' => {
-                        let res =
-                            process_chunks_formatter(&DFormatter, chunks, num_bytes, local_buf_len);
-                        process_res_string(
-                            &offset_string,
-                            &mut previous_offset_string,
-                            &mut previous_asterisk,
-                            &res,
-                            config.verbose,
-                        );
-                    }
-                    'x' => {
-                        let res =
-                            process_chunks_formatter(&XFormatter, chunks, num_bytes, local_buf_len);
-                        process_res_string(
-                            &offset_string,
-                            &mut previous_offset_string,
-                            &mut previous_asterisk,
-                            &res,
-                            config.verbose,
-                        );
-                    }
-                    'o' => {
-                        let res =
-                            process_chunks_formatter(&OFormatter, chunks, num_bytes, local_buf_len);
-                        process_res_string(
-                            &offset_string,
-                            &mut previous_offset_string,
-                            &mut previous_asterisk,
-                            &res,
-                            config.verbose,
-                        );
-                    }
-                    'f' => {
-                        let res =
-                            process_chunks_formatter(&FFormatter, chunks, num_bytes, local_buf_len);
-                        process_res_string(
-                            &offset_string,
-                            &mut previous_offset_string,
-                            &mut previous_asterisk,
-                            &res,
-                            config.verbose,
-                        );
-                    }
-                    _ => {
-                        // Default formatter for unknown types.
-                        let res = process_formatter(&DefaultFormatter, local_buf, local_buf_len);
-                        process_res_string(
-                            &offset_string,
-                            &mut previous_offset_string,
-                            &mut previous_asterisk,
-                            &res,
-                            config.verbose,
-                        );
-                    }
-                }
-            }
         }
 
         offset += bytes_read as u64; // Move to the next line of bytes.
@@ -540,10 +448,6 @@ fn process_res_string(
         println!(); // Print a newline after each line of bytes.
         res_string.clone_into(previous_offset_string);
     }
-}
-
-trait FormatterChunks {
-    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String;
 }
 
 /// Lay a chunk out as `num_bytes` bytes of memory, extending a short final
@@ -704,103 +608,151 @@ fn chunk_to_float_text(chunk: &[u8], num_bytes: usize) -> String {
     }
 }
 
-struct UFormatter;
-
-impl FormatterChunks for UFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
-        // Widest decimal the width can hold: u8 255, u16 65535, u32 and u64
-        // likewise at 10 and 20 digits.
-        let pad_to = match num_bytes {
-            1 => 3_usize,
-            2 => 5_usize,
-            4 => 10_usize,
-            8 => 20_usize,
-            _ => unreachable!("unsupported integer width {num_bytes}"),
-        };
-
-        let value = chunk_to_u64(chunk, num_bytes);
-        format!(" {value: >width$}", width = pad_to)
+/// One field's text, before it is padded into its column.
+///
+/// The padding that is part of the *conversion* -- the leading zeroes of a hex
+/// or octal field -- is applied here, because it belongs to the value. The
+/// padding that positions the field in its column is not, because that depends
+/// on the other types sharing the line and is applied by [`render_line`].
+fn field_text(spec: &TypeSpec, chunk: &[u8]) -> String {
+    match spec.type_char {
+        'a' => {
+            // Named-character output uses only the least significant seven bits.
+            let byte = chunk[0] & 0x7F;
+            if let Some(name) = get_named_char(byte) {
+                name.to_string()
+            } else if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
+                (byte as char).to_string()
+            } else {
+                format!("{byte:03o}")
+            }
+        }
+        'c' => match chunk[0] {
+            b'\0' => "\\0".to_string(),
+            // POSIX (l. 109177): a <backslash> is exempt from the escape table
+            // and "shall be written as a single <backslash>" -- NOT as `\\`.
+            // Keeping the arm explicit (rather than letting the graphic
+            // character case below handle it) documents that omitting the
+            // escape is deliberate.
+            b'\\' => "\\".to_string(),
+            b'\x07' => "\\a".to_string(),
+            b'\x08' => "\\b".to_string(),
+            b'\x0C' => "\\f".to_string(),
+            b'\x0A' => "\\n".to_string(),
+            b'\x0D' => "\\r".to_string(),
+            b'\x09' => "\\t".to_string(),
+            b'\x0B' => "\\v".to_string(),
+            byte if byte.is_ascii_graphic() || byte.is_ascii_whitespace() => {
+                (byte as char).to_string()
+            }
+            byte => format!("{byte:03o}"),
+        },
+        'u' => chunk_to_u64(chunk, spec.num_bytes).to_string(),
+        'd' => chunk_to_i64(chunk, spec.num_bytes).to_string(),
+        'x' => format!(
+            "{:0width$x}",
+            chunk_to_u64(chunk, spec.num_bytes),
+            width = spec.num_bytes * 2
+        ),
+        'o' => format!(
+            "{:0width$o}",
+            chunk_to_u64(chunk, spec.num_bytes),
+            // As many digits as the widest value of this width needs, which is
+            // ceil(bits/3). Three digits *per byte* is a bound on a byte, not
+            // on the number the bytes compose, and is tight only up to two of
+            // them: u32::MAX is 37777777777, eleven digits, not twelve.
+            width = (spec.num_bytes * 8).div_ceil(3)
+        ),
+        'f' => chunk_to_float_text(chunk, spec.num_bytes),
+        // `parse_type_string` admits no other type character.
+        _ => unreachable!("unsupported type character {}", spec.type_char),
     }
 }
 
-struct DFormatter;
-
-impl FormatterChunks for DFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
-        // Widest signed decimal the width can hold, sign included: i8 -128,
-        // i16 -32768, i32 -2147483648, i64 -9223372036854775808.
-        let pad_to = match num_bytes {
-            1 => 4_usize,
-            2 => 6_usize,
-            4 => 11_usize,
-            8 => 20_usize,
-            _ => unreachable!("unsupported integer width {num_bytes}"),
-        };
-
-        let value = chunk_to_i64(chunk, num_bytes);
-        format!(" {value: >width$}", width = pad_to)
+/// The width one field of this type occupies on its own, the blank that
+/// separates it from the previous field included.
+fn natural_field(spec: &TypeSpec) -> usize {
+    match spec.type_char {
+        // A named character, a C escape, or three octal digits.
+        'a' | 'c' => 4,
+        'u' => {
+            1 + match spec.num_bytes {
+                1 => 3,
+                2 => 5,
+                4 => 10,
+                8 => 20,
+                _ => unreachable!("unsupported integer width {}", spec.num_bytes),
+            }
+        }
+        'd' => {
+            1 + match spec.num_bytes {
+                1 => 4,
+                2 => 6,
+                4 => 11,
+                8 => 20,
+                _ => unreachable!("unsupported integer width {}", spec.num_bytes),
+            }
+        }
+        'x' => 1 + spec.num_bytes * 2,
+        'o' => 1 + (spec.num_bytes * 8).div_ceil(3),
+        'f' => float_field(spec.num_bytes),
+        _ => unreachable!("unsupported type character {}", spec.type_char),
     }
 }
 
-struct XFormatter;
-
-impl FormatterChunks for XFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
-        let value = chunk_to_u64(chunk, num_bytes);
-        // Two hex digits per byte, exactly.
-        format!(" {value:0width$x}", width = num_bytes * 2)
+/// The column width one input byte is given, shared by every type on the
+/// block, as the fraction `natural / bytes` of whichever type needs the most
+/// room per byte.
+///
+/// Sharing it is what lines the types up: a type converting more bytes per
+/// field gets a proportionally wider field, so the same input byte sits in the
+/// same column on every line. POSIX 109189-109192 asks only that fields be
+/// "separated by one or more <blank> characters", so the alignment is a
+/// courtesy rather than a requirement -- but an unaligned multi-type dump is
+/// most of the reason to ask for one.
+fn column_scale(specs: &[TypeSpec]) -> (usize, usize) {
+    // Zero is the identity for the maximum below, so the first spec always
+    // wins outright: seeding with a real width instead would impose it as a
+    // floor, widening every type that needs less room per byte than it does.
+    let mut scale = (0, 1);
+    for spec in specs {
+        let (num, den) = (natural_field(spec), spec.num_bytes);
+        // num/den > scale.0/scale.1, cross-multiplied to stay in integers.
+        if num * scale.1 > scale.0 * den {
+            scale = (num, den);
+        }
     }
+    scale
 }
 
-struct OFormatter;
-
-impl FormatterChunks for OFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
-        let value = chunk_to_u64(chunk, num_bytes);
-        // As many digits as the widest value of this width needs, which is
-        // ceil(bits/3): 3, 6, 11, 22. Three digits *per byte* is right only up
-        // to two bytes -- u32::MAX is 37777777777, eleven digits, not twelve,
-        // so a fourth byte bought a leading zero that could never be anything
-        // else.
-        format!(" {value:0width$o}", width = (num_bytes * 8).div_ceil(3))
-    }
+/// The column at which field `index` of a `bytes`-wide type ends.
+///
+/// Rounded to the nearest column rather than truncated, so that a scale which
+/// is not a whole number -- seven columns per two bytes, say -- spreads its
+/// remainder across the fields (4, 3, 4, 3, ...) instead of letting them drift
+/// out of alignment with the wider type's.
+fn field_end(index: usize, bytes: usize, scale: (usize, usize)) -> usize {
+    let (num, den) = scale;
+    (2 * index * bytes * num + den) / (2 * den)
 }
 
-struct FFormatter;
+/// Render one output line: every field of one type, across the whole block.
+fn render_line(spec: &TypeSpec, local_buf: &[u8], scale: (usize, usize)) -> String {
+    let mut out = String::new();
+    let mut column = 0;
 
-impl FormatterChunks for FFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
-        let text = chunk_to_float_text(chunk, num_bytes);
-        // One blank separates the fields, as for every other type; the rest of
-        // the column is padding, so the values line up.
-        format!(" {text:>width$}", width = float_field(num_bytes) - 1)
-    }
-}
-
-fn process_chunks_formatter(
-    formatter: &dyn FormatterChunks,
-    chunks: Chunks<u8>,
-    num_bytes: usize,
-    local_buf_len: usize,
-) -> String {
-    let buffer_size = local_buf_len * 8;
-
-    let mut result = String::with_capacity(buffer_size);
-
-    for chunk in chunks {
-        result.push_str(&formatter.format_value_from_chunk(chunk, num_bytes));
+    for (index, chunk) in local_buf.chunks(spec.num_bytes).enumerate() {
+        let text = field_text(spec, chunk);
+        let end = field_end(index + 1, spec.num_bytes, scale);
+        // Never narrower than the text: a rounded-down column would otherwise
+        // run two fields together with no separating blank.
+        let width = (end - column).max(text.len() + 1);
+        column = end;
+        out.push_str(&format!("{text:>width$}"));
     }
 
-    result
+    out
 }
-
-trait Formatter {
-    fn format_value(&self, byte: u8) -> String;
-}
-
-struct AFormatter;
-struct CFormatter;
-struct DefaultFormatter;
 
 /// One resolved output type: the type character and the number of input bytes
 /// each conversion of it consumes.
@@ -955,71 +907,23 @@ fn parse_type_string(spec: &str) -> Result<Vec<TypeSpec>, String> {
 }
 
 /// Resolve every `-t` option into a flat list of output types, in order.
+///
+/// With no type requested at all, od dumps two-byte octal words -- the
+/// historical default the XSI synopsis spells `-t o2`. Making it an ordinary
+/// spec rather than a branch in the render loop means it goes through the same
+/// field layout and duplicate-suppression as everything else.
 fn parse_type_specs(type_strings: &[String]) -> Result<Vec<TypeSpec>, String> {
     let mut specs = Vec::new();
     for spec in type_strings {
         specs.extend(parse_type_string(spec)?);
     }
+    if specs.is_empty() {
+        specs.push(TypeSpec {
+            type_char: 'o',
+            num_bytes: 2,
+        });
+    }
     Ok(specs)
-}
-
-impl Formatter for AFormatter {
-    fn format_value(&self, byte: u8) -> String {
-        // Named-character output uses only the least significant seven bits.
-        let byte = byte & 0x7F;
-        if let Some(name) = get_named_char(byte) {
-            format!(" {name: >3}")
-        } else if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
-            format!("   {}", byte as char)
-        } else {
-            format!(" {byte:03o}")
-        }
-    }
-}
-
-impl Formatter for CFormatter {
-    fn format_value(&self, byte: u8) -> String {
-        match byte {
-            b'\0' => "  \\0".to_string(),
-            // POSIX (l. 109177): a <backslash> is exempt from the escape table
-            // and "shall be written as a single <backslash>" -- NOT as `\\`.
-            // It still occupies the same 4-column field as every other
-            // conversion, so this arm carries three spaces, not two. Keeping
-            // the arm explicit (rather than letting the graphic-character case
-            // below handle it) documents that omitting the escape is
-            // deliberate.
-            b'\\' => "   \\".to_string(),
-            b'\x07' => "  \\a".to_string(),
-            b'\x08' => "  \\b".to_string(),
-            b'\x0C' => "  \\f".to_string(),
-            b'\x0A' => "  \\n".to_string(),
-            b'\x0D' => "  \\r".to_string(),
-            b'\x09' => "  \\t".to_string(),
-            b'\x0B' => "  \\v".to_string(),
-            _ if byte.is_ascii_graphic() || byte.is_ascii_whitespace() => {
-                format!("   {}", byte as char)
-            }
-            _ => format!(" {:03o}", byte),
-        }
-    }
-}
-
-impl Formatter for DefaultFormatter {
-    fn format_value(&self, byte: u8) -> String {
-        format!(" {:03o}", byte)
-    }
-}
-
-fn process_formatter(formatter: &dyn Formatter, local_buf: &[u8], local_buf_len: usize) -> String {
-    let buffer_size = local_buf_len * 8;
-
-    let mut result = String::with_capacity(buffer_size);
-
-    for byte in local_buf {
-        result.push_str(&formatter.format_value(*byte));
-    }
-
-    result
 }
 
 fn get_named_char(byte: u8) -> Option<&'static str> {

@@ -920,13 +920,14 @@ fn column_scale(specs: &[TypeSpec]) -> (usize, usize) {
 
 /// The column at which field `index` of a `bytes`-wide type ends.
 ///
-/// Rounded to the nearest column rather than truncated, so that a scale which
-/// is not a whole number -- seven columns per two bytes, say -- spreads its
-/// remainder across the fields (4, 3, 4, 3, ...) instead of letting them drift
-/// out of alignment with the wider type's.
+/// Rounded *up* where the scale is not a whole number of columns per byte. A
+/// group then gets its spare columns at the head rather than spread through
+/// it: with f8 driving the scale at 25 columns per eight bytes, x1's eight
+/// 3-column fields leave one column over, and it belongs before the first of
+/// them. Rounding to nearest instead put it in the middle of the group.
 fn field_end(index: usize, bytes: usize, scale: (usize, usize)) -> usize {
     let (num, den) = scale;
-    (2 * index * bytes * num + den) / (2 * den)
+    (index * bytes * num).div_ceil(den)
 }
 
 /// Render one output line: every field of one type, across the whole block.

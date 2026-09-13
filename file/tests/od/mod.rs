@@ -1147,6 +1147,18 @@ fn od_field_widths_are_shared_across_types() {
     // A single type is unaffected: its own natural width is the shared one.
     let (one, _, _) = od_raw(&["-An", "-t", "x1"], b"AB");
     assert_eq!(one, " 41 42\n");
+
+    // Where a field boundary falls between columns it is rounded *up*, so the
+    // slack lands at the start of each group rather than being spread through
+    // it. f8 needs 25 columns for eight bytes, so x1's eight 3-column fields
+    // leave one column over, and it goes before the first of them.
+    let (stdout, _, _) = od_raw(&["-An", "-t", "x1", "-t", "f8"], b"ABCDEFGHIJKLMNOP");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0], "  41 42 43 44 45 46 47 48  49 4a 4b 4c 4d 4e 4f 50",
+        "the spare column belongs to the head of the group: {stdout:?}"
+    );
+    assert_eq!(lines[0].len(), 50, "two 25-column groups");
 }
 
 // POSIX 109079-109082: "any number of groups of output lines, which would be

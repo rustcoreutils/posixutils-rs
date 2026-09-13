@@ -291,7 +291,9 @@ fn parse_offset(offset: &str) -> Result<u64, ParseIntError> {
 ///
 /// This function can return an error if:
 /// - There is an issue reading from the `reader`.
-/// - There is an invalid type string specified in `config.type_strings`.
+///
+/// Type strings are resolved into `specs` by the caller, before any input is
+/// opened, so an invalid one can no longer surface from here.
 ///
 /// # Behavior
 ///
@@ -315,6 +317,7 @@ fn parse_offset(offset: &str) -> Result<u64, ParseIntError> {
 fn print_data<R: Read>(
     reader: &mut R,
     config: &Args,
+    specs: &[TypeSpec],
     bytes_that_will_be_skipped: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The bytes have been skipped now. The offset will be > 0 if skipping was performed.
@@ -386,17 +389,15 @@ fn print_data<R: Read>(
                 config.verbose,
             );
         } else {
-            // Process the buffer according to specified type strings.
-            for type_string in &config.type_strings {
-                // Determine the number of bytes to read for this type.
-                let mut chars = type_string.chars();
-                let type_char = chars.next().unwrap();
-                let default_bytes = match type_char {
-                    'd' | 'u' | 'o' | 'x' => 2, // Default to 2 bytes for integers
-                    'f' => 4,                   // Default to 4 bytes for floats
-                    _ => 1,                     // Default to 1 byte for unknown types
-                };
-                let num_bytes = parse_type_bytes(type_char, chars.as_str(), default_bytes);
+            // Process the buffer according to the resolved output types. These
+            // were parsed and validated once before the first read, so
+            // `num_bytes` is known good here -- `chunks(0)` used to be reached
+            // before the size was checked at all, and panicked.
+            for spec in specs {
+                let TypeSpec {
+                    type_char,
+                    num_bytes,
+                } = *spec;
 
                 let chunks = local_buf.chunks(num_bytes);
                 match type_char {
@@ -421,13 +422,6 @@ fn print_data<R: Read>(
                         );
                     }
                     'u' => {
-                        // Check if the number of bytes is valid for unsigned integers.
-                        if !matches!(num_bytes, 1 | 2 | 4 | 8) {
-                            return Err(Box::new(Error::other(format!(
-                                "invalid type string `u{}`",
-                                num_bytes
-                            ))));
-                        }
                         let res =
                             process_chunks_formatter(&UFormatter, chunks, num_bytes, local_buf_len);
                         process_res_string(
@@ -439,13 +433,6 @@ fn print_data<R: Read>(
                         );
                     }
                     'd' => {
-                        // Check if the number of bytes is valid for signed integers.
-                        if !matches!(num_bytes, 1 | 2 | 4 | 8) {
-                            return Err(Box::new(Error::other(format!(
-                                "invalid type string `d{}`",
-                                num_bytes
-                            ))));
-                        }
                         let res =
                             process_chunks_formatter(&DFormatter, chunks, num_bytes, local_buf_len);
                         process_res_string(
@@ -457,13 +444,6 @@ fn print_data<R: Read>(
                         );
                     }
                     'x' => {
-                        // Check if the number of bytes is valid for hexadecimal format.
-                        if !matches!(num_bytes, 1 | 2 | 4 | 8) {
-                            return Err(Box::new(Error::other(format!(
-                                "invalid type string `x{}`",
-                                num_bytes
-                            ))));
-                        }
                         let res =
                             process_chunks_formatter(&XFormatter, chunks, num_bytes, local_buf_len);
                         process_res_string(
@@ -475,13 +455,6 @@ fn print_data<R: Read>(
                         );
                     }
                     'o' => {
-                        // Check if the number of bytes is valid for octal format.
-                        if !matches!(num_bytes, 1 | 2 | 4 | 8) {
-                            return Err(Box::new(Error::other(format!(
-                                "invalid type string `o{}`",
-                                num_bytes
-                            ))));
-                        }
                         let res =
                             process_chunks_formatter(&OFormatter, chunks, num_bytes, local_buf_len);
                         process_res_string(
@@ -493,13 +466,6 @@ fn print_data<R: Read>(
                         );
                     }
                     'f' => {
-                        // Check if the number of bytes is valid for floats.
-                        if !(matches!(num_bytes, 4 | 8)) {
-                            return Err(Box::new(Error::other(format!(
-                                "invalid type string `f{}`",
-                                num_bytes
-                            ))));
-                        }
                         let res =
                             process_chunks_formatter(&FFormatter, chunks, num_bytes, local_buf_len);
                         process_res_string(
@@ -895,38 +861,165 @@ struct AFormatter;
 struct CFormatter;
 struct DefaultFormatter;
 
-/// Parse the size suffix of a `-t` type: a letter naming a C type, or an
-/// explicit byte count, defaulting when absent or unrecognized.
+/// One resolved output type: the type character and the number of input bytes
+/// each conversion of it consumes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TypeSpec {
+    type_char: char,
+    num_bytes: usize,
+}
+
+/// The byte count a size letter names, which depends on the type character.
 ///
-/// The letters differ by type character, which is why `type_char` is needed.
 /// POSIX 109071-2 gives `f` the letters `F`/`D`/`L` -- float, double, long
 /// double -- while 109073-5 gives `d`/`o`/`u`/`x` the letters `C`/`S`/`I`/`L`
-/// -- char, short, int, long. Sharing one table let `-t fD` match nothing,
-/// fall through `s.parse()`, and silently take the 4-byte float default, so a
-/// double printed as two floats; and it read `fL` as 8, a double wearing long
-/// double's name.
-fn parse_type_bytes(type_char: char, size_str: &str, default_bytes: usize) -> usize {
-    let by_letter = match type_char {
-        'f' => match size_str {
-            "F" => Some(4),
-            "D" => Some(8),
-            "L" => Some(16),
+/// -- char, short, int, long. Sharing one table let `-t fD` match nothing and
+/// silently take the float default, so a double printed as two floats.
+fn size_letter(type_char: char, letter: char) -> Option<usize> {
+    match type_char {
+        'f' => match letter {
+            'F' => Some(4),
+            'D' => Some(8),
+            'L' => Some(16),
             _ => None,
         },
-        _ => match size_str {
-            "C" => Some(1),
-            "S" => Some(2),
-            "I" => Some(4),
-            "L" => Some(8),
+        _ => match letter {
+            'C' => Some(1),
+            'S' => Some(2),
+            'I' => Some(4),
+            'L' => Some(8),
             _ => None,
         },
-    };
-
-    match (size_str, by_letter) {
-        ("", _) => default_bytes,
-        (_, Some(bytes)) => bytes,
-        (s, None) => s.parse().unwrap_or(default_bytes),
     }
+}
+
+/// The byte count a type character converts when no size is written.
+///
+/// POSIX 109141-3: for `d`, `o`, `u` and `x` the default is "the size of the
+/// underlying implementation's basic integer type" -- `int`, 4 bytes.
+/// 109152-4: for `f` it is "the number of bytes in the underlying
+/// implementation's basic double precision floating-point data type" -- 8.
+/// These were 2 and 4, so a bare `-t x` printed eight 2-byte fields where
+/// POSIX and every other od print four 4-byte ones.
+fn default_size(type_char: char) -> usize {
+    match type_char {
+        'd' | 'o' | 'u' | 'x' => 4,
+        'f' => 8,
+        // `a` and `c` convert one byte and take no size at all.
+        _ => 1,
+    }
+}
+
+/// Reject a size the conversion cannot perform, naming the whole type string.
+///
+/// POSIX 109143-7 requires `char`, `short`, `int` and `long` for the integer
+/// conversions -- and 1, 2, 4 and 8 "even if it provides no C-language types
+/// of those sizes" -- and 109155-7 requires `float`, `double` and `long
+/// double` for `f`.
+fn validate_size(type_char: char, num_bytes: usize, spec: &str) -> Result<(), String> {
+    let ok = match type_char {
+        'f' => matches!(num_bytes, 4 | 8),
+        _ => matches!(num_bytes, 1 | 2 | 4 | 8),
+    };
+    if ok {
+        return Ok(());
+    }
+    let kind = if type_char == 'f' {
+        gettext("floating-point")
+    } else {
+        gettext("integer")
+    };
+    Err(format!(
+        "{}: {}",
+        gettext("invalid type string `{}`").replace("{}", spec),
+        gettext("no {n}-byte {kind} type")
+            .replace("{n}", &num_bytes.to_string())
+            .replace("{kind}", &kind)
+    ))
+}
+
+/// Split one `-t` type string into the types it names.
+///
+/// POSIX 109075-6: "Multiple types can be concatenated within the same
+/// type_string", which is why this yields a vector -- the spec's own example
+/// at 109237 is `-t o2x2x`, three types in one string. The old parser took
+/// the first character as the type and *all* the rest as its size, so
+/// `o2x2x` collapsed to a single type whose size failed to parse and silently
+/// became the default.
+///
+/// A size is either one letter from the type's own table or a run of decimal
+/// digits, never both: a digit may not follow a size letter, so `-t fL8` is
+/// rejected rather than read as `fL` followed by a stray `8`.
+fn parse_type_string(spec: &str) -> Result<Vec<TypeSpec>, String> {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut specs = Vec::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let type_char = chars[i];
+        i += 1;
+
+        if !matches!(type_char, 'a' | 'c' | 'd' | 'f' | 'o' | 'u' | 'x') {
+            return Err(gettext("invalid character '{c}' in type string `{s}`")
+                .replace("{c}", &type_char.to_string())
+                .replace("{s}", spec));
+        }
+
+        // `a` and `c` take no size: they always convert one byte.
+        if matches!(type_char, 'a' | 'c') {
+            specs.push(TypeSpec {
+                type_char,
+                num_bytes: 1,
+            });
+            continue;
+        }
+
+        let num_bytes = if i < chars.len() && chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let digits: String = chars[start..i].iter().collect();
+            // Only an overflowing run can fail here; `validate_size` rejects
+            // every in-range count the conversions do not provide.
+            digits
+                .parse::<usize>()
+                .map_err(|_| gettext("invalid type string `{}`").replace("{}", spec))?
+        } else if let Some(bytes) = chars.get(i).and_then(|&c| size_letter(type_char, c)) {
+            i += 1;
+            // A digit after a size letter is not a new type, and not part of
+            // the size either.
+            if let Some(&next) = chars.get(i) {
+                if next.is_ascii_digit() {
+                    return Err(gettext("invalid character '{c}' in type string `{s}`")
+                        .replace("{c}", &next.to_string())
+                        .replace("{s}", spec));
+                }
+            }
+            bytes
+        } else {
+            // No size written. Whatever follows, if anything, is the next
+            // type character and is checked on the next turn of the loop.
+            default_size(type_char)
+        };
+
+        validate_size(type_char, num_bytes, spec)?;
+        specs.push(TypeSpec {
+            type_char,
+            num_bytes,
+        });
+    }
+
+    Ok(specs)
+}
+
+/// Resolve every `-t` option into a flat list of output types, in order.
+fn parse_type_specs(type_strings: &[String]) -> Result<Vec<TypeSpec>, String> {
+    let mut specs = Vec::new();
+    for spec in type_strings {
+        specs.extend(parse_type_string(spec)?);
+    }
+    Ok(specs)
 }
 
 impl Formatter for AFormatter {
@@ -1061,6 +1154,11 @@ fn get_named_char(byte: u8) -> Option<&'static str> {
 /// 6. Calls `print_data` to read and print the data from the combined reader according to the configuration in `args`.
 ///
 fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve every `-t` before opening anything, so a malformed type string is
+    // diagnosed instead of surfacing partway through the output -- or, for a
+    // zero size, as a panic inside `chunks()`.
+    let specs = parse_type_specs(&args.type_strings).map_err(Error::other)?;
+
     let mut bytes_to_skip = 0; // Initialize the number of bytes to skip.
     let mut bytes_skipped = 0; // Initialize the number of bytes already skipped.
 
@@ -1155,7 +1253,7 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Print the data using the reader.
-    print_data(&mut reader, args, bytes_that_will_be_skipped)?;
+    print_data(&mut reader, args, &specs, bytes_that_will_be_skipped)?;
 
     Ok(())
 }

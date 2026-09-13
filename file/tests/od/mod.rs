@@ -427,7 +427,15 @@ fn od_raw(args: &[&str], stdin: &[u8]) -> (String, String, Option<i32>) {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn od");
-    child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
+    // A broken pipe here is a result, not a harness failure: od rejects a
+    // malformed `-t` before it opens the input at all, so it has already
+    // exited. Swallow only that, and let the exit code and stderr carry the
+    // verdict.
+    match child.stdin.as_mut().unwrap().write_all(stdin) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing od's stdin: {e}"),
+    }
     let out = child.wait_with_output().expect("wait od");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -478,9 +486,110 @@ fn od_long_double_is_refused_rather_than_silently_narrowed() {
     assert_ne!(code, Some(0), "fL must not silently produce doubles");
     assert!(stdout.is_empty(), "no output on refusal: {stdout:?}");
     assert!(
-        stderr.contains("f16") || stderr.contains("long double"),
+        stderr.contains("fL") || stderr.contains("16") || stderr.contains("long double"),
         "the diagnostic must name what was refused: {stderr:?}"
     );
+}
+
+// A malformed `-t` size must be diagnosed, never guessed at and never a panic.
+//
+// `parse_type_bytes` ended in `s.parse().unwrap_or(default_bytes)`, so every
+// unparseable size fell back to the default without a word: `-t x9z` and
+// `-t xZ` both behaved as `-t x2`. Silent acceptance is the defect, not the
+// missing size. And the `matches!(num_bytes, 1|2|4|8)` gate ran *after*
+// `local_buf.chunks(num_bytes)`, so `-t x0` reached `chunks(0)` and panicked
+// with "chunk size must be non-zero".
+#[test]
+fn od_diagnoses_a_malformed_type_size_rather_than_guessing() {
+    for spec in [
+        "x0", "f0", "u0", "x9z", "xZ", "fZ", "x99", "x3", "f3", "fL8",
+    ] {
+        let (stdout, stderr, code) = od_raw(&["-An", "-t", spec], b"ABCD");
+        assert_ne!(code, Some(0), "-t {spec} must be refused, not guessed at");
+        assert!(
+            !stderr.contains("panicked at"),
+            "-t {spec} panicked instead of diagnosing: {stderr:?}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "-t {spec}: no output on refusal: {stdout:?}"
+        );
+        assert!(
+            stderr.starts_with("od: ") && stderr.ends_with('\n'),
+            "-t {spec}: malformed diagnostic: {stderr:?}"
+        );
+    }
+}
+
+// POSIX 109075-109076: "Multiple types can be concatenated within the same
+// type_string". The spec's own example at 109237 is `od -A o -t o2x2x -N 18`,
+// three types in one string.
+//
+// The parser took `chars.next()` as the type character and the whole rest as
+// the size, so `o2x2x` resolved to one type whose size failed to parse and
+// silently became the default, and `x1c` became `x2`.
+#[test]
+fn od_concatenated_types_in_one_type_string() {
+    // Concatenation is defined as equivalent to separate `-t` options, which is
+    // the whole of the claim 109075-6 makes. Asserted as an equivalence rather
+    // than against fixed text, so it pins the parsing without also pinning the
+    // column widths -- those are a separate question, and unspecified besides
+    // (109189-92 asks only for "one or more <blank> characters").
+    let (concat, _, code) = od_raw(&["-An", "-t", "x1c"], b"AB");
+    assert_eq!(code, Some(0));
+    let (separate, _, _) = od_raw(&["-An", "-t", "x1", "-t", "c"], b"AB");
+    assert_eq!(concat, separate, "`-t x1c` must equal `-t x1 -t c`");
+
+    // Two types means two lines, and `x1`/`c` are both byte-oriented, so the
+    // values themselves say nothing about byte order.
+    let lines: Vec<&str> = concat.lines().collect();
+    assert_eq!(lines.len(), 2, "two types, two lines: {concat:?}");
+    assert_eq!(
+        lines[0].split_whitespace().collect::<Vec<_>>(),
+        ["41", "42"]
+    );
+    assert_eq!(lines[1].split_whitespace().collect::<Vec<_>>(), ["A", "B"]);
+
+    // The spec's own three-type example. Asserted structurally -- three output
+    // lines per 16-byte block -- so it holds on either byte order.
+    let (stdout, _, code) = od_raw(&["-A", "o", "-t", "o2x2x"], b"4.3 BSD UNIX #34ab");
+    assert_eq!(code, Some(0));
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        7,
+        "three types x two blocks plus the final offset: {stdout:?}"
+    );
+    assert!(lines[0].starts_with("0000000"), "{stdout:?}");
+    assert!(lines[3].starts_with("0000020"), "{stdout:?}");
+    assert_eq!(lines[6], "0000022", "{stdout:?}");
+}
+
+// POSIX 109141-109143: for `d`, `o`, `u` and `x` the default size is "the size
+// of the underlying implementation's basic integer type" -- `int`, 4 bytes.
+// 109152-109154: for `f` it is the basic double precision type -- 8 bytes.
+//
+// The defaults were 2 and 4, so a bare `-t x` printed eight 2-byte fields
+// where POSIX and every other od print four 4-byte ones.
+//
+// Asserted by field count rather than by value, which needs no byte order.
+#[test]
+fn od_default_type_sizes_are_the_basic_c_types() {
+    let sixteen = b"ABCDEFGHIJKLMNOP";
+    for (type_char, want) in [("d", 4), ("u", 4), ("x", 4), ("o", 4), ("f", 2)] {
+        let (bare, _, code) = od_raw(&["-An", "-t", type_char], sixteen);
+        assert_eq!(code, Some(0), "-t {type_char}");
+        assert_eq!(
+            bare.split_whitespace().count(),
+            want,
+            "-t {type_char} must convert 16 bytes into {want} items: {bare:?}"
+        );
+
+        // And the bare form must be exactly its explicit spelling.
+        let sized = format!("{type_char}{}", 16 / want);
+        let (explicit, _, _) = od_raw(&["-An", "-t", &sized], sixteen);
+        assert_eq!(bare, explicit, "-t {type_char} must equal -t {sized}");
+    }
 }
 
 #[test]

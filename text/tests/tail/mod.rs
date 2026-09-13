@@ -328,3 +328,30 @@ fn test_tail_nonexistent_file_errors() {
         "the diagnostic must name the utility, got {stderr:?}"
     );
 }
+
+/// `tail` must name the file it could not open.
+///
+/// `args.file` was moved into `tail(...)` before the diagnostic ran, so main
+/// had nothing to name; the operand is in scope at the `File::open` origin.
+#[test]
+fn test_tail_error_names_the_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("tail"))
+        .arg("/nonexistent_tail_probe_zz")
+        .output()
+        .expect("spawn tail");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("tail: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_tail_probe_zz"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

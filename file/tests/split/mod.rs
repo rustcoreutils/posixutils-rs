@@ -230,3 +230,53 @@ fn split_name_too_long_errors() {
     assert_eq!(count, 0);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `split` must name the *input* file it could not open.
+#[test]
+fn test_split_error_names_the_input_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("split"))
+        .arg("/nonexistent_split_probe_zz")
+        .output()
+        .expect("spawn split");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("split: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_split_probe_zz"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}
+
+/// ...and must name the *output* file when that is what failed, which is why
+/// the name has to be captured per origin rather than once in main.
+#[test]
+fn test_split_error_names_the_output_file() {
+    let dir = plib::tmp::tempdir().expect("tempdir");
+    let input = dir.path().join("in.txt");
+    std::fs::write(&input, "one\ntwo\nthree\n").unwrap();
+
+    let out = std::process::Command::new(plib::testing::get_binary_path("split"))
+        .arg(&input)
+        .arg("/nonexistent_dir_split_zz/prefix")
+        .output()
+        .expect("spawn split");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.contains("/nonexistent_dir_split_zz/prefix"),
+        "the output file is what failed, so that is what must be named: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(input.to_str().unwrap()),
+        "the readable input must not be blamed: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}

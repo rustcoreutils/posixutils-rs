@@ -200,3 +200,55 @@ fn unexpand_leading_tab_then_blanks() {
     // that follow form the next full stop.
     unexpand_test(&[], "\t        x\n", "\t\tx\n");
 }
+
+/// `unexpand` must name the file it could not open.
+///
+/// The operand is the loop variable at the `input_stream_dashed` origin, but
+/// the diagnostic ran in main after the loop, with nothing left to name.
+#[test]
+fn test_unexpand_error_names_the_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("unexpand"))
+        .arg("/nonexistent_unexpand_probe_zz")
+        .output()
+        .expect("spawn unexpand");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.starts_with("unexpand: "),
+        "every diagnostic must name the utility: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/nonexistent_unexpand_probe_zz"),
+        "the diagnostic must name the file it could not open: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
+    assert_ne!(out.status.code(), Some(0));
+}
+
+/// With several operands, the one that failed must be the one named -- the
+/// whole point of carrying the name from the origin.
+#[test]
+fn test_unexpand_names_the_failing_operand_among_several() {
+    let dir = plib::tmp::tempdir().expect("tempdir");
+    let good = dir.path().join("good.txt");
+    std::fs::write(&good, "a\tb\n").unwrap();
+
+    let out = std::process::Command::new(plib::testing::get_binary_path("unexpand"))
+        .arg(&good)
+        .arg("/nonexistent_unexpand_second_zz")
+        .output()
+        .expect("spawn unexpand");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        stderr.contains("/nonexistent_unexpand_second_zz"),
+        "the failing operand must be named: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(good.to_str().unwrap()),
+        "the readable operand must not be blamed: {stderr:?}"
+    );
+}

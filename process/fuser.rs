@@ -1135,24 +1135,13 @@ mod linux {
         device_list: &mut DeviceList,
         need_check_map: &mut bool,
     ) -> Result<(), std::io::Error> {
-        // Name the operand in anything that escapes from here. Both calls
-        // below fail with a bare errno, and the caller is `main`, which has no
-        // idea which of several operands was being resolved.
-        let named = |e: std::io::Error, path: &std::path::Path| {
-            std::io::Error::other(format!(
-                "{}: {}",
-                path.display(),
-                plib::diag::io_error_text(&e)
-            ))
-        };
-
         names.filename = {
             let requested = names.filename.clone();
-            expand_path(&requested).map_err(|e| named(e, &requested))?
+            expand_path(&requested).map_err(|e| named(&requested, e))?
         };
 
         let st =
-            timeout(&names.filename.to_string_lossy(), 5).map_err(|e| named(e, &names.filename))?;
+            timeout(&names.filename.to_string_lossy(), 5).map_err(|e| named(&names.filename, e))?;
         read_proc_mounts(mount_list)?;
 
         // POSIX: For block special devices, all processes using any file on
@@ -1372,7 +1361,8 @@ mod macos {
             .collect();
 
         for name in names.iter_mut() {
-            let st = timeout(&name.filename.to_string_lossy(), 5)?;
+            let st = timeout(&name.filename.to_string_lossy(), 5)
+                .map_err(|e| named(&name.filename, e))?;
             let uid = st.uid();
 
             // POSIX: For block special devices, all processes using any file on
@@ -1389,7 +1379,8 @@ mod macos {
                 Path::new(&name.filename),
                 is_volume,
                 false,
-            )?;
+            )
+            .map_err(|e| named(&name.filename, e))?;
 
             for pid in pids {
                 add_process(name, pid as i32, uid, Access::Cwd, ProcType::Normal);
@@ -1505,6 +1496,20 @@ fn print_matches(name: &mut Names, user: bool) -> Result<(), io::Error> {
 fn add_process(names: &mut Names, pid: i32, uid: u32, access: Access, proc_type: ProcType) {
     let proc = Procs::new(pid, uid, access, proc_type);
     names.add_procs(proc);
+}
+
+/// Name the operand in an error that would otherwise carry only an errno.
+///
+/// `main` reports whatever escapes the platform module, and cannot know which
+/// of several operands was being resolved. Shared by the Linux and macOS
+/// paths: the first version of this lived inside `mod linux` alone, and macOS
+/// CI duly reported `fuser: No such file or directory` with no file in it.
+fn named(path: &Path, e: io::Error) -> io::Error {
+    io::Error::other(format!(
+        "{}: {}",
+        path.display(),
+        plib::diag::io_error_text(&e)
+    ))
 }
 
 /// Executes `metadata()` system call with timeout to avoid deadlock on network-based file systems.

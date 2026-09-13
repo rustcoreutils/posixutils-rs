@@ -1080,6 +1080,43 @@ fn od_skip_of_exactly_the_whole_input_prints_the_offset() {
     assert_eq!(from_file, from_stdin, "the file and stdin paths must agree");
 }
 
+// `-j` must skip bytes that are actually read, not bytes `stat` claims are
+// there. A FIFO, a `/proc` file and a character device all report a size of
+// zero, so deciding from the size treated each as already exhausted and
+// reported "cannot skip past end of input" over a file with content in it.
+#[test]
+fn od_skip_works_on_a_file_whose_size_is_not_known() {
+    // /proc/version reports st_size 0 and reads several dozen bytes.
+    let probe = std::path::Path::new("/proc/version");
+    if !probe.exists() {
+        return; // Not Linux; the FIFO case below still covers the shape.
+    }
+
+    let (stdout, stderr, code) = od_raw(&["-j", "4", "-N", "8", "-t", "x1", "/proc/version"], b"");
+    assert_eq!(
+        code,
+        Some(0),
+        "a zero-stat file is not an empty one: {stderr:?}"
+    );
+    let fields: Vec<&str> = stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        fields.len(),
+        9,
+        "the offset and eight bytes from offset four: {stdout:?}"
+    );
+    assert_eq!(fields[0], "0000004");
+
+    // The same bytes as an ordinary read of the file, skipped by hand.
+    let whole = std::fs::read("/proc/version").unwrap();
+    let expected: Vec<String> = whole[4..12].iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(fields[1..], expected[..], "{stdout:?}");
+}
+
 // POSIX 109196-109199: "Unless -A n is specified, the *first* output line
 // produced for each input block shall be preceded by the input offset". One
 // offset per block, not one per type -- the spec's own three-type example at

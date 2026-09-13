@@ -1326,19 +1326,45 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             })?;
 
             if bytes_skipped < bytes_to_skip {
-                // If the cumulative bytes skipped are less than the bytes to skip, process the file for skipping.
-                let metadata = file.metadata()?; // Get file metadata.
-                let file_size = metadata.len(); // Get file size.
+                let remaining_skip = bytes_to_skip - bytes_skipped;
+                // Seek over a regular file, which is cheap and exact. A seek
+                // that lands past the end is not yet an error: the next file
+                // may supply the rest, and only running out of input
+                // altogether is.
+                //
+                // A reported size of zero is not evidence of an empty file. A
+                // FIFO, a character device and a `/proc` file all report zero
+                // -- and a `/proc` file is a regular file besides, so the file
+                // type does not separate them either. Believing the size
+                // treated a file with content in it as already exhausted, and
+                // `od -j 4 /proc/version` reported "cannot skip past end of
+                // input" over a line of text.
+                //
+                // So zero means "ask the file", and the skipped bytes are read
+                // and discarded. A genuinely empty file reads nothing and
+                // costs nothing.
+                let size = file
+                    .metadata()
+                    .ok()
+                    .filter(|m| m.is_file() && m.len() > 0)
+                    .map(|m| m.len());
 
-                if bytes_skipped + file_size <= bytes_to_skip {
-                    // Skip the entire file if it is within the range of bytes to skip.
-                    bytes_skipped += file_size;
-                    continue; // Move to the next file.
+                if let Some(size) = size {
+                    if size <= remaining_skip {
+                        bytes_skipped += size;
+                        continue; // This file is entirely within the skip.
+                    }
+                    file.seek(SeekFrom::Start(remaining_skip))?;
+                    bytes_skipped = bytes_to_skip;
                 } else {
-                    // Skip part of the file if only a portion of it is within the range of bytes to skip.
-                    let remaining_skip = bytes_to_skip - bytes_skipped;
-                    file.seek(SeekFrom::Start(remaining_skip))?; // Seek to the remaining bytes.
-                    bytes_skipped = bytes_to_skip; // Update the bytes skipped.
+                    let discarded = io::copy(
+                        &mut io::Read::by_ref(&mut file).take(remaining_skip),
+                        &mut io::sink(),
+                    )?;
+                    bytes_skipped += discarded;
+                    if discarded < remaining_skip {
+                        continue; // Exhausted before the skip was satisfied.
+                    }
                 }
             }
 

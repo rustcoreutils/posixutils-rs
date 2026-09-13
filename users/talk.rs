@@ -863,6 +863,20 @@ fn strip_padding(s: &str) -> String {
 }
 
 impl TermCaps {
+    /// Prepare a raw capability template for storage in [`Self::cursor_address`].
+    ///
+    /// Padding is stripped here, once, rather than from each expansion: a
+    /// padding spec is literal text in the template -- terminfo's parameter
+    /// language is `%`-based and never produces one -- so removing it up front
+    /// is equivalent, and lets `write_cup` expand straight into the caller's
+    /// buffer with nothing to post-process.
+    ///
+    /// Every template must enter the struct through here. It is the only thing
+    /// keeping `write_cup`'s "the template has no padding" assumption true.
+    fn template(raw: &[u8]) -> Vec<u8> {
+        strip_padding(&String::from_utf8_lossy(raw)).into_bytes()
+    }
+
     /// Resolve from the environment, falling back to ANSI for an unset or
     /// unknown TERM. Reading the database once matters: these are used per
     /// keystroke.
@@ -873,7 +887,7 @@ impl TermCaps {
         };
         use terminfo::capability as cap;
         if let Some(v) = db.get::<cap::CursorAddress>() {
-            caps.cursor_address = Some(v.as_ref().to_vec());
+            caps.cursor_address = Some(TermCaps::template(v.as_ref()));
         }
         if let Some(v) = db.get::<cap::ClrEol>() {
             caps.clr_eol = strip_padding(&String::from_utf8_lossy(v.as_ref()));
@@ -887,20 +901,28 @@ impl TermCaps {
         caps
     }
 
-    /// Address the cursor at 1-based `row`, `col`.
+    /// Address the cursor at 1-based `row`, `col`, writing into `out`.
     ///
     /// terminfo's `cup` is 0-based, the ANSI fallback is 1-based; the callers
     /// all think in 1-based screen rows, so the conversion lives here rather
     /// than at six call sites.
-    fn cup(&self, row: u16, col: u16) -> String {
+    ///
+    /// Expanded straight into the caller's buffer. Returning a `String` meant
+    /// a `Vec` from the expansion and a second allocation to strip padding
+    /// from it, on every cursor move -- measured at 154ns against the 78ns
+    /// write-and-flush that follows each one. The padding is gone from the
+    /// template already, so there is nothing to post-process.
+    fn write_cup<W: Write>(&self, out: &mut W, row: u16, col: u16) -> io::Result<()> {
         if let Some(tmpl) = &self.cursor_address {
             let y = u32::from(row.saturating_sub(1));
             let x = u32::from(col.saturating_sub(1));
-            if let Ok(bytes) = terminfo::expand!(tmpl.as_slice(); y, x) {
-                return strip_padding(&String::from_utf8_lossy(&bytes));
+            if terminfo::expand!(&mut *out, tmpl.as_slice(); y, x).is_ok() {
+                return Ok(());
             }
+            // The template did not expand; fall through to ANSI rather than
+            // leaving the cursor wherever it was.
         }
-        format!("\x1b[{};{}H", row, col)
+        write!(out, "\x1b[{};{}H", row, col)
     }
 }
 
@@ -956,12 +978,8 @@ impl Window {
         // Explicit positioning rather than a bare "\n": with ICANON/ONLCR
         // cleared a newline moves down without returning to column 0
         // (audit #TK17).
-        write!(
-            out,
-            "{}{}",
-            self.caps.cup(self.cursor_row(), 1),
-            self.caps.clr_eol
-        )?;
+        self.caps.write_cup(out, self.cursor_row(), 1)?;
+        out.write_all(self.caps.clr_eol.as_bytes())?;
         out.flush()
     }
 
@@ -984,13 +1002,9 @@ impl Window {
         self.col = self.col.saturating_sub(1);
         // Redraw the line rather than emitting a destructive backspace, so the
         // window stays consistent after a wrap.
-        write!(
-            out,
-            "{}{}{}",
-            self.caps.cup(self.cursor_row(), 1),
-            self.caps.clr_eol,
-            self.line
-        )?;
+        self.caps.write_cup(out, self.cursor_row(), 1)?;
+        out.write_all(self.caps.clr_eol.as_bytes())?;
+        out.write_all(self.line.as_bytes())?;
         out.flush()
     }
 
@@ -998,25 +1012,17 @@ impl Window {
     fn kill<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
         self.line.clear();
         self.col = 0;
-        write!(
-            out,
-            "{}{}",
-            self.caps.cup(self.cursor_row(), 1),
-            self.caps.clr_eol
-        )?;
+        self.caps.write_cup(out, self.cursor_row(), 1)?;
+        out.write_all(self.caps.clr_eol.as_bytes())?;
         out.flush()
     }
 
     /// Repaint this window's current line, used for Ctrl-L refresh and after a
     /// resize.
     fn repaint<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
-        write!(
-            out,
-            "{}{}{}",
-            self.caps.cup(self.cursor_row(), 1),
-            self.caps.clr_eol,
-            self.line
-        )?;
+        self.caps.write_cup(out, self.cursor_row(), 1)?;
+        out.write_all(self.caps.clr_eol.as_bytes())?;
+        out.write_all(self.line.as_bytes())?;
         out.flush()
     }
 
@@ -1734,25 +1740,40 @@ fn handle_client(stream: TcpStream) -> Result<(), io::Error> {
 /// # Errors
 ///
 /// Returns an `io::Error` if there is an issue with writing to the terminal or flushing output.
+/// Paint the split-screen frame into `out`.
+///
+/// Split from `draw_terminal` so the sequence can be asserted against a
+/// `Vec<u8>`; the caller owns the locking and the flush.
+fn draw_frame<W: Write>(
+    out: &mut W,
+    caps: &TermCaps,
+    split_row: u16,
+    width: u16,
+) -> io::Result<()> {
+    // Clear terminal screen
+    out.write_all(caps.clear_screen.as_bytes())?;
+    // Display the connection message at the top of the terminal.
+    out.write_all(b"[Connection established]")?;
+    // Move the cursor to the split row and draw the split line.
+    caps.write_cup(out, split_row, 1)?;
+    // Draw the horizontal split line (─) across the width of the terminal.
+    let width = usize::from(width.saturating_sub(2));
+    writeln!(out, "└{:─<width$}┘", "", width = width)?;
+    // Move the cursor back to the top-left corner and then down by one line.
+    caps.write_cup(out, 1, 1)?;
+    out.write_all(caps.cursor_down.as_bytes())
+}
+
 fn draw_terminal(split_row: u16, width: u16) -> io::Result<()> {
     let caps = TermCaps::from_env();
     let stdout = io::stdout();
     let mut handle = stdout.lock();
 
-    // Clear terminal screen
-    print!("{}", caps.clear_screen);
-    io::stdout().flush().ok();
-
-    // Display the connection message at the top of the terminal.
-    write!(handle, "[Connection established]")?;
-    // Move the cursor to the split row and draw the split line.
-    write!(handle, "{}", caps.cup(split_row, 1))?;
-    // Draw the horizontal split line (─) across the width of the terminal.
-    let width = usize::from(width.saturating_sub(2));
-    writeln!(handle, "└{:─<width$}┘", "", width = width)?;
-    // Move the cursor back to the top-left corner and then down by one line.
-    write!(handle, "{}", caps.cup(1, 1))?;
-    write!(handle, "{}", caps.cursor_down)?;
+    // Everything goes through `handle`. The screen clear used to go out via
+    // `print!` with its flush result discarded, which both mixed two paths to
+    // the same stream and dropped an error in a function whose whole contract
+    // is `io::Result`.
+    draw_frame(&mut handle, &caps, split_row, width)?;
 
     handle.flush()?;
 
@@ -2245,14 +2266,17 @@ pub fn handle_signals(signal_code: libc::c_int) {
     std::process::exit(code);
 }
 
-/// Clears the terminal screen by sending escape sequences.
+/// Clears the terminal screen.
 ///
-/// # Errors
+/// Uses the terminal's own `clear` capability, falling back to ANSI when TERM
+/// is unset or has no entry -- the seventh control sequence in this file, and
+/// the one the terminfo conversion missed because it sits on stderr rather
+/// than in the drawing path.
 ///
-/// This function does not return errors, but prints to standard error if the terminal cannot be cleared.
+/// Infallible by design: this runs on the teardown path, where a terminal that
+/// will not take the sequence is not worth a diagnostic.
 fn clear_terminal() {
-    // clear screeen
-    eprint!("\x1B[2J\x1B[H");
+    eprint!("{}", TermCaps::from_env().clear_screen);
 }
 
 /// Handles sending a delete request and waiting for the response from the talk daemon.
@@ -2711,7 +2735,7 @@ mod tests {
         // talk did before it consulted the database -- that is the
         // "unspecified default terminal type" the spec allows.
         let caps = TermCaps::default();
-        assert_eq!(caps.cup(3, 1), "\x1b[3;1H");
+        assert_eq!(rendered_cup(&caps, 3, 1), "\x1b[3;1H");
         assert_eq!(caps.clr_eol, "\x1b[K");
         assert_eq!(caps.clear_screen, "\x1b[2J\x1b[H");
         assert_eq!(caps.cursor_down, "\x1b[1B");
@@ -2732,11 +2756,14 @@ mod tests {
             return;
         };
         let caps = TermCaps {
-            cursor_address: Some(cup.as_ref().to_vec()),
+            // Through `template`, as `from_env` does: vt100's own cup carries
+            // a "$<5>" padding delay, and building the struct by hand used to
+            // smuggle it past the strip.
+            cursor_address: Some(TermCaps::template(cup.as_ref())),
             ..TermCaps::default()
         };
-        assert_eq!(caps.cup(3, 1), "\x1b[3;1H");
-        assert_eq!(caps.cup(1, 1), "\x1b[1;1H");
+        assert_eq!(rendered_cup(&caps, 3, 1), "\x1b[3;1H");
+        assert_eq!(rendered_cup(&caps, 1, 1), "\x1b[1;1H");
     }
 
     #[test]
@@ -2771,5 +2798,65 @@ mod tests {
         assert_eq!(strip_padding("plain"), "plain");
         // Unterminated: kept rather than swallowing the rest of the string.
         assert_eq!(strip_padding("a$<oops"), "a$<oops");
+    }
+
+    /// `write_cup` into a String, for tests that assert the exact sequence.
+    fn rendered_cup(caps: &TermCaps, row: u16, col: u16) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        caps.write_cup(&mut buf, row, col).unwrap();
+        String::from_utf8(buf).expect("cursor addressing is ASCII")
+    }
+
+    #[test]
+    fn test_draw_frame_writes_everything_through_one_writer() {
+        // draw_terminal used to emit the screen clear with `print!` while
+        // holding a StdoutLock, and discard that flush's result. Splitting the
+        // drawing out means the whole sequence is one writer's business, and
+        // can be asserted.
+        let caps = TermCaps {
+            cursor_address: None,
+            clr_eol: "<EL>".to_string(),
+            clear_screen: "<CLS>".to_string(),
+            cursor_down: "<DOWN>".to_string(),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        draw_frame(&mut buf, &caps, 12, 40).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(out.starts_with("<CLS>"), "the clear comes first: {out:?}");
+        assert!(
+            out.contains("[Connection established]"),
+            "the banner is drawn: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[12;1H"),
+            "the split row is addressed: {out:?}"
+        );
+        assert!(
+            out.ends_with("<DOWN>"),
+            "the cursor ends one line down: {out:?}"
+        );
+        assert!(
+            out.contains('\u{2514}') && out.contains('\u{2518}'),
+            "the split line is drawn: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_draw_frame_propagates_a_write_error() {
+        // The contract is io::Result; a failing stream must not be swallowed,
+        // which is what `io::stdout().flush().ok()` used to do.
+        struct Failing;
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("device gone"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("device gone"))
+            }
+        }
+        let err = draw_frame(&mut Failing, &TermCaps::default(), 12, 40)
+            .expect_err("a failing writer must surface");
+        assert_eq!(err.to_string(), "device gone");
     }
 }

@@ -982,6 +982,57 @@ fn od_field_widths_are_shared_across_types() {
     assert_eq!(one, " 41 42\n");
 }
 
+// POSIX 109079-109082: "any number of groups of output lines, which would be
+// identical to the immediately preceding group of output lines (except for the
+// byte offsets), shall be replaced with a line containing only an <asterisk>".
+//
+// The unit is the *group* -- every type's line for one input block -- and the
+// suppression repeats. Two defects: `previous_asterisk` was set on the first
+// duplicate run and never cleared, so a second run after an intervening
+// different block printed in full; and the comparison was per line with state
+// shared across types, so a multi-type dump never suppressed anything at all.
+#[test]
+fn od_duplicate_blocks_collapse_to_an_asterisk() {
+    // Three identical blocks, one different, three identical again.
+    let mut data = vec![b'A'; 48];
+    data.extend([b'B'; 16]);
+    data.extend([b'A'; 48]);
+
+    let (stdout, _, code) = od_raw(&["-t", "x1"], &data);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        stdout,
+        "0000000 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41\n\
+         *\n\
+         0000060 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42\n\
+         0000100 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41\n\
+         *\n\
+         0000160\n",
+        "both runs must collapse, not just the first"
+    );
+
+    // With two types the asterisk stands for the whole group: one per run,
+    // not one per line.
+    let (stdout, _, _) = od_raw(&["-t", "x1", "-t", "c"], &data);
+    assert_eq!(
+        stdout.lines().filter(|l| *l == "*").count(),
+        2,
+        "one asterisk per suppressed run: {stdout:?}"
+    );
+    let head: Vec<&str> = stdout.lines().take(3).collect();
+    assert!(head[0].starts_with("0000000"), "{stdout:?}");
+    assert!(head[1].trim_start().starts_with('A'), "{stdout:?}");
+    assert_eq!(
+        head[2], "*",
+        "the group's lines print before it: {stdout:?}"
+    );
+
+    // -v writes every block.
+    let (stdout, _, _) = od_raw(&["-v", "-t", "x1"], &data);
+    assert!(!stdout.contains('*'), "-v suppresses nothing: {stdout:?}");
+    assert_eq!(stdout.lines().count(), 8, "seven blocks plus the offset");
+}
+
 #[test]
 fn od_integer_size_suffixes_are_unchanged() {
     // The C/S/I/L table belongs to d/o/u/x (POSIX 109073-5) and must not have

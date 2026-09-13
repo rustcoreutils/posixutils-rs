@@ -323,8 +323,10 @@ fn print_data<R: Read>(
     let mut offset: u64 = bytes_that_will_be_skipped; // Initialize offset for printing addresses.
 
     let mut buffer = [0; 16]; // Buffer to read data in chunks of 16 bytes.
-    let mut previous_offset_string = String::new();
-    let mut previous_asterisk = false;
+                              // The previous block's rendered lines, and whether a run of duplicates is
+                              // already standing in for them.
+    let mut previous_group: Option<Vec<String>> = None;
+    let mut suppressing = false;
 
     // Parse count limit from config, if specified.
     let count = if let Some(count) = config.count.as_ref() {
@@ -395,19 +397,30 @@ fn print_data<R: Read>(
             .map(|spec| render_line(spec, local_buf, scale))
             .collect();
 
-        for (index, line) in lines.iter().enumerate() {
-            let prefix = if index == 0 {
-                offset_string.clone()
-            } else {
-                " ".repeat(offset_string.len())
-            };
-            process_res_string(
-                &prefix,
-                &mut previous_offset_string,
-                &mut previous_asterisk,
-                line,
-                config.verbose,
-            );
+        // POSIX 109079-109082: "any number of groups of output lines, which
+        // would be identical to the immediately preceding group of output
+        // lines (except for the byte offsets), shall be replaced with a line
+        // containing only an <asterisk>". The unit is the group, so a
+        // multi-type dump collapses all of its lines together or none of them;
+        // and the offsets are excluded by construction, since `lines` holds
+        // only the field text.
+        if !config.verbose && previous_group.as_deref() == Some(&lines[..]) {
+            if !suppressing {
+                println!("*");
+                suppressing = true;
+            }
+        } else {
+            // A block that prints ends the run, so the next duplicate run gets
+            // an asterisk of its own.
+            suppressing = false;
+            for (index, line) in lines.iter().enumerate() {
+                if index == 0 {
+                    println!("{offset_string}{line}");
+                } else {
+                    println!("{:width$}{line}", "", width = offset_string.len());
+                }
+            }
+            previous_group = Some(lines);
         }
 
         offset += bytes_read as u64; // Move to the next line of bytes.
@@ -427,27 +440,6 @@ fn print_data<R: Read>(
     }
 
     Ok(())
-}
-
-fn process_res_string(
-    offset_string: &str,
-    previous_offset_string: &mut String,
-    previous_asterisk: &mut bool,
-    res_string: &str,
-    verbose: bool,
-) {
-    if !verbose && res_string == previous_offset_string {
-        if !*previous_asterisk {
-            print!("*");
-            *previous_asterisk = true;
-            println!(); // Print a newline after each line of bytes.
-        }
-    } else {
-        print!("{offset_string}");
-        print!("{res_string}");
-        println!(); // Print a newline after each line of bytes.
-        res_string.clone_into(previous_offset_string);
-    }
 }
 
 /// Lay a chunk out as `num_bytes` bytes of memory, extending a short final

@@ -12,7 +12,9 @@
 //! This module provides key event types and input reading from the terminal.
 
 mod key;
+mod queue;
 mod reader;
 
 pub use key::Key;
+pub use queue::{InputQueue, KeySource, QueuedKey};
 pub use reader::InputReader;

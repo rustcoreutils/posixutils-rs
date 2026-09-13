@@ -3661,3 +3661,147 @@ fn test_backspace_erases_a_quoted_pair_on_the_ex_line() {
         editor.get_message()
     );
 }
+
+// ============================================================================
+// :map expansion
+// ============================================================================
+
+/// The basic case, and the count case beside it. A count is part of the
+/// command, not an argument to it, and 96607-96608 requires that a digit lhs
+/// work at all -- so expansion is not suppressed while a count is accumulating.
+#[test]
+fn test_command_map_expands() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\nfour\n");
+    editor.execute_keys(":map q dd\n").unwrap();
+
+    editor.execute_keys("q").unwrap();
+    assert_eq!(editor.get_buffer_text(), "two\nthree\nfour\n");
+
+    editor.execute_keys("2q").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "four\n",
+        "a count reaches the map"
+    );
+}
+
+/// 96598-96600, the case POSIX pins by name: "if the character 'x' was mapped
+/// to 'y', the command fx searched for the 'x' character, not the 'y'
+/// character. POSIX.1-2024 requires this behavior." The same holds everywhere
+/// the vi parser is waiting for an argument rather than a command.
+#[test]
+fn test_no_expansion_in_argument_position() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("axbycz\n");
+    editor.execute_keys(":map x y\n").unwrap();
+
+    // f takes a character argument: it must find the literal `x` at column 1.
+    editor.execute_keys("0fx").unwrap();
+    assert_eq!(editor.get_cursor().column, 1, "fx must find x, not y");
+
+    // r takes one too: `rx` must write an `x`.
+    editor.execute_keys("0rx").unwrap();
+    assert_eq!(&editor.get_buffer_text()[..1], "x");
+
+    // And a register name after `"` is an argument, not a command.
+    editor.set_buffer_text("alpha\nbravo\n");
+    editor.execute_keys("\"xyy").unwrap();
+    assert_eq!(
+        editor.get_register('x').map(|r| r.text.clone()),
+        Some("alpha\n".to_string()),
+        "the register name must be the literal x"
+    );
+}
+
+/// 95097-95098: a `^V`-escaped character "shall not be part of a match to an
+/// lhs". 96600-96606 makes that required from the second character on and
+/// permitted for the first; it is implemented uniformly.
+#[test]
+fn test_ctrl_v_suppresses_a_command_map() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\n");
+    editor.execute_keys(":map q dd\n").unwrap();
+
+    editor.execute_keys("\x16q").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "one\ntwo\n",
+        "a quoted q must not fire the map"
+    );
+}
+
+/// A multi-key lhs holds its keys until the match resolves. POSIX leaves the
+/// wait unspecified (95116-95118); under shortest-match a held prefix can only
+/// be a strict prefix, so waiting for the next keystroke always resolves it.
+#[test]
+fn test_multi_key_map_waits_for_the_rest() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    editor.execute_keys(":map ab dd\n").unwrap();
+
+    // `a` alone is a prefix: nothing happens yet, and in particular the `a`
+    // has not entered insert mode.
+    editor.execute_keys("a").unwrap();
+    assert_eq!(editor.get_buffer_text(), "one\ntwo\nthree\n");
+    assert_eq!(editor.get_mode(), Mode::Command, "held, not dispatched");
+
+    editor.execute_keys("b").unwrap();
+    assert_eq!(editor.get_buffer_text(), "two\nthree\n");
+}
+
+/// When a held prefix turns out to match nothing, the keys after the first go
+/// back to the front of the queue rather than being dispatched where they lie
+/// -- otherwise a left-hand side starting inside them could never fire.
+#[test]
+fn test_a_failed_prefix_releases_its_keys_for_a_later_match() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("one\ntwo\nthree\n");
+    // `ax` is a prefix of nothing, but `x` on its own is mapped.
+    editor.execute_keys(":map ax dd\n").unwrap();
+    editor.execute_keys(":map x dd\n").unwrap();
+
+    // `a` holds as a prefix of `ax`; `y` fails the match. The `a` is then
+    // dispatched (append, entering insert mode) and the `y` goes back to the
+    // front of the queue rather than being dropped or acted on out of order,
+    // so it is inserted as text after the first character.
+    editor.execute_keys("ay\x1b").unwrap();
+    assert_eq!(
+        editor.get_buffer_text(),
+        "oyne\ntwo\nthree\n",
+        "the released key must still be acted on, in order"
+    );
+}
+
+/// vi.md 120624: "If the vi command resulted from a map expansion, all
+/// characters from that map expansion shall be discarded."
+#[test]
+fn test_an_error_discards_the_rest_of_the_expansion() {
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("ab\ntwo\n");
+    // `5rZ` on a two-character line is an error -- POSIX makes a count larger
+    // than the characters left on the line fail with the line unchanged -- so
+    // the `dd` behind it must never run.
+    editor.execute_keys(":map q 5rZdd\n").unwrap();
+
+    editor.execute_keys("q").unwrap();
+    assert!(
+        editor.is_error_message(),
+        "the 5rZ must have failed; got {:?}",
+        editor.get_message()
+    );
+    assert_eq!(
+        editor.get_buffer_text(),
+        "ab\ntwo\n",
+        "the dd after the failing command must be discarded"
+    );
+
+    // The same keys typed by hand are not an expansion, so the `dd` does run:
+    // it is the discarding that is conditional, not the failure.
+    let mut editor = Editor::new_headless();
+    editor.set_buffer_text("ab\ntwo\n");
+    editor.execute_keys("5rZ").unwrap();
+    assert!(editor.is_error_message());
+    editor.execute_keys("dd").unwrap();
+    assert_eq!(editor.get_buffer_text(), "two\n");
+}

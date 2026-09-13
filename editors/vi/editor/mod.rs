@@ -15,13 +15,13 @@
 mod executor;
 
 use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
-use crate::command::CommandParser;
+use crate::command::{CommandParser, ParserState};
 use crate::error::{Result, ViError};
 use crate::ex::command::{MapMode, SubstituteFlags, CTRL_V};
 use crate::ex::{parse_ex_command, AddressRange, ExCommand, ExResult};
 use crate::file::{read_file, write_file, write_range, FileManager};
-use crate::input::{InputReader, Key};
-use crate::maps::keys_from_text;
+use crate::input::{InputQueue, InputReader, Key, KeySource, QueuedKey};
+use crate::maps::{keys_from_text, MapMatch};
 use crate::mode::{enter_insert_mode, process_insert_key, InsertKind, InsertState, Mode};
 use crate::options::Options;
 use crate::register::{RegisterContent, Registers};
@@ -177,6 +177,8 @@ pub struct Editor {
     marks: [Option<Position>; 26],
     /// `:map`, `:map!` and `:ab` definitions.
     maps: crate::maps::Maps,
+    /// Keys waiting to be acted on: typed, expanded, or from an `@` buffer.
+    input: InputQueue,
     /// A `^V` on the ex command line is pending, so the next key is quoted.
     ///
     /// Only the four commands POSIX gives `<control>-V` escaping to
@@ -280,6 +282,7 @@ impl Editor {
             is_error: false,
             marks: [None; 26],
             maps: crate::maps::Maps::default(),
+            input: InputQueue::default(),
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -327,6 +330,7 @@ impl Editor {
             is_error: false,
             marks: [None; 26],
             maps: crate::maps::Maps::default(),
+            input: InputQueue::default(),
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -377,6 +381,7 @@ impl Editor {
             is_error: false,
             marks: [None; 26],
             maps: crate::maps::Maps::default(),
+            input: InputQueue::default(),
             ex_pending_literal: false,
             tag_stack: Vec::new(),
             should_quit: false,
@@ -850,18 +855,193 @@ impl Editor {
         }
     }
 
-    /// Handle a key press.
+    /// Accept one key and run the editor until nothing is left to do.
+    ///
+    /// The key does not necessarily act at once: a `:map` whose left-hand side
+    /// is more than one key long holds it back until the match resolves, and a
+    /// map that fires puts its replacement in front of whatever was waiting.
+    /// Draining here rather than in the read loop is what makes the headless
+    /// harness and the real editor take the same path.
     fn handle_key(&mut self, key: Key) -> Result<()> {
-        // Clear any previous message
-        if !matches!(key, Key::Char(':')) {
-            self.clear_message();
-        }
+        self.input.push_typed(key);
+        self.drain_input()
+    }
 
-        match &self.mode {
-            Mode::Command => self.handle_command_key(key),
-            Mode::Insert(_) | Mode::Replace | Mode::Open => self.handle_insert_key(key),
-            Mode::Ex => self.handle_ex_key(key),
+    /// Dispatch queued keys until the queue empties or a match needs more input.
+    fn drain_input(&mut self) -> Result<()> {
+        loop {
+            // ex.md 96616-96617: a map defined in terms of itself loops, POSIX
+            // "requires conformance to historical practice, and that such loops
+            // be interruptible". So the escape is a signal, not a depth cap --
+            // a cap would refuse a mapping the spec says must work.
+            if crate::signals::take(&crate::signals::SIGINT_RECEIVED) {
+                self.abort_expansion();
+                return Ok(());
+            }
+
+            let Some(q) = self.next_input_key() else {
+                return Ok(());
+            };
+
+            // Clear any previous message
+            if !matches!(q.key, Key::Char(':')) {
+                self.clear_message();
+            }
+
+            let result = match &self.mode {
+                Mode::Command => self.handle_command_key(q.key),
+                Mode::Insert(_) | Mode::Replace | Mode::Open => self.handle_insert_key(q.key),
+                Mode::Ex => self.handle_ex_key(q.key),
+            };
+
+            // vi.md 120619-120627. `self.is_error` has to be consulted as well
+            // as the `Result`: most of `execute_command` reports through
+            // `set_error` rather than returning `Err`, so testing the `Result`
+            // alone would miss the majority of vi command errors.
+            if result.is_err() || self.is_error {
+                self.abort_expansion();
+            }
+            result?;
         }
+    }
+
+    /// Which `:map` table applies right now, or `None` where no map does.
+    ///
+    /// POSIX scopes both tables to "open or visual" mode (95090-95092): command
+    /// mode takes `:map`, text input mode takes `:map!`. Two contexts are
+    /// deliberately absent. The colon line is one — 96496-96509 permits not
+    /// expanding there and forbids the two behaviours that expanding the first
+    /// argument of `:ab`/`:una` historically caused, so not expanding is both
+    /// the safe reading and the simple one. Ex text input mode (`:a`, `:i`,
+    /// `:c`) is the other: it is neither open nor visual, and it does not reach
+    /// this function at all, since `handle_ex_key` owns it.
+    fn active_map_mode(&self) -> Option<MapMode> {
+        match self.mode {
+            Mode::Command => Some(MapMode::Command),
+            Mode::Insert(_) | Mode::Replace | Mode::Open => Some(MapMode::Insert),
+            Mode::Ex => None,
+        }
+    }
+
+    /// Whether a left-hand side may be matched at this point in a command.
+    ///
+    /// 95094-95095 says a command-mode map fires when its lhs is entered "as
+    /// any part of a vi command (but not as part of the arguments to the
+    /// command)", and 96598-96600 gives the case that pins it: with `x` mapped
+    /// to `y`, "the command fx searched for the 'x' character, not the 'y'
+    /// character. POSIX.1-2024 requires this behavior."
+    ///
+    /// `CommandParser` already knows when it is waiting for an argument, so
+    /// this is a question about its state and needs no bookkeeping of its own.
+    /// A count is *not* an argument: 96607-96608 requires that a digit lhs
+    /// work, so `Count` and `Operator` stay eligible.
+    fn in_argument_position(&self) -> bool {
+        matches!(
+            self.parser.state(),
+            ParserState::Register | ParserState::WaitingChar | ParserState::MotionWaitingChar
+        )
+    }
+
+    /// The next key to act on, expanding maps along the way.
+    ///
+    /// `None` means the keys in hand are a strict prefix of some left-hand side
+    /// and the match cannot be resolved without more input (95116-95118, where
+    /// the wait is explicitly unspecified). Under shortest-match that can only
+    /// happen when nothing has matched exactly, so waiting for the next
+    /// keystroke resolves it and no timer is needed.
+    fn next_input_key(&mut self) -> Option<QueuedKey> {
+        loop {
+            let Some(q) = self.input.pop() else {
+                // Nothing more is coming from an expansion, so a held prefix
+                // will never complete. Give it up.
+                return self.input.release_partial();
+            };
+
+            // A key that cannot begin a match goes straight through -- but not
+            // past keys already held, or it would overtake them.
+            let literal = self.input.take_literal_next();
+            let Some(mode) = self.active_map_mode() else {
+                return Some(self.flush_before(q));
+            };
+            if literal || !q.remappable || self.in_argument_position() {
+                return Some(self.flush_before(q));
+            }
+
+            // A command-mode `^V` means the next key matches no lhs
+            // (95097-95098, permitted for the first character by 96600-96603).
+            if mode == MapMode::Command
+                && matches!(q.key, Key::Ctrl('v') | Key::Ctrl('q'))
+                && self.input.partial().is_empty()
+            {
+                self.input.set_literal_next();
+                continue;
+            }
+
+            self.input.hold(q);
+            let keys: Vec<Key> = self.input.partial().iter().map(|k| k.key).collect();
+            match self.maps.table(mode).probe(&keys) {
+                MapMatch::Full(i) => {
+                    self.expand_map(mode, i);
+                    self.input.clear_partial();
+                }
+                // More lookahead is already available, so keep consuming it;
+                // otherwise hold and wait for the user.
+                MapMatch::Partial if self.input.has_queued() => continue,
+                MapMatch::Partial => return None,
+                MapMatch::NoMatch => return self.input.release_partial(),
+            }
+        }
+    }
+
+    /// Release any held keys before `q`, which cannot join a match.
+    fn flush_before(&mut self, q: QueuedKey) -> QueuedKey {
+        if self.input.partial().is_empty() {
+            return q;
+        }
+        self.input.push_front(std::iter::once(q));
+        self.input
+            .release_partial()
+            .expect("partial was just checked non-empty")
+    }
+
+    /// Put a matched map's replacement at the front of the queue.
+    fn expand_map(&mut self, mode: MapMode, index: usize) {
+        let entry = self.maps.table(mode).entry(index);
+        // 95119-95121: the replacement is itself remapped, "except that if the
+        // characters in lhs occur as prefix characters in rhs, those characters
+        // shall not be remapped". With `remap` unset the whole replacement is
+        // exempt, which is 95874-95875's "only a one-step translation".
+        let exempt = if self.options.remap {
+            entry.no_remap_prefix
+        } else {
+            entry.rhs.len()
+        };
+        let keys: Vec<QueuedKey> = entry
+            .rhs
+            .iter()
+            .enumerate()
+            .map(|(i, &key)| QueuedKey {
+                key,
+                remappable: i >= exempt,
+                abbrevable: true,
+                source: KeySource::MapExpansion,
+            })
+            .collect();
+        self.input.push_front(keys.into_iter());
+    }
+
+    /// Discard everything an erroring command should not have led to.
+    ///
+    /// vi.md 120619-120627 in one place: alert the terminal, drop any partially
+    /// entered command, drop the rest of a map expansion, and stop a buffer
+    /// execution. The queue holds all three kinds of pending key, so one
+    /// `discard` covers the last two.
+    fn abort_expansion(&mut self) {
+        if self.input.is_expanding() {
+            let _ = self.terminal.bell();
+        }
+        self.input.discard();
+        self.parser.reset();
     }
 
     /// Handle a key in command mode.

@@ -1238,21 +1238,6 @@ mod setup {
         };
     }
 
-    // TODO
-    // This should be optimized
-    /// Set members that cannot be enumerated into the byte tables: character
-    /// classes, whose membership follows `LC_CTYPE`, and equivalence classes,
-    /// whose membership follows `LC_COLLATE`.
-    ///
-    /// The tables above stay the fast path — a set of plain characters never
-    /// touches this — and a character is decoded from the byte stream only when
-    /// this set is non-empty.
-    #[derive(Default)]
-    pub struct PredicateSet {
-        classes: Vec<ClassName>,
-        equivalences: Vec<EquivMatcher>,
-    }
-
     /// One `[=c=]`, answered by libc.
     ///
     /// POSIX defines the equivalence class by `LC_COLLATE` (118137-118138), and
@@ -1285,9 +1270,51 @@ mod setup {
         }
     }
 
-    impl PredicateSet {
-        pub fn is_empty(&self) -> bool {
-            self.classes.is_empty() && self.equivalences.is_empty()
+    /// Membership in a set of characters, and nothing else.
+    ///
+    /// POSIX describes string1 and string2 as *arrays*, but `-d`, `-s` and the
+    /// complement forms only ever ask one question of them: is this element a
+    /// member? This type answers that and never enumerates itself — a class has
+    /// as many members as `LC_CTYPE` says, which for `[:alpha:]` in a UTF-8
+    /// locale is upwards of a hundred thousand.
+    ///
+    /// It is the one membership type. Having two, only one of which consulted
+    /// the locale, is what made `tr -d '[:alpha:]'` delete `é` while
+    /// `tr '[:alpha:]' X` left it untouched.
+    pub struct Set {
+        /// Characters named literally, and `\ooo` below 128 — an octal escape
+        /// there names an ASCII character, not a byte lacking one.
+        ascii: [bool; 128_usize],
+        /// Non-ASCII characters named literally.
+        chars: Vec<char>,
+        /// `\ooo` at or above 128: a byte with no character identity, matched
+        /// byte-wise. `tr -d '\251'` takes the second byte of `é` and leaves
+        /// the first, as a byte-oriented tr does.
+        high_bytes: [bool; 128_usize],
+        classes: Vec<ClassName>,
+        equivalences: Vec<EquivMatcher>,
+    }
+
+    impl Default for Set {
+        fn default() -> Self {
+            // `[bool; 128]` has no `Default`, so the derive cannot be used.
+            Set {
+                ascii: [false; 128_usize],
+                chars: Vec::new(),
+                high_bytes: [false; 128_usize],
+                classes: Vec::new(),
+                equivalences: Vec::new(),
+            }
+        }
+    }
+
+    impl Set {
+        pub fn push_element(&mut self, element: &DataTypeWithData) {
+            match *element {
+                DataTypeWithData::Is7Bit(ue) => self.ascii[usize::from(ue)] = true,
+                DataTypeWithData::Is8Bit(ue) => self.high_bytes[usize::from(ue) - 128] = true,
+                DataTypeWithData::IsMultiByte(ch) => self.chars.push(ch),
+            }
         }
 
         pub fn push_class(&mut self, name: ClassName) {
@@ -1298,12 +1325,86 @@ mod setup {
             self.equivalences.push(EquivMatcher::new(source));
         }
 
-        pub fn contains(&self, c: char) -> bool {
+        /// Is the element at the front of the input a member? If so, how many
+        /// bytes does it occupy?
+        ///
+        /// A raw byte member is tried first and matches byte-wise; anything
+        /// else is one character, decoded under `LC_CTYPE`.
+        pub fn matches_at(&self, lead: u8, next_bytes: &[u8]) -> Option<usize> {
+            if lead < 128_u8 {
+                // ASCII is one byte in every locale tr supports, so the hot
+                // path never decodes.
+                let c = char::from(lead);
+                if self.ascii[usize::from(lead)] || self.matches_predicates(c) {
+                    return Some(1_usize);
+                }
+                return None;
+            }
+
+            if self.high_bytes[usize::from(lead) - 128] {
+                return Some(1_usize);
+            }
+
+            // Only a non-ASCII byte reaches a decoder, and only when the set
+            // has a member one could match.
+            if self.chars.is_empty() && self.classes.is_empty() && self.equivalences.is_empty() {
+                return None;
+            }
+
+            let (c, width) = decode_one(lead, next_bytes)?;
+            if self.chars.contains(&c) || self.matches_predicates(c) {
+                Some(width)
+            } else {
+                None
+            }
+        }
+
+        /// How wide the element at this position is, member or not. Used by
+        /// `-C`, which advances over a whole non-member character where `-c`
+        /// advances one byte.
+        pub fn element_width(&self, lead: u8, next_bytes: &[u8]) -> usize {
+            if lead < 128_u8 {
+                return 1_usize;
+            }
+            decode_one(lead, next_bytes).map_or(1_usize, |(_, width)| width)
+        }
+
+        fn matches_predicates(&self, c: char) -> bool {
             self.classes.iter().any(|cl| cl.contains(c))
                 || self.equivalences.iter().any(|eq| eq.contains(c))
         }
     }
 
+    /// Decode the character beginning at `lead`, with its total width in bytes.
+    /// `None` when the bytes are not a complete valid character, in which case
+    /// the caller keeps its byte-wise behavior.
+    ///
+    /// **tr's character model is UTF-8, in every locale.** Its operands arrive
+    /// as `String`s, so string1 and string2 are UTF-8 by construction; decoding
+    /// the *input* by `LC_CTYPE` instead would make the two disagree, and in
+    /// the C locale — where `LC_CTYPE` says every byte is its own character —
+    /// a set holding `é` would stop matching the `é` in its input. Under that
+    /// reading `tr -d 'ᛆᚠ'` deletes nothing, where it currently deletes those
+    /// two characters. One model, applied to both sides, is worth more here
+    /// than a literal reading that only agrees with itself. Recorded in
+    /// NONPOSIX.md.
+    fn decode_one(lead: u8, next_bytes: &[u8]) -> Option<(char, usize)> {
+        if lead < 128_u8 {
+            return Some((char::from(lead), 1_usize));
+        }
+        let width = match lead {
+            0xC2..=0xDF => 2_usize,
+            0xE0..=0xEF => 3_usize,
+            0xF0..=0xF4 => 4_usize,
+            _ => return None,
+        };
+        let tail = next_bytes.get(..(width - 1_usize))?;
+        let mut buf = [0_u8; 4_usize];
+        buf[0] = lead;
+        buf[1..width].copy_from_slice(tail);
+        let st = std::str::from_utf8(&buf[..width]).ok()?;
+        st.chars().next().map(|c| (c, width))
+    }
     /// Decode the character beginning at `lead`, returning it with the number of
     /// *additional* bytes it consumed. `None` when the bytes are not a complete
     /// valid character, in which case the caller keeps its byte-wise behavior.
@@ -1781,55 +1882,39 @@ mod setup {
         string1_or_string2_operands: Vec<Operand>,
         is_string1: bool,
     ) -> Result<ForRemoval, Box<dyn Error>> {
-        let mut predicates = PredicateSet::default();
-        let mut equiv = Vec::<DataTypeWithData>::new();
-
-        let mut seven_bit = [false; 128_usize];
-        let mut eight_bit = [false; 128_usize];
-        let mut multi_byte = [const { Option::<Vec<Search>>::None }; 128_usize];
+        let mut set = Set::default();
 
         for op in string1_or_string2_operands {
             match op {
                 Operand::Char(CharOperand {
                     char_repetition,
                     char,
-                }) => match char_repetition {
-                    CharRepetition::AsManyAsNeeded => {
-                        if is_string1 {
-                            return Err(Box::from(
-                                "the [c*] repeat construct may not appear in string1".to_owned(),
-                            ));
-                        } else {
-                            // Squeezing, allowed
-                            // See `tr_non_standard_d_s`
-                            add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
-                        }
+                }) => {
+                    if matches!(char_repetition, CharRepetition::AsManyAsNeeded) && is_string1 {
+                        return Err(Box::from(
+                            "the [c*] repeat construct may not appear in string1".to_owned(),
+                        ));
                     }
-                    CharRepetition::N(_) => {
-                        add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
-                    }
-                },
-                Operand::Equiv(EquivOperand { char }) => {
-                    // The literal stays in the fast exact-match list; the
-                    // predicate covers any further members LC_COLLATE defines.
-                    if let Some(c) = char.as_char() {
-                        predicates.push_equivalence(c);
-                    }
-                    equiv.push(char);
+                    // A repeat count says nothing about membership: `[x*5]` and
+                    // `x` name the same one-element set. (`[c*]` in string2 is
+                    // allowed when squeezing -- see `tr_non_standard_d_s`.)
+                    set.push_element(&char);
                 }
-                // Membership follows LC_CTYPE, so the class stays a predicate
-                // instead of being flattened into the byte tables.
-                Operand::Class(name) => predicates.push_class(name),
+                Operand::Equiv(EquivOperand { char }) => {
+                    // The literal itself, plus whatever else LC_COLLATE puts in
+                    // its equivalence class.
+                    set.push_element(&char);
+                    if let Some(c) = char.as_char() {
+                        set.push_equivalence(c);
+                    }
+                }
+                // Membership follows LC_CTYPE, so a class is a predicate rather
+                // than an enumeration.
+                Operand::Class(name) => set.push_class(name),
             }
         }
 
-        let removal = RemovalShared {
-            eight_bit,
-            equiv,
-            multi_byte,
-            seven_bit,
-            predicates,
-        };
+        let removal = RemovalShared { set };
 
         let for_removal = if complement {
             ForRemoval::Complemented(Box::new(ComplementedRemoval {
@@ -1930,6 +2015,17 @@ mod setup {
     }
 
     impl SearchNumberOfBytes {
+        /// The lookahead for a match of `extra` bytes beyond the lead byte.
+        /// `None` for a single-byte match, which needs no lookahead at all.
+        pub fn from_extra(extra: usize) -> Option<Self> {
+            match extra {
+                1_usize => Some(SearchNumberOfBytes::One),
+                2_usize => Some(SearchNumberOfBytes::Two),
+                3_usize => Some(SearchNumberOfBytes::Three),
+                _ => None,
+            }
+        }
+
         pub fn increment(&self) -> FullCharNumberOfBytes {
             match self {
                 SearchNumberOfBytes::One => FullCharNumberOfBytes::Two,
@@ -2314,132 +2410,35 @@ mod setup {
     }
 
     pub struct RemovalShared {
-        seven_bit: [bool; 128_usize],
-        eight_bit: [bool; 128_usize],
-        multi_byte: [Option<Vec<Search>>; 128_usize],
-        equiv: Vec<DataTypeWithData>,
-        /// Members that are predicates rather than enumerable characters.
-        predicates: PredicateSet,
+        pub set: Set,
     }
 
     pub struct RemovalCheckResult {
         pub matched: bool,
         pub match_lookahead_length: Option<SearchNumberOfBytes>,
-        pub found_match: bool,
     }
 
     impl RemovalShared {
+        /// Ask the set once. Every representation the set needs to consult --
+        /// literal characters, raw bytes, `LC_CTYPE` classes, `LC_COLLATE`
+        /// equivalence classes -- lives behind `matches_at`, so `-d`, `-s` and
+        /// the complement forms cannot disagree about what a class contains.
+        ///
+        /// The result keeps `check`'s established contract: a lookahead is
+        /// reported only for a *match* wider than one byte, because a caller
+        /// that missed advances one byte at a time by design. The complement
+        /// forms supply their own width on a miss.
         #[inline]
         fn check(&self, ue: u8, next_bytes: &[u8]) -> RemovalCheckResult {
-            let first_check = if ue < 128_u8 {
-                self.get_seven_bit_deletion(ue)
-            } else {
-                self.get_eight_bit_deletion(ue - 128_u8, next_bytes)
-            };
-
-            if first_check.found_match {
-                return first_check;
-            }
-
-            for da in &self.equiv {
-                match da {
-                    DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
-                        if ue == *uei {
-                            return RemovalCheckResult {
-                                matched: true,
-                                match_lookahead_length: None,
-                                found_match: true,
-                            };
-                        }
-                    }
-                    DataTypeWithData::IsMultiByte(_) => {
-                        unreachable!();
-                    }
-                }
-            }
-
-            // Only now decode a character: a set of plain characters has an
-            // empty predicate set and never reaches this.
-            if !self.predicates.is_empty() {
-                if let Some((c, extra)) = decode_char(ue, next_bytes) {
-                    if self.predicates.contains(c) {
-                        let lookahead = match extra {
-                            1_usize => Some(SearchNumberOfBytes::One),
-                            2_usize => Some(SearchNumberOfBytes::Two),
-                            3_usize => Some(SearchNumberOfBytes::Three),
-                            _ => None,
-                        };
-                        return RemovalCheckResult {
-                            matched: true,
-                            match_lookahead_length: lookahead,
-                            found_match: true,
-                        };
-                    }
-                }
-            }
-
-            RemovalCheckResult {
-                matched: false,
-                match_lookahead_length: None,
-                found_match: false,
-            }
-        }
-
-        #[inline]
-        fn get_seven_bit_deletion(&self, ue: u8) -> RemovalCheckResult {
-            let index = usize::from(ue);
-
-            let value_is_true = self.seven_bit[index];
-
-            RemovalCheckResult {
-                match_lookahead_length: None,
-                matched: value_is_true,
-                found_match: value_is_true,
-            }
-        }
-
-        #[inline]
-        fn get_eight_bit_deletion(&self, ue: u8, next_bytes: &[u8]) -> RemovalCheckResult {
-            let index = usize::from(ue);
-
-            if self.eight_bit[index] {
-                RemovalCheckResult {
+            match self.set.matches_at(ue, next_bytes) {
+                Some(width) => RemovalCheckResult {
                     matched: true,
+                    match_lookahead_length: SearchNumberOfBytes::from_extra(width - 1_usize),
+                },
+                None => RemovalCheckResult {
+                    matched: false,
                     match_lookahead_length: None,
-                    found_match: true,
-                }
-            } else {
-                match &self.multi_byte[index] {
-                    Some(ve) => {
-                        // TODO
-                        // Order
-                        for se in ve {
-                            let number_of_bytes = se.number_of_bytes;
-
-                            let test =
-                                next_bytes.starts_with(&se.payload[..(number_of_bytes as usize)]);
-
-                            if test {
-                                return RemovalCheckResult {
-                                    matched: true,
-                                    match_lookahead_length: Some(number_of_bytes),
-                                    found_match: true,
-                                };
-                            }
-                        }
-
-                        RemovalCheckResult {
-                            matched: false,
-                            match_lookahead_length: None,
-                            found_match: false,
-                        }
-                    }
-                    None => RemovalCheckResult {
-                        matched: false,
-                        match_lookahead_length: None,
-                        found_match: false,
-                    },
-                }
+                },
             }
         }
     }
@@ -2480,9 +2479,12 @@ mod setup {
             // A character *not* in the set is the one being acted on here, and
             // the inner check reported no lookahead for it because it matched
             // nothing. Under `-C` that whole character is the unit, so `tr -C`
-            // deletes or squeezes it once rather than byte by byte.
+            // deletes or squeezes it once rather than byte by byte -- which is
+            // the whole of the `-c`/`-C` difference. The width comes from the
+            // set, so it follows LC_CTYPE like everything else.
             if self.char_wise && re.matched && re.match_lookahead_length.is_none() {
-                re.match_lookahead_length = char_wise_lookahead(ue, next_bytes);
+                let width = self.removal.set.element_width(ue, next_bytes);
+                re.match_lookahead_length = SearchNumberOfBytes::from_extra(width - 1_usize);
             }
 
             re

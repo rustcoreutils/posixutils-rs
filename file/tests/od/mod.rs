@@ -188,15 +188,18 @@ fn test_od_15() {
     );
 }
 
-// TODO
-// Does not match other implementations
+// The trailing '!' is a one-byte tail. Extended with three null bytes it is
+// the denormal 0x00000021, not zero -- the `0e0` this used to assert was the
+// `_ => 0.0` arm of a ladder that had no case for a tail shorter than four
+// bytes, which is what the "does not match other implementations" comment
+// here was recording.
 #[test]
 fn test_od_16() {
     od_test(
         &["-tf4"],
         "Hello, World!",
         "\
-0000000 1.1431391224375825e27 1.7611270127616e14 1.7446709643352771e22 0e0
+0000000 1.1431391224375825e27 1.7611270127616e14 1.7446709643352771e22 4.624284932271896e-44
 0000015
 ",
     );
@@ -621,6 +624,8 @@ fn od_short_final_chunk_is_extended_with_null_bytes() {
         ("u2", 2),
         ("d2", 2),
         ("o2", 2),
+        ("f8", 8),
+        ("f4", 4),
     ] {
         for tail in 1..width {
             // High bytes throughout, so sign extension and high-order padding
@@ -664,6 +669,52 @@ fn od_short_chunk_sign_follows_the_declared_width() {
         fields.last().copied(),
         Some(want),
         "0xc7 extended to four bytes: {stdout:?}"
+    );
+}
+
+// The float conversion must be chosen by the declared type, not by how many
+// bytes happen to be left.
+//
+// `FFormatter` matched on `chunk.len()` and ignored `num_bytes` entirely (the
+// parameter was spelled `_num_bytes`), so a four-byte tail of a `-t f8` run
+// fell into the `4 =>` arm and was decoded as an f32 -- a different number
+// altogether, not a rounding difference. Tails of one to three bytes had no
+// arm at all and silently produced zero.
+#[test]
+fn od_float_conversion_is_chosen_by_the_type_not_the_tail() {
+    // Twelve bytes under `-t f8`: one full double, then a four-byte tail.
+    let data: Vec<u8> = (0..12u8)
+        .map(|i| 0x80 | (i.wrapping_mul(29) & 0x7f))
+        .collect();
+
+    let (short, _, code) = od_raw(&["-An", "-t", "f8"], &data);
+    assert_eq!(code, Some(0));
+
+    // The tail is a double built from those four bytes plus four NULs, which
+    // is what `-t f8` on the explicitly padded input gives.
+    let mut padded = data.clone();
+    padded.resize(16, 0);
+    let (full, _, _) = od_raw(&["-An", "-t", "f8"], &padded);
+    assert_eq!(
+        short.split_whitespace().collect::<Vec<_>>(),
+        full.split_whitespace().collect::<Vec<_>>(),
+        "a 4-byte tail of -t f8 is a double, not a float: {short:?}"
+    );
+
+    // And it is emphatically not the f32 reading of the same four bytes.
+    let (as_float, _, _) = od_raw(&["-An", "-t", "f4"], &data[8..]);
+    assert_ne!(
+        short.split_whitespace().last(),
+        as_float.split_whitespace().last(),
+        "-t f8 must not decode its tail as an f32"
+    );
+
+    // A one-byte tail is a very small denormal, never a zero.
+    let (tiny, _, _) = od_raw(&["-An", "-t", "f4"], &[0x21u8]);
+    let field = tiny.split_whitespace().next().unwrap_or("");
+    assert!(
+        field.parse::<f64>().is_ok_and(|v| v != 0.0),
+        "a 1-byte tail must extend to a denormal, not zero: {tiny:?}"
     );
 }
 

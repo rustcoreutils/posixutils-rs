@@ -593,6 +593,22 @@ fn chunk_to_i64(chunk: &[u8], num_bytes: usize) -> i64 {
     }
 }
 
+/// Read an extended chunk as a floating-point value of the *declared* width.
+///
+/// The width comes from the type, never from what is left of the input: a
+/// four-byte tail of a `-t f8` run is the first four bytes of a double, not a
+/// float, and decoding it as a float gives an unrelated number rather than a
+/// rounded one.
+fn chunk_to_f64(chunk: &[u8], num_bytes: usize) -> f64 {
+    let buf = extend_chunk(chunk, num_bytes);
+    match num_bytes {
+        4 => f32::from_ne_bytes(buf[..4].try_into().unwrap()) as f64,
+        8 => f64::from_ne_bytes(buf),
+        // `parse_type_string` admits no other width.
+        _ => unreachable!("unsupported float width {num_bytes}"),
+    }
+}
+
 struct UFormatter;
 
 impl FormatterChunks for UFormatter {
@@ -654,38 +670,8 @@ impl FormatterChunks for OFormatter {
 struct FFormatter;
 
 impl FormatterChunks for FFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8], _num_bytes: usize) -> String {
-        let value = match chunk.len() {
-            4 => {
-                let mut arr: [u8; 4] = chunk.try_into().unwrap();
-                arr.reverse();
-                f32::from_be_bytes(arr) as f64
-            }
-            5 => {
-                let mut arr = [0u8; 8];
-                arr[3..].copy_from_slice(chunk);
-                arr.reverse();
-                f64::from_be_bytes(arr)
-            }
-            6 => {
-                let mut arr = [0u8; 8];
-                arr[2..].copy_from_slice(chunk);
-                arr.reverse();
-                f64::from_be_bytes(arr)
-            }
-            7 => {
-                let mut arr = [0u8; 8];
-                arr[1..].copy_from_slice(chunk);
-                arr.reverse();
-                f64::from_be_bytes(arr)
-            }
-            8 => {
-                let mut arr: [u8; 8] = chunk.try_into().unwrap();
-                arr.reverse();
-                f64::from_be_bytes(arr)
-            }
-            _ => 0.0,
-        };
+    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
+        let value = chunk_to_f64(chunk, num_bytes);
         format!(" {value:e}")
     }
 }

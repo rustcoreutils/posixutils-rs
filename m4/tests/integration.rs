@@ -17,14 +17,24 @@ fn unescape_newlines(input: &str) -> String {
     input.replace("\\n", "\n")
 }
 
-/// Parse the .out file format (key=value lines)
-fn parse_out_file(content: &str) -> (String, String, i32, bool, bool, Option<String>) {
+/// Parse the .out file format (key=value lines).
+///
+/// Returns only what a test actually compares. The format grew under the
+/// `m4/test-manager` crate, which generated these files and read keys back out
+/// of them; that crate was deleted when the suite moved to `TestPlan`, and the
+/// keys it alone consumed were left parsed into values nothing read.
+///
+/// `expect_error` and `stdout_regex` survive as recognised keys because they
+/// still document a fixture's intent, but the behaviour they once selected is
+/// now chosen by *which macro* registers the test -- `m4_test_expect_error!`
+/// or `m4_test_regex!`. An unrecognised key is a hard error rather than a
+/// shrug: `ignore=true` sat in four of these files claiming those tests were
+/// skipped, when the field had no reader and all four had been running, and
+/// passing, the whole time.
+fn parse_out_file(content: &str) -> (String, String, i32) {
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut status = 0i32;
-    let mut ignore = false;
-    let mut expect_error = false;
-    let mut stdout_regex: Option<String> = None;
 
     for line in content.lines() {
         if line.is_empty() || line.starts_with('#') {
@@ -35,16 +45,19 @@ fn parse_out_file(content: &str) -> (String, String, i32, bool, bool, Option<Str
                 "stdout" => stdout = unescape_newlines(value),
                 "stderr" => stderr = unescape_newlines(value),
                 "status" => status = value.parse().unwrap_or(0),
-                "ignore" => ignore = value == "true",
-                "expect_error" => expect_error = value == "true",
-                "stdout_regex" => stdout_regex = Some(unescape_newlines(value)),
-                "skip_update" => {} // Not needed at runtime
-                _ => {}
+                // Recognised, and deliberately not acted on here: the macro
+                // that registers the test selects the checker.
+                "expect_error" | "stdout_regex" => {}
+                other => panic!(
+                    "unknown key {other:?} in a .out fixture; \
+                     add it to parse_out_file or delete it, do not leave it \
+                     to be silently ignored"
+                ),
             }
         }
     }
 
-    (stdout, stderr, status, ignore, expect_error, stdout_regex)
+    (stdout, stderr, status)
 }
 
 /// Load a fixture and create a TestPlan
@@ -58,7 +71,7 @@ fn load_fixture(name: &str) -> TestPlan {
 
     let out_content = fs::read_to_string(&out_path)
         .unwrap_or_else(|_| panic!("Failed to read {}", out_path.display()));
-    let (expected_out, expected_err, expected_exit_code, _, _, _) = parse_out_file(&out_content);
+    let (expected_out, expected_err, expected_exit_code) = parse_out_file(&out_content);
 
     if args_path.exists() {
         // CLI args test - args are in the file content

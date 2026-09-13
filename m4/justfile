@@ -1,2 +1,0 @@
-update-snapshots:
-    cargo run -p m4-test-manager update-snapshots

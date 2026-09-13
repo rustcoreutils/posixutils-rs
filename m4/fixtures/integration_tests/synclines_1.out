@@ -3,4 +3,3 @@ stderr=
 status=0
 # Currently this matches the BSD algorithm which differs considerably from GNU
 # Perhaps due to what's mentioned here https://web.mit.edu/gnu/doc/html/m4_15.html
-ignore=true

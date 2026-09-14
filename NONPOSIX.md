@@ -412,6 +412,42 @@ GNU tar.
  * The `-a` and `-o` operators and `(` / `)` grouping, which POSIX.1-2024
    removed.
 
+### tr
+
+ * **Characters are UTF-8, in every locale.**  A multi-byte character can be a
+   set member, a range endpoint, or a translation target: `tr 'α-γ' 'A-C'`
+   works, where a byte-oriented `tr` produces mojibake.
+
+   This is a deliberate deviation, not an oversight.  POSIX has `LC_CTYPE`
+   decide how bytes become characters, which in the C locale makes every byte
+   its own character.  But `tr`'s operands reach it as text, so `string1` and
+   `string2` are UTF-8 however `LC_CTYPE` is set; reading the *input* by
+   `LC_CTYPE` instead would make the two disagree, and under the default C
+   locale a set holding `é` would stop matching the `é` in its input —
+   `tr -d 'ᛆᚠ'` would delete nothing.  One model applied to both sides is worth
+   more here than a literal reading that only agrees with itself.
+
+   Character *class* membership and case conversion do follow `LC_CTYPE`, since
+   which characters are letters is a locale question rather than an encoding
+   one.
+
+ * **`-c` and `-C` differ**, as POSIX 118153-118158 specifies and as most
+   implementations do not: `-c` complements the set of *values*, so a
+   non-member multi-byte character is acted on once per byte, while `-C`
+   complements the set of *characters* and acts on it once.
+
+ * `[=c=]` accepts only a single-byte character.  POSIX does not require more,
+   and its members come from `LC_COLLATE` by way of the system's regular
+   expression engine, so in a locale where the class is larger than the
+   character itself it will be larger here too.
+
+ * Adjacent octal escapes are separate bytes, so `\303\251` is two members and
+   not `é`.  The spec contradicts itself: 118095-118096 says a multi-byte
+   character "require[s] multiple, concatenated escape sequences", while the
+   RATIONALE at 118258-118263 records that this was found ambiguous and settles
+   on octal escapes naming single byte values.  The RATIONALE's reading is the
+   one implemented, and it is what other implementations do.
+
 ### uucp / uux / uustat
 
  * Transport is SSH.  The legacy UUCP protocol, configuration files and

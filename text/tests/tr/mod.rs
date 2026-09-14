@@ -1203,3 +1203,257 @@ fn tr_squeeze_with_translation_keeps_multibyte_output_well_formed() {
     assert_eq!(tr_bytes(&["-s", "ä"], "äää".as_bytes()), "ä".as_bytes());
     assert_eq!(tr_bytes(&["ä", "ö"], "ääää".as_bytes()), "öööö".as_bytes());
 }
+
+/// A wall-clock bound for a test that pins a *cost* rather than an answer.
+///
+/// Scaled for the build: the same work measures about twelve times slower
+/// unoptimised, and these tests run under `cargo test` either way. The bound
+/// stays far below what the defect took -- the point is to separate constant
+/// time from time proportional to a character class, and those are orders of
+/// magnitude apart in both builds.
+fn cost_bound(release_secs: u64) -> std::time::Duration {
+    let secs = if cfg!(debug_assertions) {
+        release_secs * 5
+    } else {
+        release_secs
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// Run `tr` under a specific locale, returning stdout and the exit status.
+///
+/// The shared harness forces `LC_ALL=C`, which is the right default but hides
+/// every question about `LC_CTYPE`. A locale that is not installed makes libc
+/// fall back to C, so these callers assert only what holds either way, or skip.
+fn tr_in_locale(locale: &str, args: &[&str], stdin: &[u8]) -> (Vec<u8>, i32) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tr"))
+        .args(args)
+        .env("LC_ALL", locale)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tr");
+    // Write on another thread: with more than a pipe buffer of input, writing
+    // it all before reading any output deadlocks -- the child blocks writing
+    // stdout while this side blocks writing stdin.
+    let mut sink = child.stdin.take().expect("stdin");
+    let payload = stdin.to_vec();
+    let writer = std::thread::spawn(move || match sink.write_all(&payload) {
+        Ok(()) => {}
+        // tr rejects a bad operand before it reads, which is a result.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing tr's stdin: {e}"),
+    });
+    let out = child.wait_with_output().expect("wait tr");
+    writer.join().expect("stdin writer");
+    (out.stdout, out.status.code().unwrap_or(-1))
+}
+
+/// Is this locale actually installed? If libc fell back to C, `é` is not a
+/// letter and there is nothing to assert.
+fn utf8_locale_available() -> bool {
+    let (out, code) = tr_in_locale("en_US.UTF-8", &["-d", "[:alpha:]"], "é".as_bytes());
+    code == 0 && out.is_empty()
+}
+
+// POSIX EXAMPLES item 3: `tr "[=e=]" "[e*]"` strips diacritical marks.
+//
+// It exited 1 with "tr: Indexing failed" -- an equivalence class occupied a
+// position in string1's array but was not counted in the length the string2
+// padding was sized against, so the pairing walked off the end. Every padded
+// string2 failed the same way, not just this one.
+#[test]
+fn tr_equivalence_class_does_not_break_string2_padding() {
+    // The spec's own example. In a locale where `[=e=]` is a singleton this is
+    // the identity, which is exactly what it must be -- not an error.
+    tr_test(&["[=e=]", "[e*]"], "tree", "tree");
+
+    // Every padding shape against an equivalence class.
+    tr_test(&["ab[=c=]", "XY"], "abcde", "XYYde");
+    tr_test(&["[=c=]ab", "XY"], "abcde", "YYXde");
+    tr_test(&["ab[=c=]", "[X*]"], "abcde", "XXXde");
+    tr_test(&["ab[=c=]", "X"], "abcde", "XXXde");
+    // And with string2 long enough that no padding is needed, which worked.
+    tr_test(&["ab[=c=]", "XYZ"], "abcde", "XYZde");
+}
+
+// A repeat count is a number, not that many elements.
+//
+// This pins a *cost*, not an answer: the old code printed `xxx` correctly, it
+// just materialised four billion elements to do it -- 10.5 seconds and 33 GB
+// for three characters. So the assertion is on elapsed time, with a bound
+// three orders of magnitude above what the fix takes (0.01s) and below what
+// materialising takes. A regression fails here in seconds rather than by
+// exhausting the machine.
+#[test]
+fn tr_large_repeat_count_is_not_materialised() {
+    let started = std::time::Instant::now();
+    tr_test(&["abc", "[x*4294967296]"], "abc", "xxx");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < cost_bound(10),
+        "a repeat count must not be materialised; took {elapsed:?}"
+    );
+
+    // Counts no machine could hold are answered from the run, not allocated.
+    tr_test(&["abc", "[x*18446744073709551615]"], "abc", "xxx");
+    tr_test(&["abc", "[x*999999999]"], "abcd", "xxxd");
+    // The ordinary counts still place characters where they belong.
+    tr_test(&["abcdef", "[x*2]yz"], "abcdef", "xxyzzz");
+    tr_test(&["abcdef", "[x*]yz"], "abcdef", "xxxxyz");
+    tr_test(&["abcdef", "y[x*]z"], "abcdef", "yxxxxz");
+}
+
+// One character class means one thing, whichever operation asks.
+//
+// `-d`, `-s` and case conversion decoded a character and asked `LC_CTYPE`;
+// translation flattened the class into its ASCII members first, so `é` was a
+// letter to three of them and not to the fourth.
+#[test]
+fn tr_class_membership_is_the_same_for_every_operation() {
+    if !utf8_locale_available() {
+        return;
+    }
+    const L: &str = "en_US.UTF-8";
+
+    // `é` is alphabetic, so every operation must act on it.
+    assert_eq!(
+        tr_in_locale(L, &["-d", "[:alpha:]"], "abéc1".as_bytes()).0,
+        b"1"
+    );
+    assert_eq!(
+        tr_in_locale(L, &["[:alpha:]", "X"], "abéc1".as_bytes()).0,
+        b"XXXX1"
+    );
+    assert_eq!(
+        tr_in_locale(L, &["[:alpha:]", "[x*]"], "abéc1".as_bytes()).0,
+        b"xxxx1"
+    );
+    assert_eq!(
+        tr_in_locale(L, &["-s", "[:alpha:]"], "aaéébb".as_bytes()).0,
+        "aéb".as_bytes()
+    );
+
+    // And the complement must agree that it is a letter, so `-C` leaves it.
+    assert_eq!(
+        tr_in_locale(L, &["-C", "[:alpha:]", "X"], "abéc1".as_bytes()).0,
+        "abécX".as_bytes()
+    );
+
+    // Case conversion already followed the locale and must keep doing so.
+    assert_eq!(
+        tr_in_locale(L, &["[:lower:]", "[:upper:]"], "aéb".as_bytes()).0,
+        "AÉB".as_bytes()
+    );
+}
+
+// A `[:class:]` in string2 is valid only as the case-conversion counterpart of
+// its converse in string1, at the same relative position (POSIX 118122-118125).
+// When that pairing does not hold, it is an error -- not a panic.
+//
+// `Replacements::build` asserted the case-conversion pass had removed every
+// class before it, but that pass gives up when the two operand lists differ in
+// length, and is not attempted at all under `-c`/`-C`. Both routes reached the
+// assertion and aborted with exit 101.
+#[test]
+fn tr_unpaired_class_in_string2_is_an_error_not_a_panic() {
+    for args in [
+        // Lengths differ, so the case-conversion pairing is never extracted.
+        vec!["[:lower:]x", "[:upper:]"],
+        // Complement disables case conversion outright.
+        vec!["-c", "[:lower:]", "[:upper:]"],
+        vec!["-c", "[:upper:]", "[:lower:]"],
+        vec!["-cs", "[:lower:]", "[:upper:]"],
+    ] {
+        let (out, code) = tr_in_locale("C", &args, b"abc");
+        assert_eq!(code, 1, "tr {args:?} must fail cleanly, got {code}");
+        assert!(out.is_empty(), "tr {args:?} wrote output: {out:x?}");
+    }
+}
+
+// `[c*]` may not appear in string1 (it maps many characters to one, which only
+// makes sense on the replacement side). The complement branch matched the
+// character and discarded its repeat count, so `-c` accepted what plain `tr`
+// rejects.
+#[test]
+fn tr_repeat_construct_in_string1_is_rejected_under_complement_too() {
+    for args in [
+        vec!["[a*]", "x"],
+        vec!["-c", "[a*]", "x"],
+        vec!["-C", "[a*]", "x"],
+        vec!["-cs", "[a*]", "x"],
+    ] {
+        let (_, code) = tr_in_locale("C", &args, b"abc");
+        assert_eq!(code, 1, "tr {args:?} must reject [c*] in string1");
+    }
+}
+
+// Under a complement every non-member maps to *one* character, and when
+// string2 has a `[c*]` fill that character is the fill -- not whatever happens
+// to be written last. The fill is the construct that means "as many as needed",
+// so it is the one that covers the complement.
+#[test]
+fn tr_complement_replacement_is_the_fill_when_there_is_one() {
+    tr_test(&["-c", "a", "[x*]y"], "abc", "axx");
+    tr_test(&["-c", "a", "[x*0]y"], "abc", "axx");
+    tr_test(&["-cs", "a-e", "[y*0]z"], "abcxyz", "abcy");
+    // With no fill, the last character stands, as before.
+    tr_test(&["-c", "a", "xy"], "abc", "ayy");
+    tr_test(&["-c", "a", "x"], "abc", "axx");
+}
+
+// A class in string1 whose members mostly map to one character must not put
+// every member in the byte tables.
+//
+// When string2 is not uniform over the class, the members were enumerated and
+// one entry per member pushed into a per-lead-byte vector that is scanned
+// linearly for every input byte. With a locale-correct class that is tens of
+// thousands of entries: 900 KB of CJK through `tr '[:alpha:]' '[a*]b'` took
+// 0.61s, against 0.00s for the same input when string2 *is* uniform. Only the
+// members that need a distinct replacement belong in the tables; the rest are
+// the class rule.
+#[test]
+fn tr_class_spread_over_string2_does_not_fill_the_tables() {
+    if !utf8_locale_available() {
+        return;
+    }
+    // Sized so the unfixed code takes seconds: it was ~0.6s per 900 KB, and
+    // this is roughly 4 MB. The fix runs it in hundredths.
+    let cjk = "漢字テスト".repeat(280_000);
+
+    let started = std::time::Instant::now();
+    let (out, code) = tr_in_locale("en_US.UTF-8", &["[:alpha:]", "[a*]b"], cjk.as_bytes());
+    let elapsed = started.elapsed();
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.len(),
+        cjk.chars().count(),
+        "one byte out per character in"
+    );
+    assert!(
+        elapsed < cost_bound(2),
+        "a class spread over string2 must not be enumerated into the tables; took {elapsed:?}"
+    );
+}
+
+// A repeat count in *string1* is a number too. Only the positions before
+// string2 goes constant can differ, so the loop that pairs them is bounded by
+// that, not by the count: `tr '[x*18446744073709551615]y' 'ab'` ran the loop
+// eighteen quintillion times and never returned. GNU rejects the count
+// outright; there is no need to, once it is not being counted out.
+#[test]
+fn tr_large_repeat_count_in_string1_terminates() {
+    // `x` fills every position but the last, so string2 -- padded with its
+    // own last character -- gives `b` for both. GNU agrees for the counts it
+    // accepts at all.
+    let started = std::time::Instant::now();
+    tr_test(&["[x*18446744073709551615]y", "ab"], "xy", "bb");
+    tr_test(&["[x*4294967296]y", "ab"], "xy", "bb");
+    assert!(
+        started.elapsed() < cost_bound(10),
+        "a string1 repeat count must not be counted out"
+    );
+}

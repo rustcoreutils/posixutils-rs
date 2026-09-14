@@ -1204,7 +1204,23 @@ fn tr_squeeze_with_translation_keeps_multibyte_output_well_formed() {
     assert_eq!(tr_bytes(&["ä", "ö"], "ääää".as_bytes()), "öööö".as_bytes());
 }
 
-/// Run `tr` under a specific locale, returning stdout, stderr and the status.
+/// A wall-clock bound for a test that pins a *cost* rather than an answer.
+///
+/// Scaled for the build: the same work measures about twelve times slower
+/// unoptimised, and these tests run under `cargo test` either way. The bound
+/// stays far below what the defect took -- the point is to separate constant
+/// time from time proportional to a character class, and those are orders of
+/// magnitude apart in both builds.
+fn cost_bound(release_secs: u64) -> std::time::Duration {
+    let secs = if cfg!(debug_assertions) {
+        release_secs * 5
+    } else {
+        release_secs
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// Run `tr` under a specific locale, returning stdout and the exit status.
 ///
 /// The shared harness forces `LC_ALL=C`, which is the right default but hides
 /// every question about `LC_CTYPE`. A locale that is not installed makes libc
@@ -1277,7 +1293,7 @@ fn tr_large_repeat_count_is_not_materialised() {
     tr_test(&["abc", "[x*4294967296]"], "abc", "xxx");
     let elapsed = started.elapsed();
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
+        elapsed < cost_bound(10),
         "a repeat count must not be materialised; took {elapsed:?}"
     );
 
@@ -1418,7 +1434,7 @@ fn tr_class_spread_over_string2_does_not_fill_the_tables() {
         "one byte out per character in"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
+        elapsed < cost_bound(2),
         "a class spread over string2 must not be enumerated into the tables; took {elapsed:?}"
     );
 }
@@ -1437,7 +1453,7 @@ fn tr_large_repeat_count_in_string1_terminates() {
     tr_test(&["[x*18446744073709551615]y", "ab"], "xy", "bb");
     tr_test(&["[x*4294967296]y", "ab"], "xy", "bb");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
+        started.elapsed() < cost_bound(10),
         "a string1 repeat count must not be counted out"
     );
 }

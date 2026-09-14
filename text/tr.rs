@@ -496,11 +496,10 @@ mod parsing {
         /// would have to enumerate a million code points to find a handful, and
         /// the construct POSIX defines for that case -- mapping the class to
         /// one character -- never reaches here.
-        pub fn members(self) -> Vec<char> {
+        pub fn members(self) -> impl Iterator<Item = char> {
             (0_u32..=0xFFFF_u32)
                 .filter_map(char::from_u32)
-                .filter(|&c| self.contains(c))
-                .collect()
+                .filter(move |&c| self.contains(c))
         }
     }
 
@@ -1556,7 +1555,7 @@ mod setup {
                 CharRepetition::N(n) => Ok(*n),
             },
             Operand::Equiv(_) => Ok(1_usize),
-            Operand::Class(name) => Ok(name.members().len()),
+            Operand::Class(name) => Ok(name.members().count()),
         }
     }
 
@@ -1750,16 +1749,17 @@ mod setup {
                         // of entries behind a single lead byte, each scanned
                         // linearly for every input byte: 0.6s per 900 KB of
                         // CJK, against nothing at all when the class is a rule.
-                        let members = name.members();
                         let bulk = replacements.bulk().convert_to_replacement();
-                        for (offset, member) in members.iter().enumerate() {
+                        let mut members = 0_usize;
+                        for (offset, member) in name.members().enumerate() {
+                            members += 1_usize;
                             let replacement =
                                 replacements.at(position + offset).convert_to_replacement();
                             if replacement.same_char(&bulk) {
                                 continue;
                             }
                             add_normal_char_with_replacement(
-                                crate::parsing::categorize_char(*member),
+                                crate::parsing::categorize_char(member),
                                 replacement,
                             );
                         }
@@ -1767,7 +1767,7 @@ mod setup {
                             name: *name,
                             replacement: bulk,
                         });
-                        position = position.saturating_add(members.len());
+                        position = position.saturating_add(members);
                     }
                 }
             }
@@ -2511,11 +2511,7 @@ mod transformation {
         /// Would writing `candidate` repeat a squeezable character?
         fn repeats(&self, candidate: &FullChar) -> bool {
             match &self.printed {
-                Some((last, true)) => {
-                    last.number_of_bytes as usize == candidate.number_of_bytes as usize
-                        && last.payload[..(last.number_of_bytes as usize)]
-                            == candidate.payload[..(candidate.number_of_bytes as usize)]
-                }
+                Some((last, true)) => last.same_char(candidate),
                 _ => false,
             }
         }

@@ -115,15 +115,22 @@ impl Drop for FileDescriptor {
     }
 }
 
-impl Clone for FileDescriptor {
-    fn clone(&self) -> Self {
-        if self.fd != libc::AT_FDCWD {
-            Self {
-                fd: unsafe { libc::dup(self.fd) },
-            }
-        } else {
-            Self { fd: libc::AT_FDCWD }
+impl FileDescriptor {
+    /// Duplicate this descriptor with `dup(2)`.
+    ///
+    /// Fallible on purpose: a `Clone` impl has nowhere to report `EMFILE`, and the one this
+    /// replaces stored the resulting `-1` instead, so the failure resurfaced later as a
+    /// confusing `EBADF` from whatever used the copy.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        // The negative `AT_FDCWD` is a sentinel, not a descriptor, so it must not be dup'ed.
+        if self.fd == libc::AT_FDCWD {
+            return Ok(Self { fd: libc::AT_FDCWD });
         }
+        let fd = unsafe { libc::dup(self.fd) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
     }
 }
 
@@ -528,36 +535,48 @@ where
     };
     let is_symlink = entry_symlink_metadata.file_type() == FileType::SymbolicLink;
 
-    // If `follow_symlinks` is enabled, read the location of the symlink and use the metadata of the
-    // pointed file.
-    let (entry_readlink, entry_metadata) = if is_symlink && follow_symlinks {
+    // Read the link target for every symbolic link, whether or not this walk follows links:
+    // consumers need it either way -- `cp -P` and `mv` recreate the link from it, `ls -l` prints
+    // it. Leaving it unset on a non-following walk handed callers a `None` they did not expect,
+    // on the one path nobody exercised.
+    let (entry_readlink, entry_metadata) = if is_symlink {
         let read_link = match read_link_at(dir_fd.fd, entry_filename.as_ptr()) {
-            Ok(p) => p,
+            Ok(p) => Some(p),
             Err(e) => {
                 err_reporter(
-                    Entry::new(dir_fd, path_stack, entry_filename, None),
+                    Entry::new(dir_fd, path_stack, entry_filename.clone(), None),
                     Error::new(e, ErrorKind::ReadLink),
                 );
-                return ProcessFileResult::NotProcessed;
+                if follow_symlinks {
+                    // The target's metadata is about to be needed and cannot be obtained.
+                    return ProcessFileResult::NotProcessed;
+                }
+                // Nothing else here depends on the target: a walk that does not follow links can
+                // still stat, list and unlink the link itself.
+                None
             }
         };
 
-        match Metadata::new(
-            dir_fd.fd,
-            unsafe { CStr::from_ptr(entry_filename.as_ptr()) },
-            true,
-        ) {
-            Ok(md) => (Some(read_link), md),
-            Err(e) => {
-                if e.kind() == io::ErrorKind::NotFound {
-                    // Don't treat dangling links as an error, use the metadata of the original
-                    (Some(read_link), entry_symlink_metadata)
-                } else {
-                    err_reporter(
-                        Entry::new(dir_fd, path_stack, entry_filename, None),
-                        Error::new(e, ErrorKind::Stat),
-                    );
-                    return ProcessFileResult::NotProcessed;
+        if !follow_symlinks {
+            (read_link, entry_symlink_metadata)
+        } else {
+            match Metadata::new(
+                dir_fd.fd,
+                unsafe { CStr::from_ptr(entry_filename.as_ptr()) },
+                true,
+            ) {
+                Ok(md) => (read_link, md),
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::NotFound {
+                        // Don't treat dangling links as an error, use the metadata of the original
+                        (read_link, entry_symlink_metadata)
+                    } else {
+                        err_reporter(
+                            Entry::new(dir_fd, path_stack, entry_filename, None),
+                            Error::new(e, ErrorKind::Stat),
+                        );
+                        return ProcessFileResult::NotProcessed;
+                    }
                 }
             }
         }
@@ -602,7 +621,7 @@ fn open_long_filename<'a, H>(
     path: &'a Path,
     mut path_stack: Option<&mut Vec<Rc<[libc::c_char]>>>,
     err_reporter: &mut H,
-) -> Option<(FileDescriptor, std::path::Components<'a>)>
+) -> io::Result<(FileDescriptor, std::path::Components<'a>)>
 where
     H: FnMut(Entry<'_>, Error),
 {
@@ -650,13 +669,15 @@ where
         ) {
             Ok(fd) => fd,
             Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(libc::EIO);
                 if let Some(path_stack) = &path_stack {
                     err_reporter(
                         Entry::new(&starting_dir, path_stack, filename, None),
                         Error::new(e, ErrorKind::Open),
                     );
                 }
-                return None;
+                // The caller still needs the reason: the deferred reopen path passes no reporter.
+                return Err(io::Error::from_raw_os_error(errno));
             }
         };
 
@@ -665,7 +686,7 @@ where
         }
     }
 
-    Some((starting_dir, path_components))
+    Ok((starting_dir, path_components))
 }
 
 /// Options for `traverse_directory`. These are disabled by default.
@@ -749,8 +770,9 @@ where
         Some(&mut path_stack),
         &mut err_reporter,
     ) {
-        Some(pair) => pair,
-        None => return false,
+        Ok(pair) => pair,
+        // Already reported through `err_reporter`.
+        Err(_) => return false,
     };
 
     {
@@ -854,9 +876,18 @@ where
     // Depth first traversal main loop
     'outer: while let Some(current) = stack.last() {
         let dir = &current.dir;
-        let dir_fd = match dir {
-            HybridDir::Owned(dir) => dir.file_descriptor(),
-            HybridDir::Deferred(dir) => &dir.open_file_descriptor(),
+
+        // Holds a descriptor reopened for a deferred directory alive for the rest of the body.
+        let reopened;
+        let dir_fd_result = match dir {
+            HybridDir::Owned(dir) => Ok(dir.file_descriptor()),
+            HybridDir::Deferred(dir) => match dir.open_file_descriptor() {
+                Ok(fd) => {
+                    reopened = fd;
+                    Ok(&reopened)
+                }
+                Err(e) => Err(e),
+            },
         };
 
         // Resize `path_stack` to the appropriate depth.
@@ -869,198 +900,262 @@ where
 
         let path_depth = path_stack.len();
 
-        {
-            let mut dir_iter = dir.iter();
+        // Acquiring the descriptor and the directory stream can both fail: a deferred directory
+        // is reopened by path here, which is where a concurrently swapped entry is refused and
+        // where EMFILE lands. The node is already on the stack and its `file_handler` returned
+        // `Ok(true)`, so report and fall through to the exit block below -- a `continue` would
+        // spin on the same node forever.
+        let mut dir_exit = DirExit::Descended;
+        // The failure is recorded rather than handled in place: anything still holding the
+        // directory stream also holds a borrow of `stack`, which the body below pushes to.
+        let mut enumeration_error: Option<io::Error> = None;
 
-            // Read the current directory
-            while let Some(entry_or_err) = dir_iter.next() {
-                let entry = match entry_or_err {
-                    Ok(entry) => entry,
-
-                    // Errors in reading the entry usually occurs due to lack of permissions
-                    Err(e) => {
-                        // `path_stack` is the ancestors plus `current.filename`, and the report
-                        // names `current` itself, so its parent is everything before the last
-                        // component. This is the same slice the `postprocess_dir` call below
-                        // passes, which pops first and then hands over the whole stack.
-                        debug_assert_eq!(path_stack.len(), path_depth);
-                        let parent_path_stack = &path_stack[..path_depth - 1];
-                        let second_last_index = stack.len().checked_sub(2);
-                        let prev_dir = match second_last_index {
-                            Some(index) => match &stack.get(index).unwrap().dir {
-                                HybridDir::Owned(dir) => dir.file_descriptor(),
-                                HybridDir::Deferred(dir) => &dir.open_file_descriptor(),
-                            },
-                            None => &starting_dir,
-                        };
-                        err_reporter(
-                            Entry::new(
-                                prev_dir,
-                                parent_path_stack,
-                                current.filename.clone(),
-                                Some(current.metadata.clone()),
-                            ),
-                            Error::new(e, ErrorKind::ReadDir),
-                        );
-
-                        success = false;
-
-                        // A failing `readdir` keeps returning NULL with the same errno, so
-                        // continuing here would spin forever re-reporting it. POSIX leaves the
-                        // stream position unspecified after an error; give up on this directory
-                        // and let it take the normal exit path.
-                        break;
-                    }
-                };
-
-                let is_dot_or_double_dot = entry.is_dot_or_double_dot();
-
-                // Skip . and ..
-                if is_dot_or_double_dot && !include_dot_and_double_dot {
-                    continue;
+        // A labeled block, not nested matches: each `match` temporary then dies at the end of its
+        // own `let`, leaving only `dir_iter` holding the borrow of `dir` -- which the body
+        // already drops explicitly before pushing to `stack`.
+        'enumerate: {
+            let dir_fd = match dir_fd_result {
+                Ok(dir_fd) => dir_fd,
+                Err(e) => {
+                    enumeration_error = Some(e);
+                    break 'enumerate;
                 }
+            };
+            let mut dir_iter = match dir.iter() {
+                Ok(dir_iter) => dir_iter,
+                Err(e) => {
+                    enumeration_error = Some(e);
+                    break 'enumerate;
+                }
+            };
+            {
+                // Read the current directory
+                while let Some(entry_or_err) = dir_iter.next() {
+                    let entry = match entry_or_err {
+                        Ok(entry) => entry,
 
-                let entry_filename = cstring_to_rc(entry.name_cstr());
-
-                let conserve_fds = match dir {
-                    HybridDir::Owned(_) => {
-                        let used_fds = stack
-                            .len()
-                            .saturating_add(subdirs.len())
-                            .saturating_mul(1usize.saturating_add(caller_fds_per_level));
-                        used_fds >= fd_threshold
-                    }
-                    HybridDir::Deferred(_) => {
-                        // If parent is conserving file descriptors, so should its subdirectories
-                        true
-                    }
-                };
-
-                match process_file(
-                    &path_stack,
-                    dir_fd,
-                    entry_filename.clone(),
-                    follow_symlinks,
-                    is_dot_or_double_dot,
-                    &mut file_handler,
-                    &mut err_reporter,
-                ) {
-                    ProcessFileResult::ProcessedDirectory(entry) => {
-                        let (want_dev, want_ino) = {
-                            let md = entry.metadata.as_ref().unwrap();
-                            (md.0.st_dev, md.0.st_ino)
-                        };
-
-                        // Symbolic-link loop detection. Only possible when following symlinks
-                        // (a real directory tree is acyclic). `stack` is exactly the chain of
-                        // ancestors of the entry about to be descended, so re-encountering an
-                        // ancestor's (dev, ino) means a cycle.
-                        if follow_symlinks
-                            && stack.iter().any(|n| {
-                                n.metadata.0.st_dev == want_dev && n.metadata.0.st_ino == want_ino
-                            })
-                        {
-                            refuse_descent!(
-                                entry,
-                                Error::new(
-                                    io::Error::from_raw_os_error(libc::ELOOP),
-                                    ErrorKind::Stat,
-                                )
-                            );
-                        }
-
-                        let node = if conserve_fds {
-                            match dir {
-                                HybridDir::Owned(current_dir) => {
-                                    let path = build_path(&path_stack, &entry_filename);
-                                    let slow_dir = DeferredDir::new(
-                                        Rc::new((
-                                            current_dir.file_descriptor().clone(),
-                                            path.parent().unwrap().to_path_buf(),
-                                        )),
-                                        path,
-                                        descent_flags,
-                                    );
-                                    TreeNode {
-                                        dir: HybridDir::Deferred(slow_dir),
-                                        filename: entry_filename,
-                                        metadata: entry.metadata.unwrap(),
-                                        path_depth,
-                                    }
-                                }
-                                HybridDir::Deferred(current_dir) => {
-                                    let slow_dir = DeferredDir::new(
-                                        current_dir.parent().clone(),
-                                        build_path(&path_stack, &entry_filename),
-                                        descent_flags,
-                                    );
-                                    TreeNode {
-                                        dir: HybridDir::Deferred(slow_dir),
-                                        filename: entry_filename,
-                                        metadata: entry.metadata.unwrap(),
-                                        path_depth,
-                                    }
-                                }
-                            }
-                        } else {
-                            match OwnedDir::open_at(dir_fd, entry_filename.as_ptr(), descent_flags)
-                            {
-                                Ok(new_dir) => {
-                                    // TOCTOU re-verification: confirm the directory we opened is the
-                                    // very file we stat'd. A concurrent swap to a different
-                                    // directory passes `O_NOFOLLOW`/`O_DIRECTORY` but changes
-                                    // (dev, ino), so the walk would otherwise be redirected.
-                                    let verified = {
-                                        let mut sb = MaybeUninit::<libc::stat>::uninit();
-                                        let r = unsafe {
-                                            libc::fstat(
-                                                new_dir.file_descriptor().as_raw_fd(),
-                                                sb.as_mut_ptr(),
-                                            )
-                                        };
-                                        r == 0 && {
-                                            let sb = unsafe { sb.assume_init() };
-                                            sb.st_dev == want_dev && sb.st_ino == want_ino
+                        // Errors in reading the entry usually occurs due to lack of permissions
+                        Err(e) => {
+                            // `path_stack` is the ancestors plus `current.filename`, and the report
+                            // names `current` itself, so its parent is everything before the last
+                            // component. This is the same slice the `postprocess_dir` call below
+                            // passes, which pops first and then hands over the whole stack.
+                            debug_assert_eq!(path_stack.len(), path_depth);
+                            let parent_path_stack = &path_stack[..path_depth - 1];
+                            // Only `entry.path()` is read from this report, and that comes from the
+                            // path stack, so a deferred parent that cannot be reopened right now can
+                            // fall back to the starting directory.
+                            let reopened_parent;
+                            let prev_dir = match stack.len().checked_sub(2) {
+                                Some(index) => match &stack.get(index).unwrap().dir {
+                                    HybridDir::Owned(dir) => dir.file_descriptor(),
+                                    HybridDir::Deferred(dir) => match dir.open_file_descriptor() {
+                                        Ok(fd) => {
+                                            reopened_parent = fd;
+                                            &reopened_parent
                                         }
-                                    };
-                                    if !verified {
-                                        refuse_descent!(
-                                            entry,
-                                            Error::new(
-                                                io::Error::from_raw_os_error(libc::ENOTDIR),
-                                                ErrorKind::OpenDir,
-                                            )
-                                        );
-                                    }
-                                    TreeNode {
-                                        dir: HybridDir::Owned(new_dir),
-                                        filename: entry_filename,
-                                        metadata: entry.metadata.unwrap(),
-                                        path_depth,
-                                    }
-                                }
-                                Err(error) => {
-                                    refuse_descent!(entry, error);
-                                }
-                            }
-                        };
+                                        Err(_) => &starting_dir,
+                                    },
+                                },
+                                None => &starting_dir,
+                            };
+                            err_reporter(
+                                Entry::new(
+                                    prev_dir,
+                                    parent_path_stack,
+                                    current.filename.clone(),
+                                    Some(current.metadata.clone()),
+                                ),
+                                Error::new(e, ErrorKind::ReadDir),
+                            );
 
-                        if list_contents_first {
-                            subdirs.push(node);
-                        } else {
-                            // `dir_iter` has a dependency on `stack` so run it's `Drop` method first
-                            std::mem::drop(dir_iter);
+                            success = false;
 
-                            stack.push(node);
-                            continue 'outer;
+                            // A failing `readdir` keeps returning NULL with the same errno, so
+                            // continuing here would spin forever re-reporting it. POSIX leaves the
+                            // stream position unspecified after an error; give up on this directory
+                            // and let it take the normal exit path.
+                            break;
                         }
+                    };
+
+                    let is_dot_or_double_dot = entry.is_dot_or_double_dot();
+
+                    // Skip . and ..
+                    if is_dot_or_double_dot && !include_dot_and_double_dot {
+                        continue;
                     }
-                    ProcessFileResult::NotProcessed => {
-                        success = false;
+
+                    let entry_filename = cstring_to_rc(entry.name_cstr());
+
+                    let conserve_fds = match dir {
+                        HybridDir::Owned(_) => {
+                            let used_fds = stack
+                                .len()
+                                .saturating_add(subdirs.len())
+                                .saturating_mul(1usize.saturating_add(caller_fds_per_level));
+                            used_fds >= fd_threshold
+                        }
+                        HybridDir::Deferred(_) => {
+                            // If parent is conserving file descriptors, so should its subdirectories
+                            true
+                        }
+                    };
+
+                    match process_file(
+                        &path_stack,
+                        dir_fd,
+                        entry_filename.clone(),
+                        follow_symlinks,
+                        is_dot_or_double_dot,
+                        &mut file_handler,
+                        &mut err_reporter,
+                    ) {
+                        ProcessFileResult::ProcessedDirectory(entry) => {
+                            let (want_dev, want_ino) = {
+                                let md = entry.metadata.as_ref().unwrap();
+                                (md.0.st_dev, md.0.st_ino)
+                            };
+
+                            // Symbolic-link loop detection. Only possible when following symlinks
+                            // (a real directory tree is acyclic). `stack` is exactly the chain of
+                            // ancestors of the entry about to be descended, so re-encountering an
+                            // ancestor's (dev, ino) means a cycle.
+                            if follow_symlinks
+                                && stack.iter().any(|n| {
+                                    n.metadata.0.st_dev == want_dev
+                                        && n.metadata.0.st_ino == want_ino
+                                })
+                            {
+                                refuse_descent!(
+                                    entry,
+                                    Error::new(
+                                        io::Error::from_raw_os_error(libc::ELOOP),
+                                        ErrorKind::Stat,
+                                    )
+                                );
+                            }
+
+                            let node = if conserve_fds {
+                                match dir {
+                                    HybridDir::Owned(current_dir) => {
+                                        let path = build_path(&path_stack, &entry_filename);
+                                        let anchor = match current_dir.file_descriptor().try_clone()
+                                        {
+                                            Ok(fd) => fd,
+                                            // Running out of descriptors is exactly the condition
+                                            // that put the walk in conserving mode; there is nothing
+                                            // to fall back to.
+                                            Err(e) => {
+                                                refuse_descent!(
+                                                    entry,
+                                                    Error::new(e, ErrorKind::Open)
+                                                )
+                                            }
+                                        };
+                                        let slow_dir = DeferredDir::new(
+                                            Rc::new((anchor, path.parent().unwrap().to_path_buf())),
+                                            path,
+                                            descent_flags,
+                                        );
+                                        TreeNode {
+                                            dir: HybridDir::Deferred(slow_dir),
+                                            filename: entry_filename,
+                                            metadata: entry.metadata.unwrap(),
+                                            path_depth,
+                                        }
+                                    }
+                                    HybridDir::Deferred(current_dir) => {
+                                        let slow_dir = DeferredDir::new(
+                                            current_dir.parent().clone(),
+                                            build_path(&path_stack, &entry_filename),
+                                            descent_flags,
+                                        );
+                                        TreeNode {
+                                            dir: HybridDir::Deferred(slow_dir),
+                                            filename: entry_filename,
+                                            metadata: entry.metadata.unwrap(),
+                                            path_depth,
+                                        }
+                                    }
+                                }
+                            } else {
+                                match OwnedDir::open_at(
+                                    dir_fd,
+                                    entry_filename.as_ptr(),
+                                    descent_flags,
+                                ) {
+                                    Ok(new_dir) => {
+                                        // TOCTOU re-verification: confirm the directory we opened is the
+                                        // very file we stat'd. A concurrent swap to a different
+                                        // directory passes `O_NOFOLLOW`/`O_DIRECTORY` but changes
+                                        // (dev, ino), so the walk would otherwise be redirected.
+                                        let verified = {
+                                            let mut sb = MaybeUninit::<libc::stat>::uninit();
+                                            let r = unsafe {
+                                                libc::fstat(
+                                                    new_dir.file_descriptor().as_raw_fd(),
+                                                    sb.as_mut_ptr(),
+                                                )
+                                            };
+                                            r == 0 && {
+                                                let sb = unsafe { sb.assume_init() };
+                                                sb.st_dev == want_dev && sb.st_ino == want_ino
+                                            }
+                                        };
+                                        if !verified {
+                                            refuse_descent!(
+                                                entry,
+                                                Error::new(
+                                                    io::Error::from_raw_os_error(libc::ENOTDIR),
+                                                    ErrorKind::OpenDir,
+                                                )
+                                            );
+                                        }
+                                        TreeNode {
+                                            dir: HybridDir::Owned(new_dir),
+                                            filename: entry_filename,
+                                            metadata: entry.metadata.unwrap(),
+                                            path_depth,
+                                        }
+                                    }
+                                    Err(error) => {
+                                        refuse_descent!(entry, error);
+                                    }
+                                }
+                            };
+
+                            if list_contents_first {
+                                subdirs.push(node);
+                            } else {
+                                // `dir_iter` has a dependency on `stack` so run it's `Drop` method first
+                                std::mem::drop(dir_iter);
+
+                                stack.push(node);
+                                continue 'outer;
+                            }
+                        }
+                        ProcessFileResult::NotProcessed => {
+                            success = false;
+                        }
+                        ProcessFileResult::ProcessedFile | ProcessFileResult::Skipped => (),
                     }
-                    ProcessFileResult::ProcessedFile | ProcessFileResult::Skipped => (),
                 }
             }
+        }
+
+        if let Some(e) = enumeration_error {
+            err_reporter(
+                Entry::new(
+                    &starting_dir,
+                    &path_stack[..path_depth - 1],
+                    current.filename.clone(),
+                    Some(current.metadata.clone()),
+                ),
+                Error::new(e, ErrorKind::OpenDir),
+            );
+            success = false;
+            dir_exit = DirExit::NotDescended;
         }
 
         if list_contents_first && !subdirs.is_empty() {
@@ -1081,27 +1176,54 @@ where
         // Undoes the `path_stack.push` above
         path_stack.pop();
 
-        let second_last_index = stack.len().checked_sub(2);
-        let prev_dir = match second_last_index {
+        // The exit callback acts relative to the *parent's* descriptor -- `rm` unlinks through
+        // it -- so unlike the reporter above there is no safe fallback if a deferred parent
+        // cannot be reopened: a wrong descriptor here would remove the wrong directory. Report
+        // and skip the callback instead. This is the one documented gap in the invariant, and it
+        // is reachable only in descriptor-conserving mode.
+        let reopened_parent;
+        let prev_dir = match stack.len().checked_sub(2) {
             Some(index) => match &stack.get(index).unwrap().dir {
-                HybridDir::Owned(dir) => dir.file_descriptor(),
-                HybridDir::Deferred(dir) => &dir.open_file_descriptor(),
+                HybridDir::Owned(dir) => Ok(dir.file_descriptor()),
+                HybridDir::Deferred(dir) => match dir.open_file_descriptor() {
+                    Ok(fd) => {
+                        reopened_parent = fd;
+                        Ok(&reopened_parent)
+                    }
+                    Err(e) => Err(e),
+                },
             },
-            None => &starting_dir,
+            None => Ok(&starting_dir),
         };
-        if postprocess_dir(
-            Entry::new(
-                prev_dir,
-                &path_stack,
-                current.filename.clone(),
-                Some(current.metadata.clone()),
-            ),
-            DirExit::Descended,
-        )
-        .is_err()
-        {
-            success = false;
-            // Don't `continue` here, falldown below
+        match prev_dir {
+            Ok(prev_dir) => {
+                if postprocess_dir(
+                    Entry::new(
+                        prev_dir,
+                        &path_stack,
+                        current.filename.clone(),
+                        Some(current.metadata.clone()),
+                    ),
+                    dir_exit,
+                )
+                .is_err()
+                {
+                    success = false;
+                    // Don't `continue` here, falldown below
+                }
+            }
+            Err(e) => {
+                err_reporter(
+                    Entry::new(
+                        &starting_dir,
+                        &path_stack,
+                        current.filename.clone(),
+                        Some(current.metadata.clone()),
+                    ),
+                    Error::new(e, ErrorKind::Open),
+                );
+                success = false;
+            }
         }
 
         // Process the next node

@@ -21,9 +21,16 @@ use std::{
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
-pub type InodeMap = HashMap<(u64, u64), (ftw::FileDescriptor, CString)>;
+/// Where each already-copied inode landed, so a later name for the same file can be hard-linked
+/// to it instead of copied again.
+///
+/// The descriptor is shared rather than duplicated: `dup`ing one per hard-linked inode grew the
+/// process's descriptor use without bound over a large move, and made the walk's own descriptor
+/// budget meaningless.
+pub type InodeMap = HashMap<(u64, u64), (Rc<ftw::FileDescriptor>, CString)>;
 
 pub struct CopyConfig {
     pub force: bool,
@@ -427,7 +434,7 @@ where
     F: Copy + Fn(&str) -> bool,
 {
     // `RefCell` to allow sharing these between closures
-    let target_dirfd_stack = RefCell::new(vec![ftw::FileDescriptor::cwd()]);
+    let target_dirfd_stack = RefCell::new(vec![Rc::new(ftw::FileDescriptor::cwd())]);
     let target_dir_path = RefCell::new(PathBuf::new());
     let terminate = RefCell::new(false);
     let last_error = RefCell::new(None);
@@ -511,7 +518,7 @@ where
                         if source_md.nlink() > 1 {
                             inode_map.insert(
                                 identifier,
-                                (target_dirfd.clone(), target_filename_cstr.clone()),
+                                (Rc::clone(target_dirfd), target_filename_cstr.clone()),
                             );
                         }
                     }
@@ -549,7 +556,7 @@ where
                                 }
                             };
 
-                            target_dirfd_stack_borrowed.push(new_target_dirfd);
+                            target_dirfd_stack_borrowed.push(Rc::new(new_target_dirfd));
                             target_dir_path_borrowed.push(target_filename);
 
                             true

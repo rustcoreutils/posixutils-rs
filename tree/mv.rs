@@ -12,7 +12,7 @@ mod common;
 
 use self::common::{copy_file, error_string};
 use clap::Parser;
-use common::CopyConfig;
+use common::{CopyConfig, InodeMap};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::{
     collections::{HashMap, HashSet},
@@ -72,7 +72,7 @@ fn copy_hierarchy(
     cfg: &MvConfig,
     src: &Path,
     dst: &Path,
-    inode_map: &mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>,
+    inode_map: &mut InodeMap,
     created_files: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     let copy_cfg = CopyConfig {
@@ -104,7 +104,7 @@ fn move_file(
     cfg: &MvConfig,
     source: &Path,
     target: &Path,
-    inode_map: &mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>,
+    inode_map: &mut InodeMap,
     created_files: Option<&mut HashSet<PathBuf>>,
 ) -> io::Result<bool> {
     let source_filename = CString::new(source.as_os_str().as_bytes()).unwrap();

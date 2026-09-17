@@ -171,21 +171,27 @@ impl DeferredDir {
         }
     }
 
-    pub fn iter(&self) -> DeferredDirIterator<'_> {
-        let file_descriptor = self.open_file_descriptor();
-        let dir = OwnedDir::new(file_descriptor).unwrap();
+    pub fn iter(&self) -> io::Result<DeferredDirIterator<'_>> {
+        let file_descriptor = self.open_file_descriptor()?;
+        let dir = OwnedDir::new(file_descriptor)?;
         let dirp = dir.dirp;
 
         // Passing ownership of `dirp` to `SlowDirIterator`
         std::mem::forget(dir);
 
-        DeferredDirIterator {
+        Ok(DeferredDirIterator {
             dirp,
             visited: self.visited.borrow_mut(),
-        }
+        })
     }
 
-    pub fn open_file_descriptor(&self) -> FileDescriptor {
+    /// Reopen this directory by path from the nearest ancestor descriptor still held.
+    ///
+    /// Fallible: the reopen is where the fail-closed `O_NOFOLLOW` hardening below actually
+    /// refuses a swapped directory, and it is also where `EMFILE` shows up -- the condition that
+    /// put the walk into descriptor-conserving mode in the first place. Both used to abort the
+    /// process.
+    pub fn open_file_descriptor(&self) -> io::Result<FileDescriptor> {
         // e.g.:
         // self.parent.1 - foo
         // self.path - foo/bar/baz
@@ -194,9 +200,10 @@ impl DeferredDir {
 
         // `remainder` is not guaranteed to be shorter than `libc::PATH_MAX`
         let (starting_dir, components) =
-            open_long_filename(self.parent.0.clone(), remainder, None, &mut |_, _| {}).unwrap();
+            open_long_filename(self.parent.0.try_clone()?, remainder, None, &mut |_, _| {})?;
 
-        let filename_cstr = CString::new(components.as_path().as_os_str().as_bytes()).unwrap();
+        let filename_cstr = CString::new(components.as_path().as_os_str().as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         // Same descent hardening as the non-deferred path. `O_NOFOLLOW` here makes a leaf that was
         // concurrently swapped for a symlink fail the reopen (fail-closed) rather than redirecting
@@ -207,7 +214,6 @@ impl DeferredDir {
             &filename_cstr,
             libc::O_RDONLY | self.descent_flags,
         )
-        .unwrap()
     }
 
     pub fn parent(&self) -> &Rc<(FileDescriptor, PathBuf)> {
@@ -271,10 +277,12 @@ pub enum HybridDir {
 }
 
 impl HybridDir {
-    pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = io::Result<EntryInternal<'a>>> + 'a> {
+    pub fn iter<'a>(
+        &'a self,
+    ) -> io::Result<Box<dyn Iterator<Item = io::Result<EntryInternal<'a>>> + 'a>> {
         match self {
-            HybridDir::Owned(d) => Box::new(d.iter()),
-            HybridDir::Deferred(d) => Box::new(d.iter()),
+            HybridDir::Owned(d) => Ok(Box::new(d.iter())),
+            HybridDir::Deferred(d) => Ok(Box::new(d.iter()?)),
         }
     }
 }

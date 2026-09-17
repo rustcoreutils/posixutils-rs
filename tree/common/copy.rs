@@ -90,6 +90,17 @@ enum CopyResult {
 // Implements the algorithm for `cp`:
 //
 // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/cp.html
+/// State carried across every entry of one `copy_file` walk.
+struct CopyState<'a> {
+    /// Destinations this copy has already written, so a later source cannot clobber one.
+    created_files: &'a mut HashSet<PathBuf>,
+    /// Identity of every destination directory this copy created or entered.
+    dest_dir_ids: &'a RefCell<HashSet<(u64, u64)>>,
+    /// The operands as the user wrote them, for the diagnostics that must name them rather than
+    /// the entry the failure was noticed on.
+    operands: (&'a Path, &'a Path),
+}
+
 /// The pathname stored in the symbolic link `source`.
 ///
 /// `ftw` fills in `Entry::read_link` for every symbolic link, but reading it here keeps this
@@ -137,7 +148,7 @@ fn copy_file_impl<F>(
     target: &Path,
     target_dirfd: libc::c_int,
     target_filename: *const libc::c_char,
-    created_files: &mut HashSet<PathBuf>,
+    state: &mut CopyState<'_>,
     prompt_fn: F,
 ) -> io::Result<CopyResult>
 where
@@ -240,17 +251,30 @@ where
             return Err(io::Error::other(err_str));
         }
 
+        // Refuse to descend into a directory that is one of this copy's own destinations, which
+        // is what a copy into itself looks like from the inside. The previous test compared path
+        // text, so "./a" and "a" named the same directory without matching, and `cp -R ./a a/b`
+        // recursed until the filesystem filled. Identity cannot be spelled two ways.
+        //
+        // The message names the operands, not this entry: the recursion is only visible several
+        // levels down, but what the user got wrong is the pair they typed.
+        // Borrowed only for the test: the caller mutates this set while handling the result.
+        let copying_into_self = state
+            .dest_dir_ids
+            .borrow()
+            .contains(&(source_md.dev(), source_md.ino()));
+        if copying_into_self {
+            let (source_arg, target_arg) = state.operands;
+            let err_str = gettext!(
+                "cannot copy a directory, '{}', into itself, '{}'",
+                source_arg.display(),
+                target_arg.display()
+            );
+            return Err(io::Error::other(err_str));
+        }
+
         // 2.e
         if !target_exists {
-            if target.starts_with(PathBuf::from(format!("{}", source.path()))) {
-                let err_str = gettext!(
-                    "cannot copy a directory, '{}', into itself, '{}'",
-                    source.path(),
-                    target.display()
-                );
-                return Err(io::Error::other(err_str));
-            }
-
             unsafe {
                 // Creates the target directory with the same file permission bits as the source,
                 // modified by the umask of the process. Copying the permission bits without the
@@ -279,9 +303,22 @@ where
     } else {
         // 3. If source_file is of type regular file
 
+        // When the options say not to follow this entry's links, refuse to follow one that
+        // appeared between the traversal's `lstat` and this open. GNU guards the same way.
+        let source_open_flags = libc::O_RDONLY
+            | if deref_this_entry {
+                0
+            } else {
+                libc::O_NOFOLLOW
+            };
+
         let create_target_then_copy = || -> io::Result<()> {
             let source_fd = unsafe {
-                libc::openat(source.dir_fd(), source.file_name().as_ptr(), libc::O_RDONLY)
+                libc::openat(
+                    source.dir_fd(),
+                    source.file_name().as_ptr(),
+                    source_open_flags,
+                )
             };
             if source_fd == -1 {
                 let e = io::Error::last_os_error();
@@ -337,7 +374,7 @@ where
 
         // 3.a
         if target_exists && !target_is_dangling_symlink {
-            if created_files.contains(target) {
+            if state.created_files.contains(target) {
                 let err_str = gettext!(
                     "will not overwrite just-created '{}' with '{}'",
                     target.display(),
@@ -395,7 +432,7 @@ where
                 target_dirfd,
                 target_filename,
                 target_exists,
-                created_files,
+                state.created_files,
             )?;
             return Ok(CopyResult::CopiedFile);
         }
@@ -437,7 +474,26 @@ where
                 )));
             }
         } else if replacing_existing {
-            // 3.a.ii
+            // 3.a.ii. Open the source first: truncating the destination before knowing the
+            // source can be read destroyed its contents and then reported a failure.
+            let source_fd = unsafe {
+                libc::openat(
+                    source.dir_fd(),
+                    source.file_name().as_ptr(),
+                    source_open_flags,
+                )
+            };
+            if source_fd == -1 {
+                let e = io::Error::last_os_error();
+                let err_str = gettext!(
+                    "cannot open '{}' for reading: {}",
+                    source.path(),
+                    error_string(&e)
+                );
+                return Err(io::Error::other(err_str));
+            }
+            let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
+
             let target_fd = unsafe {
                 libc::openat(
                     target_dirfd,
@@ -447,20 +503,6 @@ where
             };
             if target_fd != -1 {
                 let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
-
-                let source_fd = unsafe {
-                    libc::openat(source.dir_fd(), source.file_name().as_ptr(), libc::O_RDONLY)
-                };
-                if source_fd == -1 {
-                    let e = io::Error::last_os_error();
-                    let err_str = gettext!(
-                        "cannot open '{}' for reading: {}",
-                        source.path(),
-                        error_string(&e)
-                    );
-                    return Err(io::Error::other(err_str));
-                }
-                let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
 
                 io::copy(&mut source_file, &mut target_file)?;
             } else {
@@ -497,7 +539,7 @@ where
             create_target_then_copy()?;
         }
 
-        created_files.insert(target.to_path_buf());
+        state.created_files.insert(target.to_path_buf());
     }
 
     Ok(CopyResult::CopiedFile)
@@ -516,6 +558,9 @@ where
 {
     // `RefCell` to allow sharing these between closures
     let target_dirfd_stack = RefCell::new(vec![Rc::new(ftw::FileDescriptor::cwd())]);
+    // (st_dev, st_ino) of every destination directory this copy creates or enters. A source
+    // directory found in here is one we are copying *into*.
+    let dest_dir_ids = RefCell::new(HashSet::<(u64, u64)>::new());
     let target_dir_path = RefCell::new(PathBuf::new());
     let terminate = RefCell::new(false);
     let last_error = RefCell::new(None);
@@ -589,7 +634,11 @@ where
                 &target,
                 target_dirfd.as_raw_fd(),
                 target_filename_cstr.as_ptr(),
-                created_files,
+                &mut CopyState {
+                    created_files,
+                    dest_dir_ids: &dest_dir_ids,
+                    operands: (source_arg, target_arg),
+                },
                 prompt_fn,
             ) {
                 Ok(copy_result) => {
@@ -641,6 +690,21 @@ where
                                     return Ok(false);
                                 }
                             };
+
+                            // Record what this destination directory *is*, from the descriptor
+                            // already in hand rather than by name. Recording on entry, not on
+                            // creation, so a destination that existed beforehand counts too.
+                            let mut st = MaybeUninit::<libc::stat>::uninit();
+                            if unsafe { libc::fstat(new_target_dirfd.as_raw_fd(), st.as_mut_ptr()) }
+                                == 0
+                            {
+                                let st = unsafe { st.assume_init() };
+                                // Casts needed: `dev_t`/`ino_t` are not u64 on every platform.
+                                #[allow(clippy::unnecessary_cast)]
+                                dest_dir_ids
+                                    .borrow_mut()
+                                    .insert((st.st_dev as u64, st.st_ino as u64));
+                            }
 
                             target_dirfd_stack_borrowed.push(Rc::new(new_target_dirfd));
                             target_dir_path_borrowed.push(target_filename);

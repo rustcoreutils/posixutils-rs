@@ -1600,3 +1600,122 @@ fn test_cp_setuid_not_preserved_without_p() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// Runs `cp` directly with a wall-clock limit, killing it if it overruns.
+///
+/// The copy-into-itself tests describe a runaway recursion, so a regression would otherwise run
+/// until the filesystem filled up rather than failing the test.
+fn cp_test_bounded(cwd: &str, args: &[&str], expected_error: &str, expected_exit_code: i32) {
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cp"))
+        .args(args)
+        .current_dir(cwd)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("cp did not terminate: {args:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stderr), expected_error);
+    assert_eq!(output.status.code(), Some(expected_exit_code));
+}
+
+// The guard against copying a directory into itself compared path text, so any other spelling of
+// the same directory defeated it and the copy recursed without bound.
+#[test]
+fn test_cp_into_self_alt_spelling() {
+    let test_dir = &format!(
+        "{}/test_cp_into_self_alt_spelling",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let a = &format!("{test_dir}/a");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(a).unwrap();
+    fs::write(format!("{a}/f"), b"x").unwrap();
+
+    // Relative and spelled with a `.`, as a user would type it. Comparing path text could be
+    // defeated by any spelling that names the same directory differently.
+    cp_test_bounded(
+        test_dir,
+        &["-R", "./a", "a/b"],
+        "cp: cannot copy a directory, './a', into itself, 'a/b'\n",
+        1,
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// The guard was skipped entirely when the destination already existed.
+#[test]
+fn test_cp_into_self_existing_target() {
+    let test_dir = &format!(
+        "{}/test_cp_into_self_existing_target",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/a/b");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(a).unwrap();
+    fs::create_dir(b).unwrap();
+    fs::write(format!("{a}/f"), b"x").unwrap();
+
+    cp_test_bounded(
+        test_dir,
+        &["-R", "a", "a/b"],
+        "cp: cannot copy a directory, 'a', into itself, 'a/b/a'\n",
+        1,
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// A destination that is an existing symbolic link to a regular file is written *through*, as
+// POSIX 90658-90661 and GNU both do. Hardening the creating open must not change that.
+#[test]
+fn test_cp_overwrites_symlink_target() {
+    let test_dir = &format!(
+        "{}/test_cp_overwrites_symlink_target",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let real = &format!("{test_dir}/real");
+    let link = &format!("{test_dir}/link");
+    let src = &format!("{test_dir}/src");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(real, b"OLD\n").unwrap();
+    unix::fs::symlink("real", link).unwrap();
+    fs::write(src, b"NEW\n").unwrap();
+
+    cp_test(&[src, link], "", "", 0);
+
+    assert!(
+        fs::symlink_metadata(link).unwrap().is_symlink(),
+        "the link was replaced instead of written through"
+    );
+    let mut contents = String::new();
+    fs::File::open(real)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "NEW\n");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

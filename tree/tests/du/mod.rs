@@ -540,8 +540,10 @@ fn test_du_error_names_the_operand() {
 
 /// Find a directory that contains a subdirectory on a *different* device.
 ///
-/// `tree/audit.md` recorded `-x` as untestable because it "needs a real mount
-/// point, so CI cannot exercise it". That is not so: a device boundary needs
+/// The tree/ audit recorded `-x` as untestable because it "needs a real mount
+/// point, so CI cannot exercise it" -- this test is what refuted that and
+/// closed the audit's last row, so `git log --follow -- tree/audit.md` is now
+/// where that finding lives. The premise was wrong: a device boundary needs
 /// no root and no setup, only a host that already has one. `/dev` (devtmpfs)
 /// containing `/dev/shm` (tmpfs) is the usual one on Linux.
 ///

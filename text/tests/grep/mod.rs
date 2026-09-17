@@ -1474,7 +1474,8 @@ fn grep_input_containing_nul_bytes() {
     // `regexec`, which takes a NUL-terminated string, so the conversion fails
     // and the line is skipped. GNU grep instead reports "binary file matches"
     // and exits 0. Both are within the latitude the spec allows for non-text
-    // input; the divergence is recorded in the audit.
+    // input. This comment is the record of that divergence: the text/ audit it
+    // was written against is in git history.
     let (out, code) = grep_stdin(&["a"], b"a\x00b\n");
     assert_eq!(code, 1, "a NUL-bearing line does not match");
     assert!(out.is_empty());

@@ -942,7 +942,7 @@ fn test_cp_special_bits() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #C1: `cp -p` must preserve S_ISUID/S_ISGID when ownership can be duplicated.
+// `cp -p` must preserve S_ISUID/S_ISGID when ownership can be duplicated.
 // Copying our own file reproduces the chown-succeeds path (same owner), so the bits stay.
 #[test]
 fn test_cp_preserve_keeps_setuid_same_owner() {
@@ -973,7 +973,7 @@ fn test_cp_preserve_keeps_setuid_same_owner() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #C1: `cp -p` must CLEAR S_ISUID/S_ISGID when the user/group ID cannot be duplicated
+// `cp -p` must CLEAR S_ISUID/S_ISGID when the user/group ID cannot be duplicated
 // (POSIX cp 90720-90721). A non-root user copying a root-owned setuid file cannot chown the copy
 // back to root, so the privileged bits must be dropped. Needs root + `NON_ROOT_USERNAME`.
 #[test]
@@ -1080,7 +1080,7 @@ fn test_cp_issue199() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #C2: more than one source with a target that is not an existing directory must be an
+// More than one source with a target that is not an existing directory must be an
 // error (POSIX cp 90605-90606), not a silent copy of only the first source.
 #[test]
 fn test_cp_multi_source_nondir_target() {
@@ -1107,7 +1107,7 @@ fn test_cp_multi_source_nondir_target() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #C3: a per-file failure during `cp -R` must not abort the whole copy — same-level and
+// A per-file failure during `cp -R` must not abort the whole copy — same-level and
 // ancestor entries are still copied (POSIX cp 90829-90832). One unreadable file among several
 // readable siblings: all readable siblings must still be copied (regardless of readdir order),
 // and the exit status is non-zero.

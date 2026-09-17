@@ -98,7 +98,7 @@ fn test_readlink_not_a_symlink() {
     });
 }
 
-// Audit #RL1: readlink on a non-symlink writes a diagnostic to stderr and exits 1, even without -v.
+// Readlink on a non-symlink writes a diagnostic to stderr and exits 1, even without -v.
 #[test]
 fn test_readlink_not_symlink_diagnoses() {
     let dir = tempdir().unwrap();

@@ -1456,7 +1456,7 @@ fn test_mv_sticky_to_xpart() {
     fs::remove_dir_all(other_dir).unwrap();
 }
 
-// Audit #M2: more than one source with a non-directory target must error (mv synopsis), and the
+// More than one source with a non-directory target must error (mv synopsis), and the
 // first source must NOT be moved.
 #[test]
 fn test_mv_multi_source_nondir_target() {
@@ -1486,7 +1486,7 @@ fn test_mv_multi_source_nondir_target() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #M2 (108049-108050): a non-directory source with a trailing-slash target_file is an error.
+// POSIX 108049-108050: a non-directory source with a trailing-slash target_file is an error.
 #[test]
 fn test_mv_nondir_source_trailing_slash() {
     let test_dir = &format!(

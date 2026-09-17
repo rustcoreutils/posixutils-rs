@@ -93,7 +93,7 @@ fn rmdir_remove_directory_with_parents() {
     assert!(!parent_dir.exists());
 }
 
-// Audit #RD1: `rmdir -p` on a non-empty parent reports the parent that actually failed (not the
+// `rmdir -p` on a non-empty parent reports the parent that actually failed (not the
 // original operand), removes the empty leaf chain, and exits 1.
 #[test]
 fn test_rmdir_p_names_failing_parent() {

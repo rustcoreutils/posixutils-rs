@@ -185,7 +185,7 @@ fn test_chmod_thru_dangling() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #CM1 (shared with #CO1/#CG1/#DU1): a per-file error during `chmod -R` is reported but the
+// A per-file error during `chmod -R` is reported but the
 // walk continues — a readable sibling is still chmod'd and the exit status is non-zero.
 #[test]
 fn test_chmod_continue_on_error() {

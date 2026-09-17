@@ -666,7 +666,7 @@ fn test_ls_time() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #LS1/#LS2: `ls -l` on a symbolic link — named directly on the command line, and present
+// `ls -l` on a symbolic link — named directly on the command line, and present
 // inside a listed directory — must not panic; it renders `name -> target`.
 #[test]
 fn test_ls_l_symlink_no_panic() {
@@ -696,7 +696,7 @@ fn test_ls_l_symlink_no_panic() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #LS10: a socket gets type char `s` (long format) and indicator `=` (-F).
+// A socket gets type char `s` (long format) and indicator `=` (-F).
 #[test]
 fn test_ls_socket_classification() {
     let test_dir = &format!(
@@ -724,7 +724,7 @@ fn test_ls_socket_classification() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #LS9: the long-format day is blank-padded (`%e`), not zero-padded (`Jun  5`, not `Jun 05`).
+// The long-format day is blank-padded (`%e`), not zero-padded (`Jun  5`, not `Jun 05`).
 #[test]
 fn test_ls_date_blank_padded_day() {
     let test_dir = &format!(
@@ -752,7 +752,7 @@ fn test_ls_date_blank_padded_day() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #LS4: the recent-vs-old date format tracks the DISPLAYED timestamp — under `-u`, a file
+// The recent-vs-old date format tracks the DISPLAYED timestamp — under `-u`, a file
 // with an old mtime but a recent atime uses the recent (HH:MM) format, not the year format.
 #[test]
 fn test_ls_u_recency_displayed_time() {
@@ -793,7 +793,7 @@ fn test_ls_u_recency_displayed_time() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #LS5: a file carrying a POSIX ACL gets the trailing `+` on its mode string. Gated on
+// A file carrying a POSIX ACL gets the trailing `+` on its mode string. Gated on
 // `setfacl` being available and the filesystem supporting ACLs.
 #[test]
 fn test_ls_acl_plus_flag() {
@@ -821,7 +821,7 @@ fn test_ls_acl_plus_flag() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #LS6: explicit `-q` replaces non-printable filename characters with `?`.
+// Explicit `-q` replaces non-printable filename characters with `?`.
 #[test]
 fn test_ls_q_non_printable() {
     let test_dir = &format!("{}/test_ls_q_non_printable", env!("CARGO_TARGET_TMPDIR"));
@@ -838,7 +838,7 @@ fn test_ls_q_non_printable() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #LS13: `-s` reports blocks in 1024-byte units by default (matches coreutils).
+// `-s` reports blocks in 1024-byte units by default (matches coreutils).
 #[test]
 fn test_ls_s_kib_default() {
     let test_dir = &format!("{}/test_ls_s_kib_default", env!("CARGO_TARGET_TMPDIR"));

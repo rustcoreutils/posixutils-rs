@@ -47,7 +47,7 @@ fn test_ln_hard_and_symbolic() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #LN1: `-f` removes an existing destination before linking.
+// `-f` removes an existing destination before linking.
 #[test]
 fn test_ln_force_over_existing() {
     let d = dir("test_ln_force_over_existing");
@@ -68,7 +68,7 @@ fn test_ln_force_over_existing() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #LN1: `ln -f a a` (same file) is refused rather than destroying the only copy.
+// `ln -f a a` (same file) is refused rather than destroying the only copy.
 #[test]
 fn test_ln_force_same_file_refused() {
     let d = dir("test_ln_force_same_file_refused");
@@ -83,7 +83,7 @@ fn test_ln_force_same_file_refused() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #LN1/#LN3: `ln -f -L <symlink-to-X> X` must compare the *referent* (which -L hard-links)
+// `ln -f -L <symlink-to-X> X` must compare the *referent* (which -L hard-links)
 // against the destination, so the same-file guard fires and X is not unlinked.
 #[test]
 fn test_ln_force_logical_same_file_refused() {
@@ -110,7 +110,7 @@ fn test_ln_force_logical_same_file_refused() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #LN2: with an existing-directory final operand, sources are linked into it.
+// With an existing-directory final operand, sources are linked into it.
 #[test]
 fn test_ln_into_directory() {
     let d = dir("test_ln_into_directory");
@@ -125,7 +125,7 @@ fn test_ln_into_directory() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #LN2: more than two operands with a non-directory final operand is an error (no partial).
+// More than two operands with a non-directory final operand is an error (no partial).
 #[test]
 fn test_ln_multi_nondir_target_errors() {
     let d = dir("test_ln_multi_nondir_target_errors");
@@ -142,7 +142,7 @@ fn test_ln_multi_nondir_target_errors() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #LN3: -L hard-links a symlink's referent; -P hard-links the symlink itself.
+// -L hard-links a symlink's referent; -P hard-links the symlink itself.
 #[test]
 fn test_ln_logical_physical() {
     let d = dir("test_ln_logical_physical");

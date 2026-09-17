@@ -1275,3 +1275,172 @@ fn test_cp_i_unwritable_prompt_wording() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// -P must act on the link itself, both for an operand and for links found during the walk
+// (POSIX 90621-90623). While -P was inert, `cp -RP` followed a symlinked directory and copied
+// the real files it pointed at, which is exactly what -P is passed to prevent.
+#[test]
+fn test_cp_rp_does_not_escape_source_tree() {
+    let test_dir = &format!(
+        "{}/test_cp_rp_does_not_escape_source_tree",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let outside = &format!("{test_dir}/outside");
+    let src = &format!("{test_dir}/src");
+    let escape = &format!("{src}/escape");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(outside).unwrap();
+    fs::write(format!("{outside}/secret.txt"), b"secret\n").unwrap();
+    fs::create_dir(src).unwrap();
+    // Absolute, so the copy cannot resolve it by accident from its new location.
+    unix::fs::symlink(outside, escape).unwrap();
+
+    for (flags, dst_name) in [(&["-R", "-P"][..], "dst_p"), (&["-R"][..], "dst_default")] {
+        let dst = &format!("{test_dir}/{dst_name}");
+        let mut args = flags.to_vec();
+        args.push(src);
+        args.push(dst);
+        cp_test(&args, "", "", 0);
+
+        let copied = &format!("{dst}/escape");
+        assert!(
+            fs::symlink_metadata(copied).unwrap().is_symlink(),
+            "{dst_name}: the symlink was resolved instead of recreated"
+        );
+        assert_eq!(
+            fs::read_link(copied).unwrap(),
+            Path::new(outside),
+            "{dst_name}: the link was not reproduced verbatim"
+        );
+        // Following the recreated link reaches the original, which is expected; what must not
+        // happen is a real copy of it appearing inside the destination.
+        assert!(
+            !fs::symlink_metadata(format!("{dst}/escape/"))
+                .map(|md| md.is_dir())
+                .unwrap_or(false)
+                || fs::symlink_metadata(copied).unwrap().is_symlink(),
+            "{dst_name}: the referenced directory was duplicated into the destination"
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// -L acts on what the link refers to, for operands and for links met during the walk
+// (POSIX 90706-90708).
+#[test]
+fn test_cp_rl_dereferences_symlink_in_hierarchy() {
+    let test_dir = &format!(
+        "{}/test_cp_rl_dereferences_symlink_in_hierarchy",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    fs::write(format!("{src}/real"), b"REAL\n").unwrap();
+    unix::fs::symlink("real", format!("{src}/link")).unwrap();
+
+    cp_test(&["-R", "-L", src, dst], "", "", 0);
+
+    let link_copy = &format!("{dst}/link");
+    assert!(
+        !fs::symlink_metadata(link_copy).unwrap().is_symlink(),
+        "-L recreated the link instead of copying what it refers to"
+    );
+    let mut contents = String::new();
+    fs::File::open(link_copy)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "REAL\n");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90727-90728: more than one of -H, -L, -P is not an error, and the last one wins.
+#[test]
+fn test_cp_deref_flags_last_wins() {
+    let test_dir = &format!(
+        "{}/test_cp_deref_flags_last_wins",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    fs::write(format!("{src}/real"), b"REAL\n").unwrap();
+    unix::fs::symlink("real", format!("{src}/link")).unwrap();
+
+    // (flags, destination, whether the copied entry should still be a symlink)
+    let cases: [(&[&str], &str, bool); 3] = [
+        (&["-R", "-L", "-P"], "a", true),
+        (&["-R", "-P", "-L"], "b", false),
+        (&["-R", "-H", "-P"], "c", true),
+    ];
+    for (flags, dst_name, expect_symlink) in cases {
+        let dst = &format!("{test_dir}/{dst_name}");
+        let mut args = flags.to_vec();
+        args.push(src);
+        args.push(dst);
+        cp_test(&args, "", "", 0);
+
+        assert_eq!(
+            fs::symlink_metadata(format!("{dst}/link"))
+                .unwrap()
+                .is_symlink(),
+            expect_symlink,
+            "{flags:?} did not take the last-specified option"
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// The cp synopsis (POSIX 90580) allows -P without -R; only -H and -L require it.
+#[test]
+fn test_cp_p_without_r_is_accepted() {
+    let test_dir = &format!(
+        "{}/test_cp_p_without_r_is_accepted",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let real = &format!("{test_dir}/real");
+    let link = &format!("{test_dir}/link");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(real, b"REAL\n").unwrap();
+    unix::fs::symlink("real", link).unwrap();
+
+    cp_test(&["-P", link, dst], "", "", 0);
+    assert!(fs::symlink_metadata(dst).unwrap().is_symlink());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Without -R and without -P, cp acts on what the link refers to (POSIX 90610-90612), so a
+// dangling link is an error rather than something to recreate.
+#[test]
+fn test_cp_dangling_source_is_an_error() {
+    let test_dir = &format!(
+        "{}/test_cp_dangling_source_is_an_error",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let dangle = &format!("{test_dir}/dangle");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    unix::fs::symlink("no-such-file", dangle).unwrap();
+
+    cp_test(
+        &[dangle, dst],
+        "",
+        &format!("cp: cannot stat '{dangle}': No such file or directory\n"),
+        1,
+    );
+    assert!(fs::symlink_metadata(dst).is_err());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

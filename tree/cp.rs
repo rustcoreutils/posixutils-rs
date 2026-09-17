@@ -9,7 +9,7 @@
 
 mod common;
 
-use self::common::{copy_file, copy_files, error_string, CopyConfig};
+use self::common::{copy_file, copy_files, error_string, CopyConfig, DerefMode};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::collections::HashSet;
@@ -36,6 +36,8 @@ struct Args {
     )]
     follow_cli: bool,
 
+    // No `default_value_t`: `overrides_with_all` resolves which flag was given last, but it does
+    // not clear a value clap inserted as a default, which is what left `-P` with no effect.
     #[arg(
         short = 'L',
         long,
@@ -45,11 +47,12 @@ struct Args {
             "no_dereference"
         ],
         requires = "recursive",
-        default_value_t = true,
         help = gettext("Follow symlinks in source")
     )]
     dereference: bool,
 
+    // Unlike -H and -L this carries no `requires = "recursive"`: the cp synopsis (POSIX 90580)
+    // allows -P in all three forms.
     #[arg(
         short = 'P',
         long,
@@ -75,14 +78,32 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
+/// Resolves which of -H, -L and -P is in effect.
+///
+/// `overrides_with_all` leaves at most one of the three set, so this is a straight mapping; the
+/// interesting part is the default. Without -R, POSIX 90610-90612 requires acting on what a link
+/// refers to. With -R and none of the three given, 90614-90615 leaves it unspecified, and both
+/// GNU and the BSDs behave as -P -- which is also the only choice that keeps a recursive copy
+/// inside the tree it was pointed at.
+fn deref_mode(args: &Args) -> DerefMode {
+    if args.no_dereference {
+        DerefMode::Never
+    } else if args.dereference {
+        DerefMode::Always
+    } else if args.follow_cli {
+        DerefMode::CommandLineOnly
+    } else if args.recursive {
+        DerefMode::Never
+    } else {
+        DerefMode::Always
+    }
+}
+
 impl CopyConfig {
     fn new(args: &Args) -> Self {
-        // `args.no_dereference` serves only to disable `args.dereference` or
-        // `follow_cli`
         CopyConfig {
             force: args.force,
-            follow_cli: args.follow_cli,
-            dereference: args.dereference,
+            deref: deref_mode(args),
             interactive: args.interactive,
             preserve: args.preserve,
             recursive: args.recursive,

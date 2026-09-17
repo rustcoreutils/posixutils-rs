@@ -32,10 +32,44 @@ use std::{
 /// budget meaningless.
 pub type InodeMap = HashMap<(u64, u64), (Rc<ftw::FileDescriptor>, CString)>;
 
+/// Which symbolic links are acted on by what they refer to, rather than as links
+/// (POSIX cp 90609-90623).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DerefMode {
+    /// `-P`: act on the link itself, whether it is an operand or was found during the walk.
+    Never,
+    /// `-H`: act on the referent of a link named as an operand, and on nothing else.
+    CommandLineOnly,
+    /// `-L`, and the default when `-R` was not given (90610-90612).
+    Always,
+}
+
+impl DerefMode {
+    fn follow_symlinks_on_args(self) -> bool {
+        self != DerefMode::Never
+    }
+
+    fn follow_symlinks(self) -> bool {
+        self == DerefMode::Always
+    }
+
+    /// Whether *this* entry's link is to be followed.
+    ///
+    /// This lines up with what the traversal was told to do, which is what makes the entry's
+    /// metadata the right one to act on: under `CommandLineOnly` the walk dereferences exactly
+    /// the operand, which is exactly where `at_top_level` is true.
+    fn deref_entry(self, at_top_level: bool) -> bool {
+        match self {
+            DerefMode::Always => true,
+            DerefMode::CommandLineOnly => at_top_level,
+            DerefMode::Never => false,
+        }
+    }
+}
+
 pub struct CopyConfig {
     pub force: bool,
-    pub follow_cli: bool,
-    pub dereference: bool,
+    pub deref: DerefMode,
     pub interactive: bool,
     pub preserve: bool,
     pub recursive: bool,
@@ -56,6 +90,24 @@ enum CopyResult {
 // Implements the algorithm for `cp`:
 //
 // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/cp.html
+/// The pathname stored in the symbolic link `source`.
+///
+/// `ftw` fills in `Entry::read_link` for every symbolic link, but reading it here keeps this
+/// correct regardless of how the walk was configured -- the alternative was an `unwrap` that
+/// turned a missing value into a process abort.
+fn read_source_link(source: &ftw::Entry) -> io::Result<CString> {
+    if let Some(link) = source.read_link() {
+        return Ok(link.to_owned());
+    }
+
+    let e = io::Error::last_os_error();
+    Err(io::Error::other(gettext!(
+        "cannot read symbolic link '{}': {}",
+        source.path(),
+        error_string(&e)
+    )))
+}
+
 /// Renders a mode as the pair used in the overwrite prompt: four octal digits, and the nine
 /// `rwx` characters.
 fn format_mode(mode: u32) -> (String, String) {
@@ -92,7 +144,12 @@ where
     F: Fn(&str) -> bool,
 {
     let source_md = source.metadata().unwrap();
-    let source_is_symlink = source.is_symlink().unwrap_or(false);
+    // The descriptor stack starts at `AT_FDCWD` and gains a real one per level, so the sentinel
+    // is exactly the operand named on the command line.
+    let at_top_level = target_dirfd == libc::AT_FDCWD;
+    let deref_this_entry = cfg.deref.deref_entry(at_top_level);
+    // Act on the link itself only when the options say so (POSIX 90689).
+    let act_on_link_itself = source.is_symlink().unwrap_or(false) && !deref_this_entry;
     let source_file_type = source_md.file_type();
     let source_is_dir = source_file_type == ftw::FileType::Directory;
 
@@ -118,6 +175,19 @@ where
     }
 
     let source_deref_md = unsafe { ftw::Metadata::new(source.dir_fd(), source.file_name(), true) };
+
+    // A link we were told to act through, whose referent does not exist, is an error -- there is
+    // nothing to copy. Without this the failure surfaced later as "cannot open ... for reading".
+    // (Under -P the link itself is the subject, and a dangling one is reproduced as-is.)
+    if deref_this_entry && source.is_symlink().unwrap_or(false) {
+        if let Err(e) = &source_deref_md {
+            return Err(io::Error::other(gettext!(
+                "cannot stat '{}': {}",
+                source.path(),
+                error_string(e)
+            )));
+        }
+    }
 
     let target_symlink_md = ftw::Metadata::new(
         target_dirfd,
@@ -312,7 +382,9 @@ where
             }
 
             // 4.c
-            if source_is_symlink {
+            if act_on_link_itself {
+                let link_target = read_source_link(source)?;
+
                 let ret = unsafe {
                     libc::unlinkat(
                         target_dirfd,
@@ -321,18 +393,23 @@ where
                     )
                 };
                 if ret != 0 {
-                    return Err(io::Error::last_os_error());
+                    let e = io::Error::last_os_error();
+                    return Err(io::Error::other(gettext!(
+                        "cannot remove '{}': {}",
+                        target.display(),
+                        error_string(&e)
+                    )));
                 }
 
-                let ret = unsafe {
-                    libc::symlinkat(
-                        source.read_link().unwrap().as_ptr(),
-                        target_dirfd,
-                        target_filename,
-                    )
-                };
+                let ret =
+                    unsafe { libc::symlinkat(link_target.as_ptr(), target_dirfd, target_filename) };
                 if ret != 0 {
-                    return Err(io::Error::last_os_error());
+                    let e = io::Error::last_os_error();
+                    return Err(io::Error::other(gettext!(
+                        "cannot create symbolic link '{}': {}",
+                        target.display(),
+                        error_string(&e)
+                    )));
                 }
             } else {
                 // 3.a.ii
@@ -394,16 +471,17 @@ where
         // 3.b
         } else {
             // 4.c
-            if source_is_symlink {
-                let ret = unsafe {
-                    libc::symlinkat(
-                        source.read_link().unwrap().as_ptr(),
-                        target_dirfd,
-                        target_filename,
-                    )
-                };
+            if act_on_link_itself {
+                let link_target = read_source_link(source)?;
+                let ret =
+                    unsafe { libc::symlinkat(link_target.as_ptr(), target_dirfd, target_filename) };
                 if ret != 0 {
-                    return Err(io::Error::last_os_error());
+                    let e = io::Error::last_os_error();
+                    return Err(io::Error::other(gettext!(
+                        "cannot create symbolic link '{}': {}",
+                        target.display(),
+                        error_string(&e)
+                    )));
                 }
             } else {
                 create_target_then_copy()?;
@@ -656,8 +734,8 @@ where
             }
         },
         ftw::TraverseDirectoryOpts {
-            follow_symlinks_on_args: cfg.follow_cli,
-            follow_symlinks: cfg.dereference,
+            follow_symlinks_on_args: cfg.deref.follow_symlinks_on_args(),
+            follow_symlinks: cfg.deref.follow_symlinks(),
             // One target-directory descriptor is held per level in `target_dirfd_stack`, so the
             // traversal must count those too when deciding to conserve descriptors.
             caller_fds_per_level: 1,

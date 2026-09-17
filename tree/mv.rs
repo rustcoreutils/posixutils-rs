@@ -12,7 +12,7 @@ mod common;
 
 use self::common::{copy_file, error_string};
 use clap::Parser;
-use common::{CopyConfig, InodeMap};
+use common::{CopyConfig, DerefMode, InodeMap};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::{
     collections::{HashMap, HashSet},
@@ -81,10 +81,12 @@ fn copy_hierarchy(
         // and retry.
         force: true,
         interactive: false,
-        follow_cli: true,   // Follow symlink if passed as an argument
-        dereference: false, // Don't follow symlinks
-        preserve: true,     // Always copy file attributes
-        recursive: true,    // Recursively copy
+        // POSIX mv step 6 (108097-108099): links are duplicated as links, including a link
+        // named as an operand -- moving one across a filesystem must not turn it into a copy of
+        // whatever it points at.
+        deref: DerefMode::Never,
+        preserve: true,  // Always copy file attributes
+        recursive: true, // Recursively copy
         prog: "mv",
         // mv must stop the duplication on the first structural error so the source is not removed.
         continue_on_error: false,

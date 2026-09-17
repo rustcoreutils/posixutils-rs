@@ -645,6 +645,9 @@ where
         ftw::TraverseDirectoryOpts {
             follow_symlinks_on_args: cfg.follow_cli,
             follow_symlinks: cfg.dereference,
+            // One target-directory descriptor is held per level in `target_dirfd_stack`, so the
+            // traversal must count those too when deciding to conserve descriptors.
+            caller_fds_per_level: 1,
             ..Default::default()
         },
     );

@@ -1258,6 +1258,7 @@ fn process_single_dir(
             follow_symlinks,
             include_dot_and_double_dot: true,
             list_contents_first: true,
+            ..Default::default()
         },
     );
 

@@ -33,16 +33,6 @@ impl EntryInternal<'_> {
         unsafe { CStr::from_ptr(self.dirent.byte_offset(OFFSET).cast()) }
     }
 
-    pub fn ino(&self) -> libc::ino_t {
-        const OFFSET: isize = std::mem::offset_of!(libc::dirent, d_ino) as isize;
-        unsafe {
-            self.dirent
-                .byte_offset(OFFSET)
-                .cast::<libc::ino_t>()
-                .read_unaligned()
-        }
-    }
-
     pub fn is_dot_or_double_dot(&self) -> bool {
         const DOT: u8 = b'.';
 
@@ -157,7 +147,11 @@ impl<'a> Iterator for OwnedDirIterator<'a> {
 pub struct DeferredDir {
     parent: Rc<(FileDescriptor, PathBuf)>,
     path: PathBuf,
-    visited: RefCell<HashSet<libc::ino_t>>,
+    /// Names already yielded, so a reopened directory resumes where it left off. Keyed on the
+    /// entry name and not `d_ino`: an inode is not unique within a directory (two hard links to
+    /// one file) nor across one (every mount point's root is inode 2), and a collision here
+    /// silently drops a file from the walk.
+    visited: RefCell<HashSet<Box<[u8]>>>,
     /// Flags OR'ed into the leaf `openat` when (re)opening this directory. Carries the same
     /// `O_DIRECTORY`/`O_NOFOLLOW` hardening as the non-deferred descent path.
     descent_flags: libc::c_int,
@@ -223,7 +217,7 @@ impl DeferredDir {
 
 pub struct DeferredDirIterator<'a> {
     dirp: *mut libc::DIR,
-    visited: RefMut<'a, HashSet<libc::ino_t>>,
+    visited: RefMut<'a, HashSet<Box<[u8]>>>,
 }
 
 impl Drop for DeferredDirIterator<'_> {
@@ -257,11 +251,10 @@ impl<'a> Iterator for DeferredDirIterator<'a> {
                         dirent,
                         phantom: PhantomData,
                     };
-                    let ino = entry.ino();
-                    if self.visited.contains(&ino) {
+                    // The name borrows the `dirent` buffer, which the next `readdir` reuses.
+                    let name: Box<[u8]> = entry.name_cstr().to_bytes().into();
+                    if !self.visited.insert(name) {
                         continue;
-                    } else {
-                        self.visited.insert(ino);
                     }
 
                     break Some(Ok(entry));

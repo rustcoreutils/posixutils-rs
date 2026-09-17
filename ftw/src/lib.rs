@@ -677,6 +677,14 @@ pub struct TraverseDirectoryOpts {
     pub follow_symlinks: bool,
     /// Do not ignore `.` and `..`
     pub include_dot_and_double_dot: bool,
+
+    /// Number of file descriptors the *caller* holds open for each directory level of the walk.
+    ///
+    /// Folded into the traversal's own per-level usage when deciding to switch to the
+    /// descriptor-conserving strategy. `cp`/`mv` keep one target-directory descriptor per level
+    /// of the source tree, so they pass 1; without it the budget only counts ftw's own
+    /// descriptors and the conserving path never engages before the process hits `EMFILE`.
+    pub caller_fds_per_level: usize,
     /// List the contents of the current directory before descending into a subdirectory.
     pub list_contents_first: bool,
 }
@@ -724,6 +732,7 @@ where
         follow_symlinks,
         include_dot_and_double_dot,
         list_contents_first,
+        caller_fds_per_level,
     } = opts;
 
     // Stack of the directories to process
@@ -806,8 +815,13 @@ where
     };
 
     // Subtract a few to allow for some FD bookkeeping. `saturating_sub` guards against an
-    // implausibly tiny `RLIMIT_NOFILE`.
-    let fd_threshold: usize = (fd_rlim_cur as usize).saturating_sub(7).max(1);
+    // implausibly tiny `RLIMIT_NOFILE`, and the upper clamp against `RLIM_INFINITY`, which would
+    // otherwise disable conservation entirely and leave the walk to fail at the kernel's own
+    // per-process cap.
+    const MAX_FD_THRESHOLD: usize = 4096;
+    let fd_threshold: usize = (fd_rlim_cur as usize)
+        .saturating_sub(7)
+        .clamp(1, MAX_FD_THRESHOLD);
 
     // Flags OR'ed into every descent `openat`. `O_DIRECTORY` rejects a directory entry that was
     // concurrently replaced with a non-directory (e.g. a FIFO, which would otherwise block the
@@ -847,6 +861,12 @@ where
 
                     // Errors in reading the entry usually occurs due to lack of permissions
                     Err(e) => {
+                        // `path_stack` is the ancestors plus `current.filename`, and the report
+                        // names `current` itself, so its parent is everything before the last
+                        // component. This is the same slice the `postprocess_dir` call below
+                        // passes, which pops first and then hands over the whole stack.
+                        debug_assert_eq!(path_stack.len(), path_depth);
+                        let parent_path_stack = &path_stack[..path_depth - 1];
                         let second_last_index = stack.len().checked_sub(2);
                         let prev_dir = match second_last_index {
                             Some(index) => match &stack.get(index).unwrap().dir {
@@ -858,9 +878,7 @@ where
                         err_reporter(
                             Entry::new(
                                 prev_dir,
-                                // Need to report the filename of the directory itself so exclude
-                                // the last one
-                                &path_stack[..(path_stack.len() - 2)],
+                                parent_path_stack,
                                 current.filename.clone(),
                                 Some(current.metadata.clone()),
                             ),
@@ -868,7 +886,12 @@ where
                         );
 
                         success = false;
-                        continue;
+
+                        // A failing `readdir` keeps returning NULL with the same errno, so
+                        // continuing here would spin forever re-reporting it. POSIX leaves the
+                        // stream position unspecified after an error; give up on this directory
+                        // and let it take the normal exit path.
+                        break;
                     }
                 };
 
@@ -883,7 +906,10 @@ where
 
                 let conserve_fds = match dir {
                     HybridDir::Owned(_) => {
-                        let used_fds = stack.len() + subdirs.len();
+                        let used_fds = stack
+                            .len()
+                            .saturating_add(subdirs.len())
+                            .saturating_mul(1usize.saturating_add(caller_fds_per_level));
                         used_fds >= fd_threshold
                     }
                     HybridDir::Deferred(_) => {
@@ -1089,16 +1115,46 @@ fn read_link_at(
     dirfd: libc::c_int,
     filename: *const libc::c_char,
 ) -> io::Result<Rc<[libc::c_char]>> {
-    let mut buf = vec![0; libc::PATH_MAX as usize];
+    read_link_at_with_capacity(dirfd, filename, libc::PATH_MAX as usize)
+}
 
-    let ret = unsafe { libc::readlinkat(dirfd, filename, buf.as_mut_ptr(), buf.len()) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
+/// Largest symbolic link target this will read before giving up with `ENAMETOOLONG`.
+const READ_LINK_MAX: usize = 1 << 16;
+
+/// `read_link_at` with an explicit starting buffer size, so the grow-and-retry path can be
+/// exercised by a test without needing a filesystem that allows a `PATH_MAX`-sized target.
+fn read_link_at_with_capacity(
+    dirfd: libc::c_int,
+    filename: *const libc::c_char,
+    initial_capacity: usize,
+) -> io::Result<Rc<[libc::c_char]>> {
+    let mut capacity = initial_capacity.max(1);
+
+    loop {
+        let mut buf = vec![0; capacity];
+
+        let ret = unsafe { libc::readlinkat(dirfd, filename, buf.as_mut_ptr(), buf.len()) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let num_bytes = ret as usize;
+
+        // `readlinkat` truncates silently and does not NUL-terminate, so a completely full
+        // buffer is indistinguishable from a target that is exactly that long. Grow and retry.
+        if num_bytes == buf.len() {
+            capacity = match capacity.checked_mul(2) {
+                Some(c) if c <= READ_LINK_MAX => c,
+                _ => return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG)),
+            };
+            continue;
+        }
+
+        // `Vec::shrink_to` would only lower the capacity; the length has to be cut explicitly or
+        // the `CStr` built from this is terminated only by luck of the zero-fill.
+        buf.truncate(num_bytes);
+        buf.push(0);
+        return Ok(Rc::from(buf.into_boxed_slice()));
     }
-
-    let num_bytes = ret as usize;
-    buf.shrink_to(num_bytes);
-    Ok(Rc::from(buf.into_boxed_slice()))
 }
 
 // Build the full path of an entry
@@ -1117,4 +1173,28 @@ fn build_path(path_stack: &[Rc<[libc::c_char]>], filename: &Rc<[libc::c_char]>) 
     append(filename.as_ptr());
 
     pathbuf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// `readlinkat` neither NUL-terminates nor reports truncation, so a buffer it fills exactly
+    /// has to be grown and retried. Driving the loop from a 1-byte buffer covers the retry path
+    /// without needing a target near `PATH_MAX`.
+    #[test]
+    fn read_link_at_grows_until_the_target_fits() {
+        let tmp_dir = plib::tmp::tempdir().unwrap();
+
+        let target = "t".repeat(200);
+        let link = tmp_dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let link_cstr = CString::new(link.as_os_str().as_bytes()).unwrap();
+        let read = read_link_at_with_capacity(libc::AT_FDCWD, link_cstr.as_ptr(), 1).unwrap();
+
+        let as_cstr = unsafe { CStr::from_ptr(read.as_ptr()) };
+        assert_eq!(as_cstr.to_bytes(), target.as_bytes());
+    }
 }

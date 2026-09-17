@@ -484,3 +484,118 @@ fn test_ftw_long_filename() {
     }
     // Cleanup happens automatically when cleanup is dropped
 }
+
+/// Forces the descriptor-conserving (`DeferredDir`) strategy from the first level, without
+/// touching the process-wide `RLIMIT_NOFILE`.
+fn conserving_fds_opts() -> ftw::TraverseDirectoryOpts {
+    ftw::TraverseDirectoryOpts {
+        caller_fds_per_level: 4096,
+        ..Default::default()
+    }
+}
+
+/// A conserving walk reopens each directory and filters the entries it already yielded. Keying
+/// that filter on the inode instead of the name dropped the second of two hard links to one file,
+/// and every mount point past the first (all roots are inode 2), silently losing files.
+#[test]
+fn conserving_walk_yields_every_hard_link() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("conserving_walk_yields_every_hard_link")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+
+    // A subdirectory, so the walk has somewhere to descend and must reopen `sub` afterwards.
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("plain"), b"x").unwrap();
+    fs::write(sub.join("link_a"), b"y").unwrap();
+    fs::hard_link(sub.join("link_a"), sub.join("link_b")).unwrap();
+    fs::create_dir(sub.join("deeper")).unwrap();
+    fs::write(sub.join("deeper/inner"), b"z").unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    ftw::traverse_directory(
+        root,
+        |entry| {
+            // Skip the operand itself, which is reported relative to the current directory.
+            if entry.dir_fd() != libc::AT_FDCWD {
+                seen.push(entry.file_name().to_string_lossy().to_string());
+            }
+            Ok(true)
+        },
+        |_| Ok(()),
+        |entry, e| panic!("unexpected error on {}: {:?}", entry.path(), e.kind()),
+        conserving_fds_opts(),
+    );
+
+    seen.sort();
+    assert_eq!(
+        seen,
+        ["deeper", "inner", "link_a", "link_b", "plain", "sub"],
+        "a conserving walk must visit every name exactly once"
+    );
+}
+
+/// A failing `readdir` in the directory named on the command line is reported against that
+/// directory and ends the walk. The reporter used to index `path_stack` two components back,
+/// which underflows at depth 1, and the loop used to `continue` -- but `readdir` keeps returning
+/// the same error, so it never terminated.
+#[test]
+fn readdir_error_on_root_reports_once_and_terminates() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("readdir_error_on_root")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+
+    // Several entries so at least one more `readdir` follows the one that succeeded.
+    for name in ["a", "b", "c", "d"] {
+        fs::write(root.join(name), b"x").unwrap();
+    }
+
+    // Replace the directory's descriptor with one referring to a non-directory, so the next
+    // `readdir` fails with ENOTDIR. `dup2` rather than `close` keeps the descriptor number
+    // allocated: closing it would let another thread in this test binary reuse the number.
+    let scratch = fs::File::create(tmp_dir.path().join("scratch")).unwrap();
+    let mut sabotaged = false;
+    let mut errors: Vec<(String, ftw::ErrorKind)> = Vec::new();
+
+    ftw::traverse_directory(
+        root,
+        |entry| {
+            if !sabotaged && entry.dir_fd() != libc::AT_FDCWD {
+                sabotaged = true;
+                assert_ne!(
+                    unsafe { libc::dup2(scratch.as_raw_fd(), entry.dir_fd()) },
+                    -1
+                );
+            }
+            Ok(true)
+        },
+        |_| Ok(()),
+        |entry, e| errors.push((entry.path().to_string(), e.kind())),
+        ftw::TraverseDirectoryOpts::default(),
+    );
+
+    assert!(sabotaged, "the walk never entered the root directory");
+
+    // Entries already buffered by the C library are still handed back, and their `fstatat`
+    // now fails against the replaced descriptor; those reports are collateral of the sabotage.
+    // What matters is the `readdir` failure itself: reported once, naming the root.
+    let readdir_errors: Vec<&String> = errors
+        .iter()
+        .filter(|(_, kind)| *kind == ftw::ErrorKind::ReadDir)
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        readdir_errors.len(),
+        1,
+        "expected exactly one readdir report, got {errors:?}"
+    );
+    assert_eq!(
+        *readdir_errors[0],
+        root.to_string_lossy(),
+        "the report must name the directory that could not be read"
+    );
+}

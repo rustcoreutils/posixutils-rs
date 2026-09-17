@@ -1202,3 +1202,76 @@ fn test_cp_unreadable_subdir_does_not_misplace_siblings() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// POSIX 90699-90700 and step 3.a.iii: -f means "if the destination cannot be opened, unlink it
+// and try again". It is not a prompt. Prompting made `cp -f` read EOF from a script's stdin,
+// treat that as "no", and exit 0 with the destination never written.
+#[test]
+fn test_cp_f_does_not_prompt_without_tty() {
+    if is_root() {
+        eprintln!("Skipping test: root can write a mode-0444 file without unlinking it");
+        return;
+    }
+
+    let test_dir = &format!(
+        "{}/test_cp_f_does_not_prompt_without_tty",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(src, b"NEWDATA\n").unwrap();
+    fs::write(dst, b"OLDDATA\n").unwrap();
+    fs::set_permissions(dst, fs::Permissions::from_mode(0o444)).unwrap();
+
+    cp_test(&["-f", src, dst], "", "", 0);
+
+    let mut contents = String::new();
+    fs::File::open(dst)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "NEWDATA\n", "-f left the destination unchanged");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// The prompt is a -i behavior (POSIX 90703-90705). An unwritable destination only changes its
+// wording, as in GNU cp, and does not make -f prompt.
+#[test]
+fn test_cp_i_unwritable_prompt_wording() {
+    if is_root() {
+        eprintln!("Skipping test: root is not blocked by the mode bits under test");
+        return;
+    }
+
+    let test_dir = &format!(
+        "{}/test_cp_i_unwritable_prompt_wording",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(src, b"NEWDATA\n").unwrap();
+    fs::write(dst, b"OLDDATA\n").unwrap();
+    fs::set_permissions(dst, fs::Permissions::from_mode(0o444)).unwrap();
+
+    cp_test_with_stdin(
+        &["-i", src, dst],
+        "n\n",
+        "",
+        &format!("cp: replace '{dst}', overriding mode 0444 (r--r--r--)? "),
+        0,
+    );
+
+    let mut contents = String::new();
+    fs::File::open(dst)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "OLDDATA\n", "a declined prompt still copied");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

@@ -69,19 +69,22 @@ fn prompt_user(prompt: &str) -> bool {
 
 // Copy the file or directory hierarchy from `src` to `dst`.
 fn copy_hierarchy(
-    cfg: &MvConfig,
     src: &Path,
     dst: &Path,
     inode_map: &mut InodeMap,
     created_files: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     let copy_cfg = CopyConfig {
-        force: cfg.force,
+        // `mv` already asked its own POSIX step-1 question (108060-108064) and step 5 removed the
+        // destination, so the copy engine must not ask again for the same file. `force` here
+        // carries only the cp step-3.a.iii meaning: unlink a destination that cannot be opened
+        // and retry.
+        force: true,
+        interactive: false,
         follow_cli: true,   // Follow symlink if passed as an argument
         dereference: false, // Don't follow symlinks
-        interactive: cfg.interactive,
-        preserve: true,  // Always copy file attributes
-        recursive: true, // Recursively copy
+        preserve: true,     // Always copy file attributes
+        recursive: true,    // Recursively copy
         prog: "mv",
         // mv must stop the duplication on the first structural error so the source is not removed.
         continue_on_error: false,
@@ -301,7 +304,7 @@ fn move_file(
         Some(set) => set,
         None => &mut HashSet::new(),
     };
-    copy_hierarchy(cfg, source, target, inode_map, created_files).map_err(err_inter_device)?;
+    copy_hierarchy(source, target, inode_map, created_files).map_err(err_inter_device)?;
 
     Ok(false)
 }

@@ -56,6 +56,29 @@ enum CopyResult {
 // Implements the algorithm for `cp`:
 //
 // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/cp.html
+/// Renders a mode as the pair used in the overwrite prompt: four octal digits, and the nine
+/// `rwx` characters.
+fn format_mode(mode: u32) -> (String, String) {
+    let mut mode_str = String::new();
+    let bit_loc = 0o400;
+    for i in 0..9 {
+        let mask = bit_loc >> i;
+        if mode & mask != 0 {
+            match i % 3 {
+                0 => mode_str.push('r'),
+                1 => mode_str.push('w'),
+                2 => mode_str.push('x'),
+                _ => (),
+            }
+        } else {
+            mode_str.push('-');
+        }
+    }
+
+    // `gettext!` takes no format spec, so the octal has to be rendered separately.
+    (format!("{:04o}", mode & 0o7777), mode_str)
+}
+
 fn copy_file_impl<F>(
     cfg: &CopyConfig,
     source: &ftw::Entry,
@@ -262,58 +285,27 @@ where
                 return Err(io::Error::other(err_str));
             }
 
-            // 3.a.i
-            let target_is_writable =
-                ftw::is_writable_at(target_dirfd, unsafe { CStr::from_ptr(target_filename) });
+            // 3.a.i. The prompt belongs to -i alone (POSIX 90703-90705). -f is only step
+            // 3.a.iii -- "if the descriptor cannot be obtained, unlink and proceed" (90699-90700)
+            // -- so it must never prompt: with no terminal the prompt read EOF, took it for a
+            // refusal, and exited 0 having copied nothing. An unwritable destination only
+            // changes the wording, as it does in GNU cp.
+            if cfg.interactive {
+                let target_is_writable =
+                    ftw::is_writable_at(target_dirfd, unsafe { CStr::from_ptr(target_filename) });
 
-            // Different prompt if the target is not writable
-            if !target_is_writable && (cfg.interactive || cfg.force) {
-                let mode = target_symlink_md.as_ref().unwrap().mode();
-
-                let mut mode_str = String::new();
-                let bit_loc = 0o400;
-                for i in 0..9 {
-                    let mask = bit_loc >> i;
-                    if mode & mask != 0 {
-                        match i % 3 {
-                            0 => mode_str.push('r'),
-                            1 => mode_str.push('w'),
-                            2 => mode_str.push('x'),
-                            _ => (),
-                        }
-                    } else {
-                        mode_str.push('-');
-                    }
-                }
-
-                // 4 octal digits
-                // This needs to be formatted separately because `gettext!` does
-                // not accept a format spec (just plain curly braces, `{}`).
-                let mode_octal = format!("{:04o}", mode & 0o7777);
-
-                if cfg.force {
-                    let is_affirm = prompt_fn(&gettext!(
+                let is_affirm = if target_is_writable {
+                    prompt_fn(&gettext!("overwrite '{}'?", target.display()))
+                } else {
+                    let (mode_octal, mode_str) =
+                        format_mode(target_symlink_md.as_ref().unwrap().mode());
+                    prompt_fn(&gettext!(
                         "replace '{}', overriding mode {} ({})?",
                         target.display(),
                         mode_octal,
                         mode_str
-                    ));
-                    if !is_affirm {
-                        return Ok(CopyResult::Skipped);
-                    }
-                } else if cfg.interactive {
-                    let is_affirm = prompt_fn(&gettext!(
-                        "unwritable '{}' (mode {}, {}); try anyway?",
-                        target.display(),
-                        mode_octal,
-                        mode_str
-                    ));
-                    if !is_affirm {
-                        return Ok(CopyResult::Skipped);
-                    }
-                }
-            } else if cfg.interactive {
-                let is_affirm = prompt_fn(&gettext!("overwrite '{}'?", target.display()));
+                    ))
+                };
                 if !is_affirm {
                     return Ok(CopyResult::Skipped);
                 }
@@ -386,9 +378,11 @@ where
                         // 3.b
                         create_target_then_copy()?;
                     } else {
+                        // The open that failed was for writing, and without -f there is no
+                        // second attempt. Same wording as GNU cp.
                         let e = io::Error::last_os_error();
                         let err_str = gettext!(
-                            "cannot open '{}' for reading: {}",
+                            "cannot create regular file '{}': {}",
                             target.display(),
                             error_string(&e)
                         );
@@ -512,14 +506,19 @@ where
                 prompt_fn,
             ) {
                 Ok(copy_result) => {
-                    // If copying succeeds, then store the hard-link data
-                    if let Some(inode_map) = inode_map.as_deref_mut() {
-                        // Don't include every file, just those with hard links
-                        if source_md.nlink() > 1 {
-                            inode_map.insert(
-                                identifier,
-                                (Rc::clone(target_dirfd), target_filename_cstr.clone()),
-                            );
+                    // Record where this inode landed only if a file was actually created there.
+                    // Recording a skipped copy pointed a later hard link at a target that does
+                    // not exist, and every directory reports nlink > 1, so directories were
+                    // recorded too.
+                    if matches!(copy_result, CopyResult::CopiedFile) {
+                        if let Some(inode_map) = inode_map.as_deref_mut() {
+                            // Only files that have hard links are worth tracking.
+                            if source_md.nlink() > 1 {
+                                inode_map.insert(
+                                    identifier,
+                                    (Rc::clone(target_dirfd), target_filename_cstr.clone()),
+                                );
+                            }
                         }
                     }
 

@@ -609,16 +609,17 @@ fn declarator_line(lines: &[&str], start_line: u32, name: &str) -> u32 {
     start_line
 }
 
-// lex / yacc Input
+// Generated Inputs (lex / yacc / assembler)
 
-/// C source generated from a `.l` or `.y` operand, plus the temporary directory
-/// holding it (dropped, and so cleaned up, when this goes out of scope).
-struct GeneratedSource {
+/// A file produced from an operand -- C source from a `.l` or `.y`, an object
+/// from a `.s` or `.S` -- plus the temporary directory holding it (dropped,
+/// and so cleaned up, when this goes out of scope).
+struct Generated {
     _dir: plib::tmp::TempDir,
     path: String,
 }
 
-impl GeneratedSource {
+impl Generated {
     fn path(&self) -> &str {
         &self.path
     }
@@ -631,7 +632,7 @@ impl GeneratedSource {
 /// APPLICATION USAGE adds that feeding cflow the *generated* C confuses it
 /// because of the reordered `#line` directives, which is precisely why the
 /// grammar itself is the operand.
-fn generate_from_grammar(file: &str, ext: &str) -> io::Result<GeneratedSource> {
+fn generate_from_grammar(file: &str, ext: &str) -> io::Result<Generated> {
     use std::process::Command;
 
     let dir = plib::tmp::TempDir::new()?;
@@ -682,7 +683,59 @@ fn generate_from_grammar(file: &str, ext: &str) -> io::Result<GeneratedSource> {
     }
 
     let path = generated.to_string_lossy().into_owned();
-    Ok(GeneratedSource { _dir: dir, path })
+    Ok(Generated { _dir: dir, path })
+}
+
+/// Assemble a `.s` (or an already-preprocessed `.S`) into a temporary object.
+///
+/// DESCRIPTION: cflow "shall analyze a collection of object files or assembler,
+/// C-language, lex, or yacc source files". Assembling reuses the whole object
+/// path rather than teaching this tool a second symbol reader, which is what
+/// OPERANDS allows for: files suffixed `.s` "may have more limited information
+/// extracted from them" than C source gives.
+fn assemble_to_object(source: &str) -> io::Result<Generated> {
+    use std::process::Command;
+
+    let dir = plib::tmp::TempDir::new()?;
+    let object = dir.path().join("a.o");
+
+    // No `current_dir` here, unlike the grammar generators: `-o` names the
+    // output, so the operand can be passed through as written and `as` reports
+    // against the path the user typed.
+    let output = Command::new("as")
+        .arg("-o")
+        .arg(&object)
+        .arg(source)
+        .output()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{}: as: {}",
+                    gettext("cannot run"),
+                    plib::diag::io_error_text(&e)
+                ),
+            )
+        })?;
+
+    if !output.status.success() {
+        // Surface the assembler's own diagnostics.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            plib::diag::error(line);
+        }
+        return Err(io::Error::other(format!("as {}", gettext("failed"))));
+    }
+
+    if !object.exists() {
+        return Err(io::Error::other(format!(
+            "as {}",
+            gettext("produced no output file")
+        )));
+    }
+
+    let path = object.to_string_lossy().into_owned();
+    Ok(Generated { _dir: dir, path })
 }
 
 // Object File Processing
@@ -837,6 +890,23 @@ fn process_object_file(path: &str, graph: &mut CallGraph, buffer: &[u8]) -> io::
     }
 
     Ok(())
+}
+
+/// Read an object file and fold its symbols into the graph, reporting failures.
+///
+/// `path` is what to open; `display` is the operand it came from. They differ
+/// when the object was assembled from a `.s`/`.S` operand into a temporary, and
+/// it is `display` that reaches the output, so a definition reads
+/// `<foo.s text>` rather than naming a temporary the user never saw.
+fn analyze_object(path: &str, display: &str, graph: &mut CallGraph) {
+    match std::fs::read(path) {
+        Ok(buffer) => {
+            if let Err(e) = process_object_file(display, graph, &buffer) {
+                plib::diag::error(&format!("{}: {}", display, plib::diag::io_error_text(&e)));
+            }
+        }
+        Err(e) => plib::diag::error(&format!("{}: {}", display, plib::diag::io_error_text(&e))),
+    }
 }
 
 // File Processing
@@ -1210,26 +1280,21 @@ fn main() -> ExitCode {
                     plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
                 }
             },
-            "s" => {
-                plib::diag::error(&format!(
-                    "{}: {}",
-                    file,
-                    gettext("assembly files not supported")
-                ));
-            }
-            // Object files, archives and shared libraries. DESCRIPTION requires
-            // cflow to analyze "a collection of object files or assembler,
-            // C-language, lex, or yacc source files".
-            _ => match std::fs::read(file) {
-                Ok(buffer) => {
-                    if let Err(e) = process_object_file(file, &mut graph, &buffer) {
-                        plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)));
-                    }
-                }
+            // POSIX DESCRIPTION requires assembler source to be analyzed, and
+            // OPERANDS grants it latitude: a `.s` "may have more limited
+            // information extracted". Assembling and reading the object is
+            // exactly that -- an intra-section call to a file-local symbol
+            // leaves no relocation, so it contributes no edge.
+            "s" => match assemble_to_object(file) {
+                Ok(object) => analyze_object(object.path(), file, &mut graph),
                 Err(e) => {
                     plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
                 }
             },
+            // Object files, archives and shared libraries. DESCRIPTION requires
+            // cflow to analyze "a collection of object files or assembler,
+            // C-language, lex, or yacc source files".
+            _ => analyze_object(file, file, &mut graph),
         }
     }
 

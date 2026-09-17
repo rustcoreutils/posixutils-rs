@@ -910,6 +910,89 @@ fn cflow_processes_lex_input() {
     }
 }
 
+/// Build a `.s` fixture by compiling C, and return (its path, the temp dir).
+///
+/// Every function has external linkage on purpose. Call edges are recovered
+/// from relocations, and an intra-section call to a file-local symbol leaves
+/// none -- a `static` callee would silently contribute no edge and make this
+/// test prove less than it appears to.
+fn assembler_fixture(dir: &TempDir, stem: &str) -> String {
+    let c = src(
+        dir,
+        &format!("{}.c", stem),
+        "int h(void);\nint f(void){ return h(); }\nint main(void){ return f(); }\n",
+    );
+    let s = dir.path().join(format!("{}.s", stem));
+    let built = Command::new(exe_for("c17"))
+        .args(["-S", &c, "-o", s.to_str().unwrap()])
+        .output()
+        .expect("run c17");
+    assert!(
+        built.status.success() && s.exists(),
+        "failed to build fixture assembly: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    s.to_str().unwrap().to_string()
+}
+
+/// DESCRIPTION (88916): cflow "shall analyze a collection of object files or
+/// assembler, C-language, lex, or yacc source files".
+///
+/// A `.s` operand used to be refused outright with "assembly files not
+/// supported", which OPERANDS does not permit: 88942 says only that such a
+/// file "may have more limited information extracted from them".
+#[test]
+fn cflow_processes_assembler_input() {
+    let dir = TempDir::new().unwrap();
+    let s = assembler_fixture(&dir, "asmsrc");
+
+    let (stdout, stderr, code) = run("cflow", &[&s]);
+    assert_eq!(code, 0, "a .s operand must be analyzed: {}", stderr);
+
+    // The graph comes back through the relocations, main -> f -> h.
+    for name in ["main:", "f:", "h:"] {
+        assert!(stdout.contains(name), "expected {:?} in {:?}", name, stdout);
+    }
+    // STDOUT (88976): object-derived definitions carry "the filename and
+    // location counter under which the symbol appeared".
+    assert!(
+        stdout.contains("asmsrc.s ") && stdout.contains("text>"),
+        "definitions should name the operand and its counter: {:?}",
+        stdout
+    );
+    // The object is a temporary the user never named; it must not surface.
+    assert!(
+        !stdout.contains(".o"),
+        "the temporary object leaked into the report: {:?}",
+        stdout
+    );
+}
+
+/// A `.s` that will not assemble is a loud failure naming the operand, and an
+/// unreachable assembler is too -- neither may be silently skipped.
+#[test]
+fn cflow_assembler_failures_are_loud() {
+    let dir = TempDir::new().unwrap();
+
+    let bad = src(&dir, "bad.s", "this is not assembly at all @@@\n");
+    let (_, stderr, code) = run("cflow", &[&bad]);
+    assert_ne!(code, 0, "a .s that will not assemble must fail");
+    assert!(
+        stderr.contains("bad.s"),
+        "diagnostic should name the operand: {:?}",
+        stderr
+    );
+
+    let good = assembler_fixture(&dir, "unreachable");
+    let (_, stderr, code) = run_env("cflow", &[&good], &[("PATH", "/nonexistent")]);
+    assert_ne!(code, 0, "a .s operand with no assembler must fail");
+    assert!(
+        stderr.contains("as"),
+        "diagnostic should name the assembler: {:?}",
+        stderr
+    );
+}
+
 /// Diagnostics belong on stderr only; stdout carries the report.
 /// POSIX STDERR: "used only for diagnostic messages" (all three utilities).
 #[test]

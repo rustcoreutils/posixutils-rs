@@ -23,6 +23,34 @@ use std::{
     rc::Rc,
 };
 
+// `faccessat` and `AT_EACCESS` are not exported by `libc` 0.2.189 for linux-gnu or musl, though
+// they are for apple/bsd and were for 0.2.171. Declare the function here so the check does not
+// depend on which `libc` 0.2.x the lockfile resolves to, and take the flag from `libc` wherever
+// it does define it.
+extern "C" {
+    fn faccessat(
+        dirfd: libc::c_int,
+        pathname: *const libc::c_char,
+        mode: libc::c_int,
+        flags: libc::c_int,
+    ) -> libc::c_int;
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const AT_EACCESS: libc::c_int = 0x200;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+use libc::AT_EACCESS;
+
+/// Whether the calling process can write to `file_name`, resolved relative to `dirfd`.
+///
+/// This asks the kernel, via `faccessat(2)`. Comparing `st_mode` against `geteuid`/`getegid` is
+/// not equivalent: it ignores supplementary groups, ACLs, read-only mounts and the superuser
+/// bypass, so it reports files as unwritable that can in fact be written. Symbolic links are
+/// followed, as in `access(2)`, and a path that cannot be resolved at all is not writable.
+pub fn is_writable_at(dirfd: libc::c_int, file_name: &CStr) -> bool {
+    unsafe { faccessat(dirfd, file_name.as_ptr(), libc::W_OK, AT_EACCESS) == 0 }
+}
+
 /// Type of error to be handled by the `err_reporter` of `traverse_directory`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -173,30 +201,6 @@ impl Metadata {
             libc::S_IFCHR => FileType::CharacterDevice,
             libc::S_IFIFO => FileType::Fifo,
             _ => FileType::Unknown,
-        }
-    }
-
-    // These are "effective" IDs and not "real" to allow for things like sudo
-    fn get_uid_and_gid(&self) -> (libc::uid_t, libc::gid_t) {
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        (uid, gid)
-    }
-
-    /// Check if the current process has write permission for the file that this `Metadata` refers
-    /// to.
-    pub fn is_writable(&self) -> bool {
-        let (uid, gid) = self.get_uid_and_gid();
-
-        let same_user = self.0.st_uid == uid;
-        let same_group = self.0.st_gid == gid;
-
-        if same_user {
-            self.0.st_mode & libc::S_IWUSR != 0
-        } else if same_group {
-            self.0.st_mode & libc::S_IWGRP != 0
-        } else {
-            self.0.st_mode & libc::S_IWOTH != 0
         }
     }
 
@@ -405,6 +409,11 @@ impl<'a> Entry<'a> {
     /// This is either relative to the current working directory or an absolute path.
     pub fn path(&self) -> DisplayablePath {
         DisplayablePath(build_path(self.path_stack, &self.filename))
+    }
+
+    /// Whether the calling process can write to the file this entry refers to.
+    pub fn is_writable(&self) -> bool {
+        is_writable_at(self.dir_fd(), self.file_name())
     }
 
     /// Check if this `Entry` is an empty directory.

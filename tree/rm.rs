@@ -14,7 +14,7 @@ use clap::Parser;
 use ftw::{self, traverse_directory};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     fs,
     io::{self, IsTerminal},
     os::{
@@ -122,8 +122,19 @@ fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::Metadata) -> bool {
-    let writable = metadata.is_writable();
+/// Whether removing this file counts as unprotected, which is what decides the wording of the
+/// prompt and, without `-f`, whether there is one at all.
+///
+/// A symbolic link is never treated as write-protected: what `rm` unlinks is the link, whose own
+/// mode bits carry no meaning, and the permissions of whatever it points at are not the ones
+/// being overridden. Following it would also make a dangling link look unwritable. GNU `rm` makes
+/// the same exception.
+fn is_writable_for_removal(dirfd: libc::c_int, file_name: &CStr, metadata: &ftw::Metadata) -> bool {
+    metadata.file_type() == ftw::FileType::SymbolicLink || ftw::is_writable_at(dirfd, file_name)
+}
+
+fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry) -> bool {
+    let writable = entry.is_writable();
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
             gettext!(
@@ -143,8 +154,8 @@ fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::Me
     true
 }
 
-fn should_remove_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::Metadata) -> bool {
-    let writable = metadata.is_writable();
+fn should_remove_directory(cfg: &RmConfig, entry: &ftw::Entry) -> bool {
+    let writable = entry.is_writable();
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
             gettext!(
@@ -166,11 +177,17 @@ fn should_remove_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::M
 
 // The signature of `filename_fn` is to prevent unnecessarily building the filename when a prompt
 // is not required.
-fn should_remove_file<F>(cfg: &RmConfig, metadata: &ftw::Metadata, filename_fn: F) -> bool
+fn should_remove_file<F>(
+    cfg: &RmConfig,
+    dirfd: libc::c_int,
+    file_name: &CStr,
+    metadata: &ftw::Metadata,
+    filename_fn: F,
+) -> bool
 where
     F: Fn() -> String,
 {
-    let writable = metadata.is_writable();
+    let writable = is_writable_for_removal(dirfd, file_name, metadata);
     if ask_for_prompt(cfg, writable) {
         let file_type = metadata.file_type();
         let prompt = match file_type {
@@ -231,16 +248,12 @@ enum DirAction {
 }
 
 /// Directly remove a directory or enter it.
-fn process_directory(
-    cfg: &RmConfig,
-    entry: &ftw::Entry,
-    metadata: &ftw::Metadata,
-) -> io::Result<DirAction> {
+fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction> {
     let dir_is_empty = entry.is_empty_dir();
 
     // If directory is empty or the directory is inaccessible, try to remove it directly
     if (dir_is_empty.is_ok() && dir_is_empty.as_ref().unwrap() == &true) || dir_is_empty.is_err() {
-        if should_remove_directory(cfg, entry, metadata) {
+        if should_remove_directory(cfg, entry) {
             let ret = unsafe {
                 libc::unlinkat(
                     entry.dir_fd(),
@@ -273,7 +286,7 @@ fn process_directory(
         }
 
     // Else, manually traverse the directory to remove the contents one-by-one
-    } else if descend_into_directory(cfg, entry, metadata) {
+    } else if descend_into_directory(cfg, entry) {
         Ok(DirAction::Entered)
     } else {
         Ok(DirAction::Skipped)
@@ -303,7 +316,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             let md = entry.metadata().unwrap();
 
             if md.file_type() == ftw::FileType::Directory {
-                match process_directory(cfg, &entry, md) {
+                match process_directory(cfg, &entry) {
                     Ok(dir_action) => match dir_action {
                         DirAction::Entered => Ok(true),
                         DirAction::Removed | DirAction::Skipped => Ok(false),
@@ -314,7 +327,9 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                     }
                 }
             } else {
-                if should_remove_file(cfg, md, || entry.path().clean_trailing_slashes()) {
+                if should_remove_file(cfg, entry.dir_fd(), entry.file_name(), md, || {
+                    entry.path().clean_trailing_slashes()
+                }) {
                     // Remove the file
                     let ret =
                         unsafe { libc::unlinkat(entry.dir_fd(), entry.file_name().as_ptr(), 0) };
@@ -344,8 +359,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                 return Ok(());
             }
 
-            let md = entry.metadata().unwrap();
-            if should_remove_directory(cfg, &entry, md) {
+            if should_remove_directory(cfg, &entry) {
                 // Remove the directory
                 let ret = unsafe {
                     libc::unlinkat(
@@ -471,7 +485,13 @@ fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     let (parent_fd, basename_cstr) = open_parent(filepath)?;
     let metadata = ftw::Metadata::new(parent_fd.as_raw_fd(), &basename_cstr, false)?;
 
-    if should_remove_file(cfg, &metadata, || display_cleaned(filepath)) {
+    if should_remove_file(
+        cfg,
+        parent_fd.as_raw_fd(),
+        &basename_cstr,
+        &metadata,
+        || display_cleaned(filepath),
+    ) {
         let ret = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), basename_cstr.as_ptr(), 0) };
         if ret != 0 {
             let e = io::Error::last_os_error();
@@ -497,9 +517,8 @@ fn rm_dir_empty(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     refuse_dot_dotdot_root(filepath)?;
 
     let filename_cstr = CString::new(filepath.as_os_str().as_bytes())?;
-    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &filename_cstr, false)?;
 
-    let writable = metadata.is_writable();
+    let writable = ftw::is_writable_at(libc::AT_FDCWD, &filename_cstr);
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
             gettext!("remove directory '{}'?", display_cleaned(filepath))

@@ -256,10 +256,8 @@ where
             }
 
             // 3.a.i
-            let target_is_writable = target_symlink_md
-                .as_ref()
-                .map(|md| md.is_writable())
-                .unwrap_or(false);
+            let target_is_writable =
+                ftw::is_writable_at(target_dirfd, unsafe { CStr::from_ptr(target_filename) });
 
             // Different prompt if the target is not writable
             if !target_is_writable && (cfg.interactive || cfg.force) {

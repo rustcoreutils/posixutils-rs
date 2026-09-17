@@ -1012,11 +1012,21 @@ fn cflow_preprocesses_capital_s_operands() {
 
     // Under -DUSE_ALT the callee is renamed, so the graph names a different
     // symbol -- which it can only do if the preprocessor actually ran.
+    //
+    // Both spellings are defined because the assembly-level name is not the C
+    // name everywhere: Mach-O gives every identifier a leading underscore
+    // (`__USER_LABEL_PREFIX__` is "_"), so the token here is `_helper` on
+    // macOS and `helper` on ELF. Defining both beats guessing the platform --
+    // on either one, the other define matches nothing. cflow strips the
+    // Mach-O underscore back off, so the report reads `alt_helper` on both.
     let capital = src(
         &dir,
         "ppasm.S",
         &format!(
-            "#ifdef USE_ALT\n#define helper alt_helper\n#endif\n{}",
+            "#ifdef USE_ALT\n\
+             #define helper alt_helper\n\
+             #define _helper _alt_helper\n\
+             #endif\n{}",
             body
         ),
     );
@@ -1113,11 +1123,13 @@ fn cflow_a_failing_operand_does_not_condemn_later_ones() {
 #[test]
 fn cflow_capital_s_assembler_errors_carry_the_source_line() {
     let dir = TempDir::new().unwrap();
-    // Three directive lines before the bad instruction on line 6.
+    // Three directive lines before the bad instruction on line 6. The mnemonic
+    // is bare, with no operand: register syntax differs between x86-64 and
+    // aarch64, and all this needs is something no assembler recognizes.
     let bad = src(
         &dir,
         "lines.S",
-        "#define A 1\n#if A\n    .text\n#endif\n    .globl e\n    bogusinsn %rax\n",
+        "#define A 1\n#if A\n    .text\n#endif\n    .globl e\n    bogusmnemonic\n",
     );
 
     let (_, stderr, code) = run("cflow", &[&bad]);

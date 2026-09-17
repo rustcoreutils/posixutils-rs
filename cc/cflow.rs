@@ -20,7 +20,10 @@ use posixutils_cc::ppargs;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_collecting, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::token::{
+    preprocess_asm_file, preprocess_collecting, AsmPreprocessConfig, PreprocessConfig, StreamTable,
+    Tokenizer,
+};
 use posixutils_cc::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -693,7 +696,12 @@ fn generate_from_grammar(file: &str, ext: &str) -> io::Result<Generated> {
 /// path rather than teaching this tool a second symbol reader, which is what
 /// OPERANDS allows for: files suffixed `.s` "may have more limited information
 /// extracted from them" than C source gives.
-fn assemble_to_object(source: &str) -> io::Result<Generated> {
+///
+/// `display` names the operand. It differs from `source` only for a `.S`, whose
+/// operand has already been preprocessed into a temporary; the assembler
+/// reports against the file it was handed, so those diagnostics are rewritten
+/// to name the operand instead.
+fn assemble_to_object(source: &str, display: &str) -> io::Result<Generated> {
     use std::process::Command;
 
     let dir = plib::tmp::TempDir::new()?;
@@ -722,7 +730,7 @@ fn assemble_to_object(source: &str) -> io::Result<Generated> {
         // Surface the assembler's own diagnostics.
         let stderr = String::from_utf8_lossy(&output.stderr);
         for line in stderr.lines() {
-            plib::diag::error(line);
+            plib::diag::error(&line.replace(source, display));
         }
         return Err(io::Error::other(format!("as {}", gettext("failed"))));
     }
@@ -735,6 +743,47 @@ fn assemble_to_object(source: &str) -> io::Result<Generated> {
     }
 
     let path = object.to_string_lossy().into_owned();
+    Ok(Generated { _dir: dir, path })
+}
+
+/// Preprocess a `.S` operand into a temporary `.s`.
+///
+/// POSIX names only `.s` (88942); `.S` is the GCC convention for assembler
+/// that must go through the preprocessor first, and c17 accepts it, so cflow
+/// reads the same files the compiler does. The preprocessor settings match
+/// what [`process_file`] chooses for C source, `-D`/`-U`/`-I` included.
+fn preprocess_assembler(
+    file: &str,
+    args: &Args,
+    defines: &[String],
+    undefines: &[String],
+) -> io::Result<Generated> {
+    let dir = plib::tmp::TempDir::new()?;
+    let content = std::fs::read(file)?;
+    let target = Target::host();
+
+    let config = AsmPreprocessConfig {
+        defines,
+        undefines,
+        include_paths: &args.include_paths,
+        search: Default::default(),
+        no_std_inc: false,
+        // Not a compiler: nothing here optimizes, so nothing claims to.
+        optimization: Default::default(),
+    };
+    let preprocessed = preprocess_asm_file(&content, &target, file, &config);
+
+    // preprocess_asm_file reports through the shared counter and returns
+    // whatever it managed to produce, so a #error or a missing include is only
+    // visible here. Assembling the remains would bury it.
+    if posixutils_cc::diag::has_error() != 0 {
+        return Err(io::Error::other(gettext("preprocessing failed")));
+    }
+
+    let out = dir.path().join("a.s");
+    std::fs::write(&out, &preprocessed)?;
+
+    let path = out.to_string_lossy().into_owned();
     Ok(Generated { _dir: dir, path })
 }
 
@@ -1285,12 +1334,27 @@ fn main() -> ExitCode {
             // information extracted". Assembling and reading the object is
             // exactly that -- an intra-section call to a file-local symbol
             // leaves no relocation, so it contributes no edge.
-            "s" => match assemble_to_object(file) {
+            "s" => match assemble_to_object(file, file) {
                 Ok(object) => analyze_object(object.path(), file, &mut graph),
                 Err(e) => {
                     plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
                 }
             },
+            // `.S` is preprocessed assembler: the GCC convention, not a POSIX
+            // suffix, and accepted because c17 accepts it.
+            "S" => {
+                let assembled = preprocess_assembler(file, &args, &defines, &undefines)
+                    // The assembler must run while `pp` is still alive: its
+                    // temporary directory is what holds the preprocessed
+                    // source, and dropping it takes the file with it.
+                    .and_then(|pp| assemble_to_object(pp.path(), file));
+                match assembled {
+                    Ok(object) => analyze_object(object.path(), file, &mut graph),
+                    Err(e) => {
+                        plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
+                    }
+                }
+            }
             // Object files, archives and shared libraries. DESCRIPTION requires
             // cflow to analyze "a collection of object files or assembler,
             // C-language, lex, or yacc source files".

@@ -129,6 +129,15 @@ Language and preprocessor additions:
 Deviation: `-std=` is accepted and discarded — `__STDC_VERSION__` is always
 `201112L`, not the `201710L` the utility's name implies.
 
+### cflow
+
+ * `.S` operands — assembler source that is preprocessed before it is
+   assembled, following the GCC convention.  POSIX names only `.s` among the
+   assembler suffixes, and says such files "may have more limited information
+   extracted from them"; `-D`, `-U` and `-I` reach a `.S` exactly as they
+   reach C source.  Accepted because `c17` accepts it, so the two tools read
+   the same files.
+
 ### chown
 
  * An `owner:` operand with an empty group resolves the group to the owner's

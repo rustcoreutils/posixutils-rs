@@ -920,7 +920,7 @@ fn assembler_fixture(dir: &TempDir, stem: &str) -> String {
     let c = src(
         dir,
         &format!("{}.c", stem),
-        "int h(void);\nint f(void){ return h(); }\nint main(void){ return f(); }\n",
+        "int helper(void);\nint f(void){ return helper(); }\nint main(void){ return f(); }\n",
     );
     let s = dir.path().join(format!("{}.s", stem));
     let built = Command::new(exe_for("c17"))
@@ -949,8 +949,8 @@ fn cflow_processes_assembler_input() {
     let (stdout, stderr, code) = run("cflow", &[&s]);
     assert_eq!(code, 0, "a .s operand must be analyzed: {}", stderr);
 
-    // The graph comes back through the relocations, main -> f -> h.
-    for name in ["main:", "f:", "h:"] {
+    // The graph comes back through the relocations, main -> f -> helper.
+    for name in ["main:", "f:", "helper:"] {
         assert!(stdout.contains(name), "expected {:?} in {:?}", name, stdout);
     }
     // STDOUT (88976): object-derived definitions carry "the filename and
@@ -989,6 +989,77 @@ fn cflow_assembler_failures_are_loud() {
     assert!(
         stderr.contains("as"),
         "diagnostic should name the assembler: {:?}",
+        stderr
+    );
+}
+
+/// A `.S` is preprocessed before it is assembled.
+///
+/// POSIX OPERANDS names only `.s`; `.S` is the GCC convention for assembler
+/// that needs the preprocessor, and cflow accepts it because c17 does. The
+/// fixture is built on top of c17's own output rather than hand-written: an
+/// assembler symbol with no `.type x, @function` is NOTYPE, and the object
+/// reader will not call it a function, so a hand-rolled fixture yields an
+/// empty graph and proves nothing.
+#[test]
+fn cflow_preprocesses_capital_s_operands() {
+    let dir = TempDir::new().unwrap();
+    let s = assembler_fixture(&dir, "ppasm");
+    let body = fs::read_to_string(&s).unwrap();
+
+    // Under -DUSE_ALT the callee is renamed, so the graph names a different
+    // symbol -- which it can only do if the preprocessor actually ran.
+    let capital = src(
+        &dir,
+        "ppasm.S",
+        &format!(
+            "#ifdef USE_ALT\n#define helper alt_helper\n#endif\n{}",
+            body
+        ),
+    );
+
+    let (stdout, stderr, code) = run("cflow", &["-DUSE_ALT", &capital]);
+    assert_eq!(code, 0, "a .S operand must be analyzed: {}", stderr);
+    assert!(
+        stdout.contains("alt_helper:"),
+        "-D did not reach the .S: {:?}",
+        stdout
+    );
+    // `alt_helper:` contains `helper:`, so the absence check needs the space.
+    assert!(
+        !stdout.contains(" helper:"),
+        "the unselected branch was taken: {:?}",
+        stdout
+    );
+
+    let (stdout, stderr, code) = run("cflow", &[&capital]);
+    assert_eq!(code, 0, "{}", stderr);
+    assert!(
+        stdout.contains(" helper:") && !stdout.contains("alt_helper:"),
+        "without -D the default branch should be taken: {:?}",
+        stdout
+    );
+
+    // The operand is what the report names, not either temporary.
+    assert!(
+        stdout.contains("ppasm.S ") && !stdout.contains(".o"),
+        "the report should name the operand: {:?}",
+        stdout
+    );
+}
+
+/// A `.S` whose preprocessing fails is a loud failure naming the operand --
+/// not a file assembled from whatever the preprocessor managed to emit.
+#[test]
+fn cflow_capital_s_preprocessor_errors_are_loud() {
+    let dir = TempDir::new().unwrap();
+    let bad = src(&dir, "missing.S", "#include \"no-such-header-exists.h\"\n");
+
+    let (_, stderr, code) = run("cflow", &[&bad]);
+    assert_ne!(code, 0, "a .S that will not preprocess must fail");
+    assert!(
+        stderr.contains("missing.S"),
+        "diagnostic should name the operand: {:?}",
         stderr
     );
 }

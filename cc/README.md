@@ -6,7 +6,7 @@ c17 implements **C17 (ISO/IEC 9899:2018) only**, plus selected GNU extensions, t
 
 References:
 - [ISO/IEC 9899:2011 (C11)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf) — C17 is this plus defect reports; the published C17 text is not free
-- Conformance findings and known divergences: [audit.md](audit.md)
+- Conformance findings and known divergences: git history; see [doc/README.md](doc/README.md)
 
 ## Quick start
 

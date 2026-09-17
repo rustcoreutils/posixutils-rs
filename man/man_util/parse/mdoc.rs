@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Hand-written recursive-descent mdoc parser (grown to parity with pest).
+//! Hand-written recursive-descent mdoc parser. This is the only mdoc parser;
+//! pest and its grammar were removed once this reached parity with them.
 //!
 //! Implicit blocks (`.Sh`/`.Ss`/`.Nd`) scope following content until a closing
 //! macro, modeled with an explicit frame stack — no PEG backtracking. Macro
 //! arguments are tokenized per word into `Text` nodes; a plain text line becomes
-//! a single `Text` node, matching the pest AST.
+//! a single `Text` node, which is the AST shape the formatter expects.
 
 use crate::man_util::mdoc_macro::text_production::StType;
 use crate::man_util::mdoc_macro::types::{AnType, BdType, BfType, BlType, OffsetType, SmMode};
@@ -50,8 +51,11 @@ impl std::fmt::Display for NestingTooDeep {
 
 impl std::error::Error for NestingTooDeep {}
 
-/// Parse an mdoc document into the AST. Coverage is being grown to parity with
-/// the pest parser; unimplemented macros currently degrade to text.
+/// Parse an mdoc document into the AST.
+///
+/// Every mdoc macro is handled. A control line naming something else -- a roff
+/// request the front end did not consume, a vendor macro, a typo -- renders as
+/// literal text rather than failing the page, which is what mandoc does too.
 pub fn parse_mdoc_v2(input: &str) -> Result<MdocDocument, NestingTooDeep> {
     let prepared = prepare_document(input);
     let mut p = Parser {
@@ -554,8 +558,9 @@ impl Parser {
                     self.push(el);
                 }
             }
-            // Not yet implemented: degrade to text so the v2 path stays usable.
-            // (Production defaults to pest until v2 is complete.)
+            // Not an mdoc macro: a leftover roff request, a vendor macro or a
+            // typo. Render the line as text rather than dropping it -- a page
+            // that uses one is still worth showing.
             _ => {
                 let mut text = String::from(".");
                 text.push_str(name);

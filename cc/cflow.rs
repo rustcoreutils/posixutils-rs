@@ -20,7 +20,10 @@ use posixutils_cc::ppargs;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
-use posixutils_cc::token::{preprocess_collecting, PreprocessConfig, StreamTable, Tokenizer};
+use posixutils_cc::token::{
+    preprocess_asm_file, preprocess_collecting, AsmPreprocessConfig, PreprocessConfig, StreamTable,
+    Tokenizer,
+};
 use posixutils_cc::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -609,16 +612,17 @@ fn declarator_line(lines: &[&str], start_line: u32, name: &str) -> u32 {
     start_line
 }
 
-// lex / yacc Input
+// Generated Inputs (lex / yacc / assembler)
 
-/// C source generated from a `.l` or `.y` operand, plus the temporary directory
-/// holding it (dropped, and so cleaned up, when this goes out of scope).
-struct GeneratedSource {
+/// A file produced from an operand -- C source from a `.l` or `.y`, an object
+/// from a `.s` or `.S` -- plus the temporary directory holding it (dropped,
+/// and so cleaned up, when this goes out of scope).
+struct Generated {
     _dir: plib::tmp::TempDir,
     path: String,
 }
 
-impl GeneratedSource {
+impl Generated {
     fn path(&self) -> &str {
         &self.path
     }
@@ -631,7 +635,7 @@ impl GeneratedSource {
 /// APPLICATION USAGE adds that feeding cflow the *generated* C confuses it
 /// because of the reordered `#line` directives, which is precisely why the
 /// grammar itself is the operand.
-fn generate_from_grammar(file: &str, ext: &str) -> io::Result<GeneratedSource> {
+fn generate_from_grammar(file: &str, ext: &str) -> io::Result<Generated> {
     use std::process::Command;
 
     let dir = plib::tmp::TempDir::new()?;
@@ -682,7 +686,101 @@ fn generate_from_grammar(file: &str, ext: &str) -> io::Result<GeneratedSource> {
     }
 
     let path = generated.to_string_lossy().into_owned();
-    Ok(GeneratedSource { _dir: dir, path })
+    Ok(Generated { _dir: dir, path })
+}
+
+/// Assemble a `.s` (or an already-preprocessed `.S`) into a temporary object.
+///
+/// DESCRIPTION: cflow "shall analyze a collection of object files or assembler,
+/// C-language, lex, or yacc source files". Assembling reuses the whole object
+/// path rather than teaching this tool a second symbol reader, which is what
+/// OPERANDS allows for: files suffixed `.s` "may have more limited information
+/// extracted from them" than C source gives.
+///
+/// `display` names the operand. It differs from `source` only for a `.S`, whose
+/// operand has already been preprocessed into a temporary; the assembler
+/// reports against the file it was handed, so those diagnostics are rewritten
+/// to name the operand instead.
+fn assemble_to_object(source: &str, display: &str) -> io::Result<Generated> {
+    use std::process::Command;
+
+    let dir = plib::tmp::TempDir::new()?;
+    let object = dir.path().join("a.o");
+
+    // No `current_dir` here, unlike the grammar generators: `-o` names the
+    // output, so the operand can be passed through as written and `as` reports
+    // against the path the user typed.
+    let output = Command::new("as")
+        .arg("-o")
+        .arg(&object)
+        .arg(source)
+        .output()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{}: as: {}",
+                    gettext("cannot run"),
+                    plib::diag::io_error_text(&e)
+                ),
+            )
+        })?;
+
+    if !output.status.success() {
+        // Surface the assembler's own diagnostics.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            plib::diag::error(&line.replace(source, display));
+        }
+        return Err(io::Error::other(format!("as {}", gettext("failed"))));
+    }
+
+    if !object.exists() {
+        return Err(io::Error::other(format!(
+            "as {}",
+            gettext("produced no output file")
+        )));
+    }
+
+    let path = object.to_string_lossy().into_owned();
+    Ok(Generated { _dir: dir, path })
+}
+
+/// Preprocess a `.S` operand into a temporary `.s`.
+///
+/// POSIX names only `.s` (88942); `.S` is the GCC convention for assembler
+/// that must go through the preprocessor first, and c17 accepts it, so cflow
+/// reads the same files the compiler does. The preprocessor settings match
+/// what [`process_file`] chooses for C source, `-D`/`-U`/`-I` included.
+fn preprocess_assembler(
+    file: &str,
+    args: &Args,
+    defines: &[String],
+    undefines: &[String],
+) -> io::Result<Generated> {
+    let dir = plib::tmp::TempDir::new()?;
+    let content = std::fs::read(file)?;
+    let target = Target::host();
+
+    let config = AsmPreprocessConfig {
+        defines,
+        undefines,
+        include_paths: &args.include_paths,
+        search: Default::default(),
+        no_std_inc: false,
+        // Not a compiler: nothing here optimizes, so nothing claims to.
+        optimization: Default::default(),
+    };
+    // A #error or a missing include makes the remaining bytes not worth
+    // assembling: `as` would bury the real diagnostic under syntax errors.
+    let preprocessed = preprocess_asm_file(&content, &target, file, &config)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let out = dir.path().join("a.s");
+    std::fs::write(&out, &preprocessed)?;
+
+    let path = out.to_string_lossy().into_owned();
+    Ok(Generated { _dir: dir, path })
 }
 
 // Object File Processing
@@ -837,6 +935,23 @@ fn process_object_file(path: &str, graph: &mut CallGraph, buffer: &[u8]) -> io::
     }
 
     Ok(())
+}
+
+/// Read an object file and fold its symbols into the graph, reporting failures.
+///
+/// `path` is what to open; `display` is the operand it came from. They differ
+/// when the object was assembled from a `.s`/`.S` operand into a temporary, and
+/// it is `display` that reaches the output, so a definition reads
+/// `<foo.s text>` rather than naming a temporary the user never saw.
+fn analyze_object(path: &str, display: &str, graph: &mut CallGraph) {
+    match std::fs::read(path) {
+        Ok(buffer) => {
+            if let Err(e) = process_object_file(display, graph, &buffer) {
+                plib::diag::error(&format!("{}: {}", display, plib::diag::io_error_text(&e)));
+            }
+        }
+        Err(e) => plib::diag::error(&format!("{}: {}", display, plib::diag::io_error_text(&e))),
+    }
 }
 
 // File Processing
@@ -1210,26 +1325,36 @@ fn main() -> ExitCode {
                     plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
                 }
             },
-            "s" => {
-                plib::diag::error(&format!(
-                    "{}: {}",
-                    file,
-                    gettext("assembly files not supported")
-                ));
-            }
-            // Object files, archives and shared libraries. DESCRIPTION requires
-            // cflow to analyze "a collection of object files or assembler,
-            // C-language, lex, or yacc source files".
-            _ => match std::fs::read(file) {
-                Ok(buffer) => {
-                    if let Err(e) = process_object_file(file, &mut graph, &buffer) {
-                        plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)));
-                    }
-                }
+            // POSIX DESCRIPTION requires assembler source to be analyzed, and
+            // OPERANDS grants it latitude: a `.s` "may have more limited
+            // information extracted". Assembling and reading the object is
+            // exactly that -- an intra-section call to a file-local symbol
+            // leaves no relocation, so it contributes no edge.
+            "s" => match assemble_to_object(file, file) {
+                Ok(object) => analyze_object(object.path(), file, &mut graph),
                 Err(e) => {
                     plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
                 }
             },
+            // `.S` is preprocessed assembler: the GCC convention, not a POSIX
+            // suffix, and accepted because c17 accepts it.
+            "S" => {
+                let assembled = preprocess_assembler(file, &args, &defines, &undefines)
+                    // The assembler must run while `pp` is still alive: its
+                    // temporary directory is what holds the preprocessed
+                    // source, and dropping it takes the file with it.
+                    .and_then(|pp| assemble_to_object(pp.path(), file));
+                match assembled {
+                    Ok(object) => analyze_object(object.path(), file, &mut graph),
+                    Err(e) => {
+                        plib::diag::error(&format!("{}: {}", file, plib::diag::io_error_text(&e)))
+                    }
+                }
+            }
+            // Object files, archives and shared libraries. DESCRIPTION requires
+            // cflow to analyze "a collection of object files or assembler,
+            // C-language, lex, or yacc source files".
+            _ => analyze_object(file, file, &mut graph),
         }
     }
 

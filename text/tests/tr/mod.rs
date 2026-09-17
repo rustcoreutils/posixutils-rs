@@ -874,10 +874,12 @@ fn tr_empty_string1_and_string2() {
 // ---------------------------------------------------------------------------
 // Locale-dependent behavior
 //
-// These pin the *current* behavior of gaps the audit already records as
-// MISSING (#1, #2, #4, #5): character classes, case mapping, equivalence
-// classes and ranges are all ASCII/code-point based rather than driven by
-// LC_CTYPE and LC_COLLATE. Making them locale-aware is a substantial change to
+// These pin the *current* behavior of four gaps the retired text/ audit
+// recorded as MISSING, its #1, #2, #4 and #5 (`git log --follow --
+// text/audit.md`): character classes, case mapping, equivalence classes and
+// ranges are all ASCII/code-point based rather than driven by LC_CTYPE and
+// LC_COLLATE. These tests are the standing record of that, the audit having
+// gone once nothing in it was outstanding. Making them locale-aware is a substantial change to
 // tr's parsing layer, so the tests document where the boundary is today and
 // will fail loudly when it moves.
 // ---------------------------------------------------------------------------

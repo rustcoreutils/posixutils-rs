@@ -4611,7 +4611,7 @@ fn diagnostics_index_range_after_field_designator() {
 }
 
 // ============================================================================
-// #C164 — a declaration that declares nothing (C17 6.7p2)
+// A declaration that declares nothing (C17 6.7p2)
 // ============================================================================
 
 /// 6.7p2 wants a declarator, a tag, or enumeration members. These have none.

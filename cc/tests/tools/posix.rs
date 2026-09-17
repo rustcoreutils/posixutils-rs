@@ -910,6 +910,237 @@ fn cflow_processes_lex_input() {
     }
 }
 
+/// Build a `.s` fixture by compiling C into assembly, and return its path.
+///
+/// The file lives in `dir`, which the caller owns and which must outlive the
+/// run that reads it.
+///
+/// Every function has external linkage on purpose. Call edges are recovered
+/// from relocations, and an intra-section call to a file-local symbol leaves
+/// none -- a `static` callee would silently contribute no edge and make this
+/// test prove less than it appears to.
+fn assembler_fixture(dir: &TempDir, stem: &str) -> String {
+    let c = src(
+        dir,
+        &format!("{}.c", stem),
+        "int helper(void);\nint f(void){ return helper(); }\nint main(void){ return f(); }\n",
+    );
+    let s = dir.path().join(format!("{}.s", stem));
+    let built = Command::new(exe_for("c17"))
+        .args(["-S", &c, "-o", s.to_str().unwrap()])
+        .output()
+        .expect("run c17");
+    assert!(
+        built.status.success() && s.exists(),
+        "failed to build fixture assembly: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    s.to_str().unwrap().to_string()
+}
+
+/// DESCRIPTION (88916): cflow "shall analyze a collection of object files or
+/// assembler, C-language, lex, or yacc source files".
+///
+/// A `.s` operand used to be refused outright with "assembly files not
+/// supported", which OPERANDS does not permit: 88942 says only that such a
+/// file "may have more limited information extracted from them".
+#[test]
+fn cflow_processes_assembler_input() {
+    let dir = TempDir::new().unwrap();
+    let s = assembler_fixture(&dir, "asmsrc");
+
+    let (stdout, stderr, code) = run("cflow", &[&s]);
+    assert_eq!(code, 0, "a .s operand must be analyzed: {}", stderr);
+
+    // The graph comes back through the relocations, main -> f -> helper.
+    for name in ["main:", "f:", "helper:"] {
+        assert!(stdout.contains(name), "expected {:?} in {:?}", name, stdout);
+    }
+    // STDOUT (88976): object-derived definitions carry "the filename and
+    // location counter under which the symbol appeared".
+    assert!(
+        stdout.contains("asmsrc.s ") && stdout.contains("text>"),
+        "definitions should name the operand and its counter: {:?}",
+        stdout
+    );
+    // The object is a temporary the user never named; it must not surface.
+    assert!(
+        !stdout.contains(".o"),
+        "the temporary object leaked into the report: {:?}",
+        stdout
+    );
+}
+
+/// A `.s` that will not assemble is a loud failure naming the operand, and an
+/// unreachable assembler is too -- neither may be silently skipped.
+#[test]
+fn cflow_assembler_failures_are_loud() {
+    let dir = TempDir::new().unwrap();
+
+    let bad = src(&dir, "bad.s", "this is not assembly at all @@@\n");
+    let (_, stderr, code) = run("cflow", &[&bad]);
+    assert_ne!(code, 0, "a .s that will not assemble must fail");
+    assert!(
+        stderr.contains("bad.s"),
+        "diagnostic should name the operand: {:?}",
+        stderr
+    );
+
+    let good = assembler_fixture(&dir, "unreachable");
+    let (_, stderr, code) = run_env("cflow", &[&good], &[("PATH", "/nonexistent")]);
+    assert_ne!(code, 0, "a .s operand with no assembler must fail");
+    assert!(
+        stderr.contains("as"),
+        "diagnostic should name the assembler: {:?}",
+        stderr
+    );
+}
+
+/// A `.S` is preprocessed before it is assembled.
+///
+/// POSIX OPERANDS names only `.s`; `.S` is the GCC convention for assembler
+/// that needs the preprocessor, and cflow accepts it because c17 does. The
+/// fixture is built on top of c17's own output rather than hand-written: an
+/// assembler symbol with no `.type x, @function` is NOTYPE, and the object
+/// reader will not call it a function, so a hand-rolled fixture yields an
+/// empty graph and proves nothing.
+#[test]
+fn cflow_preprocesses_capital_s_operands() {
+    let dir = TempDir::new().unwrap();
+    let s = assembler_fixture(&dir, "ppasm");
+    let body = fs::read_to_string(&s).unwrap();
+
+    // Under -DUSE_ALT the callee is renamed, so the graph names a different
+    // symbol -- which it can only do if the preprocessor actually ran.
+    //
+    // Both spellings are defined because the assembly-level name is not the C
+    // name everywhere: Mach-O gives every identifier a leading underscore
+    // (`__USER_LABEL_PREFIX__` is "_"), so the token here is `_helper` on
+    // macOS and `helper` on ELF. Defining both beats guessing the platform --
+    // on either one, the other define matches nothing. cflow strips the
+    // Mach-O underscore back off, so the report reads `alt_helper` on both.
+    let capital = src(
+        &dir,
+        "ppasm.S",
+        &format!(
+            "#ifdef USE_ALT\n\
+             #define helper alt_helper\n\
+             #define _helper _alt_helper\n\
+             #endif\n{}",
+            body
+        ),
+    );
+
+    let (stdout, stderr, code) = run("cflow", &["-DUSE_ALT", &capital]);
+    assert_eq!(code, 0, "a .S operand must be analyzed: {}", stderr);
+    assert!(
+        stdout.contains("alt_helper:"),
+        "-D did not reach the .S: {:?}",
+        stdout
+    );
+    // `alt_helper:` contains `helper:`, so the absence check needs the space.
+    assert!(
+        !stdout.contains(" helper:"),
+        "the unselected branch was taken: {:?}",
+        stdout
+    );
+
+    let (stdout, stderr, code) = run("cflow", &[&capital]);
+    assert_eq!(code, 0, "{}", stderr);
+    assert!(
+        stdout.contains(" helper:") && !stdout.contains("alt_helper:"),
+        "without -D the default branch should be taken: {:?}",
+        stdout
+    );
+
+    // The operand is what the report names, not either temporary.
+    assert!(
+        stdout.contains("ppasm.S ") && !stdout.contains(".o"),
+        "the report should name the operand: {:?}",
+        stdout
+    );
+}
+
+/// A `.S` whose preprocessing fails is a loud failure naming the operand --
+/// not a file assembled from whatever the preprocessor managed to emit.
+#[test]
+fn cflow_capital_s_preprocessor_errors_are_loud() {
+    let dir = TempDir::new().unwrap();
+    let bad = src(&dir, "missing.S", "#include \"no-such-header-exists.h\"\n");
+
+    let (_, stderr, code) = run("cflow", &[&bad]);
+    assert_ne!(code, 0, "a .S that will not preprocess must fail");
+    assert!(
+        stderr.contains("missing.S"),
+        "diagnostic should name the operand: {:?}",
+        stderr
+    );
+}
+
+/// One operand's failure must not condemn the next one.
+///
+/// The compiler front end's error state is a sticky process-global, so asking
+/// "did an error happen?" after preprocessing a `.S` answers "has anything
+/// failed since this process started?" -- and a clean `.S` after any earlier
+/// failure was rejected without being looked at. POSIX CONSEQUENCES OF ERRORS
+/// is Default here, and the utility processes the operands it was given.
+#[test]
+fn cflow_a_failing_operand_does_not_condemn_later_ones() {
+    let dir = TempDir::new().unwrap();
+    let good = {
+        let s = assembler_fixture(&dir, "after");
+        let body = fs::read_to_string(&s).unwrap();
+        src(&dir, "after.S", &body)
+    };
+
+    // Two ways to fail first: a C operand, and another .S.
+    for first in [
+        src(&dir, "broken.c", "#include \"no-such-header.h\"\n"),
+        src(&dir, "broken.S", "#error deliberate\n"),
+    ] {
+        let (stdout, stderr, code) = run("cflow", &[&first, &good]);
+        assert_ne!(code, 0, "the failing operand must still set the status");
+        assert!(
+            stdout.contains("main:") && stdout.contains("after.S "),
+            "the good .S must still be analyzed after {:?} failed:\nout={:?}\nerr={:?}",
+            first,
+            stdout,
+            stderr
+        );
+    }
+
+    // And on its own it is still clean.
+    let (_, _, code) = run("cflow", &[&good]);
+    assert_eq!(code, 0);
+}
+
+/// An assembler diagnostic for a `.S` names the operand *and* its real line.
+///
+/// Preprocessing drops directive lines, so the temporary handed to `as` is
+/// shorter than the operand. Rewriting the path without keeping the line
+/// numbers true turns an obviously-suspect temp path into a confident wrong
+/// location -- the worse of the two failures.
+#[test]
+fn cflow_capital_s_assembler_errors_carry_the_source_line() {
+    let dir = TempDir::new().unwrap();
+    // Three directive lines before the bad instruction on line 6. The mnemonic
+    // is bare, with no operand: register syntax differs between x86-64 and
+    // aarch64, and all this needs is something no assembler recognizes.
+    let bad = src(
+        &dir,
+        "lines.S",
+        "#define A 1\n#if A\n    .text\n#endif\n    .globl e\n    bogusmnemonic\n",
+    );
+
+    let (_, stderr, code) = run("cflow", &[&bad]);
+    assert_ne!(code, 0, "a .S that will not assemble must fail");
+    assert!(
+        stderr.contains("lines.S:6:"),
+        "diagnostic should name the operand's own line 6, got {:?}",
+        stderr
+    );
+}
+
 /// Diagnostics belong on stderr only; stdout carries the report.
 /// POSIX STDERR: "used only for diagnostic messages" (all three utilities).
 #[test]

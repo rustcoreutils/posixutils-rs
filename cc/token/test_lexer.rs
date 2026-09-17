@@ -1297,6 +1297,29 @@ fn test_tokens_to_source_bytes_ends_with_newline() {
     assert!(source_text("x").ends_with('\n'));
 }
 
+/// The first token keeps its source line, so a `.S` diagnostic points at the
+/// right place.
+///
+/// Directives produce no output, so when they precede the first real token the
+/// padding that puts it on its own line is the only thing keeping every later
+/// line from sliding up by however many there were. Skipping the padding for
+/// the first token cost three lines in the case that found this, and the
+/// assembler reported the wrong location with complete confidence.
+#[test]
+fn test_tokens_to_source_bytes_pads_to_the_first_tokens_line() {
+    // The token is on line 3; two blank lines must precede it.
+    let text = source_text("\n\nx");
+    assert_eq!(
+        text.lines().position(|l| l.contains('x')),
+        Some(2),
+        "first token should land on its source line, got {:?}",
+        text
+    );
+
+    // A token already on line 1 gains nothing.
+    assert_eq!(source_text("x").lines().next(), Some("x"));
+}
+
 /// The reason this path deals in bytes: a literal payload is one `char`
 /// per source byte, and rendering it as a Rust string doubles every byte
 /// of 0x80 or more.

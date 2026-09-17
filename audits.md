@@ -271,10 +271,9 @@ coverage while asserting nothing.
 
 Crates with open items today:
 
-- [`cc/audit.md`](cc/audit.md) — `c17`, `cflow`, `ctags`, `cxref`
 - [`cron/audit.md`](cron/audit.md) — `crontab`, `at`, `batch`, `crond`
 
-Audited with nothing open, so no file: `awk`, `calc`, `datetime`, `dev`,
+Audited with nothing open, so no file: `awk`, `calc`, `cc`, `datetime`, `dev`,
 `display`, `editors`, `file`, `fs`, `i18n`, `m4`, `mailx`, `make`, `man`,
 `misc`, `pathnames`, `pax`, `print`, `process`, `sccs`, `screen`, `sh`, `sys`,
 `text`, `tree`, `users`, `uucp`, `xform`.
@@ -283,7 +282,13 @@ Five crates joined that list on 2026-09-12, as their last open items closed:
 `dev` (`#A7`), `make` (`#88`, `#89`), `sys` (the `ps` and `who` coverage gaps),
 `calc` (`#B13`, `#B14`) and `sh` (`#57`). `tree` joined on 2026-09-13, when its
 one remaining row — a `du -x` coverage gap — turned out to rest on a false
-premise and was closed with a test rather than deferred again.
+premise and was closed with a test rather than deferred again. `cc` joined on
+2026-09-17, when `#C164` closed — cflow refusing assembler source, the last
+place c17 or its tools knowingly diverged from the standard. Its file had one
+other row, `#C55` (trigraphs off by default), and that is a maintainer
+decision rather than a gap; by the rule the next paragraph ends on, a decision
+is not a punch-list item, so it was never what kept the file alive. The
+trigraph reasoning is in `cc/doc/TODO.md` under "Settled — do not re-open".
 
 Three of those closures were decisions rather than code, and each is recorded
 in the commit that closed it so it is not re-raised: `make`'s `#86` (GNU `::`

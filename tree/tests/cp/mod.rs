@@ -1444,3 +1444,159 @@ fn test_cp_dangling_source_is_an_error() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+fn mkfifo_at(path: &str, mode: libc::mode_t) {
+    let c = CString::new(path.as_bytes()).unwrap();
+    let ret = unsafe { libc::mkfifo(c.as_ptr(), mode) };
+    if ret != 0 {
+        panic!("{}", io::Error::last_os_error());
+    }
+}
+
+// The special-file path ran before step 1 and before all of the -i and -f handling, and unlinked
+// whatever was at the destination unconditionally, so `cp -R -i` destroyed an existing file
+// without ever asking.
+#[test]
+fn test_cp_special_i_does_not_clobber() {
+    let test_dir = &format!(
+        "{}/test_cp_special_i_does_not_clobber",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let fifo = &format!("{test_dir}/fifo");
+    let target = &format!("{test_dir}/target");
+
+    fs::create_dir(test_dir).unwrap();
+    mkfifo_at(fifo, 0o644);
+    fs::write(target, b"IMPORTANT\n").unwrap();
+
+    cp_test_with_stdin(
+        &["-R", "-i", fifo, target],
+        "n\n",
+        "",
+        &format!("cp: overwrite '{target}'? "),
+        0,
+    );
+
+    assert!(fs::metadata(target).unwrap().file_type().is_file());
+    let mut contents = String::new();
+    fs::File::open(target)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(
+        contents, "IMPORTANT\n",
+        "the declined copy went ahead anyway"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Step 1 applies to special files too: copying one onto itself unlinked and recreated the source.
+#[test]
+fn test_cp_special_same_file() {
+    let test_dir = &format!("{}/test_cp_special_same_file", env!("CARGO_TARGET_TMPDIR"));
+    let fifo = &format!("{test_dir}/fifo");
+
+    fs::create_dir(test_dir).unwrap();
+    mkfifo_at(fifo, 0o644);
+
+    cp_test(
+        &["-R", fifo, fifo],
+        "",
+        &format!("cp: '{fifo}' and '{fifo}' are the same file\n"),
+        1,
+    );
+    assert!(fs::metadata(fifo).unwrap().file_type().is_fifo());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90682 step 4.a: the destination is created with the same file type as the source. mknod
+// with no type bits creates a regular file, so an unprivileged `cp -R /dev/zero t` used to
+// "succeed" with an empty regular file instead of failing.
+#[test]
+fn test_cp_special_device_keeps_its_type() {
+    if is_root() {
+        eprintln!("Skipping test: root may create device nodes");
+        return;
+    }
+
+    let test_dir = &format!(
+        "{}/test_cp_special_device_keeps_its_type",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let target = &format!("{test_dir}/target");
+
+    fs::create_dir(test_dir).unwrap();
+
+    // /dev/null rather than /dev/zero deliberately: if this path ever regresses to reading the
+    // device as an ordinary file, an empty read ends immediately, where /dev/zero would write
+    // until the filesystem filled up.
+    cp_test(
+        &["-R", "/dev/null", target],
+        "",
+        &format!("cp: cannot create special file '{target}': Operation not permitted\n"),
+        1,
+    );
+    assert!(
+        fs::symlink_metadata(target).is_err(),
+        "a file was created where the device node could not be"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90683-90685: a FIFO gets the source's permission bits, not a hard-coded 0644.
+#[test]
+fn test_cp_special_fifo_mode_from_source() {
+    let test_dir = &format!(
+        "{}/test_cp_special_fifo_mode_from_source",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let fifo = &format!("{test_dir}/fifo");
+    let copy = &format!("{test_dir}/copy");
+
+    fs::create_dir(test_dir).unwrap();
+    mkfifo_at(fifo, 0o644);
+    fs::set_permissions(fifo, fs::Permissions::from_mode(0o600)).unwrap();
+
+    cp_test(&["-R", fifo, copy], "", "", 0);
+
+    let md = fs::metadata(copy).unwrap();
+    assert!(md.file_type().is_fifo());
+    assert_eq!(
+        md.permissions().mode() & 0o077,
+        0,
+        "group and other bits came from somewhere other than the source"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Without -p, cp must not hand the copy a set-user-ID bit: the new file belongs to whoever ran
+// cp, so preserving it would grant that user's privileges to anyone who can execute it.
+#[test]
+fn test_cp_setuid_not_preserved_without_p() {
+    let test_dir = &format!(
+        "{}/test_cp_setuid_not_preserved_without_p",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(src, b"x").unwrap();
+    fs::set_permissions(src, fs::Permissions::from_mode(0o4755)).unwrap();
+
+    cp_test(&[src, dst], "", "", 0);
+
+    #[allow(clippy::unnecessary_cast)]
+    let setid = (libc::S_ISUID as u32) | (libc::S_ISGID as u32);
+    assert_eq!(
+        fs::metadata(dst).unwrap().permissions().mode() & setid,
+        0,
+        "the copy carries a set-user-ID or set-group-ID bit"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

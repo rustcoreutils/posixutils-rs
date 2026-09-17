@@ -160,20 +160,6 @@ where
             | ftw::FileType::Fifo
             | ftw::FileType::Socket
     );
-    // -R is required for step 4
-    if source_is_special_file && cfg.recursive {
-        copy_special_file(
-            cfg,
-            source_md,
-            target,
-            target_dirfd,
-            target_filename,
-            created_files,
-            source_file_type == ftw::FileType::Fifo,
-        )?;
-        return Ok(CopyResult::CopiedFile);
-    }
-
     let source_deref_md = unsafe { ftw::Metadata::new(source.dir_fd(), source.file_name(), true) };
 
     // A link we were told to act through, whose referent does not exist, is an error -- there is
@@ -308,13 +294,18 @@ where
             }
             let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
 
-            // 3.b
+            // 3.b. POSIX 90670-90671 asks for source_file's permission bits. The set-user-ID and
+            // set-group-ID bits are masked off unless -p was given: the copy belongs to whoever
+            // ran cp, so carrying them over would hand that user's privileges to anyone who can
+            // run it. GNU masks the same way, and -p restores them later through
+            // `copy_characteristics`, which clears them if the ownership could not be duplicated.
+            let create_mode = source_md.mode() & if cfg.preserve { 0o7777 } else { 0o777 };
             let target_fd = unsafe {
                 libc::openat(
                     target_dirfd,
                     target_filename,
                     libc::O_WRONLY | libc::O_CREAT,
-                    source_md.mode(),
+                    create_mode,
                 )
             };
             if target_fd == -1 {
@@ -380,18 +371,51 @@ where
                     return Ok(CopyResult::Skipped);
                 }
             }
+        }
 
-            // 4.c
-            if act_on_link_itself {
-                let link_target = read_source_link(source)?;
+        // A destination that exists and is not a dangling link has now been checked against the
+        // just-created set and prompted for. Everything below replaces it.
+        let replacing_existing = target_exists && !target_is_dangling_symlink;
 
-                let ret = unsafe {
-                    libc::unlinkat(
-                        target_dirfd,
-                        target_filename,
-                        if target_is_dir { libc::AT_REMOVEDIR } else { 0 },
-                    )
-                };
+        // 4. -R is required for a FIFO, device or socket; without it the contents are read like
+        // any other file, which is what makes `cp /dev/null x` work.
+        if source_is_special_file && cfg.recursive {
+            if target_is_dir {
+                let err_str = gettext!(
+                    "cannot overwrite directory '{}' with non-directory '{}'",
+                    target.display(),
+                    source.path()
+                );
+                return Err(io::Error::other(err_str));
+            }
+            copy_special_file(
+                source_md,
+                source_file_type,
+                target,
+                target_dirfd,
+                target_filename,
+                target_exists,
+                created_files,
+            )?;
+            return Ok(CopyResult::CopiedFile);
+        }
+
+        // 4.c
+        if act_on_link_itself {
+            let link_target = read_source_link(source)?;
+
+            if target_exists {
+                if target_is_dir {
+                    let err_str = gettext!(
+                        "cannot overwrite directory '{}' with non-directory '{}'",
+                        target.display(),
+                        source.path()
+                    );
+                    return Err(io::Error::other(err_str));
+                }
+                // Also covers a dangling destination link, which `symlinkat` would otherwise
+                // refuse with EEXIST.
+                let ret = unsafe { libc::unlinkat(target_dirfd, target_filename, 0) };
                 if ret != 0 {
                     let e = io::Error::last_os_error();
                     return Err(io::Error::other(gettext!(
@@ -400,92 +424,77 @@ where
                         error_string(&e)
                     )));
                 }
+            }
 
-                let ret =
-                    unsafe { libc::symlinkat(link_target.as_ptr(), target_dirfd, target_filename) };
-                if ret != 0 {
+            let ret =
+                unsafe { libc::symlinkat(link_target.as_ptr(), target_dirfd, target_filename) };
+            if ret != 0 {
+                let e = io::Error::last_os_error();
+                return Err(io::Error::other(gettext!(
+                    "cannot create symbolic link '{}': {}",
+                    target.display(),
+                    error_string(&e)
+                )));
+            }
+        } else if replacing_existing {
+            // 3.a.ii
+            let target_fd = unsafe {
+                libc::openat(
+                    target_dirfd,
+                    target_filename,
+                    libc::O_WRONLY | libc::O_TRUNC,
+                )
+            };
+            if target_fd != -1 {
+                let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
+
+                let source_fd = unsafe {
+                    libc::openat(source.dir_fd(), source.file_name().as_ptr(), libc::O_RDONLY)
+                };
+                if source_fd == -1 {
                     let e = io::Error::last_os_error();
-                    return Err(io::Error::other(gettext!(
-                        "cannot create symbolic link '{}': {}",
+                    let err_str = gettext!(
+                        "cannot open '{}' for reading: {}",
+                        source.path(),
+                        error_string(&e)
+                    );
+                    return Err(io::Error::other(err_str));
+                }
+                let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
+
+                io::copy(&mut source_file, &mut target_file)?;
+            } else {
+                // 3.a.iii
+                if cfg.force {
+                    let ret = unsafe {
+                        libc::unlinkat(
+                            target_dirfd,
+                            target_filename,
+                            if target_is_dir { libc::AT_REMOVEDIR } else { 0 },
+                        )
+                    };
+                    if ret != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+
+                    // 3.b
+                    create_target_then_copy()?;
+                } else {
+                    // The open that failed was for writing, and without -f there is no
+                    // second attempt. Same wording as GNU cp.
+                    let e = io::Error::last_os_error();
+                    let err_str = gettext!(
+                        "cannot create regular file '{}': {}",
                         target.display(),
                         error_string(&e)
-                    )));
-                }
-            } else {
-                // 3.a.ii
-                let target_fd = unsafe {
-                    libc::openat(
-                        target_dirfd,
-                        target_filename,
-                        libc::O_WRONLY | libc::O_TRUNC,
-                    )
-                };
-                if target_fd != -1 {
-                    let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
-
-                    let source_fd = unsafe {
-                        libc::openat(source.dir_fd(), source.file_name().as_ptr(), libc::O_RDONLY)
-                    };
-                    if source_fd == -1 {
-                        let e = io::Error::last_os_error();
-                        let err_str = gettext!(
-                            "cannot open '{}' for reading: {}",
-                            source.path(),
-                            error_string(&e)
-                        );
-                        return Err(io::Error::other(err_str));
-                    }
-                    let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
-
-                    io::copy(&mut source_file, &mut target_file)?;
-                } else {
-                    // 3.a.iii
-                    if cfg.force {
-                        let ret = unsafe {
-                            libc::unlinkat(
-                                target_dirfd,
-                                target_filename,
-                                if target_is_dir { libc::AT_REMOVEDIR } else { 0 },
-                            )
-                        };
-                        if ret != 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-
-                        // 3.b
-                        create_target_then_copy()?;
-                    } else {
-                        // The open that failed was for writing, and without -f there is no
-                        // second attempt. Same wording as GNU cp.
-                        let e = io::Error::last_os_error();
-                        let err_str = gettext!(
-                            "cannot create regular file '{}': {}",
-                            target.display(),
-                            error_string(&e)
-                        );
-                        return Err(io::Error::other(err_str));
-                    }
+                    );
+                    return Err(io::Error::other(err_str));
                 }
             }
 
         // 3.b
         } else {
-            // 4.c
-            if act_on_link_itself {
-                let link_target = read_source_link(source)?;
-                let ret =
-                    unsafe { libc::symlinkat(link_target.as_ptr(), target_dirfd, target_filename) };
-                if ret != 0 {
-                    let e = io::Error::last_os_error();
-                    return Err(io::Error::other(gettext!(
-                        "cannot create symbolic link '{}': {}",
-                        target.display(),
-                        error_string(&e)
-                    )));
-                }
-            } else {
-                create_target_then_copy()?;
-            }
+            create_target_then_copy()?;
         }
 
         created_files.insert(target.to_path_buf());
@@ -819,50 +828,47 @@ where
     result
 }
 
+/// POSIX cp step 4: reproduce a FIFO, device or socket at the destination.
+///
+/// The caller has already applied steps 1 to 3.a, so an existing destination has been prompted
+/// for and is known not to be a directory.
 fn copy_special_file(
-    cfg: &CopyConfig,
     source_md: &ftw::Metadata,
+    source_file_type: ftw::FileType,
 
     // Should only be used for keeping track of created files and for displaying error messages
     target: &Path,
 
     target_dirfd: libc::c_int,
     target_filename: *const libc::c_char,
+    target_exists: bool,
     created_files: &mut HashSet<PathBuf>,
-    is_fifo: bool,
 ) -> io::Result<()> {
-    // 4.a
-    let dev = source_md.rdev();
+    let is_fifo = source_file_type == ftw::FileType::Fifo;
 
-    // 4.b
-    let mode = if is_fifo {
-        // Mandatory to be the same as source for FIFO
-        source_md.mode()
-    } else {
-        // Under Rationale:
-        // "In general, it is strongly suggested that the permissions,
-        // owner, and group be the same as if the user had run the
-        // historical mknod, ln, or other utility to create the file"
-        0o644
-    };
+    // 4.b. A FIFO takes the source's permission bits (90683-90685); for the other types they are
+    // implementation-defined, and GNU uses the source's as well. `mknodat` applies the umask, and
+    // `-p` restores the exact bits afterwards through `copy_characteristics`.
+    #[allow(clippy::unnecessary_cast)] // `S_IFMT` is u16 on macOS and u32 on Linux
+    let perm = source_md.mode() & if is_fifo { 0o7777 } else { 0o777 };
 
-    let mut stat_buf = MaybeUninit::uninit();
-
-    // Using `fstatat` to check for the existence of the target file
-    let ret = unsafe {
-        libc::fstatat(
-            target_dirfd,
-            target_filename,
-            stat_buf.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    let target_exists = ret == 0;
+    // 4.a: "The dest_file shall be created with the same file type as source_file." Passing no
+    // type bits to `mknod` asks for a *regular file*, which is how copying a character device
+    // used to report success having written an empty regular file.
+    #[allow(clippy::unnecessary_cast)]
+    let mode = (source_md.mode() & libc::S_IFMT as u32) | perm;
 
     if target_exists {
+        // Never `AT_REMOVEDIR`: removing a directory to plant a device node is destruction POSIX
+        // never asks for. The caller rejects a directory destination before getting here.
         let ret = unsafe { libc::unlinkat(target_dirfd, target_filename, 0) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            return Err(io::Error::other(gettext!(
+                "cannot remove '{}': {}",
+                target.display(),
+                error_string(&e)
+            )));
         }
     }
 
@@ -871,7 +877,7 @@ fn copy_special_file(
             target_dirfd,
             target_filename,
             mode as libc::mode_t,
-            dev as libc::dev_t,
+            source_md.rdev() as libc::dev_t,
         )
     };
     if ret == 0 {
@@ -879,11 +885,19 @@ fn copy_special_file(
         Ok(())
     } else {
         let e = io::Error::last_os_error();
-        let err_str = gettext!(
-            "cannot create regular file '{}': {}",
-            target.display(),
-            error_string(&e)
-        );
+        let err_str = if is_fifo {
+            gettext!(
+                "cannot create fifo '{}': {}",
+                target.display(),
+                error_string(&e)
+            )
+        } else {
+            gettext!(
+                "cannot create special file '{}': {}",
+                target.display(),
+                error_string(&e)
+            )
+        };
         Err(io::Error::other(err_str))
     }
 }

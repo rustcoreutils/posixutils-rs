@@ -51,13 +51,18 @@ The `[package] version` is the first `version =` in each member manifest, so:
 ```sh
 NEW=X.Y.Z
 for f in */Cargo.toml; do
-    sed -i "0,/^version = \"/s/^version = \".*\"/version = \"$NEW\"/" "$f"
+    perl -0777 -i -pe 's/^version = ".*"/version = "'"$NEW"'"/m' "$f"
 done
 grep -l "^version = \"$NEW\"" */Cargo.toml | wc -l   # must equal the member count
 ```
 
-Verify the count rather than trusting the loop — a `sed` that matches nothing
-fails silently.
+`perl -i` rather than `sed -i` because the bump has to run on macOS too: BSD
+sed requires a backup suffix after `-i`, and its addresses do not include the
+GNU `0,/re/` form that would stop at the first match. The `-0777` slurp plus
+`/m` gives perl the same first-match-only behaviour without it.
+
+Verify the count rather than trusting the loop — a substitution that matches
+nothing fails silently.
 
 Building refreshes the path-dependency versions recorded in `Cargo.lock`, so
 that file changes too; include it in the same commit. Then run full-gate

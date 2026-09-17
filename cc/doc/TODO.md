@@ -19,8 +19,8 @@ and so neither is raised again as a question.
 ### `_FORTIFY_SOURCE` compiles but checks nothing
 
 **Not a conformance item, and the sole record of this one.** It was also
-tracked as **#C12** in `cc/audit.md` until 2026-08-21, when it was removed
-from there: `_FORTIFY_SOURCE`, `__builtin_object_size` and the `_chk` family
+tracked as **#C12** in the conformance audit until 2026-08-21, when it was
+removed from there: `_FORTIFY_SOURCE`, `__builtin_object_size` and the `_chk` family
 appear nowhere in POSIX.1-2024, so an entry in a POSIX conformance audit's
 Open list overstated what it was. The number is kept here so
 `git log --grep '#C12'` still finds the history. **Deferred indefinitely by
@@ -108,7 +108,7 @@ anyone coming to the spec fresh. `--trigraphs` implements translation phase 1
 exactly. The default is off because replacement reaches inside string
 literals — `"What??!"` becomes `"What|"` — and `??` is far likelier to appear
 by accident than by intent; gcc and clang default them off for the same reason.
-See #C55 in `cc/audit.md`.
+`git log --grep '#C55'` has the record.
 
 ## Technical Debt
 
@@ -159,7 +159,7 @@ does or claims.
 
 _The `__int128` and `long double` argument-passing bugs, the universal-character-name
 encoding, and the silently-dropped attributes used to belong here; all are closed, see
-#C42, #C43, #C57, #C58 and #C59 in `cc/audit.md`. What remains of that family: `used` is
+#C42, #C43, #C57, #C58 and #C59 (`git log --grep`). What remains of that family: `used` is
 satisfied only because nothing is pruned -- re-probed 2026-08-20, an unreferenced static
 survives `-O2` whether or not it is marked. `vector_size` is implemented as storage and
 `mode` as of #C85, the latter also binding to a struct member's and a parameter's
@@ -169,12 +169,12 @@ float HFA on aarch64 -- is fixed, this note having outlived it (re-probed 2026-0
 
 _Constraint diagnostics used to belong here. As of 2026-08-15 a 35-case matrix
 -- 21 constraint violations and 14 accept-side controls -- agrees with
-`gcc -std=c17` on every row; see #C45-#C49 in `cc/audit.md`. Two divergences are
+`gcc -std=c17` on every row; see #C45-#C49 in git log. Two divergences are
 deliberate and remain: `return` with a value in a `void` function, and a bare
 `return` in a non-`void` one, are errors here and warnings in gcc, both being
 genuine 6.8.6.4 violations. `__attribute__((transparent_union))` used to sit
 here too -- an argument matching any member of *any* union parameter was
-accepted rather than checked -- and is closed, see #C51 in `cc/audit.md`._
+accepted rather than checked -- and is closed, see #C51 in git log._
 
 _The packed-bit-field layout used to be a row in the table below:
 `struct __attribute__((packed)) { unsigned a:20, b:20; }` was 8 bytes here and
@@ -314,7 +314,7 @@ without it (#X1).
 The deferral this section used to record was justified by the
 value-versus-address convention for small aggregates needing to be settled
 first. That turned out not to be a blocker, and not to be one convention --
-see #C116 in `cc/audit.md` for what the three sites actually decide. The member-access
+see #C116 in git log for what the three sites actually decide. The member-access
 warning that stood here is #C113, closed 2026-08-18; C11 6.5.2.3p5 makes it
 undefined behaviour rather than a constraint violation, so it is a warning
 rather than the rejection an earlier version of this list called for.
@@ -434,7 +434,7 @@ two spaces can no longer be assigned to one another.
 
 What remains on that target is the `Loc::IncomingArg` variant itself, which is
 what would make the distinction *exhaustively* checked rather than centralized
-in three accessors — see #C34 in `cc/audit.md` for why adding the variant
+in three accessors — see #C34 in git log for why adding the variant
 naively would be a step backwards.
 
 #### Local CSE / Value Numbering

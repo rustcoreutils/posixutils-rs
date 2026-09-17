@@ -15,10 +15,32 @@ honoured (`-Wno-c17-dialect` silences it).
 | [BUILTIN.md](BUILTIN.md) | Compiler builtin functions (`__builtin_*`) |
 | [TODO.md](TODO.md) | Technical debt, future features, and optimization passes |
 
-Conformance is tracked in [../audit.md](../audit.md). The C99 and C11
-checklists that used to live here were retired once satisfied: they had served
-their purpose, and a checklist of 885 ticked boxes is a maintenance burden that
-says less than the audit's record of what was actually probed.
+## Conformance
+
+There is no open conformance punch list. `cc/audit.md` was retired once its
+last gap closed, following the rule in the repository's `audits.md`: a crate
+keeps an audit file only while it still has an open item, because a punch list
+with nothing on it reads as coverage while asserting nothing. The C99 and C11
+checklists went the same way earlier, once satisfied — 885 ticked boxes are a
+maintenance burden that says less than a record of what was actually probed.
+
+Every finding, every CONFORMS row and every probe is in git history.
+`git log --follow -- cc/audit.md` recovers the file; `git log --grep '#C116'`
+finds a single finding by number, in the commit that fixed it.
+
+Two things that file established are worth keeping in front of you:
+
+**Scope.** Conformance means POSIX.1-2024 and the ISO C standard it
+incorporates, and nothing else. Engineering debt that is *not* a conformance
+question belongs in [TODO.md](TODO.md) — `_FORTIFY_SOURCE` moved there because
+it, `__builtin_object_size` and the `_chk` family appear nowhere in
+POSIX.1-2024, and filing it as a conformance gap overstated what it was.
+
+**How a conformance claim is established.** By probing the built binary
+against the spec slice — not by reading the source, and not by trusting an
+earlier write-up. Several findings were originally written from a premise that
+a probe then disproved, and every unprobed ISO C row that got re-probed turned
+out to be wrong.
 
 ## Quick Links
 

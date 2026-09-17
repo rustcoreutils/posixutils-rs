@@ -62,7 +62,7 @@ One entry, and it is a technicality rather than a gap:
 
 | Attribute | Why the program cannot currently tell |
 |-----------|---------------------------------------|
-| `used` | c17 never prunes an unreferenced static, so keeping one alive is already what happens. gcc drops it at `-O2` and c17 does not. If dead-global elimination is ever added, `used` has to be consulted then, or this becomes a real divergence. See #C59 in `cc/audit.md` |
+| `used` | c17 never prunes an unreferenced static, so keeping one alive is already what happens. gcc drops it at `-O2` and c17 does not. If dead-global elimination is ever added, `used` has to be consulted then, or this becomes a real divergence. See #C59 in git log |
 
 An attribute the compiler does not recognise is no longer dropped in silence:
 it is a warning, suppressible with `-Wno-attributes`.

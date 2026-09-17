@@ -212,7 +212,7 @@ emits `__*_chk` calls -- `__OPTIMIZE__` is predefined, and
 not *check*: `__builtin_object_size` is folded at parse time, where a wrapper
 measuring its own parameter can only answer "unknown", and folding it after
 inlining is the remaining work. See the `_FORTIFY_SOURCE` entry in `TODO.md`,
-which is where this is tracked; it was also `#C12` in `../audit.md` until that
+which is where this is tracked; it was also `#C12` in the conformance audit until that
 file was narrowed to conformance findings alone.
 
 ## C11 Atomic Builtins
@@ -250,4 +250,4 @@ system header takes.
 | `__builtin_setjmp` | Not implemented; the ordinary `setjmp`/`longjmp` are |
 
 `__real__` and `__imag__` used to be listed here and are **implemented** — see
-`#C29` in `../audit.md`.
+`#C29` in git log.

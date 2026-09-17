@@ -822,8 +822,8 @@ fn test_rm_rm2() {
         &["-rf", a, b],
         "",
         &format!(
-            "rm: cannot remove '{a_1}': Permission denied\n\
-            rm: cannot remove '{b}': Permission denied\n"
+            "rm: cannot remove '{a_1_2}': Permission denied\n\
+            rm: cannot remove '{b_3}': Permission denied\n"
         ),
         1,
     );
@@ -837,6 +837,7 @@ fn test_rm_rm2() {
     assert!(!Path::new(a_3).exists());
 
     assert!(Path::new(a_1).exists());
+    assert!(Path::new(a_1_2).exists());
     assert!(Path::new(b_3).exists());
 
     fs::remove_dir_all(test_dir).unwrap();

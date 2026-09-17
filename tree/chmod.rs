@@ -105,7 +105,7 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
 
             Ok(is_dir && recurse)
         },
-        |_| Ok(()), // No-op
+        |_, _| Ok(()), // No-op
         |entry, error| {
             let e = error.inner();
             let err_str = gettext!("cannot access '{}': {}", entry.path(), error_string(&e));

@@ -597,7 +597,11 @@ where
 
             Ok(continue_processing)
         },
-        |source| {
+        // Pops unconditionally. `ftw` calls this for every directory whose handler returned
+        // `true`, including ones it then could not descend into; leaving the push in place there
+        // would silently redirect every later file into the wrong destination directory.
+        // The target directory exists either way, so `-p` still applies to it.
+        |source, _exit| {
             let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
             let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
 
@@ -632,13 +636,18 @@ where
 
             Ok(())
         },
-        |_entry, error| {
-            let e = error.inner();
+        |entry, error| {
+            // `ftw::Error` carries no filename; the entry it failed on does.
+            let err_str = gettext!(
+                "cannot access '{}': {}",
+                entry.path(),
+                error_string(&error.inner())
+            );
             if cfg.continue_on_error {
-                eprintln!("{}: {}", cfg.prog, error_string(&e));
+                eprintln!("{}: {}", cfg.prog, err_str);
                 *had_error.borrow_mut() = true;
             } else {
-                *last_error.borrow_mut() = Some(e);
+                *last_error.borrow_mut() = Some(io::Error::other(err_str));
                 *terminate.borrow_mut() = true;
             }
         },

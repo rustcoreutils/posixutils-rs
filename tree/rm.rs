@@ -336,7 +336,14 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                 Ok(true)
             }
         },
-        |entry| {
+        |entry, exit| {
+            // A directory the traversal could not descend into still has its contents, so
+            // prompting for it and attempting the removal would only produce a second diagnostic
+            // on top of the one already reported.
+            if exit == ftw::DirExit::NotDescended {
+                return Ok(());
+            }
+
             let md = entry.metadata().unwrap();
             if should_remove_directory(cfg, &entry, md) {
                 // Remove the directory
@@ -394,13 +401,13 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                 eprintln!(
                     "rm: {}",
                     gettext!(
-                        "cannot stat '{}': {}",
+                        "cannot remove '{}': {}",
                         entry.path().clean_trailing_slashes(),
                         error_string(&error.inner())
                     )
                 );
             }
-            ftw::ErrorKind::Open | ftw::ErrorKind::DirNotSearchable => {
+            ftw::ErrorKind::Open => {
                 eprintln!(
                     "rm: {}",
                     gettext!(

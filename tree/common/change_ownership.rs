@@ -96,7 +96,7 @@ where
 
             Ok(recurse)
         },
-        |_| Ok(()), // Do nothing on `postprocess_dir`
+        |_, _| Ok(()), // Do nothing on `postprocess_dir`
         |entry, error| {
             err_handler(error.inner(), entry.path());
             *had_error.borrow_mut() = true;

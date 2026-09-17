@@ -1147,3 +1147,58 @@ fn test_cp_recursive_continue_on_error() {
     fs::set_permissions(u, fs::Permissions::from_mode(0o644)).unwrap();
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+// A subdirectory the walk cannot descend into must not shift every later file one level deeper.
+// `ftw` told the copy engine to descend, which pushed a target directory descriptor, and then
+// refused; without the matching unwind the stack stayed too deep and the remaining siblings were
+// written inside the failed directory instead of beside it.
+#[test]
+fn test_cp_unreadable_subdir_does_not_misplace_siblings() {
+    if is_root() {
+        eprintln!("Skipping test: root can descend into a mode-0 directory");
+        return;
+    }
+
+    let test_dir = &format!(
+        "{}/test_cp_unreadable_subdir_does_not_misplace_siblings",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+    // Sorts before the files, so an unbalanced stack would capture all of them.
+    let locked = &format!("{src}/aaa_locked");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    fs::create_dir(locked).unwrap();
+    for name in ["zzz_b", "zzz_c", "zzz_d"] {
+        fs::write(format!("{src}/{name}.txt"), b"x").unwrap();
+    }
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    cp_test(
+        &["-R", src, dst],
+        "",
+        &format!("cp: cannot access '{locked}': Permission denied\n"),
+        1,
+    );
+
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for name in ["zzz_b", "zzz_c", "zzz_d"] {
+        assert!(
+            Path::new(&format!("{dst}/{name}.txt")).exists(),
+            "{name}.txt was not copied beside the failed directory"
+        );
+        assert!(
+            !Path::new(&format!("{dst}/aaa_locked/{name}.txt")).exists(),
+            "{name}.txt was written inside the directory that could not be read"
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

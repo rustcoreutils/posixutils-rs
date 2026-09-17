@@ -172,7 +172,7 @@ fn main() -> Result<(), io::Error> {
             |e: io::Error, path: ftw::DisplayablePath| {
                 let err_str = match e.kind() {
                     io::ErrorKind::PermissionDenied => {
-                        gettext!("cannot read directory '{}': {}", path, error_string(&e))
+                        gettext!("cannot access '{}': {}", path, error_string(&e))
                     }
                     io::ErrorKind::NotFound => {
                         gettext!("cannot access '{}': {}", path, error_string(&e))

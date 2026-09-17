@@ -31,7 +31,20 @@ pub enum ErrorKind {
     ReadDir,
     Stat,
     ReadLink,
-    DirNotSearchable,
+}
+
+/// Why `traverse_directory` is leaving a directory.
+///
+/// `postprocess_dir` is called for every directory whose `file_handler` returned `Ok(true)`,
+/// including those the traversal turned out to be unable to descend, so that a caller can unwind
+/// per-directory state it established when it returned `Ok(true)`. This says which happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirExit {
+    /// The directory was opened and its entries were enumerated.
+    Descended,
+    /// `file_handler` returned `Ok(true)`, but the directory could not be descended into. The
+    /// reason was already passed to `err_reporter`.
+    NotDescended,
 }
 
 /// Wrapper for `std::io::Error` with additional context.
@@ -184,23 +197,6 @@ impl Metadata {
             self.0.st_mode & libc::S_IWGRP != 0
         } else {
             self.0.st_mode & libc::S_IWOTH != 0
-        }
-    }
-
-    /// Check if the current process has execute or search permission for the file that this
-    /// `Metadata` refers to.
-    pub fn is_executable(&self) -> bool {
-        let (uid, gid) = self.get_uid_and_gid();
-
-        let same_user = self.0.st_uid == uid;
-        let same_group = self.0.st_gid == gid;
-
-        if same_user {
-            self.0.st_mode & libc::S_IXUSR != 0
-        } else if same_group {
-            self.0.st_mode & libc::S_IXGRP != 0
-        } else {
-            self.0.st_mode & libc::S_IXOTH != 0
         }
     }
 
@@ -573,18 +569,13 @@ where
 
     match file_handler_result {
         Ok(true) => {
-            let entry_metadata = entry.metadata.as_ref().unwrap();
-            if entry_metadata.is_dir() {
-                // Is the directory searchable?
-                if entry_metadata.is_executable() {
-                    ProcessFileResult::ProcessedDirectory(entry)
-                } else {
-                    // "Permission denied" error. `io::ErrorKind::PermissionDenied` uses
-                    // lowercase for "permission" in the error message so don't use that here.
-                    let e = io::Error::from_raw_os_error(libc::EACCES);
-                    err_reporter(entry, Error::new(e, ErrorKind::DirNotSearchable));
-                    ProcessFileResult::NotProcessed
-                }
+            // No permission probe here: `openat` below is the authority on whether the directory
+            // can be enumerated, and it needs read permission, not search permission. A mode-bit
+            // comparison also ignored supplementary groups, ACLs and the superuser bypass, so it
+            // refused directories the kernel would have opened. Let the open decide and report
+            // the errno it actually returns.
+            if entry.metadata.as_ref().unwrap().is_dir() {
+                ProcessFileResult::ProcessedDirectory(entry)
             } else {
                 ProcessFileResult::ProcessedFile
             }
@@ -724,7 +715,7 @@ pub fn traverse_directory<P, F, G, H>(
 where
     P: AsRef<Path>,
     F: FnMut(Entry<'_>) -> Result<bool, ()>,
-    G: FnMut(Entry<'_>) -> Result<(), ()>,
+    G: FnMut(Entry<'_>, DirExit) -> Result<(), ()>,
     H: FnMut(Entry<'_>, Error),
 {
     let TraverseDirectoryOpts {
@@ -782,7 +773,8 @@ where
                         stack.push(node);
                     }
                     Err(error) => {
-                        err_reporter(entry, error);
+                        err_reporter(entry.clone(), error);
+                        let _ = postprocess_dir(entry, DirExit::NotDescended);
                         return false;
                     }
                 }
@@ -832,6 +824,23 @@ where
     } else {
         libc::O_DIRECTORY | libc::O_NOFOLLOW
     };
+
+    // Refuse to descend into a directory whose `file_handler` already returned `Ok(true)`:
+    // report why, then still run `postprocess_dir` so the caller can unwind whatever state it
+    // established on that `Ok(true)`. Without the second call a caller that pushes per-directory
+    // state (`cp`'s target-directory descriptor stack, `du`'s running totals) is left one level
+    // too deep for the remainder of the walk.
+    macro_rules! refuse_descent {
+        ($entry:expr, $error:expr) => {{
+            let entry = $entry;
+            err_reporter(entry.clone(), $error);
+            success = false;
+            if postprocess_dir(entry, DirExit::NotDescended).is_err() {
+                success = false;
+            }
+            continue;
+        }};
+    }
 
     // Depth first traversal main loop
     'outer: while let Some(current) = stack.last() {
@@ -942,15 +951,13 @@ where
                                 n.metadata.0.st_dev == want_dev && n.metadata.0.st_ino == want_ino
                             })
                         {
-                            err_reporter(
+                            refuse_descent!(
                                 entry,
                                 Error::new(
                                     io::Error::from_raw_os_error(libc::ELOOP),
                                     ErrorKind::Stat,
-                                ),
+                                )
                             );
-                            success = false;
-                            continue;
                         }
 
                         let node = if conserve_fds {
@@ -1008,15 +1015,13 @@ where
                                         }
                                     };
                                     if !verified {
-                                        err_reporter(
+                                        refuse_descent!(
                                             entry,
                                             Error::new(
                                                 io::Error::from_raw_os_error(libc::ENOTDIR),
                                                 ErrorKind::OpenDir,
-                                            ),
+                                            )
                                         );
-                                        success = false;
-                                        continue;
                                     }
                                     TreeNode {
                                         dir: HybridDir::Owned(new_dir),
@@ -1026,9 +1031,7 @@ where
                                     }
                                 }
                                 Err(error) => {
-                                    err_reporter(entry, error);
-                                    success = false;
-                                    continue;
+                                    refuse_descent!(entry, error);
                                 }
                             }
                         };
@@ -1077,12 +1080,15 @@ where
             },
             None => &starting_dir,
         };
-        if postprocess_dir(Entry::new(
-            prev_dir,
-            &path_stack,
-            current.filename.clone(),
-            Some(current.metadata.clone()),
-        ))
+        if postprocess_dir(
+            Entry::new(
+                prev_dir,
+                &path_stack,
+                current.filename.clone(),
+                Some(current.metadata.clone()),
+            ),
+            DirExit::Descended,
+        )
         .is_err()
         {
             success = false;

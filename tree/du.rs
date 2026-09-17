@@ -148,7 +148,9 @@ fn du_impl(args: &Args, filename: &str, seen: &RefCell<HashSet<(u64, u64)>>) -> 
 
             Ok(is_dir)
         },
-        |entry| {
+        // Pops unconditionally: the node was pushed when the handler returned `Ok(true)`, so it
+        // has to come off again even when the traversal could not descend.
+        |entry, _exit| {
             let mut stack = stack.borrow_mut();
             if let Some(node) = stack.pop_back() {
                 let size = node.total_blocks;

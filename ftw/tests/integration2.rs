@@ -167,7 +167,7 @@ fn test_ftw_fd_raii() {
     ftw::traverse_directory(
         test_dir,
         |_| Ok(true),
-        |_| Ok(()),
+        |_, _| Ok(()),
         |_, _| {},
         ftw::TraverseDirectoryOpts::default(),
     );
@@ -233,7 +233,7 @@ fn test_ftw_too_many_open_files() {
                     dir_count += 1;
                     Ok(true)
                 },
-                |_| Ok(()),
+                |_, _| Ok(()),
                 |_, e| {
                     assert!(e.kind() == ftw::ErrorKind::Open);
                     assert_eq!(e.inner().raw_os_error(), Some(libc::EMFILE));

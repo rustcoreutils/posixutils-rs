@@ -77,7 +77,7 @@ fn descent_refuses_dir_swapped_for_symlink() {
             }
             Ok(true)
         },
-        |_entry| Ok(()),
+        |_entry, _exit| Ok(()),
         |_entry, _err| {
             *errors.borrow_mut() += 1;
         },
@@ -158,7 +158,7 @@ fn descent_refuses_dir_swapped_for_other_dir() {
             }
             Ok(true)
         },
-        |_entry| Ok(()),
+        |_entry, _exit| Ok(()),
         |_entry, _err| {
             *errors.borrow_mut() += 1;
         },
@@ -197,7 +197,7 @@ fn nonfollowing_walk_still_lists_symlink_entries() {
             visited.borrow_mut().insert(basename(&entry));
             Ok(true)
         },
-        |_entry| Ok(()),
+        |_entry, _exit| Ok(()),
         |_entry, _err| {},
         TraverseDirectoryOpts::default(),
     );

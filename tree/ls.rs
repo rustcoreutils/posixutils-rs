@@ -1244,7 +1244,7 @@ fn process_single_dir(
                 }
             }
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |entry, error| {
             let path_str = ls_from_utf8_lossy(entry.path().as_inner().as_os_str().as_bytes());
             eprintln!(

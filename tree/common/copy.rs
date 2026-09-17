@@ -111,11 +111,11 @@ fn read_source_link(source: &ftw::Entry) -> io::Result<CString> {
         return Ok(link.to_owned());
     }
 
-    let e = io::Error::last_os_error();
+    // Deliberately no errno: the `readlinkat` that failed ran inside the traversal, which
+    // reported it, and several other syscalls have overwritten `errno` since.
     Err(io::Error::other(gettext!(
-        "cannot read symbolic link '{}': {}",
-        source.path(),
-        error_string(&e)
+        "cannot read symbolic link '{}'",
+        source.path()
     )))
 }
 
@@ -474,6 +474,15 @@ where
                 )));
             }
         } else if replacing_existing {
+            if target_is_dir {
+                let err_str = gettext!(
+                    "cannot overwrite directory '{}' with non-directory '{}'",
+                    target.display(),
+                    source.path()
+                );
+                return Err(io::Error::other(err_str));
+            }
+
             // 3.a.ii. Open the source first: truncating the destination before knowing the
             // source can be read destroyed its contents and then reported a failure.
             let source_fd = unsafe {
@@ -508,15 +517,16 @@ where
             } else {
                 // 3.a.iii
                 if cfg.force {
-                    let ret = unsafe {
-                        libc::unlinkat(
-                            target_dirfd,
-                            target_filename,
-                            if target_is_dir { libc::AT_REMOVEDIR } else { 0 },
-                        )
-                    };
+                    // Plain `unlinkat`: a directory destination was refused above, and removing
+                    // one to put a file in its place is not something -f asks for.
+                    let ret = unsafe { libc::unlinkat(target_dirfd, target_filename, 0) };
                     if ret != 0 {
-                        return Err(io::Error::last_os_error());
+                        let e = io::Error::last_os_error();
+                        return Err(io::Error::other(gettext!(
+                            "cannot remove '{}': {}",
+                            target.display(),
+                            error_string(&e)
+                        )));
                     }
 
                     // 3.b
@@ -913,7 +923,10 @@ fn copy_special_file(
     // 4.b. A FIFO takes the source's permission bits (90683-90685); for the other types they are
     // implementation-defined, and GNU uses the source's as well. `mknodat` applies the umask, and
     // `-p` restores the exact bits afterwards through `copy_characteristics`.
-    #[allow(clippy::unnecessary_cast)] // `S_IFMT` is u16 on macOS and u32 on Linux
+    // 4.b. A FIFO takes the source's permission bits, umask-modified without -p
+    // (POSIX 90683-90685). That is all nine-plus-three bits: unlike a regular file, a set-user-ID
+    // FIFO is inert, and GNU reproduces the bit too. For the other types the permissions are
+    // implementation-defined; drop the set-id bits there.
     let perm = source_md.mode() & if is_fifo { 0o7777 } else { 0o777 };
 
     // 4.a: "The dest_file shall be created with the same file type as source_file." Passing no

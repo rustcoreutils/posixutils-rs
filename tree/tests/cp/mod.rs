@@ -1719,3 +1719,70 @@ fn test_cp_overwrites_symlink_target() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+// A non-directory source must never replace a directory, with or without -f. The overwrite path
+// removed an empty destination directory and put a regular file there.
+#[test]
+fn test_cp_f_does_not_replace_directory() {
+    let test_dir = &format!(
+        "{}/test_cp_f_does_not_replace_directory",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/s");
+    let src_contents = &format!("{test_dir}/s/.");
+    let dst = &format!("{test_dir}/d");
+    let clash = &format!("{test_dir}/d/sub");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    // A file in the source whose name is a directory in the destination.
+    fs::write(format!("{src}/sub"), b"FILE\n").unwrap();
+    fs::create_dir(dst).unwrap();
+    fs::create_dir(clash).unwrap();
+
+    for flags in [&["-R", "-f"][..], &["-R"][..]] {
+        let mut args = flags.to_vec();
+        args.push(src_contents);
+        args.push(dst);
+        cp_test(
+            &args,
+            "",
+            &format!("cp: cannot overwrite directory '{clash}' with non-directory '{src}/sub'\n"),
+            1,
+        );
+        assert!(
+            Path::new(clash).is_dir(),
+            "{flags:?} replaced the directory with a file"
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90683-90685 gives a FIFO the source's permission bits. Those include the set-user-ID and
+// set-group-ID bits, which carry no privilege on a FIFO; GNU reproduces them too.
+#[test]
+fn test_cp_special_fifo_keeps_set_id_bits() {
+    let test_dir = &format!(
+        "{}/test_cp_special_fifo_keeps_set_id_bits",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let fifo = &format!("{test_dir}/fifo");
+    let copy = &format!("{test_dir}/copy");
+
+    fs::create_dir(test_dir).unwrap();
+    mkfifo_at(fifo, 0o666);
+    fs::set_permissions(fifo, fs::Permissions::from_mode(0o4666)).unwrap();
+
+    cp_test(&["-R", fifo, copy], "", "", 0);
+
+    #[allow(clippy::unnecessary_cast)]
+    let setuid = libc::S_ISUID as u32;
+    assert_eq!(
+        fs::metadata(copy).unwrap().permissions().mode() & setuid,
+        setuid,
+        "the set-user-ID bit was dropped from the FIFO"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

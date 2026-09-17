@@ -131,12 +131,14 @@ fn move_file(
         Some(md) => md.file_type() == ftw::FileType::Directory,
         None => false,
     };
-    // As in `rm`, a symbolic link target is not write-protected: `mv` replaces the link itself,
-    // not what it points at, so neither the link's own mode bits nor the referent's apply.
-    let target_is_writable = match &target_md {
-        Some(md) if md.file_type() == ftw::FileType::SymbolicLink => true,
-        _ => ftw::is_writable_at(libc::AT_FDCWD, &target_filename),
-    };
+    // As in `rm`, a symbolic link destination is not write-protected: `mv` replaces the link
+    // itself, not what it points at, so neither the link's own mode bits nor the referent's
+    // apply. `target_md` follows the link, so the type has to come from an `lstat`.
+    let target_is_symlink = ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false)
+        .map(|md| md.file_type() == ftw::FileType::SymbolicLink)
+        .unwrap_or(false);
+    let target_is_writable =
+        target_is_symlink || ftw::is_writable_at(libc::AT_FDCWD, &target_filename);
 
     let source_md = match ftw::Metadata::new(libc::AT_FDCWD, &source_filename, true) {
         Ok(md) => Some(md),

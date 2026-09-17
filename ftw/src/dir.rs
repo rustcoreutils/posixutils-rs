@@ -171,18 +171,24 @@ impl DeferredDir {
         }
     }
 
-    pub fn iter(&self) -> io::Result<DeferredDirIterator<'_>> {
-        let file_descriptor = self.open_file_descriptor()?;
-        let dir = OwnedDir::new(file_descriptor)?;
-        let dirp = dir.dirp;
+    /// Reopen this directory for one visit.
+    ///
+    /// The caller keeps the result alive and takes both the descriptor and the entry stream from
+    /// it, so a conserving walk needs one descriptor per visit rather than two.
+    pub fn open(&self) -> io::Result<OwnedDir> {
+        OwnedDir::new(self.open_file_descriptor()?)
+    }
 
-        // Passing ownership of `dirp` to `SlowDirIterator`
-        std::mem::forget(dir);
-
-        Ok(DeferredDirIterator {
-            dirp,
+    /// Enumerate this directory through a descriptor already opened for it by `open`.
+    ///
+    /// Entries already yielded on an earlier visit are filtered out, which is what lets a
+    /// directory that is reopened from scratch each time resume where it left off.
+    pub fn iter_in<'a>(&'a self, dir: &'a OwnedDir) -> DeferredDirIterator<'a> {
+        DeferredDirIterator {
+            dirp: dir.dirp,
             visited: self.visited.borrow_mut(),
-        })
+            phantom: PhantomData,
+        }
     }
 
     /// Reopen this directory by path from the nearest ancestor descriptor still held.
@@ -224,14 +230,8 @@ impl DeferredDir {
 pub struct DeferredDirIterator<'a> {
     dirp: *mut libc::DIR,
     visited: RefMut<'a, HashSet<Box<[u8]>>>,
-}
-
-impl Drop for DeferredDirIterator<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            libc::closedir(self.dirp);
-        }
-    }
+    /// The stream belongs to the `OwnedDir` this was created from, which closes it.
+    phantom: PhantomData<&'a OwnedDir>,
 }
 
 impl<'a> Iterator for DeferredDirIterator<'a> {
@@ -274,15 +274,4 @@ impl<'a> Iterator for DeferredDirIterator<'a> {
 pub enum HybridDir {
     Owned(OwnedDir),
     Deferred(DeferredDir),
-}
-
-impl HybridDir {
-    pub fn iter<'a>(
-        &'a self,
-    ) -> io::Result<Box<dyn Iterator<Item = io::Result<EntryInternal<'a>>> + 'a>> {
-        match self {
-            HybridDir::Owned(d) => Ok(Box::new(d.iter())),
-            HybridDir::Deferred(d) => Ok(Box::new(d.iter()?)),
-        }
-    }
 }

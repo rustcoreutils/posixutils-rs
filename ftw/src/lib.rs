@@ -837,13 +837,16 @@ where
         }
     };
 
-    // Subtract a few to allow for some FD bookkeeping. `saturating_sub` guards against an
-    // implausibly tiny `RLIMIT_NOFILE`, and the upper clamp against `RLIM_INFINITY`, which would
-    // otherwise disable conservation entirely and leave the walk to fail at the kernel's own
-    // per-process cap.
+    // Descriptors that are in use but not accounted for per level: the three standard streams,
+    // the two a caller holds open while copying one file, the one this walk reopens a deferred
+    // parent with on the way out, and slack. Conservation has to start before these no longer
+    // fit, or the walk fails at its deepest point having done all the work.
+    const FD_RESERVE: usize = 16;
+    // The upper clamp is for `RLIM_INFINITY`, which would otherwise disable conservation
+    // entirely and leave the walk to fail at the kernel's own per-process cap instead.
     const MAX_FD_THRESHOLD: usize = 4096;
     let fd_threshold: usize = (fd_rlim_cur as usize)
-        .saturating_sub(7)
+        .saturating_sub(FD_RESERVE)
         .clamp(1, MAX_FD_THRESHOLD);
 
     // Flags OR'ed into every descent `openat`. `O_DIRECTORY` rejects a directory entry that was
@@ -877,18 +880,9 @@ where
     'outer: while let Some(current) = stack.last() {
         let dir = &current.dir;
 
-        // Holds a descriptor reopened for a deferred directory alive for the rest of the body.
-        let reopened;
-        let dir_fd_result = match dir {
-            HybridDir::Owned(dir) => Ok(dir.file_descriptor()),
-            HybridDir::Deferred(dir) => match dir.open_file_descriptor() {
-                Ok(fd) => {
-                    reopened = fd;
-                    Ok(&reopened)
-                }
-                Err(e) => Err(e),
-            },
-        };
+        // Keeps a deferred directory's reopened handle alive for as long as it is enumerated.
+        // Dropped before the exit block below, which needs a descriptor of its own.
+        let mut reopened = None;
 
         // Resize `path_stack` to the appropriate depth.
         debug_assert!(path_stack.len() >= current.path_depth);
@@ -914,19 +908,22 @@ where
         // own `let`, leaving only `dir_iter` holding the borrow of `dir` -- which the body
         // already drops explicitly before pushing to `stack`.
         'enumerate: {
-            let dir_fd = match dir_fd_result {
-                Ok(dir_fd) => dir_fd,
-                Err(e) => {
-                    enumeration_error = Some(e);
-                    break 'enumerate;
-                }
-            };
-            let mut dir_iter = match dir.iter() {
-                Ok(dir_iter) => dir_iter,
-                Err(e) => {
-                    enumeration_error = Some(e);
-                    break 'enumerate;
-                }
+            // One descriptor per visit, not two: a deferred directory is reopened once here and
+            // both the descriptor and the entry stream come from that same handle. Opening them
+            // separately cost two descriptors per level in exactly the mode that exists to
+            // conserve them.
+            let (dir_fd, mut dir_iter): (&FileDescriptor, Box<dyn Iterator<Item = _>>) = match dir {
+                HybridDir::Owned(dir) => (dir.file_descriptor(), Box::new(dir.iter())),
+                HybridDir::Deferred(deferred) => match deferred.open() {
+                    Ok(owned) => {
+                        let owned = reopened.insert(owned);
+                        (owned.file_descriptor(), Box::new(deferred.iter_in(owned)))
+                    }
+                    Err(e) => {
+                        enumeration_error = Some(e);
+                        break 'enumerate;
+                    }
+                },
             };
             {
                 // Read the current directory
@@ -1143,6 +1140,9 @@ where
                 }
             }
         }
+
+        // The directory has been read; give its descriptor back before reopening the parent.
+        drop(reopened);
 
         if let Some(e) = enumeration_error {
             err_reporter(

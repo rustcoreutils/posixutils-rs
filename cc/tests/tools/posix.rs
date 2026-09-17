@@ -910,7 +910,10 @@ fn cflow_processes_lex_input() {
     }
 }
 
-/// Build a `.s` fixture by compiling C, and return (its path, the temp dir).
+/// Build a `.s` fixture by compiling C into assembly, and return its path.
+///
+/// The file lives in `dir`, which the caller owns and which must outlive the
+/// run that reads it.
 ///
 /// Every function has external linkage on purpose. Call edges are recovered
 /// from relocations, and an intra-section call to a file-local symbol leaves
@@ -1060,6 +1063,68 @@ fn cflow_capital_s_preprocessor_errors_are_loud() {
     assert!(
         stderr.contains("missing.S"),
         "diagnostic should name the operand: {:?}",
+        stderr
+    );
+}
+
+/// One operand's failure must not condemn the next one.
+///
+/// The compiler front end's error state is a sticky process-global, so asking
+/// "did an error happen?" after preprocessing a `.S` answers "has anything
+/// failed since this process started?" -- and a clean `.S` after any earlier
+/// failure was rejected without being looked at. POSIX CONSEQUENCES OF ERRORS
+/// is Default here, and the utility processes the operands it was given.
+#[test]
+fn cflow_a_failing_operand_does_not_condemn_later_ones() {
+    let dir = TempDir::new().unwrap();
+    let good = {
+        let s = assembler_fixture(&dir, "after");
+        let body = fs::read_to_string(&s).unwrap();
+        src(&dir, "after.S", &body)
+    };
+
+    // Two ways to fail first: a C operand, and another .S.
+    for first in [
+        src(&dir, "broken.c", "#include \"no-such-header.h\"\n"),
+        src(&dir, "broken.S", "#error deliberate\n"),
+    ] {
+        let (stdout, stderr, code) = run("cflow", &[&first, &good]);
+        assert_ne!(code, 0, "the failing operand must still set the status");
+        assert!(
+            stdout.contains("main:") && stdout.contains("after.S "),
+            "the good .S must still be analyzed after {:?} failed:\nout={:?}\nerr={:?}",
+            first,
+            stdout,
+            stderr
+        );
+    }
+
+    // And on its own it is still clean.
+    let (_, _, code) = run("cflow", &[&good]);
+    assert_eq!(code, 0);
+}
+
+/// An assembler diagnostic for a `.S` names the operand *and* its real line.
+///
+/// Preprocessing drops directive lines, so the temporary handed to `as` is
+/// shorter than the operand. Rewriting the path without keeping the line
+/// numbers true turns an obviously-suspect temp path into a confident wrong
+/// location -- the worse of the two failures.
+#[test]
+fn cflow_capital_s_assembler_errors_carry_the_source_line() {
+    let dir = TempDir::new().unwrap();
+    // Three directive lines before the bad instruction on line 6.
+    let bad = src(
+        &dir,
+        "lines.S",
+        "#define A 1\n#if A\n    .text\n#endif\n    .globl e\n    bogusinsn %rax\n",
+    );
+
+    let (_, stderr, code) = run("cflow", &[&bad]);
+    assert_ne!(code, 0, "a .S that will not assemble must fail");
+    assert!(
+        stderr.contains("lines.S:6:"),
+        "diagnostic should name the operand's own line 6, got {:?}",
         stderr
     );
 }

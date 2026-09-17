@@ -320,7 +320,13 @@ fn set_error(flag: u32) {
     HAS_ERROR.fetch_or(flag, Ordering::Relaxed);
 }
 
-#[cfg(test)]
+/// How many errors have been reported so far.
+///
+/// A monotonically increasing count, unlike [`has_error`], which is a sticky
+/// bitmask and so cannot distinguish "an error happened here" from "an error
+/// happened at some point earlier in this process". A caller wrapping one
+/// fallible step -- preprocessing a single operand, say -- snapshots this
+/// before and compares after.
 pub fn error_count() -> u32 {
     ERROR_COUNT.load(Ordering::Relaxed)
 }

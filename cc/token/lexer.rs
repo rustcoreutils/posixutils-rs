@@ -1866,8 +1866,15 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
         let spelling = &result[start..];
         let first_char = spelling.first().copied();
 
-        // Handle newlines: if token is on a new line, add newline(s)
-        if token.pos.newline && start > 0 {
+        // Handle newlines: if token is on a new line, add newline(s).
+        //
+        // This runs for the first token too, and must: directives before it
+        // produce no output, so without the padding the first real token lands
+        // on line 1 and every line after it is short by however many directives
+        // preceded it. The assembler then reports a confident wrong location --
+        // `#define`/`#if` above the first instruction shifted a `.S` diagnostic
+        // three lines in the case that found this.
+        if token.pos.newline {
             let spelling: Vec<u8> = result.split_off(start);
             while last_line < token.pos.line {
                 result.push(b'\n');

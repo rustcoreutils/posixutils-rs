@@ -2609,6 +2609,21 @@ pub struct AsmPreprocessConfig<'a> {
     pub optimization: crate::opt::Optimization,
 }
 
+/// A `.S` operand that could not be preprocessed.
+///
+/// The diagnostics have already been printed; this only reports *that* they
+/// were, so the caller does not have to interrogate a global to find out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsmPreprocessFailed;
+
+impl std::fmt::Display for AsmPreprocessFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "preprocessing failed")
+    }
+}
+
+impl std::error::Error for AsmPreprocessFailed {}
+
 /// Preprocess an assembly file (.S) and return the preprocessed text.
 ///
 /// This uses the same preprocessor as C files but with assembly-specific
@@ -2617,13 +2632,21 @@ pub struct AsmPreprocessConfig<'a> {
 /// # Returns
 /// The preprocessed assembly text, as bytes: a string literal's payload is a
 /// byte sequence, so rendering it through a Rust `String` would re-encode
-/// every byte >= 0x80.
+/// every byte >= 0x80. `Err` means this call reported a diagnostic -- a
+/// `#error`, a missing include -- and the bytes are not worth assembling.
+///
+/// The error count is compared against a snapshot taken on entry, rather than
+/// `diag::has_error()` being read afterwards, because that flag is a sticky
+/// process-global: reading it tells you whether *anything* has failed since
+/// the process started, not whether this call did. A caller that gets that
+/// wrong condemns every later operand once any earlier one has failed.
 pub fn preprocess_asm_file(
     content: &[u8],
     target: &Target,
     filename: &str,
     config: &AsmPreprocessConfig<'_>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, AsmPreprocessFailed> {
+    let errors_on_entry = diag::error_count();
     // Create string table for tokenization
     let mut strings = IdentTable::new();
 
@@ -2681,7 +2704,12 @@ pub fn preprocess_asm_file(
     pp.report_unterminated_conditionals();
 
     // Convert tokens back to text
-    tokens_to_source_bytes(&preprocessed, &strings)
+    let text = tokens_to_source_bytes(&preprocessed, &strings);
+
+    if diag::error_count() != errors_on_entry {
+        return Err(AsmPreprocessFailed);
+    }
+    Ok(text)
 }
 
 #[cfg(test)]

@@ -771,14 +771,10 @@ fn preprocess_assembler(
         // Not a compiler: nothing here optimizes, so nothing claims to.
         optimization: Default::default(),
     };
-    let preprocessed = preprocess_asm_file(&content, &target, file, &config);
-
-    // preprocess_asm_file reports through the shared counter and returns
-    // whatever it managed to produce, so a #error or a missing include is only
-    // visible here. Assembling the remains would bury it.
-    if posixutils_cc::diag::has_error() != 0 {
-        return Err(io::Error::other(gettext("preprocessing failed")));
-    }
+    // A #error or a missing include makes the remaining bytes not worth
+    // assembling: `as` would bury the real diagnostic under syntax errors.
+    let preprocessed = preprocess_asm_file(&content, &target, file, &config)
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let out = dir.path().join("a.s");
     std::fs::write(&out, &preprocessed)?;

@@ -570,14 +570,10 @@ fn preprocess_asm_operand(
         search: system_search(args),
         no_std_inc: args.no_std_inc,
     };
-    let preprocessed = preprocess_asm_file(&content, target, path, &config);
-    if diag::has_error() != 0 {
+    let preprocessed = preprocess_asm_file(&content, target, path, &config).map_err(|e| {
         diag::reset_counts();
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "preprocessing failed",
-        ));
-    }
+        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+    })?;
     out.write_all(&preprocessed)?;
     out.flush()
 }
@@ -1871,12 +1867,12 @@ fn assemble_operand(
             search: system_search(args),
             no_std_inc: args.no_std_inc,
         };
-        let preprocessed = preprocess_asm_file(&content, target, path, &asm_config);
-        // Catch #error, a missing include, and friends.
-        if diag::has_error() != 0 {
-            diag::reset_counts();
-            return Err(io::Error::other("preprocessing failed"));
-        }
+        // Catches #error, a missing include, and friends.
+        let preprocessed =
+            preprocess_asm_file(&content, target, path, &asm_config).map_err(|e| {
+                diag::reset_counts();
+                io::Error::other(e.to_string())
+            })?;
         std::fs::write(&temp_s, &preprocessed)?;
         temp_s
     } else {

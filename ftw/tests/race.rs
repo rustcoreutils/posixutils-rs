@@ -77,7 +77,7 @@ fn descent_refuses_dir_swapped_for_symlink() {
             }
             Ok(true)
         },
-        |_entry| Ok(()),
+        |_entry, _exit| Ok(()),
         |_entry, _err| {
             *errors.borrow_mut() += 1;
         },
@@ -158,7 +158,7 @@ fn descent_refuses_dir_swapped_for_other_dir() {
             }
             Ok(true)
         },
-        |_entry| Ok(()),
+        |_entry, _exit| Ok(()),
         |_entry, _err| {
             *errors.borrow_mut() += 1;
         },
@@ -197,7 +197,7 @@ fn nonfollowing_walk_still_lists_symlink_entries() {
             visited.borrow_mut().insert(basename(&entry));
             Ok(true)
         },
-        |_entry| Ok(()),
+        |_entry, _exit| Ok(()),
         |_entry, _err| {},
         TraverseDirectoryOpts::default(),
     );
@@ -207,5 +207,50 @@ fn nonfollowing_walk_still_lists_symlink_entries() {
     assert!(
         visited.contains("link"),
         "symlink entry should still be listed: {visited:?}"
+    );
+}
+
+/// A walk that does not follow symbolic links still resolves their targets. `cp -P` and `mv`
+/// recreate a link from `Entry::read_link`, so leaving it unset here made them fail on the one
+/// configuration that needs it most.
+#[test]
+fn symlink_target_available_without_following() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("symlink_target_available_without_following")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+
+    fs::write(root.join("real"), b"x").unwrap();
+    std::os::unix::fs::symlink("real", root.join("to_real")).unwrap();
+    // Dangling too: the target is still readable even though it resolves to nothing.
+    std::os::unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
+
+    let mut targets: Vec<(String, Option<String>)> = Vec::new();
+    traverse_directory(
+        root,
+        |entry| {
+            if entry.is_symlink() == Some(true) {
+                targets.push((
+                    entry.file_name().to_string_lossy().to_string(),
+                    entry
+                        .read_link()
+                        .map(|link| link.to_string_lossy().to_string()),
+                ));
+            }
+            Ok(true)
+        },
+        |_entry, _exit| Ok(()),
+        |_entry, _err| {},
+        TraverseDirectoryOpts::default(),
+    );
+
+    targets.sort();
+    assert_eq!(
+        targets,
+        [
+            ("dangling".to_string(), Some("nowhere".to_string())),
+            ("to_real".to_string(), Some("real".to_string())),
+        ]
     );
 }

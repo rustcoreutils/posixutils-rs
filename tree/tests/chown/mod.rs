@@ -660,7 +660,7 @@ fn test_chown_hardlink() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #CO4: the `owner:` form (trailing colon, empty group) sets the group to the owner's login
+// The `owner:` form (trailing colon, empty group) sets the group to the owner's login
 // group rather than erroring.
 #[test]
 fn test_chown_owner_colon_login_group() {

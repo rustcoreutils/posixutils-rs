@@ -148,7 +148,7 @@ fn test_ftw_simple() {
             filenames.push(s);
             Ok(true)
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |_, e| panic!("{}", e.inner()),
         ftw::TraverseDirectoryOpts::default(),
     );
@@ -166,7 +166,7 @@ fn test_ftw_simple() {
             filenames.push(s);
             Ok(true)
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |_, e| panic!("{}", e.inner()),
         ftw::TraverseDirectoryOpts {
             list_contents_first: true,
@@ -223,7 +223,7 @@ fn test_ftw_symlinks() {
             filenames.push(s);
             Ok(true)
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |_, e| panic!("{}", e.inner()),
         ftw::TraverseDirectoryOpts {
             follow_symlinks: true,
@@ -271,7 +271,7 @@ fn test_ftw_deep() {
             count += 1;
             Ok(true)
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |_, e| panic!("{}", e.inner()),
         ftw::TraverseDirectoryOpts::default(),
     );
@@ -318,7 +318,7 @@ fn test_ftw_deep_symlinks() {
             count += 1;
             Ok(true)
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |_, e| panic!("{}", e.inner()),
         ftw::TraverseDirectoryOpts {
             follow_symlinks: true,
@@ -374,7 +374,7 @@ fn test_ftw_path_prefix_modification() {
 
             Ok(true)
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |entry, e| {
             // a/b/c is indeed removed so ignore this error
             if e.kind() == ftw::ErrorKind::Open {
@@ -406,7 +406,7 @@ fn test_ftw_path_prefix_modification() {
             filenames.push(filename.to_str().unwrap().to_owned());
             Ok(true)
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |_, e| panic!("{}", e.inner()),
         ftw::TraverseDirectoryOpts {
             follow_symlinks_on_args: true,
@@ -473,7 +473,7 @@ fn test_ftw_long_filename() {
             dirs.insert(entry.file_name().to_string_lossy().to_string());
             Ok(true)
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |_, e| panic!("{:?}", e.kind()),
         ftw::TraverseDirectoryOpts::default(),
     );
@@ -483,4 +483,305 @@ fn test_ftw_long_filename() {
         assert!(dirs.contains(&filename));
     }
     // Cleanup happens automatically when cleanup is dropped
+}
+
+/// Forces the descriptor-conserving (`DeferredDir`) strategy from the first level, without
+/// touching the process-wide `RLIMIT_NOFILE`.
+fn conserving_fds_opts() -> ftw::TraverseDirectoryOpts {
+    ftw::TraverseDirectoryOpts {
+        caller_fds_per_level: 4096,
+        ..Default::default()
+    }
+}
+
+/// A conserving walk reopens each directory and filters the entries it already yielded. Keying
+/// that filter on the inode instead of the name dropped the second of two hard links to one file,
+/// and every mount point past the first (all roots are inode 2), silently losing files.
+#[test]
+fn conserving_walk_yields_every_hard_link() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("conserving_walk_yields_every_hard_link")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+
+    // A subdirectory, so the walk has somewhere to descend and must reopen `sub` afterwards.
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("plain"), b"x").unwrap();
+    fs::write(sub.join("link_a"), b"y").unwrap();
+    fs::hard_link(sub.join("link_a"), sub.join("link_b")).unwrap();
+    fs::create_dir(sub.join("deeper")).unwrap();
+    fs::write(sub.join("deeper/inner"), b"z").unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    ftw::traverse_directory(
+        root,
+        |entry| {
+            // Skip the operand itself, which is reported relative to the current directory.
+            if entry.dir_fd() != libc::AT_FDCWD {
+                seen.push(entry.file_name().to_string_lossy().to_string());
+            }
+            Ok(true)
+        },
+        |_, _| Ok(()),
+        |entry, e| panic!("unexpected error on {}: {:?}", entry.path(), e.kind()),
+        conserving_fds_opts(),
+    );
+
+    seen.sort();
+    assert_eq!(
+        seen,
+        ["deeper", "inner", "link_a", "link_b", "plain", "sub"],
+        "a conserving walk must visit every name exactly once"
+    );
+}
+
+/// A failing `readdir` in the directory named on the command line is reported against that
+/// directory and ends the walk. The reporter used to index `path_stack` two components back,
+/// which underflows at depth 1, and the loop used to `continue` -- but `readdir` keeps returning
+/// the same error, so it never terminated.
+///
+/// Whether the sabotage below produces a `readdir` failure at all is platform-dependent, so the
+/// assertion about it is made only where it can be provoked; the walk must terminate everywhere.
+#[test]
+fn readdir_error_on_root_reports_once_and_terminates() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("readdir_error_on_root")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+
+    // Several entries so at least one more `readdir` follows the one that succeeded.
+    for name in ["a", "b", "c", "d"] {
+        fs::write(root.join(name), b"x").unwrap();
+    }
+
+    // Replace the directory's descriptor with one referring to a non-directory. `dup2` rather
+    // than `close` keeps the descriptor number allocated: closing it would let another thread in
+    // this test binary reuse the number.
+    //
+    // On Linux the next `getdents` on that descriptor fails with ENOTDIR, which is the error path
+    // under test. On macOS the entries the C library has already buffered simply drain and the
+    // stream ends -- reading the empty scratch file returns end-of-file rather than an error -- so
+    // no `readdir` failure is produced there.
+    let scratch = fs::File::create(tmp_dir.path().join("scratch")).unwrap();
+    let mut sabotaged = false;
+    let mut errors: Vec<(String, ftw::ErrorKind)> = Vec::new();
+
+    ftw::traverse_directory(
+        root,
+        |entry| {
+            if !sabotaged && entry.dir_fd() != libc::AT_FDCWD {
+                sabotaged = true;
+                assert_ne!(
+                    unsafe { libc::dup2(scratch.as_raw_fd(), entry.dir_fd()) },
+                    -1
+                );
+            }
+            Ok(true)
+        },
+        |_, _| Ok(()),
+        |entry, e| errors.push((entry.path().to_string(), e.kind())),
+        ftw::TraverseDirectoryOpts::default(),
+    );
+
+    assert!(sabotaged, "the walk never entered the root directory");
+
+    // Reaching here at all is the guard against the non-terminating loop, on every platform.
+
+    // Entries already buffered by the C library are still handed back, and their `fstatat` now
+    // fails against the replaced descriptor; those reports are collateral of the sabotage. What
+    // matters is the `readdir` failure itself: reported once, and naming the root rather than
+    // panicking on a path stack too short to index.
+    let readdir_errors: Vec<&String> = errors
+        .iter()
+        .filter(|(_, kind)| *kind == ftw::ErrorKind::ReadDir)
+        .map(|(path, _)| path)
+        .collect();
+
+    assert!(
+        readdir_errors.len() <= 1,
+        "the failing directory was reported more than once: {errors:?}"
+    );
+    for path in &readdir_errors {
+        assert_eq!(
+            **path,
+            root.to_string_lossy(),
+            "the report must name the directory that could not be read"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        readdir_errors.len(),
+        1,
+        "expected a readdir report, got {errors:?}"
+    );
+}
+
+/// Counts `file_handler` returning `Ok(true)` for a directory against `postprocess_dir` calls.
+/// A caller that establishes per-directory state on `Ok(true)` unwinds it in `postprocess_dir`,
+/// so the two must match however the walk turns out.
+fn assert_enter_exit_balanced(
+    root: &Path,
+    opts: ftw::TraverseDirectoryOpts,
+) -> Vec<ftw::ErrorKind> {
+    use std::cell::{Cell, RefCell};
+
+    let depth = Cell::new(0i64);
+    let entered = Cell::new(0usize);
+    let exited = Cell::new(0usize);
+    let errors = RefCell::new(Vec::new());
+
+    ftw::traverse_directory(
+        root,
+        |entry| {
+            if entry.metadata().map(|md| md.is_dir()).unwrap_or(false) {
+                depth.set(depth.get() + 1);
+                entered.set(entered.get() + 1);
+            }
+            Ok(true)
+        },
+        |_, _| {
+            depth.set(depth.get() - 1);
+            exited.set(exited.get() + 1);
+            assert!(
+                depth.get() >= 0,
+                "postprocess_dir called without a matching enter"
+            );
+            Ok(())
+        },
+        |_, e| errors.borrow_mut().push(e.kind()),
+        opts,
+    );
+
+    assert_eq!(
+        entered.get(),
+        exited.get(),
+        "{} directories entered but {} exited",
+        entered.get(),
+        exited.get()
+    );
+    assert_eq!(
+        depth.get(),
+        0,
+        "traversal ended {} levels deep",
+        depth.get()
+    );
+    errors.into_inner()
+}
+
+/// An unreadable subdirectory must not unbalance the callbacks for everything that follows it.
+#[test]
+fn enter_exit_balanced_when_descent_refused() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("Skipping test: root can descend into a mode-0 directory");
+        return;
+    }
+
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("enter_exit_balanced_when_descent_refused")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+
+    // Sorted before the siblings, so the imbalance would affect everything after it.
+    let locked = root.join("aaa_locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("child"), b"x").unwrap();
+    fs::create_dir(root.join("zzz_other")).unwrap();
+    fs::write(root.join("zzz_file"), b"x").unwrap();
+
+    fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+
+    let errors = assert_enter_exit_balanced(root, ftw::TraverseDirectoryOpts::default());
+
+    // Restore before the temp dir is removed.
+    fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        errors,
+        [ftw::ErrorKind::Open],
+        "the refusal must be reported, with the errno the open actually returned"
+    );
+}
+
+/// The same, for a symbolic link loop, which is refused after the handler has already been told
+/// to descend.
+#[test]
+fn enter_exit_balanced_on_symlink_loop() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("enter_exit_balanced_on_symlink_loop")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    unix::fs::symlink("..", sub.join("loop")).unwrap();
+    fs::write(root.join("after"), b"x").unwrap();
+
+    let errors = assert_enter_exit_balanced(
+        root,
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(errors, [ftw::ErrorKind::Stat], "expected an ELOOP report");
+}
+
+/// A directory that is readable but not searchable can still be enumerated: `opendir` needs read
+/// permission, not search permission. ftw used to probe the mode bits itself and refuse it.
+#[test]
+fn readable_but_not_searchable_dir_is_enumerated() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("Skipping test: root is not subject to the mode bits under test");
+        return;
+    }
+
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("readable_but_not_searchable_dir")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("visible"), b"x").unwrap();
+    fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+
+    let mut names = Vec::new();
+    let mut errors = Vec::new();
+    ftw::traverse_directory(
+        root,
+        |entry| {
+            names.push(entry.file_name().to_string_lossy().to_string());
+            Ok(true)
+        },
+        |_, _| Ok(()),
+        |entry, e| errors.push((entry.path().to_string(), e.kind())),
+        ftw::TraverseDirectoryOpts::default(),
+    );
+
+    fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    assert!(
+        names.iter().any(|n| n == "sub"),
+        "the directory itself was never handed to the handler: {names:?}"
+    );
+
+    // `readdir` needs read permission and succeeds, so the walk reaches the child and fails on
+    // *its* `fstatat`, which needs search permission. Previously ftw probed the mode bits before
+    // descending and refused the whole directory with a single EACCES, never reading it at all.
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|(path, kind)| path.ends_with("/visible") && *kind == ftw::ErrorKind::Stat)
+            .count(),
+        1,
+        "expected the walk to enumerate the directory and fail on the child: {errors:?}"
+    );
 }

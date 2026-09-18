@@ -1456,7 +1456,7 @@ fn test_mv_sticky_to_xpart() {
     fs::remove_dir_all(other_dir).unwrap();
 }
 
-// Audit #M2: more than one source with a non-directory target must error (mv synopsis), and the
+// More than one source with a non-directory target must error (mv synopsis), and the
 // first source must NOT be moved.
 #[test]
 fn test_mv_multi_source_nondir_target() {
@@ -1486,7 +1486,7 @@ fn test_mv_multi_source_nondir_target() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #M2 (108049-108050): a non-directory source with a trailing-slash target_file is an error.
+// POSIX 108049-108050: a non-directory source with a trailing-slash target_file is an error.
 #[test]
 fn test_mv_nondir_source_trailing_slash() {
     let test_dir = &format!(
@@ -1507,5 +1507,84 @@ fn test_mv_nondir_source_trailing_slash() {
     );
     assert!(Path::new(f).exists());
 
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// A cross-filesystem move falls back to copying, and POSIX mv step 6 (108097-108099) requires
+// links in the hierarchy to be duplicated as links. The copy engine read the link target from a
+// field the walk had left unset, and panicked, leaving an empty directory at the destination.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_mv_xdev_dir_with_symlink() {
+    let test_name = "test_mv_xdev_dir_with_symlink";
+    let test_dir = &format!("{}/{test_name}", env!("CARGO_TARGET_TMPDIR"));
+    let src = &format!("{test_dir}/d");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    fs::write(format!("{src}/real"), b"REAL\n").unwrap();
+    unix::fs::symlink("real", format!("{src}/link")).unwrap();
+
+    let other_dir = &format!(
+        "{}/{test_name}",
+        option_env!("OTHER_PARTITION_TMPDIR").unwrap_or("/dev/shm")
+    );
+    let _ = fs::remove_dir_all(other_dir);
+    fs::create_dir(other_dir).unwrap();
+
+    mv_test(&[src, other_dir], "", "", 0);
+
+    assert!(!Path::new(src).exists(), "the source was not removed");
+
+    let moved = &format!("{other_dir}/d");
+    let mut contents = String::new();
+    fs::File::open(format!("{moved}/real"))
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "REAL\n");
+
+    let moved_link = &format!("{moved}/link");
+    assert!(
+        fs::symlink_metadata(moved_link).unwrap().is_symlink(),
+        "the link was not duplicated as a link"
+    );
+    assert_eq!(fs::read_link(moved_link).unwrap(), Path::new("real"));
+
+    fs::remove_dir_all(other_dir).unwrap();
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// A symbolic link named as an operand is moved as a link, not replaced by a copy of its referent.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_mv_xdev_symlink_operand() {
+    let test_name = "test_mv_xdev_symlink_operand";
+    let test_dir = &format!("{}/{test_name}", env!("CARGO_TARGET_TMPDIR"));
+    let real = &format!("{test_dir}/real");
+    let link = &format!("{test_dir}/link");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(real, b"REAL\n").unwrap();
+    unix::fs::symlink("real", link).unwrap();
+
+    let other_dir = &format!(
+        "{}/{test_name}",
+        option_env!("OTHER_PARTITION_TMPDIR").unwrap_or("/dev/shm")
+    );
+    let _ = fs::remove_dir_all(other_dir);
+    fs::create_dir(other_dir).unwrap();
+
+    mv_test(&[link, other_dir], "", "", 0);
+
+    let moved = &format!("{other_dir}/link");
+    assert!(
+        fs::symlink_metadata(moved).unwrap().is_symlink(),
+        "the operand link became a regular copy of its referent"
+    );
+    assert_eq!(fs::read_link(moved).unwrap(), Path::new("real"));
+    assert!(Path::new(real).exists(), "the referent was moved too");
+
+    fs::remove_dir_all(other_dir).unwrap();
     fs::remove_dir_all(test_dir).unwrap();
 }

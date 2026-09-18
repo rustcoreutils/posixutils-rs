@@ -21,14 +21,55 @@ use std::{
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
-pub type InodeMap = HashMap<(u64, u64), (ftw::FileDescriptor, CString)>;
+/// Where each already-copied inode landed, so a later name for the same file can be hard-linked
+/// to it instead of copied again.
+///
+/// The descriptor is shared rather than duplicated: `dup`ing one per hard-linked inode grew the
+/// process's descriptor use without bound over a large move, and made the walk's own descriptor
+/// budget meaningless.
+pub type InodeMap = HashMap<(u64, u64), (Rc<ftw::FileDescriptor>, CString)>;
+
+/// Which symbolic links are acted on by what they refer to, rather than as links
+/// (POSIX cp 90609-90623).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DerefMode {
+    /// `-P`: act on the link itself, whether it is an operand or was found during the walk.
+    Never,
+    /// `-H`: act on the referent of a link named as an operand, and on nothing else.
+    CommandLineOnly,
+    /// `-L`, and the default when `-R` was not given (90610-90612).
+    Always,
+}
+
+impl DerefMode {
+    fn follow_symlinks_on_args(self) -> bool {
+        self != DerefMode::Never
+    }
+
+    fn follow_symlinks(self) -> bool {
+        self == DerefMode::Always
+    }
+
+    /// Whether *this* entry's link is to be followed.
+    ///
+    /// This lines up with what the traversal was told to do, which is what makes the entry's
+    /// metadata the right one to act on: under `CommandLineOnly` the walk dereferences exactly
+    /// the operand, which is exactly where `at_top_level` is true.
+    fn deref_entry(self, at_top_level: bool) -> bool {
+        match self {
+            DerefMode::Always => true,
+            DerefMode::CommandLineOnly => at_top_level,
+            DerefMode::Never => false,
+        }
+    }
+}
 
 pub struct CopyConfig {
     pub force: bool,
-    pub follow_cli: bool,
-    pub dereference: bool,
+    pub deref: DerefMode,
     pub interactive: bool,
     pub preserve: bool,
     pub recursive: bool,
@@ -49,20 +90,77 @@ enum CopyResult {
 // Implements the algorithm for `cp`:
 //
 // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/cp.html
+/// State carried across every entry of one `copy_file` walk.
+struct CopyState<'a> {
+    /// Destinations this copy has already written, so a later source cannot clobber one.
+    created_files: &'a mut HashSet<PathBuf>,
+    /// Identity of every destination directory this copy created or entered.
+    dest_dir_ids: &'a RefCell<HashSet<(u64, u64)>>,
+    /// The operands as the user wrote them, for the diagnostics that must name them rather than
+    /// the entry the failure was noticed on.
+    operands: (&'a Path, &'a Path),
+}
+
+/// The pathname stored in the symbolic link `source`.
+///
+/// `ftw` fills in `Entry::read_link` for every symbolic link, but reading it here keeps this
+/// correct regardless of how the walk was configured -- the alternative was an `unwrap` that
+/// turned a missing value into a process abort.
+fn read_source_link(source: &ftw::Entry) -> io::Result<CString> {
+    if let Some(link) = source.read_link() {
+        return Ok(link.to_owned());
+    }
+
+    // Deliberately no errno: the `readlinkat` that failed ran inside the traversal, which
+    // reported it, and several other syscalls have overwritten `errno` since.
+    Err(io::Error::other(gettext!(
+        "cannot read symbolic link '{}'",
+        source.path()
+    )))
+}
+
+/// Renders a mode as the pair used in the overwrite prompt: four octal digits, and the nine
+/// `rwx` characters.
+fn format_mode(mode: u32) -> (String, String) {
+    let mut mode_str = String::new();
+    let bit_loc = 0o400;
+    for i in 0..9 {
+        let mask = bit_loc >> i;
+        if mode & mask != 0 {
+            match i % 3 {
+                0 => mode_str.push('r'),
+                1 => mode_str.push('w'),
+                2 => mode_str.push('x'),
+                _ => (),
+            }
+        } else {
+            mode_str.push('-');
+        }
+    }
+
+    // `gettext!` takes no format spec, so the octal has to be rendered separately.
+    (format!("{:04o}", mode & 0o7777), mode_str)
+}
+
 fn copy_file_impl<F>(
     cfg: &CopyConfig,
     source: &ftw::Entry,
     target: &Path,
     target_dirfd: libc::c_int,
     target_filename: *const libc::c_char,
-    created_files: &mut HashSet<PathBuf>,
+    state: &mut CopyState<'_>,
     prompt_fn: F,
 ) -> io::Result<CopyResult>
 where
     F: Fn(&str) -> bool,
 {
     let source_md = source.metadata().unwrap();
-    let source_is_symlink = source.is_symlink().unwrap_or(false);
+    // The descriptor stack starts at `AT_FDCWD` and gains a real one per level, so the sentinel
+    // is exactly the operand named on the command line.
+    let at_top_level = target_dirfd == libc::AT_FDCWD;
+    let deref_this_entry = cfg.deref.deref_entry(at_top_level);
+    // Act on the link itself only when the options say so (POSIX 90689).
+    let act_on_link_itself = source.is_symlink().unwrap_or(false) && !deref_this_entry;
     let source_file_type = source_md.file_type();
     let source_is_dir = source_file_type == ftw::FileType::Directory;
 
@@ -73,21 +171,20 @@ where
             | ftw::FileType::Fifo
             | ftw::FileType::Socket
     );
-    // -R is required for step 4
-    if source_is_special_file && cfg.recursive {
-        copy_special_file(
-            cfg,
-            source_md,
-            target,
-            target_dirfd,
-            target_filename,
-            created_files,
-            source_file_type == ftw::FileType::Fifo,
-        )?;
-        return Ok(CopyResult::CopiedFile);
-    }
-
     let source_deref_md = unsafe { ftw::Metadata::new(source.dir_fd(), source.file_name(), true) };
+
+    // A link we were told to act through, whose referent does not exist, is an error -- there is
+    // nothing to copy. Without this the failure surfaced later as "cannot open ... for reading".
+    // (Under -P the link itself is the subject, and a dangling one is reproduced as-is.)
+    if deref_this_entry && source.is_symlink().unwrap_or(false) {
+        if let Err(e) = &source_deref_md {
+            return Err(io::Error::other(gettext!(
+                "cannot stat '{}': {}",
+                source.path(),
+                error_string(e)
+            )));
+        }
+    }
 
     let target_symlink_md = ftw::Metadata::new(
         target_dirfd,
@@ -154,17 +251,30 @@ where
             return Err(io::Error::other(err_str));
         }
 
+        // Refuse to descend into a directory that is one of this copy's own destinations, which
+        // is what a copy into itself looks like from the inside. The previous test compared path
+        // text, so "./a" and "a" named the same directory without matching, and `cp -R ./a a/b`
+        // recursed until the filesystem filled. Identity cannot be spelled two ways.
+        //
+        // The message names the operands, not this entry: the recursion is only visible several
+        // levels down, but what the user got wrong is the pair they typed.
+        // Borrowed only for the test: the caller mutates this set while handling the result.
+        let copying_into_self = state
+            .dest_dir_ids
+            .borrow()
+            .contains(&(source_md.dev(), source_md.ino()));
+        if copying_into_self {
+            let (source_arg, target_arg) = state.operands;
+            let err_str = gettext!(
+                "cannot copy a directory, '{}', into itself, '{}'",
+                source_arg.display(),
+                target_arg.display()
+            );
+            return Err(io::Error::other(err_str));
+        }
+
         // 2.e
         if !target_exists {
-            if target.starts_with(PathBuf::from(format!("{}", source.path()))) {
-                let err_str = gettext!(
-                    "cannot copy a directory, '{}', into itself, '{}'",
-                    source.path(),
-                    target.display()
-                );
-                return Err(io::Error::other(err_str));
-            }
-
             unsafe {
                 // Creates the target directory with the same file permission bits as the source,
                 // modified by the umask of the process. Copying the permission bits without the
@@ -193,9 +303,22 @@ where
     } else {
         // 3. If source_file is of type regular file
 
+        // When the options say not to follow this entry's links, refuse to follow one that
+        // appeared between the traversal's `lstat` and this open. GNU guards the same way.
+        let source_open_flags = libc::O_RDONLY
+            | if deref_this_entry {
+                0
+            } else {
+                libc::O_NOFOLLOW
+            };
+
         let create_target_then_copy = || -> io::Result<()> {
             let source_fd = unsafe {
-                libc::openat(source.dir_fd(), source.file_name().as_ptr(), libc::O_RDONLY)
+                libc::openat(
+                    source.dir_fd(),
+                    source.file_name().as_ptr(),
+                    source_open_flags,
+                )
             };
             if source_fd == -1 {
                 let e = io::Error::last_os_error();
@@ -208,13 +331,18 @@ where
             }
             let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
 
-            // 3.b
+            // 3.b. POSIX 90670-90671 asks for source_file's permission bits. The set-user-ID and
+            // set-group-ID bits are masked off unless -p was given: the copy belongs to whoever
+            // ran cp, so carrying them over would hand that user's privileges to anyone who can
+            // run it. GNU masks the same way, and -p restores them later through
+            // `copy_characteristics`, which clears them if the ownership could not be duplicated.
+            let create_mode = source_md.mode() & if cfg.preserve { 0o7777 } else { 0o777 };
             let target_fd = unsafe {
                 libc::openat(
                     target_dirfd,
                     target_filename,
                     libc::O_WRONLY | libc::O_CREAT,
-                    source_md.mode(),
+                    create_mode,
                 )
             };
             if target_fd == -1 {
@@ -246,7 +374,7 @@ where
 
         // 3.a
         if target_exists && !target_is_dangling_symlink {
-            if created_files.contains(target) {
+            if state.created_files.contains(target) {
                 let err_str = gettext!(
                     "will not overwrite just-created '{}' with '{}'",
                     target.display(),
@@ -255,163 +383,173 @@ where
                 return Err(io::Error::other(err_str));
             }
 
-            // 3.a.i
-            let target_is_writable = target_symlink_md
-                .as_ref()
-                .map(|md| md.is_writable())
-                .unwrap_or(false);
+            // 3.a.i. The prompt belongs to -i alone (POSIX 90703-90705). -f is only step
+            // 3.a.iii -- "if the descriptor cannot be obtained, unlink and proceed" (90699-90700)
+            // -- so it must never prompt: with no terminal the prompt read EOF, took it for a
+            // refusal, and exited 0 having copied nothing. An unwritable destination only
+            // changes the wording, as it does in GNU cp.
+            if cfg.interactive {
+                let target_is_writable =
+                    ftw::is_writable_at(target_dirfd, unsafe { CStr::from_ptr(target_filename) });
 
-            // Different prompt if the target is not writable
-            if !target_is_writable && (cfg.interactive || cfg.force) {
-                let mode = target_symlink_md.as_ref().unwrap().mode();
-
-                let mut mode_str = String::new();
-                let bit_loc = 0o400;
-                for i in 0..9 {
-                    let mask = bit_loc >> i;
-                    if mode & mask != 0 {
-                        match i % 3 {
-                            0 => mode_str.push('r'),
-                            1 => mode_str.push('w'),
-                            2 => mode_str.push('x'),
-                            _ => (),
-                        }
-                    } else {
-                        mode_str.push('-');
-                    }
-                }
-
-                // 4 octal digits
-                // This needs to be formatted separately because `gettext!` does
-                // not accept a format spec (just plain curly braces, `{}`).
-                let mode_octal = format!("{:04o}", mode & 0o7777);
-
-                if cfg.force {
-                    let is_affirm = prompt_fn(&gettext!(
+                let is_affirm = if target_is_writable {
+                    prompt_fn(&gettext!("overwrite '{}'?", target.display()))
+                } else {
+                    let (mode_octal, mode_str) =
+                        format_mode(target_symlink_md.as_ref().unwrap().mode());
+                    prompt_fn(&gettext!(
                         "replace '{}', overriding mode {} ({})?",
                         target.display(),
                         mode_octal,
                         mode_str
-                    ));
-                    if !is_affirm {
-                        return Ok(CopyResult::Skipped);
-                    }
-                } else if cfg.interactive {
-                    let is_affirm = prompt_fn(&gettext!(
-                        "unwritable '{}' (mode {}, {}); try anyway?",
-                        target.display(),
-                        mode_octal,
-                        mode_str
-                    ));
-                    if !is_affirm {
-                        return Ok(CopyResult::Skipped);
-                    }
-                }
-            } else if cfg.interactive {
-                let is_affirm = prompt_fn(&gettext!("overwrite '{}'?", target.display()));
+                    ))
+                };
                 if !is_affirm {
                     return Ok(CopyResult::Skipped);
                 }
             }
+        }
 
-            // 4.c
-            if source_is_symlink {
-                let ret = unsafe {
-                    libc::unlinkat(
-                        target_dirfd,
-                        target_filename,
-                        if target_is_dir { libc::AT_REMOVEDIR } else { 0 },
-                    )
-                };
-                if ret != 0 {
-                    return Err(io::Error::last_os_error());
-                }
+        // A destination that exists and is not a dangling link has now been checked against the
+        // just-created set and prompted for. Everything below replaces it.
+        let replacing_existing = target_exists && !target_is_dangling_symlink;
 
-                let ret = unsafe {
-                    libc::symlinkat(
-                        source.read_link().unwrap().as_ptr(),
-                        target_dirfd,
-                        target_filename,
-                    )
-                };
-                if ret != 0 {
-                    return Err(io::Error::last_os_error());
+        // 4. -R is required for a FIFO, device or socket; without it the contents are read like
+        // any other file, which is what makes `cp /dev/null x` work.
+        if source_is_special_file && cfg.recursive {
+            if target_is_dir {
+                let err_str = gettext!(
+                    "cannot overwrite directory '{}' with non-directory '{}'",
+                    target.display(),
+                    source.path()
+                );
+                return Err(io::Error::other(err_str));
+            }
+            copy_special_file(
+                source_md,
+                source_file_type,
+                target,
+                target_dirfd,
+                target_filename,
+                target_exists,
+                state.created_files,
+            )?;
+            return Ok(CopyResult::CopiedFile);
+        }
+
+        // 4.c
+        if act_on_link_itself {
+            let link_target = read_source_link(source)?;
+
+            if target_exists {
+                if target_is_dir {
+                    let err_str = gettext!(
+                        "cannot overwrite directory '{}' with non-directory '{}'",
+                        target.display(),
+                        source.path()
+                    );
+                    return Err(io::Error::other(err_str));
                 }
+                // Also covers a dangling destination link, which `symlinkat` would otherwise
+                // refuse with EEXIST.
+                let ret = unsafe { libc::unlinkat(target_dirfd, target_filename, 0) };
+                if ret != 0 {
+                    let e = io::Error::last_os_error();
+                    return Err(io::Error::other(gettext!(
+                        "cannot remove '{}': {}",
+                        target.display(),
+                        error_string(&e)
+                    )));
+                }
+            }
+
+            let ret =
+                unsafe { libc::symlinkat(link_target.as_ptr(), target_dirfd, target_filename) };
+            if ret != 0 {
+                let e = io::Error::last_os_error();
+                return Err(io::Error::other(gettext!(
+                    "cannot create symbolic link '{}': {}",
+                    target.display(),
+                    error_string(&e)
+                )));
+            }
+        } else if replacing_existing {
+            if target_is_dir {
+                let err_str = gettext!(
+                    "cannot overwrite directory '{}' with non-directory '{}'",
+                    target.display(),
+                    source.path()
+                );
+                return Err(io::Error::other(err_str));
+            }
+
+            // 3.a.ii. Open the source first: truncating the destination before knowing the
+            // source can be read destroyed its contents and then reported a failure.
+            let source_fd = unsafe {
+                libc::openat(
+                    source.dir_fd(),
+                    source.file_name().as_ptr(),
+                    source_open_flags,
+                )
+            };
+            if source_fd == -1 {
+                let e = io::Error::last_os_error();
+                let err_str = gettext!(
+                    "cannot open '{}' for reading: {}",
+                    source.path(),
+                    error_string(&e)
+                );
+                return Err(io::Error::other(err_str));
+            }
+            let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
+
+            let target_fd = unsafe {
+                libc::openat(
+                    target_dirfd,
+                    target_filename,
+                    libc::O_WRONLY | libc::O_TRUNC,
+                )
+            };
+            if target_fd != -1 {
+                let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
+
+                io::copy(&mut source_file, &mut target_file)?;
             } else {
-                // 3.a.ii
-                let target_fd = unsafe {
-                    libc::openat(
-                        target_dirfd,
-                        target_filename,
-                        libc::O_WRONLY | libc::O_TRUNC,
-                    )
-                };
-                if target_fd != -1 {
-                    let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
-
-                    let source_fd = unsafe {
-                        libc::openat(source.dir_fd(), source.file_name().as_ptr(), libc::O_RDONLY)
-                    };
-                    if source_fd == -1 {
+                // 3.a.iii
+                if cfg.force {
+                    // Plain `unlinkat`: a directory destination was refused above, and removing
+                    // one to put a file in its place is not something -f asks for.
+                    let ret = unsafe { libc::unlinkat(target_dirfd, target_filename, 0) };
+                    if ret != 0 {
                         let e = io::Error::last_os_error();
-                        let err_str = gettext!(
-                            "cannot open '{}' for reading: {}",
-                            source.path(),
-                            error_string(&e)
-                        );
-                        return Err(io::Error::other(err_str));
-                    }
-                    let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
-
-                    io::copy(&mut source_file, &mut target_file)?;
-                } else {
-                    // 3.a.iii
-                    if cfg.force {
-                        let ret = unsafe {
-                            libc::unlinkat(
-                                target_dirfd,
-                                target_filename,
-                                if target_is_dir { libc::AT_REMOVEDIR } else { 0 },
-                            )
-                        };
-                        if ret != 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-
-                        // 3.b
-                        create_target_then_copy()?;
-                    } else {
-                        let e = io::Error::last_os_error();
-                        let err_str = gettext!(
-                            "cannot open '{}' for reading: {}",
+                        return Err(io::Error::other(gettext!(
+                            "cannot remove '{}': {}",
                             target.display(),
                             error_string(&e)
-                        );
-                        return Err(io::Error::other(err_str));
+                        )));
                     }
+
+                    // 3.b
+                    create_target_then_copy()?;
+                } else {
+                    // The open that failed was for writing, and without -f there is no
+                    // second attempt. Same wording as GNU cp.
+                    let e = io::Error::last_os_error();
+                    let err_str = gettext!(
+                        "cannot create regular file '{}': {}",
+                        target.display(),
+                        error_string(&e)
+                    );
+                    return Err(io::Error::other(err_str));
                 }
             }
 
         // 3.b
         } else {
-            // 4.c
-            if source_is_symlink {
-                let ret = unsafe {
-                    libc::symlinkat(
-                        source.read_link().unwrap().as_ptr(),
-                        target_dirfd,
-                        target_filename,
-                    )
-                };
-                if ret != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            } else {
-                create_target_then_copy()?;
-            }
+            create_target_then_copy()?;
         }
 
-        created_files.insert(target.to_path_buf());
+        state.created_files.insert(target.to_path_buf());
     }
 
     Ok(CopyResult::CopiedFile)
@@ -429,7 +567,10 @@ where
     F: Copy + Fn(&str) -> bool,
 {
     // `RefCell` to allow sharing these between closures
-    let target_dirfd_stack = RefCell::new(vec![ftw::FileDescriptor::cwd()]);
+    let target_dirfd_stack = RefCell::new(vec![Rc::new(ftw::FileDescriptor::cwd())]);
+    // (st_dev, st_ino) of every destination directory this copy creates or enters. A source
+    // directory found in here is one we are copying *into*.
+    let dest_dir_ids = RefCell::new(HashSet::<(u64, u64)>::new());
     let target_dir_path = RefCell::new(PathBuf::new());
     let terminate = RefCell::new(false);
     let last_error = RefCell::new(None);
@@ -503,18 +644,27 @@ where
                 &target,
                 target_dirfd.as_raw_fd(),
                 target_filename_cstr.as_ptr(),
-                created_files,
+                &mut CopyState {
+                    created_files,
+                    dest_dir_ids: &dest_dir_ids,
+                    operands: (source_arg, target_arg),
+                },
                 prompt_fn,
             ) {
                 Ok(copy_result) => {
-                    // If copying succeeds, then store the hard-link data
-                    if let Some(inode_map) = inode_map.as_deref_mut() {
-                        // Don't include every file, just those with hard links
-                        if source_md.nlink() > 1 {
-                            inode_map.insert(
-                                identifier,
-                                (target_dirfd.clone(), target_filename_cstr.clone()),
-                            );
+                    // Record where this inode landed only if a file was actually created there.
+                    // Recording a skipped copy pointed a later hard link at a target that does
+                    // not exist, and every directory reports nlink > 1, so directories were
+                    // recorded too.
+                    if matches!(copy_result, CopyResult::CopiedFile) {
+                        if let Some(inode_map) = inode_map.as_deref_mut() {
+                            // Only files that have hard links are worth tracking.
+                            if source_md.nlink() > 1 {
+                                inode_map.insert(
+                                    identifier,
+                                    (Rc::clone(target_dirfd), target_filename_cstr.clone()),
+                                );
+                            }
                         }
                     }
 
@@ -551,7 +701,22 @@ where
                                 }
                             };
 
-                            target_dirfd_stack_borrowed.push(new_target_dirfd);
+                            // Record what this destination directory *is*, from the descriptor
+                            // already in hand rather than by name. Recording on entry, not on
+                            // creation, so a destination that existed beforehand counts too.
+                            let mut st = MaybeUninit::<libc::stat>::uninit();
+                            if unsafe { libc::fstat(new_target_dirfd.as_raw_fd(), st.as_mut_ptr()) }
+                                == 0
+                            {
+                                let st = unsafe { st.assume_init() };
+                                // Casts needed: `dev_t`/`ino_t` are not u64 on every platform.
+                                #[allow(clippy::unnecessary_cast)]
+                                dest_dir_ids
+                                    .borrow_mut()
+                                    .insert((st.st_dev as u64, st.st_ino as u64));
+                            }
+
+                            target_dirfd_stack_borrowed.push(Rc::new(new_target_dirfd));
                             target_dir_path_borrowed.push(target_filename);
 
                             true
@@ -597,7 +762,11 @@ where
 
             Ok(continue_processing)
         },
-        |source| {
+        // Pops unconditionally. `ftw` calls this for every directory whose handler returned
+        // `true`, including ones it then could not descend into; leaving the push in place there
+        // would silently redirect every later file into the wrong destination directory.
+        // The target directory exists either way, so `-p` still applies to it.
+        |source, _exit| {
             let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
             let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
 
@@ -632,19 +801,27 @@ where
 
             Ok(())
         },
-        |_entry, error| {
-            let e = error.inner();
+        |entry, error| {
+            // `ftw::Error` carries no filename; the entry it failed on does.
+            let err_str = gettext!(
+                "cannot access '{}': {}",
+                entry.path(),
+                error_string(&error.inner())
+            );
             if cfg.continue_on_error {
-                eprintln!("{}: {}", cfg.prog, error_string(&e));
+                eprintln!("{}: {}", cfg.prog, err_str);
                 *had_error.borrow_mut() = true;
             } else {
-                *last_error.borrow_mut() = Some(e);
+                *last_error.borrow_mut() = Some(io::Error::other(err_str));
                 *terminate.borrow_mut() = true;
             }
         },
         ftw::TraverseDirectoryOpts {
-            follow_symlinks_on_args: cfg.follow_cli,
-            follow_symlinks: cfg.dereference,
+            follow_symlinks_on_args: cfg.deref.follow_symlinks_on_args(),
+            follow_symlinks: cfg.deref.follow_symlinks(),
+            // One target-directory descriptor is held per level in `target_dirfd_stack`, so the
+            // traversal must count those too when deciding to conserve descriptors.
+            caller_fds_per_level: 1,
             ..Default::default()
         },
     );
@@ -725,50 +902,48 @@ where
     result
 }
 
+/// POSIX cp step 4: reproduce a FIFO, device or socket at the destination.
+///
+/// The caller has already applied steps 1 to 3.a, so an existing destination has been prompted
+/// for and is known not to be a directory.
 fn copy_special_file(
-    cfg: &CopyConfig,
     source_md: &ftw::Metadata,
+    source_file_type: ftw::FileType,
 
     // Should only be used for keeping track of created files and for displaying error messages
     target: &Path,
 
     target_dirfd: libc::c_int,
     target_filename: *const libc::c_char,
+    target_exists: bool,
     created_files: &mut HashSet<PathBuf>,
-    is_fifo: bool,
 ) -> io::Result<()> {
-    // 4.a
-    let dev = source_md.rdev();
+    let is_fifo = source_file_type == ftw::FileType::Fifo;
 
-    // 4.b
-    let mode = if is_fifo {
-        // Mandatory to be the same as source for FIFO
-        source_md.mode()
-    } else {
-        // Under Rationale:
-        // "In general, it is strongly suggested that the permissions,
-        // owner, and group be the same as if the user had run the
-        // historical mknod, ln, or other utility to create the file"
-        0o644
-    };
+    // 4.b. A FIFO takes the source's permission bits (POSIX 90683-90685), all twelve of them:
+    // unlike a regular file a set-user-ID FIFO is inert, and GNU reproduces the bit too. For the
+    // other special types the permissions are implementation-defined, so keep only the ordinary
+    // nine. `mknodat` applies the umask, and `-p` restores the exact bits afterwards through
+    // `copy_characteristics`.
+    let perm = source_md.mode() & if is_fifo { 0o7777 } else { 0o777 };
 
-    let mut stat_buf = MaybeUninit::uninit();
-
-    // Using `fstatat` to check for the existence of the target file
-    let ret = unsafe {
-        libc::fstatat(
-            target_dirfd,
-            target_filename,
-            stat_buf.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    let target_exists = ret == 0;
+    // 4.a: "The dest_file shall be created with the same file type as source_file." Passing no
+    // type bits to `mknod` asks for a *regular file*, which is how copying a character device
+    // used to report success having written an empty regular file.
+    #[allow(clippy::unnecessary_cast)]
+    let mode = (source_md.mode() & libc::S_IFMT as u32) | perm;
 
     if target_exists {
+        // Never `AT_REMOVEDIR`: removing a directory to plant a device node is destruction POSIX
+        // never asks for. The caller rejects a directory destination before getting here.
         let ret = unsafe { libc::unlinkat(target_dirfd, target_filename, 0) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            return Err(io::Error::other(gettext!(
+                "cannot remove '{}': {}",
+                target.display(),
+                error_string(&e)
+            )));
         }
     }
 
@@ -777,7 +952,7 @@ fn copy_special_file(
             target_dirfd,
             target_filename,
             mode as libc::mode_t,
-            dev as libc::dev_t,
+            source_md.rdev() as libc::dev_t,
         )
     };
     if ret == 0 {
@@ -785,11 +960,19 @@ fn copy_special_file(
         Ok(())
     } else {
         let e = io::Error::last_os_error();
-        let err_str = gettext!(
-            "cannot create regular file '{}': {}",
-            target.display(),
-            error_string(&e)
-        );
+        let err_str = if is_fifo {
+            gettext!(
+                "cannot create fifo '{}': {}",
+                target.display(),
+                error_string(&e)
+            )
+        } else {
+            gettext!(
+                "cannot create special file '{}': {}",
+                target.display(),
+                error_string(&e)
+            )
+        };
         Err(io::Error::other(err_str))
     }
 }

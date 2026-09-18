@@ -390,7 +390,7 @@ fn test_du_hardlink() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #DU1 (shared with #CM1/#CO1/#CG1): a per-file error during a recursive walk is reported
+// A per-file error during a recursive walk is reported
 // but the walk continues — a readable sibling is still counted and the exit status is non-zero.
 #[test]
 fn test_du_continue_on_error() {
@@ -422,7 +422,7 @@ fn test_du_continue_on_error() {
     fs::remove_dir_all(&test_dir).unwrap();
 }
 
-// Audit #DU5: -a and -s are mutually exclusive (clap conflict → usage error, non-zero exit).
+// -a and -s are mutually exclusive (clap conflict → usage error, non-zero exit).
 #[test]
 fn test_du_a_s_conflict() {
     du_test_with_checker_and_exit(&["-a", "-s", "."], 2, |_, output| {
@@ -434,7 +434,7 @@ fn test_du_a_s_conflict() {
     });
 }
 
-// Audit #DU3: a hard-linked file appearing under two separate operands is counted once — the
+// A hard-linked file appearing under two separate operands is counted once — the
 // (dev,ino) dedup set is shared across operands, so the second operand reports size 0.
 #[test]
 fn test_du_hardlink_cross_operand() {
@@ -461,7 +461,7 @@ fn test_du_hardlink_cross_operand() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #DU2: -H and -L are last-specified-wins. With an in-directory symlink, -H (follow only
+// -H and -L are last-specified-wins. With an in-directory symlink, -H (follow only
 // command-line symlinks) leaves it unfollowed, while -L (follow all) reports the target's size.
 #[test]
 fn test_du_h_l_last_wins() {

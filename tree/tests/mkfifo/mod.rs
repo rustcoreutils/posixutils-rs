@@ -169,7 +169,7 @@ fn test_create_multiple_fifos() {
     fs::remove_file(fifo2).expect("Unable to remove test FIFO");
 }
 
-// Audit #MF2: a <newline> in the pathname is rejected.
+// A <newline> in the pathname is rejected.
 #[test]
 fn test_mkfifo_newline_rejected() {
     let test_dir = &format!(

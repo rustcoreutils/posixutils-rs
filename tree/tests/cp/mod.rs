@@ -942,7 +942,7 @@ fn test_cp_special_bits() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #C1: `cp -p` must preserve S_ISUID/S_ISGID when ownership can be duplicated.
+// `cp -p` must preserve S_ISUID/S_ISGID when ownership can be duplicated.
 // Copying our own file reproduces the chown-succeeds path (same owner), so the bits stay.
 #[test]
 fn test_cp_preserve_keeps_setuid_same_owner() {
@@ -973,7 +973,7 @@ fn test_cp_preserve_keeps_setuid_same_owner() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #C1: `cp -p` must CLEAR S_ISUID/S_ISGID when the user/group ID cannot be duplicated
+// `cp -p` must CLEAR S_ISUID/S_ISGID when the user/group ID cannot be duplicated
 // (POSIX cp 90720-90721). A non-root user copying a root-owned setuid file cannot chown the copy
 // back to root, so the privileged bits must be dropped. Needs root + `NON_ROOT_USERNAME`.
 #[test]
@@ -1080,7 +1080,7 @@ fn test_cp_issue199() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #C2: more than one source with a target that is not an existing directory must be an
+// More than one source with a target that is not an existing directory must be an
 // error (POSIX cp 90605-90606), not a silent copy of only the first source.
 #[test]
 fn test_cp_multi_source_nondir_target() {
@@ -1107,7 +1107,7 @@ fn test_cp_multi_source_nondir_target() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #C3: a per-file failure during `cp -R` must not abort the whole copy — same-level and
+// A per-file failure during `cp -R` must not abort the whole copy — same-level and
 // ancestor entries are still copied (POSIX cp 90829-90832). One unreadable file among several
 // readable siblings: all readable siblings must still be copied (regardless of readdir order),
 // and the exit status is non-zero.
@@ -1145,5 +1145,644 @@ fn test_cp_recursive_continue_on_error() {
     }
 
     fs::set_permissions(u, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+// A subdirectory the walk cannot descend into must not shift every later file one level deeper.
+// `ftw` told the copy engine to descend, which pushed a target directory descriptor, and then
+// refused; without the matching unwind the stack stayed too deep and the remaining siblings were
+// written inside the failed directory instead of beside it.
+#[test]
+fn test_cp_unreadable_subdir_does_not_misplace_siblings() {
+    if is_root() {
+        eprintln!("Skipping test: root can descend into a mode-0 directory");
+        return;
+    }
+
+    let test_dir = &format!(
+        "{}/test_cp_unreadable_subdir_does_not_misplace_siblings",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+    // Sorts before the files, so an unbalanced stack would capture all of them.
+    let locked = &format!("{src}/aaa_locked");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    fs::create_dir(locked).unwrap();
+    for name in ["zzz_b", "zzz_c", "zzz_d"] {
+        fs::write(format!("{src}/{name}.txt"), b"x").unwrap();
+    }
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    cp_test(
+        &["-R", src, dst],
+        "",
+        &format!("cp: cannot access '{locked}': Permission denied\n"),
+        1,
+    );
+
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for name in ["zzz_b", "zzz_c", "zzz_d"] {
+        assert!(
+            Path::new(&format!("{dst}/{name}.txt")).exists(),
+            "{name}.txt was not copied beside the failed directory"
+        );
+        assert!(
+            !Path::new(&format!("{dst}/aaa_locked/{name}.txt")).exists(),
+            "{name}.txt was written inside the directory that could not be read"
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90699-90700 and step 3.a.iii: -f means "if the destination cannot be opened, unlink it
+// and try again". It is not a prompt. Prompting made `cp -f` read EOF from a script's stdin,
+// treat that as "no", and exit 0 with the destination never written.
+#[test]
+fn test_cp_f_does_not_prompt_without_tty() {
+    if is_root() {
+        eprintln!("Skipping test: root can write a mode-0444 file without unlinking it");
+        return;
+    }
+
+    let test_dir = &format!(
+        "{}/test_cp_f_does_not_prompt_without_tty",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(src, b"NEWDATA\n").unwrap();
+    fs::write(dst, b"OLDDATA\n").unwrap();
+    fs::set_permissions(dst, fs::Permissions::from_mode(0o444)).unwrap();
+
+    cp_test(&["-f", src, dst], "", "", 0);
+
+    let mut contents = String::new();
+    fs::File::open(dst)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "NEWDATA\n", "-f left the destination unchanged");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// The prompt is a -i behavior (POSIX 90703-90705). An unwritable destination only changes its
+// wording, as in GNU cp, and does not make -f prompt.
+#[test]
+fn test_cp_i_unwritable_prompt_wording() {
+    if is_root() {
+        eprintln!("Skipping test: root is not blocked by the mode bits under test");
+        return;
+    }
+
+    let test_dir = &format!(
+        "{}/test_cp_i_unwritable_prompt_wording",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(src, b"NEWDATA\n").unwrap();
+    fs::write(dst, b"OLDDATA\n").unwrap();
+    fs::set_permissions(dst, fs::Permissions::from_mode(0o444)).unwrap();
+
+    cp_test_with_stdin(
+        &["-i", src, dst],
+        "n\n",
+        "",
+        &format!("cp: replace '{dst}', overriding mode 0444 (r--r--r--)? "),
+        0,
+    );
+
+    let mut contents = String::new();
+    fs::File::open(dst)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "OLDDATA\n", "a declined prompt still copied");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// -P must act on the link itself, both for an operand and for links found during the walk
+// (POSIX 90621-90623). While -P was inert, `cp -RP` followed a symlinked directory and copied
+// the real files it pointed at, which is exactly what -P is passed to prevent.
+#[test]
+fn test_cp_rp_does_not_escape_source_tree() {
+    let test_dir = &format!(
+        "{}/test_cp_rp_does_not_escape_source_tree",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let outside = &format!("{test_dir}/outside");
+    let src = &format!("{test_dir}/src");
+    let escape = &format!("{src}/escape");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(outside).unwrap();
+    fs::write(format!("{outside}/secret.txt"), b"secret\n").unwrap();
+    fs::create_dir(src).unwrap();
+    // Absolute, so the copy cannot resolve it by accident from its new location.
+    unix::fs::symlink(outside, escape).unwrap();
+
+    for (flags, dst_name) in [(&["-R", "-P"][..], "dst_p"), (&["-R"][..], "dst_default")] {
+        let dst = &format!("{test_dir}/{dst_name}");
+        let mut args = flags.to_vec();
+        args.push(src);
+        args.push(dst);
+        cp_test(&args, "", "", 0);
+
+        let copied = &format!("{dst}/escape");
+        assert!(
+            fs::symlink_metadata(copied).unwrap().is_symlink(),
+            "{dst_name}: the symlink was resolved instead of recreated"
+        );
+        assert_eq!(
+            fs::read_link(copied).unwrap(),
+            Path::new(outside),
+            "{dst_name}: the link was not reproduced verbatim"
+        );
+        // Following the recreated link reaches the original, which is expected; what must not
+        // happen is a real copy of it appearing inside the destination.
+        assert!(
+            !fs::symlink_metadata(format!("{dst}/escape/"))
+                .map(|md| md.is_dir())
+                .unwrap_or(false)
+                || fs::symlink_metadata(copied).unwrap().is_symlink(),
+            "{dst_name}: the referenced directory was duplicated into the destination"
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// -L acts on what the link refers to, for operands and for links met during the walk
+// (POSIX 90706-90708).
+#[test]
+fn test_cp_rl_dereferences_symlink_in_hierarchy() {
+    let test_dir = &format!(
+        "{}/test_cp_rl_dereferences_symlink_in_hierarchy",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    fs::write(format!("{src}/real"), b"REAL\n").unwrap();
+    unix::fs::symlink("real", format!("{src}/link")).unwrap();
+
+    cp_test(&["-R", "-L", src, dst], "", "", 0);
+
+    let link_copy = &format!("{dst}/link");
+    assert!(
+        !fs::symlink_metadata(link_copy).unwrap().is_symlink(),
+        "-L recreated the link instead of copying what it refers to"
+    );
+    let mut contents = String::new();
+    fs::File::open(link_copy)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "REAL\n");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90727-90728: more than one of -H, -L, -P is not an error, and the last one wins.
+#[test]
+fn test_cp_deref_flags_last_wins() {
+    let test_dir = &format!(
+        "{}/test_cp_deref_flags_last_wins",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    fs::write(format!("{src}/real"), b"REAL\n").unwrap();
+    unix::fs::symlink("real", format!("{src}/link")).unwrap();
+
+    // (flags, destination, whether the copied entry should still be a symlink)
+    let cases: [(&[&str], &str, bool); 3] = [
+        (&["-R", "-L", "-P"], "a", true),
+        (&["-R", "-P", "-L"], "b", false),
+        (&["-R", "-H", "-P"], "c", true),
+    ];
+    for (flags, dst_name, expect_symlink) in cases {
+        let dst = &format!("{test_dir}/{dst_name}");
+        let mut args = flags.to_vec();
+        args.push(src);
+        args.push(dst);
+        cp_test(&args, "", "", 0);
+
+        assert_eq!(
+            fs::symlink_metadata(format!("{dst}/link"))
+                .unwrap()
+                .is_symlink(),
+            expect_symlink,
+            "{flags:?} did not take the last-specified option"
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// The cp synopsis (POSIX 90580) allows -P without -R; only -H and -L require it.
+#[test]
+fn test_cp_p_without_r_is_accepted() {
+    let test_dir = &format!(
+        "{}/test_cp_p_without_r_is_accepted",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let real = &format!("{test_dir}/real");
+    let link = &format!("{test_dir}/link");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(real, b"REAL\n").unwrap();
+    unix::fs::symlink("real", link).unwrap();
+
+    cp_test(&["-P", link, dst], "", "", 0);
+    assert!(fs::symlink_metadata(dst).unwrap().is_symlink());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Without -R and without -P, cp acts on what the link refers to (POSIX 90610-90612), so a
+// dangling link is an error rather than something to recreate.
+#[test]
+fn test_cp_dangling_source_is_an_error() {
+    let test_dir = &format!(
+        "{}/test_cp_dangling_source_is_an_error",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let dangle = &format!("{test_dir}/dangle");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    unix::fs::symlink("no-such-file", dangle).unwrap();
+
+    cp_test(
+        &[dangle, dst],
+        "",
+        &format!("cp: cannot stat '{dangle}': No such file or directory\n"),
+        1,
+    );
+    assert!(fs::symlink_metadata(dst).is_err());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+fn mkfifo_at(path: &str, mode: libc::mode_t) {
+    let c = CString::new(path.as_bytes()).unwrap();
+    let ret = unsafe { libc::mkfifo(c.as_ptr(), mode) };
+    if ret != 0 {
+        panic!("{}", io::Error::last_os_error());
+    }
+}
+
+// The special-file path ran before step 1 and before all of the -i and -f handling, and unlinked
+// whatever was at the destination unconditionally, so `cp -R -i` destroyed an existing file
+// without ever asking.
+#[test]
+fn test_cp_special_i_does_not_clobber() {
+    let test_dir = &format!(
+        "{}/test_cp_special_i_does_not_clobber",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let fifo = &format!("{test_dir}/fifo");
+    let target = &format!("{test_dir}/target");
+
+    fs::create_dir(test_dir).unwrap();
+    mkfifo_at(fifo, 0o644);
+    fs::write(target, b"IMPORTANT\n").unwrap();
+
+    cp_test_with_stdin(
+        &["-R", "-i", fifo, target],
+        "n\n",
+        "",
+        &format!("cp: overwrite '{target}'? "),
+        0,
+    );
+
+    assert!(fs::metadata(target).unwrap().file_type().is_file());
+    let mut contents = String::new();
+    fs::File::open(target)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(
+        contents, "IMPORTANT\n",
+        "the declined copy went ahead anyway"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Step 1 applies to special files too: copying one onto itself unlinked and recreated the source.
+#[test]
+fn test_cp_special_same_file() {
+    let test_dir = &format!("{}/test_cp_special_same_file", env!("CARGO_TARGET_TMPDIR"));
+    let fifo = &format!("{test_dir}/fifo");
+
+    fs::create_dir(test_dir).unwrap();
+    mkfifo_at(fifo, 0o644);
+
+    cp_test(
+        &["-R", fifo, fifo],
+        "",
+        &format!("cp: '{fifo}' and '{fifo}' are the same file\n"),
+        1,
+    );
+    assert!(fs::metadata(fifo).unwrap().file_type().is_fifo());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90682 step 4.a: the destination is created with the same file type as the source. mknod
+// with no type bits creates a regular file, so an unprivileged `cp -R /dev/zero t` used to
+// "succeed" with an empty regular file instead of failing.
+#[test]
+fn test_cp_special_device_keeps_its_type() {
+    if is_root() {
+        eprintln!("Skipping test: root may create device nodes");
+        return;
+    }
+
+    let test_dir = &format!(
+        "{}/test_cp_special_device_keeps_its_type",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let target = &format!("{test_dir}/target");
+
+    fs::create_dir(test_dir).unwrap();
+
+    // /dev/null rather than /dev/zero deliberately: if this path ever regresses to reading the
+    // device as an ordinary file, an empty read ends immediately, where /dev/zero would write
+    // until the filesystem filled up.
+    cp_test(
+        &["-R", "/dev/null", target],
+        "",
+        &format!("cp: cannot create special file '{target}': Operation not permitted\n"),
+        1,
+    );
+    assert!(
+        fs::symlink_metadata(target).is_err(),
+        "a file was created where the device node could not be"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90683-90685: a FIFO gets the source's permission bits, not a hard-coded 0644.
+#[test]
+fn test_cp_special_fifo_mode_from_source() {
+    let test_dir = &format!(
+        "{}/test_cp_special_fifo_mode_from_source",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let fifo = &format!("{test_dir}/fifo");
+    let copy = &format!("{test_dir}/copy");
+
+    fs::create_dir(test_dir).unwrap();
+    mkfifo_at(fifo, 0o644);
+    fs::set_permissions(fifo, fs::Permissions::from_mode(0o600)).unwrap();
+
+    cp_test(&["-R", fifo, copy], "", "", 0);
+
+    let md = fs::metadata(copy).unwrap();
+    assert!(md.file_type().is_fifo());
+    assert_eq!(
+        md.permissions().mode() & 0o077,
+        0,
+        "group and other bits came from somewhere other than the source"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Without -p, cp must not hand the copy a set-user-ID bit: the new file belongs to whoever ran
+// cp, so preserving it would grant that user's privileges to anyone who can execute it.
+#[test]
+fn test_cp_setuid_not_preserved_without_p() {
+    let test_dir = &format!(
+        "{}/test_cp_setuid_not_preserved_without_p",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/src");
+    let dst = &format!("{test_dir}/dst");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(src, b"x").unwrap();
+    fs::set_permissions(src, fs::Permissions::from_mode(0o4755)).unwrap();
+
+    cp_test(&[src, dst], "", "", 0);
+
+    #[allow(clippy::unnecessary_cast)]
+    let setid = (libc::S_ISUID as u32) | (libc::S_ISGID as u32);
+    assert_eq!(
+        fs::metadata(dst).unwrap().permissions().mode() & setid,
+        0,
+        "the copy carries a set-user-ID or set-group-ID bit"
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// Runs `cp` directly with a wall-clock limit, killing it if it overruns.
+///
+/// The copy-into-itself tests describe a runaway recursion, so a regression would otherwise run
+/// until the filesystem filled up rather than failing the test.
+fn cp_test_bounded(cwd: &str, args: &[&str], expected_error: &str, expected_exit_code: i32) {
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cp"))
+        .args(args)
+        .current_dir(cwd)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("cp did not terminate: {args:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stderr), expected_error);
+    assert_eq!(output.status.code(), Some(expected_exit_code));
+}
+
+// The guard against copying a directory into itself compared path text, so any other spelling of
+// the same directory defeated it and the copy recursed without bound.
+#[test]
+fn test_cp_into_self_alt_spelling() {
+    let test_dir = &format!(
+        "{}/test_cp_into_self_alt_spelling",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let a = &format!("{test_dir}/a");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(a).unwrap();
+    fs::write(format!("{a}/f"), b"x").unwrap();
+
+    // Relative and spelled with a `.`, as a user would type it. Comparing path text could be
+    // defeated by any spelling that names the same directory differently.
+    cp_test_bounded(
+        test_dir,
+        &["-R", "./a", "a/b"],
+        "cp: cannot copy a directory, './a', into itself, 'a/b'\n",
+        1,
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// The guard was skipped entirely when the destination already existed.
+#[test]
+fn test_cp_into_self_existing_target() {
+    let test_dir = &format!(
+        "{}/test_cp_into_self_existing_target",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/a/b");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(a).unwrap();
+    fs::create_dir(b).unwrap();
+    fs::write(format!("{a}/f"), b"x").unwrap();
+
+    cp_test_bounded(
+        test_dir,
+        &["-R", "a", "a/b"],
+        "cp: cannot copy a directory, 'a', into itself, 'a/b/a'\n",
+        1,
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// A destination that is an existing symbolic link to a regular file is written *through*, as
+// POSIX 90658-90661 and GNU both do. Hardening the creating open must not change that.
+#[test]
+fn test_cp_overwrites_symlink_target() {
+    let test_dir = &format!(
+        "{}/test_cp_overwrites_symlink_target",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let real = &format!("{test_dir}/real");
+    let link = &format!("{test_dir}/link");
+    let src = &format!("{test_dir}/src");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::write(real, b"OLD\n").unwrap();
+    unix::fs::symlink("real", link).unwrap();
+    fs::write(src, b"NEW\n").unwrap();
+
+    cp_test(&[src, link], "", "", 0);
+
+    assert!(
+        fs::symlink_metadata(link).unwrap().is_symlink(),
+        "the link was replaced instead of written through"
+    );
+    let mut contents = String::new();
+    fs::File::open(real)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "NEW\n");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// A non-directory source must never replace a directory, with or without -f. The overwrite path
+// removed an empty destination directory and put a regular file there.
+#[test]
+fn test_cp_f_does_not_replace_directory() {
+    let test_dir = &format!(
+        "{}/test_cp_f_does_not_replace_directory",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let src = &format!("{test_dir}/s");
+    let src_contents = &format!("{test_dir}/s/.");
+    let dst = &format!("{test_dir}/d");
+    let clash = &format!("{test_dir}/d/sub");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(src).unwrap();
+    // A file in the source whose name is a directory in the destination.
+    fs::write(format!("{src}/sub"), b"FILE\n").unwrap();
+    fs::create_dir(dst).unwrap();
+    fs::create_dir(clash).unwrap();
+
+    for flags in [&["-R", "-f"][..], &["-R"][..]] {
+        let mut args = flags.to_vec();
+        args.push(src_contents);
+        args.push(dst);
+        cp_test(
+            &args,
+            "",
+            &format!("cp: cannot overwrite directory '{clash}' with non-directory '{src}/sub'\n"),
+            1,
+        );
+        assert!(
+            Path::new(clash).is_dir(),
+            "{flags:?} replaced the directory with a file"
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// POSIX 90683-90685 gives a FIFO the source's permission bits. Those include the set-user-ID and
+// set-group-ID bits, which carry no privilege on a FIFO; GNU reproduces them too.
+#[test]
+fn test_cp_special_fifo_keeps_set_id_bits() {
+    let test_dir = &format!(
+        "{}/test_cp_special_fifo_keeps_set_id_bits",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let fifo = &format!("{test_dir}/fifo");
+    let copy = &format!("{test_dir}/copy");
+
+    fs::create_dir(test_dir).unwrap();
+    mkfifo_at(fifo, 0o666);
+    fs::set_permissions(fifo, fs::Permissions::from_mode(0o4666)).unwrap();
+
+    cp_test(&["-R", fifo, copy], "", "", 0);
+
+    #[allow(clippy::unnecessary_cast)]
+    let setuid = libc::S_ISUID as u32;
+    assert_eq!(
+        fs::metadata(copy).unwrap().permissions().mode() & setuid,
+        setuid,
+        "the set-user-ID bit was dropped from the FIFO"
+    );
+
     fs::remove_dir_all(test_dir).unwrap();
 }

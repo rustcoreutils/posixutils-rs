@@ -33,16 +33,6 @@ impl EntryInternal<'_> {
         unsafe { CStr::from_ptr(self.dirent.byte_offset(OFFSET).cast()) }
     }
 
-    pub fn ino(&self) -> libc::ino_t {
-        const OFFSET: isize = std::mem::offset_of!(libc::dirent, d_ino) as isize;
-        unsafe {
-            self.dirent
-                .byte_offset(OFFSET)
-                .cast::<libc::ino_t>()
-                .read_unaligned()
-        }
-    }
-
     pub fn is_dot_or_double_dot(&self) -> bool {
         const DOT: u8 = b'.';
 
@@ -157,7 +147,11 @@ impl<'a> Iterator for OwnedDirIterator<'a> {
 pub struct DeferredDir {
     parent: Rc<(FileDescriptor, PathBuf)>,
     path: PathBuf,
-    visited: RefCell<HashSet<libc::ino_t>>,
+    /// Names already yielded, so a reopened directory resumes where it left off. Keyed on the
+    /// entry name and not `d_ino`: an inode is not unique within a directory (two hard links to
+    /// one file) nor across one (every mount point's root is inode 2), and a collision here
+    /// silently drops a file from the walk.
+    visited: RefCell<HashSet<Box<[u8]>>>,
     /// Flags OR'ed into the leaf `openat` when (re)opening this directory. Carries the same
     /// `O_DIRECTORY`/`O_NOFOLLOW` hardening as the non-deferred descent path.
     descent_flags: libc::c_int,
@@ -177,21 +171,33 @@ impl DeferredDir {
         }
     }
 
-    pub fn iter(&self) -> DeferredDirIterator<'_> {
-        let file_descriptor = self.open_file_descriptor();
-        let dir = OwnedDir::new(file_descriptor).unwrap();
-        let dirp = dir.dirp;
+    /// Reopen this directory for one visit.
+    ///
+    /// The caller keeps the result alive and takes both the descriptor and the entry stream from
+    /// it, so a conserving walk needs one descriptor per visit rather than two.
+    pub fn open(&self) -> io::Result<OwnedDir> {
+        OwnedDir::new(self.open_file_descriptor()?)
+    }
 
-        // Passing ownership of `dirp` to `SlowDirIterator`
-        std::mem::forget(dir);
-
+    /// Enumerate this directory through a descriptor already opened for it by `open`.
+    ///
+    /// Entries already yielded on an earlier visit are filtered out, which is what lets a
+    /// directory that is reopened from scratch each time resume where it left off.
+    pub fn iter_in<'a>(&'a self, dir: &'a OwnedDir) -> DeferredDirIterator<'a> {
         DeferredDirIterator {
-            dirp,
+            dirp: dir.dirp,
             visited: self.visited.borrow_mut(),
+            phantom: PhantomData,
         }
     }
 
-    pub fn open_file_descriptor(&self) -> FileDescriptor {
+    /// Reopen this directory by path from the nearest ancestor descriptor still held.
+    ///
+    /// Fallible: the reopen is where the fail-closed `O_NOFOLLOW` hardening below actually
+    /// refuses a swapped directory, and it is also where `EMFILE` shows up -- the condition that
+    /// put the walk into descriptor-conserving mode in the first place. Both used to abort the
+    /// process.
+    pub fn open_file_descriptor(&self) -> io::Result<FileDescriptor> {
         // e.g.:
         // self.parent.1 - foo
         // self.path - foo/bar/baz
@@ -200,9 +206,10 @@ impl DeferredDir {
 
         // `remainder` is not guaranteed to be shorter than `libc::PATH_MAX`
         let (starting_dir, components) =
-            open_long_filename(self.parent.0.clone(), remainder, None, &mut |_, _| {}).unwrap();
+            open_long_filename(self.parent.0.try_clone()?, remainder, None, &mut |_, _| {})?;
 
-        let filename_cstr = CString::new(components.as_path().as_os_str().as_bytes()).unwrap();
+        let filename_cstr = CString::new(components.as_path().as_os_str().as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         // Same descent hardening as the non-deferred path. `O_NOFOLLOW` here makes a leaf that was
         // concurrently swapped for a symlink fail the reopen (fail-closed) rather than redirecting
@@ -213,7 +220,6 @@ impl DeferredDir {
             &filename_cstr,
             libc::O_RDONLY | self.descent_flags,
         )
-        .unwrap()
     }
 
     pub fn parent(&self) -> &Rc<(FileDescriptor, PathBuf)> {
@@ -223,15 +229,9 @@ impl DeferredDir {
 
 pub struct DeferredDirIterator<'a> {
     dirp: *mut libc::DIR,
-    visited: RefMut<'a, HashSet<libc::ino_t>>,
-}
-
-impl Drop for DeferredDirIterator<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            libc::closedir(self.dirp);
-        }
-    }
+    visited: RefMut<'a, HashSet<Box<[u8]>>>,
+    /// The stream belongs to the `OwnedDir` this was created from, which closes it.
+    phantom: PhantomData<&'a OwnedDir>,
 }
 
 impl<'a> Iterator for DeferredDirIterator<'a> {
@@ -257,11 +257,10 @@ impl<'a> Iterator for DeferredDirIterator<'a> {
                         dirent,
                         phantom: PhantomData,
                     };
-                    let ino = entry.ino();
-                    if self.visited.contains(&ino) {
+                    // The name borrows the `dirent` buffer, which the next `readdir` reuses.
+                    let name: Box<[u8]> = entry.name_cstr().to_bytes().into();
+                    if !self.visited.insert(name) {
                         continue;
-                    } else {
-                        self.visited.insert(ino);
                     }
 
                     break Some(Ok(entry));
@@ -275,13 +274,4 @@ impl<'a> Iterator for DeferredDirIterator<'a> {
 pub enum HybridDir {
     Owned(OwnedDir),
     Deferred(DeferredDir),
-}
-
-impl HybridDir {
-    pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = io::Result<EntryInternal<'a>>> + 'a> {
-        match self {
-            HybridDir::Owned(d) => Box::new(d.iter()),
-            HybridDir::Deferred(d) => Box::new(d.iter()),
-        }
-    }
 }

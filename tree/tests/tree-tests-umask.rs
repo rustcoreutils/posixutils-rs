@@ -340,7 +340,7 @@ fn mkdir_test(args: &[&str], expected_output: &str, expected_error: &str, expect
     )
 }
 
-// Audit #MK1: an explicit `-m` mode is not reduced by the umask.
+// An explicit `-m` mode is not reduced by the umask.
 #[test]
 fn test_mkdir_explicit_mode_bypasses_umask() {
     let test_dir = &format!(
@@ -360,7 +360,7 @@ fn test_mkdir_explicit_mode_bypasses_umask() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #MK2: `-p` intermediates get the default mode (+u+wx), only the leaf gets `-m`.
+// `-p` intermediates get the default mode (+u+wx), only the leaf gets `-m`.
 #[test]
 fn test_mkdir_p_intermediate_mode() {
     let test_dir = &format!(

@@ -65,13 +65,15 @@ fn test_chmod_no_x() {
     let a = &format!("{test_dir}/a");
     let a_b = &format!("{test_dir}/a/b");
     let d = &format!("{test_dir}/d");
+    let d_no_x = &format!("{test_dir}/d/no-x");
     let d_no_x_y = &format!("{test_dir}/d/no-x/y");
 
     fs::create_dir(test_dir).unwrap();
     fs::create_dir_all(a_b).unwrap();
     fs::create_dir_all(d_no_x_y).unwrap();
 
-    chmod_test(&["u=rw", d_no_x_y], "", "", 0);
+    // Search permission is removed from the parent, so `y` inside it cannot be reached.
+    chmod_test(&["u=rw", d_no_x], "", "", 0);
     chmod_test(
         &["-R", "o=r", d],
         "",
@@ -86,8 +88,9 @@ fn test_chmod_no_x() {
         1,
     );
 
-    // Reset permission so it can be deleted
+    // Reset permissions so the tree can be deleted
     fs::set_permissions(a, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(d_no_x, fs::Permissions::from_mode(0o777)).unwrap();
 
     fs::remove_dir_all(test_dir).unwrap();
 }
@@ -182,7 +185,7 @@ fn test_chmod_thru_dangling() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Audit #CM1 (shared with #CO1/#CG1/#DU1): a per-file error during `chmod -R` is reported but the
+// A per-file error during `chmod -R` is reported but the
 // walk continues — a readable sibling is still chmod'd and the exit status is non-zero.
 #[test]
 fn test_chmod_continue_on_error() {

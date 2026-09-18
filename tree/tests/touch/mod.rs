@@ -57,7 +57,7 @@ fn test_touch_creates_file() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #TO2: the spec `-d` forms (T or space separator, comma/dot fraction, Z) are all accepted
+// The spec `-d` forms (T or space separator, comma/dot fraction, Z) are all accepted
 // and yield the same instant (compared under a fixed UTC zone).
 #[test]
 fn test_touch_d_iso_forms() {
@@ -84,7 +84,7 @@ fn test_touch_d_iso_forms() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #TO3: -t interprets its fields in the local timezone (TZ), not UTC. Noon in New York
+// -t interprets its fields in the local timezone (TZ), not UTC. Noon in New York
 // (UTC-5 in January) is 5 hours later in epoch terms than noon UTC.
 #[test]
 fn test_touch_t_honors_tz() {
@@ -104,7 +104,7 @@ fn test_touch_t_honors_tz() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #TO4: `-c` on a missing file is silent and exits 0.
+// `-c` on a missing file is silent and exits 0.
 #[test]
 fn test_touch_c_missing_silent() {
     let d = dir("test_touch_c_missing_silent");
@@ -116,7 +116,7 @@ fn test_touch_c_missing_silent() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #TO5: sub-second precision is preserved.
+// Sub-second precision is preserved.
 #[test]
 fn test_touch_subsecond_preserved() {
     let d = dir("test_touch_subsecond_preserved");
@@ -137,7 +137,7 @@ fn test_touch_subsecond_preserved() {
     fs::remove_dir_all(&d).unwrap();
 }
 
-// Audit #TO6: `-a -t <past>` on a new file sets only atime; mtime stays at the (current) creation
+// `-a -t <past>` on a new file sets only atime; mtime stays at the (current) creation
 // time, not the past option time.
 #[test]
 fn test_touch_a_newfile_leaves_mtime_now() {

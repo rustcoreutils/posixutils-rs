@@ -12,7 +12,7 @@ mod common;
 
 use self::common::{copy_file, error_string};
 use clap::Parser;
-use common::CopyConfig;
+use common::{CopyConfig, DerefMode, InodeMap};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::{
     collections::{HashMap, HashSet},
@@ -69,17 +69,22 @@ fn prompt_user(prompt: &str) -> bool {
 
 // Copy the file or directory hierarchy from `src` to `dst`.
 fn copy_hierarchy(
-    cfg: &MvConfig,
     src: &Path,
     dst: &Path,
-    inode_map: &mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>,
+    inode_map: &mut InodeMap,
     created_files: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     let copy_cfg = CopyConfig {
-        force: cfg.force,
-        follow_cli: true,   // Follow symlink if passed as an argument
-        dereference: false, // Don't follow symlinks
-        interactive: cfg.interactive,
+        // `mv` already asked its own POSIX step-1 question (108060-108064) and step 5 removed the
+        // destination, so the copy engine must not ask again for the same file. `force` here
+        // carries only the cp step-3.a.iii meaning: unlink a destination that cannot be opened
+        // and retry.
+        force: true,
+        interactive: false,
+        // POSIX mv step 6 (108097-108099): links are duplicated as links, including a link
+        // named as an operand -- moving one across a filesystem must not turn it into a copy of
+        // whatever it points at.
+        deref: DerefMode::Never,
         preserve: true,  // Always copy file attributes
         recursive: true, // Recursively copy
         prog: "mv",
@@ -104,7 +109,7 @@ fn move_file(
     cfg: &MvConfig,
     source: &Path,
     target: &Path,
-    inode_map: &mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>,
+    inode_map: &mut InodeMap,
     created_files: Option<&mut HashSet<PathBuf>>,
 ) -> io::Result<bool> {
     let source_filename = CString::new(source.as_os_str().as_bytes()).unwrap();
@@ -126,7 +131,14 @@ fn move_file(
         Some(md) => md.file_type() == ftw::FileType::Directory,
         None => false,
     };
-    let target_is_writable = target_md.map(|md| md.is_writable()).unwrap_or(false);
+    // As in `rm`, a symbolic link destination is not write-protected: `mv` replaces the link
+    // itself, not what it points at, so neither the link's own mode bits nor the referent's
+    // apply. `target_md` follows the link, so the type has to come from an `lstat`.
+    let target_is_symlink = ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false)
+        .map(|md| md.file_type() == ftw::FileType::SymbolicLink)
+        .unwrap_or(false);
+    let target_is_writable =
+        target_is_symlink || ftw::is_writable_at(libc::AT_FDCWD, &target_filename);
 
     let source_md = match ftw::Metadata::new(libc::AT_FDCWD, &source_filename, true) {
         Ok(md) => Some(md),
@@ -296,7 +308,7 @@ fn move_file(
         Some(set) => set,
         None => &mut HashSet::new(),
     };
-    copy_hierarchy(cfg, source, target, inode_map, created_files).map_err(err_inter_device)?;
+    copy_hierarchy(source, target, inode_map, created_files).map_err(err_inter_device)?;
 
     Ok(false)
 }

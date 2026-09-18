@@ -417,13 +417,12 @@ fn test_chgrp_no_x() {
     };
     fs::set_permissions(d_no_x, perm_usr_rw_only).unwrap();
 
-    // Other acceptable error messages:
-    // chgrp: '{d_no_x}': Permission denied
-    // chgrp: cannot access '{d_no_x_y}': Permission denied
+    // `d/no-x` is readable but not searchable, so its entries can be listed but not stat'ed;
+    // the diagnostic names the entry that could not be reached, as GNU chgrp does.
     chgrp_test(
         &["-R", g2, d],
         "",
-        &format!("chgrp: cannot read directory '{d_no_x}': Permission denied\n"),
+        &format!("chgrp: cannot access '{d_no_x_y}': Permission denied\n"),
         1,
     );
 

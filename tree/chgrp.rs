@@ -56,7 +56,7 @@ fn parse_group(group: &str) -> Result<Option<u32>, String> {
 fn err_handler(e: io::Error, path: ftw::DisplayablePath) {
     let err_str = match e.kind() {
         io::ErrorKind::PermissionDenied => {
-            gettext!("cannot read directory '{}': {}", path, error_string(&e))
+            gettext!("cannot access '{}': {}", path, error_string(&e))
         }
         _ => {
             gettext!("changing group of '{}': {}", path, error_string(&e))

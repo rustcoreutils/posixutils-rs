@@ -1118,12 +1118,9 @@ fn process_single_dir(
                     let mut target_path = None;
                     if metadata.is_symlink() && !dereference_symlink {
                         if let OutputFormat::Long(_) = &config.output_format {
-                            // Prefer ftw's cached readlink; fall back to an explicit readlinkat
-                            // (it can be `None` for symlinks discovered during directory traversal).
-                            target_path = match dir_entry.read_link() {
-                                Some(link) => Some(ls_from_utf8_lossy(link.to_bytes())),
-                                None => read_link_target(dir_entry.dir_fd(), dir_entry.file_name()),
-                            };
+                            target_path = dir_entry
+                                .read_link()
+                                .map(|link| ls_from_utf8_lossy(link.to_bytes()));
                         }
                     }
 
@@ -1244,7 +1241,7 @@ fn process_single_dir(
                 }
             }
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |entry, error| {
             let path_str = ls_from_utf8_lossy(entry.path().as_inner().as_os_str().as_bytes());
             eprintln!(
@@ -1258,6 +1255,7 @@ fn process_single_dir(
             follow_symlinks,
             include_dot_and_double_dot: true,
             list_contents_first: true,
+            ..Default::default()
         },
     );
 

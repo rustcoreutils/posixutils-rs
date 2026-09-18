@@ -725,7 +725,13 @@ pub struct TraverseDirectoryOpts {
 ///   contents will be skipped if `file_handler` returns `false`. The return value of
 ///   `file_handler` is ignored when the entry is a file.
 ///
-/// * `postprocess_dir` - Called when `traverse_directory` is exiting a directory.
+/// * `postprocess_dir` - Called when `traverse_directory` is exiting a directory: exactly once
+///   for every entry whose `file_handler` returned `Ok(true)` and whose metadata reported a
+///   directory, whether or not the traversal was able to descend into it. The [`DirExit`]
+///   argument says which of the two happened, so that a caller can unwind per-directory state it
+///   established on that `Ok(true)` without repeating work that only makes sense for a directory
+///   that was actually read. When descent was refused, `err_reporter` is called with the reason
+///   first.
 ///
 /// * `err_reporter` - Callback for reporting the errors encountered during the directory traversal.
 ///

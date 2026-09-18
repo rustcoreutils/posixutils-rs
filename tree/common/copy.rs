@@ -920,13 +920,11 @@ fn copy_special_file(
 ) -> io::Result<()> {
     let is_fifo = source_file_type == ftw::FileType::Fifo;
 
-    // 4.b. A FIFO takes the source's permission bits (90683-90685); for the other types they are
-    // implementation-defined, and GNU uses the source's as well. `mknodat` applies the umask, and
-    // `-p` restores the exact bits afterwards through `copy_characteristics`.
-    // 4.b. A FIFO takes the source's permission bits, umask-modified without -p
-    // (POSIX 90683-90685). That is all nine-plus-three bits: unlike a regular file, a set-user-ID
-    // FIFO is inert, and GNU reproduces the bit too. For the other types the permissions are
-    // implementation-defined; drop the set-id bits there.
+    // 4.b. A FIFO takes the source's permission bits (POSIX 90683-90685), all twelve of them:
+    // unlike a regular file a set-user-ID FIFO is inert, and GNU reproduces the bit too. For the
+    // other special types the permissions are implementation-defined, so keep only the ordinary
+    // nine. `mknodat` applies the umask, and `-p` restores the exact bits afterwards through
+    // `copy_characteristics`.
     let perm = source_md.mode() & if is_fifo { 0o7777 } else { 0o777 };
 
     // 4.a: "The dest_file shall be created with the same file type as source_file." Passing no

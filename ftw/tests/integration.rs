@@ -541,6 +541,9 @@ fn conserving_walk_yields_every_hard_link() {
 /// directory and ends the walk. The reporter used to index `path_stack` two components back,
 /// which underflows at depth 1, and the loop used to `continue` -- but `readdir` keeps returning
 /// the same error, so it never terminated.
+///
+/// Whether the sabotage below produces a `readdir` failure at all is platform-dependent, so the
+/// assertion about it is made only where it can be provoked; the walk must terminate everywhere.
 #[test]
 fn readdir_error_on_root_reports_once_and_terminates() {
     let tmp_dir = plib::tmp::Builder::new()
@@ -554,9 +557,14 @@ fn readdir_error_on_root_reports_once_and_terminates() {
         fs::write(root.join(name), b"x").unwrap();
     }
 
-    // Replace the directory's descriptor with one referring to a non-directory, so the next
-    // `readdir` fails with ENOTDIR. `dup2` rather than `close` keeps the descriptor number
-    // allocated: closing it would let another thread in this test binary reuse the number.
+    // Replace the directory's descriptor with one referring to a non-directory. `dup2` rather
+    // than `close` keeps the descriptor number allocated: closing it would let another thread in
+    // this test binary reuse the number.
+    //
+    // On Linux the next `getdents` on that descriptor fails with ENOTDIR, which is the error path
+    // under test. On macOS the entries the C library has already buffered simply drain and the
+    // stream ends -- reading the empty scratch file returns end-of-file rather than an error -- so
+    // no `readdir` failure is produced there.
     let scratch = fs::File::create(tmp_dir.path().join("scratch")).unwrap();
     let mut sabotaged = false;
     let mut errors: Vec<(String, ftw::ErrorKind)> = Vec::new();
@@ -580,23 +588,35 @@ fn readdir_error_on_root_reports_once_and_terminates() {
 
     assert!(sabotaged, "the walk never entered the root directory");
 
-    // Entries already buffered by the C library are still handed back, and their `fstatat`
-    // now fails against the replaced descriptor; those reports are collateral of the sabotage.
-    // What matters is the `readdir` failure itself: reported once, naming the root.
+    // Reaching here at all is the guard against the non-terminating loop, on every platform.
+
+    // Entries already buffered by the C library are still handed back, and their `fstatat` now
+    // fails against the replaced descriptor; those reports are collateral of the sabotage. What
+    // matters is the `readdir` failure itself: reported once, and naming the root rather than
+    // panicking on a path stack too short to index.
     let readdir_errors: Vec<&String> = errors
         .iter()
         .filter(|(_, kind)| *kind == ftw::ErrorKind::ReadDir)
         .map(|(path, _)| path)
         .collect();
+
+    assert!(
+        readdir_errors.len() <= 1,
+        "the failing directory was reported more than once: {errors:?}"
+    );
+    for path in &readdir_errors {
+        assert_eq!(
+            **path,
+            root.to_string_lossy(),
+            "the report must name the directory that could not be read"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     assert_eq!(
         readdir_errors.len(),
         1,
-        "expected exactly one readdir report, got {errors:?}"
-    );
-    assert_eq!(
-        *readdir_errors[0],
-        root.to_string_lossy(),
-        "the report must name the directory that could not be read"
+        "expected a readdir report, got {errors:?}"
     );
 }
 

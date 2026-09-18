@@ -1083,3 +1083,48 @@ fn test_write_bounds_member_data_to_header_size() {
         stderr_str(&listing)
     );
 }
+
+/// A pax archive writes an extended header only for the members that need one,
+/// so the first block may be an ordinary ustar header. Reading the format from
+/// that block alone got the rest of the archive wrong: the later 'x' blocks
+/// became regular files named PaxHeader/N, and the members they described fell
+/// back to the truncated 100-byte name in their ustar header.
+#[test]
+fn test_read_pax_archive_whose_first_member_needs_no_extended_header() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+
+    // A short name first, then one too long for a ustar header.
+    let long_name = "b".repeat(160);
+    fs::write(src.join("a.txt"), b"one\n").unwrap();
+    fs::write(src.join(&long_name), b"two\n").unwrap();
+
+    let archive = temp.path().join("a.tar");
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-f",
+            archive.to_str().unwrap(),
+            "a.txt",
+            &long_name,
+        ],
+        &src,
+    );
+    assert_success(&out, "writing the archive");
+
+    let listing = run_pax_in_dir(&["-t", "-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&listing, "listing the archive");
+    let listed = stdout_str(&listing);
+
+    assert!(
+        listed.contains(&long_name),
+        "the long member name was not read back in full: {listed}"
+    );
+    assert!(
+        !listed.contains("PaxHeader"),
+        "an extended header block was listed as a member: {listed}"
+    );
+}

@@ -126,3 +126,55 @@ fn test_malformed_unrecognized_leading_block() {
     );
     assert_failure(&output, "list an unrecognized archive");
 }
+
+/// A header length field is attacker-controlled, so it must never size an
+/// allocation. A single 512-byte block declaring a 4 GiB extended header used to
+/// abort the process on the allocation alone, before reading any of it.
+#[test]
+fn test_malformed_huge_extended_header_size_is_rejected() {
+    // 0o37777777777 == 4294967295.
+    let mut archive = ustar_header("PaxHeaders/1", 0, b'x').to_vec();
+    archive[124..136].copy_from_slice(b"37777777777\0");
+    archive[148..156].copy_from_slice(b"        ");
+    let sum: u32 = archive[..BLOCK].iter().map(|&b| b as u32).sum();
+    archive[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+
+    let output = run_pax_with_stdin_bytes(&["-t"], &archive);
+
+    assert!(
+        !output.status.success(),
+        "an unsatisfiable extended-header size should be rejected"
+    );
+    assert!(
+        stderr_str(&output).contains("exceeds"),
+        "expected a size-limit diagnostic, got: {}",
+        stderr_str(&output)
+    );
+}
+
+/// The same for cpio, whose name and symbolic-link-target lengths come straight
+/// from the header: a 128-byte archive declaring a 2 GiB link target.
+#[test]
+fn test_malformed_huge_cpio_symlink_size_is_rejected() {
+    fn field(v: u32) -> String {
+        format!("{v:08X}")
+    }
+    let mut archive = String::from("070701");
+    for v in [1, 0o120777, 0, 0, 1, 0, 0x7FFF_FFF0, 0, 0, 0, 0, 5, 0] {
+        archive.push_str(&field(v));
+    }
+    let mut archive = archive.into_bytes();
+    archive.extend_from_slice(b"link\0\0\0\0");
+
+    let output = run_pax_with_stdin_bytes(&["-t", "-x", "cpio"], &archive);
+
+    assert!(
+        !output.status.success(),
+        "an unsatisfiable symbolic-link target size should be rejected"
+    );
+    assert!(
+        stderr_str(&output).contains("exceeds"),
+        "expected a size-limit diagnostic, got: {}",
+        stderr_str(&output)
+    );
+}

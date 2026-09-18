@@ -404,8 +404,12 @@ fn parse_odc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<Archive
     let filesize = parse_octal_field(&header[59..70])?;
 
     // Read filename
-    let mut name_buf = vec![0u8; namesize];
-    reader.read_exact(&mut name_buf)?;
+    let name_buf = crate::formats::read_declared(
+        reader,
+        namesize as u64,
+        crate::formats::MAX_NAME,
+        "cpio member name",
+    )?;
 
     // Remove trailing NUL
     let name = parse_name(&name_buf);
@@ -415,8 +419,12 @@ fn parse_odc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<Archive
 
     // For symlinks, the file data is the link target - read it now
     let link_target = if entry_type == EntryType::Symlink && filesize > 0 {
-        let mut target_buf = vec![0u8; filesize as usize];
-        reader.read_exact(&mut target_buf)?;
+        let target_buf = crate::formats::read_declared(
+            reader,
+            filesize,
+            crate::formats::MAX_NAME,
+            "cpio symbolic link target",
+        )?;
         Some(PathBuf::from(parse_name(&target_buf)))
     } else {
         None
@@ -485,8 +493,12 @@ fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(Archi
     // c_check at [96..104] is ignored for reading
 
     // Read filename
-    let mut name_buf = vec![0u8; namesize];
-    reader.read_exact(&mut name_buf)?;
+    let name_buf = crate::formats::read_declared(
+        reader,
+        namesize as u64,
+        crate::formats::MAX_NAME,
+        "cpio member name",
+    )?;
 
     // Calculate padding after filename (header + name must be 4-byte aligned)
     // Header is 110 bytes, so (110 + namesize) must be aligned to 4
@@ -505,8 +517,12 @@ fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(Archi
 
     // For symlinks, the file data is the link target - read it now
     let (link_target, size, data_padding) = if entry_type == EntryType::Symlink && filesize > 0 {
-        let mut target_buf = vec![0u8; filesize as usize];
-        reader.read_exact(&mut target_buf)?;
+        let target_buf = crate::formats::read_declared(
+            reader,
+            filesize,
+            crate::formats::MAX_NAME,
+            "cpio symbolic link target",
+        )?;
         // Calculate padding after symlink data
         let symlink_padding = (4 - (filesize as usize % 4)) % 4;
         if symlink_padding > 0 {
@@ -596,8 +612,12 @@ fn parse_bin_header<R: Read>(
     let filesize = read_u32(20) as u64;
 
     // Read filename (padded to word boundary)
-    let mut name_buf = vec![0u8; namesize];
-    reader.read_exact(&mut name_buf)?;
+    let name_buf = crate::formats::read_declared(
+        reader,
+        namesize as u64,
+        crate::formats::MAX_NAME,
+        "cpio member name",
+    )?;
 
     // Skip padding after filename (header + name must be word-aligned)
     // Header is 26 bytes, so total = 26 + namesize, must be even
@@ -615,8 +635,12 @@ fn parse_bin_header<R: Read>(
 
     // For symlinks, the file data is the link target - read it now
     let (link_target, size, data_padding) = if entry_type == EntryType::Symlink && filesize > 0 {
-        let mut target_buf = vec![0u8; filesize as usize];
-        reader.read_exact(&mut target_buf)?;
+        let target_buf = crate::formats::read_declared(
+            reader,
+            filesize,
+            crate::formats::MAX_NAME,
+            "cpio symbolic link target",
+        )?;
         // Skip padding after symlink data
         let symlink_padding = (filesize as usize) % 2;
         if symlink_padding > 0 {

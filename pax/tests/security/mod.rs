@@ -22,9 +22,17 @@ use std::fs;
 /// Build a one-member ustar archive by hand, so the member name can be anything
 /// -- including names pax itself would refuse to write.
 fn ustar_archive(name: &str, typeflag: u8, linkname: &str, body: &[u8]) -> Vec<u8> {
+    let mut a = ustar_member(name, typeflag, linkname, 0o644, body);
+    a.extend_from_slice(&[0u8; 1024]);
+    a
+}
+
+/// One ustar member: header plus padded body, with no end-of-archive trailer, so
+/// several can be concatenated.
+fn ustar_member(name: &str, typeflag: u8, linkname: &str, mode: u32, body: &[u8]) -> Vec<u8> {
     let mut h = [0u8; 512];
     h[..name.len()].copy_from_slice(name.as_bytes());
-    h[100..108].copy_from_slice(b"0000644\0");
+    h[100..108].copy_from_slice(format!("{mode:07o}\0").as_bytes());
     h[108..116].copy_from_slice(b"0000000\0");
     h[116..124].copy_from_slice(b"0000000\0");
     h[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
@@ -43,7 +51,6 @@ fn ustar_archive(name: &str, typeflag: u8, linkname: &str, body: &[u8]) -> Vec<u
         data.resize(data.len().div_ceil(512) * 512, 0);
         a.extend_from_slice(&data);
     }
-    a.extend_from_slice(&[0u8; 1024]);
     a
 }
 
@@ -210,3 +217,35 @@ fn test_extract_readonly_directory_gets_its_contents() {
 // resolution now makes possible. Building the fixture needs the same fd-relative
 // walk under test -- std's create_dir_all fails with ENAMETOOLONG on the source
 // tree -- so the test would mostly exercise its own scaffolding.
+
+/// Directory attributes are applied after the whole archive is extracted, so an
+/// archive can arrange for the name to be a symlink by then: a directory member
+/// `d/`, then a symlink member `d`. Applying the archived mode by name chmods
+/// whatever the link points at, anywhere on the system.
+#[test]
+fn test_extract_does_not_chmod_through_planted_symlink() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let outside = temp.path().join("outside");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&outside).unwrap();
+    fs::create_dir(&dst).unwrap();
+
+    let victim = outside.join("victim");
+    fs::write(&victim, b"secret\n").unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut archive = ustar_member("d/", b'5', "", 0o777, b"");
+    archive.extend_from_slice(&ustar_member("d", b'2', "../outside/victim", 0o777, b""));
+    archive.extend_from_slice(&[0u8; 1024]);
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
+
+    assert_eq!(
+        fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
+        0o600,
+        "an archive changed the mode of a file outside the extraction directory: {}",
+        stderr_str(&output)
+    );
+}

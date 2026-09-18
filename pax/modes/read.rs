@@ -927,11 +927,9 @@ fn extract_file<R: ArchiveReader>(
     };
 
     copy_file_data(archive, &mut file, entry.size)?;
-    drop(file);
 
-    set_owner_at(dirfd, name, entry, options)?;
-    set_permissions_at(dirfd, name, entry, options)?;
-    set_times_at(dirfd, name, entry, options)
+    // Through the descriptor the data was just written to, not by name.
+    set_attrs_fd(file.as_fd(), entry, options)
 }
 
 /// Copy file data from archive to file
@@ -970,12 +968,7 @@ fn is_archive_newer_at(entry: &ArchiveEntry, dirfd: BorrowedFd<'_>, name: &CStr)
 }
 
 /// Set file permissions
-fn set_permissions_at(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    entry: &ArchiveEntry,
-    options: &ReadOptions,
-) -> PaxResult<()> {
+fn effective_mode(entry: &ArchiveEntry, options: &ReadOptions) -> u32 {
     let mut mode = entry.mode;
 
     // Per POSIX: If owner is not preserved, clear SUID and SGID bits
@@ -994,6 +987,43 @@ fn set_permissions_at(
         mode &= !options.umask;
     }
 
+    mode
+}
+
+/// Set file permissions on a name below `dirfd`.
+///
+/// `fchmodat` has no portable way to refuse a symbolic link -- Linux rejects
+/// `AT_SYMLINK_NOFOLLOW` outright -- so the type is checked first and a link is
+/// refused. Callers that hold a descriptor for the file should use
+/// `set_attrs_fd` instead, which cannot be redirected at all.
+fn set_permissions_at(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+) -> PaxResult<()> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::fstatat(
+            dirfd.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        // Whatever this name was when it was created, it is a symbolic link
+        // now. Following it would apply the archived mode to the file it
+        // points at, anywhere on the system.
+        return Err(PaxError::InvalidHeader(
+            "refusing to set permissions through a symbolic link".to_string(),
+        ));
+    }
+
+    let mode = effective_mode(entry, options);
     let r = unsafe { libc::fchmodat(dirfd.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) };
     if r != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -1037,15 +1067,10 @@ fn set_owner_at(
 }
 
 /// Set file access and modification times
-fn set_times_at(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    entry: &ArchiveEntry,
-    options: &ReadOptions,
-) -> PaxResult<()> {
+fn effective_times(entry: &ArchiveEntry, options: &ReadOptions) -> Option<[libc::timespec; 2]> {
     // If neither atime nor mtime preservation is requested, skip
     if !options.preserve_mtime && !options.preserve_atime {
-        return Ok(());
+        return None;
     }
 
     // Determine the atime to set, preserving nanosecond precision. UTIME_OMIT
@@ -1081,7 +1106,20 @@ fn set_times_at(
         }
     };
 
-    let times = [atime, mtime];
+    Some([atime, mtime])
+}
+
+/// Set file access and modification times
+fn set_times_at(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+) -> PaxResult<()> {
+    let Some(times) = effective_times(entry, options) else {
+        return Ok(());
+    };
+
     let result = unsafe {
         libc::utimensat(
             dirfd.as_raw_fd(),
@@ -1100,6 +1138,43 @@ fn set_times_at(
             eprintln!("pax: warning: cannot set times: {}", err);
         }
         crate::error::note_error();
+    }
+
+    Ok(())
+}
+
+/// Apply owner, mode and times to an already-open file.
+///
+/// Nothing here names a path, so none of it can be redirected by a name that
+/// changed after the file was created.
+fn set_attrs_fd(fd: BorrowedFd<'_>, entry: &ArchiveEntry, options: &ReadOptions) -> PaxResult<()> {
+    if options.preserve_owner {
+        let r = unsafe { libc::fchown(fd.as_raw_fd(), entry.uid, entry.gid) };
+        if r != 0 {
+            let err = std::io::Error::last_os_error();
+            // EPERM usually means we're not root - warn but continue
+            if err.raw_os_error() == Some(libc::EPERM) {
+                eprintln!("pax: cannot change owner: Operation not permitted");
+                crate::error::note_error();
+            } else {
+                return Err(err.into());
+            }
+        }
+    }
+
+    let mode = effective_mode(entry, options);
+    let r = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    if let Some(times) = effective_times(entry, options) {
+        let r = unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) };
+        if r != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("pax: warning: cannot set times: {}", err);
+            crate::error::note_error();
+        }
     }
 
     Ok(())
@@ -1130,10 +1205,25 @@ fn apply_pending_dirs(
         let pfd = parent.as_fd();
         let name = member.leaf.as_c_str();
 
-        let outcome = set_owner_at(pfd, name, entry, options)
-            .and_then(|_| set_permissions_at(pfd, name, entry, options))
-            .and_then(|_| set_times_at(pfd, name, entry, options));
-        if let Err(e) = outcome {
+        // Reopen the directory itself and work through that descriptor. This
+        // pass runs after the whole archive has been extracted, so the name
+        // need not still be the directory that was created for this member --
+        // a later member can have replaced it with a symbolic link, and
+        // applying the archived mode by name would then chmod whatever the
+        // link points at. `O_NOFOLLOW` refuses the link, and `O_DIRECTORY`
+        // refuses anything else that took its place.
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(pfd.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            crate::error::report_error(
+                member.display.display(),
+                PaxError::from(std::io::Error::last_os_error()),
+            );
+            continue;
+        }
+        let dir = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        if let Err(e) = set_attrs_fd(dir.as_fd(), entry, options) {
             crate::error::report_error(member.display.display(), e);
         }
     }

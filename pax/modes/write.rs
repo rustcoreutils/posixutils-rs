@@ -594,9 +594,9 @@ fn write_file<W: ArchiveWriter>(
     // Write regular file
     archive.write_entry(&entry)?;
 
-    // Copy file contents
+    // Copy file contents, bounded by the size already written in the header.
     let mut file = File::open(src_path)?;
-    copy_file_data(&mut file, archive)?;
+    copy_file_data(&mut file, archive, entry.size, src_path)?;
 
     archive.finish_entry()?;
 
@@ -623,16 +623,60 @@ fn file_checksum(path: &Path) -> PaxResult<u32> {
     }
 }
 
-/// Copy file data to archive
-fn copy_file_data<W: ArchiveWriter>(file: &mut File, archive: &mut W) -> PaxResult<()> {
+/// Copy file data to the archive, writing exactly the `size` already recorded in
+/// the member's header.
+///
+/// The header goes out before the data, so the size in it is a promise made from
+/// a `stat` that has already happened. A file being written by someone else can
+/// yield a different amount by the time it is read, and letting that through put
+/// unbounded extra bytes into the archive at a 512-byte boundary -- where a
+/// reader takes them for a header, so anyone able to modify a file while it is
+/// archived could inject fabricated members. Reading short instead left the
+/// member unterminated.
+///
+/// So the read is truncated if the file grew and zero-padded if it shrank, which
+/// is what GNU tar does ("File shrank by N bytes; padding with zeros"), and the
+/// exit status records that the archive does not match what was on disk. The
+/// bound also has to come from `size` rather than from end-of-file: waiting for a
+/// shrinking file to deliver bytes it no longer has is how CVE-2018-20482 turned
+/// into an infinite loop.
+fn copy_file_data<W: ArchiveWriter>(
+    file: &mut File,
+    archive: &mut W,
+    size: u64,
+    path: &Path,
+) -> PaxResult<()> {
     let mut buf = [0u8; 8192];
+    let mut remaining = size;
 
-    loop {
-        let n = file.read(&mut buf)?;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want])?;
         if n == 0 {
             break;
         }
         archive.write_data(&buf[..n])?;
+        remaining -= n as u64;
+    }
+
+    if remaining > 0 {
+        eprintln!(
+            "pax: {}: File shrank by {} bytes; padding with zeros",
+            path.display(),
+            remaining
+        );
+        crate::error::note_error();
+
+        let zeros = [0u8; 8192];
+        while remaining > 0 {
+            let n = remaining.min(zeros.len() as u64) as usize;
+            archive.write_data(&zeros[..n])?;
+            remaining -= n as u64;
+        }
+    } else if file.read(&mut buf[..1])? != 0 {
+        // Still more to read than the header promised.
+        eprintln!("pax: {}: file changed as we read it", path.display());
+        crate::error::note_error();
     }
 
     Ok(())
@@ -845,7 +889,19 @@ fn reset_atime(path: &Path, atime_sec: i64, atime_nsec: i64) {
         },
     ];
 
-    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
+    // `AT_SYMLINK_NOFOLLOW`: the file has been read and closed by now, so the
+    // name is being resolved a second time. Without the flag, a name replaced by
+    // a symbolic link in between would have pax stamp the link's target instead.
+    // It also matches the `symlink_metadata` above, which took the mtime from the
+    // link rather than through it.
+    let result = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path_cstr.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
 
     if result != 0 {
         let err = std::io::Error::last_os_error();

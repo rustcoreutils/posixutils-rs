@@ -1046,3 +1046,40 @@ fn test_long_splittable_path_roundtrip() {
         "splittable"
     );
 }
+
+/// The header goes out before the data, so the size in it is a promise made from
+/// a `stat` that has already happened. Writing more than that puts bytes into the
+/// archive at a 512-byte boundary, where a reader takes them for a header.
+///
+/// A procfs file reports size 0 and then yields content, which is the same
+/// mismatch a file being appended to during the read produces, without a race.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_write_bounds_member_data_to_header_size() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("a.tar");
+
+    let output = run_pax_in_dir(
+        &["-w", "-f", archive.to_str().unwrap(), "/proc/self/status"],
+        temp.path(),
+    );
+
+    assert!(
+        !output.status.success(),
+        "a member whose data did not match its header should set a non-zero status"
+    );
+    assert!(
+        stderr_str(&output).contains("changed as we read it"),
+        "expected a changed-file diagnostic, got: {}",
+        stderr_str(&output)
+    );
+
+    // The point of bounding the data: the archive is still structurally valid,
+    // so the next header is where the previous member's size says it is.
+    let listing = run_pax_in_dir(&["-t", "-f", archive.to_str().unwrap()], temp.path());
+    assert!(
+        listing.status.success(),
+        "the archive should still be readable: {}",
+        stderr_str(&listing)
+    );
+}

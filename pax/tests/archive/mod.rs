@@ -13,6 +13,7 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1044,5 +1045,135 @@ fn test_long_splittable_path_roundtrip() {
     assert_eq!(
         fs::read_to_string(dst_dir.join(&dir_name).join(&name)).unwrap(),
         "splittable"
+    );
+}
+
+/// The header goes out before the data, so the size in it is a promise made from
+/// a `stat` that has already happened. Writing more than that puts bytes into the
+/// archive at a 512-byte boundary, where a reader takes them for a header.
+///
+/// A procfs file reports size 0 and then yields content, which is the same
+/// mismatch a file being appended to during the read produces, without a race.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_write_bounds_member_data_to_header_size() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("a.tar");
+
+    let output = run_pax_in_dir(
+        &["-w", "-f", archive.to_str().unwrap(), "/proc/self/status"],
+        temp.path(),
+    );
+
+    assert!(
+        !output.status.success(),
+        "a member whose data did not match its header should set a non-zero status"
+    );
+    assert!(
+        stderr_str(&output).contains("changed as we read it"),
+        "expected a changed-file diagnostic, got: {}",
+        stderr_str(&output)
+    );
+
+    // The point of bounding the data: the archive is still structurally valid,
+    // so the next header is where the previous member's size says it is.
+    let listing = run_pax_in_dir(&["-t", "-f", archive.to_str().unwrap()], temp.path());
+    assert!(
+        listing.status.success(),
+        "the archive should still be readable: {}",
+        stderr_str(&listing)
+    );
+}
+
+/// A pax archive writes an extended header only for the members that need one,
+/// so the first block may be an ordinary ustar header. Reading the format from
+/// that block alone got the rest of the archive wrong: the later 'x' blocks
+/// became regular files named PaxHeader/N, and the members they described fell
+/// back to the truncated 100-byte name in their ustar header.
+#[test]
+fn test_read_pax_archive_whose_first_member_needs_no_extended_header() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+
+    // A short name first, then one too long for a ustar header.
+    let long_name = "b".repeat(160);
+    fs::write(src.join("a.txt"), b"one\n").unwrap();
+    fs::write(src.join(&long_name), b"two\n").unwrap();
+
+    let archive = temp.path().join("a.tar");
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-f",
+            archive.to_str().unwrap(),
+            "a.txt",
+            &long_name,
+        ],
+        &src,
+    );
+    assert_success(&out, "writing the archive");
+
+    let listing = run_pax_in_dir(&["-t", "-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&listing, "listing the archive");
+    let listed = stdout_str(&listing);
+
+    assert!(
+        listed.contains(&long_name),
+        "the long member name was not read back in full: {listed}"
+    );
+    assert!(
+        !listed.contains("PaxHeader"),
+        "an extended header block was listed as a member: {listed}"
+    );
+}
+
+/// `-t` restores the access time of the file whose access time the read actually
+/// disturbed. With `-L` that is the symbolic link's target, not the link: pax
+/// opens and reads through the link, so stamping the link leaves the target
+/// disturbed and changes an inode that was never read.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_reset_atime_stamps_the_file_that_was_read() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fs::write(dir.join("target"), b"data\n").unwrap();
+    std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+
+    // A distinctive access time, well in the past.
+    const WHEN: i64 = 978_307_200;
+    let times = [
+        libc::timespec {
+            tv_sec: WHEN,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: WHEN,
+            tv_nsec: 0,
+        },
+    ];
+    let target_c = std::ffi::CString::new(dir.join("target").as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, target_c.as_ptr(), times.as_ptr(), 0) },
+        0
+    );
+
+    let archive = dir.join("a.tar");
+    assert_success(
+        &run_pax_in_dir(
+            &["-w", "-L", "-t", "-f", archive.to_str().unwrap(), "link"],
+            dir,
+        ),
+        "archiving through a symbolic link with -t",
+    );
+
+    assert_eq!(
+        fs::metadata(dir.join("target")).unwrap().atime(),
+        WHEN,
+        "-L -t left the target's access time disturbed"
     );
 }

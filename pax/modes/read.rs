@@ -13,15 +13,18 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, Extr
 use crate::error::{PaxError, PaxResult};
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
+use crate::modes::anchored::{
+    create_replacing, set_attrs_fd, stat_at, AttrPolicy, Attrs, DirTree, MemberPath,
+};
 use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Options for read/extract mode
 pub struct ReadOptions {
@@ -517,195 +520,6 @@ fn copy_member_to_stdout<R: ArchiveReader>(
     Ok(())
 }
 
-/// A member pathname reduced to the directory components that must be walked
-/// and the final component to create.
-struct MemberPath {
-    dirs: Vec<CString>,
-    leaf: CString,
-    /// The same path as text, for diagnostics and hard-link bookkeeping.
-    display: PathBuf,
-}
-
-impl MemberPath {
-    /// `Ok(None)` for a member that names nothing to create -- `.`, or a name
-    /// made up entirely of `.`, `..` and root components.
-    ///
-    /// `..` still pops and a leading `/` is still dropped, but this lexical
-    /// pass is no longer the security boundary it used to be: it cannot see
-    /// that `a/b` escapes when `a` is a symlink. Resolution opens each
-    /// component with O_NOFOLLOW instead, which does not care how the name is
-    /// spelled. What remains here is naming policy, plus the one check that
-    /// must happen before any syscall: an embedded NUL.
-    fn parse(path: &Path) -> PaxResult<Option<Self>> {
-        use std::path::Component;
-
-        let mut parts: Vec<OsString> = Vec::new();
-        for comp in path.components() {
-            match comp {
-                Component::Normal(c) => parts.push(c.to_os_string()),
-                Component::ParentDir => {
-                    parts.pop();
-                }
-                Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-            }
-        }
-
-        let Some(leaf_os) = parts.pop() else {
-            return Ok(None);
-        };
-
-        let to_c = |s: &OsString| {
-            CString::new(s.as_bytes())
-                .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))
-        };
-
-        let dirs = parts.iter().map(to_c).collect::<PaxResult<Vec<_>>>()?;
-        let mut display = PathBuf::new();
-        for p in &parts {
-            display.push(p);
-        }
-        display.push(&leaf_os);
-
-        Ok(Some(MemberPath {
-            dirs,
-            leaf: to_c(&leaf_os)?,
-            display,
-        }))
-    }
-
-    /// How deep the member sits, for ordering the deferred directory pass.
-    fn depth(&self) -> usize {
-        self.dirs.len()
-    }
-}
-
-/// Extraction anchored at an open descriptor for the working directory.
-///
-/// Member paths are walked one component at a time with
-/// `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, so a symlink planted anywhere along the
-/// path fails the descent rather than redirecting the write outside the
-/// extraction directory. The previous code resolved whole paths through the
-/// ordinary filesystem namespace, where `create_dir_all` on `sub/file` was
-/// happy to follow `sub -> /elsewhere`.
-struct DirTree {
-    root: OwnedFd,
-}
-
-impl DirTree {
-    fn open_cwd() -> PaxResult<Self> {
-        let dot = CString::new(".").expect("no NUL in \".\"");
-        let fd = unsafe {
-            libc::openat(
-                libc::AT_FDCWD,
-                dot.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(DirTree {
-            root: unsafe { OwnedFd::from_raw_fd(fd) },
-        })
-    }
-
-    /// Open the directory that will hold `member`, creating any missing
-    /// intermediate components.
-    fn parent_of(&self, member: &MemberPath, create_missing: bool) -> PaxResult<OwnedFd> {
-        let mut cur = self.root.try_clone()?;
-        for comp in &member.dirs {
-            cur = open_dir_at(cur.as_fd(), comp, create_missing)?;
-        }
-        Ok(cur)
-    }
-}
-
-/// Open one directory component below `dirfd` without following a symlink.
-fn open_dir_at(dirfd: BorrowedFd<'_>, name: &CString, create_missing: bool) -> PaxResult<OwnedFd> {
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-
-    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
-    if fd >= 0 {
-        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
-    }
-
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() != Some(libc::ENOENT) || !create_missing {
-        return Err(err.into());
-    }
-
-    // Intermediate directories are created with the normal file-creation
-    // action, per POSIX read/copy mode: mode 0777 modified by the umask.
-    let r = unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), 0o777) };
-    if r != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EEXIST) {
-            return Err(e.into());
-        }
-    }
-
-    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// Remove whatever currently occupies `name`, so an exclusive create can win.
-fn unlink_at(dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<()> {
-    let r = unsafe { libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), 0) };
-    if r != 0 {
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::ENOENT) => return Ok(()),
-            // A directory in the way needs the directory flag instead.
-            Some(libc::EISDIR) | Some(libc::EPERM) => {
-                let r =
-                    unsafe { libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
-                if r == 0 {
-                    return Ok(());
-                }
-                return Err(std::io::Error::last_os_error().into());
-            }
-            _ => return Err(err.into()),
-        }
-    }
-    Ok(())
-}
-
-/// Create a member, retrying once after clearing whatever is in the way.
-///
-/// `create` reports `EEXIST` by returning `Err`; that is the whole point. With
-/// -k an existing name means skip, atomically and with no window. Otherwise the
-/// old entry is unlinked and the create retried, so the member is always a
-/// freshly created object -- never a write *through* a symlink or a hard link
-/// an attacker left behind, which `O_TRUNC` on an existing name would allow.
-fn create_replacing<F>(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    no_clobber: bool,
-    mut create: F,
-) -> PaxResult<bool>
-where
-    F: FnMut() -> std::io::Result<()>,
-{
-    match create() {
-        Ok(()) => return Ok(true),
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    if no_clobber {
-        return Ok(false);
-    }
-
-    unlink_at(dirfd, name)?;
-    match create() {
-        Ok(()) => Ok(true),
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// Extract a directory. Returns whether its attributes should be applied later.
 fn extract_directory(
     dirfd: BorrowedFd<'_>,
@@ -927,11 +741,9 @@ fn extract_file<R: ArchiveReader>(
     };
 
     copy_file_data(archive, &mut file, entry.size)?;
-    drop(file);
 
-    set_owner_at(dirfd, name, entry, options)?;
-    set_permissions_at(dirfd, name, entry, options)?;
-    set_times_at(dirfd, name, entry, options)
+    // Through the descriptor the data was just written to, not by name.
+    set_attrs_fd(file.as_fd(), &attrs_of(entry), &policy_of(options))
 }
 
 /// Copy file data from archive to file
@@ -969,31 +781,55 @@ fn is_archive_newer_at(entry: &ArchiveEntry, dirfd: BorrowedFd<'_>, name: &CStr)
     entry.mtime as i64 > st.st_mtime
 }
 
-/// Set file permissions
+/// The archived attributes of a member, in the shared shape.
+fn attrs_of(entry: &ArchiveEntry) -> Attrs {
+    Attrs {
+        mode: entry.mode,
+        uid: entry.uid,
+        gid: entry.gid,
+        mtime: entry.mtime as i64,
+        mtime_nsec: entry.mtime_nsec as i64,
+        atime: entry.atime.map(|a| a as i64),
+        atime_nsec: entry.atime_nsec as i64,
+    }
+}
+
+/// What `-p` asked to keep, in the shared shape.
+fn policy_of(options: &ReadOptions) -> AttrPolicy {
+    AttrPolicy {
+        preserve_owner: options.preserve_owner,
+        preserve_perms: options.preserve_perms,
+        preserve_mtime: options.preserve_mtime,
+        preserve_atime: options.preserve_atime,
+        umask: options.umask,
+    }
+}
+
+/// Set file permissions on a name below `dirfd`.
+///
+/// `fchmodat` has no portable way to refuse a symbolic link -- Linux rejects
+/// `AT_SYMLINK_NOFOLLOW` outright -- so the type is checked first and a link is
+/// refused. Callers that hold a descriptor for the file should use
+/// `set_attrs_fd` instead, which cannot be redirected at all.
 fn set_permissions_at(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
 ) -> PaxResult<()> {
-    let mut mode = entry.mode;
-
-    // Per POSIX: If owner is not preserved, clear SUID and SGID bits
-    if !options.preserve_owner {
-        // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
-        #[allow(clippy::unnecessary_cast)]
-        let setid_mask = !((libc::S_ISUID | libc::S_ISGID) as u32);
-        mode &= setid_mask;
+    let Some(st) = stat_at(dirfd, name) else {
+        return Err(std::io::Error::last_os_error().into());
+    };
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        // Whatever this name was when it was created, it is a symbolic link
+        // now. Following it would apply the archived mode to the file it
+        // points at, anywhere on the system.
+        return Err(PaxError::InvalidHeader(
+            "refusing to set permissions through a symbolic link".to_string(),
+        ));
     }
 
-    // When the mode is not explicitly preserved (no `-p p`/`-p e`), the file
-    // is created as part of the "normal file creation action": the archived
-    // mode is modified by the process file-creation mask (umask), exactly as
-    // open()/mkdir() would do. With `-p p`/`-p e` the exact mode is restored.
-    if !options.preserve_perms {
-        mode &= !options.umask;
-    }
-
+    let mode = policy_of(options).mode(&attrs_of(entry));
     let r = unsafe { libc::fchmodat(dirfd.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) };
     if r != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -1043,45 +879,10 @@ fn set_times_at(
     entry: &ArchiveEntry,
     options: &ReadOptions,
 ) -> PaxResult<()> {
-    // If neither atime nor mtime preservation is requested, skip
-    if !options.preserve_mtime && !options.preserve_atime {
+    let Some(times) = policy_of(options).times(&attrs_of(entry)) else {
         return Ok(());
-    }
-
-    // Determine the atime to set, preserving nanosecond precision. UTIME_OMIT
-    // leaves the one we are not preserving exactly as it is, which is both
-    // simpler and more accurate than reading it back first.
-    let atime = if options.preserve_atime {
-        match entry.atime {
-            Some(sec) => libc::timespec {
-                tv_sec: sec as libc::time_t,
-                tv_nsec: entry.atime_nsec as _,
-            },
-            None => libc::timespec {
-                tv_sec: entry.mtime as libc::time_t,
-                tv_nsec: entry.mtime_nsec as _,
-            },
-        }
-    } else {
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        }
     };
 
-    let mtime = if options.preserve_mtime {
-        libc::timespec {
-            tv_sec: entry.mtime as libc::time_t,
-            tv_nsec: entry.mtime_nsec as _,
-        }
-    } else {
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        }
-    };
-
-    let times = [atime, mtime];
     let result = unsafe {
         libc::utimensat(
             dirfd.as_raw_fd(),
@@ -1130,10 +931,25 @@ fn apply_pending_dirs(
         let pfd = parent.as_fd();
         let name = member.leaf.as_c_str();
 
-        let outcome = set_owner_at(pfd, name, entry, options)
-            .and_then(|_| set_permissions_at(pfd, name, entry, options))
-            .and_then(|_| set_times_at(pfd, name, entry, options));
-        if let Err(e) = outcome {
+        // Reopen the directory itself and work through that descriptor. This
+        // pass runs after the whole archive has been extracted, so the name
+        // need not still be the directory that was created for this member --
+        // a later member can have replaced it with a symbolic link, and
+        // applying the archived mode by name would then chmod whatever the
+        // link points at. `O_NOFOLLOW` refuses the link, and `O_DIRECTORY`
+        // refuses anything else that took its place.
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(pfd.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            crate::error::report_error(
+                member.display.display(),
+                PaxError::from(std::io::Error::last_os_error()),
+            );
+            continue;
+        }
+        let dir = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        if let Err(e) = set_attrs_fd(dir.as_fd(), &attrs_of(entry), &policy_of(options)) {
             crate::error::report_error(member.display.display(), e);
         }
     }

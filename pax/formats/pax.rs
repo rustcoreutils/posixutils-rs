@@ -729,8 +729,12 @@ impl<R: Read> PaxReader<R> {
 
     /// Read extended header data
     fn read_extended_header(&mut self, size: u64) -> PaxResult<ExtendedHeader> {
-        let mut data = vec![0u8; size as usize];
-        self.reader.read_exact(&mut data)?;
+        let data = crate::formats::read_declared(
+            &mut self.reader,
+            size,
+            crate::formats::MAX_EXTENDED_HEADER,
+            "pax extended header",
+        )?;
 
         // Skip padding to block boundary using a stack buffer
         let padding = padding_needed(size);

@@ -23,7 +23,7 @@
 use crate::archive::{ArchiveFormat, ArchiveReader};
 use crate::blocked_io::BlockedWriter;
 use crate::error::{PaxError, PaxResult};
-use crate::formats::{CpioReader, PaxReader, UstarReader};
+use crate::formats::{CpioReader, PaxReader};
 use crate::modes::write::WriteOptions;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -132,61 +132,99 @@ fn archived_mtimes(archive_path: &Path, format: ArchiveFormat) -> PaxResult<Hash
     }
 
     match format {
-        ArchiveFormat::Ustar => collect(&mut UstarReader::new(file), &mut mtimes)?,
-        ArchiveFormat::Pax => collect(&mut PaxReader::new(file), &mut mtimes)?,
+        // Read with the superset reader whatever the archive's identity is: a
+        // pax archive writes an extended header only for the members that need
+        // one, so reading a tar-family archive as plain ustar turns any 'x'
+        // block it does contain into a member of its own and truncates the name
+        // of the member it described.
+        ArchiveFormat::Ustar | ArchiveFormat::Pax => {
+            collect(&mut PaxReader::new(file), &mut mtimes)?
+        }
         ArchiveFormat::Cpio => collect(&mut CpioReader::new(file), &mut mtimes)?,
     }
 
     Ok(mtimes)
 }
 
-/// Detect archive format from file
+/// What the archive already *is*, which is what new members must be written as
+/// and what an explicit `-x` has to match.
+///
+/// Deliberately not the same question the reader asks. Any ustar-magic archive
+/// is *read* as pax, because a pax archive is a ustar archive with extra headers
+/// and the pax reader handles a member without them identically. Appending has
+/// to preserve what is there instead: writing pax members into a plain ustar
+/// archive would change its format, and refusing to append ustar members to one
+/// would be wrong the other way.
+///
+/// So the family comes from the first block, and within the tar family the
+/// archive counts as pax only if it actually carries an extended header. Judging
+/// that from the first block alone was the bug: a pax archive whose first member
+/// needs no extended header begins with an ordinary ustar header, so appending
+/// to it refused an explicit `-x pax` and otherwise wrote ustar members, which
+/// silently drops any name too long for a ustar header.
 fn detect_format(file: &mut File) -> PaxResult<ArchiveFormat> {
     let mut header = [0u8; BLOCK_SIZE];
     file.read_exact(&mut header)?;
-    file.seek(SeekFrom::Start(0))?; // Reset to beginning
+    file.seek(SeekFrom::Start(0))?;
 
-    // Check for ustar magic at offset 257
-    if &header[257..262] == b"ustar" {
-        // Check typeflag at offset 156 for pax extended headers
-        let typeflag = header[156];
-        if typeflag == b'x' || typeflag == b'g' {
-            return Ok(ArchiveFormat::Pax);
+    let family = crate::detect_format_from_bytes(&header)?;
+    if family == ArchiveFormat::Cpio {
+        return Ok(family);
+    }
+
+    let has_extended = archive_has_extended_header(file)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(if has_extended {
+        ArchiveFormat::Pax
+    } else {
+        ArchiveFormat::Ustar
+    })
+}
+
+/// Whether any member of a tar-family archive carries an extended header.
+///
+/// Walks the member headers, stepping over each one's data by the size it
+/// records, so that a byte sequence inside a file's contents is never mistaken
+/// for a header.
+fn archive_has_extended_header(file: &mut File) -> PaxResult<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    loop {
+        let mut header = [0u8; BLOCK_SIZE];
+        match file.read_exact(&mut header) {
+            Ok(()) => {}
+            // A truncated archive is not this function's business to diagnose.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e.into()),
         }
-        return Ok(ArchiveFormat::Ustar);
-    }
 
-    // Check for cpio magic at offset 0
-    // ASCII formats (6 bytes):
-    //   070707 = POSIX octet-oriented (odc)
-    //   070701 = SVR4 newc (no CRC)
-    //   070702 = SVR4 newc with CRC
-    // Binary format (2 bytes):
-    //   0x71C7 = old binary cpio (little-endian)
-    //   0xC771 = old binary cpio (big-endian)
-    let magic = &header[0..6];
-    if magic == b"070707" || magic == b"070701" || magic == b"070702" {
-        return Ok(ArchiveFormat::Cpio);
-    }
-    // Check for binary cpio magic
-    let magic16 = u16::from_le_bytes([header[0], header[1]]);
-    let magic16_be = u16::from_be_bytes([header[0], header[1]]);
-    if magic16 == 0o070707 || magic16_be == 0o070707 {
-        return Ok(ArchiveFormat::Cpio);
-    }
-
-    // Check for old-style tar by validating checksum
-    if is_valid_tar_checksum(&header) {
-        let typeflag = header[156];
-        if typeflag == b'x' || typeflag == b'g' {
-            return Ok(ArchiveFormat::Pax);
+        // A zero block ends the archive.
+        if header.iter().all(|&b| b == 0) {
+            return Ok(false);
         }
-        return Ok(ArchiveFormat::Ustar);
-    }
 
-    Err(PaxError::InvalidFormat(
-        "unable to detect archive format".to_string(),
-    ))
+        if header[156] == b'x' || header[156] == b'g' {
+            return Ok(true);
+        }
+
+        let size = parse_octal_size(&header[124..136]);
+        let blocks = size.div_ceil(BLOCK_SIZE as u64);
+        if blocks > 0 {
+            file.seek(SeekFrom::Current((blocks * BLOCK_SIZE as u64) as i64))?;
+        }
+    }
+}
+
+/// The size field of a tar header, which is octal digits padded with NUL or
+/// space. An unparsable field reads as zero, which only costs an early stop.
+fn parse_octal_size(field: &[u8]) -> u64 {
+    let mut value: u64 = 0;
+    for &b in field {
+        match b {
+            b'0'..=b'7' => value = value.saturating_mul(8).saturating_add((b - b'0') as u64),
+            _ => break,
+        }
+    }
+    value
 }
 
 /// Verify tar checksum

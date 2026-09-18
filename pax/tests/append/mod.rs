@@ -562,3 +562,70 @@ fn test_append_truncates_the_old_tail() {
     assert_eq!(fs::read_to_string(dst.join("small.txt")).unwrap(), "s");
     assert_eq!(fs::metadata(dst.join("big.txt")).unwrap().len(), 40_000);
 }
+
+/// Appending has to detect the archive's format the same way reading does. A pax
+/// archive whose first member needs no extended header begins with an ordinary
+/// ustar header, and judging by that block alone made append treat it as ustar:
+/// with `-x pax` it refused outright, and without it wrote ustar members, which
+/// silently drops any name too long for a ustar header.
+#[test]
+fn test_append_to_pax_archive_whose_first_member_needs_no_extended_header() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    let long_name = "b".repeat(160);
+    fs::write(dir.join("a.txt"), b"one\n").unwrap();
+    fs::write(dir.join(&long_name), b"two\n").unwrap();
+
+    let archive = dir.join("a.tar");
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-x",
+                "pax",
+                "-f",
+                archive.to_str().unwrap(),
+                "a.txt",
+                &long_name,
+            ],
+            dir,
+        ),
+        "creating the archive",
+    );
+
+    // An explicit -x pax must agree with what is already there.
+    fs::write(dir.join("c.txt"), b"three\n").unwrap();
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-a",
+                "-x",
+                "pax",
+                "-f",
+                archive.to_str().unwrap(),
+                "c.txt",
+            ],
+            dir,
+        ),
+        "appending with an explicit -x pax",
+    );
+
+    // And an appended member whose name needs an extended header must survive.
+    let appended = "z".repeat(160);
+    fs::write(dir.join(&appended), b"four\n").unwrap();
+    assert_success(
+        &run_pax_in_dir(
+            &["-w", "-a", "-f", archive.to_str().unwrap(), &appended],
+            dir,
+        ),
+        "appending a long member name",
+    );
+
+    let listing = run_pax_in_dir(&["-t", "-f", archive.to_str().unwrap()], dir);
+    assert_success(&listing, "listing the appended archive");
+    let listed = stdout_str(&listing);
+    for name in ["a.txt", &long_name, "c.txt", &appended] {
+        assert!(listed.contains(name), "{name} missing from: {listed}");
+    }
+}

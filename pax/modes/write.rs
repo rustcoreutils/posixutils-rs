@@ -594,16 +594,17 @@ fn write_file<W: ArchiveWriter>(
     // Write regular file
     archive.write_entry(&entry)?;
 
-    // Copy file contents
+    // Copy file contents, bounded by the size already written in the header.
     let mut file = File::open(src_path)?;
-    copy_file_data(&mut file, archive)?;
+    copy_file_data(&mut file, archive, entry.size, src_path)?;
+    // Held open past the copy so -t can stamp the descriptor below.
 
     archive.finish_entry()?;
 
     // Reset access time if requested
     #[cfg(unix)]
     if let Some((atime_sec, atime_nsec)) = original_atime {
-        reset_atime(src_path, atime_sec, atime_nsec);
+        reset_atime(&file, src_path, atime_sec, atime_nsec);
     }
 
     Ok(())
@@ -623,16 +624,60 @@ fn file_checksum(path: &Path) -> PaxResult<u32> {
     }
 }
 
-/// Copy file data to archive
-fn copy_file_data<W: ArchiveWriter>(file: &mut File, archive: &mut W) -> PaxResult<()> {
+/// Copy file data to the archive, writing exactly the `size` already recorded in
+/// the member's header.
+///
+/// The header goes out before the data, so the size in it is a promise made from
+/// a `stat` that has already happened. A file being written by someone else can
+/// yield a different amount by the time it is read, and letting that through put
+/// unbounded extra bytes into the archive at a 512-byte boundary -- where a
+/// reader takes them for a header, so anyone able to modify a file while it is
+/// archived could inject fabricated members. Reading short instead left the
+/// member unterminated.
+///
+/// So the read is truncated if the file grew and zero-padded if it shrank, which
+/// is what GNU tar does ("File shrank by N bytes; padding with zeros"), and the
+/// exit status records that the archive does not match what was on disk. The
+/// bound also has to come from `size` rather than from end-of-file: waiting for a
+/// shrinking file to deliver bytes it no longer has is how CVE-2018-20482 turned
+/// into an infinite loop.
+fn copy_file_data<W: ArchiveWriter>(
+    file: &mut File,
+    archive: &mut W,
+    size: u64,
+    path: &Path,
+) -> PaxResult<()> {
     let mut buf = [0u8; 8192];
+    let mut remaining = size;
 
-    loop {
-        let n = file.read(&mut buf)?;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want])?;
         if n == 0 {
             break;
         }
         archive.write_data(&buf[..n])?;
+        remaining -= n as u64;
+    }
+
+    if remaining > 0 {
+        eprintln!(
+            "pax: {}: File shrank by {} bytes; padding with zeros",
+            path.display(),
+            remaining
+        );
+        crate::error::note_error();
+
+        let zeros = [0u8; 8192];
+        while remaining > 0 {
+            let n = remaining.min(zeros.len() as u64) as usize;
+            archive.write_data(&zeros[..n])?;
+            remaining -= n as u64;
+        }
+    } else if file.read(&mut buf[..1])? != 0 {
+        // Still more to read than the header promised.
+        eprintln!("pax: {}: file changed as we read it", path.display());
+        crate::error::note_error();
     }
 
     Ok(())
@@ -813,46 +858,36 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// Reset access time of a file to the specified time
+/// Restore the access time `-t` recorded, on the file that was actually read.
+///
+/// Stamping goes through the descriptor the data came from rather than by name.
+/// Resolving the name a second time was wrong both ways round: without
+/// `AT_SYMLINK_NOFOLLOW` a name replaced by a symbolic link in between would
+/// redirect the timestamp onto the link's target, and with it, `-L`/`-H` stamped
+/// the link rather than the file whose access time the read had actually
+/// disturbed. A descriptor has neither problem, and `UTIME_OMIT` leaves the
+/// modification time alone instead of reading it back to write it again.
 #[cfg(unix)]
-fn reset_atime(path: &Path, atime_sec: i64, atime_nsec: i64) {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+fn reset_atime(file: &File, path: &Path, atime_sec: i64, atime_nsec: i64) {
+    use std::os::fd::AsRawFd;
 
-    let path_cstr = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    // Get current modification time to preserve it
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-
-    let mtime_sec = metadata.mtime();
-    let mtime_nsec = metadata.mtime_nsec();
-
-    // Use utimensat for nanosecond precision if available
     let times = [
         libc::timespec {
             tv_sec: atime_sec as libc::time_t,
             tv_nsec: atime_nsec as libc::c_long,
         },
         libc::timespec {
-            tv_sec: mtime_sec as libc::time_t,
-            tv_nsec: mtime_nsec as libc::c_long,
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
         },
     ];
 
-    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
-
+    let result = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
     if result != 0 {
-        let err = std::io::Error::last_os_error();
         eprintln!(
             "pax: warning: cannot reset atime on {}: {}",
             path.display(),
-            err
+            std::io::Error::last_os_error()
         );
     }
 }

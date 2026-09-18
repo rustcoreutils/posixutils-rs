@@ -9,6 +9,7 @@
 
 //! pax operation mode implementations
 
+pub(crate) mod anchored;
 pub mod append;
 pub mod copy;
 pub mod list;

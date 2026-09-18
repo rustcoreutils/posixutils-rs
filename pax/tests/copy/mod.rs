@@ -13,6 +13,7 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 
 #[test]
 fn test_copy_mode_basic() {
@@ -620,5 +621,140 @@ fn test_copy_mode_destination_uses_member_path() {
     assert!(
         !dst_dir.join("c.txt").exists(),
         "and must not be flattened to its basename"
+    );
+}
+
+// Copy mode must stay inside the destination directory. POSIX defines a copy as
+// an archive round-trip, so these are the same guarantees the extraction tests
+// make: a name planted in the destination is never written through, whatever it
+// points at.
+
+/// A *dangling* symlink in the destination is not "already there": `exists()`
+/// follows the link and reports false, so nothing was removed and the create
+/// then followed it, writing the source data wherever it pointed.
+#[test]
+fn test_copy_does_not_write_through_dangling_symlink() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+
+    fs::write(src.join("member"), b"payload\n").unwrap();
+    std::os::unix::fs::symlink(&outside, dst.join("member")).unwrap();
+
+    let output = run_pax_in_dir(&["-r", "-w", ".", dst.to_str().unwrap()], &src);
+
+    assert!(
+        !outside.exists(),
+        "copy mode wrote through a dangling symlink: {}",
+        stderr_str(&output)
+    );
+}
+
+/// A symlink to a directory is not the directory: treating it as "already
+/// there" wrote the whole subtree through it.
+#[test]
+fn test_copy_does_not_descend_symlinked_destination_directory() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::create_dir(&outside).unwrap();
+
+    fs::create_dir(src.join("sub")).unwrap();
+    fs::write(src.join("sub").join("member"), b"payload\n").unwrap();
+    std::os::unix::fs::symlink(&outside, dst.join("sub")).unwrap();
+
+    let output = run_pax_in_dir(&["-r", "-w", ".", dst.to_str().unwrap()], &src);
+
+    assert!(
+        !outside.join("member").exists(),
+        "copy mode wrote a subtree through a symlinked destination directory: {}",
+        stderr_str(&output)
+    );
+}
+
+/// Copying a directory into a subdirectory of itself must be refused rather
+/// than followed until the pathname runs out of room.
+#[test]
+fn test_copy_into_own_subdirectory_is_refused() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let sub = src.join("sub");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&sub).unwrap();
+    fs::write(src.join("f"), b"payload\n").unwrap();
+
+    let output = run_pax_in_dir(&["-r", "-w", ".", "sub"], &src);
+
+    // Whatever the diagnostic, it must not have recursed: a handful of levels
+    // is a copy, a thousand is the runaway.
+    let depth = walkdir_depth(&sub);
+    assert!(
+        depth <= 3,
+        "copy recursed into its own destination to depth {depth}: {}",
+        stderr_str(&output)
+    );
+}
+
+/// Deepest nesting below `root`, counted in directory levels.
+fn walkdir_depth(root: &std::path::Path) -> usize {
+    fn go(p: &std::path::Path, d: usize) -> usize {
+        if d > 64 {
+            return d;
+        }
+        let Ok(entries) = fs::read_dir(p) else {
+            return d;
+        };
+        entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| go(&e.path(), d + 1))
+            .max()
+            .unwrap_or(d)
+    }
+    go(root, 0)
+}
+
+/// A `-s` rename can produce a member name with a leading slash. The file is
+/// created under the sanitized name, so a second name for the same inode must be
+/// linked to *that*, resolved from the destination anchor -- handing the raw name
+/// to `linkat` resolved it from the root of the filesystem instead, and the link
+/// was simply never made.
+#[test]
+fn test_copy_hard_link_follows_the_sanitized_member_name() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+
+    fs::write(src.join("aaa"), b"payload\n").unwrap();
+    fs::hard_link(src.join("aaa"), src.join("zzz")).unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-w",
+            "-s",
+            ",^aaa$,/abs/aaa,",
+            ".",
+            dst.to_str().unwrap(),
+        ],
+        &src,
+    );
+    assert_success(&output, "copying a hard-linked pair through a -s rename");
+
+    let renamed = dst.join("abs").join("aaa");
+    let other = dst.join("zzz");
+    assert!(other.exists(), "the second name was not copied");
+    assert_eq!(
+        fs::metadata(&renamed).unwrap().ino(),
+        fs::metadata(&other).unwrap().ino(),
+        "the second name is not a link to the first copy"
     );
 }

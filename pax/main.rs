@@ -729,16 +729,18 @@ fn open_archive_for_read(
 
 /// Detect format from peek buffer
 fn detect_format_from_bytes(buf: &[u8]) -> PaxResult<ArchiveFormat> {
-    // Check for ustar magic at offset 257
+    // Check for ustar magic at offset 257.
+    //
+    // Read as pax whatever the first block's typeflag is. An extended header is
+    // written only for the members that need one, so a pax archive whose first
+    // member needs none used to be read as plain ustar: its later 'x' blocks
+    // became regular files named PaxHeader/N, and the members they described fell
+    // back to the 100-byte name in the ustar header -- silently truncated, and
+    // able to collide with an unrelated path. PaxReader reads a member with no
+    // extended header exactly as UstarReader does, so this costs nothing for an
+    // archive that really is plain ustar.
     if buf.len() >= 263 && &buf[257..262] == b"ustar" {
-        // Check typeflag at offset 156 for pax extended headers
-        // 'x' (0x78) = per-file extended header
-        // 'g' (0x67) = global extended header
-        let typeflag = buf[156];
-        if typeflag == b'x' || typeflag == b'g' {
-            return Ok(ArchiveFormat::Pax);
-        }
-        return Ok(ArchiveFormat::Ustar);
+        return Ok(ArchiveFormat::Pax);
     }
 
     // Check for cpio magic at offset 0
@@ -936,9 +938,21 @@ impl PeekReader {
 
     fn peek(&mut self) -> PaxResult<&[u8]> {
         if !self.peeked {
+            // Keep reading until the peek is full or the archive really has run
+            // out. A single `read` is free to return less than it was asked for
+            // -- reading from a pipe hands back whatever the writer has sent so
+            // far -- and a short buffer here makes format detection see a
+            // truncated header and reject a perfectly good archive.
             self.buffer = vec![0u8; self.peek_size];
-            let n = self.reader.read(&mut self.buffer)?;
-            self.buffer.truncate(n);
+            let mut filled = 0;
+            while filled < self.buffer.len() {
+                let n = self.reader.read(&mut self.buffer[filled..])?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            self.buffer.truncate(filled);
             self.peeked = true;
         }
         Ok(&self.buffer)
@@ -964,6 +978,56 @@ impl Read for PeekReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader that hands back at most `chunk` bytes per call, the way a pipe
+    /// delivers whatever its writer has sent so far.
+    struct Dribble {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl Read for Dribble {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.chunk.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn test_peek_fills_from_a_dribbling_reader() {
+        let data: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+        let mut reader = PeekReader::new(
+            Box::new(Dribble {
+                data: data.clone(),
+                pos: 0,
+                chunk: 64,
+            }),
+            512,
+        );
+
+        // A single `read` would have returned 64 bytes here, leaving format
+        // detection to judge the archive on a truncated header.
+        assert_eq!(reader.peek().unwrap(), &data[..]);
+    }
+
+    #[test]
+    fn test_peek_stops_at_a_short_archive() {
+        let data = vec![7u8; 100];
+        let mut reader = PeekReader::new(
+            Box::new(Dribble {
+                data: data.clone(),
+                pos: 0,
+                chunk: 8,
+            }),
+            512,
+        );
+
+        // Filling must not spin once the reader is genuinely out of bytes.
+        assert_eq!(reader.peek().unwrap(), &data[..]);
+    }
 
     #[test]
     fn test_determine_mode() {

@@ -16,12 +16,19 @@
 use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
+use crate::modes::anchored::{
+    create_replacing, open_dir_at, set_attrs_fd, set_link_attrs_at, stat_at, AttrPolicy, Attrs,
+    DirTree, MemberPath,
+};
 use crate::pattern::{matches_any, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
-use std::fs::{self, File, Permissions};
+use std::collections::HashSet;
+use std::ffi::{CStr, CString};
+use std::fs::{self, File};
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Options for copy mode
@@ -84,17 +91,31 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
         )));
     }
 
-    let mut link_tracker = HardLinkTracker::new();
+    // Everything below is written relative to this descriptor. POSIX defines a
+    // copy as an archive round-trip, so the destination gets the same treatment
+    // extraction gives it: each component of a member name is opened with
+    // O_NOFOLLOW, and the leaf is created fresh rather than written through.
+    let tree = DirTree::open_path(dest_dir)?;
+
+    let mut state = CopyState {
+        link_tracker: HardLinkTracker::new(),
+        dest_ids: HashSet::new(),
+        // Create interactive prompter if needed
+        prompter: if options.interactive {
+            Some(InteractivePrompter::new()?)
+        } else {
+            None
+        },
+    };
+    if let Some(st) = stat_at(tree.root(), c".") {
+        // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        state.dest_ids.insert((st.st_dev as u64, st.st_ino as u64));
+    }
+
     // No filesystem is established until a directory is descended into; the
     // per-directory splits below are the ones that matter for -X.
     let initial_dev: Option<u64> = None;
-
-    // Create interactive prompter if needed
-    let mut prompter = if options.interactive {
-        Some(InteractivePrompter::new()?)
-    } else {
-        None
-    };
 
     for path in files {
         // Diagnose a per-operand failure and set a non-zero exit, but continue
@@ -102,18 +123,26 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
         if let Err(e) = copy_member(
             path,
             &member_name(path),
-            dest_dir,
+            &tree,
             options,
-            &mut link_tracker,
+            &mut state,
             initial_dev,
             true,
-            &mut prompter,
         ) {
             crate::error::report_error(path.display(), e);
         }
     }
 
     Ok(())
+}
+
+/// State threaded through the whole copy.
+struct CopyState {
+    link_tracker: HardLinkTracker,
+    /// `(st_dev, st_ino)` of every destination directory this copy has created
+    /// or entered. A source directory found in here is one being copied *into*.
+    dest_ids: HashSet<(u64, u64)>,
+    prompter: Option<InteractivePrompter>,
 }
 
 /// The archive-relative name a source path would be stored under, and so the
@@ -141,23 +170,21 @@ fn member_name(src: &Path) -> PathBuf {
 }
 
 /// Copy one source path, and its subtree if it is a directory, to `member`
-/// beneath `dest_root`.
+/// beneath the destination anchor.
 ///
 /// This is the single walk for both command-line operands and everything found
 /// by recursion. It used to be two functions -- `copy_path` for operands and
 /// `copy_path_to_dest` for their descendants -- and the second had never
 /// acquired the first's `-s` substitution and pattern selection, so both
 /// applied only to paths typed on the command line.
-#[allow(clippy::too_many_arguments)]
 fn copy_member(
     src: &Path,
     member: &Path,
-    dest_root: &Path,
+    tree: &DirTree,
     options: &CopyOptions,
-    link_tracker: &mut HardLinkTracker,
+    state: &mut CopyState,
     initial_dev: Option<u64>,
     is_cli_arg: bool,
-    prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
     let follow = should_follow_symlink(options, is_cli_arg);
     let metadata = if follow {
@@ -205,7 +232,7 @@ fn copy_member(
         }
     };
 
-    let member = if let Some(ref mut p) = prompter {
+    let member = if let Some(ref mut p) = state.prompter {
         match p.prompt(&member.to_string_lossy())? {
             RenameResult::Skip => return Ok(()),
             RenameResult::UseOriginal => member,
@@ -215,34 +242,38 @@ fn copy_member(
         member
     };
 
-    if member.as_os_str().is_empty() {
-        // The operand was `.`: its children carry the names, not itself.
-        return copy_directory(
-            src,
-            dest_root,
-            member.as_path(),
-            options,
-            link_tracker,
-            &metadata,
-            prompter,
-        );
+    // A source directory that *is* one of this copy's destinations is one being
+    // copied into. Following it walks the copy's own output back into itself
+    // until the pathname runs out of room; identity cannot be spelled two ways,
+    // where a path comparison could be defeated by any other spelling.
+    if metadata.is_dir() && state.dest_ids.contains(&(metadata.dev(), metadata.ino())) {
+        return Err(PaxError::InvalidFormat(format!(
+            "cannot copy directory {} into itself",
+            src.display()
+        )));
     }
 
-    let dest = dest_root.join(&member);
+    if member.as_os_str().is_empty() {
+        // The operand was `.`: its children carry the names, not itself.
+        return copy_directory(src, tree, member.as_path(), options, state, &metadata);
+    }
+
+    let Some(mp) = MemberPath::parse(&member)? else {
+        return Ok(());
+    };
 
     // A member may name directories the walk has not created yet (`a/b/c` given
     // as an operand). POSIX requires the intermediate directories be made with
     // the normal file-creation action.
-    if let Some(parent) = dest.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
-    }
+    let parent = tree.parent_of(&mp, true)?;
+    let pfd = parent.as_fd();
+    let name = mp.leaf.as_c_str();
 
-    if options.no_clobber && dest.exists() {
+    let existing = stat_at(pfd, name);
+    if options.no_clobber && existing.is_some() {
         return Ok(());
     }
-    if options.update && !is_source_newer(&metadata, &dest) {
+    if options.update && !is_source_newer(&metadata, existing.as_ref()) {
         return Ok(());
     }
 
@@ -251,20 +282,12 @@ fn copy_member(
     }
 
     if metadata.is_dir() {
-        copy_directory(
-            src,
-            dest_root,
-            &member,
-            options,
-            link_tracker,
-            &metadata,
-            prompter,
-        )?;
+        copy_directory(src, tree, &member, options, state, &metadata)?;
     } else if metadata.is_symlink() {
-        copy_symlink(src, &dest, &metadata, options)?;
+        copy_symlink(src, pfd, name, &metadata, options)?;
     } else if metadata.is_file() {
-        copy_file(src, &dest, options, link_tracker, &metadata)?;
-    } else if let Err(e) = copy_special_file(&dest, &metadata, options) {
+        copy_file(src, tree, pfd, name, &member, options, state, &metadata)?;
+    } else if let Err(e) = copy_special_file(pfd, name, &metadata, options) {
         crate::error::report_error(src.display(), e);
     }
 
@@ -276,66 +299,49 @@ fn should_follow_symlink(options: &CopyOptions, is_cli_arg: bool) -> bool {
     options.dereference || (is_cli_arg && options.cli_dereference)
 }
 
-/// Check if source is newer than destination (for -u option)
-fn is_source_newer(src_metadata: &fs::Metadata, dest: &Path) -> bool {
+/// Check if source is newer than the destination that is already there (`-u`).
+fn is_source_newer(src_metadata: &fs::Metadata, dest: Option<&libc::stat>) -> bool {
     // If destination doesn't exist, always copy
-    if !dest.exists() {
+    let Some(dest) = dest else {
         return true;
-    }
-
-    // Get the modification time of destination
-    let dest_mtime = match fs::metadata(dest) {
-        Ok(meta) => {
-            #[cfg(unix)]
-            {
-                meta.mtime() as u64
-            }
-            #[cfg(not(unix))]
-            {
-                meta.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-            }
-        }
-        Err(_) => return true, // If we can't stat dest, assume we should copy
     };
-
-    // Get source modification time
-    #[cfg(unix)]
-    let src_mtime = src_metadata.mtime() as u64;
-    #[cfg(not(unix))]
-    let src_mtime = src_metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // Copy if source is newer than destination
-    src_mtime > dest_mtime
+    src_metadata.mtime() > dest.st_mtime
 }
 
 /// Copy a directory and its contents
 fn copy_directory(
     src: &Path,
-    dest_root: &Path,
+    tree: &DirTree,
     member: &Path,
     options: &CopyOptions,
-    link_tracker: &mut HardLinkTracker,
+    state: &mut CopyState,
     metadata: &fs::Metadata,
-    prompter: &mut Option<InteractivePrompter>,
 ) -> PaxResult<()> {
-    let dest = dest_root.join(member);
+    // Create the destination directory and hold a descriptor for it. Its own
+    // attributes are applied on the way back out, not here: a source mode
+    // without write or search permission (0555, say) would otherwise stop us
+    // creating the very files that belong inside it, and any mode/owner/time
+    // set now would be invalidated by populating it anyway.
+    //
+    // `open_dir_at` creates it when missing and otherwise opens what is there
+    // with O_DIRECTORY|O_NOFOLLOW, so a symbolic link left in the destination
+    // is refused rather than descended through.
+    let dir = if member.as_os_str().is_empty() {
+        tree.root().try_clone_to_owned()?
+    } else {
+        let Some(mp) = MemberPath::parse(member)? else {
+            return Ok(());
+        };
+        let parent = tree.parent_of(&mp, true)?;
+        open_dir_at(parent.as_fd(), &mp.leaf, true)?
+    };
 
-    // Create the destination directory. Its own attributes are applied on the
-    // way back out, not here: an archived mode without write or search
-    // permission (0555, say) would otherwise stop us creating the very files
-    // that belong inside it, and any mode/owner/time set now would be
-    // invalidated by populating it anyway.
-    if !dest.exists() {
-        fs::create_dir(&dest)?;
+    // Remember what this destination directory *is*, so the walk can recognise
+    // it if the source tree leads back here.
+    if let Some(st) = stat_at(dir.as_fd(), c".") {
+        // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        state.dest_ids.insert((st.st_dev as u64, st.st_ino as u64));
     }
 
     // Recurse into directory unless no_recurse
@@ -368,16 +374,17 @@ fn copy_directory(
 
             // The child's member name extends its parent's, so selection and
             // substitution see the same pathname an archive would record.
-            copy_member(
+            if let Err(e) = copy_member(
                 &entry.path(),
                 &member.join(entry.file_name()),
-                dest_root,
+                tree,
                 options,
-                link_tracker,
+                state,
                 initial_dev,
                 false,
-                prompter,
-            )?;
+            ) {
+                crate::error::report_error(entry.path().display(), e);
+            }
         }
     }
 
@@ -387,170 +394,213 @@ fn copy_directory(
         return Ok(());
     }
 
-    // Now that the subtree exists, give the directory its archived attributes.
-    restore_all(&dest, metadata, options)
+    // Now that the subtree exists, give the directory its source attributes,
+    // through the descriptor rather than by name.
+    set_attrs_fd(dir.as_fd(), &attrs_of(metadata), &policy_of(options))
 }
 
-/// Recreate a special file (FIFO or device node) at `dest`.
+/// Recreate a special file (FIFO or device node) below `dirfd`.
 ///
-/// FIFOs are recreated with `mkfifo` and block/character devices with `mknod`
-/// (the latter typically requires privilege). Sockets cannot be meaningfully
-/// recreated and are reported as an unsupported type. The error message is
-/// context-free; the caller adds the pathname via `report_error`.
-#[cfg(unix)]
-fn copy_special_file(dest: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+/// FIFOs are recreated with `mkfifoat` and block/character devices with
+/// `mknodat` (the latter typically requires privilege). Sockets cannot be
+/// meaningfully recreated and are reported as an unsupported type. The error
+/// message is context-free; the caller adds the pathname via `report_error`.
+fn copy_special_file(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    metadata: &fs::Metadata,
+    options: &CopyOptions,
+) -> PaxResult<()> {
     use std::os::unix::fs::FileTypeExt;
 
     let ft = metadata.file_type();
-
-    // Replace any existing destination entry first.
-    if dest.exists() || dest.symlink_metadata().is_ok() {
-        let _ = fs::remove_file(dest);
-    }
-
-    let dest_c = CString::new(dest.as_os_str().as_bytes())
-        .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
     let perm = (metadata.mode() & 0o7777) as libc::mode_t;
 
-    if ft.is_fifo() {
-        let r = unsafe { libc::mkfifo(dest_c.as_ptr(), perm) };
-        if r != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+    let created = if ft.is_fifo() {
+        create_replacing(dirfd, name, options.no_clobber, || {
+            let r = unsafe { libc::mkfifoat(dirfd.as_raw_fd(), name.as_ptr(), perm) };
+            if r != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })?
     } else if ft.is_block_device() || ft.is_char_device() {
         let type_bits = if ft.is_block_device() {
             libc::S_IFBLK
         } else {
             libc::S_IFCHR
         };
-        let r = unsafe {
-            libc::mknod(
-                dest_c.as_ptr(),
-                perm | type_bits,
-                metadata.rdev() as libc::dev_t,
-            )
-        };
-        if r != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        create_replacing(dirfd, name, options.no_clobber, || {
+            let r = unsafe {
+                libc::mknodat(
+                    dirfd.as_raw_fd(),
+                    name.as_ptr(),
+                    perm | type_bits,
+                    metadata.rdev() as libc::dev_t,
+                )
+            };
+            if r != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })?
     } else {
         return Err(PaxError::InvalidFormat(gettextrs::gettext(
             "unsupported file type",
         )));
+    };
+
+    if !created {
+        return Ok(());
     }
 
-    // mkfifo and mknod both apply the process umask, so the mode they were
+    // mkfifoat and mknodat both apply the process umask, so the mode they were
     // given is not necessarily the mode on disk; and neither carries ownership
-    // or times. Extraction restores all three here, so a copy must too.
-    restore_all(dest, metadata, options)
-}
-
-#[cfg(not(unix))]
-fn copy_special_file(
-    _dest: &Path,
-    _metadata: &fs::Metadata,
-    _options: &CopyOptions,
-) -> PaxResult<()> {
-    Err(PaxError::InvalidFormat(gettextrs::gettext(
-        "unsupported file type",
-    )))
+    // or times. Extraction restores all three here, so a copy must too. A FIFO
+    // cannot be opened for the purpose without blocking on a writer, so this is
+    // the one place a name is used -- and set_permissions_at refuses a link.
+    set_node_attrs_at(dirfd, name, metadata, options)
 }
 
 /// Copy a symlink
 fn copy_symlink(
     src: &Path,
-    dest: &Path,
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
     metadata: &fs::Metadata,
     options: &CopyOptions,
 ) -> PaxResult<()> {
     let target = fs::read_link(src)?;
+    let target_c = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| PaxError::InvalidHeader("link target contains null".to_string()))?;
 
-    // Remove existing file if present
-    if dest.exists() || dest.symlink_metadata().is_ok() {
-        fs::remove_file(dest)?;
+    let created = create_replacing(dirfd, name, options.no_clobber, || {
+        let r = unsafe { libc::symlinkat(target_c.as_ptr(), dirfd.as_raw_fd(), name.as_ptr()) };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })?;
+    if !created {
+        return Ok(());
     }
 
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&target, dest)?;
-    }
-
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::symlink_file(&target, dest)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, dest))?;
-    }
-
-    restore_symlink_attrs(dest, metadata, options)
+    // A symlink's own mode is meaningless and there is no portable way to chmod
+    // one, so only owner and times are restored.
+    set_link_attrs_at(dirfd, name, &attrs_of(metadata), &policy_of(options))
 }
 
 /// Copy a regular file
+#[allow(clippy::too_many_arguments)]
 fn copy_file(
     src: &Path,
-    dest: &Path,
+    tree: &DirTree,
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    member: &Path,
     options: &CopyOptions,
-    link_tracker: &mut HardLinkTracker,
+    state: &mut CopyState,
     metadata: &fs::Metadata,
 ) -> PaxResult<()> {
-    // Check if we should create a hard link instead of copying
+    // -l: link to the source rather than copying it.
     if options.link {
-        // Try to create hard link to source
-        if dest.exists() {
-            fs::remove_file(dest)?;
+        let src_c = CString::new(src.as_os_str().as_bytes())
+            .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+        let linked = create_replacing(dirfd, name, options.no_clobber, || {
+            // flags 0: link the source itself, never what it points at.
+            let r = unsafe {
+                libc::linkat(
+                    libc::AT_FDCWD,
+                    src_c.as_ptr(),
+                    dirfd.as_raw_fd(),
+                    name.as_ptr(),
+                    0,
+                )
+            };
+            if r != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+        match linked {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                // Hard link failed (maybe cross-device), fall back to copy
+                eprintln!("pax: hard link failed, copying: {}: {}", src.display(), e);
+            }
         }
-
-        if let Err(e) = fs::hard_link(src, dest) {
-            // Hard link failed (maybe cross-device), fall back to copy
-            eprintln!("pax: hard link failed, copying: {}: {}", src.display(), e);
-            do_copy_file(src, dest, metadata, options)?;
-        }
-        return Ok(());
     }
 
-    // Check if this is a hard link to a file we already copied
-    // The caller already stat'd this file, so pass the ids straight through.
-    if let Some(link_target) = link_tracker.check_ids(
+    // A second name for a file already copied becomes a link to that copy.
+    if let Some(link_target) = state.link_tracker.check_ids(
         metadata.dev(),
         metadata.ino(),
         metadata.nlink() as u32,
-        dest,
+        member,
     ) {
-        // Create hard link to the already-copied file
-        if dest.exists() {
-            fs::remove_file(dest)?;
-        }
-        fs::hard_link(&link_target, dest)?;
+        let target_c = CString::new(link_target.as_os_str().as_bytes())
+            .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+        create_replacing(dirfd, name, options.no_clobber, || {
+            // The first copy's name is recorded relative to the destination
+            // root, so it resolves from the root's descriptor. flags 0: link
+            // that file itself, never anything it might point at.
+            let r = unsafe {
+                libc::linkat(
+                    tree.root().as_raw_fd(),
+                    target_c.as_ptr(),
+                    dirfd.as_raw_fd(),
+                    name.as_ptr(),
+                    0,
+                )
+            };
+            if r != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })?;
         return Ok(());
     }
 
-    // Normal copy
-    do_copy_file(src, dest, metadata, options)
+    do_copy_file(src, dirfd, name, metadata, options)
 }
 
 /// Actually copy file contents
 fn do_copy_file(
     src: &Path,
-    dest: &Path,
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
     metadata: &fs::Metadata,
     options: &CopyOptions,
 ) -> PaxResult<()> {
-    // Remove existing file if present
-    if dest.exists() {
-        fs::remove_file(dest)?;
-    }
-
-    // Create parent directories if needed
-    if let Some(parent) = dest.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
-    // Copy file contents
     let mut src_file = File::open(src)?;
-    let mut dest_file = File::create(dest)?;
+
+    // O_EXCL|O_NOFOLLOW, retried once after unlinking whatever is in the way:
+    // the destination is always a freshly created file, never a write *through*
+    // a name someone else put there. `exists()` used to stand in for this, and
+    // it follows symbolic links -- so a *dangling* one read as "nothing here",
+    // nothing was removed, and the create followed it out of the tree.
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut opened: Option<File> = None;
+    let created = create_replacing(dirfd, name, options.no_clobber, || {
+        let fd = unsafe {
+            libc::openat(
+                dirfd.as_raw_fd(),
+                name.as_ptr(),
+                flags,
+                (metadata.mode() & 0o777) as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        opened = Some(unsafe { File::from_raw_fd(fd) });
+        Ok(())
+    })?;
+
+    let Some(mut dest_file) = opened else {
+        debug_assert!(!created);
+        return Ok(());
+    };
 
     let mut buf = [0u8; 8192];
     loop {
@@ -561,161 +611,69 @@ fn do_copy_file(
         dest_file.write_all(&buf[..n])?;
     }
 
-    drop(dest_file);
-
-    // Set permissions and times
-    set_permissions(dest, metadata, options)?;
-    set_times(dest, metadata, options)?;
-
-    Ok(())
+    set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))
 }
 
-/// Set file permissions
-fn set_permissions(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
-    #[cfg(unix)]
-    {
-        let mut mode = metadata.mode() & 0o7777;
-        // Without explicit `-p p`/`-p e`, copied files are created subject to the
-        // process umask (the normal file-creation action), matching extract mode.
-        if !options.preserve_perms {
-            mode &= !options.umask;
-        }
-        let perms = Permissions::from_mode(mode);
-        fs::set_permissions(path, perms)?;
+/// A source file's attributes, in the shape the anchored helpers take.
+fn attrs_of(metadata: &fs::Metadata) -> Attrs {
+    Attrs {
+        mode: metadata.mode() & 0o7777,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        atime: Some(metadata.atime()),
+        atime_nsec: metadata.atime_nsec(),
     }
-
-    #[cfg(not(unix))]
-    {
-        if options.preserve_perms {
-            let perms = metadata.permissions();
-            fs::set_permissions(path, perms)?;
-        }
-    }
-
-    Ok(())
 }
 
-/// Restore access and modification times on a copied file.
-///
-/// POSIX describes a copy as behaving "as if the copied files were written to a
-/// pax format archive file and then subsequently extracted", so this has to
-/// match what extraction does: the two times are independent, each is preserved
-/// only when its `-p` flag says so, and both carry nanoseconds. The previous
-/// implementation called `utimes` with the source *mtime* in both slots and
-/// `tv_usec: 0`, so it overwrote the destination's access time with an
-/// unrelated value and discarded all sub-second precision.
-#[cfg(unix)]
-fn set_times(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
-    if !options.preserve_mtime && !options.preserve_atime {
-        return Ok(());
+/// What `-p` asked to keep, in the shape the anchored helpers take.
+fn policy_of(options: &CopyOptions) -> AttrPolicy {
+    AttrPolicy {
+        // A copy takes ownership from the source only when asked; otherwise the
+        // new file belongs to whoever ran pax.
+        preserve_owner: options.preserve_owner,
+        preserve_perms: options.preserve_perms,
+        preserve_mtime: options.preserve_mtime,
+        preserve_atime: options.preserve_atime,
+        umask: options.umask,
     }
+}
 
-    let atime = if options.preserve_atime {
-        libc::timespec {
-            tv_sec: metadata.atime() as libc::time_t,
-            tv_nsec: metadata.atime_nsec() as _,
-        }
-    } else {
-        // Leave this one as the filesystem set it at creation.
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        }
+/// Owner, mode and times for a node that cannot be opened for the purpose.
+fn set_node_attrs_at(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    metadata: &fs::Metadata,
+    options: &CopyOptions,
+) -> PaxResult<()> {
+    let attrs = attrs_of(metadata);
+    let policy = policy_of(options);
+
+    // Owner and times take AT_SYMLINK_NOFOLLOW; the mode check is in
+    // set_permissions_at, which refuses a name that is a symbolic link.
+    set_link_attrs_at(dirfd, name, &attrs, &policy)?;
+
+    let Some(st) = stat_at(dirfd, name) else {
+        return Err(std::io::Error::last_os_error().into());
     };
-    let mtime = if options.preserve_mtime {
-        libc::timespec {
-            tv_sec: metadata.mtime() as libc::time_t,
-            tv_nsec: metadata.mtime_nsec() as _,
-        }
-    } else {
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        }
-    };
-
-    utimensat_nofollow(path, [atime, mtime])
-}
-
-/// `utimensat` on the path itself, never on a symlink's target.
-#[cfg(unix)]
-fn utimensat_nofollow(path: &Path, times: [libc::timespec; 2]) -> PaxResult<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path_cstr = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(PaxError::InvalidHeader(
+            "refusing to set permissions through a symbolic link".to_string(),
+        ));
+    }
     let r = unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            path_cstr.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
+        libc::fchmodat(
+            dirfd.as_raw_fd(),
+            name.as_ptr(),
+            policy.mode(&attrs) as libc::mode_t,
+            0,
         )
     };
     if r != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_times(_path: &Path, _metadata: &fs::Metadata, _options: &CopyOptions) -> PaxResult<()> {
-    Ok(())
-}
-
-/// Restore ownership, when `-p o`/`-p e` asked for it and the process can.
-///
-/// Copy mode had no equivalent of this at all, so `-p o` and `-p e` were silent
-/// no-ops there. Ownership must be restored before the mode, because chown
-/// clears the set-user-ID and set-group-ID bits.
-#[cfg(unix)]
-fn set_owner(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    if !options.preserve_owner {
-        return Ok(());
-    }
-
-    let path_cstr = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
-    let r = unsafe {
-        libc::fchownat(
-            libc::AT_FDCWD,
-            path_cstr.as_ptr(),
-            metadata.uid(),
-            metadata.gid(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    // Best effort: only a sufficiently privileged process can give a file away,
-    // and failing to is not a reason to fail the copy.
-    let _ = r;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner(_path: &Path, _metadata: &fs::Metadata, _options: &CopyOptions) -> PaxResult<()> {
-    Ok(())
-}
-
-/// Owner, then mode, then times -- the order extraction uses.
-fn restore_all(path: &Path, metadata: &fs::Metadata, options: &CopyOptions) -> PaxResult<()> {
-    set_owner(path, metadata, options)?;
-    set_permissions(path, metadata, options)?;
-    set_times(path, metadata, options)
-}
-
-/// Same, for a symlink: its mode is meaningless and `fchmodat(AT_SYMLINK_NOFOLLOW)`
-/// is not portable, so only owner and times are restored.
-fn restore_symlink_attrs(
-    path: &Path,
-    metadata: &fs::Metadata,
-    options: &CopyOptions,
-) -> PaxResult<()> {
-    set_owner(path, metadata, options)?;
-    set_times(path, metadata, options)
 }
 
 #[cfg(test)]

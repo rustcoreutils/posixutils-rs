@@ -13,6 +13,7 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 
 #[test]
 fn test_copy_mode_basic() {
@@ -717,4 +718,43 @@ fn walkdir_depth(root: &std::path::Path) -> usize {
             .unwrap_or(d)
     }
     go(root, 0)
+}
+
+/// A `-s` rename can produce a member name with a leading slash. The file is
+/// created under the sanitized name, so a second name for the same inode must be
+/// linked to *that*, resolved from the destination anchor -- handing the raw name
+/// to `linkat` resolved it from the root of the filesystem instead, and the link
+/// was simply never made.
+#[test]
+fn test_copy_hard_link_follows_the_sanitized_member_name() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+
+    fs::write(src.join("aaa"), b"payload\n").unwrap();
+    fs::hard_link(src.join("aaa"), src.join("zzz")).unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-r",
+            "-w",
+            "-s",
+            ",^aaa$,/abs/aaa,",
+            ".",
+            dst.to_str().unwrap(),
+        ],
+        &src,
+    );
+    assert_success(&output, "copying a hard-linked pair through a -s rename");
+
+    let renamed = dst.join("abs").join("aaa");
+    let other = dst.join("zzz");
+    assert!(other.exists(), "the second name was not copied");
+    assert_eq!(
+        fs::metadata(&renamed).unwrap().ino(),
+        fs::metadata(&other).unwrap().ino(),
+        "the second name is not a link to the first copy"
+    );
 }

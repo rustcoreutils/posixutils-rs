@@ -13,6 +13,7 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1126,5 +1127,53 @@ fn test_read_pax_archive_whose_first_member_needs_no_extended_header() {
     assert!(
         !listed.contains("PaxHeader"),
         "an extended header block was listed as a member: {listed}"
+    );
+}
+
+/// `-t` restores the access time of the file whose access time the read actually
+/// disturbed. With `-L` that is the symbolic link's target, not the link: pax
+/// opens and reads through the link, so stamping the link leaves the target
+/// disturbed and changes an inode that was never read.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_reset_atime_stamps_the_file_that_was_read() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fs::write(dir.join("target"), b"data\n").unwrap();
+    std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+
+    // A distinctive access time, well in the past.
+    const WHEN: i64 = 978_307_200;
+    let times = [
+        libc::timespec {
+            tv_sec: WHEN,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: WHEN,
+            tv_nsec: 0,
+        },
+    ];
+    let target_c = std::ffi::CString::new(dir.join("target").as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, target_c.as_ptr(), times.as_ptr(), 0) },
+        0
+    );
+
+    let archive = dir.join("a.tar");
+    assert_success(
+        &run_pax_in_dir(
+            &["-w", "-L", "-t", "-f", archive.to_str().unwrap(), "link"],
+            dir,
+        ),
+        "archiving through a symbolic link with -t",
+    );
+
+    assert_eq!(
+        fs::metadata(dir.join("target")).unwrap().atime(),
+        WHEN,
+        "-L -t left the target's access time disturbed"
     );
 }

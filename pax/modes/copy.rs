@@ -286,7 +286,7 @@ fn copy_member(
     } else if metadata.is_symlink() {
         copy_symlink(src, pfd, name, &metadata, options)?;
     } else if metadata.is_file() {
-        copy_file(src, tree, pfd, name, &member, options, state, &metadata)?;
+        copy_file(src, tree, pfd, name, &mp.display, options, state, &metadata)?;
     } else if let Err(e) = copy_special_file(pfd, name, &metadata, options) {
         crate::error::report_error(src.display(), e);
     }
@@ -532,22 +532,30 @@ fn copy_file(
     }
 
     // A second name for a file already copied becomes a link to that copy.
+    //
+    // `member` is the name the first copy was actually created under -- the
+    // parsed one, with any leading `/` and `..` already removed. Recording the
+    // raw name instead let a `-s` rename to an absolute path be handed to
+    // `linkat`, which resolves an absolute path from the root of the filesystem
+    // and ignores the anchor descriptor entirely.
     if let Some(link_target) = state.link_tracker.check_ids(
         metadata.dev(),
         metadata.ino(),
         metadata.nlink() as u32,
         member,
     ) {
-        let target_c = CString::new(link_target.as_os_str().as_bytes())
-            .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
+        let Some(target) = MemberPath::parse(&link_target)? else {
+            return do_copy_file(src, dirfd, name, metadata, options);
+        };
+        let target_dir = tree.parent_of(&target, false)?;
         create_replacing(dirfd, name, options.no_clobber, || {
-            // The first copy's name is recorded relative to the destination
-            // root, so it resolves from the root's descriptor. flags 0: link
-            // that file itself, never anything it might point at.
+            // Resolved one component at a time from the destination anchor, the
+            // same way the file itself was created. flags 0: link that file
+            // itself, never anything it might point at.
             let r = unsafe {
                 libc::linkat(
-                    tree.root().as_raw_fd(),
-                    target_c.as_ptr(),
+                    target_dir.as_raw_fd(),
+                    target.leaf.as_ptr(),
                     dirfd.as_raw_fd(),
                     name.as_ptr(),
                     0,

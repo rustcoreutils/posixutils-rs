@@ -781,7 +781,6 @@ fn is_archive_newer_at(entry: &ArchiveEntry, dirfd: BorrowedFd<'_>, name: &CStr)
     entry.mtime as i64 > st.st_mtime
 }
 
-/// Set file permissions
 /// The archived attributes of a member, in the shared shape.
 fn attrs_of(entry: &ArchiveEntry) -> Attrs {
     Attrs {
@@ -873,7 +872,6 @@ fn set_owner_at(
     Ok(())
 }
 
-/// Set file access and modification times
 /// Set file access and modification times
 fn set_times_at(
     dirfd: BorrowedFd<'_>,

@@ -597,13 +597,14 @@ fn write_file<W: ArchiveWriter>(
     // Copy file contents, bounded by the size already written in the header.
     let mut file = File::open(src_path)?;
     copy_file_data(&mut file, archive, entry.size, src_path)?;
+    // Held open past the copy so -t can stamp the descriptor below.
 
     archive.finish_entry()?;
 
     // Reset access time if requested
     #[cfg(unix)]
     if let Some((atime_sec, atime_nsec)) = original_atime {
-        reset_atime(src_path, atime_sec, atime_nsec);
+        reset_atime(&file, src_path, atime_sec, atime_nsec);
     }
 
     Ok(())
@@ -857,58 +858,36 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// Reset access time of a file to the specified time
+/// Restore the access time `-t` recorded, on the file that was actually read.
+///
+/// Stamping goes through the descriptor the data came from rather than by name.
+/// Resolving the name a second time was wrong both ways round: without
+/// `AT_SYMLINK_NOFOLLOW` a name replaced by a symbolic link in between would
+/// redirect the timestamp onto the link's target, and with it, `-L`/`-H` stamped
+/// the link rather than the file whose access time the read had actually
+/// disturbed. A descriptor has neither problem, and `UTIME_OMIT` leaves the
+/// modification time alone instead of reading it back to write it again.
 #[cfg(unix)]
-fn reset_atime(path: &Path, atime_sec: i64, atime_nsec: i64) {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+fn reset_atime(file: &File, path: &Path, atime_sec: i64, atime_nsec: i64) {
+    use std::os::fd::AsRawFd;
 
-    let path_cstr = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    // Get current modification time to preserve it
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-
-    let mtime_sec = metadata.mtime();
-    let mtime_nsec = metadata.mtime_nsec();
-
-    // Use utimensat for nanosecond precision if available
     let times = [
         libc::timespec {
             tv_sec: atime_sec as libc::time_t,
             tv_nsec: atime_nsec as libc::c_long,
         },
         libc::timespec {
-            tv_sec: mtime_sec as libc::time_t,
-            tv_nsec: mtime_nsec as libc::c_long,
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
         },
     ];
 
-    // `AT_SYMLINK_NOFOLLOW`: the file has been read and closed by now, so the
-    // name is being resolved a second time. Without the flag, a name replaced by
-    // a symbolic link in between would have pax stamp the link's target instead.
-    // It also matches the `symlink_metadata` above, which took the mtime from the
-    // link rather than through it.
-    let result = unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            path_cstr.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-
+    let result = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
     if result != 0 {
-        let err = std::io::Error::last_os_error();
         eprintln!(
             "pax: warning: cannot reset atime on {}: {}",
             path.display(),
-            err
+            std::io::Error::last_os_error()
         );
     }
 }

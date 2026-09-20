@@ -648,7 +648,10 @@ fn extract_device(
         EntryType::CharDevice => libc::S_IFCHR,
         _ => 0,
     };
-    let mode: libc::mode_t = (entry.mode as libc::mode_t) | type_bits;
+    // Created without the set-id bits; set_permissions_at applies the archived
+    // mode below, once the node exists.
+    let mode: libc::mode_t =
+        (policy_of(options).creation_mode(&attrs_of(entry)) as libc::mode_t) | type_bits;
 
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         let r = unsafe { libc::mknodat(dirfd.as_raw_fd(), name.as_ptr(), mode, dev) };
@@ -682,8 +685,13 @@ fn extract_fifo(
     options: &ReadOptions,
 ) -> PaxResult<()> {
     let created = create_replacing(dirfd, name, options.no_clobber, || {
-        let r =
-            unsafe { libc::mkfifoat(dirfd.as_raw_fd(), name.as_ptr(), entry.mode as libc::mode_t) };
+        let r = unsafe {
+            libc::mkfifoat(
+                dirfd.as_raw_fd(),
+                name.as_ptr(),
+                policy_of(options).creation_mode(&attrs_of(entry)) as libc::mode_t,
+            )
+        };
         if r != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -723,7 +731,7 @@ fn extract_file<R: ArchiveReader>(
                 dirfd.as_raw_fd(),
                 name.as_ptr(),
                 flags,
-                entry.mode as libc::c_uint,
+                policy_of(options).creation_mode(&attrs_of(entry)) as libc::c_uint,
             )
         };
         if fd < 0 {

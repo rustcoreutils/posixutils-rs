@@ -291,6 +291,23 @@ impl AttrPolicy {
         mode
     }
 
+    /// The permission bits to *create* with, as opposed to the ones the
+    /// finished file ends up with.
+    ///
+    /// Never set-user-ID or set-group-ID, whatever `-p` asked for. A member is
+    /// created before its contents are written, so passing the archived mode
+    /// straight to `open()` leaves a set-id file -- owned by whoever is running
+    /// pax -- executable for the whole duration of the copy. Extracting an
+    /// untrusted archive as root that way hands out a root shell to anyone who
+    /// wins the race to `exec` it.
+    ///
+    /// `set_attrs_fd` applies [`AttrPolicy::mode`] through the descriptor once
+    /// the data is complete, so any set-id bit the archive legitimately carries
+    /// arrives then, on a file whose contents are already final.
+    pub fn creation_mode(&self, attrs: &Attrs) -> u32 {
+        self.mode(attrs) & 0o777
+    }
+
     /// The times to apply, or `None` when neither was asked for.
     ///
     /// `UTIME_OMIT` leaves the one that was not asked for exactly as it is,
@@ -435,4 +452,83 @@ pub(crate) fn stat_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<libc::stat> 
         )
     };
     (r == 0).then_some(st)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attrs(mode: u32) -> Attrs {
+        Attrs {
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            atime: None,
+            atime_nsec: 0,
+        }
+    }
+
+    fn policy(preserve_owner: bool, preserve_perms: bool) -> AttrPolicy {
+        AttrPolicy {
+            preserve_owner,
+            preserve_perms,
+            preserve_mtime: false,
+            preserve_atime: false,
+            umask: 0o022,
+        }
+    }
+
+    /// The whole point of the method: a member is created before its contents
+    /// are written, so a set-id bit present at creation time is executable by
+    /// anyone for the duration of the copy. No `-p` combination may produce
+    /// one -- including `-p e`, which is the combination that asks for set-id
+    /// to be preserved and so is the one that used to leave the window open.
+    #[test]
+    fn test_creation_mode_never_carries_set_id() {
+        for mode in [0o4755, 0o2755, 0o6755, 0o4777] {
+            for owner in [false, true] {
+                for perms in [false, true] {
+                    let created = policy(owner, perms).creation_mode(&attrs(mode));
+                    assert_eq!(
+                        created & 0o7000,
+                        0,
+                        "mode {mode:o} created as {created:o} with \
+                         preserve_owner={owner} preserve_perms={perms}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// It must also never be *wider* than the mode the file ends up with,
+    /// or the window trades one exposure for another.
+    #[test]
+    fn test_creation_mode_is_never_wider_than_the_final_mode() {
+        for mode in [0o4755, 0o755, 0o600, 0o777, 0o000, 0o2750] {
+            for owner in [false, true] {
+                for perms in [false, true] {
+                    let p = policy(owner, perms);
+                    let created = p.creation_mode(&attrs(mode));
+                    let final_mode = p.mode(&attrs(mode));
+                    assert_eq!(
+                        created & !final_mode,
+                        0,
+                        "mode {mode:o}: created {created:o} grants what final {final_mode:o} does not"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And it must still carry the ordinary permission bits, or extraction
+    /// would produce unreadable files and the fix would be a regression.
+    #[test]
+    fn test_creation_mode_keeps_the_permission_bits() {
+        // -p p preserves the mode exactly; the umask does not apply.
+        assert_eq!(policy(true, true).creation_mode(&attrs(0o4755)), 0o755);
+        // Without -p p the normal file-creation action applies the umask.
+        assert_eq!(policy(false, false).creation_mode(&attrs(0o4777)), 0o755);
+    }
 }

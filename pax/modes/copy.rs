@@ -595,7 +595,7 @@ fn do_copy_file(
                 dirfd.as_raw_fd(),
                 name.as_ptr(),
                 flags,
-                (metadata.mode() & 0o777) as libc::c_uint,
+                policy_of(options).creation_mode(&attrs_of(metadata)) as libc::c_uint,
             )
         };
         if fd < 0 {

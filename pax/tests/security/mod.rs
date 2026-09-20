@@ -255,3 +255,65 @@ fn test_extract_does_not_chmod_through_planted_symlink() {
         stderr_str(&output)
     );
 }
+
+/// A set-user-ID member must not exist as a set-user-ID file before its
+/// contents are complete. The window itself is a race and is asserted at the
+/// unit level (`AttrPolicy::creation_mode`); what this pins is that closing it
+/// did not cost the preservation `-p e` asks for.
+#[test]
+fn test_extract_preserves_setuid_bit_on_the_finished_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let archive = Ustar {
+        name: b"suid",
+        mode: 0o4755,
+        body: b"contents\n",
+        ..Default::default()
+    }
+    .archive();
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-p", "e"], &archive, &dst);
+
+    let mode = fs::metadata(dst.join("suid")).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o7777,
+        0o4755,
+        "-p e must restore the archived set-user-ID mode: {}",
+        stderr_str(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join("suid")).unwrap(),
+        "contents\n",
+        "and the contents must be complete"
+    );
+}
+
+/// Without `-p o`/`-p e` the set-id bits are dropped entirely: the file is
+/// about to belong to whoever ran pax, not to the user the archive names.
+#[test]
+fn test_extract_drops_setuid_without_preserve() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let archive = Ustar {
+        name: b"sgid",
+        mode: 0o6755,
+        body: b"contents\n",
+        ..Default::default()
+    }
+    .archive();
+    run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
+
+    let mode = fs::metadata(dst.join("sgid")).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "set-id bits must not survive extraction without -p o or -p e"
+    );
+}

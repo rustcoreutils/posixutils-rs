@@ -417,7 +417,15 @@ fn extract_entry<R: ArchiveReader>(
     }
 
     let Some(member) = MemberPath::parse(&entry.path)? else {
-        // The member names nothing to create (`.`, or only `..`/root parts).
+        // The member names nothing to create below the anchor. A `.` member
+        // is ordinary -- every archive built with `pax -w .` carries one --
+        // but an empty name, or one made only of `..` and root components, is
+        // not, and dropping it in silence with a zero exit status makes an
+        // archive that extracted nothing look like one that extracted
+        // everything. GNU tar diagnoses the empty name too.
+        if !MemberPath::names_current_directory(&entry.path) {
+            crate::error::report_error(entry.path.display(), "names no file to create; skipping");
+        }
         archive.skip_data()?;
         return Ok(());
     };

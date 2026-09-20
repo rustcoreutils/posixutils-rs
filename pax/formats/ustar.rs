@@ -66,6 +66,7 @@ const CHRTYPE: u8 = b'3';
 const BLKTYPE: u8 = b'4';
 const DIRTYPE: u8 = b'5';
 const FIFOTYPE: u8 = b'6';
+const CONTTYPE: u8 = b'7';
 
 // Device number field offsets and lengths
 const DEVMAJOR_OFF: usize = 329;
@@ -94,20 +95,30 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
         // Skip any remaining data from previous entry
         self.skip_data()?;
 
-        let Some(header) = next_header_block(&mut self.reader)? else {
-            return Ok(None);
-        };
+        loop {
+            let Some(header) = next_header_block(&mut self.reader)? else {
+                return Ok(None);
+            };
 
-        // Verify checksum
-        if !verify_checksum(&header) {
-            return Err(PaxError::InvalidHeader("checksum mismatch".to_string()));
+            // Verify checksum
+            if !verify_checksum(&header) {
+                return Err(PaxError::InvalidHeader("checksum mismatch".to_string()));
+            }
+
+            // A GNU long-name record describes the member that follows, whose
+            // own name field is truncated. The records and the member are
+            // dropped together -- there can be more than one record.
+            if long_name_record(header[TYPEFLAG_OFF]).is_some() {
+                skip_long_name_records(&mut self.reader, header)?;
+                continue;
+            }
+
+            let entry = parse_header(&header, SizeRule::Ustar)?;
+            self.current_size = entry.size;
+            self.bytes_read = 0;
+
+            return Ok(Some(entry));
         }
-
-        let entry = parse_header(&header, SizeRule::Ustar)?;
-        self.current_size = entry.size;
-        self.bytes_read = 0;
-
-        Ok(Some(entry))
     }
 
     fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
@@ -266,7 +277,8 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     let mtime = parse_octal(&header[MTIME_OFF..MTIME_OFF + 12])?;
 
     let typeflag = header[TYPEFLAG_OFF];
-    let entry_type = parse_typeflag(typeflag)?;
+    let flag = parse_typeflag(typeflag);
+    let entry_type = flag.entry_type();
     let size = rule.data_size(entry_type, declared_size);
 
     let linkname = parse_path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
@@ -275,6 +287,23 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     } else {
         None
     };
+
+    // POSIX: "If conversion to a regular file occurs, the pax utility shall
+    // produce an error indicating that the conversion took place."
+    match flag {
+        TypeFlag::Known(_) | TypeFlag::RegularByDefinition => {}
+        TypeFlag::Unimplemented(what) => crate::error::report_error(
+            path.display(),
+            format!("is {what}, which is not supported; extracting as a regular file"),
+        ),
+        TypeFlag::Unknown => crate::error::report_error(
+            path.display(),
+            format!(
+                "has unrecognized type {}; extracting as a regular file",
+                show_typeflag(typeflag)
+            ),
+        ),
+    }
 
     if declared_size != 0 && rule.size_must_be_zero(entry_type) {
         crate::error::report_error(
@@ -345,17 +374,88 @@ pub(crate) fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
     u64::from_str_radix(&s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
 }
 
-/// Parse typeflag to EntryType
-pub(crate) fn parse_typeflag(flag: u8) -> PaxResult<EntryType> {
+/// What a header's typeflag means, and why.
+///
+/// POSIX requires an unrecognised type to be extracted as a regular file *and*
+/// an error produced saying the conversion took place. Collapsing every
+/// unhandled flag straight to `Regular` loses the second half, and with it the
+/// only sign that a member did not come back as what it went in as. The
+/// distinction between "this is a regular file" and "we could not tell, so it
+/// is one now" has to survive as far as the caller that knows the pathname.
+pub(crate) enum TypeFlag {
+    /// A ustar type with its own meaning, handled as such.
+    Known(EntryType),
+    /// A type POSIX defines as a regular file: typeflag 7, "reserved to
+    /// represent a file to which an implementation has associated some
+    /// high-performance attribute", which implementations without such
+    /// extensions treat as type 0. No diagnostic; nothing was lost.
+    RegularByDefinition,
+    /// A GNU extension that is not implemented, named because its failure mode
+    /// is silent corruption rather than a missing file -- a sparse member
+    /// extracted as a regular file gets its sparse map as contents, and a
+    /// volume label becomes a file named after the label.
+    Unimplemented(&'static str),
+    /// Anything else, including a value reserved for a future version of the
+    /// standard.
+    Unknown,
+}
+
+impl TypeFlag {
+    /// The type to extract as. Everything that is not a known type is a
+    /// regular file, per POSIX.
+    pub(crate) fn entry_type(&self) -> EntryType {
+        match self {
+            TypeFlag::Known(t) => *t,
+            _ => EntryType::Regular,
+        }
+    }
+}
+
+/// A typeflag as a diagnostic renders it.
+///
+/// Most are a printable character and read best as one. A value reserved for a
+/// future version of the standard need not be printable at all, and writing it
+/// raw would put a control byte -- an escape sequence, even -- on the terminal
+/// of whoever listed the archive.
+fn show_typeflag(flag: u8) -> String {
+    if flag.is_ascii_graphic() {
+        format!("'{}'", flag as char)
+    } else {
+        format!("'\\{flag:03o}'")
+    }
+}
+
+/// The GNU long-name record types, which describe the *next* member rather
+/// than a file of their own.
+pub(crate) fn long_name_record(flag: u8) -> Option<&'static str> {
     match flag {
-        REGTYPE | AREGTYPE => Ok(EntryType::Regular),
-        LNKTYPE => Ok(EntryType::Hardlink),
-        SYMTYPE => Ok(EntryType::Symlink),
-        CHRTYPE => Ok(EntryType::CharDevice),
-        BLKTYPE => Ok(EntryType::BlockDevice),
-        DIRTYPE => Ok(EntryType::Directory),
-        FIFOTYPE => Ok(EntryType::Fifo),
-        _ => Ok(EntryType::Regular), // Treat unknown as regular
+        b'L' => Some("a GNU long name record"),
+        b'K' => Some("a GNU long link target record"),
+        _ => None,
+    }
+}
+
+/// Classify a header's typeflag.
+pub(crate) fn parse_typeflag(flag: u8) -> TypeFlag {
+    match flag {
+        REGTYPE | AREGTYPE => TypeFlag::Known(EntryType::Regular),
+        LNKTYPE => TypeFlag::Known(EntryType::Hardlink),
+        SYMTYPE => TypeFlag::Known(EntryType::Symlink),
+        CHRTYPE => TypeFlag::Known(EntryType::CharDevice),
+        BLKTYPE => TypeFlag::Known(EntryType::BlockDevice),
+        DIRTYPE => TypeFlag::Known(EntryType::Directory),
+        FIFOTYPE => TypeFlag::Known(EntryType::Fifo),
+        CONTTYPE => TypeFlag::RegularByDefinition,
+        // The GNU extensions we can name. A member of one of these types is
+        // not a regular file, and extracting it as one silently produces a
+        // wrong file rather than no file.
+        b'S' => TypeFlag::Unimplemented("a GNU sparse file"),
+        b'V' => TypeFlag::Unimplemented("a GNU volume label"),
+        b'L' => TypeFlag::Unimplemented("a GNU long name record"),
+        b'K' => TypeFlag::Unimplemented("a GNU long link target record"),
+        b'M' => TypeFlag::Unimplemented("a GNU multi-volume continuation"),
+        b'D' | b'N' => TypeFlag::Unimplemented("a GNU incremental-dump record"),
+        _ => TypeFlag::Unknown,
     }
 }
 
@@ -413,6 +513,103 @@ pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8;
             Ok(None)
         }
     }
+}
+
+/// Read and discard a GNU `L`/`K` long-name record, returning its recorded
+/// value.
+///
+/// These carry the real pathname (or link target) of the member that follows,
+/// whose own header holds the value truncated to 100 bytes. A member may be
+/// preceded by more than one: GNU tar writes `K` and then `L` when it has both
+/// a long link target and a long name, so a reader that assumes exactly one
+/// record mistakes the second record's *header* for the member, and then reads
+/// the real member header as an ordinary one -- restoring it under the
+/// truncated name it was trying to avoid. `skip_long_name_records` consumes the
+/// whole run.
+pub(crate) fn consume_long_name_record(
+    reader: &mut impl Read,
+    header: &[u8; BLOCK_SIZE],
+    what: &str,
+) -> PaxResult<Vec<u8>> {
+    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    let data = crate::formats::read_declared(reader, size, crate::formats::MAX_NAME, what)?;
+    let padding = (BLOCK_SIZE - (size as usize % BLOCK_SIZE)) % BLOCK_SIZE;
+    if padding > 0 {
+        let mut pad = [0u8; BLOCK_SIZE];
+        reader.read_exact(&mut pad[..padding])?;
+    }
+
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    Ok(data[..end].to_vec())
+}
+
+/// Consume every long-name record preceding a member, then the member itself,
+/// and report the whole group as unsupported.
+///
+/// `header` is the first record's header. Returns once the member has been
+/// stepped over, so the caller's next read is the following member.
+///
+/// Implementing the extension is separate work. What this avoids is the
+/// alternative: extracting `././@LongLink` as a file of its own and the member
+/// under a name truncated to 100 bytes -- two wrong files, and the name that
+/// got path-checked is not the name the archive meant.
+pub(crate) fn skip_long_name_records(
+    reader: &mut impl Read,
+    mut header: [u8; BLOCK_SIZE],
+) -> PaxResult<()> {
+    let mut long_name: Option<Vec<u8>> = None;
+    let mut kinds: Vec<&'static str> = Vec::new();
+
+    while let Some(what) = long_name_record(header[TYPEFLAG_OFF]) {
+        let value = consume_long_name_record(reader, &header, what)?;
+        // The `L` record holds the name; `K` holds the link target, which is
+        // not what the member is called.
+        if header[TYPEFLAG_OFF] == b'L' {
+            long_name = Some(value);
+        }
+        kinds.push(what);
+
+        let Some(next) = next_header_block(reader)? else {
+            // The archive ends after the record, with no member to skip.
+            report_long_name_group(&long_name, &header, &kinds);
+            return Ok(());
+        };
+        if !verify_checksum(&next) {
+            return Err(PaxError::InvalidHeader("checksum mismatch".to_string()));
+        }
+        header = next;
+    }
+
+    // `header` is now the member the records described.
+    report_long_name_group(&long_name, &header, &kinds);
+    skip_member_data(reader, &header)
+}
+
+/// Name the member that is being skipped, and the extensions that describe it.
+fn report_long_name_group(
+    long_name: &Option<Vec<u8>>,
+    member: &[u8; BLOCK_SIZE],
+    kinds: &[&'static str],
+) {
+    // The long name if the archive gave one, otherwise the truncated name in
+    // the member's own header -- which is all there is to go on for a lone `K`.
+    let name = match long_name {
+        Some(n) => String::from_utf8_lossy(n).into_owned(),
+        None => parse_path_field(&member[NAME_OFF..NAME_OFF + NAME_LEN]),
+    };
+    crate::error::report_error(
+        name,
+        format!(
+            "uses {}, which is not supported; skipping the member",
+            kinds.join(" and ")
+        ),
+    );
+}
+
+/// Step over a member's data blocks without interpreting them.
+pub(crate) fn skip_member_data(reader: &mut impl Read, header: &[u8; BLOCK_SIZE]) -> PaxResult<()> {
+    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    skip_bytes(reader, round_up_block(size))
 }
 
 /// Verify header checksum

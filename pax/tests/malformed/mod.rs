@@ -221,3 +221,325 @@ fn test_malformed_pax_size_keyword_at_u64_max() {
         "a member declaring 2^64-1 bytes cannot be satisfied and must fail"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Input that used to be accepted in silence. A missing feature that fails
+// loudly is a missing feature; one that fails quietly is a defect, because the
+// archive looks like it came back whole.
+// ---------------------------------------------------------------------------
+
+/// POSIX: "If conversion to a regular file occurs, the pax utility shall
+/// produce an error indicating that the conversion took place." Every
+/// unrecognized typeflag became a regular file with no diagnostic and a zero
+/// exit status.
+#[test]
+fn test_unknown_typeflag_is_diagnosed() {
+    let archive = Ustar {
+        name: b"weird",
+        typeflag: b'Q',
+        body: b"data\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert!(
+        stderr_str(&output).contains("unrecognized type 'Q'"),
+        "an unknown typeflag must be named: {}",
+        stderr_str(&output)
+    );
+    assert_failure(&output, "list a member of unknown type");
+}
+
+/// A typeflag that is not a printable character must not reach the terminal
+/// raw -- writing it out is how an archive gets to send escape sequences to
+/// whoever listed it.
+#[test]
+fn test_unprintable_typeflag_is_escaped_in_the_diagnostic() {
+    let archive = Ustar {
+        name: b"esc",
+        typeflag: 0x1b,
+        body: b"data\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert!(
+        stderr_str(&output).contains(r"'\033'"),
+        "an unprintable typeflag must be shown as an escape: {}",
+        stderr_str(&output)
+    );
+    assert!(
+        !output.stderr.contains(&0x1b),
+        "the raw escape byte must not be written to the terminal"
+    );
+}
+
+/// Typeflag 7 is the exception: POSIX defines it as a regular file for any
+/// implementation without the high-performance extension, so nothing was lost
+/// and nothing is diagnosed.
+#[test]
+fn test_contiguous_typeflag_is_not_diagnosed() {
+    let archive = Ustar {
+        name: b"contig",
+        typeflag: b'7',
+        body: b"data\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert_success(&output, "list a typeflag 7 member");
+    assert_eq!(stderr_str(&output), "");
+}
+
+/// A GNU sparse member extracted as a regular file gets its sparse map as
+/// contents, and a volume label becomes a file named after the label. Both
+/// look like success, so both are named specifically rather than being folded
+/// into the generic unknown-type message.
+#[test]
+fn test_gnu_extensions_are_named_in_the_diagnostic() {
+    for (typeflag, expected) in [(b'S', "GNU sparse file"), (b'V', "GNU volume label")] {
+        let archive = Ustar {
+            name: b"m",
+            typeflag,
+            body: b"data\n",
+            ..Default::default()
+        }
+        .archive();
+
+        let output = run_pax_with_stdin_bytes(&[], &archive);
+        assert!(
+            stderr_str(&output).contains(expected),
+            "typeflag {} should be named as {expected}: {}",
+            typeflag as char,
+            stderr_str(&output)
+        );
+    }
+}
+
+/// A GNU `L` record carries the real name of the member that follows, whose
+/// own header holds a name truncated to 100 bytes. Treating `L` as an unknown
+/// type created a file called `@LongLink` *and* extracted the member under its
+/// truncated name -- two wrong files, silently. Both are now skipped, and the
+/// diagnostic reports the name the archive actually meant.
+#[test]
+fn test_gnu_long_name_record_skips_the_member_it_describes() {
+    let long = [b"d/".as_slice(), &[b'x'; 200], b"/deep.txt"].concat();
+    let mut body = long.clone();
+    body.push(0);
+
+    let mut archive = Ustar {
+        name: b"././@LongLink",
+        typeflag: b'L',
+        body: &body,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: &long[..100],
+            body: b"payload\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+
+    assert!(
+        stderr_str(&output).contains("GNU long name record"),
+        "the unsupported extension must be named: {}",
+        stderr_str(&output)
+    );
+    assert!(
+        stderr_str(&output).contains("deep.txt"),
+        "the diagnostic should report the name the archive meant: {}",
+        stderr_str(&output)
+    );
+    assert!(
+        !temp.path().join("@LongLink").exists(),
+        "the long-name record must not be extracted as a file of its own"
+    );
+    assert!(
+        std::fs::read_dir(temp.path()).unwrap().next().is_none(),
+        "nothing at all should have been created"
+    );
+    assert_failure(&output, "extract an archive using GNU long names");
+}
+
+/// `c_namesize` counts the NUL terminator, so zero is malformed. GNU cpio
+/// says "file name of zero length"; pax listed a blank line and exited zero.
+#[test]
+fn test_cpio_zero_length_name_is_diagnosed() {
+    let archive = CpioNewc {
+        namesize: Some(0),
+        ..Default::default()
+    }
+    .member();
+
+    let output = run_pax_with_stdin_bytes(&["-x", "cpio"], &archive);
+    assert!(
+        stderr_str(&output).contains("zero length"),
+        "a zero-length cpio name must be diagnosed: {}",
+        stderr_str(&output)
+    );
+    assert_failure(&output, "list a cpio member with no name");
+}
+
+/// A name field whose declared size leaves no room for the terminator is
+/// equally malformed, and GNU cpio equally diagnoses it.
+#[test]
+fn test_cpio_unterminated_name_is_diagnosed() {
+    let archive = CpioNewc {
+        name: b"abcd",
+        namesize: Some(4),
+        ..Default::default()
+    }
+    .member();
+
+    let output = run_pax_with_stdin_bytes(&["-x", "cpio"], &archive);
+    assert!(
+        stderr_str(&output).contains("NUL-terminated"),
+        "an unterminated cpio name must be diagnosed: {}",
+        stderr_str(&output)
+    );
+    assert_failure(&output, "list a cpio member with an unterminated name");
+}
+
+/// A member whose name resolves to nothing below the extraction directory is
+/// dropped -- correctly -- but dropping it in silence made an archive that
+/// extracted nothing look like one that extracted everything.
+#[test]
+fn test_member_naming_no_file_is_diagnosed() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let archive = Ustar {
+        name: b"..",
+        typeflag: b'5',
+        ..Default::default()
+    }
+    .archive();
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert!(
+        stderr_str(&output).contains("names no file to create"),
+        "a member that creates nothing must say so: {}",
+        stderr_str(&output)
+    );
+    assert_failure(&output, "extract a member named `..`");
+}
+
+/// But `.` is ordinary: every archive built with `pax -w .` carries one, and
+/// it must not be diagnosed or the common case fails.
+#[test]
+fn test_current_directory_member_is_not_diagnosed() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let mut archive = Ustar {
+        name: b".",
+        typeflag: b'5',
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"./a.txt",
+            body: b"x\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&output, "extract an archive containing a `.` member");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+        "x\n"
+    );
+}
+
+/// A member can be preceded by *more than one* long-name record: GNU tar
+/// writes `K` (long link target) and then `L` (long name) when a member has
+/// both. Consuming only one mistakes the second record's header for the member
+/// and then reads the real member header as an ordinary one -- restoring it
+/// under exactly the truncated 100-byte name the skip exists to avoid, while
+/// the diagnostic claims the member was skipped.
+#[test]
+fn test_paired_gnu_long_name_records_skip_the_whole_group() {
+    let long_name = [b"n".as_slice(), &[b'd'; 121]].concat();
+    let long_target = [b"t".as_slice(), &[b't'; 137]].concat();
+
+    let with_nul = |v: &[u8]| {
+        let mut b = v.to_vec();
+        b.push(0);
+        b
+    };
+    let name_body = with_nul(&long_name);
+    let target_body = with_nul(&long_target);
+
+    // K, then L, then the member -- the order GNU tar emits.
+    let mut archive = Ustar {
+        name: b"././@LongLink",
+        typeflag: b'K',
+        body: &target_body,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"././@LongLink",
+            typeflag: b'L',
+            body: &name_body,
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(
+        &Ustar {
+            name: &long_name[..100],
+            typeflag: b'2',
+            linkname: &long_target[..100],
+            ..Default::default()
+        }
+        .member(),
+    );
+    // A following member proves the reader resynchronised on the right block.
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"after.txt",
+            body: b"still here\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-v"], &archive, temp.path());
+
+    let created: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "only the member after the group should be created, got {created:?}"
+    );
+    assert_eq!(created[0], std::ffi::OsStr::new("after.txt"));
+
+    let err = stderr_str(&output);
+    assert!(
+        err.contains("long link target") && err.contains("long name"),
+        "both records should be named: {err}"
+    );
+    // The diagnostic must name the member, which is what the `L` record holds
+    // -- not the link target, which is what a lone `K` would leave in hand.
+    assert!(
+        err.contains(std::str::from_utf8(&long_name).unwrap()),
+        "the diagnostic should report the member's real name: {err}"
+    );
+}

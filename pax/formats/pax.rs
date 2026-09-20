@@ -783,6 +783,14 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     extended_header = Some(self.read_extended_header(size)?);
                 }
+                _ if crate::formats::ustar::long_name_record(typeflag).is_some() => {
+                    // A GNU long-name record describes the member that
+                    // follows, whose own name field is truncated to 100 bytes.
+                    // The records and the member are dropped together, and
+                    // there can be more than one record -- see
+                    // skip_long_name_records.
+                    crate::formats::ustar::skip_long_name_records(&mut self.reader, header)?;
+                }
                 _ => {
                     // Regular file entry - parse and apply extended headers
                     let mut entry = parse_ustar_header(&header, SizeRule::Pax)?;

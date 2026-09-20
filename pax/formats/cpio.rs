@@ -412,7 +412,7 @@ fn parse_odc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<Archive
     )?;
 
     // Remove trailing NUL
-    let name = parse_name(&name_buf);
+    let name = parse_name(&name_buf)?;
     let path = PathBuf::from(name);
 
     let entry_type = parse_mode_type(mode);
@@ -425,7 +425,7 @@ fn parse_odc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<Archive
             crate::formats::MAX_NAME,
             "cpio symbolic link target",
         )?;
-        Some(PathBuf::from(parse_name(&target_buf)))
+        Some(PathBuf::from(parse_link_target(&target_buf)))
     } else {
         None
     };
@@ -510,7 +510,7 @@ fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(Archi
     }
 
     // Remove trailing NUL
-    let name = parse_name(&name_buf);
+    let name = parse_name(&name_buf)?;
     let path = PathBuf::from(name);
 
     let entry_type = parse_mode_type(mode);
@@ -529,7 +529,7 @@ fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(Archi
             let mut pad = vec![0u8; symlink_padding];
             reader.read_exact(&mut pad)?;
         }
-        (Some(PathBuf::from(parse_name(&target_buf))), 0, 0)
+        (Some(PathBuf::from(parse_link_target(&target_buf))), 0, 0)
     } else {
         // Calculate padding after file data
         let file_padding = if filesize > 0 {
@@ -628,7 +628,7 @@ fn parse_bin_header<R: Read>(
     }
 
     // Remove trailing NUL
-    let name = parse_name(&name_buf);
+    let name = parse_name(&name_buf)?;
     let path = PathBuf::from(name);
 
     let entry_type = parse_mode_type(mode);
@@ -647,7 +647,7 @@ fn parse_bin_header<R: Read>(
             let mut pad = [0u8; 1];
             reader.read_exact(&mut pad)?;
         }
-        (Some(PathBuf::from(parse_name(&target_buf))), 0, 0)
+        (Some(PathBuf::from(parse_link_target(&target_buf))), 0, 0)
     } else {
         // Calculate padding after file data (must be word-aligned)
         let file_padding = if filesize > 0 {
@@ -702,8 +702,35 @@ fn parse_hex_field(bytes: &[u8]) -> PaxResult<u64> {
     u64::from_str_radix(s, 16).map_err(|_| PaxError::InvalidHeader(format!("invalid hex: {}", s)))
 }
 
-/// Parse filename, removing NUL terminator
-fn parse_name(bytes: &[u8]) -> String {
+/// Parse a member name from the `c_namesize` bytes that follow a header.
+///
+/// `c_namesize` counts the NUL terminator, so the field must be non-empty and
+/// must end in one. GNU cpio diagnoses both failures ("file name of zero
+/// length", "file name is not nul-terminated"); accepting them silently turned
+/// a `c_namesize` of zero into a member with an empty name, listed as a blank
+/// line and extracted as nothing at all, with a zero exit status.
+fn parse_name(bytes: &[u8]) -> PaxResult<String> {
+    if bytes.is_empty() {
+        return Err(PaxError::InvalidHeader(
+            "cpio member name is of zero length".to_string(),
+        ));
+    }
+    let Some(end) = bytes.iter().position(|&b| b == 0) else {
+        return Err(PaxError::InvalidHeader(
+            "cpio member name is not NUL-terminated".to_string(),
+        ));
+    };
+    if end == 0 {
+        return Err(PaxError::InvalidHeader(
+            "cpio member name is empty".to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes[..end]).to_string())
+}
+
+/// A symbolic link's target, which is the member data rather than a
+/// NUL-terminated name field -- some writers pad it with a NUL, some do not.
+fn parse_link_target(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).to_string()
 }
@@ -1007,8 +1034,13 @@ mod tests {
 
     #[test]
     fn test_parse_name() {
-        assert_eq!(parse_name(b"hello\0"), "hello");
-        assert_eq!(parse_name(b"test"), "test");
+        assert_eq!(parse_name(b"hello\0").unwrap(), "hello");
+
+        // c_namesize counts the terminator, so a field without one is
+        // malformed -- GNU cpio says so and we used to accept it.
+        assert!(parse_name(b"test").is_err());
+        assert!(parse_name(b"").is_err());
+        assert!(parse_name(b"\0").is_err());
     }
 
     #[test]

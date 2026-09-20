@@ -97,11 +97,20 @@ impl Substitution {
             match c {
                 'g' => global = true,
                 'p' => print = true,
-                // POSIX `s`/`S` select whether the substitution applies to the
-                // contents of a symbolic link. This implementation substitutes
-                // only pathnames (not link target contents), so both are accepted
-                // as no-ops rather than rejected.
-                's' | 'S' => {}
+                // POSIX `s`/`S` select whether the substitution applies to
+                // the contents of a symbolic link. `s` -- do not apply -- is
+                // what this implementation does, so it is accepted. `S` asks
+                // for the opposite and is not implemented; accepting it would
+                // silently do nothing, and a user relocating a tree with `-s`
+                // would get symbolic links still pointing at the old one.
+                's' => {}
+                'S' => {
+                    return Err(PaxError::PatternError(
+                        "substitution flag 'S' (apply to symbolic link contents) \
+                         is not supported"
+                            .to_string(),
+                    ))
+                }
                 _ => {
                     return Err(PaxError::PatternError(format!(
                         "unknown substitution flag: {}",
@@ -343,14 +352,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_symlink_flags_accepted() {
-        // The POSIX `s`/`S` symlink-content flags must be accepted (as no-ops),
-        // not rejected as unknown flags.
+    fn test_parse_symlink_flags() {
+        // `s` asks for what this implementation does -- substitute pathnames
+        // and leave symbolic link contents alone -- so it is accepted.
         assert!(Substitution::parse("/foo/bar/s").is_ok());
-        assert!(Substitution::parse("/foo/bar/S").is_ok());
         let s = Substitution::parse("/foo/bar/gps").unwrap();
         assert!(s.global);
         assert!(s.print);
+
+        // `S` asks for the opposite and is not implemented. Accepting it
+        // would silently do nothing, which is worse than refusing: a user
+        // relocating a tree would get links still pointing at the old one.
+        let err = Substitution::parse("/foo/bar/S").unwrap_err();
+        assert!(
+            err.to_string().contains("'S'"),
+            "the diagnostic must name the flag: {err}"
+        );
+
         // A genuinely unknown flag is still rejected.
         assert!(Substitution::parse("/foo/bar/z").is_err());
     }

@@ -82,6 +82,25 @@ impl MemberPath {
         }))
     }
 
+    /// Whether this name refers to the extraction directory itself rather
+    /// than naming nothing at all.
+    ///
+    /// `pax -w .` records a `.` member, so every archive built that way
+    /// carries one and there is nothing wrong with it -- it just has no file
+    /// to create below the anchor. An empty name, or one made only of `..`
+    /// and root components, is a different thing and worth saying out loud.
+    pub(crate) fn names_current_directory(path: &Path) -> bool {
+        use std::path::Component;
+        let mut saw_something = false;
+        for comp in path.components() {
+            match comp {
+                Component::CurDir => saw_something = true,
+                _ => return false,
+            }
+        }
+        saw_something
+    }
+
     /// How deep the member sits, for ordering the deferred directory pass.
     pub(crate) fn depth(&self) -> usize {
         self.dirs.len()

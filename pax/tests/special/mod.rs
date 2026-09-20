@@ -358,7 +358,10 @@ fn test_stdin_file_list_preserves_leading_space() {
 /// so the fixture cannot exist on macOS.
 #[cfg(target_os = "linux")]
 #[test]
-fn test_pax_invalid_binary_preserves_raw_name() {
+fn test_pax_preserves_a_raw_name_without_being_asked() {
+    // This used to need `-o invalid=binary`. A pathname is bytes, so keeping
+    // the bytes is not an option to opt into: hdrcharset=BINARY is decided by
+    // the writer from the name it was given.
     let temp = TempDir::new().unwrap();
     let src_dir = temp.path().join("source");
     let dst_dir = temp.path().join("dest");
@@ -371,19 +374,10 @@ fn test_pax_invalid_binary_preserves_raw_name() {
     fs::write(src_dir.join(name), b"payload").unwrap();
 
     let output = run_pax_in_dir(
-        &[
-            "-w",
-            "-x",
-            "pax",
-            "-o",
-            "invalid=binary",
-            "-f",
-            archive.to_str().unwrap(),
-            ".",
-        ],
+        &["-w", "-x", "pax", "-f", archive.to_str().unwrap(), "."],
         &src_dir,
     );
-    assert_success(&output, "write with -o invalid=binary");
+    assert_success(&output, "write a member whose name is not UTF-8");
 
     let bytes = fs::read(&archive).unwrap();
     assert!(
@@ -406,5 +400,254 @@ fn test_pax_invalid_binary_preserves_raw_name() {
         fs::read_to_string(dst_dir.join(name)).unwrap_or_default(),
         "payload",
         "the member must round-trip under its original byte name"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A pathname is a byte string. Every one of these used to come back with each
+// invalid byte replaced by U+FFFD -- a different file, silently.
+// ---------------------------------------------------------------------------
+
+/// The member name a GNU-tar archive records must be the name pax creates.
+///
+/// Linux-only: APFS and HFS+ reject a filename that is not well-formed UTF-8
+/// (`creat` returns EILSEQ), so neither the source file nor the extracted one
+/// can exist on macOS. What is under test is that pax passes the bytes
+/// through; a filesystem that refuses to hold them cannot show that either
+/// way.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_non_utf8_name_round_trips_through_every_format() {
+    let raw = b"na\xffme.txt";
+    let name = std::ffi::OsStr::from_bytes(raw);
+
+    for format in ["ustar", "pax", "cpio"] {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(src.join(name), b"payload").unwrap();
+
+        let archive = temp.path().join("a.archive");
+        assert_success(
+            &run_pax_in_dir(
+                &["-w", "-x", format, "-f", archive.to_str().unwrap(), "."],
+                &src,
+            ),
+            &format!("archive a non-UTF-8 name as {format}"),
+        );
+        assert_success(
+            &run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst),
+            &format!("extract a non-UTF-8 name from {format}"),
+        );
+
+        assert_eq!(
+            fs::read(dst.join(name)).unwrap_or_default(),
+            b"payload",
+            "{format}: the member did not come back under its own name"
+        );
+    }
+}
+
+/// Two members differing only in bytes that are not valid UTF-8 are two
+/// members. Under a lossy conversion both became `a<U+FFFD>b` and the second
+/// clobbered the first.
+///
+/// Linux-only: see the note above -- macOS will not hold either name.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_names_differing_only_in_invalid_bytes_do_not_collide() {
+    let temp = TempDir::new().unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let mut archive = crate::common::Ustar {
+        name: b"a\xffb",
+        body: b"first\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &crate::common::Ustar {
+            name: b"a\xfeb",
+            body: b"second\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&crate::common::ustar_trailer());
+
+    crate::common::run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
+
+    assert_eq!(
+        fs::read(dst.join(std::ffi::OsStr::from_bytes(b"a\xffb"))).unwrap_or_default(),
+        b"first\n"
+    );
+    assert_eq!(
+        fs::read(dst.join(std::ffi::OsStr::from_bytes(b"a\xfeb"))).unwrap_or_default(),
+        b"second\n"
+    );
+}
+
+/// A raw member name is listed as the bytes the archive recorded.
+///
+/// Portable: nothing is created, so this runs wherever pax does. The listing
+/// is the half of the `pax -t` / `pax -r` agreement that does not need a
+/// filesystem willing to hold the name.
+#[test]
+fn test_listing_reports_the_recorded_bytes() {
+    let archive = crate::common::Ustar {
+        name: b"na\xffme.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let listing = crate::common::run_pax_with_stdin_bytes(&[], &archive);
+    assert_eq!(
+        listing.stdout, b"na\xffme.txt\n",
+        "the listing must be the recorded bytes, not a rendering of them"
+    );
+}
+
+/// ...and it must be the name extraction actually creates. `pax -t` rendering
+/// U+FFFD where `pax -r` writes a raw byte makes the two disagree about the
+/// same archive.
+///
+/// Linux-only: macOS will not create the file, so there is no name to compare
+/// the listing against.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_listing_reports_the_name_extraction_creates() {
+    let temp = TempDir::new().unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let archive = crate::common::Ustar {
+        name: b"na\xffme.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let listing = crate::common::run_pax_with_stdin_bytes(&[], &archive);
+    crate::common::run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
+    let created: Vec<_> = fs::read_dir(&dst)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        created[0].as_bytes(),
+        &listing.stdout[..listing.stdout.len() - 1],
+        "`pax -t` and `pax -r` must agree about the name"
+    );
+}
+
+/// `-o listopt=%F` is a second path to the same name and must not diverge from
+/// the plain listing.
+#[test]
+fn test_listopt_renders_a_raw_name_exactly() {
+    let archive = crate::common::Ustar {
+        name: b"na\xffme.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = crate::common::run_pax_with_stdin_bytes(&["-o", "listopt=%F"], &archive);
+    assert_eq!(output.stdout, b"na\xffme.txt\n");
+}
+
+/// For cpio the symbolic link target *is* the member data, so taking its
+/// length from a lossy string made the header disagree with the bytes written
+/// and desynchronised everything after it.
+#[test]
+fn test_non_utf8_symlink_target_round_trips_through_cpio() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+
+    let target = std::ffi::OsStr::from_bytes(b"ta\xffrget");
+    std::os::unix::fs::symlink(target, src.join("link")).unwrap();
+    fs::write(src.join("after.txt"), b"still here\n").unwrap();
+
+    let archive = temp.path().join("a.cpio");
+    assert_success(
+        &run_pax_in_dir(
+            &["-w", "-x", "cpio", "-f", archive.to_str().unwrap(), "."],
+            &src,
+        ),
+        "archive a non-UTF-8 symlink target",
+    );
+    assert_success(
+        &run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst),
+        "extract a non-UTF-8 symlink target",
+    );
+
+    assert_eq!(
+        fs::read_link(dst.join("link"))
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+        b"ta\xffrget",
+        "the link target must come back byte-identical"
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join("after.txt")).unwrap_or_default(),
+        "still here\n",
+        "a wrong target length desynchronises every member after it"
+    );
+}
+
+/// Escaping applies only to a terminal. Every test in this suite runs pax with
+/// its output piped, so this asserts the guarantee the whole design rests on:
+/// piped output is byte-identical, and nothing that parses `pax -t` changes
+/// behaviour. It is also the regression test for escaping unconditionally by
+/// accident.
+#[test]
+fn test_piped_output_keeps_control_bytes_verbatim() {
+    let archive = crate::common::Ustar {
+        name: b"x\x1b[31mred\tname",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let plain = crate::common::run_pax_with_stdin_bytes(&[], &archive);
+    assert_eq!(
+        plain.stdout, b"x\x1b[31mred\tname\n",
+        "a pipe must receive the recorded bytes, escape sequence and all"
+    );
+
+    let verbose = crate::common::run_pax_with_stdin_bytes(&["-v"], &archive);
+    assert!(
+        verbose.stdout.windows(4).any(|w| w == b"\x1b[31"),
+        "the verbose listing must not escape to a pipe either"
+    );
+
+    let listopt = crate::common::run_pax_with_stdin_bytes(&["-o", "listopt=%F"], &archive);
+    assert_eq!(listopt.stdout, b"x\x1b[31mred\tname\n");
+}
+
+/// A `-o listopt` format string is operator-supplied, so its own literal
+/// characters must survive whatever the escaping rule does to the values
+/// substituted into it.
+#[test]
+fn test_listopt_literal_tab_survives() {
+    let archive = crate::common::Ustar {
+        name: b"a.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = crate::common::run_pax_with_stdin_bytes(&["-o", "listopt=%F\t%s"], &archive);
+    assert_eq!(
+        output.stdout, b"a.txt\t2\n",
+        "the tab is part of the format, not part of a name"
     );
 }

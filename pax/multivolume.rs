@@ -38,6 +38,7 @@
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::formats::ustar::parse_octal;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -415,77 +416,13 @@ impl MultiVolumeReader {
         header.len() >= 157 && header[156] == GNUTYPE_MULTIVOL
     }
 
-    /// Parse a tar header into an ArchiveEntry
+    /// Parse a tar header into an ArchiveEntry.
+    ///
+    /// This is the plain ustar parse. The GNU continuation typeflag is
+    /// recognised by `is_continuation_header` before we get here, and the
+    /// entry it describes is an ordinary member in every other respect.
     fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
-        let name = Self::parse_string(&header[0..100]);
-        let prefix = Self::parse_string(&header[345..500]);
-
-        let path = if prefix.is_empty() {
-            PathBuf::from(name)
-        } else {
-            PathBuf::from(format!("{}/{}", prefix, name))
-        };
-
-        let mode = parse_octal(&header[100..108])? as u32;
-        let uid = parse_octal(&header[108..116])? as u32;
-        let gid = parse_octal(&header[116..124])? as u32;
-        let size = parse_octal(&header[124..136])?;
-        let mtime = parse_octal(&header[136..148])?;
-
-        let typeflag = header[156];
-        let entry_type = Self::parse_typeflag(typeflag);
-
-        let linkname = Self::parse_string(&header[157..257]);
-        let link_target = if !linkname.is_empty() {
-            Some(PathBuf::from(linkname))
-        } else {
-            None
-        };
-
-        let uname = Self::parse_string(&header[265..297]);
-        let gname = Self::parse_string(&header[297..329]);
-
-        let devmajor = parse_octal(&header[329..337])? as u32;
-        let devminor = parse_octal(&header[337..345])? as u32;
-
-        Ok(ArchiveEntry {
-            path,
-            mode,
-            uid,
-            gid,
-            size,
-            mtime,
-            entry_type,
-            link_target,
-            uname: if uname.is_empty() { None } else { Some(uname) },
-            gname: if gname.is_empty() { None } else { Some(gname) },
-            devmajor,
-            devminor,
-            ..Default::default()
-        })
-    }
-
-    /// Parse a NUL-terminated string
-    fn parse_string(bytes: &[u8]) -> String {
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        String::from_utf8_lossy(&bytes[..end])
-            .trim_end()
-            .to_string()
-    }
-
-    /// Parse typeflag to EntryType
-    fn parse_typeflag(flag: u8) -> EntryType {
-        match flag {
-            b'0' | b'\0' => EntryType::Regular,
-            b'1' => EntryType::Hardlink,
-            b'2' => EntryType::Symlink,
-            b'3' => EntryType::CharDevice,
-            b'4' => EntryType::BlockDevice,
-            b'5' => EntryType::Directory,
-            b'6' => EntryType::Fifo,
-            GNUTYPE_MULTIVOL => EntryType::Regular, // Continuation is treated as regular
-            _ => EntryType::Regular,
-        }
+        crate::formats::ustar::parse_header(header, crate::formats::ustar::SizeRule::Ustar)
     }
 
     /// Parse offset from GNU continuation header (bytes 369-380)
@@ -523,7 +460,10 @@ impl MultiVolumeReader {
 
     /// Round up to next block boundary
     fn round_up_block(size: u64) -> u64 {
-        size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64
+        // See the note in formats/ustar.rs: a declared size near u64::MAX
+        // rounds up to 0 and the skip length then underflows.
+        size.div_ceil(BLOCK_SIZE as u64)
+            .saturating_mul(BLOCK_SIZE as u64)
     }
 }
 
@@ -566,8 +506,19 @@ impl ArchiveReader for MultiVolumeReader {
                 let remaining_size = parse_octal(&header[124..136])?;
 
                 if self.options.verbose {
-                    let name = Self::parse_string(&header[0..100]);
-                    eprintln!("pax: continuation of '{}' at offset {}", name, offset);
+                    // A member name out of the archive, so it goes out as its
+                    // bytes and is escaped only for a terminal -- the same
+                    // treatment every other name-bearing diagnostic gets.
+                    // `display()` here would both render an invalid byte as
+                    // U+FFFD and let an escape sequence through.
+                    let name = crate::rawpath::from_bytes(crate::formats::ustar::path_field(
+                        &header[0..100],
+                    ));
+                    let mut line = Vec::new();
+                    line.extend_from_slice(b"pax: continuation of '");
+                    line.extend_from_slice(crate::rawpath::as_bytes(&name));
+                    line.extend_from_slice(format!("' at offset {offset}").as_bytes());
+                    crate::escape::write_stderr_line(&line);
                 }
 
                 // Update our tracking - we're continuing from where we left off
@@ -595,7 +546,7 @@ impl ArchiveReader for MultiVolumeReader {
     }
 
     fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         if remaining == 0 {
             // Check if we need to switch to next volume for more data
             if self.in_split_file && self.total_bytes_read < self.total_entry_size {
@@ -622,7 +573,7 @@ impl ArchiveReader for MultiVolumeReader {
             }
         }
 
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         let to_read = std::cmp::min(buf.len() as u64, remaining) as usize;
 
         let reader = self
@@ -684,20 +635,6 @@ fn write_octal(buf: &mut [u8], val: u64, width: usize) {
     buf[..len].copy_from_slice(&bytes[..len]);
 }
 
-fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
-    let s = std::str::from_utf8(bytes)
-        .map_err(|_| PaxError::InvalidHeader("invalid octal".to_string()))?;
-    let s = s.trim_matches(|c| c == ' ' || c == '\0');
-    if s.is_empty() {
-        return Ok(0);
-    }
-    // Reject if the octal string contains a sign
-    if s.starts_with('+') || s.starts_with('-') {
-        return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
-    }
-    u64::from_str_radix(s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
-}
-
 fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
     let mut sum: u32 = 0;
     for (i, &byte) in header.iter().enumerate() {
@@ -719,8 +656,8 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     // itself. split_path errors rather than truncating when even the pair
     // cannot hold the path.
     let (name, prefix) = crate::formats::ustar::split_path(entry)?;
-    header[0..name.len()].copy_from_slice(name.as_bytes());
-    header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
+    header[0..name.len()].copy_from_slice(&name);
+    header[345..345 + prefix.len()].copy_from_slice(&prefix);
 
     // Mode, uid, gid
     write_octal(&mut header[100..], entry.mode as u64, 8);

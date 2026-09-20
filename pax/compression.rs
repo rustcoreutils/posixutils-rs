@@ -12,7 +12,7 @@
 //! This module provides transparent gzip compression and decompression
 //! as a filter layer that wraps Read/Write streams.
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::{self, Read, Write};
@@ -26,18 +26,24 @@ pub fn is_gzip(data: &[u8]) -> bool {
 }
 
 /// Gzip decompression wrapper for Read streams
+///
+/// `MultiGzDecoder`, not `GzDecoder`: a gzip stream may hold more than one
+/// deflate member, and `GzDecoder` stops at the end of the first one. That is
+/// not a corner case -- `gzip -c a >> x.gz`, `cat a.gz b.gz` and bgzip all
+/// produce multi-member streams -- and the failure is silent truncation of the
+/// archive, or a short read part way through a member.
 pub struct GzipReader<R: Read> {
-    decoder: GzDecoder<R>,
+    decoder: MultiGzDecoder<R>,
 }
 
 impl<R: Read> GzipReader<R> {
     /// Create a new gzip decompressor wrapping the given reader
     ///
     /// A malformed gzip header is reported by the first [`Read::read`] rather
-    /// than here, because `GzDecoder` parses the header lazily.
+    /// than here, because the decoder parses the header lazily.
     pub fn new(reader: R) -> io::Result<Self> {
         Ok(GzipReader {
-            decoder: GzDecoder::new(reader),
+            decoder: MultiGzDecoder::new(reader),
         })
     }
 }

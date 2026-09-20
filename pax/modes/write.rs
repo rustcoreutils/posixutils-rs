@@ -10,15 +10,16 @@
 //! Write mode implementation - create archives
 
 use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveWriter, EntryType, HardLinkTracker};
-use crate::error::PaxResult;
+use crate::error::{PaxError, PaxResult};
 use crate::formats::{checksum_bytes, CpioFormat, CpioWriter, PaxWriter, UstarWriter};
 use crate::interactive::{InteractivePrompter, RenameResult};
-use crate::options::{FormatOptions, InvalidAction};
+use crate::options::FormatOptions;
 use crate::pattern::{matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::{self, File, Metadata};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -63,13 +64,14 @@ impl WriteOptions {
     ///
     /// False whenever `-u` is not in force or the name is new to the archive,
     /// so an unfiltered run writes everything.
-    fn is_up_to_date(&self, archive_path: &Path, metadata: &Metadata) -> bool {
+    fn is_up_to_date(&self, archive_path: &Path, metadata: &ftw::Metadata) -> bool {
         let Some(times) = &self.update_times else {
             return false;
         };
         // Directory members are stored with a trailing slash; archived_mtimes
         // strips it so both sides of this lookup spell the name the same way.
-        let name = archive_path.to_string_lossy();
+        let name = crate::rawpath::MatchName::of(archive_path);
+        let name = name.as_str();
         let name = Path::new(name.trim_end_matches('/'));
         let Some(&member_mtime) = times.get(name) else {
             return false;
@@ -80,7 +82,7 @@ impl WriteOptions {
 
 /// A file's modification time in whole seconds, the resolution every header
 /// format records.
-fn file_mtime_secs(metadata: &Metadata) -> u64 {
+fn file_mtime_secs(metadata: &ftw::Metadata) -> u64 {
     #[cfg(unix)]
     {
         metadata.mtime().max(0) as u64
@@ -122,347 +124,277 @@ pub fn create_archive<W: Write>(
     }
 }
 
-/// Write files to any archive writer
+/// Write files to any archive writer.
+///
+/// The walk is `ftw::traverse_directory`, the same race-free traversal `cp` and
+/// `mv` use: everything below an operand is resolved one component at a time
+/// from a directory descriptor, with `O_DIRECTORY|O_NOFOLLOW` on the descent
+/// and a `(dev, ino)` re-check after it. What this replaced re-resolved the
+/// whole pathname on every call, so a source tree another process could modify
+/// was a window in which pax could be pointed at a file outside it.
+///
+/// One thing the operand itself is not: it is resolved once, by name, because
+/// it has to be. Everything under it is not.
 fn write_files<W: ArchiveWriter>(
     archive: &mut W,
     files: &[PathBuf],
     options: &WriteOptions,
 ) -> PaxResult<()> {
-    let mut link_tracker = HardLinkTracker::new();
-    // No filesystem is established until a directory is descended into; the
-    // per-directory splits below are the ones that matter for -X.
-    let initial_dev: Option<u64> = None;
-
-    // Create interactive prompter if needed
-    let mut prompter = if options.interactive {
+    let prompter = if options.interactive {
         Some(InteractivePrompter::new()?)
     } else {
         None
     };
 
+    let walk = WriteWalk {
+        archive: RefCell::new(archive),
+        link_tracker: RefCell::new(HardLinkTracker::new()),
+        prompter: RefCell::new(prompter),
+        dev_stack: RefCell::new(Vec::new()),
+        fatal: RefCell::new(None),
+        options,
+    };
+
     for path in files {
-        // Diagnose a per-operand failure and set a non-zero exit, but continue
-        // archiving the remaining operands (POSIX CONSEQUENCES OF ERRORS).
-        if let Err(e) = write_path(
-            archive,
+        let _ = ftw::traverse_directory(
             path,
-            options,
-            &mut link_tracker,
-            initial_dev,
-            true,
-            &mut prompter,
-        ) {
-            crate::error::report_error(path.display(), e);
+            |entry| walk.visit(entry),
+            |_, _| {
+                walk.dev_stack.borrow_mut().pop();
+                Ok(())
+            },
+            |entry, err| crate::error::report_error(entry.path().as_inner(), err.inner()),
+            ftw::TraverseDirectoryOpts {
+                follow_symlinks_on_args: options.cli_dereference,
+                follow_symlinks: options.dereference,
+                // Nothing here holds a descriptor open per level; the archive
+                // is written as the walk goes.
+                caller_fds_per_level: 0,
+                ..Default::default()
+            },
+        );
+
+        // A handler cannot abort the walk, so a fatal error is parked and
+        // re-raised here. traverse_directory's own bool return conflates "an
+        // error occurred" with "the operand was not a directory", so the exit
+        // status comes from note_error() as everywhere else.
+        if let Some(e) = walk.fatal.borrow_mut().take() {
+            return Err(e);
         }
     }
 
     Ok(())
 }
 
-/// Write a path (file or directory) to the archive
-fn write_path<W: ArchiveWriter>(
-    archive: &mut W,
-    path: &Path,
-    options: &WriteOptions,
-    link_tracker: &mut HardLinkTracker,
-    initial_dev: Option<u64>,
-    is_cli_arg: bool,
-    prompter: &mut Option<InteractivePrompter>,
-) -> PaxResult<()> {
-    // Exclusion is decided on the name as traversed, before -s renaming, and
-    // before stat: an excluded directory returns here, so its whole subtree is
-    // skipped without the caller needing an ancestor check.
-    if matches_excluded(&options.exclude_patterns, &path.to_string_lossy()) {
-        return Ok(());
-    }
+/// State the three traversal callbacks share.
+///
+/// `RefCell` throughout because `file_handler`, `postprocess_dir` and
+/// `err_reporter` are three closures alive at once and each needs a different
+/// part of it. Every borrow is taken and released within one callback; none is
+/// held across a call that could re-enter.
+struct WriteWalk<'a, W: ArchiveWriter> {
+    archive: RefCell<&'a mut W>,
+    link_tracker: RefCell<HardLinkTracker>,
+    prompter: RefCell<Option<InteractivePrompter>>,
+    /// `st_dev` of each directory descended into, for `-X`. Per parent rather
+    /// than per operand: `-X` stops pax crossing *a* mount point, not just the
+    /// one the operand sits on.
+    dev_stack: RefCell<Vec<u64>>,
+    /// Set by a failure that must stop the walk rather than skip a file.
+    fatal: RefCell<Option<PaxError>>,
+    options: &'a WriteOptions,
+}
 
-    // Get metadata
-    let follow = should_follow_symlink(options, is_cli_arg);
-    let metadata = if follow {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    };
-
-    let metadata = match metadata {
-        Ok(m) => m,
-        Err(e) => {
-            crate::error::report_error(path.display(), e);
-            return Ok(());
+impl<W: ArchiveWriter> WriteWalk<'_, W> {
+    /// Archive one entry. `Ok(true)` descends into a directory.
+    fn visit(&self, entry: ftw::Entry<'_>) -> Result<bool, ()> {
+        if self.fatal.borrow().is_some() {
+            return Ok(false);
         }
-    };
 
-    // Check one_file_system
-    #[cfg(unix)]
-    {
-        if options.one_file_system {
-            let dev = metadata.dev();
-            if let Some(initial) = initial_dev {
-                if dev != initial {
-                    return Ok(());
+        let path = entry.path();
+        let path = path.as_inner();
+
+        // Exclusion is decided on the name as traversed, before -s renaming
+        // and before any stat. Declining to descend takes the whole subtree.
+        if matches_excluded(
+            &self.options.exclude_patterns,
+            crate::rawpath::MatchName::of(path).as_str(),
+        ) {
+            return Ok(false);
+        }
+
+        let Some(metadata) = entry.metadata() else {
+            // ftw reports its own failures through err_reporter; reaching here
+            // without metadata would mean it handed us an entry it could not
+            // stat, which it does not do inside the handler.
+            return Ok(false);
+        };
+
+        // -L, and -H on an operand, ask for the *target*, not the link. ftw
+        // falls back to the link's own metadata when the target cannot be
+        // stat'ed, so a dangling link would otherwise be archived as a link --
+        // silently, and as the opposite of what was asked for. The previous
+        // traversal called fs::metadata here and reported its ENOENT.
+        //
+        // The walk is at an operand exactly when no directory has been
+        // descended into yet, which is what dev_stack being empty means.
+        let at_operand = self.dev_stack.borrow().is_empty();
+        let asked_to_follow =
+            self.options.dereference || (self.options.cli_dereference && at_operand);
+        if asked_to_follow && entry.is_symlink() == Some(true) && metadata.is_symlink() {
+            crate::error::report_error(path, std::io::Error::from_raw_os_error(libc::ENOENT));
+            return Ok(false);
+        }
+
+        // -X: a directory on a different filesystem from its parent is not
+        // descended and not archived.
+        if self.options.one_file_system {
+            if let Some(&parent_dev) = self.dev_stack.borrow().last() {
+                if metadata.dev() != parent_dev {
+                    return Ok(false);
                 }
+            }
+        }
+
+        match self.archive_entry(&entry, path, metadata) {
+            Ok(descend) => Ok(descend),
+            Err(e) if crate::modes::is_fatal(&e) => {
+                *self.fatal.borrow_mut() = Some(e);
+                Ok(false)
+            }
+            Err(e) => {
+                // POSIX CONSEQUENCES OF ERRORS: diagnose, set a non-zero exit,
+                // carry on with the next file.
+                crate::error::report_error(path, e);
+                Ok(false)
             }
         }
     }
 
-    // Apply substitutions first (per POSIX: -s applies before -i)
-    let archive_path = if !options.substitutions.is_empty() {
-        let path_str = path.to_string_lossy();
-        match apply_substitutions(&options.substitutions, &path_str) {
-            SubstResult::Unchanged => path.to_path_buf(),
-            SubstResult::Changed(new_path) => PathBuf::from(new_path),
-            SubstResult::Empty => return Ok(()), // Skip this file
-        }
-    } else {
-        path.to_path_buf()
-    };
+    fn archive_entry(
+        &self,
+        entry: &ftw::Entry<'_>,
+        path: &Path,
+        metadata: &ftw::Metadata,
+    ) -> PaxResult<bool> {
+        // Apply substitutions first (per POSIX: -s applies before -i)
+        let archive_path = if !self.options.substitutions.is_empty() {
+            match apply_substitutions(&self.options.substitutions, path) {
+                SubstResult::Unchanged => path.to_path_buf(),
+                SubstResult::Changed(new_path) => crate::rawpath::from_substituted(&new_path),
+                SubstResult::Empty => return Ok(false), // Skip this file
+            }
+        } else {
+            path.to_path_buf()
+        };
 
-    // Handle interactive rename
-    let archive_path = if let Some(ref mut p) = prompter {
-        let path_str = archive_path.to_string_lossy();
-        match p.prompt(&path_str)? {
-            RenameResult::Skip => return Ok(()),
-            RenameResult::UseOriginal => archive_path,
-            RenameResult::Rename(new_path) => new_path,
-        }
-    } else {
-        archive_path
-    };
-
-    // Handle invalid filename characters according to -o invalid=action
-    // The extended header carries the encoding, so hdrcharset is decided by the
-    // pax writer from the bytes it is given; nothing else needs to be threaded
-    // through here.
-    let archive_path = match handle_invalid_filename(
-        &archive_path,
-        options.format_options.invalid_action,
-        prompter,
-    )? {
-        InvalidHandleResult::Use(p) | InvalidHandleResult::Binary(p) => p,
-        InvalidHandleResult::Skip => return Ok(()),
-    };
-
-    // -u is decided here rather than on the operands, because this is the
-    // first point at which the member name exists: -s and an interactive
-    // rename have been applied, so the name being looked up is the one an
-    // extraction would resolve. A directory is never skipped outright -- the
-    // whole point of -u is to pick up a file that changed underneath one that
-    // did not -- so only its own entry is suppressed, inside write_directory.
-    if !metadata.is_dir() && options.is_up_to_date(&archive_path, &metadata) {
-        return Ok(());
-    }
-
-    if options.verbose {
-        eprintln!("{}", path.display());
-    }
-
-    if metadata.is_dir() {
-        write_directory(
-            archive,
-            path,
-            &archive_path,
-            &metadata,
-            options,
-            link_tracker,
-            prompter,
-        )?;
-    } else if metadata.is_symlink() {
-        write_symlink(archive, &archive_path, &metadata, path)?;
-    } else if metadata.is_file() {
-        write_file(
-            archive,
-            path,
-            &archive_path,
-            &metadata,
-            link_tracker,
-            options,
-        )?;
-    } else {
-        // Handle special file types (block device, char device, fifo, socket)
-        write_special(archive, &archive_path, &metadata)?;
-    }
-
-    Ok(())
-}
-
-/// Check if we should follow symlinks
-fn should_follow_symlink(options: &WriteOptions, is_cli_arg: bool) -> bool {
-    options.dereference || (is_cli_arg && options.cli_dereference)
-}
-
-/// Check if a path contains valid UTF-8 characters
-#[cfg(unix)]
-fn is_valid_utf8_path(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    // On Unix, check if the raw bytes are valid UTF-8
-    std::str::from_utf8(path.as_os_str().as_bytes()).is_ok()
-}
-
-#[cfg(not(unix))]
-fn is_valid_utf8_path(path: &Path) -> bool {
-    // On non-Unix platforms, paths are typically already UTF-16 or UTF-8
-    path.to_str().is_some()
-}
-
-/// Sanitize a path by replacing invalid UTF-8 sequences with replacement char
-fn sanitize_path(path: &Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().into_owned())
-}
-
-/// Result of handling an invalid filename
-enum InvalidHandleResult {
-    /// Use this path (possibly sanitized)
-    Use(PathBuf),
-    /// Skip this file
-    Skip,
-    /// Mark as needing binary charset header
-    Binary(PathBuf),
-}
-
-/// Handle a path with potentially invalid UTF-8 according to the invalid action
-fn handle_invalid_filename(
-    path: &Path,
-    action: InvalidAction,
-    prompter: &mut Option<InteractivePrompter>,
-) -> PaxResult<InvalidHandleResult> {
-    if is_valid_utf8_path(path) {
-        return Ok(InvalidHandleResult::Use(path.to_path_buf()));
-    }
-
-    match action {
-        InvalidAction::Bypass => {
-            eprintln!(
-                "pax: {}: Filename contains invalid characters, skipping",
-                path.display()
-            );
-            Ok(InvalidHandleResult::Skip)
-        }
-        InvalidAction::Rename => {
-            // Use interactive prompt to get new name
-            if let Some(ref mut p) = prompter {
-                let path_str = path.to_string_lossy();
-                eprintln!(
-                    "pax: {}: Filename contains invalid characters",
-                    path.display()
-                );
-                match p.prompt(&path_str)? {
-                    RenameResult::Skip => Ok(InvalidHandleResult::Skip),
-                    RenameResult::UseOriginal => {
-                        // User chose to use original despite warning - sanitize it
-                        Ok(InvalidHandleResult::Use(sanitize_path(path)))
-                    }
-                    RenameResult::Rename(new_path) => Ok(InvalidHandleResult::Use(new_path)),
+        // Handle interactive rename
+        let archive_path = {
+            let mut prompter = self.prompter.borrow_mut();
+            if let Some(ref mut p) = *prompter {
+                match p.prompt(&archive_path)? {
+                    RenameResult::Skip => return Ok(false),
+                    RenameResult::UseOriginal => archive_path,
+                    RenameResult::Rename(new_path) => new_path,
                 }
             } else {
-                // No prompter available, fall back to bypass
-                eprintln!(
-                    "pax: {}: Filename contains invalid characters, skipping (no terminal for rename)",
-                    path.display()
-                );
-                Ok(InvalidHandleResult::Skip)
-            }
-        }
-        InvalidAction::Write => {
-            // Sanitize the name and write
-            Ok(InvalidHandleResult::Use(sanitize_path(path)))
-        }
-        InvalidAction::Utf8 => {
-            // Use lossy conversion (already done by to_string_lossy internally)
-            Ok(InvalidHandleResult::Use(sanitize_path(path)))
-        }
-        InvalidAction::Binary => {
-            // Keep the bytes exactly as they are. The pax writer announces them
-            // with hdrcharset=BINARY and records the pathname unencoded, which
-            // is the whole point of this action -- running the name through
-            // to_string_lossy first, as this used to, replaced every invalid
-            // byte with U+FFFD irreversibly and made `binary` behave
-            // identically to `write`.
-            Ok(InvalidHandleResult::Binary(path.to_path_buf()))
-        }
-    }
-}
-
-/// Write a directory and its contents
-fn write_directory<W: ArchiveWriter>(
-    archive: &mut W,
-    src_path: &Path,
-    archive_path: &Path,
-    metadata: &Metadata,
-    options: &WriteOptions,
-    link_tracker: &mut HardLinkTracker,
-    prompter: &mut Option<InteractivePrompter>,
-) -> PaxResult<()> {
-    // Write directory entry, unless -u says the archive already has one no
-    // older than this. The subtree below is still walked either way.
-    if !options.is_up_to_date(archive_path, metadata) {
-        let entry = build_entry(archive_path, metadata, EntryType::Directory)?;
-        archive.write_entry(&entry)?;
-        archive.finish_entry()?;
-    }
-
-    // Recurse into directory unless no_recurse
-    if !options.no_recurse {
-        #[cfg(unix)]
-        let initial_dev = if options.one_file_system {
-            Some(metadata.dev())
-        } else {
-            None
-        };
-        #[cfg(not(unix))]
-        let initial_dev: Option<u64> = None;
-
-        let entries = match fs::read_dir(src_path) {
-            Ok(e) => e,
-            Err(e) => {
-                crate::error::report_error(src_path.display(), e);
-                return Ok(());
+                archive_path
             }
         };
 
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    crate::error::report_error(src_path.display(), e);
-                    continue;
-                }
-            };
-            write_path(
+        // -u is decided here rather than on the operands, because this is the
+        // first point at which the member name exists: -s and an interactive
+        // rename have been applied, so the name being looked up is the one an
+        // extraction would resolve. A directory is never skipped outright --
+        // the whole point of -u is to pick up a file that changed underneath
+        // one that did not -- so only its own entry is suppressed.
+        let up_to_date = self.options.is_up_to_date(&archive_path, metadata);
+        if !metadata.is_dir() && up_to_date {
+            return Ok(false);
+        }
+
+        if self.options.verbose {
+            let mut line = Vec::new();
+            crate::escape::push_escaped(
+                &mut line,
+                crate::rawpath::as_bytes(path),
+                crate::escape::stderr_style(),
+            );
+            line.push(b'\n');
+            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
+        }
+
+        let archive = &mut **self.archive.borrow_mut();
+
+        if metadata.is_dir() {
+            if !up_to_date {
+                let dir_entry = build_entry(&archive_path, metadata, EntryType::Directory)?;
+                archive.write_entry(&dir_entry)?;
+                archive.finish_entry()?;
+            }
+            if self.options.no_recurse {
+                return Ok(false);
+            }
+            self.dev_stack.borrow_mut().push(metadata.dev());
+            return Ok(true);
+        }
+
+        if metadata.is_symlink() {
+            // ftw has already done the readlinkat, from the descriptor of the
+            // directory the link was found in.
+            let target = entry
+                .read_link()
+                .map(|t| crate::rawpath::from_bytes(t.to_bytes()))
+                .ok_or_else(|| {
+                    PaxError::InvalidHeader("symbolic link with no target".to_string())
+                })?;
+            write_symlink(archive, &archive_path, metadata, target)?;
+        } else if metadata.is_file() {
+            write_file(
                 archive,
-                &entry.path(),
-                options,
-                link_tracker,
-                initial_dev,
-                false,
-                prompter,
+                entry,
+                &archive_path,
+                metadata,
+                &mut self.link_tracker.borrow_mut(),
+                self.options,
             )?;
+        } else {
+            // Block and character devices, FIFOs and sockets are archived from
+            // their metadata; none of them is ever opened, so a FIFO with no
+            // writer cannot block the walk.
+            write_special(archive, &archive_path, metadata)?;
         }
-    }
 
-    Ok(())
+        Ok(false)
+    }
 }
 
 /// Write a symlink
 fn write_symlink<W: ArchiveWriter>(
     archive: &mut W,
     archive_path: &Path,
-    metadata: &Metadata,
-    src_path: &Path,
+    metadata: &ftw::Metadata,
+    target: PathBuf,
 ) -> PaxResult<()> {
-    let target = fs::read_link(src_path)?;
-    let target_str = target.to_string_lossy();
+    // The target is a pathname, so it goes out as its bytes. Taking the size
+    // and the data from `to_string_lossy()` while `link_target` kept the real
+    // bytes made the two disagree: for cpio the target *is* the member data,
+    // so a target that is not UTF-8 was written corrupted and at the wrong
+    // length, which desynchronises everything after it in the archive.
+    let target_bytes = crate::rawpath::as_bytes(&target).to_vec();
     let mut entry = build_entry(archive_path, metadata, EntryType::Symlink)?;
     entry.link_target = Some(target.clone());
-    // For cpio format, the symlink target is written as file data
-    // Set size to target length so cpio writer includes it
-    entry.size = target_str.len() as u64;
+    // For cpio format, the symlink target is written as file data; the size
+    // field is what makes the reader read it back.
+    entry.size = target_bytes.len() as u64;
     if archive.needs_data_checksum() {
-        entry.data_checksum = Some(checksum_bytes(0, target_str.as_bytes()));
+        entry.data_checksum = Some(checksum_bytes(0, &target_bytes));
     }
 
     archive.write_entry(&entry)?;
     // Write the symlink target as data (needed for cpio format)
-    archive.write_data(target_str.as_bytes())?;
+    archive.write_data(&target_bytes)?;
     archive.finish_entry()?;
 
     Ok(())
@@ -473,7 +405,7 @@ fn write_symlink<W: ArchiveWriter>(
 fn write_special<W: ArchiveWriter>(
     archive: &mut W,
     path: &Path,
-    metadata: &Metadata,
+    metadata: &ftw::Metadata,
 ) -> PaxResult<()> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -487,7 +419,7 @@ fn write_special<W: ArchiveWriter>(
     } else if file_type.is_socket() {
         EntryType::Socket
     } else {
-        crate::error::report_error(path.display(), gettextrs::gettext("unsupported file type"));
+        crate::error::report_error(path, gettextrs::gettext("unsupported file type"));
         return Ok(());
     };
 
@@ -502,7 +434,7 @@ fn write_special<W: ArchiveWriter>(
 fn write_special<W: ArchiveWriter>(
     _archive: &mut W,
     path: &Path,
-    _metadata: &Metadata,
+    _metadata: &ftw::Metadata,
 ) -> PaxResult<()> {
     eprintln!(
         "pax: {}: special files not supported on this platform",
@@ -514,12 +446,14 @@ fn write_special<W: ArchiveWriter>(
 /// Write a regular file
 fn write_file<W: ArchiveWriter>(
     archive: &mut W,
-    src_path: &Path,
+    entry_ref: &ftw::Entry<'_>,
     archive_path: &Path,
-    metadata: &Metadata,
+    metadata: &ftw::Metadata,
     link_tracker: &mut HardLinkTracker,
     options: &WriteOptions,
 ) -> PaxResult<()> {
+    let src_path = entry_ref.path();
+    let src_path = src_path.as_inner();
     // Save access time if we need to reset it after reading
     #[cfg(unix)]
     let original_atime = if options.reset_atime {
@@ -585,17 +519,34 @@ fn write_file<W: ArchiveWriter>(
         // Otherwise fall through and write the file contents.
     }
 
+    // Opened once, from the descriptor of the directory the walk found it in,
+    // and re-checked against the (dev, ino) the walk saw. What this replaced
+    // resolved the whole pathname again -- twice over, for the cpio "crc"
+    // format, which needs the contents summed before the header goes out.
+    //
+    // Whether the walk dereferenced this entry is directly observable: the
+    // name is a symbolic link but the metadata is not, so -H/-L policy stays
+    // in the traversal options and is not decided a second time here.
+    let followed = entry_ref.is_symlink() == Some(true) && !metadata.is_symlink();
+    let mut file = crate::modes::anchored::open_source_file(
+        entry_ref.dir_fd(),
+        entry_ref.file_name(),
+        followed,
+        (metadata.dev(), metadata.ino()),
+    )?;
+
     // The cpio "crc" format records the data checksum in the header, ahead of
-    // the data, so that one format costs an extra read of the file.
+    // the data, so that one format costs an extra read of the file -- of the
+    // descriptor, now, rather than of the name.
     if archive.needs_data_checksum() {
-        entry.data_checksum = Some(file_checksum(src_path)?);
+        entry.data_checksum = Some(file_checksum(&mut file)?);
+        file.rewind()?;
     }
 
     // Write regular file
     archive.write_entry(&entry)?;
 
     // Copy file contents, bounded by the size already written in the header.
-    let mut file = File::open(src_path)?;
     copy_file_data(&mut file, archive, entry.size, src_path)?;
     // Held open past the copy so -t can stamp the descriptor below.
 
@@ -611,8 +562,7 @@ fn write_file<W: ArchiveWriter>(
 }
 
 /// Sum a file's bytes for the cpio "crc" format's c_check field
-fn file_checksum(path: &Path) -> PaxResult<u32> {
-    let mut file = File::open(path)?;
+fn file_checksum(file: &mut File) -> PaxResult<u32> {
     let mut buf = [0u8; 8192];
     let mut sum = 0u32;
     loop {
@@ -676,7 +626,7 @@ fn copy_file_data<W: ArchiveWriter>(
         }
     } else if file.read(&mut buf[..1])? != 0 {
         // Still more to read than the header promised.
-        eprintln!("pax: {}: file changed as we read it", path.display());
+        crate::error::report_error(path, "file changed as we read it");
         crate::error::note_error();
     }
 
@@ -684,7 +634,11 @@ fn copy_file_data<W: ArchiveWriter>(
 }
 
 /// Build an ArchiveEntry from path and metadata
-fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxResult<ArchiveEntry> {
+fn build_entry(
+    path: &Path,
+    metadata: &ftw::Metadata,
+    entry_type: EntryType,
+) -> PaxResult<ArchiveEntry> {
     let mut entry = ArchiveEntry::new(path.to_path_buf(), entry_type);
 
     #[cfg(unix)]
@@ -728,7 +682,7 @@ fn build_entry(path: &Path, metadata: &Metadata, entry_type: EntryType) -> PaxRe
     }
 
     if entry_type == EntryType::Regular || entry_type == EntryType::Symlink {
-        entry.size = metadata.len();
+        entry.size = metadata.size();
     }
 
     // Try to get user/group names

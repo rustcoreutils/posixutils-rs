@@ -18,41 +18,7 @@
 use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs;
-
-/// Build a one-member ustar archive by hand, so the member name can be anything
-/// -- including names pax itself would refuse to write.
-fn ustar_archive(name: &str, typeflag: u8, linkname: &str, body: &[u8]) -> Vec<u8> {
-    let mut a = ustar_member(name, typeflag, linkname, 0o644, body);
-    a.extend_from_slice(&[0u8; 1024]);
-    a
-}
-
-/// One ustar member: header plus padded body, with no end-of-archive trailer, so
-/// several can be concatenated.
-fn ustar_member(name: &str, typeflag: u8, linkname: &str, mode: u32, body: &[u8]) -> Vec<u8> {
-    let mut h = [0u8; 512];
-    h[..name.len()].copy_from_slice(name.as_bytes());
-    h[100..108].copy_from_slice(format!("{mode:07o}\0").as_bytes());
-    h[108..116].copy_from_slice(b"0000000\0");
-    h[116..124].copy_from_slice(b"0000000\0");
-    h[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
-    h[136..148].copy_from_slice(b"00000000000\0");
-    h[148..156].copy_from_slice(b"        ");
-    h[156] = typeflag;
-    h[157..157 + linkname.len()].copy_from_slice(linkname.as_bytes());
-    h[257..263].copy_from_slice(b"ustar\0");
-    h[263..265].copy_from_slice(b"00");
-    let sum: u32 = h.iter().map(|&b| b as u32).sum();
-    h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
-
-    let mut a = h.to_vec();
-    let mut data = body.to_vec();
-    if !data.is_empty() {
-        data.resize(data.len().div_ceil(512) * 512, 0);
-        a.extend_from_slice(&data);
-    }
-    a
-}
+use std::os::unix::ffi::OsStrExt;
 
 /// A symlink planted where a member will be written must not be followed. This
 /// is the state an attacker reaches by winning the window between the old
@@ -67,7 +33,12 @@ fn test_extract_does_not_follow_planted_symlink_at_leaf() {
 
     std::os::unix::fs::symlink("../outside/target", dst.join("evil")).unwrap();
 
-    let archive = ustar_archive("evil", b'0', "", b"payload\n");
+    let archive = Ustar {
+        name: b"evil",
+        body: b"payload\n",
+        ..Default::default()
+    }
+    .archive();
     let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
     assert!(
@@ -96,7 +67,12 @@ fn test_extract_does_not_follow_planted_symlink_in_parent() {
 
     std::os::unix::fs::symlink("../outside", dst.join("sub")).unwrap();
 
-    let archive = ustar_archive("sub/file", b'0', "", b"payload\n");
+    let archive = Ustar {
+        name: b"sub/file",
+        body: b"payload\n",
+        ..Default::default()
+    }
+    .archive();
     let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
     assert!(
@@ -117,7 +93,12 @@ fn test_extract_no_clobber_with_planted_symlink() {
     fs::create_dir(&dst).unwrap();
     std::os::unix::fs::symlink("../outside/target", dst.join("evil")).unwrap();
 
-    let archive = ustar_archive("evil", b'0', "", b"payload\n");
+    let archive = Ustar {
+        name: b"evil",
+        body: b"payload\n",
+        ..Default::default()
+    }
+    .archive();
     run_pax_with_stdin_bytes_in_dir(&["-r", "-k"], &archive, &dst);
 
     assert!(
@@ -146,7 +127,13 @@ fn test_extract_hardlink_target_cannot_escape() {
     fs::write(outside.join("secret"), b"secret\n").unwrap();
     std::os::unix::fs::symlink("../outside", dst.join("sub")).unwrap();
 
-    let archive = ustar_archive("link", b'1', "sub/secret", b"");
+    let archive = Ustar {
+        name: b"link",
+        typeflag: b'1',
+        linkname: b"sub/secret",
+        ..Default::default()
+    }
+    .archive();
     run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
     assert!(
@@ -162,7 +149,12 @@ fn test_extract_parent_traversal_stays_inside() {
     let dst = temp.path().join("dst");
     fs::create_dir(&dst).unwrap();
 
-    let archive = ustar_archive("../escape", b'0', "", b"nope\n");
+    let archive = Ustar {
+        name: b"../escape",
+        body: b"nope\n",
+        ..Default::default()
+    }
+    .archive();
     run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
     assert!(
@@ -236,9 +228,24 @@ fn test_extract_does_not_chmod_through_planted_symlink() {
     fs::write(&victim, b"secret\n").unwrap();
     fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut archive = ustar_member("d/", b'5', "", 0o777, b"");
-    archive.extend_from_slice(&ustar_member("d", b'2', "../outside/victim", 0o777, b""));
-    archive.extend_from_slice(&[0u8; 1024]);
+    let mut archive = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o777,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"d",
+            typeflag: b'2',
+            linkname: b"../outside/victim",
+            mode: 0o777,
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
 
     let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
@@ -247,5 +254,434 @@ fn test_extract_does_not_chmod_through_planted_symlink() {
         0o600,
         "an archive changed the mode of a file outside the extraction directory: {}",
         stderr_str(&output)
+    );
+}
+
+/// A set-user-ID member must not exist as a set-user-ID file before its
+/// contents are complete. The window itself is a race and is asserted at the
+/// unit level (`AttrPolicy::creation_mode`); what this pins is that closing it
+/// did not cost the preservation `-p e` asks for.
+#[test]
+fn test_extract_preserves_setuid_bit_on_the_finished_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let archive = Ustar {
+        name: b"suid",
+        mode: 0o4755,
+        body: b"contents\n",
+        ..Default::default()
+    }
+    .archive();
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-p", "e"], &archive, &dst);
+
+    let mode = fs::metadata(dst.join("suid")).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o7777,
+        0o4755,
+        "-p e must restore the archived set-user-ID mode: {}",
+        stderr_str(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join("suid")).unwrap(),
+        "contents\n",
+        "and the contents must be complete"
+    );
+}
+
+/// Without `-p o`/`-p e` the set-id bits are dropped entirely: the file is
+/// about to belong to whoever ran pax, not to the user the archive names.
+#[test]
+fn test_extract_drops_setuid_without_preserve() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let archive = Ustar {
+        name: b"sgid",
+        mode: 0o6755,
+        body: b"contents\n",
+        ..Default::default()
+    }
+    .archive();
+    run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
+
+    let mode = fs::metadata(dst.join("sgid")).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "set-id bits must not survive extraction without -p o or -p e"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parser differentials: a member visible to one tool and not another is how
+// content gets past a scanner. POSIX: "No data logical records are stored for
+// types 1, 2, or 5."
+// ---------------------------------------------------------------------------
+
+/// A directory header with a non-zero size field. POSIX defines that field for
+/// a directory as a size *limit*, not a data length, and says a system that
+/// does not implement limiting should ignore it -- so the blocks that follow
+/// are the next member's header. Honouring the field stepped over them and the
+/// member vanished, while GNU tar read it.
+#[test]
+fn test_directory_size_field_does_not_hide_the_next_member() {
+    let mut archive = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        size: Some(512),
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"hidden.txt",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    let listing = stdout_str(&output);
+    assert!(
+        listing.contains("hidden.txt"),
+        "a member behind a directory size field was not seen: {listing}"
+    );
+    // A directory size limit is legal, so nothing is diagnosed.
+    assert_success(&output, "list past a directory size field");
+}
+
+/// The same for a symbolic link, where POSIX requires the size field to be
+/// zero -- so a non-zero one is malformed and says so.
+#[test]
+fn test_symlink_size_field_does_not_hide_the_next_member() {
+    let mut archive = Ustar {
+        name: b"ln",
+        typeflag: b'2',
+        linkname: b"target",
+        size: Some(512),
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"hidden.txt",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    let listing = stdout_str(&output);
+    assert!(
+        listing.contains("hidden.txt"),
+        "a member behind a symlink size field was not seen: {listing}"
+    );
+    assert!(
+        stderr_str(&output).contains("POSIX requires to be zero"),
+        "a non-zero symlink size field must be diagnosed: {}",
+        stderr_str(&output)
+    );
+}
+
+/// A hard link *may* carry the linked file's contents in pax interchange
+/// format -- POSIX says so explicitly, and that is `-o linkdata`. So its size
+/// field is honoured, and a member hidden behind one is NOT seen.
+///
+/// This pins a deliberate divergence from GNU tar, which reads those blocks as
+/// headers. It is here so the divergence stays a decision rather than becoming
+/// an accident: the alternative is to ignore the field and lose the ability to
+/// read a bsdtar archive written with linkdata.
+#[test]
+fn test_hardlink_size_field_is_honoured_in_pax_format() {
+    let mut archive = Ustar {
+        name: b"a.txt",
+        body: b"aa\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"b.txt",
+            typeflag: b'1',
+            linkname: b"a.txt",
+            size: Some(512),
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"behind.txt",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let listing = stdout_str(&run_pax_with_stdin_bytes(&[], &archive));
+    assert!(listing.contains("a.txt") && listing.contains("b.txt"));
+    assert!(
+        !listing.contains("behind.txt"),
+        "typeflag 1 data is the linked file's contents in pax format, so the \
+         blocks after it are data and not a header: {listing}"
+    );
+}
+
+/// The end-of-archive indicator is *two* zero blocks. Stopping at one hid
+/// every member after it and looked like a clean end of archive; GNU tar stops
+/// there too, but says so.
+#[test]
+fn test_lone_zero_block_is_diagnosed() {
+    let mut archive = Ustar {
+        name: b"first.txt",
+        body: b"1\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(&[0u8; 512]);
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"after.txt",
+            body: b"2\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert!(
+        stderr_str(&output).contains("lone zero block"),
+        "a lone zero block must not look like a clean end of archive: {}",
+        stderr_str(&output)
+    );
+    assert_failure(&output, "list an archive truncated by a lone zero block");
+}
+
+/// An archive that genuinely ends after a single zero block -- the second
+/// block being end-of-file rather than data -- is not truncated and must still
+/// read cleanly.
+#[test]
+fn test_archive_ending_in_a_single_zero_block_reads_cleanly() {
+    let mut archive = Ustar {
+        name: b"only.txt",
+        body: b"1\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(&[0u8; 512]);
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert_success(&output, "list an archive ending in one zero block");
+    assert!(stdout_str(&output).contains("only.txt"));
+    assert!(
+        !stderr_str(&output).contains("lone zero block"),
+        "end of file after one zero block is a clean end, not a truncation: {}",
+        stderr_str(&output)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The source side of write and copy mode, now walked from directory
+// descriptors rather than by re-resolving a pathname on every operation.
+//
+// These pin behaviour rather than prove the fix. The defect was a race, and the
+// syscall shape that closes it -- one component per openat, O_NOFOLLOW on each,
+// and a (dev, ino) re-check after the open -- is observable under strace but
+// not assertable from a test that does not win a race. What these catch is the
+// traversal rewrite silently changing what gets archived: a symbolic link
+// descended instead of copied, or a FIFO opened instead of stat'ed, would each
+// turn up here.
+// ---------------------------------------------------------------------------
+
+/// A symbolic link where a directory would be is copied, not descended --
+/// before the rewrite and after it. This is here so that the rewrite cannot
+/// quietly start following one.
+#[test]
+fn test_write_does_not_descend_a_symlinked_source_directory() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(src.join("keep")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(src.join("keep/inside.txt"), b"mine\n").unwrap();
+    fs::write(outside.join("secret.txt"), b"not mine\n").unwrap();
+
+    // `sub` is what a directory would have been.
+    std::os::unix::fs::symlink("../outside", src.join("sub")).unwrap();
+
+    let archive = temp.path().join("a.tar");
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src,
+    );
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        !listing.contains("secret.txt"),
+        "the walk followed a symbolic link out of the source tree: {listing}"
+    );
+    assert!(
+        listing.contains("keep/inside.txt"),
+        "and must still have archived the real subtree: {listing}"
+    );
+}
+
+/// The same for copy mode's source side.
+#[test]
+fn test_copy_does_not_descend_a_symlinked_source_directory() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let outside = temp.path().join("outside");
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(src.join("keep")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("keep/inside.txt"), b"mine\n").unwrap();
+    fs::write(outside.join("secret.txt"), b"not mine\n").unwrap();
+    std::os::unix::fs::symlink("../outside", src.join("sub")).unwrap();
+
+    run_pax_in_dir(&["-r", "-w", ".", dst.to_str().unwrap()], &src);
+
+    // `sub` is copied as the symbolic link it is, not descended into. Note
+    // that `dst/sub/secret.txt` *resolves* -- through the copied link, to the
+    // original file -- so the property to assert is what `dst/sub` is, not
+    // what can be reached through it.
+    let sub = fs::symlink_metadata(dst.join("sub")).expect("the link should be copied");
+    assert!(
+        sub.file_type().is_symlink(),
+        "the source symlink was descended and recreated as a real directory"
+    );
+    assert_eq!(
+        fs::read_link(dst.join("sub")).unwrap(),
+        std::path::Path::new("../outside"),
+        "and it must be the same link, copied rather than resolved"
+    );
+    assert!(
+        dst.join("keep/inside.txt").exists(),
+        "and must still have copied the real subtree"
+    );
+}
+
+/// A FIFO in the source tree must not stop the walk.
+///
+/// A FIFO is archived from its metadata and never opened, so this passes both
+/// before and after the rewrite. It is here because the rewrite introduced an
+/// `openat` of source files that `O_NOFOLLOW` alone does not make safe -- a
+/// FIFO is not a symbolic link, and a blocking open of one with no writer never
+/// returns -- so `open_source_file` opens non-blocking and checks what it
+/// actually got. If that check is ever dropped, and something starts opening
+/// non-regular files, this is what hangs.
+#[test]
+fn test_write_does_not_block_on_a_fifo_substituted_for_a_file() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("a.txt"), b"first\n").unwrap();
+
+    // Pre-plant the outcome: a FIFO where a regular file is expected. Opening
+    // it for reading with no writer would block forever.
+    let fifo = src.join("b.fifo");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+    fs::write(src.join("c.txt"), b"last\n").unwrap();
+
+    let archive = temp.path().join("a.tar");
+    let output = run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src,
+    );
+
+    // A FIFO is archived from its metadata and never opened, so this finishes.
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    for want in ["a.txt", "b.fifo", "c.txt"] {
+        assert!(
+            listing.contains(want),
+            "{want} missing; the walk did not get past the FIFO: {listing}\n{}",
+            stderr_str(&output)
+        );
+    }
+}
+
+/// `-L` asks for the target, not the link. A dangling link has no target, and
+/// the traversal falls back to the link's own metadata when it cannot stat one
+/// -- so without this check the link is archived as a link, which is the
+/// opposite of what was asked for, with a zero exit status.
+#[test]
+fn test_dangling_symlink_is_diagnosed_when_dereferencing() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
+    fs::write(src.join("real.txt"), b"ok\n").unwrap();
+
+    let archive = temp.path().join("a.tar");
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-L",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src,
+    );
+
+    assert!(
+        stderr_str(&output).contains("dangling"),
+        "a link that cannot be followed must be diagnosed: {}",
+        stderr_str(&output)
+    );
+    assert_failure(&output, "archive a dangling link with -L");
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        !listing.contains("dangling"),
+        "and must not be stored as the link it is: {listing}"
+    );
+    assert!(listing.contains("real.txt"), "the rest is still archived");
+}
+
+/// The same for `-H`, which dereferences only what is named on the command
+/// line -- so a dangling link found *below* an operand is stored as a link,
+/// and is not an error.
+#[test]
+fn test_dangling_symlink_below_an_operand_is_kept_under_cli_dereference() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
+
+    let archive = temp.path().join("a.tar");
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-H",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src,
+    );
+    assert_success(&output, "-H does not dereference below the operand");
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        listing.contains("dangling"),
+        "the link itself should be archived: {listing}"
     );
 }

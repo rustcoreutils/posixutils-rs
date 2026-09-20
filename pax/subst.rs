@@ -23,6 +23,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use plib::regex::{Match, Regex, RegexFlags, MAX_CAPTURES};
+use std::path::Path;
 
 /// A compiled substitution expression from -s option
 #[derive(Debug)]
@@ -97,11 +98,20 @@ impl Substitution {
             match c {
                 'g' => global = true,
                 'p' => print = true,
-                // POSIX `s`/`S` select whether the substitution applies to the
-                // contents of a symbolic link. This implementation substitutes
-                // only pathnames (not link target contents), so both are accepted
-                // as no-ops rather than rejected.
-                's' | 'S' => {}
+                // POSIX `s`/`S` select whether the substitution applies to
+                // the contents of a symbolic link. `s` -- do not apply -- is
+                // what this implementation does, so it is accepted. `S` asks
+                // for the opposite and is not implemented; accepting it would
+                // silently do nothing, and a user relocating a tree with `-s`
+                // would get symbolic links still pointing at the old one.
+                's' => {}
+                'S' => {
+                    return Err(PaxError::PatternError(
+                        "substitution flag 'S' (apply to symbolic link contents) \
+                         is not supported"
+                            .to_string(),
+                    ))
+                }
                 _ => {
                     return Err(PaxError::PatternError(format!(
                         "unknown substitution flag: {}",
@@ -161,10 +171,6 @@ impl Substitution {
 
         if !any_match {
             return SubstResult::Unchanged;
-        }
-
-        if self.print {
-            eprintln!("{} >> {}", path, result);
         }
 
         if result.is_empty() {
@@ -296,11 +302,31 @@ fn parse_delimited(s: &str, delimiter: char) -> PaxResult<(String, String)> {
 ///
 /// Substitutions are applied in order. The first one that matches
 /// (produces a change) wins, and no further substitutions are tried.
-pub fn apply_substitutions(substitutions: &[Substitution], path: &str) -> SubstResult {
+/// Apply the `-s` expressions to a member name, in order, stopping at the
+/// first that changes it.
+///
+/// Takes the pathname rather than its lossy rendering so that the `p` flag can
+/// report the name as it really is. The matching itself is still done on the
+/// lossy form -- see `crate::rawpath::MatchName` -- which is why the left-hand
+/// side of the report comes from `path` and not from what the regex saw.
+pub fn apply_substitutions(substitutions: &[Substitution], path: &Path) -> SubstResult {
+    let name = crate::rawpath::MatchName::of(path);
     for subst in substitutions {
-        match subst.apply(path) {
+        match subst.apply(name.as_str()) {
             SubstResult::Unchanged => continue,
-            result => return result,
+            result => {
+                if subst.print {
+                    let mut line = Vec::new();
+                    line.extend_from_slice(crate::rawpath::as_bytes(path));
+                    line.extend_from_slice(b" >> ");
+                    match &result {
+                        SubstResult::Changed(new) => line.extend_from_slice(new.as_bytes()),
+                        SubstResult::Empty | SubstResult::Unchanged => {}
+                    }
+                    crate::escape::write_stderr_line(&line);
+                }
+                return result;
+            }
         }
     }
     SubstResult::Unchanged
@@ -343,14 +369,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_symlink_flags_accepted() {
-        // The POSIX `s`/`S` symlink-content flags must be accepted (as no-ops),
-        // not rejected as unknown flags.
+    fn test_parse_symlink_flags() {
+        // `s` asks for what this implementation does -- substitute pathnames
+        // and leave symbolic link contents alone -- so it is accepted.
         assert!(Substitution::parse("/foo/bar/s").is_ok());
-        assert!(Substitution::parse("/foo/bar/S").is_ok());
         let s = Substitution::parse("/foo/bar/gps").unwrap();
         assert!(s.global);
         assert!(s.print);
+
+        // `S` asks for the opposite and is not implemented. Accepting it
+        // would silently do nothing, which is worse than refusing: a user
+        // relocating a tree would get links still pointing at the old one.
+        let err = Substitution::parse("/foo/bar/S").unwrap_err();
+        assert!(
+            err.to_string().contains("'S'"),
+            "the diagnostic must name the flag: {err}"
+        );
+
         // A genuinely unknown flag is still rejected.
         assert!(Substitution::parse("/foo/bar/z").is_err());
     }
@@ -513,7 +548,7 @@ mod tests {
             Substitution::parse("/foo/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, "foo"),
+            apply_substitutions(&subs, Path::new("foo")),
             SubstResult::Changed("first".to_string())
         );
     }
@@ -525,7 +560,7 @@ mod tests {
             Substitution::parse("/foo/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, "foo"),
+            apply_substitutions(&subs, Path::new("foo")),
             SubstResult::Changed("second".to_string())
         );
     }
@@ -536,7 +571,10 @@ mod tests {
             Substitution::parse("/xxx/first/").unwrap(),
             Substitution::parse("/yyy/second/").unwrap(),
         ];
-        assert_eq!(apply_substitutions(&subs, "foo"), SubstResult::Unchanged);
+        assert_eq!(
+            apply_substitutions(&subs, Path::new("foo")),
+            SubstResult::Unchanged
+        );
     }
 
     #[test]

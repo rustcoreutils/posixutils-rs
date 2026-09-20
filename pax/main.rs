@@ -12,12 +12,14 @@ mod blocked_io;
 mod cli;
 mod compression;
 mod error;
+mod escape;
 mod formats;
 mod interactive;
 mod modes;
 mod multivolume;
 mod options;
 mod pattern;
+mod rawpath;
 mod subst;
 
 use archive::{ArchiveFormat, ArchiveWriter};

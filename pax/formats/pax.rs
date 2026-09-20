@@ -24,7 +24,11 @@
 //! - Data format: "%d %s=%s\n" (length, keyword, value)
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::error::{PaxError, PaxResult};
+use crate::formats::ustar::{
+    calculate_checksum, parse_header as parse_ustar_header, parse_octal, try_split_path,
+    ustar_path_bytes, verify_checksum, write_field, SizeRule,
+};
 use crate::options::FormatOptions;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -42,7 +46,6 @@ const PAX_GHDR: u8 = b'g'; // Global extended header
 
 // Regular ustar typeflags (for reference)
 const REGTYPE: u8 = b'0';
-const AREGTYPE: u8 = b'\0';
 const LNKTYPE: u8 = b'1';
 const SYMTYPE: u8 = b'2';
 const CHRTYPE: u8 = b'3';
@@ -144,11 +147,9 @@ impl ExtendedHeader {
                 break;
             }
 
-            let (record_len, value_start) = parse_record_len(data, pos)?;
-            // record_len is at least value_start - pos + 1, so the trailing
-            // <newline> is inside the record and this cannot underflow.
-            header.apply_record(&data[value_start..pos + record_len - 1])?;
-            pos += record_len;
+            let span = parse_record_span(data, pos)?;
+            header.apply_record(&data[span.value.clone()])?;
+            pos = span.next;
         }
 
         Ok(header)
@@ -473,10 +474,10 @@ impl ExtendedHeader {
         // when it has no '/' at a position that leaves a <= NAME_LEN tail
         // (e.g. a 190-byte "dir/<185-byte-basename>"). Without this record the
         // ustar fallback in split_path() silently truncates the name.
-        let path_bytes = entry.path.as_os_str().as_bytes();
-        let path_str = ustar_path_string(entry);
+        let path_bytes = crate::rawpath::as_bytes(&entry.path);
+        let ustar_spelling = ustar_path_bytes(entry);
         let path_is_binary = std::str::from_utf8(path_bytes).is_err();
-        if try_split_path(&path_str).is_none() || path_is_binary {
+        if try_split_path(&ustar_spelling).is_none() || path_is_binary {
             // A non-UTF-8 name has no faithful ustar spelling, so it always
             // needs the record regardless of length.
             header.path = Some(path_bytes.to_vec());
@@ -558,15 +559,26 @@ impl ExtendedHeader {
     }
 }
 
-/// Read the `"<len> "` prefix of the record starting at `pos`, returning the
-/// record's total length and the offset of its `keyword=value` body.
+/// Where one extended-header record's value lies, and where the next record
+/// begins.
 ///
-/// The length is the record's own byte count including the length field itself,
-/// so it must exceed that field plus the <space> plus the trailing <newline>. A
-/// length of 0 is the case that matters: it once wrapped `pos + len - 1` to
-/// `usize::MAX` and aborted on the slice, and it would never advance `pos`, so
-/// even a bounds-checked slice would spin forever.
-fn parse_record_len(data: &[u8], pos: usize) -> PaxResult<(usize, usize)> {
+/// The offsets are computed once, here, and handed to the caller. Returning the
+/// *declared length* instead and letting the caller work out `pos + len` is how
+/// the bounds check below came to be bypassed: the check lived here but the
+/// slice was built there, from the same addition done a second time.
+struct RecordSpan {
+    value: std::ops::Range<usize>,
+    next: usize,
+}
+
+/// Parse the `"%d "` length prefix of the record starting at `pos`.
+///
+/// The length field is attacker-controlled, so every arithmetic step on it is
+/// checked. `pos + record_len` in particular wraps for a length near
+/// `usize::MAX`, and a release build does not trap on that -- the wrapped sum
+/// compares below `data.len()`, the bounds check passes, and the slice that
+/// follows has a start beyond its end.
+fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
     let bad_len = || PaxError::InvalidHeader("invalid extended header length".to_string());
 
     let space_pos = data[pos..]
@@ -577,17 +589,30 @@ fn parse_record_len(data: &[u8], pos: usize) -> PaxResult<(usize, usize)> {
     let len_str = std::str::from_utf8(&data[pos..pos + space_pos]).map_err(|_| bad_len())?;
     let record_len: usize = len_str.parse().map_err(|_| bad_len())?;
 
-    let value_start = pos + space_pos + 1;
+    // The record must extend past its own length field, its <space>, and the
+    // trailing <newline>; otherwise there is no value and the end underflows.
     if record_len <= space_pos + 1 {
         return Err(bad_len());
     }
-    if pos + record_len > data.len() {
+
+    let next = pos.checked_add(record_len).ok_or_else(bad_len)?;
+    if next > data.len() {
         return Err(PaxError::InvalidHeader(
             "extended header record extends past end".to_string(),
         ));
     }
 
-    Ok((record_len, value_start))
+    let value_start = pos + space_pos + 1;
+    // record_len > space_pos + 1 puts the <newline> at or after value_start.
+    let value_end = next - 1;
+    if value_end < value_start {
+        return Err(bad_len());
+    }
+
+    Ok(RecordSpan {
+        value: value_start..value_end,
+        next,
+    })
 }
 
 /// Parse pax time format (decimal seconds with optional fractional part)
@@ -698,26 +723,11 @@ impl<R: Read> PaxReader<R> {
         self
     }
 
-    /// Read exactly n bytes
-    fn read_exact(&mut self, buf: &mut [u8]) -> PaxResult<()> {
-        self.reader.read_exact(buf)?;
-        Ok(())
-    }
-
     /// Read a raw header block
     fn read_header_block(&mut self) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
-        let mut header = [0u8; BLOCK_SIZE];
-        if let Err(e) = self.read_exact(&mut header) {
-            if is_eof_error(&e) {
-                return Ok(None);
-            }
-            return Err(e);
-        }
-
-        // Check for end of archive (zero block)
-        if is_zero_block(&header) {
+        let Some(header) = crate::formats::ustar::next_header_block(&mut self.reader)? else {
             return Ok(None);
-        }
+        };
 
         // Verify checksum
         if !verify_checksum(&header) {
@@ -773,9 +783,17 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     extended_header = Some(self.read_extended_header(size)?);
                 }
+                _ if crate::formats::ustar::long_name_record(typeflag).is_some() => {
+                    // A GNU long-name record describes the member that
+                    // follows, whose own name field is truncated to 100 bytes.
+                    // The records and the member are dropped together, and
+                    // there can be more than one record -- see
+                    // skip_long_name_records.
+                    crate::formats::ustar::skip_long_name_records(&mut self.reader, header)?;
+                }
                 _ => {
                     // Regular file entry - parse and apply extended headers
-                    let mut entry = parse_ustar_header(&header)?;
+                    let mut entry = parse_ustar_header(&header, SizeRule::Pax)?;
 
                     // Apply global header first, honoring `-o delete=` so removed
                     // keywords fall back to the ustar header value.
@@ -797,7 +815,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
     }
 
     fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         if remaining == 0 {
             return Ok(0);
         }
@@ -810,7 +828,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
 
     fn skip_data(&mut self) -> PaxResult<()> {
         let total_bytes = round_up_block(self.current_size);
-        let to_skip = total_bytes - self.bytes_read;
+        let to_skip = total_bytes.saturating_sub(self.bytes_read);
 
         if to_skip > 0 {
             skip_bytes(&mut self.reader, to_skip)?;
@@ -899,7 +917,7 @@ impl<W: Write> PaxWriter<W> {
         } else {
             glob_name
         };
-        write_string(&mut header[NAME_OFF..], &glob_name, NAME_LEN);
+        write_field(&mut header[NAME_OFF..], glob_name.as_bytes(), NAME_LEN);
 
         // Mode, uid, gid (use reasonable defaults)
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
@@ -966,7 +984,7 @@ impl<W: Write> PaxWriter<W> {
         } else {
             ext_name
         };
-        write_string(&mut header[NAME_OFF..], &ext_name, NAME_LEN);
+        write_field(&mut header[NAME_OFF..], ext_name.as_bytes(), NAME_LEN);
 
         // Mode, uid, gid (use reasonable defaults)
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
@@ -1062,128 +1080,6 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
 // Helper functions (shared with ustar where needed)
 // ============================================================================
 
-/// Check if a block is all zeros
-fn is_zero_block(block: &[u8]) -> bool {
-    block.iter().all(|&b| b == 0)
-}
-
-/// Parse a NUL-terminated or space-padded string
-fn parse_string(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end])
-        .trim_end()
-        .to_string()
-}
-
-/// Parse an octal number from bytes
-fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
-    let s = parse_string(bytes);
-    if s.is_empty() {
-        return Ok(0);
-    }
-    // Reject if the octal string contains a sign
-    if s.starts_with('+') || s.starts_with('-') {
-        return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
-    }
-    u64::from_str_radix(&s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
-}
-
-/// Parse typeflag to EntryType
-fn parse_typeflag(flag: u8) -> PaxResult<EntryType> {
-    match flag {
-        REGTYPE | AREGTYPE => Ok(EntryType::Regular),
-        LNKTYPE => Ok(EntryType::Hardlink),
-        SYMTYPE => Ok(EntryType::Symlink),
-        CHRTYPE => Ok(EntryType::CharDevice),
-        BLKTYPE => Ok(EntryType::BlockDevice),
-        DIRTYPE => Ok(EntryType::Directory),
-        FIFOTYPE => Ok(EntryType::Fifo),
-        _ => Ok(EntryType::Regular),
-    }
-}
-
-/// Build full path from prefix and name
-fn build_path(prefix: &str, name: &str) -> PathBuf {
-    if prefix.is_empty() {
-        PathBuf::from(name)
-    } else {
-        PathBuf::from(format!("{}/{}", prefix, name))
-    }
-}
-
-/// Verify header checksum
-fn verify_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
-    let stored = match parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]) {
-        Ok(v) => v as u32,
-        Err(_) => return false,
-    };
-
-    let calculated = calculate_checksum(header);
-    stored == calculated
-}
-
-/// Calculate header checksum
-fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
-    let mut sum: u32 = 0;
-    for (i, &byte) in header.iter().enumerate() {
-        if (CHKSUM_OFF..CHKSUM_OFF + 8).contains(&i) {
-            sum += b' ' as u32;
-        } else {
-            sum += byte as u32;
-        }
-    }
-    sum
-}
-
-/// Parse a ustar header into an ArchiveEntry
-fn parse_ustar_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
-    let name = crate::formats::ustar::parse_path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
-    let prefix =
-        crate::formats::ustar::parse_path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
-
-    let path = build_path(&prefix, &name);
-
-    let mode = parse_octal(&header[MODE_OFF..MODE_OFF + 8])? as u32;
-    let uid = parse_octal(&header[UID_OFF..UID_OFF + 8])? as u32;
-    let gid = parse_octal(&header[GID_OFF..GID_OFF + 8])? as u32;
-    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
-    let mtime = parse_octal(&header[MTIME_OFF..MTIME_OFF + 12])?;
-
-    let typeflag = header[TYPEFLAG_OFF];
-    let entry_type = parse_typeflag(typeflag)?;
-
-    let linkname =
-        crate::formats::ustar::parse_path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
-    let link_target = if !linkname.is_empty() {
-        Some(PathBuf::from(linkname))
-    } else {
-        None
-    };
-
-    let uname = parse_string(&header[UNAME_OFF..UNAME_OFF + UNAME_LEN]);
-    let gname = parse_string(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
-
-    // Parse device major/minor numbers for device files
-    let devmajor = parse_octal(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8])? as u32;
-    let devminor = parse_octal(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8])? as u32;
-
-    Ok(ArchiveEntry {
-        path,
-        mode,
-        uid,
-        gid,
-        size,
-        mtime,
-        entry_type,
-        link_target,
-        uname: if uname.is_empty() { None } else { Some(uname) },
-        gname: if gname.is_empty() { None } else { Some(gname) },
-        devmajor,
-        devminor,
-        ..Default::default()
-    })
-}
-
 /// Build a ustar header block from an ArchiveEntry
 fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     let mut header = [0u8; BLOCK_SIZE];
@@ -1192,7 +1088,7 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     let (name, prefix) = split_path(entry)?;
 
     // Write fields
-    write_string(&mut header[NAME_OFF..], &name, NAME_LEN);
+    write_field(&mut header[NAME_OFF..], &name, NAME_LEN);
     write_octal(&mut header[MODE_OFF..], entry.mode as u64, 8);
     write_octal(
         &mut header[UID_OFF..],
@@ -1217,11 +1113,13 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // Linkname
     if let Some(ref target) = entry.link_target {
-        let link_str = target.to_string_lossy();
-        // Truncate on a char boundary; the full target is in the `linkpath`
-        // extended record whenever it exceeds LINKNAME_LEN.
-        let truncated = &link_str[..floor_char_boundary(&link_str, LINKNAME_LEN)];
-        write_string(&mut header[LINKNAME_OFF..], truncated, LINKNAME_LEN);
+        let link_bytes = crate::rawpath::as_bytes(target);
+        // Truncate on a character boundary where there is one; the full target
+        // is in the `linkpath` extended record whenever it exceeds
+        // LINKNAME_LEN, so this field is only a fallback for a reader that
+        // ignores extended headers.
+        let truncated = &link_bytes[..floor_char_boundary(link_bytes, LINKNAME_LEN)];
+        write_field(&mut header[LINKNAME_OFF..], truncated, LINKNAME_LEN);
     }
 
     // Magic and version
@@ -1230,10 +1128,10 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // uname and gname
     if let Some(ref uname) = entry.uname {
-        write_string(&mut header[UNAME_OFF..], uname, UNAME_LEN);
+        write_field(&mut header[UNAME_OFF..], uname.as_bytes(), UNAME_LEN);
     }
     if let Some(ref gname) = entry.gname {
-        write_string(&mut header[GNAME_OFF..], gname, GNAME_LEN);
+        write_field(&mut header[GNAME_OFF..], gname.as_bytes(), GNAME_LEN);
     }
 
     // Device major/minor (always written for POSIX compliance)
@@ -1241,7 +1139,7 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     write_octal(&mut header[DEVMINOR_OFF..], entry.devminor as u64, 8);
 
     // Prefix
-    write_string(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
+    write_field(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
 
     // Calculate and write checksum
     let checksum = calculate_checksum(&header);
@@ -1250,63 +1148,43 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     Ok(header)
 }
 
-/// The path as it is written to the ustar name/prefix fields: directories
-/// carry a trailing slash. Shared by split_path() and ExtendedHeader so both
-/// judge "does this fit in ustar?" against the identical string.
-fn ustar_path_string(entry: &ArchiveEntry) -> String {
-    let path_str = entry.path.to_string_lossy();
-    if entry.is_dir() && !path_str.ends_with('/') {
-        format!("{}/", path_str)
-    } else {
-        path_str.into_owned()
-    }
-}
-
-/// Split a path into ustar name (max 100) and prefix (max 155) fields.
+/// Split path into the ustar name and prefix fields.
 ///
-/// Returns `None` if the path cannot be represented exactly, in which case the
-/// caller must emit a `path=` extended header record.
-fn try_split_path(path_str: &str) -> Option<(String, String)> {
-    if path_str.len() <= NAME_LEN {
-        return Some((path_str.to_string(), String::new()));
-    }
+/// Unlike ustar, a path that does not fit is not an error here: the real path
+/// is already recorded in a `path=` extended header record by
+/// `ExtendedHeader::from_entry`, so these fields are only a fallback for a
+/// reader that ignores extended headers. Truncate on a UTF-8 character
+/// boundary so a multi-byte character straddling NAME_LEN does not panic.
+fn split_path(entry: &ArchiveEntry) -> PaxResult<(Vec<u8>, Vec<u8>)> {
+    let path = ustar_path_bytes(entry);
 
-    // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
-    // '/' is ASCII, so an index holding it is always a char boundary.
-    for i in (1..=PREFIX_LEN.min(path_str.len().saturating_sub(1))).rev() {
-        if path_str.as_bytes()[i] == b'/' && path_str.len() - (i + 1) <= NAME_LEN {
-            return Some((path_str[i + 1..].to_string(), path_str[..i].to_string()));
-        }
-    }
-
-    None
-}
-
-/// Split path into name (max 100) and prefix (max 155)
-fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
-    let path_str = ustar_path_string(entry);
-
-    if let Some(split) = try_split_path(&path_str) {
+    if let Some(split) = try_split_path(&path) {
         return Ok(split);
     }
 
-    // The path does not fit; ExtendedHeader::from_entry has recorded the real
-    // path in a `path=` record, so the ustar fields are only a fallback for
-    // readers that ignore extended headers. Truncate on a UTF-8 char boundary
-    // so a multi-byte character straddling NAME_LEN does not panic.
     Ok((
-        path_str[..floor_char_boundary(&path_str, NAME_LEN)].to_string(),
-        String::new(),
+        path[..floor_char_boundary(&path, NAME_LEN)].to_vec(),
+        Vec::new(),
     ))
 }
 
-/// Largest index `<= max` that lies on a UTF-8 character boundary of `s`.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    if max >= s.len() {
-        return s.len();
+/// Largest index `<= max` that does not cut a UTF-8 character of `bytes` in
+/// half.
+///
+/// Truncating mid-character produces a field a legacy reader renders as
+/// mojibake, so back up over continuation bytes. At most three of them can
+/// precede a lead byte, and stopping there is what keeps this well-behaved on
+/// a name that is not UTF-8 at all -- where every byte may look like a
+/// continuation and there is no boundary to find.
+fn floor_char_boundary(bytes: &[u8], max: usize) -> usize {
+    if max >= bytes.len() {
+        return bytes.len();
     }
     let mut end = max;
-    while !s.is_char_boundary(end) {
+    for _ in 0..3 {
+        if end == 0 || bytes[end] & 0xC0 != 0x80 {
+            break;
+        }
         end -= 1;
     }
     end
@@ -1326,13 +1204,6 @@ fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
     }
 }
 
-/// Write a string to a field, NUL-terminated if space permits
-fn write_string(buf: &mut [u8], s: &str, max_len: usize) {
-    let bytes = s.as_bytes();
-    let len = std::cmp::min(bytes.len(), max_len);
-    buf[..len].copy_from_slice(&bytes[..len]);
-}
-
 /// Write an octal number to a field
 fn write_octal(buf: &mut [u8], val: u64, width: usize) {
     let s = format!("{:0width$o} ", val, width = width - 2);
@@ -1343,7 +1214,11 @@ fn write_octal(buf: &mut [u8], val: u64, width: usize) {
 
 /// Round up to next block boundary
 fn round_up_block(size: u64) -> u64 {
-    size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64
+    // A `size=` extended-header record can declare u64::MAX, and rounding that
+    // up overflows to 0 -- after which the skip length underflows and the
+    // reader walks the rest of the archive as member data.
+    size.div_ceil(BLOCK_SIZE as u64)
+        .saturating_mul(BLOCK_SIZE as u64)
 }
 
 /// Calculate padding needed to reach block boundary

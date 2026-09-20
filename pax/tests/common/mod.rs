@@ -281,6 +281,218 @@ pub fn assert_exit_code(output: &Output, code: i32, context: &str) {
     }
 }
 
+// ============================================================================
+// Hand-built archives
+//
+// Several suites need archives pax itself would refuse to write: a member name
+// that escapes, a length field that lies, a typeflag with no meaning. These
+// build the bytes directly. Names are `&[u8]` rather than `&str` because a
+// member name is a byte string -- some fixtures are deliberately not UTF-8.
+// ============================================================================
+
+/// A tar block, and the unit every ustar length is rounded to.
+pub const BLOCK: usize = 512;
+
+/// The fields of one ustar member, for a test that needs to build it by hand.
+///
+/// `Default` gives a plain 0644 regular file, so a fixture names only what it
+/// is actually testing.
+pub struct Ustar<'a> {
+    pub name: &'a [u8],
+    pub typeflag: u8,
+    pub linkname: &'a [u8],
+    pub mode: u32,
+    pub body: &'a [u8],
+    /// What to write in the size field. `None` writes `body.len()`, which is
+    /// what a well-formed member has; `Some` is how a fixture makes the header
+    /// lie about how much data follows.
+    pub size: Option<u64>,
+}
+
+impl Default for Ustar<'_> {
+    fn default() -> Self {
+        Ustar {
+            name: b"",
+            typeflag: b'0',
+            linkname: b"",
+            mode: 0o644,
+            body: b"",
+            size: None,
+        }
+    }
+}
+
+impl Ustar<'_> {
+    /// The 512-byte header block, with a correct checksum over whatever the
+    /// other fields ended up as.
+    pub fn header(&self) -> [u8; BLOCK] {
+        let mut h = [0u8; BLOCK];
+        h[..self.name.len()].copy_from_slice(self.name);
+        h[100..108].copy_from_slice(format!("{:07o}\0", self.mode).as_bytes());
+        h[108..116].copy_from_slice(b"0000000\0"); // uid
+        h[116..124].copy_from_slice(b"0000000\0"); // gid
+        let size = self.size.unwrap_or(self.body.len() as u64);
+        h[124..136].copy_from_slice(format!("{:011o}\0", size).as_bytes());
+        h[136..148].copy_from_slice(b"00000000000\0"); // mtime
+        h[148..156].copy_from_slice(b"        "); // spaces while summing
+        h[156] = self.typeflag;
+        h[157..157 + self.linkname.len()].copy_from_slice(self.linkname);
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+
+        let sum: u32 = h.iter().map(|&b| b as u32).sum();
+        h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+        h
+    }
+
+    /// Header plus block-padded body, and no trailer -- so members concatenate.
+    pub fn member(&self) -> Vec<u8> {
+        let mut out = self.header().to_vec();
+        if !self.body.is_empty() {
+            let mut data = self.body.to_vec();
+            pad_to_block(&mut data);
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    /// A complete one-member archive.
+    pub fn archive(&self) -> Vec<u8> {
+        let mut out = self.member();
+        out.extend_from_slice(&ustar_trailer());
+        out
+    }
+}
+
+/// The end-of-archive indicator: two 512-byte blocks of zeros (POSIX).
+pub fn ustar_trailer() -> [u8; 2 * BLOCK] {
+    [0u8; 2 * BLOCK]
+}
+
+/// Zero-fill `data` out to a block boundary.
+pub fn pad_to_block(data: &mut Vec<u8>) {
+    let rem = data.len() % BLOCK;
+    if rem != 0 {
+        data.resize(data.len() + (BLOCK - rem), 0);
+    }
+}
+
+/// One pax extended-header record: `"%d keyword=value\n"`, where the length
+/// counts itself.
+///
+/// That self-reference is why this exists: writing the length by hand gets it
+/// wrong by one as soon as the record crosses a power of ten, and a fixture
+/// that means to be well-formed has to actually be well-formed or it tests the
+/// error path by accident.
+pub fn pax_record(keyword: &str, value: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(b' ');
+    body.extend_from_slice(keyword.as_bytes());
+    body.push(b'=');
+    body.extend_from_slice(value);
+    body.push(b'\n');
+
+    let mut len = body.len() + 1;
+    loop {
+        let digits = len.to_string().len();
+        if digits + body.len() == len {
+            break;
+        }
+        len = digits + body.len();
+    }
+
+    let mut out = len.to_string().into_bytes();
+    out.extend_from_slice(&body);
+    out
+}
+
+/// A pax archive whose single member is preceded by an `x` extended header
+/// carrying exactly `records` as its data.
+///
+/// `records` is the raw record stream, so a fixture can concatenate several
+/// records -- which is the only way to reach the parser's behaviour at a
+/// non-zero offset into the block.
+pub fn archive_with_ext_records(records: &[u8]) -> Vec<u8> {
+    let mut a = Ustar {
+        name: b"PaxHeaders/f",
+        typeflag: b'x',
+        body: records,
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"f",
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(&ustar_trailer());
+    a
+}
+
+/// The fields of one cpio "newc" member, for a test that needs to build it by
+/// hand. `Default` gives a plain 0644 regular file.
+pub struct CpioNewc<'a> {
+    pub name: &'a [u8],
+    pub mode: u32,
+    pub body: &'a [u8],
+    /// `c_namesize`. `None` writes `name.len() + 1` and appends the NUL
+    /// terminator; `Some` writes the value given and appends nothing, which is
+    /// how a fixture makes the field disagree with the name that follows.
+    pub namesize: Option<u32>,
+    /// `c_filesize`. `None` writes `body.len()`.
+    pub filesize: Option<u32>,
+}
+
+impl Default for CpioNewc<'_> {
+    fn default() -> Self {
+        CpioNewc {
+            name: b"",
+            mode: 0o100644,
+            body: b"",
+            namesize: None,
+            filesize: None,
+        }
+    }
+}
+
+impl CpioNewc<'_> {
+    /// Header, name and body, each padded to the 4-byte alignment newc uses.
+    pub fn member(&self) -> Vec<u8> {
+        let mut out = b"070701".to_vec();
+        for v in [
+            1u32,                                                // c_ino
+            self.mode,                                           // c_mode
+            0,                                                   // c_uid
+            0,                                                   // c_gid
+            1,                                                   // c_nlink
+            0,                                                   // c_mtime
+            self.filesize.unwrap_or(self.body.len() as u32),     // c_filesize
+            0,                                                   // c_devmajor
+            0,                                                   // c_devminor
+            0,                                                   // c_rdevmajor
+            0,                                                   // c_rdevminor
+            self.namesize.unwrap_or(self.name.len() as u32 + 1), // c_namesize
+            0,                                                   // c_check
+        ] {
+            out.extend_from_slice(format!("{v:08X}").as_bytes());
+        }
+        out.extend_from_slice(self.name);
+        if self.namesize.is_none() {
+            out.push(0);
+        }
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(self.body);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out
+    }
+}
+
 /// Get stdout as string
 pub fn stdout_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()

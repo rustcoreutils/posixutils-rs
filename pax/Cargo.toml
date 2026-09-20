@@ -26,6 +26,12 @@ gettext-rs.workspace = true
 # requires it, so pax's gzip support costs no additional crates.
 flate2 = "1"
 plib = { path = "../plib" }
+# Race-free directory traversal, shared with cp/mv. Write and copy mode walk a
+# source tree they have to assume another process can modify, so every
+# component below an operand is resolved one at a time from a directory
+# descriptor rather than re-resolved by name on every call. Pulls only libc and
+# errno, both already in the workspace.
+ftw = { path = "../ftw" }
 
 [dev-dependencies]
 filetime = "0.2"

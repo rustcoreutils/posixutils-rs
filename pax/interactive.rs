@@ -70,16 +70,27 @@ impl InteractivePrompter {
         )))
     }
 
-    /// Prompt for a rename decision
+    /// Prompt for a rename decision.
+    ///
+    /// Takes the pathname rather than its lossy rendering, and writes it to
+    /// `/dev/tty` escaped: `/dev/tty` is a terminal by construction, so this
+    /// prompt is exactly where an escape sequence in a member name would land.
     ///
     /// Returns:
     /// - `Ok(RenameResult::Skip)` if user enters blank line
     /// - `Ok(RenameResult::UseOriginal)` if user enters "."
     /// - `Ok(RenameResult::Rename(path))` if user enters a new name
     /// - `Err` if EOF is read or I/O error occurs
-    pub fn prompt(&mut self, original_path: &str) -> PaxResult<RenameResult> {
+    pub fn prompt(&mut self, original_path: &std::path::Path) -> PaxResult<RenameResult> {
         // Write prompt
-        write!(self.tty_write, "{} => ", original_path)?;
+        let mut line = Vec::new();
+        crate::escape::push_escaped(
+            &mut line,
+            crate::rawpath::as_bytes(original_path),
+            crate::escape::Style::TTY,
+        );
+        line.extend_from_slice(b" => ");
+        self.tty_write.write_all(&line)?;
         self.tty_write.flush()?;
 
         // Read response

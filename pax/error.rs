@@ -9,6 +9,8 @@
 
 use std::fmt;
 use std::io;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Error type for pax operations
@@ -121,12 +123,87 @@ pub fn program_name() -> &'static str {
     }
 }
 
+/// What a diagnostic is about.
+///
+/// A pathname and a command-line operand are both "the thing that went wrong",
+/// but only one of them is bytes. Taking `impl Display` for both meant every
+/// call site wrote `path.display()`, which renders an invalid byte as U+FFFD --
+/// so a diagnostic could not name the file it was about.
+pub enum Subject<'a> {
+    /// A pathname, written as the bytes it is.
+    Path(&'a Path),
+    /// A pattern, an option argument, a block number: text by origin.
+    Text(&'a str),
+    /// The same, built on the spot.
+    Owned(String),
+}
+
+impl<'a> From<&'a Path> for Subject<'a> {
+    fn from(p: &'a Path) -> Self {
+        Subject::Path(p)
+    }
+}
+
+impl<'a> From<&'a PathBuf> for Subject<'a> {
+    fn from(p: &'a PathBuf) -> Self {
+        Subject::Path(p.as_path())
+    }
+}
+
+impl<'a> From<&&'a Path> for Subject<'a> {
+    fn from(p: &&'a Path) -> Self {
+        Subject::Path(p)
+    }
+}
+
+impl<'a> From<&&'a PathBuf> for Subject<'a> {
+    fn from(p: &&'a PathBuf) -> Self {
+        Subject::Path(p.as_path())
+    }
+}
+
+/// A subject that is built on the spot -- a block number, a name decoded for a
+/// message. Owning it keeps the caller from having to hold a temporary alive.
+impl From<String> for Subject<'static> {
+    fn from(s: String) -> Self {
+        Subject::Owned(s)
+    }
+}
+
+impl<'a> From<&'a str> for Subject<'a> {
+    fn from(s: &'a str) -> Self {
+        Subject::Text(s)
+    }
+}
+
+impl<'a> From<&'a String> for Subject<'a> {
+    fn from(s: &'a String) -> Self {
+        Subject::Text(s.as_str())
+    }
+}
+
 /// Write a per-item diagnostic to standard error in the
 /// `<program>: <context>: <err>` form -- `pax`, or `tar`/`cpio` when a
 /// compatibility front-end is driving -- and flag the run as failed, so that
 /// processing can continue (per POSIX) while the final exit status is still
 /// non-zero.
-pub fn report_error(context: impl fmt::Display, err: impl fmt::Display) {
-    eprintln!("{}: {}: {}", program_name(), context, err);
+///
+/// The whole line is escaped when standard error is a terminal, not just the
+/// subject: an `io::Error` carries an OS-supplied string and `PathTooLong`
+/// carries a pathname, so one rule with no exceptions is the only one that
+/// cannot be got wrong later.
+pub fn report_error<'a>(context: impl Into<Subject<'a>>, err: impl fmt::Display) {
+    let mut line = Vec::new();
+    line.extend_from_slice(program_name().as_bytes());
+    line.extend_from_slice(b": ");
+    match context.into() {
+        Subject::Path(p) => line.extend_from_slice(crate::rawpath::as_bytes(p)),
+        Subject::Text(t) => line.extend_from_slice(t.as_bytes()),
+        Subject::Owned(t) => line.extend_from_slice(t.as_bytes()),
+    }
+    line.extend_from_slice(b": ");
+    let _ = write!(line, "{}", err);
+
+    crate::escape::write_stderr_line(&line);
     note_error();
 }

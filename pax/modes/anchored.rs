@@ -22,6 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use std::ffi::{CStr, CString, OsString};
+use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -80,6 +81,25 @@ impl MemberPath {
             leaf: to_c(&leaf_os)?,
             display,
         }))
+    }
+
+    /// Whether this name refers to the extraction directory itself rather
+    /// than naming nothing at all.
+    ///
+    /// `pax -w .` records a `.` member, so every archive built that way
+    /// carries one and there is nothing wrong with it -- it just has no file
+    /// to create below the anchor. An empty name, or one made only of `..`
+    /// and root components, is a different thing and worth saying out loud.
+    pub(crate) fn names_current_directory(path: &Path) -> bool {
+        use std::path::Component;
+        let mut saw_something = false;
+        for comp in path.components() {
+            match comp {
+                Component::CurDir => saw_something = true,
+                _ => return false,
+            }
+        }
+        saw_something
     }
 
     /// How deep the member sits, for ordering the deferred directory pass.
@@ -247,6 +267,64 @@ where
     }
 }
 
+/// Open a source file from the descriptor of the directory it was found in.
+///
+/// One component, resolved once, rather than a whole pathname re-resolved by
+/// the kernel on every call -- which is what let a source tree another process
+/// could modify redirect a read outside the tree pax was asked to archive.
+///
+/// `O_NONBLOCK` is not optional here. `O_NOFOLLOW` refuses a symbolic link, but
+/// it does not stop a regular file being replaced by a FIFO between the walk's
+/// `fstatat` and this `openat`, and a blocking `open` of a FIFO with no writer
+/// never returns. Opening non-blocking and then checking what was actually
+/// opened turns that from a hang into a diagnostic.
+///
+/// The `fstat` on the descriptor doubles as the check that the name still
+/// refers to the file the walk saw: a mismatch fails closed.
+pub(crate) fn open_source_file(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    follow: bool,
+    expected: (u64, u64),
+) -> std::io::Result<File> {
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    if !follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+
+    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source file changed type before it could be read",
+        ));
+    }
+    if (st.st_dev as u64, st.st_ino) != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "source file was replaced before it could be read",
+        ));
+    }
+
+    // Nothing below reads this descriptor expecting non-blocking semantics.
+    let cur = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if cur >= 0 {
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, cur & !libc::O_NONBLOCK) };
+    }
+
+    Ok(file)
+}
+
 /// The attributes a copied or extracted file takes from its source, whether that
 /// source is an archive member or a file on disk.
 pub(crate) struct Attrs {
@@ -289,6 +367,23 @@ impl AttrPolicy {
             mode &= !self.umask;
         }
         mode
+    }
+
+    /// The permission bits to *create* with, as opposed to the ones the
+    /// finished file ends up with.
+    ///
+    /// Never set-user-ID or set-group-ID, whatever `-p` asked for. A member is
+    /// created before its contents are written, so passing the archived mode
+    /// straight to `open()` leaves a set-id file -- owned by whoever is running
+    /// pax -- executable for the whole duration of the copy. Extracting an
+    /// untrusted archive as root that way hands out a root shell to anyone who
+    /// wins the race to `exec` it.
+    ///
+    /// `set_attrs_fd` applies [`AttrPolicy::mode`] through the descriptor once
+    /// the data is complete, so any set-id bit the archive legitimately carries
+    /// arrives then, on a file whose contents are already final.
+    pub fn creation_mode(&self, attrs: &Attrs) -> u32 {
+        self.mode(attrs) & 0o777
     }
 
     /// The times to apply, or `None` when neither was asked for.
@@ -435,4 +530,83 @@ pub(crate) fn stat_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<libc::stat> 
         )
     };
     (r == 0).then_some(st)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attrs(mode: u32) -> Attrs {
+        Attrs {
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            atime: None,
+            atime_nsec: 0,
+        }
+    }
+
+    fn policy(preserve_owner: bool, preserve_perms: bool) -> AttrPolicy {
+        AttrPolicy {
+            preserve_owner,
+            preserve_perms,
+            preserve_mtime: false,
+            preserve_atime: false,
+            umask: 0o022,
+        }
+    }
+
+    /// The whole point of the method: a member is created before its contents
+    /// are written, so a set-id bit present at creation time is executable by
+    /// anyone for the duration of the copy. No `-p` combination may produce
+    /// one -- including `-p e`, which is the combination that asks for set-id
+    /// to be preserved and so is the one that used to leave the window open.
+    #[test]
+    fn test_creation_mode_never_carries_set_id() {
+        for mode in [0o4755, 0o2755, 0o6755, 0o4777] {
+            for owner in [false, true] {
+                for perms in [false, true] {
+                    let created = policy(owner, perms).creation_mode(&attrs(mode));
+                    assert_eq!(
+                        created & 0o7000,
+                        0,
+                        "mode {mode:o} created as {created:o} with \
+                         preserve_owner={owner} preserve_perms={perms}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// It must also never be *wider* than the mode the file ends up with,
+    /// or the window trades one exposure for another.
+    #[test]
+    fn test_creation_mode_is_never_wider_than_the_final_mode() {
+        for mode in [0o4755, 0o755, 0o600, 0o777, 0o000, 0o2750] {
+            for owner in [false, true] {
+                for perms in [false, true] {
+                    let p = policy(owner, perms);
+                    let created = p.creation_mode(&attrs(mode));
+                    let final_mode = p.mode(&attrs(mode));
+                    assert_eq!(
+                        created & !final_mode,
+                        0,
+                        "mode {mode:o}: created {created:o} grants what final {final_mode:o} does not"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And it must still carry the ordinary permission bits, or extraction
+    /// would produce unreadable files and the fix would be a regression.
+    #[test]
+    fn test_creation_mode_keeps_the_permission_bits() {
+        // -p p preserves the mode exactly; the umask does not apply.
+        assert_eq!(policy(true, true).creation_mode(&attrs(0o4755)), 0o755);
+        // Without -p p the normal file-creation action applies the umask.
+        assert_eq!(policy(false, false).creation_mode(&attrs(0o4777)), 0o755);
+    }
 }

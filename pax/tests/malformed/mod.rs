@@ -13,47 +13,6 @@
 
 use crate::common::*;
 
-const BLOCK: usize = 512;
-
-/// Build a 512-byte ustar header block with a correct checksum.
-fn ustar_header(name: &str, size: usize, typeflag: u8) -> [u8; BLOCK] {
-    let mut h = [0u8; BLOCK];
-    h[..name.len()].copy_from_slice(name.as_bytes());
-    h[100..108].copy_from_slice(b"0000644\0"); // mode
-    h[108..116].copy_from_slice(b"0000000\0"); // uid
-    h[116..124].copy_from_slice(b"0000000\0"); // gid
-    h[124..136].copy_from_slice(format!("{:011o}\0", size).as_bytes());
-    h[136..148].copy_from_slice(b"00000000000\0"); // mtime
-    h[148..156].copy_from_slice(b"        "); // checksum field is spaces while summing
-    h[156] = typeflag;
-    h[257..263].copy_from_slice(b"ustar\0");
-    h[263..265].copy_from_slice(b"00");
-
-    let sum: u32 = h.iter().map(|&b| b as u32).sum();
-    h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
-    h
-}
-
-fn pad_to_block(data: &mut Vec<u8>) {
-    let rem = data.len() % BLOCK;
-    if rem != 0 {
-        data.resize(data.len() + (BLOCK - rem), 0);
-    }
-}
-
-/// A pax archive whose single member is preceded by an `x` extended header
-/// carrying exactly `records` as its data.
-fn archive_with_ext_records(records: &[u8]) -> Vec<u8> {
-    let mut a = Vec::new();
-    a.extend_from_slice(&ustar_header("PaxHeaders/f", records.len(), b'x'));
-    let mut data = records.to_vec();
-    pad_to_block(&mut data);
-    a.extend_from_slice(&data);
-    a.extend_from_slice(&ustar_header("f", 0, b'0'));
-    a.extend_from_slice(&[0u8; 2 * BLOCK]); // end-of-archive
-    a
-}
-
 /// A record length field of `0` makes `pos + record_len - 1` underflow. In a
 /// debug build that is an overflow panic; in release it wraps to `usize::MAX`,
 /// the `record_end <= record_start` guard passes, and the subsequent slice
@@ -103,8 +62,13 @@ fn test_malformed_undersized_extended_record() {
 /// A header that claims more member data than the archive contains.
 #[test]
 fn test_malformed_truncated_member_data() {
-    let mut archive = Vec::new();
-    archive.extend_from_slice(&ustar_header("f", 4096, b'0'));
+    let mut archive = Ustar {
+        name: b"f",
+        size: Some(4096),
+        ..Default::default()
+    }
+    .header()
+    .to_vec();
     archive.extend_from_slice(&[b'x'; BLOCK]); // far short of 4096
 
     let output = run_pax_with_stdin_bytes(&["-v"], &archive);
@@ -132,12 +96,14 @@ fn test_malformed_unrecognized_leading_block() {
 /// abort the process on the allocation alone, before reading any of it.
 #[test]
 fn test_malformed_huge_extended_header_size_is_rejected() {
-    // 0o37777777777 == 4294967295.
-    let mut archive = ustar_header("PaxHeaders/1", 0, b'x').to_vec();
-    archive[124..136].copy_from_slice(b"37777777777\0");
-    archive[148..156].copy_from_slice(b"        ");
-    let sum: u32 = archive[..BLOCK].iter().map(|&b| b as u32).sum();
-    archive[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+    let archive = Ustar {
+        name: b"PaxHeaders/1",
+        typeflag: b'x',
+        size: Some(0o37777777777), // 4294967295
+        ..Default::default()
+    }
+    .header()
+    .to_vec();
 
     let output = run_pax_with_stdin_bytes(&["-t"], &archive);
 
@@ -156,15 +122,15 @@ fn test_malformed_huge_extended_header_size_is_rejected() {
 /// from the header: a 128-byte archive declaring a 2 GiB link target.
 #[test]
 fn test_malformed_huge_cpio_symlink_size_is_rejected() {
-    fn field(v: u32) -> String {
-        format!("{v:08X}")
+    // A symbolic link whose target is the member data: c_filesize declares
+    // 2 GiB of it and the archive supplies none.
+    let archive = CpioNewc {
+        name: b"link",
+        mode: 0o120777,
+        filesize: Some(0x7FFF_FFF0),
+        ..Default::default()
     }
-    let mut archive = String::from("070701");
-    for v in [1, 0o120777, 0, 0, 1, 0, 0x7FFF_FFF0, 0, 0, 0, 0, 5, 0] {
-        archive.push_str(&field(v));
-    }
-    let mut archive = archive.into_bytes();
-    archive.extend_from_slice(b"link\0\0\0\0");
+    .member();
 
     let output = run_pax_with_stdin_bytes(&["-t", "-x", "cpio"], &archive);
 

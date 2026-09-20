@@ -19,41 +19,6 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs;
 
-/// Build a one-member ustar archive by hand, so the member name can be anything
-/// -- including names pax itself would refuse to write.
-fn ustar_archive(name: &str, typeflag: u8, linkname: &str, body: &[u8]) -> Vec<u8> {
-    let mut a = ustar_member(name, typeflag, linkname, 0o644, body);
-    a.extend_from_slice(&[0u8; 1024]);
-    a
-}
-
-/// One ustar member: header plus padded body, with no end-of-archive trailer, so
-/// several can be concatenated.
-fn ustar_member(name: &str, typeflag: u8, linkname: &str, mode: u32, body: &[u8]) -> Vec<u8> {
-    let mut h = [0u8; 512];
-    h[..name.len()].copy_from_slice(name.as_bytes());
-    h[100..108].copy_from_slice(format!("{mode:07o}\0").as_bytes());
-    h[108..116].copy_from_slice(b"0000000\0");
-    h[116..124].copy_from_slice(b"0000000\0");
-    h[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
-    h[136..148].copy_from_slice(b"00000000000\0");
-    h[148..156].copy_from_slice(b"        ");
-    h[156] = typeflag;
-    h[157..157 + linkname.len()].copy_from_slice(linkname.as_bytes());
-    h[257..263].copy_from_slice(b"ustar\0");
-    h[263..265].copy_from_slice(b"00");
-    let sum: u32 = h.iter().map(|&b| b as u32).sum();
-    h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
-
-    let mut a = h.to_vec();
-    let mut data = body.to_vec();
-    if !data.is_empty() {
-        data.resize(data.len().div_ceil(512) * 512, 0);
-        a.extend_from_slice(&data);
-    }
-    a
-}
-
 /// A symlink planted where a member will be written must not be followed. This
 /// is the state an attacker reaches by winning the window between the old
 /// code's remove_file and File::create.
@@ -67,7 +32,12 @@ fn test_extract_does_not_follow_planted_symlink_at_leaf() {
 
     std::os::unix::fs::symlink("../outside/target", dst.join("evil")).unwrap();
 
-    let archive = ustar_archive("evil", b'0', "", b"payload\n");
+    let archive = Ustar {
+        name: b"evil",
+        body: b"payload\n",
+        ..Default::default()
+    }
+    .archive();
     let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
     assert!(
@@ -96,7 +66,12 @@ fn test_extract_does_not_follow_planted_symlink_in_parent() {
 
     std::os::unix::fs::symlink("../outside", dst.join("sub")).unwrap();
 
-    let archive = ustar_archive("sub/file", b'0', "", b"payload\n");
+    let archive = Ustar {
+        name: b"sub/file",
+        body: b"payload\n",
+        ..Default::default()
+    }
+    .archive();
     let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
     assert!(
@@ -117,7 +92,12 @@ fn test_extract_no_clobber_with_planted_symlink() {
     fs::create_dir(&dst).unwrap();
     std::os::unix::fs::symlink("../outside/target", dst.join("evil")).unwrap();
 
-    let archive = ustar_archive("evil", b'0', "", b"payload\n");
+    let archive = Ustar {
+        name: b"evil",
+        body: b"payload\n",
+        ..Default::default()
+    }
+    .archive();
     run_pax_with_stdin_bytes_in_dir(&["-r", "-k"], &archive, &dst);
 
     assert!(
@@ -146,7 +126,13 @@ fn test_extract_hardlink_target_cannot_escape() {
     fs::write(outside.join("secret"), b"secret\n").unwrap();
     std::os::unix::fs::symlink("../outside", dst.join("sub")).unwrap();
 
-    let archive = ustar_archive("link", b'1', "sub/secret", b"");
+    let archive = Ustar {
+        name: b"link",
+        typeflag: b'1',
+        linkname: b"sub/secret",
+        ..Default::default()
+    }
+    .archive();
     run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
     assert!(
@@ -162,7 +148,12 @@ fn test_extract_parent_traversal_stays_inside() {
     let dst = temp.path().join("dst");
     fs::create_dir(&dst).unwrap();
 
-    let archive = ustar_archive("../escape", b'0', "", b"nope\n");
+    let archive = Ustar {
+        name: b"../escape",
+        body: b"nope\n",
+        ..Default::default()
+    }
+    .archive();
     run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 
     assert!(
@@ -236,9 +227,24 @@ fn test_extract_does_not_chmod_through_planted_symlink() {
     fs::write(&victim, b"secret\n").unwrap();
     fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut archive = ustar_member("d/", b'5', "", 0o777, b"");
-    archive.extend_from_slice(&ustar_member("d", b'2', "../outside/victim", 0o777, b""));
-    archive.extend_from_slice(&[0u8; 1024]);
+    let mut archive = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o777,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"d",
+            typeflag: b'2',
+            linkname: b"../outside/victim",
+            mode: 0o777,
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
 
     let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, &dst);
 

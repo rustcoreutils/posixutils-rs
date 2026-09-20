@@ -24,10 +24,10 @@
 //! - Data format: "%d %s=%s\n" (length, keyword, value)
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
-    calculate_checksum, is_zero_block, parse_header as parse_ustar_header, parse_octal,
-    try_split_path, ustar_path_string, verify_checksum,
+    calculate_checksum, parse_header as parse_ustar_header, parse_octal, try_split_path,
+    ustar_path_string, verify_checksum, SizeRule,
 };
 use crate::options::FormatOptions;
 use std::collections::HashMap;
@@ -723,26 +723,11 @@ impl<R: Read> PaxReader<R> {
         self
     }
 
-    /// Read exactly n bytes
-    fn read_exact(&mut self, buf: &mut [u8]) -> PaxResult<()> {
-        self.reader.read_exact(buf)?;
-        Ok(())
-    }
-
     /// Read a raw header block
     fn read_header_block(&mut self) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
-        let mut header = [0u8; BLOCK_SIZE];
-        if let Err(e) = self.read_exact(&mut header) {
-            if is_eof_error(&e) {
-                return Ok(None);
-            }
-            return Err(e);
-        }
-
-        // Check for end of archive (zero block)
-        if is_zero_block(&header) {
+        let Some(header) = crate::formats::ustar::next_header_block(&mut self.reader)? else {
             return Ok(None);
-        }
+        };
 
         // Verify checksum
         if !verify_checksum(&header) {
@@ -800,7 +785,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                 }
                 _ => {
                     // Regular file entry - parse and apply extended headers
-                    let mut entry = parse_ustar_header(&header)?;
+                    let mut entry = parse_ustar_header(&header, SizeRule::Pax)?;
 
                     // Apply global header first, honoring `-o delete=` so removed
                     // keywords fall back to the ustar header value.

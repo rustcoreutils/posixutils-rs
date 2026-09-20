@@ -422,7 +422,7 @@ impl MultiVolumeReader {
     /// recognised by `is_continuation_header` before we get here, and the
     /// entry it describes is an ordinary member in every other respect.
     fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
-        crate::formats::ustar::parse_header(header)
+        crate::formats::ustar::parse_header(header, crate::formats::ustar::SizeRule::Ustar)
     }
 
     /// Parse offset from GNU continuation header (bytes 369-380)

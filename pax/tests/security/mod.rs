@@ -317,3 +317,174 @@ fn test_extract_drops_setuid_without_preserve() {
         "set-id bits must not survive extraction without -p o or -p e"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Parser differentials: a member visible to one tool and not another is how
+// content gets past a scanner. POSIX: "No data logical records are stored for
+// types 1, 2, or 5."
+// ---------------------------------------------------------------------------
+
+/// A directory header with a non-zero size field. POSIX defines that field for
+/// a directory as a size *limit*, not a data length, and says a system that
+/// does not implement limiting should ignore it -- so the blocks that follow
+/// are the next member's header. Honouring the field stepped over them and the
+/// member vanished, while GNU tar read it.
+#[test]
+fn test_directory_size_field_does_not_hide_the_next_member() {
+    let mut archive = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        size: Some(512),
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"hidden.txt",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    let listing = stdout_str(&output);
+    assert!(
+        listing.contains("hidden.txt"),
+        "a member behind a directory size field was not seen: {listing}"
+    );
+    // A directory size limit is legal, so nothing is diagnosed.
+    assert_success(&output, "list past a directory size field");
+}
+
+/// The same for a symbolic link, where POSIX requires the size field to be
+/// zero -- so a non-zero one is malformed and says so.
+#[test]
+fn test_symlink_size_field_does_not_hide_the_next_member() {
+    let mut archive = Ustar {
+        name: b"ln",
+        typeflag: b'2',
+        linkname: b"target",
+        size: Some(512),
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"hidden.txt",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    let listing = stdout_str(&output);
+    assert!(
+        listing.contains("hidden.txt"),
+        "a member behind a symlink size field was not seen: {listing}"
+    );
+    assert!(
+        stderr_str(&output).contains("POSIX requires to be zero"),
+        "a non-zero symlink size field must be diagnosed: {}",
+        stderr_str(&output)
+    );
+}
+
+/// A hard link *may* carry the linked file's contents in pax interchange
+/// format -- POSIX says so explicitly, and that is `-o linkdata`. So its size
+/// field is honoured, and a member hidden behind one is NOT seen.
+///
+/// This pins a deliberate divergence from GNU tar, which reads those blocks as
+/// headers. It is here so the divergence stays a decision rather than becoming
+/// an accident: the alternative is to ignore the field and lose the ability to
+/// read a bsdtar archive written with linkdata.
+#[test]
+fn test_hardlink_size_field_is_honoured_in_pax_format() {
+    let mut archive = Ustar {
+        name: b"a.txt",
+        body: b"aa\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"b.txt",
+            typeflag: b'1',
+            linkname: b"a.txt",
+            size: Some(512),
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"behind.txt",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let listing = stdout_str(&run_pax_with_stdin_bytes(&[], &archive));
+    assert!(listing.contains("a.txt") && listing.contains("b.txt"));
+    assert!(
+        !listing.contains("behind.txt"),
+        "typeflag 1 data is the linked file's contents in pax format, so the \
+         blocks after it are data and not a header: {listing}"
+    );
+}
+
+/// The end-of-archive indicator is *two* zero blocks. Stopping at one hid
+/// every member after it and looked like a clean end of archive; GNU tar stops
+/// there too, but says so.
+#[test]
+fn test_lone_zero_block_is_diagnosed() {
+    let mut archive = Ustar {
+        name: b"first.txt",
+        body: b"1\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(&[0u8; 512]);
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"after.txt",
+            body: b"2\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert!(
+        stderr_str(&output).contains("lone zero block"),
+        "a lone zero block must not look like a clean end of archive: {}",
+        stderr_str(&output)
+    );
+    assert_failure(&output, "list an archive truncated by a lone zero block");
+}
+
+/// An archive that genuinely ends after a single zero block -- the second
+/// block being end-of-file rather than data -- is not truncated and must still
+/// read cleanly.
+#[test]
+fn test_archive_ending_in_a_single_zero_block_reads_cleanly() {
+    let mut archive = Ustar {
+        name: b"only.txt",
+        body: b"1\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(&[0u8; 512]);
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert_success(&output, "list an archive ending in one zero block");
+    assert!(stdout_str(&output).contains("only.txt"));
+    assert!(
+        !stderr_str(&output).contains("lone zero block"),
+        "end of file after one zero block is a clean end, not a truncation: {}",
+        stderr_str(&output)
+    );
+}

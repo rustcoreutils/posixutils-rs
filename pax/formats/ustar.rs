@@ -28,7 +28,7 @@
 //! - prefix:   155 bytes (offset 345)
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::error::{PaxError, PaxResult};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -87,12 +87,6 @@ impl<R: Read> UstarReader<R> {
             bytes_read: 0,
         }
     }
-
-    /// Read exactly n bytes
-    fn read_exact(&mut self, buf: &mut [u8]) -> PaxResult<()> {
-        self.reader.read_exact(buf)?;
-        Ok(())
-    }
 }
 
 impl<R: Read> ArchiveReader for UstarReader<R> {
@@ -100,25 +94,16 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
         // Skip any remaining data from previous entry
         self.skip_data()?;
 
-        let mut header = [0u8; BLOCK_SIZE];
-        if let Err(e) = self.read_exact(&mut header) {
-            if is_eof_error(&e) {
-                return Ok(None);
-            }
-            return Err(e);
-        }
-
-        // Check for end of archive (two zero blocks)
-        if is_zero_block(&header) {
+        let Some(header) = next_header_block(&mut self.reader)? else {
             return Ok(None);
-        }
+        };
 
         // Verify checksum
         if !verify_checksum(&header) {
             return Err(PaxError::InvalidHeader("checksum mismatch".to_string()));
         }
 
-        let entry = parse_header(&header)?;
+        let entry = parse_header(&header, SizeRule::Ustar)?;
         self.current_size = entry.size;
         self.bytes_read = 0;
 
@@ -223,7 +208,52 @@ pub(crate) fn is_zero_block(block: &[u8]) -> bool {
 }
 
 /// Parse a header block into an ArchiveEntry
-pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry> {
+/// Which format's rules govern a header's size field.
+///
+/// POSIX (pax, "No data logical records are stored for types 1, 2, or 5") makes
+/// the size field of those three headers not a data length. Honouring it anyway
+/// steps the reader over blocks that are the *next member's header*, so that
+/// member becomes invisible -- to us, but not to GNU tar, which reads them as
+/// headers. A member visible to one tool and not the other is how content gets
+/// past a scanner.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SizeRule {
+    /// POSIX ustar: types 1, 2 and 5 are followed by no data blocks.
+    Ustar,
+    /// pax interchange format, which differs in exactly one place: data blocks
+    /// for a typeflag 1 (hard link) "may be included, which means that the size
+    /// field may be greater than zero". That is `-o linkdata`, and bsdtar
+    /// writes it.
+    Pax,
+}
+
+impl SizeRule {
+    /// The number of data bytes that actually follow this header.
+    fn data_size(self, entry_type: EntryType, declared: u64) -> u64 {
+        match entry_type {
+            // A directory's size field is a directory size limit, not a
+            // length: POSIX says a system that does not implement such
+            // limiting "should ignore the size field". Nothing malformed
+            // about a non-zero one, so no diagnostic.
+            EntryType::Directory => 0,
+            EntryType::Symlink => 0,
+            EntryType::Hardlink if self == SizeRule::Ustar => 0,
+            _ => declared,
+        }
+    }
+
+    /// Whether a non-zero size field on this type is malformed, as opposed to
+    /// merely ignorable. POSIX requires types 1 and 2 to record zero.
+    fn size_must_be_zero(self, entry_type: EntryType) -> bool {
+        match entry_type {
+            EntryType::Symlink => true,
+            EntryType::Hardlink => self == SizeRule::Ustar,
+            _ => false,
+        }
+    }
+}
+
+pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResult<ArchiveEntry> {
     let name = parse_path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
     let prefix = parse_path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
 
@@ -232,11 +262,12 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry>
     let mode = parse_octal(&header[MODE_OFF..MODE_OFF + 8])? as u32;
     let uid = parse_octal(&header[UID_OFF..UID_OFF + 8])? as u32;
     let gid = parse_octal(&header[GID_OFF..GID_OFF + 8])? as u32;
-    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    let declared_size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
     let mtime = parse_octal(&header[MTIME_OFF..MTIME_OFF + 12])?;
 
     let typeflag = header[TYPEFLAG_OFF];
     let entry_type = parse_typeflag(typeflag)?;
+    let size = rule.data_size(entry_type, declared_size);
 
     let linkname = parse_path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
     let link_target = if !linkname.is_empty() {
@@ -244,6 +275,17 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE]) -> PaxResult<ArchiveEntry>
     } else {
         None
     };
+
+    if declared_size != 0 && rule.size_must_be_zero(entry_type) {
+        crate::error::report_error(
+            path.display(),
+            format!(
+                "header of type {} records {} bytes of data, which POSIX \
+                 requires to be zero; ignoring the size field",
+                typeflag as char, declared_size
+            ),
+        );
+    }
 
     let uname = parse_string(&header[UNAME_OFF..UNAME_OFF + UNAME_LEN]);
     let gname = parse_string(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
@@ -323,6 +365,53 @@ pub(crate) fn build_path(prefix: &str, name: &str) -> PathBuf {
         PathBuf::from(name)
     } else {
         PathBuf::from(format!("{}/{}", prefix, name))
+    }
+}
+
+/// Read one 512-byte block, or `None` at end of file.
+fn read_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
+    let mut block = [0u8; BLOCK_SIZE];
+    match reader.read_exact(&mut block) {
+        Ok(()) => Ok(Some(block)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The next header block, or `None` at the end of the archive.
+///
+/// The end-of-archive indicator is *two* 512-byte blocks of zeros (POSIX). A
+/// single one is not an end marker, and stopping at it silently hides every
+/// member that follows -- from us, while GNU tar reads them and says so. Stop
+/// at it as GNU tar does, but say so too, so the truncation is visible rather
+/// than looking like a clean end of archive.
+///
+/// GNU tar names the offset ("A lone zero block at 5"). This does not: the
+/// only counter available here would see header blocks and not the data blocks
+/// between them, so any number it produced would send someone to the wrong
+/// place in the file. Counting correctly means threading a byte position
+/// through every read and skip in both readers, which is more machinery than
+/// a diagnostic detail is worth.
+pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
+    let Some(block) = read_block(reader)? else {
+        return Ok(None);
+    };
+    if !is_zero_block(&block) {
+        return Ok(Some(block));
+    }
+
+    match read_block(reader)? {
+        // Two zero blocks, or one followed by end of file: a proper end.
+        None => Ok(None),
+        Some(next) if is_zero_block(&next) => Ok(None),
+        Some(_) => {
+            crate::error::report_error(
+                "archive",
+                "a lone zero block where the end-of-archive indicator should be; \
+                 the rest of the archive is not being read",
+            );
+            Ok(None)
+        }
     }
 }
 

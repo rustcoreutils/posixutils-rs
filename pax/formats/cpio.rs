@@ -239,7 +239,7 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
     }
 
     fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         if remaining == 0 {
             return Ok(0);
         }
@@ -251,7 +251,7 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
     }
 
     fn skip_data(&mut self) -> PaxResult<()> {
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         if remaining > 0 {
             skip_bytes(&mut self.reader, remaining)?;
             self.bytes_read = self.current_size;

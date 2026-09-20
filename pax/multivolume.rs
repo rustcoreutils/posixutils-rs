@@ -460,7 +460,10 @@ impl MultiVolumeReader {
 
     /// Round up to next block boundary
     fn round_up_block(size: u64) -> u64 {
-        size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64
+        // See the note in formats/ustar.rs: a declared size near u64::MAX
+        // rounds up to 0 and the skip length then underflows.
+        size.div_ceil(BLOCK_SIZE as u64)
+            .saturating_mul(BLOCK_SIZE as u64)
     }
 }
 
@@ -532,7 +535,7 @@ impl ArchiveReader for MultiVolumeReader {
     }
 
     fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         if remaining == 0 {
             // Check if we need to switch to next volume for more data
             if self.in_split_file && self.total_bytes_read < self.total_entry_size {
@@ -559,7 +562,7 @@ impl ArchiveReader for MultiVolumeReader {
             }
         }
 
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         let to_read = std::cmp::min(buf.len() as u64, remaining) as usize;
 
         let reader = self

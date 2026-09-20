@@ -147,11 +147,9 @@ impl ExtendedHeader {
                 break;
             }
 
-            let (record_len, value_start) = parse_record_len(data, pos)?;
-            // record_len is at least value_start - pos + 1, so the trailing
-            // <newline> is inside the record and this cannot underflow.
-            header.apply_record(&data[value_start..pos + record_len - 1])?;
-            pos += record_len;
+            let span = parse_record_span(data, pos)?;
+            header.apply_record(&data[span.value.clone()])?;
+            pos = span.next;
         }
 
         Ok(header)
@@ -561,15 +559,26 @@ impl ExtendedHeader {
     }
 }
 
-/// Read the `"<len> "` prefix of the record starting at `pos`, returning the
-/// record's total length and the offset of its `keyword=value` body.
+/// Where one extended-header record's value lies, and where the next record
+/// begins.
 ///
-/// The length is the record's own byte count including the length field itself,
-/// so it must exceed that field plus the <space> plus the trailing <newline>. A
-/// length of 0 is the case that matters: it once wrapped `pos + len - 1` to
-/// `usize::MAX` and aborted on the slice, and it would never advance `pos`, so
-/// even a bounds-checked slice would spin forever.
-fn parse_record_len(data: &[u8], pos: usize) -> PaxResult<(usize, usize)> {
+/// The offsets are computed once, here, and handed to the caller. Returning the
+/// *declared length* instead and letting the caller work out `pos + len` is how
+/// the bounds check below came to be bypassed: the check lived here but the
+/// slice was built there, from the same addition done a second time.
+struct RecordSpan {
+    value: std::ops::Range<usize>,
+    next: usize,
+}
+
+/// Parse the `"%d "` length prefix of the record starting at `pos`.
+///
+/// The length field is attacker-controlled, so every arithmetic step on it is
+/// checked. `pos + record_len` in particular wraps for a length near
+/// `usize::MAX`, and a release build does not trap on that -- the wrapped sum
+/// compares below `data.len()`, the bounds check passes, and the slice that
+/// follows has a start beyond its end.
+fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
     let bad_len = || PaxError::InvalidHeader("invalid extended header length".to_string());
 
     let space_pos = data[pos..]
@@ -580,17 +589,30 @@ fn parse_record_len(data: &[u8], pos: usize) -> PaxResult<(usize, usize)> {
     let len_str = std::str::from_utf8(&data[pos..pos + space_pos]).map_err(|_| bad_len())?;
     let record_len: usize = len_str.parse().map_err(|_| bad_len())?;
 
-    let value_start = pos + space_pos + 1;
+    // The record must extend past its own length field, its <space>, and the
+    // trailing <newline>; otherwise there is no value and the end underflows.
     if record_len <= space_pos + 1 {
         return Err(bad_len());
     }
-    if pos + record_len > data.len() {
+
+    let next = pos.checked_add(record_len).ok_or_else(bad_len)?;
+    if next > data.len() {
         return Err(PaxError::InvalidHeader(
             "extended header record extends past end".to_string(),
         ));
     }
 
-    Ok((record_len, value_start))
+    let value_start = pos + space_pos + 1;
+    // record_len > space_pos + 1 puts the <newline> at or after value_start.
+    let value_end = next - 1;
+    if value_end < value_start {
+        return Err(bad_len());
+    }
+
+    Ok(RecordSpan {
+        value: value_start..value_end,
+        next,
+    })
 }
 
 /// Parse pax time format (decimal seconds with optional fractional part)
@@ -800,7 +822,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
     }
 
     fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         if remaining == 0 {
             return Ok(0);
         }
@@ -813,7 +835,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
 
     fn skip_data(&mut self) -> PaxResult<()> {
         let total_bytes = round_up_block(self.current_size);
-        let to_skip = total_bytes - self.bytes_read;
+        let to_skip = total_bytes.saturating_sub(self.bytes_read);
 
         if to_skip > 0 {
             skip_bytes(&mut self.reader, to_skip)?;
@@ -1194,7 +1216,11 @@ fn write_octal(buf: &mut [u8], val: u64, width: usize) {
 
 /// Round up to next block boundary
 fn round_up_block(size: u64) -> u64 {
-    size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64
+    // A `size=` extended-header record can declare u64::MAX, and rounding that
+    // up overflows to 0 -- after which the skip length underflows and the
+    // reader walks the rest of the archive as member data.
+    size.div_ceil(BLOCK_SIZE as u64)
+        .saturating_mul(BLOCK_SIZE as u64)
 }
 
 /// Calculate padding needed to reach block boundary

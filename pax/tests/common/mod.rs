@@ -377,6 +377,35 @@ pub fn pad_to_block(data: &mut Vec<u8>) {
     }
 }
 
+/// One pax extended-header record: `"%d keyword=value\n"`, where the length
+/// counts itself.
+///
+/// That self-reference is why this exists: writing the length by hand gets it
+/// wrong by one as soon as the record crosses a power of ten, and a fixture
+/// that means to be well-formed has to actually be well-formed or it tests the
+/// error path by accident.
+pub fn pax_record(keyword: &str, value: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(b' ');
+    body.extend_from_slice(keyword.as_bytes());
+    body.push(b'=');
+    body.extend_from_slice(value);
+    body.push(b'\n');
+
+    let mut len = body.len() + 1;
+    loop {
+        let digits = len.to_string().len();
+        if digits + body.len() == len {
+            break;
+        }
+        len = digits + body.len();
+    }
+
+    let mut out = len.to_string().into_bytes();
+    out.extend_from_slice(&body);
+    out
+}
+
 /// A pax archive whose single member is preceded by an `x` extended header
 /// carrying exactly `records` as its data.
 ///

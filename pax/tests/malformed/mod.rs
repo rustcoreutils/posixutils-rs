@@ -144,3 +144,80 @@ fn test_malformed_huge_cpio_symlink_size_is_rejected() {
         stderr_str(&output)
     );
 }
+
+/// A record length near `usize::MAX` makes `pos + record_len` wrap. The wrapped
+/// sum compares below `data.len()`, so the bounds check passes and the slice
+/// built from it has a start beyond its end.
+///
+/// The wrap needs `pos > 0`, which is why every test above -- all of which put
+/// their one malformed record first -- missed it. A valid record has to come
+/// first for the offset to be non-zero at all.
+#[test]
+fn test_malformed_record_length_overflow_after_a_valid_record() {
+    let mut records = pax_record("comment", b"first record is well-formed");
+    records.extend_from_slice(b"18446744073709551615 path=x\n");
+    let archive = archive_with_ext_records(&records);
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert!(
+        !stderr_str(&output).contains("panicked"),
+        "an overflowing record length must be diagnosed, not panic: {}",
+        stderr_str(&output)
+    );
+    assert_exit_code(&output, 1, "list an overflowing extended-header record");
+}
+
+/// The same archive through the extraction path, which reaches the parser by a
+/// different route and must not panic either.
+#[test]
+fn test_malformed_record_length_overflow_on_extract() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let mut records = pax_record("comment", b"first record is well-formed");
+    records.extend_from_slice(b"18446744073709551615 path=x\n");
+    let archive = archive_with_ext_records(&records);
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert!(
+        !stderr_str(&output).contains("panicked"),
+        "an overflowing record length must not panic on extract: {}",
+        stderr_str(&output)
+    );
+    assert_exit_code(&output, 1, "extract an overflowing extended-header record");
+}
+
+/// And at the third record, so the fix cannot be "special-case record two".
+#[test]
+fn test_malformed_record_length_overflow_at_third_record() {
+    let mut records = pax_record("comment", b"one");
+    records.extend_from_slice(&pax_record("comment", b"two"));
+    records.extend_from_slice(b"18446744073709551615 path=x\n");
+    let archive = archive_with_ext_records(&records);
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert!(
+        !stderr_str(&output).contains("panicked"),
+        "record position must not matter: {}",
+        stderr_str(&output)
+    );
+    assert_exit_code(&output, 1, "list a third-record overflow");
+}
+
+/// A `size=` keyword of 2^64-1 rounds up to zero blocks, after which the skip
+/// length underflows and the reader treats the rest of the archive as member
+/// data. It must be refused, and it must not panic in a checked build.
+#[test]
+fn test_malformed_pax_size_keyword_at_u64_max() {
+    let records = pax_record("size", b"18446744073709551615");
+    let archive = archive_with_ext_records(&records);
+
+    let output = run_pax_with_stdin_bytes(&["-v"], &archive);
+    assert!(
+        !stderr_str(&output).contains("panicked"),
+        "a u64::MAX size must not panic: {}",
+        stderr_str(&output)
+    );
+    assert!(
+        !output.status.success(),
+        "a member declaring 2^64-1 bytes cannot be satisfied and must fail"
+    );
+}

@@ -126,7 +126,7 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
     }
 
     fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
-        let remaining = self.current_size - self.bytes_read;
+        let remaining = self.current_size.saturating_sub(self.bytes_read);
         if remaining == 0 {
             return Ok(0);
         }
@@ -140,7 +140,7 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
     fn skip_data(&mut self) -> PaxResult<()> {
         // Calculate total bytes including padding to block boundary
         let total_bytes = round_up_block(self.current_size);
-        let to_skip = total_bytes - self.bytes_read;
+        let to_skip = total_bytes.saturating_sub(self.bytes_read);
 
         if to_skip > 0 {
             skip_bytes(&mut self.reader, to_skip)?;
@@ -498,7 +498,11 @@ fn write_octal(buf: &mut [u8], val: u64, width: usize) -> PaxResult<()> {
 
 /// Round up to next block boundary
 fn round_up_block(size: u64) -> u64 {
-    size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64
+    // A `size=` extended-header record can declare u64::MAX, and rounding that
+    // up overflows to 0 -- after which the skip length underflows and the
+    // reader walks the rest of the archive as member data.
+    size.div_ceil(BLOCK_SIZE as u64)
+        .saturating_mul(BLOCK_SIZE as u64)
 }
 
 /// Calculate padding needed to reach block boundary

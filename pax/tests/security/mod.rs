@@ -18,6 +18,7 @@
 use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 
 /// A symlink planted where a member will be written must not be followed. This
 /// is the state an attacker reaches by winning the window between the old
@@ -486,5 +487,201 @@ fn test_archive_ending_in_a_single_zero_block_reads_cleanly() {
         !stderr_str(&output).contains("lone zero block"),
         "end of file after one zero block is a clean end, not a truncation: {}",
         stderr_str(&output)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The source side of write and copy mode, now walked from directory
+// descriptors rather than by re-resolving a pathname on every operation.
+//
+// These pin behaviour rather than prove the fix. The defect was a race, and the
+// syscall shape that closes it -- one component per openat, O_NOFOLLOW on each,
+// and a (dev, ino) re-check after the open -- is observable under strace but
+// not assertable from a test that does not win a race. What these catch is the
+// traversal rewrite silently changing what gets archived: a symbolic link
+// descended instead of copied, or a FIFO opened instead of stat'ed, would each
+// turn up here.
+// ---------------------------------------------------------------------------
+
+/// A symbolic link where a directory would be is copied, not descended --
+/// before the rewrite and after it. This is here so that the rewrite cannot
+/// quietly start following one.
+#[test]
+fn test_write_does_not_descend_a_symlinked_source_directory() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(src.join("keep")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(src.join("keep/inside.txt"), b"mine\n").unwrap();
+    fs::write(outside.join("secret.txt"), b"not mine\n").unwrap();
+
+    // `sub` is what a directory would have been.
+    std::os::unix::fs::symlink("../outside", src.join("sub")).unwrap();
+
+    let archive = temp.path().join("a.tar");
+    run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src,
+    );
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        !listing.contains("secret.txt"),
+        "the walk followed a symbolic link out of the source tree: {listing}"
+    );
+    assert!(
+        listing.contains("keep/inside.txt"),
+        "and must still have archived the real subtree: {listing}"
+    );
+}
+
+/// The same for copy mode's source side.
+#[test]
+fn test_copy_does_not_descend_a_symlinked_source_directory() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let outside = temp.path().join("outside");
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(src.join("keep")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("keep/inside.txt"), b"mine\n").unwrap();
+    fs::write(outside.join("secret.txt"), b"not mine\n").unwrap();
+    std::os::unix::fs::symlink("../outside", src.join("sub")).unwrap();
+
+    run_pax_in_dir(&["-r", "-w", ".", dst.to_str().unwrap()], &src);
+
+    // `sub` is copied as the symbolic link it is, not descended into. Note
+    // that `dst/sub/secret.txt` *resolves* -- through the copied link, to the
+    // original file -- so the property to assert is what `dst/sub` is, not
+    // what can be reached through it.
+    let sub = fs::symlink_metadata(dst.join("sub")).expect("the link should be copied");
+    assert!(
+        sub.file_type().is_symlink(),
+        "the source symlink was descended and recreated as a real directory"
+    );
+    assert_eq!(
+        fs::read_link(dst.join("sub")).unwrap(),
+        std::path::Path::new("../outside"),
+        "and it must be the same link, copied rather than resolved"
+    );
+    assert!(
+        dst.join("keep/inside.txt").exists(),
+        "and must still have copied the real subtree"
+    );
+}
+
+/// A FIFO in the source tree must not stop the walk.
+///
+/// A FIFO is archived from its metadata and never opened, so this passes both
+/// before and after the rewrite. It is here because the rewrite introduced an
+/// `openat` of source files that `O_NOFOLLOW` alone does not make safe -- a
+/// FIFO is not a symbolic link, and a blocking open of one with no writer never
+/// returns -- so `open_source_file` opens non-blocking and checks what it
+/// actually got. If that check is ever dropped, and something starts opening
+/// non-regular files, this is what hangs.
+#[test]
+fn test_write_does_not_block_on_a_fifo_substituted_for_a_file() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("a.txt"), b"first\n").unwrap();
+
+    // Pre-plant the outcome: a FIFO where a regular file is expected. Opening
+    // it for reading with no writer would block forever.
+    let fifo = src.join("b.fifo");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+    fs::write(src.join("c.txt"), b"last\n").unwrap();
+
+    let archive = temp.path().join("a.tar");
+    let output = run_pax_in_dir(
+        &["-w", "-x", "ustar", "-f", archive.to_str().unwrap(), "."],
+        &src,
+    );
+
+    // A FIFO is archived from its metadata and never opened, so this finishes.
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    for want in ["a.txt", "b.fifo", "c.txt"] {
+        assert!(
+            listing.contains(want),
+            "{want} missing; the walk did not get past the FIFO: {listing}\n{}",
+            stderr_str(&output)
+        );
+    }
+}
+
+/// `-L` asks for the target, not the link. A dangling link has no target, and
+/// the traversal falls back to the link's own metadata when it cannot stat one
+/// -- so without this check the link is archived as a link, which is the
+/// opposite of what was asked for, with a zero exit status.
+#[test]
+fn test_dangling_symlink_is_diagnosed_when_dereferencing() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
+    fs::write(src.join("real.txt"), b"ok\n").unwrap();
+
+    let archive = temp.path().join("a.tar");
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-L",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src,
+    );
+
+    assert!(
+        stderr_str(&output).contains("dangling"),
+        "a link that cannot be followed must be diagnosed: {}",
+        stderr_str(&output)
+    );
+    assert_failure(&output, "archive a dangling link with -L");
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        !listing.contains("dangling"),
+        "and must not be stored as the link it is: {listing}"
+    );
+    assert!(listing.contains("real.txt"), "the rest is still archived");
+}
+
+/// The same for `-H`, which dereferences only what is named on the command
+/// line -- so a dangling link found *below* an operand is stored as a link,
+/// and is not an error.
+#[test]
+fn test_dangling_symlink_below_an_operand_is_kept_under_cli_dereference() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
+
+    let archive = temp.path().join("a.tar");
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-H",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src,
+    );
+    assert_success(&output, "-H does not dereference below the operand");
+
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(
+        listing.contains("dangling"),
+        "the link itself should be archived: {listing}"
     );
 }

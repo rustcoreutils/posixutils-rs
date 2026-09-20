@@ -479,7 +479,7 @@ fn read_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
 /// than looking like a clean end of archive.
 ///
 /// GNU tar names the offset ("A lone zero block at 5"). This does not: the
-/// only counter available here would see header blocks and not the data blocks
+/// only counter available here sees header blocks and not the data blocks
 /// between them, so any number it produced would send someone to the wrong
 /// place in the file. Counting correctly means threading a byte position
 /// through every read and skip in both readers, which is more machinery than

@@ -22,6 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use std::ffi::{CStr, CString, OsString};
+use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -264,6 +265,64 @@ where
         Ok(()) => Ok(true),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Open a source file from the descriptor of the directory it was found in.
+///
+/// One component, resolved once, rather than a whole pathname re-resolved by
+/// the kernel on every call -- which is what let a source tree another process
+/// could modify redirect a read outside the tree pax was asked to archive.
+///
+/// `O_NONBLOCK` is not optional here. `O_NOFOLLOW` refuses a symbolic link, but
+/// it does not stop a regular file being replaced by a FIFO between the walk's
+/// `fstatat` and this `openat`, and a blocking `open` of a FIFO with no writer
+/// never returns. Opening non-blocking and then checking what was actually
+/// opened turns that from a hang into a diagnostic.
+///
+/// The `fstat` on the descriptor doubles as the check that the name still
+/// refers to the file the walk saw: a mismatch fails closed.
+pub(crate) fn open_source_file(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    follow: bool,
+    expected: (u64, u64),
+) -> std::io::Result<File> {
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    if !follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+
+    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source file changed type before it could be read",
+        ));
+    }
+    if (st.st_dev as u64, st.st_ino) != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "source file was replaced before it could be read",
+        ));
+    }
+
+    // Nothing below reads this descriptor expecting non-blocking semantics.
+    let cur = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if cur >= 0 {
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, cur & !libc::O_NONBLOCK) };
+    }
+
+    Ok(file)
 }
 
 /// The attributes a copied or extracted file takes from its source, whether that

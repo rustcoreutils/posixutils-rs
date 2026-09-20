@@ -1145,6 +1145,7 @@ dependencies = [
  "clap",
  "filetime",
  "flate2",
+ "ftw",
  "gettext-rs",
  "libc",
  "plib",

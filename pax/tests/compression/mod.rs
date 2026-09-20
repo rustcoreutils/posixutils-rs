@@ -8,6 +8,7 @@
 //
 
 //! Compression integration tests for pax
+use crate::common::{run_pax, run_pax_in_dir, stdout_str};
 
 use plib::tmp::TempDir;
 use std::fs::{self, File};
@@ -426,4 +427,80 @@ fn test_gzip_extract_explicit_flag() {
     assert_success(&output, "pax extract with -z");
 
     assert!(dst_dir.join("extract.txt").exists());
+}
+
+/// A gzip stream may hold several deflate members. `gzip -c a >> x.gz`,
+/// `cat a.gz b.gz` and bgzip all produce one, and the archive inside spans the
+/// boundary -- so a decoder that stops at the end of the first member truncates
+/// the archive. Where the split lands mid-member it is a short read; where it
+/// lands on a member boundary the archive just ends early, silently.
+#[test]
+fn test_gzip_reads_a_stream_split_across_two_members() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("one.txt"), b"first\n").unwrap();
+    // Big enough that the halfway point lands inside this member's data.
+    let big: Vec<u8> = (0..40_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    fs::write(src.join("big.txt"), &big).unwrap();
+    fs::write(src.join("two.txt"), b"last\n").unwrap();
+
+    let plain = temp.path().join("plain.tar");
+    assert_success(
+        &run_pax_in_dir(
+            &[
+                "-w",
+                "-x",
+                "ustar",
+                "-f",
+                plain.to_str().unwrap(),
+                "one.txt",
+                "big.txt",
+                "two.txt",
+            ],
+            &src,
+        ),
+        "build the uncompressed archive",
+    );
+
+    // Split on a block boundary inside big.txt, then gzip each half
+    // separately and concatenate -- exactly what appending to a .gz produces.
+    let tar = fs::read(&plain).unwrap();
+    let half = (tar.len() / 2 / 512) * 512;
+    assert!(
+        half > 512 && half < tar.len(),
+        "split must fall mid-archive"
+    );
+
+    let mut multi = Vec::new();
+    for part in [&tar[..half], &tar[half..]] {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(part).unwrap();
+        multi.extend_from_slice(&enc.finish().unwrap());
+    }
+    let gz = temp.path().join("multi.tar.gz");
+    fs::write(&gz, &multi).unwrap();
+
+    let listing = run_pax(&["-z", "-f", gz.to_str().unwrap()]);
+    assert_success(&listing, "list a multi-member gzip archive");
+    let names = stdout_str(&listing);
+    for want in ["one.txt", "big.txt", "two.txt"] {
+        assert!(
+            names.contains(want),
+            "member {want} was lost at the gzip member boundary; got: {names}"
+        );
+    }
+
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    assert_success(
+        &run_pax_in_dir(&["-r", "-z", "-f", gz.to_str().unwrap()], &dst),
+        "extract a multi-member gzip archive",
+    );
+    assert_eq!(
+        fs::read(dst.join("big.txt")).unwrap(),
+        big,
+        "the member straddling the boundary must come back byte-identical"
+    );
+    assert_eq!(fs::read(dst.join("two.txt")).unwrap(), b"last\n");
 }

@@ -119,7 +119,7 @@ pub fn unit_starts(bytes: &[u8]) -> Vec<usize> {
 }
 
 /// The length in bytes of the display unit beginning at `bytes[0]`.
-fn unit_len(bytes: &[u8]) -> usize {
+pub fn unit_len(bytes: &[u8]) -> usize {
     let lead = bytes[0];
     let want = if lead < 0x80 {
         1

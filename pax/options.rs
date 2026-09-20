@@ -41,6 +41,12 @@ pub struct ListEntryInfo<'a> {
     pub entry_type: EntryType,
     pub devmajor: u32,
     pub devminor: u32,
+    /// Whether the *substituted values* get escaped.
+    ///
+    /// Only the values, never the rendered result: the format string is
+    /// operator-supplied, so escaping the output would turn a deliberate
+    /// `-o listopt=$'%F\t%s'` tab into a `?`.
+    pub style: crate::escape::Style,
 }
 
 /// The `-o invalid=` actions POSIX defines, and whether this implementation
@@ -440,19 +446,31 @@ fn expand_global_header_template(template: &str, sequence: u64) -> String {
 // Format specifier handlers for list entry formatting
 fn fmt_basename(info: &ListEntryInfo) -> Vec<u8> {
     match info.path.file_name() {
-        Some(name) => crate::rawpath::as_bytes(std::path::Path::new(name)).to_vec(),
+        Some(name) => escaped(info, crate::rawpath::as_bytes(std::path::Path::new(name))),
         None => fmt_fullpath(info),
     }
 }
 
 fn fmt_fullpath(info: &ListEntryInfo) -> Vec<u8> {
-    crate::rawpath::as_bytes(info.path).to_vec()
+    escaped(info, crate::rawpath::as_bytes(info.path))
 }
 
 fn fmt_link_target(info: &ListEntryInfo) -> Vec<u8> {
-    info.link_target
-        .map(|p| crate::rawpath::as_bytes(p).to_vec())
-        .unwrap_or_default()
+    match info.link_target {
+        Some(p) => escaped(info, crate::rawpath::as_bytes(p)),
+        None => Vec::new(),
+    }
+}
+
+/// A name, escaped for the stream this listing is going to.
+///
+/// Escaping happens here rather than on the finished line so that the width
+/// and precision arithmetic below sees the units it will actually print -- and
+/// so the operator's own format string keeps whatever characters it contains.
+fn escaped(info: &ListEntryInfo, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    crate::escape::push_escaped(&mut out, bytes, info.style);
+    out
 }
 
 fn fmt_mode_octal(info: &ListEntryInfo) -> Vec<u8> {
@@ -1052,6 +1070,7 @@ mod tests {
             entry_type: EntryType::Regular,
             devmajor: 0,
             devminor: 0,
+            style: crate::escape::Style::RAW,
         };
         let result = fmt("%F", &info);
         assert_eq!(result, "path/to/file.txt");
@@ -1077,6 +1096,7 @@ mod tests {
             entry_type: EntryType::Regular,
             devmajor: 0,
             devminor: 0,
+            style: crate::escape::Style::RAW,
         };
 
         // 'é' is two bytes; a byte-indexed truncate(1) split it and aborted.
@@ -1108,6 +1128,7 @@ mod tests {
             entry_type: EntryType::Regular,
             devmajor: 0,
             devminor: 0,
+            style: crate::escape::Style::RAW,
         };
         let result = fmt("%M %u %g %s %f", &info);
         assert_eq!(result, "-rwxr-xr-x alice users 4096 file.txt");
@@ -1130,6 +1151,7 @@ mod tests {
             entry_type: EntryType::Regular,
             devmajor: 0,
             devminor: 0,
+            style: crate::escape::Style::RAW,
         };
 
         // POSIX `%(keyword)s`/`%(keyword)d` substitution.
@@ -1221,6 +1243,7 @@ mod tests {
             entry_type: EntryType::BlockDevice,
             devmajor: 8,
             devminor: 0,
+            style: crate::escape::Style::RAW,
         };
         let result = fmt("%M %D %f", &info);
         assert_eq!(result, "brw-rw---- 8,0 sda");
@@ -1245,6 +1268,7 @@ mod tests {
             entry_type: EntryType::Directory,
             devmajor: 0,
             devminor: 0,
+            style: crate::escape::Style::RAW,
         };
         let result = fmt("%M", &info);
         assert_eq!(result, "drwxr-xr-x");
@@ -1265,6 +1289,7 @@ mod tests {
             entry_type: EntryType::Symlink,
             devmajor: 0,
             devminor: 0,
+            style: crate::escape::Style::RAW,
         };
         let result = fmt("%M", &info);
         assert_eq!(result, "lrwxrwxrwx");

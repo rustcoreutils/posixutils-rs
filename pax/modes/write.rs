@@ -153,7 +153,7 @@ fn write_files<W: ArchiveWriter>(
             true,
             &mut prompter,
         ) {
-            crate::error::report_error(path.display(), e);
+            crate::error::report_error(path, e);
         }
     }
 
@@ -191,7 +191,7 @@ fn write_path<W: ArchiveWriter>(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            crate::error::report_error(path.display(), e);
+            crate::error::report_error(path, e);
             return Ok(());
         }
     };
@@ -211,8 +211,7 @@ fn write_path<W: ArchiveWriter>(
 
     // Apply substitutions first (per POSIX: -s applies before -i)
     let archive_path = if !options.substitutions.is_empty() {
-        let name = crate::rawpath::MatchName::of(path);
-        match apply_substitutions(&options.substitutions, name.as_str()) {
+        match apply_substitutions(&options.substitutions, path) {
             SubstResult::Unchanged => path.to_path_buf(),
             SubstResult::Changed(new_path) => PathBuf::from(new_path),
             SubstResult::Empty => return Ok(()), // Skip this file
@@ -223,8 +222,7 @@ fn write_path<W: ArchiveWriter>(
 
     // Handle interactive rename
     let archive_path = if let Some(ref mut p) = prompter {
-        let name = crate::rawpath::MatchName::of(&archive_path);
-        match p.prompt(name.as_str())? {
+        match p.prompt(&archive_path)? {
             RenameResult::Skip => return Ok(()),
             RenameResult::UseOriginal => archive_path,
             RenameResult::Rename(new_path) => new_path,
@@ -244,7 +242,14 @@ fn write_path<W: ArchiveWriter>(
     }
 
     if options.verbose {
-        eprintln!("{}", path.display());
+        let mut line = Vec::new();
+        crate::escape::push_escaped(
+            &mut line,
+            crate::rawpath::as_bytes(path),
+            crate::escape::stderr_style(),
+        );
+        line.push(b'\n');
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
     }
 
     if metadata.is_dir() {
@@ -313,7 +318,7 @@ fn write_directory<W: ArchiveWriter>(
         let entries = match fs::read_dir(src_path) {
             Ok(e) => e,
             Err(e) => {
-                crate::error::report_error(src_path.display(), e);
+                crate::error::report_error(src_path, e);
                 return Ok(());
             }
         };
@@ -322,7 +327,7 @@ fn write_directory<W: ArchiveWriter>(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    crate::error::report_error(src_path.display(), e);
+                    crate::error::report_error(src_path, e);
                     continue;
                 }
             };
@@ -391,7 +396,7 @@ fn write_special<W: ArchiveWriter>(
     } else if file_type.is_socket() {
         EntryType::Socket
     } else {
-        crate::error::report_error(path.display(), gettextrs::gettext("unsupported file type"));
+        crate::error::report_error(path, gettextrs::gettext("unsupported file type"));
         return Ok(());
     };
 
@@ -580,7 +585,7 @@ fn copy_file_data<W: ArchiveWriter>(
         }
     } else if file.read(&mut buf[..1])? != 0 {
         // Still more to read than the header promised.
-        eprintln!("pax: {}: file changed as we read it", path.display());
+        crate::error::report_error(path, "file changed as we read it");
         crate::error::note_error();
     }
 

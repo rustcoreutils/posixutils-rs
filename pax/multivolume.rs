@@ -506,14 +506,19 @@ impl ArchiveReader for MultiVolumeReader {
                 let remaining_size = parse_octal(&header[124..136])?;
 
                 if self.options.verbose {
+                    // A member name out of the archive, so it goes out as its
+                    // bytes and is escaped only for a terminal -- the same
+                    // treatment every other name-bearing diagnostic gets.
+                    // `display()` here would both render an invalid byte as
+                    // U+FFFD and let an escape sequence through.
                     let name = crate::rawpath::from_bytes(crate::formats::ustar::path_field(
                         &header[0..100],
                     ));
-                    eprintln!(
-                        "pax: continuation of '{}' at offset {}",
-                        name.display(),
-                        offset
-                    );
+                    let mut line = Vec::new();
+                    line.extend_from_slice(b"pax: continuation of '");
+                    line.extend_from_slice(crate::rawpath::as_bytes(&name));
+                    line.extend_from_slice(format!("' at offset {offset}").as_bytes());
+                    crate::escape::write_stderr_line(&line);
                 }
 
                 // Update our tracking - we're continuing from where we left off

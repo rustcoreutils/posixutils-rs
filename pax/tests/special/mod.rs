@@ -602,3 +602,52 @@ fn test_non_utf8_symlink_target_round_trips_through_cpio() {
         "a wrong target length desynchronises every member after it"
     );
 }
+
+/// Escaping applies only to a terminal. Every test in this suite runs pax with
+/// its output piped, so this asserts the guarantee the whole design rests on:
+/// piped output is byte-identical, and nothing that parses `pax -t` changes
+/// behaviour. It is also the regression test for escaping unconditionally by
+/// accident.
+#[test]
+fn test_piped_output_keeps_control_bytes_verbatim() {
+    let archive = crate::common::Ustar {
+        name: b"x\x1b[31mred\tname",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let plain = crate::common::run_pax_with_stdin_bytes(&[], &archive);
+    assert_eq!(
+        plain.stdout, b"x\x1b[31mred\tname\n",
+        "a pipe must receive the recorded bytes, escape sequence and all"
+    );
+
+    let verbose = crate::common::run_pax_with_stdin_bytes(&["-v"], &archive);
+    assert!(
+        verbose.stdout.windows(4).any(|w| w == b"\x1b[31"),
+        "the verbose listing must not escape to a pipe either"
+    );
+
+    let listopt = crate::common::run_pax_with_stdin_bytes(&["-o", "listopt=%F"], &archive);
+    assert_eq!(listopt.stdout, b"x\x1b[31mred\tname\n");
+}
+
+/// A `-o listopt` format string is operator-supplied, so its own literal
+/// characters must survive whatever the escaping rule does to the values
+/// substituted into it.
+#[test]
+fn test_listopt_literal_tab_survives() {
+    let archive = crate::common::Ustar {
+        name: b"a.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = crate::common::run_pax_with_stdin_bytes(&["-o", "listopt=%F\t%s"], &archive);
+    assert_eq!(
+        output.stdout, b"a.txt\t2\n",
+        "the tab is part of the format, not part of a name"
+    );
+}

@@ -100,8 +100,7 @@ fn list_entries<R: ArchiveReader, W: Write>(
             crate::modes::read::apply_keyword_overrides(&mut entry, &options.format_options);
             // Apply substitutions
             if !options.substitutions.is_empty() {
-                let name = crate::rawpath::MatchName::of(&entry.path);
-                match apply_substitutions(&options.substitutions, name.as_str()) {
+                match apply_substitutions(&options.substitutions, &entry.path) {
                     SubstResult::Unchanged => {
                         // Keep the original bytes.
                     }
@@ -130,7 +129,7 @@ fn list_entries<R: ArchiveReader, W: Write>(
                 }
             }
             if let Err(e) = print_entry(writer, &entry, options) {
-                crate::error::report_error(entry.path.display(), e);
+                crate::error::report_error(&entry.path, e);
             }
         }
         archive.skip_data()?;
@@ -230,6 +229,7 @@ fn print_entry<W: Write>(
     if let Some(ref format) = options.format_options.list_format {
         let info = ListEntryInfo {
             path: &entry.path,
+            style: crate::escape::stdout_style(),
             mode: entry.mode,
             size: entry.size,
             mtime: entry.mtime,
@@ -256,7 +256,7 @@ fn print_entry<W: Write>(
         // The name goes out as the bytes the archive recorded. `display()`
         // would render an invalid byte as U+FFFD, so the listing would not
         // name the file extraction creates.
-        writer.write_all(crate::rawpath::as_bytes(&entry.path))?;
+        crate::escape::write_name(writer, &entry.path, crate::escape::stdout_style())?;
         writer.write_all(b"\n")?;
     }
     Ok(())
@@ -279,7 +279,7 @@ fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()
         "{} {:>3} {:>8} {:>8} {:>8} {} ",
         mode_str, nlink, owner, group, size, mtime
     )?;
-    writer.write_all(crate::rawpath::as_bytes(path))?;
+    crate::escape::write_name(writer, path, crate::escape::stdout_style())?;
     write_link_suffix(writer, entry)?;
     writer.write_all(b"\n")?;
 
@@ -308,6 +308,6 @@ fn write_link_suffix<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResul
     };
     writer.write_all(marker)?;
     let target = entry.link_target.as_ref().expect("matched Some above");
-    writer.write_all(crate::rawpath::as_bytes(target))?;
+    crate::escape::write_name(writer, target, crate::escape::stdout_style())?;
     Ok(())
 }

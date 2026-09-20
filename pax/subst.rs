@@ -23,6 +23,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use plib::regex::{Match, Regex, RegexFlags, MAX_CAPTURES};
+use std::path::Path;
 
 /// A compiled substitution expression from -s option
 #[derive(Debug)]
@@ -172,10 +173,6 @@ impl Substitution {
             return SubstResult::Unchanged;
         }
 
-        if self.print {
-            eprintln!("{} >> {}", path, result);
-        }
-
         if result.is_empty() {
             SubstResult::Empty
         } else {
@@ -305,11 +302,31 @@ fn parse_delimited(s: &str, delimiter: char) -> PaxResult<(String, String)> {
 ///
 /// Substitutions are applied in order. The first one that matches
 /// (produces a change) wins, and no further substitutions are tried.
-pub fn apply_substitutions(substitutions: &[Substitution], path: &str) -> SubstResult {
+/// Apply the `-s` expressions to a member name, in order, stopping at the
+/// first that changes it.
+///
+/// Takes the pathname rather than its lossy rendering so that the `p` flag can
+/// report the name as it really is. The matching itself is still done on the
+/// lossy form -- see `crate::rawpath::MatchName` -- which is why the left-hand
+/// side of the report comes from `path` and not from what the regex saw.
+pub fn apply_substitutions(substitutions: &[Substitution], path: &Path) -> SubstResult {
+    let name = crate::rawpath::MatchName::of(path);
     for subst in substitutions {
-        match subst.apply(path) {
+        match subst.apply(name.as_str()) {
             SubstResult::Unchanged => continue,
-            result => return result,
+            result => {
+                if subst.print {
+                    let mut line = Vec::new();
+                    line.extend_from_slice(crate::rawpath::as_bytes(path));
+                    line.extend_from_slice(b" >> ");
+                    match &result {
+                        SubstResult::Changed(new) => line.extend_from_slice(new.as_bytes()),
+                        SubstResult::Empty | SubstResult::Unchanged => {}
+                    }
+                    crate::escape::write_stderr_line(&line);
+                }
+                return result;
+            }
         }
     }
     SubstResult::Unchanged
@@ -531,7 +548,7 @@ mod tests {
             Substitution::parse("/foo/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, "foo"),
+            apply_substitutions(&subs, Path::new("foo")),
             SubstResult::Changed("first".to_string())
         );
     }
@@ -543,7 +560,7 @@ mod tests {
             Substitution::parse("/foo/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, "foo"),
+            apply_substitutions(&subs, Path::new("foo")),
             SubstResult::Changed("second".to_string())
         );
     }
@@ -554,7 +571,10 @@ mod tests {
             Substitution::parse("/xxx/first/").unwrap(),
             Substitution::parse("/yyy/second/").unwrap(),
         ];
-        assert_eq!(apply_substitutions(&subs, "foo"), SubstResult::Unchanged);
+        assert_eq!(
+            apply_substitutions(&subs, Path::new("foo")),
+            SubstResult::Unchanged
+        );
     }
 
     #[test]

@@ -292,11 +292,11 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     match flag {
         TypeFlag::Known(_) | TypeFlag::RegularByDefinition => {}
         TypeFlag::Unimplemented(what) => crate::error::report_error(
-            path.display(),
+            &path,
             format!("is {what}, which is not supported; extracting as a regular file"),
         ),
         TypeFlag::Unknown => crate::error::report_error(
-            path.display(),
+            &path,
             format!(
                 "has unrecognized type {}; extracting as a regular file",
                 show_typeflag(typeflag)
@@ -306,7 +306,7 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
 
     if declared_size != 0 && rule.size_must_be_zero(entry_type) {
         crate::error::report_error(
-            path.display(),
+            &path,
             format!(
                 "header of type {} records {} bytes of data, which POSIX \
                  requires to be zero; ignoring the size field",
@@ -590,7 +590,7 @@ fn report_long_name_group(
         None => crate::rawpath::from_bytes(path_field(&member[NAME_OFF..NAME_OFF + NAME_LEN])),
     };
     crate::error::report_error(
-        name.display(),
+        &name,
         format!(
             "uses {}, which is not supported; skipping the member",
             kinds.join(" and ")

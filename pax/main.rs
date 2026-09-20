@@ -12,6 +12,7 @@ mod blocked_io;
 mod cli;
 mod compression;
 mod error;
+mod escape;
 mod formats;
 mod interactive;
 mod modes;

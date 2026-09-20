@@ -129,7 +129,7 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
             initial_dev,
             true,
         ) {
-            crate::error::report_error(path.display(), e);
+            crate::error::report_error(path, e);
         }
     }
 
@@ -195,7 +195,7 @@ fn copy_member(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            crate::error::report_error(src.display(), e);
+            crate::error::report_error(src, e);
             return Ok(());
         }
     };
@@ -226,7 +226,7 @@ fn copy_member(
     let member = if options.substitutions.is_empty() {
         member.to_path_buf()
     } else {
-        match apply_substitutions(&options.substitutions, member_str) {
+        match apply_substitutions(&options.substitutions, member) {
             SubstResult::Unchanged => member.to_path_buf(),
             SubstResult::Changed(new_name) => PathBuf::from(new_name),
             SubstResult::Empty => return Ok(()), // a null name means skip
@@ -234,7 +234,7 @@ fn copy_member(
     };
 
     let member = if let Some(ref mut p) = state.prompter {
-        match p.prompt(crate::rawpath::MatchName::of(&member).as_str())? {
+        match p.prompt(&member)? {
             RenameResult::Skip => return Ok(()),
             RenameResult::UseOriginal => member,
             RenameResult::Rename(new_name) => new_name,
@@ -279,7 +279,14 @@ fn copy_member(
     }
 
     if options.verbose {
-        eprintln!("{}", src.display());
+        let mut line = Vec::new();
+        crate::escape::push_escaped(
+            &mut line,
+            crate::rawpath::as_bytes(src),
+            crate::escape::stderr_style(),
+        );
+        line.push(b'\n');
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
     }
 
     if metadata.is_dir() {
@@ -289,7 +296,7 @@ fn copy_member(
     } else if metadata.is_file() {
         copy_file(src, tree, pfd, name, &mp.display, options, state, &metadata)?;
     } else if let Err(e) = copy_special_file(pfd, name, &metadata, options) {
-        crate::error::report_error(src.display(), e);
+        crate::error::report_error(src, e);
     }
 
     Ok(())
@@ -359,7 +366,7 @@ fn copy_directory(
         let entries = match fs::read_dir(src) {
             Ok(e) => e,
             Err(e) => {
-                crate::error::report_error(src.display(), e);
+                crate::error::report_error(src, e);
                 return Ok(());
             }
         };
@@ -368,7 +375,7 @@ fn copy_directory(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    crate::error::report_error(src.display(), e);
+                    crate::error::report_error(src, e);
                     continue;
                 }
             };
@@ -384,7 +391,7 @@ fn copy_directory(
                 initial_dev,
                 false,
             ) {
-                crate::error::report_error(entry.path().display(), e);
+                crate::error::report_error(&entry.path(), e);
             }
         }
     }
@@ -527,7 +534,7 @@ fn copy_file(
             Ok(_) => return Ok(()),
             Err(e) => {
                 // Hard link failed (maybe cross-device), fall back to copy
-                eprintln!("pax: hard link failed, copying: {}: {}", src.display(), e);
+                crate::error::report_error(src, format!("hard link failed, copying: {e}"));
             }
         }
     }

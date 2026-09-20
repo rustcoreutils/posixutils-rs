@@ -157,8 +157,7 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
             apply_keyword_overrides(&mut entry, &options.format_options);
             // Apply substitutions first (per POSIX: -s applies before -i)
             if !options.substitutions.is_empty() {
-                let name = crate::rawpath::MatchName::of(&entry.path);
-                match apply_substitutions(&options.substitutions, name.as_str()) {
+                match apply_substitutions(&options.substitutions, &entry.path) {
                     SubstResult::Unchanged => {
                         // Keep the original bytes: this is the only case that
                         // round-trips a name that is not UTF-8 exactly.
@@ -199,8 +198,7 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
 
             // Handle interactive rename if enabled
             if let Some(ref mut p) = prompter {
-                let name = crate::rawpath::MatchName::of(&entry.path);
-                match p.prompt(name.as_str())? {
+                match p.prompt(&entry.path)? {
                     RenameResult::Skip => {
                         archive.skip_data()?;
                         continue;
@@ -224,7 +222,7 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
                 &tree,
                 &mut pending_dirs,
             ) {
-                crate::error::report_error(entry.path.display(), e);
+                crate::error::report_error(&entry.path, e);
                 let _ = archive.skip_data();
             }
         } else {
@@ -430,7 +428,7 @@ fn extract_entry<R: ArchiveReader>(
         // archive that extracted nothing look like one that extracted
         // everything. GNU tar diagnoses the empty name too.
         if !MemberPath::names_current_directory(&entry.path) {
-            crate::error::report_error(entry.path.display(), "names no file to create; skipping");
+            crate::error::report_error(&entry.path, "names no file to create; skipping");
         }
         archive.skip_data()?;
         return Ok(());
@@ -454,7 +452,14 @@ fn extract_entry<R: ArchiveReader>(
     }
 
     if options.verbose {
-        eprintln!("{}", member.display.display());
+        let mut line = Vec::new();
+        crate::escape::push_escaped(
+            &mut line,
+            crate::rawpath::as_bytes(&member.display),
+            crate::escape::stderr_style(),
+        );
+        line.push(b'\n');
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
     }
 
     match entry.entry_type {
@@ -514,7 +519,14 @@ fn copy_member_to_stdout<R: ArchiveReader>(
     options: &ReadOptions,
 ) -> PaxResult<()> {
     if options.verbose {
-        eprintln!("{}", entry.path.display());
+        let mut line = Vec::new();
+        crate::escape::push_escaped(
+            &mut line,
+            crate::rawpath::as_bytes(&entry.path),
+            crate::escape::stderr_style(),
+        );
+        line.push(b'\n');
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
     }
 
     if matches!(entry.entry_type, EntryType::Regular | EntryType::Hardlink) {
@@ -946,7 +958,7 @@ fn apply_pending_dirs(
         let parent = match tree.parent_of(member, false) {
             Ok(p) => p,
             Err(e) => {
-                crate::error::report_error(member.display.display(), e);
+                crate::error::report_error(&member.display, e);
                 continue;
             }
         };
@@ -964,7 +976,7 @@ fn apply_pending_dirs(
         let fd = unsafe { libc::openat(pfd.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
             crate::error::report_error(
-                member.display.display(),
+                &member.display,
                 PaxError::from(std::io::Error::last_os_error()),
             );
             continue;
@@ -972,7 +984,7 @@ fn apply_pending_dirs(
         let dir = unsafe { OwnedFd::from_raw_fd(fd) };
 
         if let Err(e) = set_attrs_fd(dir.as_fd(), &attrs_of(entry), &policy_of(options)) {
-            crate::error::report_error(member.display.display(), e);
+            crate::error::report_error(&member.display, e);
         }
     }
 }

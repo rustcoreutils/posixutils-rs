@@ -157,13 +157,14 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
             apply_keyword_overrides(&mut entry, &options.format_options);
             // Apply substitutions first (per POSIX: -s applies before -i)
             if !options.substitutions.is_empty() {
-                let path_str = entry.path.to_string_lossy();
-                match apply_substitutions(&options.substitutions, &path_str) {
+                let name = crate::rawpath::MatchName::of(&entry.path);
+                match apply_substitutions(&options.substitutions, name.as_str()) {
                     SubstResult::Unchanged => {
-                        // Keep original path
+                        // Keep the original bytes: this is the only case that
+                        // round-trips a name that is not UTF-8 exactly.
                     }
                     SubstResult::Changed(new_path) => {
-                        entry.path = PathBuf::from(new_path);
+                        entry.path = crate::rawpath::from_substituted(&new_path);
                     }
                     SubstResult::Empty => {
                         // Skip this entry
@@ -178,9 +179,8 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
             // actually be created. A member with no components left over names
             // nothing to extract and is dropped, as GNU tar does.
             if options.strip_components > 0 {
-                let name = entry.path.to_string_lossy().into_owned();
-                match strip_leading_components(&name, options.strip_components) {
-                    Some(stripped) => entry.path = PathBuf::from(stripped),
+                match strip_leading_components(&entry.path, options.strip_components) {
+                    Some(stripped) => entry.path = stripped,
                     None => {
                         archive.skip_data()?;
                         continue;
@@ -191,18 +191,16 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
                 // the extracted tree and must be left alone.
                 if entry.entry_type == EntryType::Hardlink {
                     if let Some(target) = &entry.link_target {
-                        let target = target.to_string_lossy().into_owned();
                         entry.link_target =
-                            strip_leading_components(&target, options.strip_components)
-                                .map(PathBuf::from);
+                            strip_leading_components(target, options.strip_components);
                     }
                 }
             }
 
             // Handle interactive rename if enabled
             if let Some(ref mut p) = prompter {
-                let path_str = entry.path.to_string_lossy();
-                match p.prompt(&path_str)? {
+                let name = crate::rawpath::MatchName::of(&entry.path);
+                match p.prompt(name.as_str())? {
                     RenameResult::Skip => {
                         archive.skip_data()?;
                         continue;
@@ -311,24 +309,31 @@ pub(crate) fn apply_keyword_overrides(
 /// behavior for `--strip-components`. Empty and `.` components are not counted,
 /// so `./a/b` strips the same way `a/b` does; a trailing slash is preserved so a
 /// directory member stays recognizable as one.
-pub(crate) fn strip_leading_components(name: &str, n: usize) -> Option<String> {
+pub(crate) fn strip_leading_components(name: &std::path::Path, n: usize) -> Option<PathBuf> {
+    let bytes = crate::rawpath::as_bytes(name);
     if n == 0 {
-        return Some(name.to_string());
+        return Some(name.to_path_buf());
     }
 
-    let mut parts: Vec<&str> = name
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
+    let mut parts: Vec<&[u8]> = bytes
+        .split(|&b| b == b'/')
+        .filter(|part| !part.is_empty() && *part != b".")
         .collect();
     if parts.len() <= n {
         return None;
     }
 
-    let mut stripped = parts.split_off(n).join("/");
-    if name.ends_with('/') {
-        stripped.push('/');
+    let mut stripped: Vec<u8> = Vec::new();
+    for (i, part) in parts.split_off(n).iter().enumerate() {
+        if i > 0 {
+            stripped.push(b'/');
+        }
+        stripped.extend_from_slice(part);
     }
-    Some(stripped)
+    if bytes.last() == Some(&b'/') {
+        stripped.push(b'/');
+    }
+    Some(crate::rawpath::from_bytes(&stripped))
 }
 
 /// Check if entry should be extracted
@@ -341,16 +346,17 @@ fn should_extract(
     options: &ReadOptions,
     matched_patterns: &mut HashSet<usize>,
 ) -> Option<bool> {
-    let path = entry.path.to_string_lossy();
+    let name = crate::rawpath::MatchName::of(&entry.path);
+    let path = name.as_str();
 
     // tar's exclusion list is independent of the pattern operands and wins over
     // them, so it is applied to the stored name before anything else.
-    if matches_excluded(&options.exclude_patterns, &path) {
+    if matches_excluded(&options.exclude_patterns, path) {
         return None;
     }
 
     // Try matching against both the full path and the path with "./" prefix stripped
-    let path_stripped = path.strip_prefix("./").unwrap_or(&path);
+    let path_stripped = path.strip_prefix("./").unwrap_or(path);
 
     if options.patterns.is_empty() {
         // No patterns means match all
@@ -363,12 +369,12 @@ fn should_extract(
     // Find which pattern matches (if any). A pattern selecting a directory also
     // selects its whole subtree unless `-d` (dir_only) was given.
     let expand_subtree = !options.dir_only;
-    let matching_pattern = find_matching_pattern_subtree(&options.patterns, &path, expand_subtree)
+    let matching_pattern = find_matching_pattern_subtree(&options.patterns, path, expand_subtree)
         .or_else(|| {
             // Only worth a second pass when stripping actually changed
             // something; otherwise this repeats the first pass verbatim for
             // every non-matching member.
-            if std::ptr::eq(path_stripped, path.as_ref() as &str) {
+            if std::ptr::eq(path_stripped, path) {
                 None
             } else {
                 find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
@@ -979,28 +985,34 @@ mod tests {
 
     #[test]
     fn test_strip_leading_components() {
-        assert_eq!(
-            strip_leading_components("a/b/c", 0).as_deref(),
-            Some("a/b/c")
-        );
-        assert_eq!(strip_leading_components("a/b/c", 1).as_deref(), Some("b/c"));
-        assert_eq!(strip_leading_components("a/b/c", 2).as_deref(), Some("c"));
+        // The function takes and returns pathnames, which are bytes; the
+        // fixtures here are ASCII, so a helper keeps the assertions readable.
+        fn strip(name: &str, n: usize) -> Option<String> {
+            strip_leading_components(std::path::Path::new(name), n)
+                .map(|p| String::from_utf8(crate::rawpath::as_bytes(&p).to_vec()).unwrap())
+        }
+
+        assert_eq!(strip("a/b/c", 0).as_deref(), Some("a/b/c"));
+        assert_eq!(strip("a/b/c", 1).as_deref(), Some("b/c"));
+        assert_eq!(strip("a/b/c", 2).as_deref(), Some("c"));
 
         // Nothing is left to name a file, so the member is dropped.
-        assert_eq!(strip_leading_components("a/b/c", 3), None);
-        assert_eq!(strip_leading_components("a/b/c", 4), None);
-        assert_eq!(strip_leading_components("a", 1), None);
+        assert_eq!(strip("a/b/c", 3), None);
+        assert_eq!(strip("a/b/c", 4), None);
+        assert_eq!(strip("a", 1), None);
 
         // "." and empty components are noise, not components: "./a/b" strips
         // exactly the way "a/b" does.
-        assert_eq!(strip_leading_components("./a/b", 1).as_deref(), Some("b"));
-        assert_eq!(
-            strip_leading_components("a//b/c", 1).as_deref(),
-            Some("b/c")
-        );
+        assert_eq!(strip("./a/b", 1).as_deref(), Some("b"));
+        assert_eq!(strip("a//b/c", 1).as_deref(), Some("b/c"));
 
         // A directory member keeps its trailing slash.
-        assert_eq!(strip_leading_components("a/b/", 1).as_deref(), Some("b/"));
+        assert_eq!(strip("a/b/", 1).as_deref(), Some("b/"));
+
+        // A component that is not UTF-8 is a component like any other.
+        let stripped =
+            strip_leading_components(&crate::rawpath::from_bytes(b"a/n\xffm/c"), 1).unwrap();
+        assert_eq!(crate::rawpath::as_bytes(&stripped), b"n\xffm/c");
     }
 
     /// Without explicit `-p p`/`-p e` the extracted mode is the archived mode

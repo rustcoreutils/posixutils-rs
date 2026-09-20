@@ -202,9 +202,10 @@ fn copy_member(
 
     // Selection and substitution both act on the member name, so they reach
     // every file in the subtree rather than only the operands.
-    let member_str = member.to_string_lossy().to_string();
+    let member_name = crate::rawpath::MatchName::of(member);
+    let member_str = member_name.as_str();
     if !options.patterns.is_empty() {
-        let matches = matches_any(&options.patterns, &member_str);
+        let matches = matches_any(&options.patterns, member_str);
         if options.exclude == matches {
             return Ok(());
         }
@@ -225,7 +226,7 @@ fn copy_member(
     let member = if options.substitutions.is_empty() {
         member.to_path_buf()
     } else {
-        match apply_substitutions(&options.substitutions, &member_str) {
+        match apply_substitutions(&options.substitutions, member_str) {
             SubstResult::Unchanged => member.to_path_buf(),
             SubstResult::Changed(new_name) => PathBuf::from(new_name),
             SubstResult::Empty => return Ok(()), // a null name means skip
@@ -233,7 +234,7 @@ fn copy_member(
     };
 
     let member = if let Some(ref mut p) = state.prompter {
-        match p.prompt(&member.to_string_lossy())? {
+        match p.prompt(crate::rawpath::MatchName::of(&member).as_str())? {
             RenameResult::Skip => return Ok(()),
             RenameResult::UseOriginal => member,
             RenameResult::Rename(new_name) => new_name,

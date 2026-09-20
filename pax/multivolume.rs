@@ -506,8 +506,14 @@ impl ArchiveReader for MultiVolumeReader {
                 let remaining_size = parse_octal(&header[124..136])?;
 
                 if self.options.verbose {
-                    let name = crate::formats::ustar::parse_path_field(&header[0..100]);
-                    eprintln!("pax: continuation of '{}' at offset {}", name, offset);
+                    let name = crate::rawpath::from_bytes(crate::formats::ustar::path_field(
+                        &header[0..100],
+                    ));
+                    eprintln!(
+                        "pax: continuation of '{}' at offset {}",
+                        name.display(),
+                        offset
+                    );
                 }
 
                 // Update our tracking - we're continuing from where we left off
@@ -645,8 +651,8 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     // itself. split_path errors rather than truncating when even the pair
     // cannot hold the path.
     let (name, prefix) = crate::formats::ustar::split_path(entry)?;
-    header[0..name.len()].copy_from_slice(name.as_bytes());
-    header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
+    header[0..name.len()].copy_from_slice(&name);
+    header[345..345 + prefix.len()].copy_from_slice(&prefix);
 
     // Mode, uid, gid
     write_octal(&mut header[100..], entry.mode as u64, 8);

@@ -30,7 +30,6 @@
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use std::io::{Read, Write};
-use std::path::PathBuf;
 
 const BLOCK_SIZE: usize = 512;
 /// Static zero buffer for padding and end-of-archive markers
@@ -265,10 +264,10 @@ impl SizeRule {
 }
 
 pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResult<ArchiveEntry> {
-    let name = parse_path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
-    let prefix = parse_path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
+    let name = path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
+    let prefix = path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
 
-    let path = build_path(&prefix, &name);
+    let path = crate::rawpath::join(prefix, name);
 
     let mode = parse_octal(&header[MODE_OFF..MODE_OFF + 8])? as u32;
     let uid = parse_octal(&header[UID_OFF..UID_OFF + 8])? as u32;
@@ -281,11 +280,11 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     let entry_type = flag.entry_type();
     let size = rule.data_size(entry_type, declared_size);
 
-    let linkname = parse_path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
-    let link_target = if !linkname.is_empty() {
-        Some(PathBuf::from(linkname))
-    } else {
+    let linkname = path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
+    let link_target = if linkname.is_empty() {
         None
+    } else {
+        Some(crate::rawpath::from_bytes(linkname))
     };
 
     // POSIX: "If conversion to a regular file occurs, the pax utility shall
@@ -351,14 +350,16 @@ pub(crate) fn parse_string(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// Parse a path field (name, prefix, linkname).
+/// The value of a path field (name, prefix, linkname), as bytes.
 ///
 /// These are NUL-terminated and a trailing <space> is a legitimate pathname
-/// character, so only the NUL terminator delimits the value — unlike the
-/// space-padded fields, no whitespace is trimmed.
-pub(crate) fn parse_path_field(bytes: &[u8]) -> String {
+/// character, so only the NUL terminator delimits the value -- unlike the
+/// space-padded fields, no whitespace is trimmed. Nor is anything decoded: a
+/// pathname is a byte string, and deciding it is text is how a member named
+/// `na\377me.txt` came back as something else. See `crate::rawpath`.
+pub(crate) fn path_field(bytes: &[u8]) -> &[u8] {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).to_string()
+    &bytes[..end]
 }
 
 /// Parse an octal number from bytes
@@ -456,15 +457,6 @@ pub(crate) fn parse_typeflag(flag: u8) -> TypeFlag {
         b'M' => TypeFlag::Unimplemented("a GNU multi-volume continuation"),
         b'D' | b'N' => TypeFlag::Unimplemented("a GNU incremental-dump record"),
         _ => TypeFlag::Unknown,
-    }
-}
-
-/// Build full path from prefix and name
-pub(crate) fn build_path(prefix: &str, name: &str) -> PathBuf {
-    if prefix.is_empty() {
-        PathBuf::from(name)
-    } else {
-        PathBuf::from(format!("{}/{}", prefix, name))
     }
 }
 
@@ -594,11 +586,11 @@ fn report_long_name_group(
     // The long name if the archive gave one, otherwise the truncated name in
     // the member's own header -- which is all there is to go on for a lone `K`.
     let name = match long_name {
-        Some(n) => String::from_utf8_lossy(n).into_owned(),
-        None => parse_path_field(&member[NAME_OFF..NAME_OFF + NAME_LEN]),
+        Some(n) => crate::rawpath::from_bytes(n),
+        None => crate::rawpath::from_bytes(path_field(&member[NAME_OFF..NAME_OFF + NAME_LEN])),
     };
     crate::error::report_error(
-        name,
+        name.display(),
         format!(
             "uses {}, which is not supported; skipping the member",
             kinds.join(" and ")
@@ -648,7 +640,7 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     let (name, prefix) = split_path(entry)?;
 
     // Write fields
-    write_string(&mut header[NAME_OFF..], &name, NAME_LEN);
+    write_field(&mut header[NAME_OFF..], &name, NAME_LEN);
     write_octal(&mut header[MODE_OFF..], entry.mode as u64, 8)?;
     write_octal(&mut header[UID_OFF..], entry.uid as u64, 8)?;
     write_octal(&mut header[GID_OFF..], entry.gid as u64, 8)?;
@@ -665,11 +657,13 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // Linkname
     if let Some(ref target) = entry.link_target {
-        let link_str = target.to_string_lossy();
-        if link_str.len() > LINKNAME_LEN {
-            return Err(PaxError::PathTooLong(link_str.to_string()));
+        let link_bytes = crate::rawpath::as_bytes(target);
+        if link_bytes.len() > LINKNAME_LEN {
+            return Err(PaxError::PathTooLong(
+                String::from_utf8_lossy(link_bytes).into_owned(),
+            ));
         }
-        write_string(&mut header[LINKNAME_OFF..], &link_str, LINKNAME_LEN);
+        write_field(&mut header[LINKNAME_OFF..], link_bytes, LINKNAME_LEN);
     }
 
     // Magic and version
@@ -678,10 +672,10 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // uname and gname
     if let Some(ref uname) = entry.uname {
-        write_string(&mut header[UNAME_OFF..], uname, UNAME_LEN);
+        write_field(&mut header[UNAME_OFF..], uname.as_bytes(), UNAME_LEN);
     }
     if let Some(ref gname) = entry.gname {
-        write_string(&mut header[GNAME_OFF..], gname, GNAME_LEN);
+        write_field(&mut header[GNAME_OFF..], gname.as_bytes(), GNAME_LEN);
     }
 
     // Device major/minor (always written for POSIX compliance)
@@ -689,7 +683,7 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     write_octal(&mut header[DEVMINOR_OFF..], entry.devminor as u64, 8)?;
 
     // Prefix
-    write_string(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
+    write_field(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
 
     // Calculate and write checksum
     let checksum = calculate_checksum(&header);
@@ -699,19 +693,22 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 }
 
 /// Split path into name (max 100) and prefix (max 155)
-pub(crate) fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
-    let path_str = ustar_path_string(entry);
-    try_split_path(&path_str).ok_or(PaxError::PathTooLong(path_str))
+pub(crate) fn split_path(entry: &ArchiveEntry) -> PaxResult<(Vec<u8>, Vec<u8>)> {
+    let path = ustar_path_bytes(entry);
+    try_split_path(&path).ok_or_else(|| {
+        // A fatal diagnostic about a name that is already too long is not a
+        // round trip, so rendering it for the message costs nothing.
+        PaxError::PathTooLong(String::from_utf8_lossy(&path).into_owned())
+    })
 }
 
 /// The member name as ustar spells it: a directory carries a trailing slash.
-pub(crate) fn ustar_path_string(entry: &ArchiveEntry) -> String {
-    let path_str = entry.path.to_string_lossy();
-    if entry.is_dir() && !path_str.ends_with('/') {
-        format!("{}/", path_str)
-    } else {
-        path_str.into_owned()
+pub(crate) fn ustar_path_bytes(entry: &ArchiveEntry) -> Vec<u8> {
+    let mut bytes = crate::rawpath::as_bytes(&entry.path).to_vec();
+    if entry.is_dir() && bytes.last() != Some(&b'/') {
+        bytes.push(b'/');
     }
+    bytes
 }
 
 /// Split a path into the ustar name (max 100) and prefix (max 155) fields.
@@ -721,16 +718,15 @@ pub(crate) fn ustar_path_string(entry: &ArchiveEntry) -> String {
 /// nowhere else to put the name and fails, while pax writes a `path=` extended
 /// header record and leaves these fields as a fallback for readers that ignore
 /// it.
-pub(crate) fn try_split_path(path_str: &str) -> Option<(String, String)> {
-    if path_str.len() <= NAME_LEN {
-        return Some((path_str.to_string(), String::new()));
+pub(crate) fn try_split_path(path: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    if path.len() <= NAME_LEN {
+        return Some((path.to_vec(), Vec::new()));
     }
 
     // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
-    // '/' is ASCII, so an index holding it is always a char boundary.
-    for i in (1..=PREFIX_LEN.min(path_str.len().saturating_sub(1))).rev() {
-        if path_str.as_bytes()[i] == b'/' && path_str.len() - (i + 1) <= NAME_LEN {
-            return Some((path_str[i + 1..].to_string(), path_str[..i].to_string()));
+    for i in (1..=PREFIX_LEN.min(path.len().saturating_sub(1))).rev() {
+        if path[i] == b'/' && path.len() - (i + 1) <= NAME_LEN {
+            return Some((path[i + 1..].to_vec(), path[..i].to_vec()));
         }
     }
 
@@ -752,8 +748,7 @@ fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
 }
 
 /// Write a string to a field, NUL-terminated if space permits
-pub(crate) fn write_string(buf: &mut [u8], s: &str, max_len: usize) {
-    let bytes = s.as_bytes();
+pub(crate) fn write_field(buf: &mut [u8], bytes: &[u8], max_len: usize) {
     let len = std::cmp::min(bytes.len(), max_len);
     buf[..len].copy_from_slice(&bytes[..len]);
 }
@@ -816,6 +811,7 @@ fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_parse_octal() {
@@ -854,8 +850,8 @@ mod tests {
     fn test_split_path_short() {
         let entry = ArchiveEntry::new(PathBuf::from("short.txt"), EntryType::Regular);
         let (name, prefix) = split_path(&entry).unwrap();
-        assert_eq!(name, "short.txt");
-        assert_eq!(prefix, "");
+        assert_eq!(name, b"short.txt");
+        assert_eq!(prefix, b"");
     }
 
     #[test]

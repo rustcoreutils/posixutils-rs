@@ -18,6 +18,7 @@ mod modes;
 mod multivolume;
 mod options;
 mod pattern;
+mod rawpath;
 mod subst;
 
 use archive::{ArchiveFormat, ArchiveWriter};

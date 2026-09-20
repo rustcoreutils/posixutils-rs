@@ -27,7 +27,7 @@ use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
     calculate_checksum, parse_header as parse_ustar_header, parse_octal, try_split_path,
-    ustar_path_string, verify_checksum, SizeRule,
+    ustar_path_bytes, verify_checksum, write_field, SizeRule,
 };
 use crate::options::FormatOptions;
 use std::collections::HashMap;
@@ -474,10 +474,10 @@ impl ExtendedHeader {
         // when it has no '/' at a position that leaves a <= NAME_LEN tail
         // (e.g. a 190-byte "dir/<185-byte-basename>"). Without this record the
         // ustar fallback in split_path() silently truncates the name.
-        let path_bytes = entry.path.as_os_str().as_bytes();
-        let path_str = ustar_path_string(entry);
+        let path_bytes = crate::rawpath::as_bytes(&entry.path);
+        let ustar_spelling = ustar_path_bytes(entry);
         let path_is_binary = std::str::from_utf8(path_bytes).is_err();
-        if try_split_path(&path_str).is_none() || path_is_binary {
+        if try_split_path(&ustar_spelling).is_none() || path_is_binary {
             // A non-UTF-8 name has no faithful ustar spelling, so it always
             // needs the record regardless of length.
             header.path = Some(path_bytes.to_vec());
@@ -917,7 +917,7 @@ impl<W: Write> PaxWriter<W> {
         } else {
             glob_name
         };
-        write_string(&mut header[NAME_OFF..], &glob_name, NAME_LEN);
+        write_field(&mut header[NAME_OFF..], glob_name.as_bytes(), NAME_LEN);
 
         // Mode, uid, gid (use reasonable defaults)
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
@@ -984,7 +984,7 @@ impl<W: Write> PaxWriter<W> {
         } else {
             ext_name
         };
-        write_string(&mut header[NAME_OFF..], &ext_name, NAME_LEN);
+        write_field(&mut header[NAME_OFF..], ext_name.as_bytes(), NAME_LEN);
 
         // Mode, uid, gid (use reasonable defaults)
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
@@ -1088,7 +1088,7 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     let (name, prefix) = split_path(entry)?;
 
     // Write fields
-    write_string(&mut header[NAME_OFF..], &name, NAME_LEN);
+    write_field(&mut header[NAME_OFF..], &name, NAME_LEN);
     write_octal(&mut header[MODE_OFF..], entry.mode as u64, 8);
     write_octal(
         &mut header[UID_OFF..],
@@ -1113,11 +1113,13 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // Linkname
     if let Some(ref target) = entry.link_target {
-        let link_str = target.to_string_lossy();
-        // Truncate on a char boundary; the full target is in the `linkpath`
-        // extended record whenever it exceeds LINKNAME_LEN.
-        let truncated = &link_str[..floor_char_boundary(&link_str, LINKNAME_LEN)];
-        write_string(&mut header[LINKNAME_OFF..], truncated, LINKNAME_LEN);
+        let link_bytes = crate::rawpath::as_bytes(target);
+        // Truncate on a character boundary where there is one; the full target
+        // is in the `linkpath` extended record whenever it exceeds
+        // LINKNAME_LEN, so this field is only a fallback for a reader that
+        // ignores extended headers.
+        let truncated = &link_bytes[..floor_char_boundary(link_bytes, LINKNAME_LEN)];
+        write_field(&mut header[LINKNAME_OFF..], truncated, LINKNAME_LEN);
     }
 
     // Magic and version
@@ -1126,10 +1128,10 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // uname and gname
     if let Some(ref uname) = entry.uname {
-        write_string(&mut header[UNAME_OFF..], uname, UNAME_LEN);
+        write_field(&mut header[UNAME_OFF..], uname.as_bytes(), UNAME_LEN);
     }
     if let Some(ref gname) = entry.gname {
-        write_string(&mut header[GNAME_OFF..], gname, GNAME_LEN);
+        write_field(&mut header[GNAME_OFF..], gname.as_bytes(), GNAME_LEN);
     }
 
     // Device major/minor (always written for POSIX compliance)
@@ -1137,7 +1139,7 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     write_octal(&mut header[DEVMINOR_OFF..], entry.devminor as u64, 8);
 
     // Prefix
-    write_string(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
+    write_field(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
 
     // Calculate and write checksum
     let checksum = calculate_checksum(&header);
@@ -1153,26 +1155,36 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 /// `ExtendedHeader::from_entry`, so these fields are only a fallback for a
 /// reader that ignores extended headers. Truncate on a UTF-8 character
 /// boundary so a multi-byte character straddling NAME_LEN does not panic.
-fn split_path(entry: &ArchiveEntry) -> PaxResult<(String, String)> {
-    let path_str = ustar_path_string(entry);
+fn split_path(entry: &ArchiveEntry) -> PaxResult<(Vec<u8>, Vec<u8>)> {
+    let path = ustar_path_bytes(entry);
 
-    if let Some(split) = try_split_path(&path_str) {
+    if let Some(split) = try_split_path(&path) {
         return Ok(split);
     }
 
     Ok((
-        path_str[..floor_char_boundary(&path_str, NAME_LEN)].to_string(),
-        String::new(),
+        path[..floor_char_boundary(&path, NAME_LEN)].to_vec(),
+        Vec::new(),
     ))
 }
 
-/// Largest index `<= max` that lies on a UTF-8 character boundary of `s`.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    if max >= s.len() {
-        return s.len();
+/// Largest index `<= max` that does not cut a UTF-8 character of `bytes` in
+/// half.
+///
+/// Truncating mid-character produces a field a legacy reader renders as
+/// mojibake, so back up over continuation bytes. At most three of them can
+/// precede a lead byte, and stopping there is what keeps this well-behaved on
+/// a name that is not UTF-8 at all -- where every byte may look like a
+/// continuation and there is no boundary to find.
+fn floor_char_boundary(bytes: &[u8], max: usize) -> usize {
+    if max >= bytes.len() {
+        return bytes.len();
     }
     let mut end = max;
-    while !s.is_char_boundary(end) {
+    for _ in 0..3 {
+        if end == 0 || bytes[end] & 0xC0 != 0x80 {
+            break;
+        }
         end -= 1;
     }
     end
@@ -1190,13 +1202,6 @@ fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
         EntryType::Fifo => FIFOTYPE,
         EntryType::Socket => REGTYPE, // Sockets not supported in tar, fall back to regular
     }
-}
-
-/// Write a string to a field, NUL-terminated if space permits
-fn write_string(buf: &mut [u8], s: &str, max_len: usize) {
-    let bytes = s.as_bytes();
-    let len = std::cmp::min(bytes.len(), max_len);
-    buf[..len].copy_from_slice(&bytes[..len]);
 }
 
 /// Write an octal number to a field

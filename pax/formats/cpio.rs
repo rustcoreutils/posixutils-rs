@@ -226,7 +226,7 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
         self.format = Some(format);
 
         // Check for trailer
-        if entry.path.to_string_lossy() == TRAILER {
+        if crate::rawpath::as_bytes(&entry.path) == TRAILER.as_bytes() {
             self.finished = true;
             return Ok(None);
         }
@@ -325,7 +325,7 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
         };
 
         // The name is stored NUL-terminated and c_namesize counts the NUL.
-        let name = entry.path.to_string_lossy();
+        let name = crate::rawpath::as_bytes(&entry.path);
         let namesize = name.len() + 1;
 
         let header = match self.format {
@@ -336,7 +336,7 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
             CpioFormat::Binary => build_bin_header(entry, ino, namesize)?,
         };
         self.writer.write_all(&header)?;
-        self.writer.write_all(name.as_bytes())?;
+        self.writer.write_all(name)?;
         self.writer.write_all(&[0])?;
 
         // newc aligns the header plus its name to 4 bytes, the old binary
@@ -412,8 +412,7 @@ fn parse_odc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<Archive
     )?;
 
     // Remove trailing NUL
-    let name = parse_name(&name_buf)?;
-    let path = PathBuf::from(name);
+    let path = parse_name(&name_buf)?;
 
     let entry_type = parse_mode_type(mode);
 
@@ -425,7 +424,7 @@ fn parse_odc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<Archive
             crate::formats::MAX_NAME,
             "cpio symbolic link target",
         )?;
-        Some(PathBuf::from(parse_link_target(&target_buf)))
+        Some(parse_link_target(&target_buf))
     } else {
         None
     };
@@ -510,8 +509,7 @@ fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(Archi
     }
 
     // Remove trailing NUL
-    let name = parse_name(&name_buf)?;
-    let path = PathBuf::from(name);
+    let path = parse_name(&name_buf)?;
 
     let entry_type = parse_mode_type(mode);
 
@@ -529,7 +527,7 @@ fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(Archi
             let mut pad = vec![0u8; symlink_padding];
             reader.read_exact(&mut pad)?;
         }
-        (Some(PathBuf::from(parse_link_target(&target_buf))), 0, 0)
+        (Some(parse_link_target(&target_buf)), 0, 0)
     } else {
         // Calculate padding after file data
         let file_padding = if filesize > 0 {
@@ -628,8 +626,7 @@ fn parse_bin_header<R: Read>(
     }
 
     // Remove trailing NUL
-    let name = parse_name(&name_buf)?;
-    let path = PathBuf::from(name);
+    let path = parse_name(&name_buf)?;
 
     let entry_type = parse_mode_type(mode);
 
@@ -647,7 +644,7 @@ fn parse_bin_header<R: Read>(
             let mut pad = [0u8; 1];
             reader.read_exact(&mut pad)?;
         }
-        (Some(PathBuf::from(parse_link_target(&target_buf))), 0, 0)
+        (Some(parse_link_target(&target_buf)), 0, 0)
     } else {
         // Calculate padding after file data (must be word-aligned)
         let file_padding = if filesize > 0 {
@@ -709,7 +706,7 @@ fn parse_hex_field(bytes: &[u8]) -> PaxResult<u64> {
 /// length", "file name is not nul-terminated"); accepting them silently turned
 /// a `c_namesize` of zero into a member with an empty name, listed as a blank
 /// line and extracted as nothing at all, with a zero exit status.
-fn parse_name(bytes: &[u8]) -> PaxResult<String> {
+fn parse_name(bytes: &[u8]) -> PaxResult<PathBuf> {
     if bytes.is_empty() {
         return Err(PaxError::InvalidHeader(
             "cpio member name is of zero length".to_string(),
@@ -725,14 +722,14 @@ fn parse_name(bytes: &[u8]) -> PaxResult<String> {
             "cpio member name is empty".to_string(),
         ));
     }
-    Ok(String::from_utf8_lossy(&bytes[..end]).to_string())
+    Ok(crate::rawpath::from_bytes(&bytes[..end]))
 }
 
 /// A symbolic link's target, which is the member data rather than a
 /// NUL-terminated name field -- some writers pad it with a NUL, some do not.
-fn parse_link_target(bytes: &[u8]) -> String {
+fn parse_link_target(bytes: &[u8]) -> PathBuf {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).to_string()
+    crate::rawpath::from_bytes(&bytes[..end])
 }
 
 /// Parse file type from c_mode
@@ -1034,7 +1031,10 @@ mod tests {
 
     #[test]
     fn test_parse_name() {
-        assert_eq!(parse_name(b"hello\0").unwrap(), "hello");
+        assert_eq!(
+            crate::rawpath::as_bytes(&parse_name(b"hello\0").unwrap()),
+            b"hello"
+        );
 
         // c_namesize counts the terminator, so a field without one is
         // malformed -- GNU cpio says so and we used to accept it.

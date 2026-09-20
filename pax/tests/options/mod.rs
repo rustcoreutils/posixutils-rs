@@ -452,40 +452,51 @@ fn test_option_invalid_bypass() {
 }
 
 #[test]
-fn test_option_invalid_write() {
+fn test_option_invalid_unimplemented_actions_are_refused() {
+    // POSIX scopes -o invalid= to a value in an extended header record that
+    // the destination cannot hold. `bypass` -- skip the member -- is what pax
+    // does, so it is accepted. The other four each have to create or rename a
+    // file and none is implemented; accepting one and doing nothing is the
+    // failure worth avoiding, so each is refused by name.
     let temp = TempDir::new().unwrap();
-    let src_dir = temp.path().join("source");
     let archive = temp.path().join("test.tar");
-    let dst_dir = temp.path().join("dest");
 
-    // Create source file
-    fs::create_dir(&src_dir).unwrap();
-    let mut f = File::create(src_dir.join("test_file.txt")).unwrap();
-    writeln!(f, "Test file content").unwrap();
-
-    // Create archive with -o invalid=write
-    let output = run_pax_in_dir(
+    let ok = run_pax_in_dir(
         &[
             "-w",
             "-x",
             "pax",
             "-o",
-            "invalid=write",
+            "invalid=bypass",
             "-f",
             archive.to_str().unwrap(),
             ".",
         ],
-        &src_dir,
+        temp.path(),
     );
-    assert_success(&output, "pax write with invalid=write option");
+    assert_success(&ok, "invalid=bypass is what pax does");
 
-    // Extract and verify
-    fs::create_dir(&dst_dir).unwrap();
-    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
-    assert_success(&output, "pax read after invalid=write");
-
-    let content = fs::read_to_string(dst_dir.join("test_file.txt")).unwrap();
-    assert!(content.contains("Test file content"));
+    for action in ["write", "rename", "UTF-8", "binary"] {
+        let output = run_pax_in_dir(
+            &[
+                "-w",
+                "-x",
+                "pax",
+                "-o",
+                &format!("invalid={action}"),
+                "-f",
+                archive.to_str().unwrap(),
+                ".",
+            ],
+            temp.path(),
+        );
+        assert_failure(&output, &format!("invalid={action} should be refused"));
+        assert!(
+            stderr_str(&output).contains(action),
+            "the diagnostic must name the action: {}",
+            stderr_str(&output)
+        );
+    }
 }
 
 #[test]

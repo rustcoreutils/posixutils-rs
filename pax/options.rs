@@ -25,7 +25,7 @@ use std::collections::HashMap;
 /// Information about an archive entry for list formatting
 #[derive(Debug, Clone)]
 pub struct ListEntryInfo<'a> {
-    pub path: &'a str,
+    pub path: &'a std::path::Path,
     pub mode: u32,
     pub size: u64,
     pub mtime: u64,
@@ -37,46 +37,29 @@ pub struct ListEntryInfo<'a> {
     pub gid: u32,
     pub uname: Option<&'a str>,
     pub gname: Option<&'a str>,
-    pub link_target: Option<&'a str>,
+    pub link_target: Option<&'a std::path::Path>,
     pub entry_type: EntryType,
     pub devmajor: u32,
     pub devminor: u32,
 }
 
-/// Action to take when a filename contains invalid characters
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InvalidAction {
-    /// Skip files with invalid filenames (default in write mode)
-    #[default]
-    Bypass,
-    /// Prompt interactively for new name (reuses -i mechanism)
-    Rename,
-    /// Write file with translated/sanitized name
-    Write,
-    /// Use raw UTF-8 encoding without translation
-    Utf8,
-    /// Generate hdrcharset=BINARY header for non-UTF-8 data
-    Binary,
-}
-
-/// String to InvalidAction mapping table
-const INVALID_ACTION_MAP: &[(&str, InvalidAction)] = &[
-    ("bypass", InvalidAction::Bypass),
-    ("rename", InvalidAction::Rename),
-    ("write", InvalidAction::Write),
-    ("UTF-8", InvalidAction::Utf8),
-    ("binary", InvalidAction::Binary),
+/// The `-o invalid=` actions POSIX defines, and whether this implementation
+/// performs them.
+///
+/// POSIX scopes this keyword to values in an *extended header record* in read,
+/// copy and list mode -- a name "invalid in the destination hierarchy". On
+/// Linux the only thing that makes a pathname invalid is an embedded NUL, and
+/// such a member is already diagnosed and skipped, which is what `bypass`
+/// specifies. The other four actions would each have to create or rename a
+/// file, and none of them is implemented: accepting them and doing nothing is
+/// the silent-acceptance failure, so they are refused by name.
+const INVALID_ACTIONS: &[(&str, bool)] = &[
+    ("bypass", true),
+    ("rename", false),
+    ("write", false),
+    ("UTF-8", false),
+    ("binary", false),
 ];
-
-impl InvalidAction {
-    /// Parse from string value
-    pub fn from_str(s: &str) -> Option<Self> {
-        INVALID_ACTION_MAP
-            .iter()
-            .find(|(name, _)| *name == s)
-            .map(|(_, action)| *action)
-    }
-}
 
 /// Parsed format options
 #[derive(Debug, Clone, Default)]
@@ -102,8 +85,6 @@ pub struct FormatOptions {
     /// Global extended header name template (globexthdr.name)
     /// Default: "$TMPDIR/GlobalHead.%p.%n"
     pub globexthdr_name: Option<String>,
-    /// Action to take for invalid filenames
-    pub invalid_action: InvalidAction,
 }
 
 /// Known option identifiers for table-driven parsing
@@ -243,13 +224,22 @@ impl FormatOptions {
                 }
                 Invalid => {
                     if let Some(v) = value {
-                        if let Some(action) = InvalidAction::from_str(v) {
-                            self.invalid_action = action;
-                        } else {
-                            return Err(PaxError::InvalidFormat(format!(
-                                "invalid value for 'invalid' option: {}",
-                                v
-                            )));
+                        match INVALID_ACTIONS.iter().find(|(name, _)| *name == v) {
+                            Some((_, true)) => {}
+                            Some((name, false)) => {
+                                return Err(PaxError::InvalidFormat(format!(
+                                    "invalid={name} is not supported; the only \
+                                     supported action is invalid=bypass, which \
+                                     skips a member whose name the destination \
+                                     cannot hold"
+                                )))
+                            }
+                            None => {
+                                return Err(PaxError::InvalidFormat(format!(
+                                    "invalid value for 'invalid' option: {}",
+                                    v
+                                )))
+                            }
                         }
                     }
                 }
@@ -448,87 +438,91 @@ fn expand_global_header_template(template: &str, sequence: u64) -> String {
 }
 
 // Format specifier handlers for list entry formatting
-fn fmt_basename(info: &ListEntryInfo) -> String {
-    std::path::Path::new(info.path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| info.path.to_string())
+fn fmt_basename(info: &ListEntryInfo) -> Vec<u8> {
+    match info.path.file_name() {
+        Some(name) => crate::rawpath::as_bytes(std::path::Path::new(name)).to_vec(),
+        None => fmt_fullpath(info),
+    }
 }
 
-fn fmt_fullpath(info: &ListEntryInfo) -> String {
-    info.path.to_string()
+fn fmt_fullpath(info: &ListEntryInfo) -> Vec<u8> {
+    crate::rawpath::as_bytes(info.path).to_vec()
 }
 
-fn fmt_link_target(info: &ListEntryInfo) -> String {
-    info.link_target.unwrap_or("").to_string()
+fn fmt_link_target(info: &ListEntryInfo) -> Vec<u8> {
+    info.link_target
+        .map(|p| crate::rawpath::as_bytes(p).to_vec())
+        .unwrap_or_default()
 }
 
-fn fmt_mode_octal(info: &ListEntryInfo) -> String {
-    format!("{:o}", info.mode & 0o7777)
+fn fmt_mode_octal(info: &ListEntryInfo) -> Vec<u8> {
+    format!("{:o}", info.mode & 0o7777).into_bytes()
 }
 
-fn fmt_mode_symbolic(info: &ListEntryInfo) -> String {
-    format_mode_symbolic(info.mode, info.entry_type)
+fn fmt_mode_symbolic(info: &ListEntryInfo) -> Vec<u8> {
+    format_mode_symbolic(info.mode, info.entry_type).into_bytes()
 }
 
-fn fmt_device(info: &ListEntryInfo) -> String {
-    format!("{},{}", info.devmajor, info.devminor)
+fn fmt_device(info: &ListEntryInfo) -> Vec<u8> {
+    format!("{},{}", info.devmajor, info.devminor).into_bytes()
 }
 
 /// Bare `%D`. Rule 10: with no keyword to fall back on, a non-device entry
 /// renders as a single <space>.
-fn fmt_device_or_space(info: &ListEntryInfo) -> String {
+fn fmt_device_or_space(info: &ListEntryInfo) -> Vec<u8> {
     if is_device(info) {
         fmt_device(info)
     } else {
-        " ".to_string()
+        b" ".to_vec()
     }
 }
 
-fn fmt_size(info: &ListEntryInfo) -> String {
-    info.size.to_string()
+fn fmt_size(info: &ListEntryInfo) -> Vec<u8> {
+    info.size.to_string().into_bytes()
 }
 
-fn fmt_mtime_trad(info: &ListEntryInfo) -> String {
-    format_time_traditional(info.mtime)
+fn fmt_mtime_trad(info: &ListEntryInfo) -> Vec<u8> {
+    format_time_traditional(info.mtime).into_bytes()
 }
 
 /// Bare `%T`. Rule 8: the default keyword is mtime and the default subformat is
 /// `%b %e %H:%M %Y`.
-fn fmt_mtime_posix(info: &ListEntryInfo) -> String {
-    strftime_or_secs(info.mtime, DEFAULT_TIME_SUBFORMAT)
+fn fmt_mtime_posix(info: &ListEntryInfo) -> Vec<u8> {
+    strftime_or_secs(info.mtime, DEFAULT_TIME_SUBFORMAT).into_bytes()
 }
 
-fn fmt_username(info: &ListEntryInfo) -> String {
+fn fmt_username(info: &ListEntryInfo) -> Vec<u8> {
     info.uname
         .map(|s| s.to_string())
         .unwrap_or_else(|| info.uid.to_string())
+        .into_bytes()
 }
 
-fn fmt_groupname(info: &ListEntryInfo) -> String {
+fn fmt_groupname(info: &ListEntryInfo) -> Vec<u8> {
     info.gname
         .map(|s| s.to_string())
         .unwrap_or_else(|| info.gid.to_string())
+        .into_bytes()
 }
 
-fn fmt_uid(info: &ListEntryInfo) -> String {
-    info.uid.to_string()
+fn fmt_uid(info: &ListEntryInfo) -> Vec<u8> {
+    info.uid.to_string().into_bytes()
 }
 
-fn fmt_gid(info: &ListEntryInfo) -> String {
-    info.gid.to_string()
+fn fmt_gid(info: &ListEntryInfo) -> Vec<u8> {
+    info.gid.to_string().into_bytes()
 }
 
-fn fmt_newline(_info: &ListEntryInfo) -> String {
-    "\n".to_string()
+fn fmt_newline(_info: &ListEntryInfo) -> Vec<u8> {
+    b"\n".to_vec()
 }
 
-fn fmt_percent(_info: &ListEntryInfo) -> String {
-    "%".to_string()
+fn fmt_percent(_info: &ListEntryInfo) -> Vec<u8> {
+    b"%".to_vec()
 }
 
 /// Type alias for format specifier handler
-type FormatHandler = fn(&ListEntryInfo) -> String;
+type FormatHandler = fn(&ListEntryInfo) -> Vec<u8>;
 
 /// Table of format specifiers and their handler functions
 const FORMAT_SPECIFIERS: &[(char, FormatHandler)] = &[
@@ -608,19 +602,21 @@ fn unescape_backslashes(s: &str) -> String {
 /// - `%G` - group gid
 /// - `%n` - newline
 /// - `%%` - literal %
-pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> String {
-    let mut result = String::new();
+pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> Vec<u8> {
+    let mut result: Vec<u8> = Vec::new();
     let mut chars = format.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c == '%' {
             if let Some(spec) = parse_format_specifier(&mut chars) {
-                result.push_str(&format_with_spec(info, spec));
+                result.extend_from_slice(&format_with_spec(info, spec));
             } else {
-                result.push('%');
+                result.push(b'%');
             }
         } else {
-            result.push(c);
+            // The format string is operator-supplied text; its literal
+            // characters go out as their UTF-8 encoding.
+            result.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
         }
     }
 
@@ -701,39 +697,46 @@ fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<
     }
 }
 
-fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
+fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> Vec<u8> {
     let mut rendered = if let Some(ref keyword) = spec.keyword {
         match keyword_value(info, keyword, spec.spec) {
             KeywordValue::Value(v) => v,
-            KeywordValue::Absent => String::new(),
-            KeywordValue::Unknown => format!("%({}){}", keyword, spec.spec),
+            KeywordValue::Absent => Vec::new(),
+            KeywordValue::Unknown => format!("%({}){}", keyword, spec.spec).into_bytes(),
         }
     } else if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec.spec) {
         handler(info)
     } else {
         let mut literal = String::from("%");
         literal.push(spec.spec);
-        literal
+        literal.into_bytes()
     };
 
-    // Width and precision count characters, not bytes: `%.N` is a precision on
-    // the string value, and a byte index would both split a multi-byte
-    // character (`String::truncate` panics on a non-boundary index) and
-    // mis-align a column holding a non-ASCII name.
+    // Width and precision count display units, not bytes: a byte index would
+    // split a multi-byte character and mis-align a column holding a non-ASCII
+    // name. A unit is one valid UTF-8 character or one byte that cannot start
+    // one, so a name that is not UTF-8 is measured rather than rejected. On
+    // input that is valid UTF-8 this is exactly a character count.
+    let units = crate::rawpath::unit_starts(&rendered);
+
     if let Some(precision) = spec.precision {
-        if let Some((byte_idx, _)) = rendered.char_indices().nth(precision) {
+        if let Some(&byte_idx) = units.get(precision) {
             rendered.truncate(byte_idx);
         }
     }
 
     if let Some(width) = spec.width {
-        let chars = rendered.chars().count();
-        if chars < width {
-            let padding = " ".repeat(width - chars);
+        let count = if spec.precision.is_some() {
+            crate::rawpath::unit_starts(&rendered).len()
+        } else {
+            units.len()
+        };
+        if count < width {
+            let padding = vec![b' '; width - count];
             if spec.left_justify {
-                rendered.push_str(&padding);
+                rendered.extend_from_slice(&padding);
             } else {
-                rendered.insert_str(0, &padding);
+                rendered.splice(0..0, padding);
             }
         }
     }
@@ -744,7 +747,7 @@ fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> String {
 /// Outcome of resolving a `%(keyword)` listopt substitution.
 enum KeywordValue {
     /// The keyword resolved to this rendered value.
-    Value(String),
+    Value(Vec<u8>),
     /// A keyword we recognize, for which this archive member carried no record
     /// (an `atime` request against an archive written without `-o times`, say).
     /// POSIX rule 7 defines the result as the value from the extended header,
@@ -794,22 +797,22 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
         return match seconds {
             // Only `T` renders a calendar time; s/d yield the raw seconds.
             Some(secs) if conversion == 'T' => {
-                KeywordValue::Value(strftime_or_secs(secs, subformat))
+                KeywordValue::Value(strftime_or_secs(secs, subformat).into_bytes())
             }
-            Some(secs) => KeywordValue::Value(secs.to_string()),
+            Some(secs) => KeywordValue::Value(secs.to_string().into_bytes()),
             None => KeywordValue::Absent,
         };
     }
 
-    let value = match keyword {
+    let value: Vec<u8> = match keyword {
         "path" | "name" => fmt_fullpath(info),
-        "size" => info.size.to_string(),
-        "uid" => info.uid.to_string(),
-        "gid" => info.gid.to_string(),
-        "uname" => info.uname.unwrap_or("").to_string(),
-        "gname" => info.gname.unwrap_or("").to_string(),
-        "linkpath" => info.link_target.unwrap_or("").to_string(),
-        "mode" => format!("{:o}", info.mode),
+        "size" => info.size.to_string().into_bytes(),
+        "uid" => info.uid.to_string().into_bytes(),
+        "gid" => info.gid.to_string().into_bytes(),
+        "uname" => info.uname.unwrap_or("").as_bytes().to_vec(),
+        "gname" => info.gname.unwrap_or("").as_bytes().to_vec(),
+        "linkpath" => fmt_link_target(info),
+        "mode" => format!("{:o}", info.mode).into_bytes(),
         _ => return KeywordValue::Unknown,
     };
 
@@ -817,7 +820,7 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
     // rather than which field to read, so they still apply when a keyword was
     // given (e.g. `%(path)F`).
     let rendered = match conversion {
-        'M' => format_mode_symbolic(info.mode, info.entry_type),
+        'M' => format_mode_symbolic(info.mode, info.entry_type).into_bytes(),
         'F' => fmt_fullpath(info),
         'L' => fmt_link_target(info),
         // Rule 10: D names the device of a block/character special file. When
@@ -1025,10 +1028,17 @@ mod tests {
         assert_eq!(opts1.list_format, Some("%F".to_string()));
     }
 
+    /// `format_list_entry` yields bytes, because a member name is bytes. Every
+    /// fixture here is ASCII, so rendering back to a `String` keeps the
+    /// assertions readable; the byte-exact cases assert on the Vec directly.
+    fn fmt(format: &str, info: &ListEntryInfo) -> String {
+        String::from_utf8(format_list_entry(format, info)).expect("ASCII fixture")
+    }
+
     #[test]
     fn test_format_list_entry_basic() {
         let info = ListEntryInfo {
-            path: "path/to/file.txt",
+            path: std::path::Path::new("path/to/file.txt"),
             mode: 0o644,
             size: 1234,
             mtime: 0,
@@ -1043,7 +1053,7 @@ mod tests {
             devmajor: 0,
             devminor: 0,
         };
-        let result = format_list_entry("%F", &info);
+        let result = fmt("%F", &info);
         assert_eq!(result, "path/to/file.txt");
     }
 
@@ -1053,7 +1063,7 @@ mod tests {
     #[test]
     fn test_format_list_entry_precision_is_char_counted() {
         let info = ListEntryInfo {
-            path: "élan.txt",
+            path: std::path::Path::new("élan.txt"),
             mode: 0o644,
             size: 0,
             mtime: 0,
@@ -1070,21 +1080,21 @@ mod tests {
         };
 
         // 'é' is two bytes; a byte-indexed truncate(1) split it and aborted.
-        assert_eq!(format_list_entry("%.1F", &info), "é");
-        assert_eq!(format_list_entry("%.3F", &info), "éla");
-        assert_eq!(format_list_entry("%.1u", &info), "ü");
+        assert_eq!(fmt("%.1F", &info), "é");
+        assert_eq!(fmt("%.3F", &info), "éla");
+        assert_eq!(fmt("%.1u", &info), "ü");
         // A precision at or beyond the length leaves the value intact.
-        assert_eq!(format_list_entry("%.99F", &info), "élan.txt");
+        assert_eq!(fmt("%.99F", &info), "élan.txt");
 
         // Width padding is also a character count, so a non-ASCII name lines up
         // with an ASCII one of the same length.
-        assert_eq!(format_list_entry("%10F", &info), "  élan.txt");
+        assert_eq!(fmt("%10F", &info), "  élan.txt");
     }
 
     #[test]
     fn test_format_list_entry_complex() {
         let info = ListEntryInfo {
-            path: "dir/file.txt",
+            path: std::path::Path::new("dir/file.txt"),
             mode: 0o755,
             size: 4096,
             mtime: 0,
@@ -1099,14 +1109,14 @@ mod tests {
             devmajor: 0,
             devminor: 0,
         };
-        let result = format_list_entry("%M %u %g %s %f", &info);
+        let result = fmt("%M %u %g %s %f", &info);
         assert_eq!(result, "-rwxr-xr-x alice users 4096 file.txt");
     }
 
     #[test]
     fn test_format_list_entry_keyword_substitution() {
         let info = ListEntryInfo {
-            path: "dir/file.txt",
+            path: std::path::Path::new("dir/file.txt"),
             mode: 0o644,
             size: 4096,
             mtime: 0,
@@ -1123,16 +1133,10 @@ mod tests {
         };
 
         // POSIX `%(keyword)s`/`%(keyword)d` substitution.
-        assert_eq!(
-            format_list_entry("%(path)s %(size)d", &info),
-            "dir/file.txt 4096"
-        );
-        assert_eq!(
-            format_list_entry("%(uname)s:%(gname)s", &info),
-            "alice:users"
-        );
+        assert_eq!(fmt("%(path)s %(size)d", &info), "dir/file.txt 4096");
+        assert_eq!(fmt("%(uname)s:%(gname)s", &info), "alice:users");
         // An unknown keyword is echoed verbatim.
-        assert_eq!(format_list_entry("%(bogus)s", &info), "%(bogus)s");
+        assert_eq!(fmt("%(bogus)s", &info), "%(bogus)s");
     }
 
     #[test]
@@ -1203,7 +1207,7 @@ mod tests {
     fn test_format_list_entry_device() {
         // Test %D format specifier for device major,minor
         let info = ListEntryInfo {
-            path: "/dev/sda",
+            path: std::path::Path::new("/dev/sda"),
             mode: 0o660,
             size: 0,
             mtime: 0,
@@ -1218,7 +1222,7 @@ mod tests {
             devmajor: 8,
             devminor: 0,
         };
-        let result = format_list_entry("%M %D %f", &info);
+        let result = fmt("%M %D %f", &info);
         assert_eq!(result, "brw-rw---- 8,0 sda");
     }
 
@@ -1227,7 +1231,7 @@ mod tests {
         // Test that %M correctly uses entry_type for file type character
         // Directory
         let info = ListEntryInfo {
-            path: "mydir",
+            path: std::path::Path::new("mydir"),
             mode: 0o755,
             size: 0,
             mtime: 0,
@@ -1242,12 +1246,12 @@ mod tests {
             devmajor: 0,
             devminor: 0,
         };
-        let result = format_list_entry("%M", &info);
+        let result = fmt("%M", &info);
         assert_eq!(result, "drwxr-xr-x");
 
         // Symlink
         let info = ListEntryInfo {
-            path: "mylink",
+            path: std::path::Path::new("mylink"),
             mode: 0o777,
             size: 0,
             mtime: 0,
@@ -1257,12 +1261,12 @@ mod tests {
             gid: 0,
             uname: None,
             gname: None,
-            link_target: Some("target"),
+            link_target: Some(std::path::Path::new("target")),
             entry_type: EntryType::Symlink,
             devmajor: 0,
             devminor: 0,
         };
-        let result = format_list_entry("%M", &info);
+        let result = fmt("%M", &info);
         assert_eq!(result, "lrwxrwxrwx");
     }
 

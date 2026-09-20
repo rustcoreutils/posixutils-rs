@@ -19,7 +19,6 @@ use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 
 /// Options for list mode
 #[derive(Default)]
@@ -101,13 +100,13 @@ fn list_entries<R: ArchiveReader, W: Write>(
             crate::modes::read::apply_keyword_overrides(&mut entry, &options.format_options);
             // Apply substitutions
             if !options.substitutions.is_empty() {
-                let path_str = entry.path.to_string_lossy();
-                match apply_substitutions(&options.substitutions, &path_str) {
+                let name = crate::rawpath::MatchName::of(&entry.path);
+                match apply_substitutions(&options.substitutions, name.as_str()) {
                     SubstResult::Unchanged => {
-                        // Keep original path
+                        // Keep the original bytes.
                     }
                     SubstResult::Changed(new_path) => {
-                        entry.path = PathBuf::from(new_path);
+                        entry.path = crate::rawpath::from_substituted(&new_path);
                     }
                     SubstResult::Empty => {
                         // Skip this entry
@@ -119,10 +118,11 @@ fn list_entries<R: ArchiveReader, W: Write>(
             // --strip-components reshapes the name the listing reports, so that
             // `tar -t` shows what `tar -x` would create.
             if options.strip_components > 0 {
-                let name = entry.path.to_string_lossy().into_owned();
-                match crate::modes::read::strip_leading_components(&name, options.strip_components)
-                {
-                    Some(stripped) => entry.path = PathBuf::from(stripped),
+                match crate::modes::read::strip_leading_components(
+                    &entry.path,
+                    options.strip_components,
+                ) {
+                    Some(stripped) => entry.path = stripped,
                     None => {
                         archive.skip_data()?;
                         continue;
@@ -159,16 +159,17 @@ fn should_list(
     options: &ListOptions,
     matched_patterns: &mut HashSet<usize>,
 ) -> Option<bool> {
-    let path = entry.path.to_string_lossy();
+    let name = crate::rawpath::MatchName::of(&entry.path);
+    let path = name.as_str();
 
     // tar's exclusion list is independent of the pattern operands and wins over
     // them, so it is applied to the stored name before anything else.
-    if matches_excluded(&options.exclude_patterns, &path) {
+    if matches_excluded(&options.exclude_patterns, path) {
         return None;
     }
 
     // Try matching against both the full path and the path with "./" prefix stripped
-    let path_stripped = path.strip_prefix("./").unwrap_or(&path);
+    let path_stripped = path.strip_prefix("./").unwrap_or(path);
 
     if options.patterns.is_empty() {
         // No patterns means match all
@@ -181,12 +182,12 @@ fn should_list(
     // Find which pattern matches (if any). A pattern selecting a directory also
     // selects its whole subtree unless `-d` (dir_only) was given.
     let expand_subtree = !options.dir_only;
-    let matching_pattern = find_matching_pattern_subtree(&options.patterns, &path, expand_subtree)
+    let matching_pattern = find_matching_pattern_subtree(&options.patterns, path, expand_subtree)
         .or_else(|| {
             // Only worth a second pass when stripping actually changed
             // something; otherwise this repeats the first pass verbatim for
             // every non-matching member.
-            if std::ptr::eq(path_stripped, path.as_ref() as &str) {
+            if std::ptr::eq(path_stripped, path) {
                 None
             } else {
                 find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
@@ -227,13 +228,8 @@ fn print_entry<W: Write>(
 ) -> PaxResult<()> {
     // Check for custom list format (listopt)
     if let Some(ref format) = options.format_options.list_format {
-        let path_str = entry.path.to_string_lossy();
-        let link_target_str = entry
-            .link_target
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string());
         let info = ListEntryInfo {
-            path: &path_str,
+            path: &entry.path,
             mode: entry.mode,
             size: entry.size,
             mtime: entry.mtime,
@@ -243,21 +239,25 @@ fn print_entry<W: Write>(
             gid: entry.gid,
             uname: entry.uname.as_deref(),
             gname: entry.gname.as_deref(),
-            link_target: link_target_str.as_deref(),
+            link_target: entry.link_target.as_deref(),
             entry_type: entry.entry_type,
             devmajor: entry.devmajor,
             devminor: entry.devminor,
         };
         let output = format_list_entry(format, &info);
-        write!(writer, "{}", output)?;
+        writer.write_all(&output)?;
         // Add newline if format doesn't end with one
-        if !output.ends_with('\n') {
-            writeln!(writer)?;
+        if output.last() != Some(&b'\n') {
+            writer.write_all(b"\n")?;
         }
     } else if options.verbose {
         print_verbose(writer, entry)?;
     } else {
-        writeln!(writer, "{}", entry.path.display())?;
+        // The name goes out as the bytes the archive recorded. `display()`
+        // would render an invalid byte as U+FFFD, so the listing would not
+        // name the file extraction creates.
+        writer.write_all(crate::rawpath::as_bytes(&entry.path))?;
+        writer.write_all(b"\n")?;
     }
     Ok(())
 }
@@ -272,20 +272,16 @@ fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()
     let mtime = format_time_traditional(entry.mtime);
     let path = &entry.path;
 
-    let link_suffix = format_link_suffix(entry);
-
-    writeln!(
+    // The fixed columns are text; the name and the link target are bytes, so
+    // the line is assembled rather than formatted in one go.
+    write!(
         writer,
-        "{} {:>3} {:>8} {:>8} {:>8} {} {}{}",
-        mode_str,
-        nlink,
-        owner,
-        group,
-        size,
-        mtime,
-        path.display(),
-        link_suffix
+        "{} {:>3} {:>8} {:>8} {:>8} {} ",
+        mode_str, nlink, owner, group, size, mtime
     )?;
+    writer.write_all(crate::rawpath::as_bytes(path))?;
+    write_link_suffix(writer, entry)?;
+    writer.write_all(b"\n")?;
 
     Ok(())
 }
@@ -300,11 +296,18 @@ fn format_group(entry: &ArchiveEntry) -> String {
     entry.gname.clone().unwrap_or_else(|| entry.gid.to_string())
 }
 
-/// Format link suffix for symlinks and hardlinks
-fn format_link_suffix(entry: &ArchiveEntry) -> String {
-    match (&entry.entry_type, &entry.link_target) {
-        (EntryType::Symlink, Some(target)) => format!(" -> {}", target.display()),
-        (EntryType::Hardlink, Some(target)) => format!(" == {}", target.display()),
-        _ => String::new(),
-    }
+/// Write the ` -> target` / ` == target` suffix a link carries.
+///
+/// Writes rather than returning a `String`, so the target's bytes never pass
+/// through one -- which is what stops this drifting back to `display()`.
+fn write_link_suffix<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()> {
+    let marker = match (&entry.entry_type, &entry.link_target) {
+        (EntryType::Symlink, Some(_)) => b" -> ".as_slice(),
+        (EntryType::Hardlink, Some(_)) => b" == ".as_slice(),
+        _ => return Ok(()),
+    };
+    writer.write_all(marker)?;
+    let target = entry.link_target.as_ref().expect("matched Some above");
+    writer.write_all(crate::rawpath::as_bytes(target))?;
+    Ok(())
 }

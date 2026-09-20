@@ -13,7 +13,7 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveWriter, EntryType, Hard
 use crate::error::PaxResult;
 use crate::formats::{checksum_bytes, CpioFormat, CpioWriter, PaxWriter, UstarWriter};
 use crate::interactive::{InteractivePrompter, RenameResult};
-use crate::options::{FormatOptions, InvalidAction};
+use crate::options::FormatOptions;
 use crate::pattern::{matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashMap;
@@ -69,7 +69,8 @@ impl WriteOptions {
         };
         // Directory members are stored with a trailing slash; archived_mtimes
         // strips it so both sides of this lookup spell the name the same way.
-        let name = archive_path.to_string_lossy();
+        let name = crate::rawpath::MatchName::of(archive_path);
+        let name = name.as_str();
         let name = Path::new(name.trim_end_matches('/'));
         let Some(&member_mtime) = times.get(name) else {
             return false;
@@ -172,7 +173,10 @@ fn write_path<W: ArchiveWriter>(
     // Exclusion is decided on the name as traversed, before -s renaming, and
     // before stat: an excluded directory returns here, so its whole subtree is
     // skipped without the caller needing an ancestor check.
-    if matches_excluded(&options.exclude_patterns, &path.to_string_lossy()) {
+    if matches_excluded(
+        &options.exclude_patterns,
+        crate::rawpath::MatchName::of(path).as_str(),
+    ) {
         return Ok(());
     }
 
@@ -207,8 +211,8 @@ fn write_path<W: ArchiveWriter>(
 
     // Apply substitutions first (per POSIX: -s applies before -i)
     let archive_path = if !options.substitutions.is_empty() {
-        let path_str = path.to_string_lossy();
-        match apply_substitutions(&options.substitutions, &path_str) {
+        let name = crate::rawpath::MatchName::of(path);
+        match apply_substitutions(&options.substitutions, name.as_str()) {
             SubstResult::Unchanged => path.to_path_buf(),
             SubstResult::Changed(new_path) => PathBuf::from(new_path),
             SubstResult::Empty => return Ok(()), // Skip this file
@@ -219,27 +223,14 @@ fn write_path<W: ArchiveWriter>(
 
     // Handle interactive rename
     let archive_path = if let Some(ref mut p) = prompter {
-        let path_str = archive_path.to_string_lossy();
-        match p.prompt(&path_str)? {
+        let name = crate::rawpath::MatchName::of(&archive_path);
+        match p.prompt(name.as_str())? {
             RenameResult::Skip => return Ok(()),
             RenameResult::UseOriginal => archive_path,
             RenameResult::Rename(new_path) => new_path,
         }
     } else {
         archive_path
-    };
-
-    // Handle invalid filename characters according to -o invalid=action
-    // The extended header carries the encoding, so hdrcharset is decided by the
-    // pax writer from the bytes it is given; nothing else needs to be threaded
-    // through here.
-    let archive_path = match handle_invalid_filename(
-        &archive_path,
-        options.format_options.invalid_action,
-        prompter,
-    )? {
-        InvalidHandleResult::Use(p) | InvalidHandleResult::Binary(p) => p,
-        InvalidHandleResult::Skip => return Ok(()),
     };
 
     // -u is decided here rather than on the operands, because this is the
@@ -288,98 +279,6 @@ fn write_path<W: ArchiveWriter>(
 /// Check if we should follow symlinks
 fn should_follow_symlink(options: &WriteOptions, is_cli_arg: bool) -> bool {
     options.dereference || (is_cli_arg && options.cli_dereference)
-}
-
-/// Check if a path contains valid UTF-8 characters
-#[cfg(unix)]
-fn is_valid_utf8_path(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    // On Unix, check if the raw bytes are valid UTF-8
-    std::str::from_utf8(path.as_os_str().as_bytes()).is_ok()
-}
-
-#[cfg(not(unix))]
-fn is_valid_utf8_path(path: &Path) -> bool {
-    // On non-Unix platforms, paths are typically already UTF-16 or UTF-8
-    path.to_str().is_some()
-}
-
-/// Sanitize a path by replacing invalid UTF-8 sequences with replacement char
-fn sanitize_path(path: &Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().into_owned())
-}
-
-/// Result of handling an invalid filename
-enum InvalidHandleResult {
-    /// Use this path (possibly sanitized)
-    Use(PathBuf),
-    /// Skip this file
-    Skip,
-    /// Mark as needing binary charset header
-    Binary(PathBuf),
-}
-
-/// Handle a path with potentially invalid UTF-8 according to the invalid action
-fn handle_invalid_filename(
-    path: &Path,
-    action: InvalidAction,
-    prompter: &mut Option<InteractivePrompter>,
-) -> PaxResult<InvalidHandleResult> {
-    if is_valid_utf8_path(path) {
-        return Ok(InvalidHandleResult::Use(path.to_path_buf()));
-    }
-
-    match action {
-        InvalidAction::Bypass => {
-            eprintln!(
-                "pax: {}: Filename contains invalid characters, skipping",
-                path.display()
-            );
-            Ok(InvalidHandleResult::Skip)
-        }
-        InvalidAction::Rename => {
-            // Use interactive prompt to get new name
-            if let Some(ref mut p) = prompter {
-                let path_str = path.to_string_lossy();
-                eprintln!(
-                    "pax: {}: Filename contains invalid characters",
-                    path.display()
-                );
-                match p.prompt(&path_str)? {
-                    RenameResult::Skip => Ok(InvalidHandleResult::Skip),
-                    RenameResult::UseOriginal => {
-                        // User chose to use original despite warning - sanitize it
-                        Ok(InvalidHandleResult::Use(sanitize_path(path)))
-                    }
-                    RenameResult::Rename(new_path) => Ok(InvalidHandleResult::Use(new_path)),
-                }
-            } else {
-                // No prompter available, fall back to bypass
-                eprintln!(
-                    "pax: {}: Filename contains invalid characters, skipping (no terminal for rename)",
-                    path.display()
-                );
-                Ok(InvalidHandleResult::Skip)
-            }
-        }
-        InvalidAction::Write => {
-            // Sanitize the name and write
-            Ok(InvalidHandleResult::Use(sanitize_path(path)))
-        }
-        InvalidAction::Utf8 => {
-            // Use lossy conversion (already done by to_string_lossy internally)
-            Ok(InvalidHandleResult::Use(sanitize_path(path)))
-        }
-        InvalidAction::Binary => {
-            // Keep the bytes exactly as they are. The pax writer announces them
-            // with hdrcharset=BINARY and records the pathname unencoded, which
-            // is the whole point of this action -- running the name through
-            // to_string_lossy first, as this used to, replaced every invalid
-            // byte with U+FFFD irreversibly and made `binary` behave
-            // identically to `write`.
-            Ok(InvalidHandleResult::Binary(path.to_path_buf()))
-        }
-    }
 }
 
 /// Write a directory and its contents
@@ -450,19 +349,24 @@ fn write_symlink<W: ArchiveWriter>(
     src_path: &Path,
 ) -> PaxResult<()> {
     let target = fs::read_link(src_path)?;
-    let target_str = target.to_string_lossy();
+    // The target is a pathname, so it goes out as its bytes. Taking the size
+    // and the data from `to_string_lossy()` while `link_target` kept the real
+    // bytes made the two disagree: for cpio the target *is* the member data,
+    // so a target that is not UTF-8 was written corrupted and at the wrong
+    // length, which desynchronises everything after it in the archive.
+    let target_bytes = crate::rawpath::as_bytes(&target).to_vec();
     let mut entry = build_entry(archive_path, metadata, EntryType::Symlink)?;
     entry.link_target = Some(target.clone());
-    // For cpio format, the symlink target is written as file data
-    // Set size to target length so cpio writer includes it
-    entry.size = target_str.len() as u64;
+    // For cpio format, the symlink target is written as file data; the size
+    // field is what makes the reader read it back.
+    entry.size = target_bytes.len() as u64;
     if archive.needs_data_checksum() {
-        entry.data_checksum = Some(checksum_bytes(0, target_str.as_bytes()));
+        entry.data_checksum = Some(checksum_bytes(0, &target_bytes));
     }
 
     archive.write_entry(&entry)?;
     // Write the symlink target as data (needed for cpio format)
-    archive.write_data(target_str.as_bytes())?;
+    archive.write_data(&target_bytes)?;
     archive.finish_entry()?;
 
     Ok(())
